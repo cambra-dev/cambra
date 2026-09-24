@@ -2576,6 +2576,18 @@ impl Type {
         }
     }
 
+    /// Overwrite the [`FunKind`] of the function this denotes, through refinements.
+    /// A no-op on a non-function.
+    pub fn set_fun_kind(&mut self, kind: FunKind) {
+        let target = match self {
+            Type::Refinement(inner, _) => &mut **inner,
+            other => other,
+        };
+        if let Type::Fun { fun_kind, .. } = target {
+            *fun_kind = kind;
+        }
+    }
+
     /// The value type of the mutable variable this denotes, or `None` if it is not
     /// one.
     ///

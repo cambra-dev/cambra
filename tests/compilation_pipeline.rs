@@ -24,6 +24,8 @@
 #[path = "compilation_pipeline/helpers.rs"]
 mod helpers;
 
+#[path = "compilation_pipeline/binder_references.rs"]
+mod binder_references;
 #[path = "compilation_pipeline/comprehensions.rs"]
 mod comprehensions;
 #[path = "compilation_pipeline/conditionals.rs"]

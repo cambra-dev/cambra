@@ -275,3 +275,51 @@ fn a_correlated_filter_beside_a_correlated_body_is_refused_for_its_pair_binder()
         "a `__pair` binder survived into a compiled predicate term",
     );
 }
+
+/// **Pinned defect.** A comprehension body that is a **collection literal** reading
+/// the binder is not eliminated: `lambda_elim` converts the elements into functions
+/// of the captured `x` but leaves the `List` node's own type at the collection it
+/// had, so the list claims domain `[0, 1]` over elements whose domain is `Int`, and
+/// `post-lambda-elim` rejects the tree it just built.
+///
+/// The three neighbours below place the gap: a tuple body of the same elements is
+/// eliminated, and so is a collection literal that reads nothing, so what is missing
+/// is distributing a *collection* literal over the enclosing binder — the case the
+/// tuple rule already covers for products.
+#[test]
+fn a_collection_literal_reading_the_binder_is_not_eliminated() {
+    check_compile_error(
+        "[[x, x * 10] for x in [1, 2]]",
+        "post-lambda-elim produced an invalid tree",
+    );
+}
+
+/// The same gap reached through a feed, which is how it surfaces in user code. The
+/// feed itself is fine: `channelize` gives this the nested channel it should have
+/// (`[0, 1] ⤇ ([0, 1] ⤇ Int)`, one contribution per loop position), and the tree is
+/// consistent at that wall. It is the loop body's collection literal that stops it.
+#[test]
+fn a_collection_fed_from_inside_a_loop_hits_the_same_gap() {
+    check_compile_error(
+        "out = defer()\nfor x in [1, 2]:\n    out << [x, x * 10]\nout\n",
+        "post-lambda-elim produced an invalid tree",
+    );
+}
+
+/// A tuple body of the same two elements is eliminated — products distribute over
+/// the binder already.
+#[test]
+fn a_tuple_body_reading_the_binder_is_eliminated() {
+    check_tile(
+        "[(x, x * 10) for x in [1, 2]]",
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::tuple(vec![
+                Tile::Scalar(ColumnValue::Ints(vec![1, 2])),
+                Tile::Scalar(ColumnValue::Ints(vec![10, 20])),
+            ])),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}

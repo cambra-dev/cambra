@@ -88,6 +88,7 @@ mod typing;
 // pass: feed reads type concretely via their rigid `ChanDom` channel domains,
 // which `crate::ccl::channelize` erases by substitution — no post-channelize
 // re-typing.)
+pub use api::check_binder_references;
 #[cfg(debug_assertions)]
 pub use api::debug_assert_no_free_witness;
 pub use api::*;

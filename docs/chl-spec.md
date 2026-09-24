@@ -816,6 +816,12 @@ element type is the type of `value`, or where several feeds target one
 defer, the join of their value types
 ([Joining the types of several values](#joining-the-types-of-several-values)).
 
+A collection value is one element like any other: `out << [2, 4, 6]` contributes a single
+three-element collection, and the stream's element type is that collection's. Setting the deferred
+collection to `[2, 4, 6]` itself is the other half of the protocol,
+[`<<=`](#44-define-statement-) — one feed of a collection and one define of the same collection
+give different values.
+
 The deferred collection a target accumulates is, like any CHL
 collection, **unordered** (§3): multiple `<<` statements — across
 different iterations of a `for` loop, or across multiple feed sites

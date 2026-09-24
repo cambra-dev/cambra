@@ -1306,6 +1306,83 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
     go(expr, stage, &mut Vec::new(), &mut HashSet::new());
 }
 
+/// Check that every `Var`'s recorded type agrees with the `Let`/`LetRec` binder it
+/// names: the binder's type must be a subtype of the reference's, so a use site may
+/// widen but never claim something the binder does not supply.
+///
+/// **This is the relation the tree records twice and [`typecheck`] relates neither
+/// half of.** `Var` is a leaf whose recorded type Check trusts, and Check maintains
+/// no name scope at all (`CheckCtx::scoped` keeps only the telescope). A pass that
+/// rewrites a binder and its references out of step therefore emits a tree every
+/// wall accepts, and the disagreement surfaces at whichever later pass first reads
+/// both — arbitrarily far from the pass that made it.
+///
+/// **`Let` and `LetRec` only.** A lambda parameter, a loop target and a `Case` arm
+/// binder are bound and referenced within one construct, whose own rule already
+/// relates them. A `MutDecl` binder is read through the deref rule
+/// (`emit_value_read`) rather than through subtyping, so a reference to one
+/// differs from it by design.
+///
+/// Refinement predicates are not walked: a predicate is a term in a type slot,
+/// judged under the refinement's own binder rather than the enclosing term scope.
+///
+/// Cost: one walk of the tree, plus one subtype query per reference under a
+/// `Let`/`LetRec` binder. Each is decided syntactically, the SMT scope being
+/// `SkipSmtScope`, so no query leaves the process.
+pub fn check_binder_references(expr: &Expr) -> Result<(), Vec<InferError>> {
+    use crate::ccl::infer::solver::{ConstrainCache, Derivation, constrain_subtype};
+
+    fn go(e: &Expr, env: &mut Vec<(Name, Type)>, errors: &mut Vec<InferError>) {
+        match &e.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                go(bound_expr, env, errors);
+                env.push((binding.name.clone(), binding.ty.clone()));
+                go(body, env, errors);
+                env.pop();
+            }
+            // Every binding is in scope over the whole group *and* the body — the
+            // recurrence is the point — so the definitions are walked under the
+            // extended scope too.
+            TypedExprNode::LetRec { bindings, body } => {
+                for (b, _) in bindings {
+                    env.push((b.name.clone(), b.ty.clone()));
+                }
+                for (_, def) in bindings {
+                    go(def, env, errors);
+                }
+                go(body, env, errors);
+                env.truncate(env.len() - bindings.len());
+            }
+            // Innermost binder wins. Uniquification makes shadowing impossible in a
+            // pipeline tree, so this only keeps the walk honest on a hand-built one.
+            TypedExprNode::Var(n) => {
+                if let Some((_, binder_ty)) = env.iter().rev().find(|(b, _)| b == n) {
+                    let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+                    if let Err(err) = constrain_subtype(binder_ty, &e.ty, &mut cache) {
+                        errors.push(super::map_constrain_err(
+                            err,
+                            &format!("reference `{n}` against its binder"),
+                        ));
+                    }
+                }
+            }
+            _ => e.walk_children(|c| go(c, env, errors)),
+        }
+    }
+
+    let mut errors = Vec::new();
+    go(expr, &mut Vec::new(), &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
 /// in the tree is a fully concrete type — no [`Type::Hole`] or [`Type::Infer`] anywhere,
 /// including nested inside compound types like `Fun` or `Tuple` and inside refinements.
@@ -4132,5 +4209,95 @@ mod tests {
             undischarged_index_hint(&str_lit_ty("nope"), &Type::Base(BaseType::Int)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod binder_reference_tests {
+    use super::check_binder_references;
+    use crate::ccl::{BaseType, Expr, Lit, Type, TypedBinding, TypedExprNode};
+
+    fn int() -> Type {
+        Type::Base(BaseType::Int)
+    }
+
+    fn binding(name: &str, ty: Type) -> TypedBinding {
+        TypedBinding {
+            name: name.into(),
+            ty,
+            user_annotation: None,
+        }
+    }
+
+    /// The defect this check exists for, in its smallest form: a `LetRec` binder at
+    /// `D ⤇ Int` whose reference claims `D ⤇ (D ⤇ Int)` — one level more than the
+    /// binder supplies. This is the post-channelize shape a collection feed produced
+    /// before `channelize` read the handle's contribution type, and `typecheck`
+    /// accepts it: `Var` is a leaf whose recorded type Check trusts.
+    #[test]
+    fn a_reference_claiming_more_than_its_letrec_binder_is_reported() {
+        let dom = Type::UIntRange(3);
+        let binder_ty = Type::data_fun(dom.clone(), int());
+        let reference_ty = Type::data_fun(dom, binder_ty.clone());
+        let tree = Expr::new(TypedExprNode::LetRec {
+            bindings: vec![(
+                binding("out", binder_ty.clone()),
+                Expr::lit(Lit::Int(1)).with_ty(binder_ty),
+            )],
+            body: Box::new(Expr::var("out").with_ty(reference_ty.clone())),
+        })
+        .with_ty(reference_ty);
+        let errs = check_binder_references(&tree)
+            .expect_err("a reference one level above its binder must be reported");
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+    }
+
+    /// A reference may **widen**: reading a singleton binder at its base supplies
+    /// everything the reference claims, so the relation is subtyping rather than
+    /// equality. Pinned because equality would reject most of the corpus.
+    #[test]
+    fn a_reference_may_read_a_refined_binder_at_its_base() {
+        let refined = crate::ccl::infer::int_lit_ty(7);
+        let tree = Expr::let_in(
+            binding("x", refined),
+            Expr::lit(Lit::Int(7)).with_ty(int()),
+            Expr::var("x").with_ty(int()),
+        )
+        .with_ty(int());
+        assert!(
+            check_binder_references(&tree).is_ok(),
+            "widening a refined binder at a use site is not a disagreement"
+        );
+    }
+
+    /// The reverse is not a widening: a reference cannot claim a refinement its
+    /// binder does not supply.
+    #[test]
+    fn a_reference_may_not_claim_a_refinement_its_binder_lacks() {
+        let refined = crate::ccl::infer::int_lit_ty(7);
+        let tree = Expr::let_in(
+            binding("x", int()),
+            Expr::lit(Lit::Int(7)).with_ty(int()),
+            Expr::var("x").with_ty(refined),
+        )
+        .with_ty(int());
+        assert!(
+            check_binder_references(&tree).is_err(),
+            "a reference claiming an unsupplied refinement must be reported"
+        );
+    }
+
+    /// Only `Let` and `LetRec` are related. A lambda parameter is bound and
+    /// referenced inside one construct whose own rule relates them, so this walk
+    /// leaves it alone rather than duplicating (and disagreeing with) that rule.
+    #[test]
+    fn a_lambda_parameter_is_not_this_checks_business() {
+        let tree = Expr::lambda(
+            "p",
+            int(),
+            Expr::var("p").with_ty(Type::Base(BaseType::Bool)),
+        )
+        .with_ty(Type::fun(int(), Type::Base(BaseType::Bool)));
+        assert!(check_binder_references(&tree).is_ok());
     }
 }

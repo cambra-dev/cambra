@@ -421,6 +421,12 @@ handles are fully first-class — returnable and tuple-packable — because feed
 (multiple feeders union by `++`). `channelize` eliminates every feed-typed term when it resolves
 channels, so no history type survives to planning.
 
+𝐷 indexes the channel's **contribution sites**, one per position a `<<` runs at, and 𝑉 is what one
+contribution holds. A feed of a collection nests: `out << [2, 4, 6]` is one site holding a
+three-element collection, not three sites. `channelize` reads 𝑉 off the handle to decide, because a
+lexical collection contribution and the per-position contribution stream `hoist_feeds` builds out of
+an in-loop feed are both `𝐸 ⤇ 𝑇` and nothing in the value distinguishes them.
+
 ### `Txn` is a CCL type
 
 `Type::Txn` — the commit-time domain: an anonymous total order issued by the runtime. It is the

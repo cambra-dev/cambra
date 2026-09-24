@@ -15,8 +15,8 @@ use crate::{
     ccl::{
         Expr, Name, channelize,
         infer::{
-            InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
-            check_pre_channelize, infer, typecheck,
+            InferError, TypeInferenceContext, check_binder_references, check_mut_discipline,
+            check_mut_write_targets, check_pre_channelize, infer, typecheck,
         },
         inline, lambda_elim,
         lower::{LoweredRoute, LoweringContext, LoweringError, lower_stmts},
@@ -1468,8 +1468,17 @@ enum Check {
     PreChannelizeReportingAmbiguity,
     /// `check_pre_channelize`. A failure is a compiler bug.
     PreChannelize,
-    /// [`typecheck`]. A failure is a compiler bug.
+    /// [`typecheck`] plus [`check_binder_references`]. A failure is a compiler bug.
     Typed,
+    /// [`Check::Typed`] without [`check_binder_references`], for planning's output alone.
+    ///
+    /// A same-domain conditional leaves a `realize(…)` typed at the sum it asserts, read
+    /// by a consumer typed at the candidate that sum determines. No rule relates those —
+    /// a sum sits below no plain arrow in either direction — so the tree is ill-typed,
+    /// and the shared `let` is all that hides it: inline the binding and plain
+    /// [`typecheck`] rejects the same program at the consuming `Apply`. Pinned by
+    /// `planning_leaves_a_determined_realize_unreadable`.
+    TypedWithoutBinderReferences,
 }
 
 /// A phase boundary's post-conditions: ids unique, no witness reference free, output
@@ -1496,7 +1505,8 @@ fn settle(ir: &Expr, boundary: &str, check: Check) -> Result<(), Vec<CompileErro
     let outcome = match check {
         Check::PreChannelizeReportingAmbiguity => return pre_channelize_wall(ir, boundary),
         Check::PreChannelize => check_pre_channelize(ir),
-        Check::Typed => typecheck(ir),
+        Check::Typed => typecheck(ir).and_then(|()| check_binder_references(ir)),
+        Check::TypedWithoutBinderReferences => typecheck(ir),
     };
     outcome.unwrap_or_else(|errs| panic!("{boundary} produced an invalid tree: {errs:?}"));
     Ok(())
@@ -2017,7 +2027,11 @@ fn run_passes(
     // matches the fresh refinements it mints by structural predicate
     // equality, so the staging shapes now validate without re-blinding the
     // check or peeling cast refinements.
-    settle(&join_planned, "post-planning", Check::Typed)?;
+    settle(
+        &join_planned,
+        "post-planning",
+        Check::TypedWithoutBinderReferences,
+    )?;
 
     // Invariant (debug): planning's `iterate`/`restrict` markers live in the
     // term tree, never inside a type's refinement predicates — the substitution

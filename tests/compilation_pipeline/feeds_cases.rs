@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use bit_set::BitSet;
-use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
+use cambra::ccl::context::{GlobalContext, Phase, compile_program, compile_to, render_errors};
+use cambra::ccl::symbolic::symbolic_typed;
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
@@ -968,4 +969,116 @@ fn feeds_and_define_mixed_rejected() {
 #[test]
 fn unbound_defer_handle_rejected() {
     expect_feed_error("defer()", "unbound defer handle");
+}
+
+// ---------------------------------------------------------------------------
+// A feed nests: one contribution per feed site, holding whatever was fed
+// ---------------------------------------------------------------------------
+
+/// The post-channelize shape of `code`, as `symbolic_typed` renders it.
+fn channelized(code: &str) -> String {
+    let tree = compile_to(code, Phase::Channelize)
+        .unwrap_or_else(|errs| panic!("compiling {code:?} to channelize: {errs:?}"));
+    symbolic_typed(&tree)
+}
+
+/// A `<<` of a collection is **one** contribution holding that collection, so the
+/// channel is unit-keyed and its value is the collection: `Unit ⤇ ([0, 2] ⤇ Int)`.
+///
+/// `channelize` used to read the fed value's shape to decide whether to lift it,
+/// and a collection value looks exactly like the per-position contribution stream
+/// `mut_elim::hoist_feeds` builds out of an in-loop feed. Taking this one for that
+/// bound the channel at the collection's *own* extent — `[0, 2] ⤇ Int`, three
+/// contributions of one `Int` — while every read of the handle stayed typed at the
+/// `chan(out) ⤇ ([0, 2] ⤇ Int)` inference recorded. The binder and its reference
+/// then disagreed by one level, which no wall reported.
+#[test]
+fn a_collection_feed_is_one_contribution_holding_the_collection() {
+    let out = channelized("out = defer()\nout << [2, 4, 6]\nout\n");
+    assert!(
+        out.contains("letrec out : (Unit ⤇ ([0, 2] ⤇ Int))"),
+        "expected a unit-keyed channel holding the collection, got:\n{out}"
+    );
+    assert!(
+        !out.contains("letrec out : ([0, 2] ⤇ Int)"),
+        "the channel must not take the collection's own extent, got:\n{out}"
+    );
+}
+
+/// Two collection feeds are two contributions, so the channel is the union of two
+/// unit-keyed sites — not the two collections' extents joined.
+#[test]
+fn two_collection_feeds_are_two_contributions() {
+    let out = channelized("out = defer()\nout << [1, 2]\nout << [3, 4]\nout\n");
+    assert!(
+        out.contains("letrec out : (Unit | Unit ⤇ ([0, 1] ⤇ Int))"),
+        "expected two unit-keyed sites over the collection, got:\n{out}"
+    );
+}
+
+/// The contrast, and what the value's shape alone cannot distinguish: an in-loop
+/// feed that `mut_elim::hoist_feeds` moved out carries the loop's history — a
+/// contribution *per position* — so its own domain **is** the site set and it must
+/// not be lifted. Same `Type::Fun` shape as the case above, opposite meaning; the
+/// handle's contribution type is what tells them apart.
+#[test]
+fn a_hoisted_in_loop_feed_keeps_its_positions_as_sites() {
+    let out = channelized(indoc! {r#"
+        total := 0
+        out = defer()
+        for item in [1, 2, 3]:
+            total += item
+            out << [total, total]
+        out
+    "#});
+    assert!(
+        out.contains("letrec out : ([0, 2] ⤇ ([0, 1] ⤇ Int))"),
+        "expected one contribution per loop position, got:\n{out}"
+    );
+}
+
+/// A scalar feed is unchanged: one contribution holding a scalar.
+#[test]
+fn a_scalar_feed_is_one_unit_keyed_contribution() {
+    let out = channelized("out = defer()\nout << 3\nout\n");
+    assert!(
+        out.contains("letrec out : (Unit ⤇ Int@3)"),
+        "expected a unit-keyed scalar contribution, got:\n{out}"
+    );
+}
+
+/// `<<=` is the contrasting *user-level* operator: a define sets the channel to the
+/// collection wholesale, so `x <<= [1, 2, 3]` stays the flat three-element channel
+/// that `feed_list` above pins. Nesting is what `<<` means, not what a defer means.
+#[test]
+fn a_define_sets_the_channel_wholesale_rather_than_nesting() {
+    let out = channelized("x = defer()\nx <<= [1, 2, 3]\nx\n");
+    assert!(
+        out.contains("letrec x : ([0, 2] ⤇ Int)"),
+        "expected a define to set the channel flat, got:\n{out}"
+    );
+}
+
+/// **Pinned gap.** The nested channel is well-typed and reaches op-conversion, which
+/// cannot yet build a collection sitting in a codomain. Not specific to feeds: a bare
+/// nested list literal is refused there too (below), so what this pins is the wall the
+/// corrected shape now reaches rather than anything the feed path owes.
+///
+/// Before the fix this program ran and returned the *flattened* three-element
+/// collection, which is the wrong answer rather than a missing one.
+#[test]
+fn a_nested_collection_stops_at_op_conversion() {
+    check_compile_error(
+        "x = defer(); x << [2, 4, 6]; x",
+        "list literal reached op-conversion without an input",
+    );
+}
+
+/// A collection inside a collection with no feed anywhere, which is what makes the
+/// case above op-conversion's gap rather than the feed path's. Op-conversion rejects
+/// it on the way in (a list element must be a constant) instead of on the way out,
+/// so the message differs; what the two share is that neither builds.
+#[test]
+fn a_bare_nested_list_stops_at_op_conversion_too() {
+    check_compile_error("[[1, 2], [3, 4]]", "a list element must be a constant");
 }
