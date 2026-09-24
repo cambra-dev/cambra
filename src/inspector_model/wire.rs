@@ -824,13 +824,12 @@ mod tests {
                   total := total + x
                 total
             "#},
-            // A join, for the multi-span node. Every other corpus program
-            // attributes each node to one span, so the span-ordering and
-            // span-uniqueness assertions below ran only over one-element
-            // vectors and could not fail. The hash-join planner attributes the
-            // operators it builds to both the comprehension and the record
-            // inside it, which is the only shape in the tree that reaches
-            // `wire_spans` with something to order.
+            // A join, for the multi-span node. The hash-join planner
+            // attributes the operators it builds to both the comprehension and
+            // the record inside it, and those two differ in width, so the
+            // span-ordering and span-uniqueness assertions below run over a
+            // vector they can reject. Every other corpus program attributes
+            // each node to one span, which passes both of them vacuously.
             indoc! {r#"
                 us = [(id=1, n="a")]
                 os = [(uid=1, amt=5)]
@@ -994,14 +993,12 @@ mod tests {
     /// `wire_spans` establishes the ordering both node shapes promise, over
     /// spans handed to it in any order.
     ///
-    /// A unit test rather than a corpus one because the corpus cannot reach the
-    /// case: an operator node with more than one span needs a join, and no
-    /// program in `corpus()` has one. That gap is why the operator table
-    /// shipped `a.spans.clone()` unsorted through every payload the suite
-    /// built — `inner_join` and `join_then_groupby` are the only programs in
-    /// the tree that expose it, and neither was in a corpus the validators ran
-    /// on. Here the shape is stated directly, so the invariant no longer
-    /// depends on some program happening to produce it.
+    /// A unit test rather than a corpus one: it states the law over spans
+    /// directly, so the invariant holds whether or not a program happens to
+    /// produce a node carrying more than one. The operator table shipped
+    /// `a.spans.clone()` unsorted for as long as every corpus program
+    /// attributed each node to one span; `corpus()` carries a join now, and
+    /// this is what says what that join is checked against.
     #[test]
     fn wire_spans_orders_narrowest_first_and_dedups() {
         let span = |start: usize, end: usize| Span { start, end };
