@@ -160,7 +160,7 @@ impl CompileError {
                 buf.extend_from_slice(format!("error: type inference: {error:?}\n").as_bytes());
             }
             CompileError::LambdaElim(e) => {
-                buf.extend_from_slice(format!("error: lambda elimination: {e:?}\n").as_bytes());
+                buf.extend_from_slice(format!("error: {e}\n").as_bytes());
             }
             CompileError::Conversion(e) => {
                 buf.extend_from_slice(
