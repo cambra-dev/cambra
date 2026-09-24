@@ -692,6 +692,42 @@ x";
     );
 }
 
+/// A transaction loop over a live source filtered to nothing releases every row it reads
+/// past. No block runs, so no commit acknowledges a row, and a row the filter removes is
+/// consumed when the drive reads past it.
+#[test_log::test]
+fn test_filtered_rows_of_a_live_transaction_source_are_released() {
+    let code = "\
+pool: Mut(Int, Txn) := 100
+for r in [z for z in source1() if z > 99]:
+    with begin():
+        pool := 7
+await_final(pool)";
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    ctx.scheduler().check_for_notifications();
+    pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
+    assert_eq!(
+        test_source.borrow().get_released_predicate(),
+        Predicate::LessThanEq(Value::UInt(1)),
+        "both filtered rows are released while the source is live"
+    );
+}
+
 #[test_log::test]
 fn test_incremental_aggregates() {
     let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
