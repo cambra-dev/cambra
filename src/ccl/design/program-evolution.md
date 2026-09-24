@@ -60,7 +60,7 @@ Three questions decide a reload:
 ## The control port
 
 > **Status: [Decided]** for `/diff` and `/reload` without a branch segment, which address
-> `production`. **[Prescribed]** for every other form.
+> `production`. **[Current]** for every other form.
 
 `--control` (default 8081, `--control=PORT` to change it) serves the verbs below. Dispatch is on the
 path alone, so the HTTP method is not checked. A verb that takes a source reads it from the request
@@ -161,9 +161,8 @@ Out of scope in this draft:
 
 ## The branch table
 
-> **Status: [Prescribed].** The code has one `LiveProgram` and one `OpConversionContext` whose
-> `minted` `Inheritance` is the single version's record. The table generalizes that record to one
-> per branch.
+> **Status: [Current].** The table is `LiveProgram` in `src/live_program.rs`: one `Branch` per
+> branch, each holding its origin, its version and its record (`Inheritance`).
 
 **A branch's entry is its origin, its version, and the operators it holds.** The version is what a
 `LiveProgram` holds today: the `CompiledProgram` (source, tree, outputs) and the main producer. The
@@ -305,7 +304,7 @@ a branch still runs costs that version's compute and retention.
 ## How a reload works
 
 > **Status: [Decided]** for `production`. A branch's reload runs the same three steps against its
-> origin's tree and entry, [Prescribed].
+> origin's tree and entry, [Current].
 
 A reload drops the running version's subscriptions and then builds the replacement's, so one
 version's graph is subscribed at a time and nothing observes a half-swapped one. What crosses the
@@ -585,7 +584,7 @@ whichever version takes over.
 
 ## State takeover
 
-> **Status: [Decided]** for `production`. For a branch the predecessor is its origin, [Prescribed].
+> **Status: [Decided]** for `production`. For a branch the predecessor is its origin, [Current].
 
 **A reload is refused unless the new version can receive the state its predecessor holds.** The
 predecessor is the branch's origin for a branch and the running version for `production`, per
@@ -858,7 +857,7 @@ and the input reads a source), and `a_loop_added_over_a_buildable_collection_rep
 ## The reload lifecycle
 
 > **Status: [Decided]** for `production`. A branch's reload follows the same order against its
-> origin, [Prescribed].
+> origin, [Current].
 
 A reload is a **swap**: the reloaded branch's subscriptions are dropped and the replacement's are
 built, so one version of that branch is subscribed at a time and nothing observes a half-swapped
@@ -876,16 +875,18 @@ one.
 3. Tear down the branch's graph: detach its sink consumers and drop its outputs. For a branch
    sharing its entry, only the sink consumers no other entry holds are detached, per [The branch
    table](#the-branch-table).
-4. Offer the predecessor's operators and stores as the next compilation's inheritance. For
-   `production`, `GlobalContext::retire_version` records each source's agreement for producers
-   registering from then on (`carry_release_to_new_producers`) and moves the retiring conversion
-   context's record into the inheritance. For any other branch, the branch's previous record is
-   dropped first, freeing what no other entry holds, and the origin's entry is then offered by
-   reference and stays the origin's.
+4. Offer the predecessor's operators and stores as the next compilation's inheritance.
+   `GlobalContext::offer_predecessor` records each source's agreement for producers registering from
+   then on (`carry_release_to_new_producers`) and hands the predecessor's record to a fresh
+   conversion context. For `production`, the predecessor is its own record: it is offered and then
+   dropped from the entry, so the offer holds those operators until conversion ends
+   (`release_inheritance`). For any other branch, the branch's previous record is dropped first,
+   freeing what no other entry holds, and the origin's entry is then offered by reference and stays
+   the origin's.
 5. Compile and subscribe the new version against the same registry, which binds every endpoint a
    running version left open and opens the ones it adds. This compile diffs its own tree against the
    predecessor's (`compile_replacement`) to get the correspondence reuse is keyed on. The branch's
-   entry becomes what it recorded.
+   entry becomes what it recorded (`GlobalContext::take_record`).
 6. Notify each of the branch's sinks, so whatever is already available is pulled.
 
 Where each part of a program stands after a swap:

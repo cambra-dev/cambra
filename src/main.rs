@@ -8,9 +8,9 @@ use cambra::{
     control_port::{ControlPort, ControlReply, ControlRequest},
     interpreter::{
         Consumer,
-        tile_operators::{FunctionGuard, Tile, TileGuard},
+        tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
     },
-    live_program::{LiveProgram, render_unreadable},
+    live_program::{BranchError, LiveProgram, render_unreadable},
     pretty_graph::pretty_tile_operator,
     web_inspector::WebInspector,
 };
@@ -33,10 +33,20 @@ fn snapshot(live: &LiveProgram, inspector: Option<&WebInspector>, tick: u64) {
     });
 }
 
+/// The reply to a branch operation that did nothing: 404 for a branch the table
+/// does not hold, 400 for a refusal or a version that does not compile.
+fn refused(err: BranchError, code: &str) -> ControlReply {
+    match err {
+        BranchError::Unknown(_) => ControlReply::not_found(format!("{err}\n")),
+        BranchError::Refused(why) => ControlReply::rejected(why),
+        BranchError::Compile(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
+    }
+}
+
 /// Service at most one pending control request.
 ///
 /// One request per call rather than draining the queue: an accepted `/reload`
-/// replaces the program, so the requests behind it would be answered against a
+/// replaces a version, so the requests behind it would be answered against a
 /// version that no longer exists.
 fn poll_control(
     control: Option<&ControlPort>,
@@ -48,30 +58,83 @@ fn poll_control(
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
     let reply = match message.request() {
-        ControlRequest::Diff { code, phase } => match live.diff_against(ctx, code, *phase) {
+        ControlRequest::Diff {
+            branch,
+            code,
+            phase,
+        } => match live.diff_branch(ctx, branch, code, *phase) {
             Ok(report) => ControlReply::ok(format!(
                 "{}{}",
                 report.diff,
                 render_unreadable(&report.unreadable)
             )),
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
+            Err(err) => refused(err, code),
         },
-        ControlRequest::Reload { code } => match live.reload(ctx, code, main_consumer) {
-            Ok(report) => {
-                // The new graph has subscribed but nothing has pulled it, so arm
-                // the driver for one pass.
-                *new_data.borrow_mut() = true;
-                let ReuseTally { kept, bound } = report.reuse;
-                ControlReply::ok(format!(
-                    "reloaded: {kept}/{bound} operators kept\n\n{}{}",
-                    report.diff,
-                    render_unreadable(&report.unreadable),
-                ))
+        ControlRequest::Reload { branch, code } => {
+            match live.reload_branch(ctx, branch, code, main_consumer) {
+                Ok(report) => {
+                    // The new graph has subscribed but nothing has pulled it, so
+                    // arm the driver for one pass.
+                    *new_data.borrow_mut() = true;
+                    let ReuseTally { kept, bound } = report.reuse;
+                    ControlReply::ok(format!(
+                        "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+                        report.diff,
+                        render_unreadable(&report.unreadable),
+                    ))
+                }
+                Err(err) => refused(err, code),
             }
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
+        }
+        ControlRequest::CreateBranch { name, origin } => match live.create_branch(name, origin) {
+            Ok(()) => ControlReply::ok(format!("created branch `{name}` from `{origin}`\n")),
+            Err(err) => refused(err, ""),
         },
+        ControlRequest::DeleteBranch { name } => match live.delete_branch(ctx, name) {
+            Ok(orphaned) if orphaned.is_empty() => {
+                ControlReply::ok(format!("deleted branch `{name}`\n"))
+            }
+            Ok(orphaned) => ControlReply::ok(format!(
+                "deleted branch `{name}`; orphaned: {}\n",
+                orphaned.join(", ")
+            )),
+            Err(err) => refused(err, ""),
+        },
+        ControlRequest::RetargetBranch { name, origin } => {
+            match live.retarget_branch(name, origin) {
+                Ok(()) => ControlReply::ok(format!("retargeted `{name}` onto `{origin}`\n")),
+                Err(err) => refused(err, ""),
+            }
+        }
+        ControlRequest::ListBranches => ControlReply::ok(live.render_branches()),
     };
     message.answer(reply);
+}
+
+/// Pull `producer` once with its universal guard and release what it returned.
+///
+/// Returns the tile, whether the release was universal (the output is done),
+/// and whether the tile was empty. Producers can return empty tiles and still
+/// have more data.
+fn pull_main(producer: &mut Box<dyn TileProducer>) -> (Tile, bool, bool) {
+    debug!("Main calling get");
+    let tile = producer.get(producer.tiling().universal_guard());
+    let release_guard = match &tile {
+        Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
+        Tile::DataFunction {
+            domain_predicate, ..
+        } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+        other => panic!("Unexpected top-level tile shape: {other:?}"),
+    };
+    debug!("Main releasing with {release_guard:?}");
+    let done = release_guard.is_universal();
+    producer.release(release_guard);
+    let is_empty = match &tile {
+        Tile::Scalar(cv) => cv.is_empty(),
+        Tile::DataFunction { domain, .. } => domain.is_empty(),
+        _ => false,
+    };
+    (tile, done, is_empty)
 }
 
 /// Runs a Cambra program from a source string.
@@ -147,31 +210,28 @@ fn run_program(
         }
         *new_data.borrow_mut() = false;
 
+        // Every other version is pulled beside `production`'s, because a held
+        // fragment nothing pulls stops releasing and holds its inputs back.
+        for (label, slot) in live.branch_mains_mut() {
+            let Some(producer) = slot.as_mut() else {
+                continue;
+            };
+            let (tile, done, is_empty) = pull_main(producer);
+            if !is_empty || done {
+                println!("Got value from {label}: {tile:#?}");
+            }
+            if done {
+                *slot = None;
+            }
+        }
+
         // Re-read the producer each pass: a reload between ticks replaces it.
         let Some(producer) = live.main_producer_mut() else {
             break;
         };
-        debug!("Main calling get");
-        let tile = producer.get(producer.tiling().universal_guard());
-
-        let release_guard = match &tile {
-            Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
-            Tile::DataFunction {
-                domain_predicate, ..
-            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            other => panic!("Unexpected top-level tile shape: {other:?}"),
-        };
-        debug!("Main releasing with {release_guard:?}");
-        let done = release_guard.is_universal();
-        producer.release(release_guard);
+        let (tile, done, is_empty) = pull_main(producer);
         snapshot(&live, inspector.as_ref(), tick);
         tick += 1;
-        // Producers can return empty tiles, but still have more data.
-        let is_empty = match &tile {
-            Tile::Scalar(cv) => cv.is_empty(),
-            Tile::DataFunction { domain, .. } => domain.is_empty(),
-            _ => false,
-        };
         if !is_empty || done {
             println!("Got value: {tile:#?}");
         }
