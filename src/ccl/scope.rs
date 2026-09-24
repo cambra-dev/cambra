@@ -654,6 +654,7 @@ mod tests {
                 body: var("wbody"),
             }],
             domain: Type::Txn,
+            parameter: None,
         })
     }
 
