@@ -117,6 +117,16 @@ pub enum Token {
     /// Experimental, and so absent from `docs/chl-spec.md`.
     #[token("^+")]
     CaretPlus,
+    /// Opaque binding `^=` — a `let` whose binder is bound at the initializer's
+    /// type and never discharged to the initializer, so a refinement mentioning
+    /// the binder keeps the initializer's term out
+    /// ([`BindingTransparency`](crate::ccl::BindingTransparency)). Two chars, so
+    /// maximal munch takes it over `Caret` then `Eq`; `=` starts no expression,
+    /// so `a ^ = b` is not a competing parse.
+    ///
+    /// Experimental, and so absent from `docs/chl-spec.md`.
+    #[token("^=")]
+    CaretEq,
     #[token("-=")]
     MinusEq,
     /// Lambda body arrow `->`. Also the planned pair / map-entry arrow — `a -> b`
@@ -266,6 +276,7 @@ impl fmt::Display for Token {
             Token::PlusPlus => "++",
             Token::PlusEq => "+=",
             Token::CaretPlus => "^+",
+            Token::CaretEq => "^=",
             Token::MinusEq => "-=",
             Token::Arrow => "->",
             Token::DoubleArrow => "=>",
@@ -658,7 +669,7 @@ mod tests {
     #[test]
     fn multi_char_operators() {
         assert_eq!(
-            tokens("<< <<= == != <= >= // //= += -= *= ^+"),
+            tokens("<< <<= == != <= >= // //= += -= *= ^+ ^="),
             vec![
                 Token::LShift,
                 Token::LShiftEq,
@@ -672,6 +683,7 @@ mod tests {
                 Token::MinusEq,
                 Token::StarEq,
                 Token::CaretPlus,
+                Token::CaretEq,
                 Token::Newline,
             ]
         );
@@ -691,6 +703,23 @@ mod tests {
                 Token::Ident("c".into()),
                 Token::Plus,
                 Token::Ident("d".into()),
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// `^=` is one token: an opaque binding, not `^` applied to whatever `=`
+    /// starts. Maximal munch is what separates them.
+    #[test]
+    fn caret_eq_wins_over_caret_then_eq() {
+        assert_eq!(
+            tokens("a ^= b ^ c"),
+            vec![
+                Token::Ident("a".into()),
+                Token::CaretEq,
+                Token::Ident("b".into()),
+                Token::Caret,
+                Token::Ident("c".into()),
                 Token::Newline,
             ]
         );

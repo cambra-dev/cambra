@@ -156,10 +156,10 @@ impl Sort {
 /// scope, and a binder nothing mentions can still change the answer — a
 /// contradictory one would prove the entailment outright.
 ///
-/// The one implementor that answers is inference's lexical scope (`InferCtx`'s
-/// `ScopeStack`, `src/ccl/infer/context.rs`). [`NoScope`] is the empty
-/// environment, which every other caller passes: a query raised after inference
-/// runs over a tree whose binder types the caller does not hold. See
+/// Two implementors answer: inference's lexical scope (`InferCtx`'s `ScopeStack`,
+/// `src/ccl/infer/context.rs`) and the post-inference check's Γ, built from the tree
+/// it walks (`CheckCtx`, `src/ccl/infer/check.rs`). [`NoScope`] is the empty
+/// environment, which a caller holding a tree's binders neither way passes. See
 /// `src/ccl/design/type-inference.md`, "The scope a query runs in".
 pub trait ScopeEnv {
     /// The type a value has given `name` here, or `None` when this scope does not

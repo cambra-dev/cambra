@@ -91,6 +91,8 @@ const PANE_WINDOWS = [
 // — validateRewritten guards that boundary explicitly.
 const ALLOWED_VIA = [
   "Lower",
+  "Anf",
+  "MutRead",
   "Infer",
   "Inline",
   "Transact",

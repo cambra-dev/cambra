@@ -2567,6 +2567,22 @@ impl Type {
         }
     }
 
+    /// Does a refinement ride anywhere in this type — at this position or under
+    /// it?
+    ///
+    /// The question a pass asks before rewriting a term the type holds a copy
+    /// of: a predicate is a term riding a type slot, and a pass that rewrites
+    /// the term copy alone leaves the two unequal where inference dedups them by
+    /// structural equality (`crate::ccl::anf`, the refined `Cast` contract).
+    pub fn carries_refinement(&self) -> bool {
+        if matches!(self, Type::Refinement(..)) {
+            return true;
+        }
+        let mut found = false;
+        self.walk_children(|c| found |= c.carries_refinement());
+        found
+    }
+
     pub fn peel_refinements(&self) -> &Type {
         match self {
             // One layer suffices: `Type::refined` flattens, so a refinement's

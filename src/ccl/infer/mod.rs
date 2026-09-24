@@ -766,7 +766,7 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::test_helpers::*;
     use super::*;
-    use crate::ccl::{TypedBinding, TypedExpr, TypedExprNode};
+    use crate::ccl::{BindingTransparency, TypedBinding, TypedExpr, TypedExprNode};
 
     #[test]
     fn smoke_lambda_identity_inferred_int() {
@@ -776,6 +776,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
@@ -819,6 +820,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
+                transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(lit_int(42)),
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),

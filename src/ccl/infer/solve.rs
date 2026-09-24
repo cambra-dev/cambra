@@ -29,7 +29,9 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, Level, Name, Pattern, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{
+    BindingTransparency, Expr, Level, Name, Pattern, Type, TypedBinding, TypedExprNode,
+};
 
 use super::context::should_generalize;
 use super::{LocatedInferError, map_coalesce_err, map_constrain_err};
@@ -944,7 +946,28 @@ pub(super) fn check_scope_valid(
     scope: &std::collections::BTreeSet<Name>,
     errors: &mut Vec<LocatedInferError>,
 ) {
-    check_scope_valid_go(expr, scope, &[], errors)
+    // An opaque binder's name is not discharged when a type leaves its scope
+    // (`Typing::close_let_type`), so it stands in the types of nodes above its
+    // `let`, starting with the `let` node itself. Seeding the root scope with
+    // every such name is what admits those types. The seed admits more than
+    // those nodes: the name is already out of its lexical scope at the first
+    // node that carries it, so the walk has no position from which to rule a
+    // later one out.
+    let mut scope = scope.clone();
+    collect_opaque_binders(expr, &mut scope);
+    check_scope_valid_go(expr, &scope, &[], errors)
+}
+
+/// Every [opaque](crate::ccl::BindingTransparency::Opaque) `let` binder in the
+/// tree.
+#[cfg(debug_assertions)]
+fn collect_opaque_binders(expr: &Expr, out: &mut std::collections::BTreeSet<Name>) {
+    if let TypedExprNode::Let { binding, .. } = &expr.node
+        && binding.transparency == BindingTransparency::Opaque
+    {
+        out.insert(binding.name.clone());
+    }
+    expr.walk_children(|c| collect_opaque_binders(c, out));
 }
 
 /// Every witness binder `ty` **binds** — the binders of the sums occurring in it.
@@ -1649,8 +1672,12 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         } => {
             // Only the dependent case (the binder free in the body type's
             // refinement predicates) does any work; skip cloning the bound
-            // expression when the discharge would be vacuous.
-            if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
+            // expression when the discharge would be vacuous. An opaque binder
+            // has no definiens to discharge at all, so its body type lifts with
+            // the binder's name still in it (`Typing::close_let_type`).
+            if binding.transparency == BindingTransparency::Transparent
+                && crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name)
+            {
                 let sigma = crate::ccl::subst::Subst::discharge(
                     &binding.name,
                     bound_expr.clone_preserving_ids(),
@@ -2174,6 +2201,9 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         unreachable!("coalesce_generalized_let is only called on a generalized Let");
     };
     let mut body = *body;
+    // Every specialization is the one binding, split by use type, so each
+    // carries its transparency.
+    let transparency = binding.transparency;
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
@@ -2223,7 +2253,9 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         // The discharge only does work when the specialization binder is free
         // in the body type's refinement predicates; skip cloning `spec.def`
         // otherwise (it is still moved into the rebuilt `let` below).
-        let body_ty = if crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name) {
+        let body_ty = if transparency == BindingTransparency::Transparent
+            && crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name)
+        {
             crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone_preserving_ids())
                 .apply_type(&result.ty)
         } else {
@@ -2234,6 +2266,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
                 name: spec.name,
                 ty: spec.def.ty.clone(),
                 user_annotation: None,
+                transparency,
             },
             bound_expr: Box::new(spec.def),
             body: Box::new(result),
@@ -2483,7 +2516,10 @@ mod tests {
     use super::super::test_helpers::*;
     use crate::ccl::infer::{int_lit_ty, str_lit_ty};
     use crate::ccl::symbolic::symbolic;
-    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::ccl::{
+        ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Lit, Type, TypedExpr,
+        TypedExprNode,
+    };
 
     // ----- the projection's monomorphization (`recovered_input`) -----
 
@@ -2905,6 +2941,7 @@ mod tests {
                     name: b.into(),
                     ty: Type::Hole,
                     user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
                 },
                 empty_payload: false,
             }),

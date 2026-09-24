@@ -166,6 +166,30 @@ through the parameter's handle for the one position where a `Mut` parameter is g
 something that is not a mutable variable (a program the second-class discipline rejects, but which
 still has to be typed to be reported well).
 
+### A read is named while inference runs
+
+`mut_read` (`ccl/mut_read.rs`) binds each block's mutable-variable reads to an immutable variable,
+one per **read segment** — the statements between one write to that variable and the next. Every
+read in a segment references the segment's binder, which is opaque (`^=`), so a type lifted out of
+its scope keeps the binder rather than reading the mutable variable back in its place.
+
+A refinement is what demands the name. Inference refines a computed value by the term that computed
+it, so an operand reading `x` types as `{Int | __elem == x ^+ 1}` — a type naming a mutable
+variable, which is [what no type may do](#a-mutable-variable-read-is-an-explicit-operation) and
+which nothing binds where the type travels. Read through a binder, the same operand types as
+`{Int | __elem == __read ^+ 1}`.
+
+The binder is substituted back immediately after inference, except where a type spells it: a binding
+on a writer's spine is an operator in the graph, and the phases below recognize a read by its term.
+Every use of a segment's binder precedes the write that ended the segment, which is what makes the
+substitution sound; `inline` moves uses, so it runs after.
+
+Five positions keep the read as lowering built it, each because a later pass reads the term there:
+an application's function and argument (the three handle positions above), a block's terminal
+expression (the tail rules, and rule 2's escape check), the value of a feed
+(`rewrite_as_of_reads`), and a refined cast's value (whose target holds a copy of the term). The
+module docs carry the per-position detail.
+
 ## Surface language
 
 The surface syntax and the behaviour a programmer observes — `:=` mutation, `with begin():`
@@ -527,7 +551,10 @@ CHL source
   → lower              (surface CCL: For / MutWrite / Begin / Feed / Defer; Mut/Feed types from annotations;
                         NO mutability classification — every loop is a `For`, intro-vs-write is scope-only)
   → uniquify
+  → anf                (A-normalization: every operand position holds an atomic term)
+  → mut_read           (name each block's reads: one opaque binding per read segment)
   → infer + check      (on the surface-CCL tree; Feed(V) with a rigid ChanDom domain types the defers)
+  → mut_read unbind    (substitute each read-segment binder back, except where a type spells it)
   → inline             (UDFs — incl. writers and defer-mediating lambdas — reach their call sites)
   → transact_phase     (the transactional slice of overwrite elimination, and the three rejection
                         gates ahead of it: strip each `with begin():` site → commit records +

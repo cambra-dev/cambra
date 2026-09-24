@@ -4685,7 +4685,9 @@ mod recomputability_tests {
 #[cfg(test)]
 mod variant_ctor_tests {
     use super::*;
-    use crate::ccl::{BaseType as CclBase, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::ccl::{
+        BaseType as CclBase, BindingTransparency, Lit, Type, TypedExpr, TypedExprNode,
+    };
     use crate::interpreter::UnionArm;
     use crate::interpreter::tile_operators::{
         ProducerBase, Tile, TileProducer, impl_producer_base,
@@ -4831,6 +4833,7 @@ mod variant_ctor_tests {
             name: name.into(),
             ty,
             user_annotation: None,
+            transparency: BindingTransparency::Transparent,
         }
     }
 
