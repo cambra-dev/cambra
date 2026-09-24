@@ -12,6 +12,8 @@
 //! For the human-facing gallery, see `docs/demo-programs.md`.
 
 mod common;
+#[path = "../support/panic_message.rs"]
+mod panic_message;
 #[path = "../support/serving.rs"]
 mod serving;
 
