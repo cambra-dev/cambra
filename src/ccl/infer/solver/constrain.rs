@@ -25,7 +25,7 @@ use crate::ccl::{
     Bound, HistoryKind, InferVar, InferVarId, Level, Name, Refinement, RefinementSet, Type,
 };
 
-use super::smt::{ScopeEnv, SmtError};
+use super::smt::{NoScope, ScopeEnv, SmtError};
 use super::traits::{Trait, link_watches, notify_lower};
 use super::type_level;
 use crate::ccl::FieldKey;
@@ -237,18 +237,6 @@ impl Derivation {
     fn opens_unconditionally(self) -> bool {
         self != Derivation::LiveSolve
     }
-
-    /// Whether a refinement deficit the SMT encoder cannot read is treated as discharged.
-    ///
-    /// A re-derivation reconciles two passes' spellings of one type, and a predicate
-    /// compiled to point-free form is one such respelling — the encoder reads neither
-    /// side, so a mismatch reported there names the encoder's limit rather than anything
-    /// about the tree (the same reason [`check_node_rule`]'s `Lit` arm verifies the base
-    /// and trusts the refinement). The live solve is deciding a demand nothing has
-    /// established yet, so an unreadable predicate stays a deficit there.
-    fn trusts_an_unreadable_refinement(self) -> bool {
-        self == Derivation::PostPass
-    }
 }
 
 impl ConstrainCache {
@@ -322,7 +310,7 @@ pub type ExtrudeCache = HashMap<(InferVarId, bool), Rc<InferVar>>;
 ///
 /// Caller policy rather than a lexical environment — see
 /// [`ScopeEnv::is_skip_smt`](super::smt::ScopeEnv::is_skip_smt), which names the
-/// argument this wants to be instead. [`super::smt::NoScope`] is the other empty scope and
+/// argument this wants to be instead. [`NoScope`] is the other empty scope and
 /// differs only in letting the query run.
 pub struct SkipSmtScope;
 
@@ -344,7 +332,7 @@ impl ScopeEnv for SkipSmtScope {
 /// Supplies [`SkipSmtScope`]: no scope to resolve a refinement's free names
 /// against, and no query raised either. A caller holding the lexical scope uses
 /// [`constrain_subtype_in`]; a caller holding none that still wants the fallback
-/// passes [`super::smt::NoScope`], as [`constrain_subtype_under`] does.
+/// passes [`NoScope`], as [`constrain_subtype_under`] does.
 pub fn constrain_subtype(
     lhs: &Type,
     rhs: &Type,
@@ -358,10 +346,10 @@ pub fn constrain_subtype(
 /// The scope reaches exactly one rule: the refinement deficit's semantic
 /// fallback, where `Γ ⊢ ⋀S₁ ⇒ ⋀S₂` is decided against what the scope knows
 /// about the free names the two sides' predicates mention (see
-/// [`smt_sub`](super::smt::smt_sub)). A caller with no scope — a probe over types built
-/// outside any program — uses [`constrain_subtype`] and gets [`SkipSmtScope`]; one holding
-/// none that still wants the fallback passes [`super::smt::NoScope`], which only weakens what the
-/// fallback can prove.
+/// [`smt_sub`](super::smt::smt_sub)). A caller with no scope — a probe over
+/// types built outside any program, or a re-derivation over a tree whose
+/// binders it does not hold — uses [`constrain_subtype`] and gets [`NoScope`],
+/// which only weakens what the fallback can prove.
 pub fn constrain_subtype_in(
     lhs: &Type,
     rhs: &Type,
@@ -383,7 +371,6 @@ pub fn constrain_subtype_under(
     lhs_binders: &[crate::ccl::ty::Witness],
     rhs_binders: &[crate::ccl::ty::Witness],
     cache: &mut ConstrainCache,
-    scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     // **The right side's binders are instantiated by the left.** A caller relating a value
     // to a shape written over binders — an application's argument against the domain it
@@ -391,8 +378,11 @@ pub fn constrain_subtype_under(
     // the instantiation off the two types is what puts both sides in one spelling, so the
     // reference comparison below is name equality rather than two unrelated names.
     let instantiation = witness_instantiation(rhs, lhs, rhs_binders);
+    // [`NoScope`], for the reason [`constrain_subtype`] takes it: this entry serves
+    // Check's re-derivation, which resolves no names and so holds no binder types for
+    // the semantic fallback to read.
     cache.under(lhs_binders, rhs_binders, |cache| {
-        constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache, scope)
+        constrain_go(lhs, rhs, &Subst::id(), &instantiation, cache, &NoScope)
     })
 }
 
@@ -1721,10 +1711,11 @@ fn constrain_go_impl(
                 scope,
             )
             .or_else(|error| match error {
-                // A predicate the encoder cannot read leaves the deficit undecided, and
-                // what undecided means depends on the derivation
-                // ([`Derivation::trusts_an_unreadable_refinement`]).
-                SmtError::Encoding { .. } => Ok(cache.derivation.trusts_an_unreadable_refinement()),
+                // A predicate the encoder cannot read leaves the deficit undecided,
+                // and undecided is the answer structural matching already gave:
+                // a mismatch. Reporting the encoder's limit instead would turn an
+                // ill-typed program's diagnostic into a note about this module.
+                SmtError::Encoding { .. } => Ok(false),
                 error => Err(ConstrainError::SmtError {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),

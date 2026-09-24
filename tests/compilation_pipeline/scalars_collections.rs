@@ -191,17 +191,20 @@ fn a_provably_non_negative_exponent_is_accepted(#[case] code: &str, #[case] expe
     check_scalar(code, expected);
 }
 
-/// The exponent's demand reaches a comprehension binder.
+/// **This test pins a defect, not a decision — it should start failing when the defect is
+/// fixed.**
 ///
-/// The source's elements each discharge `{Int | __elem >= 0}`, and the discharge survives
-/// the join onto the element read (`compact.rs`'s discharged-demand rule), so the mapped
-/// function's domain and the value reaching it agree at the pass boundary. Without that the
-/// program type-checks and the wall reports a compiler bug for it.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case::non_negative_elements("sum([2 ** x for x in [1, 2, 3]])", Value::Int(14))]
-fn a_comprehension_exponent_compiles(#[case] code: &str, #[case] expected: Value) {
-    check_scalar(code, expected);
+/// Inference admits the program: each of the source's elements discharges the exponent's
+/// `{Int | __elem >= 0}`. The join of `[1, 2, 3]`'s singletons is a bare `Int`, so the
+/// discharge leaves nothing in the element read's type, and the post-inference check then
+/// finds the mapped function's domain demanding a refinement the value reaching it does not
+/// carry. A well-typed program reports an internal invariant failure. The same panic
+/// arises with no `**`, from an annotated function called in a comprehension; `**` makes it
+/// reachable without refinement syntax. Once it passes, the program evaluates to `14`.
+#[test]
+#[should_panic(expected = "post-inference produced an invalid tree: [Type mismatch")]
+fn a_comprehension_exponent_reaches_the_wall() {
+    check_scalar("sum([2 ** x for x in [1, 2, 3]])", Value::Int(14));
 }
 
 /// A negative element is still rejected, and as a type error rather than at the wall.

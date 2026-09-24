@@ -583,12 +583,13 @@ pub(super) fn lower_binop(
 /// cannot show it is rejected where it is written.
 ///
 /// TODO(pow-signature): stated on the exponent rather than in the operator's own signature,
-/// which needs two things this head has one of. `Check` now raises its own semantic queries
-/// (`CheckCtx`'s `ScopeEnv`), so a demand the operator makes is dischargeable at a pass
-/// boundary. What is still missing is somewhere to write it: `TraitInstance.args` is
-/// `&'static [BaseType]`, so an `Exponentiable` row carries a base and no predicate — the
-/// restriction its own doc comment states. Fold this back into the signature once a trait
-/// row can carry one.
+/// which needs two things this head has neither of. `Check` decides refinements structurally
+/// (`constrain_subtype`'s `SkipSmtScope`), so it cannot discharge `{Int | __elem == 3} <:
+/// {Int | __elem >= 0}` the way inference does through the semantic fallback; an annotation
+/// is narrowed by inference, so `Check` compares the refinement against itself and matches.
+/// And `TraitInstance.args` is `&'static [BaseType]`, so an `Exponentiable` row carries a base
+/// and no predicate — the restriction its own doc comment states. Fold this back into the
+/// signature once `Check` raises its own queries and a trait row can carry a predicate.
 fn pow_with_checked_exponent(
     base: Expr,
     mut exponent: Expr,
