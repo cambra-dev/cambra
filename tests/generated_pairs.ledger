@@ -1,0 +1,215 @@
+comp_element/binder_in_comp[q]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element/binder_in_comp_filter[q]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_element_in_loop/binder[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/binder_arith[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/binder_in_call[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/binder_in_comp[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/binder_in_comp[q]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/binder_in_comp_filter[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_element_in_loop/binder_in_comp_filter[q]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_element_in_loop/binder_ternary[i]	CompilerPanics	a … binder survived into a compiled predicate term, breaking the value-function property the structural producer/consumer
+comp_element_in_loop/two_binders[i,q]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders[q,i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders_arith[i,q]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders_arith[q,i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders_in_comp[i,q]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders_in_comp[q,i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders_in_filter[i,q]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_element_in_loop/two_binders_in_filter[q,i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_element_in_loop/two_binders_ternary[i,q]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_element_in_loop/two_binders_ternary[q,i]	CompilerPanics	a … binder survived into a compiled predicate term, breaking the value-function property the structural producer/consumer
+comp_filter/binder_cmp_on_comp[q]	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+comp_filter/cmp_on_sum	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+comp_filter_in_loop/binder_cmp[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_filter_in_loop/binder_cmp_on_comp[i]	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+comp_filter_in_loop/binder_cmp_on_comp[z]	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+comp_filter_in_loop/cmp_on_sum	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+comp_filter_in_loop/two_binders_cmp[i,z]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_filter_in_loop/two_binders_cmp[z,i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_in_comp/binder[w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/binder_arith[w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/binder_in_call[w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/binder_in_comp[w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/binder_in_comp[z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/binder_in_comp_filter[w]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_in_comp/binder_in_comp_filter[z]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_in_comp/binder_ternary[w]	CompilerPanics	a … binder survived into a compiled predicate term, breaking the value-function property the structural producer/consumer
+comp_in_comp/two_binders[w,z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders[z,w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders_arith[w,z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders_arith[z,w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders_in_comp[w,z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders_in_comp[z,w]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders_in_filter[w,z]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_in_comp/two_binders_in_filter[z,w]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+comp_in_comp/two_binders_ternary[w,z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+comp_in_comp/two_binders_ternary[z,w]	CompilerPanics	a … binder survived into a compiled predicate term, breaking the value-function property the structural producer/consumer
+defer_feed/binder_in_comp[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+defer_feed/binder_in_comp_filter[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+feed_collection/all_filtered	Disagrees	compiled [] vs interpreted [() -> []]
+feed_collection/comp	Disagrees	compiled [2, 4, 6] vs interpreted [() -> [2, 4, 6]]
+feed_collection/dup_union	Disagrees	compiled [`0(0) -> 1, `0(1) -> 2, `1(0) -> 1, `1(1) -> 2] vs interpreted [() -> [`0(0) -> 1, `0(1) -> 2, `1(0) -> 1, `1(1) -> 2]]
+feed_collection/filtered_comp	Disagrees	compiled [2 -> 3, 3 -> 4] vs interpreted [() -> [2 -> 3, 3 -> 4]]
+feed_collection/generator_coll	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+feed_collection/list_lit	Disagrees	compiled [1, 2, 3] vs interpreted [() -> [1, 2, 3]]
+feed_collection/map_lit	Disagrees	compiled ["a" -> 1, "b" -> 2] vs interpreted [() -> ["a" -> 1, "b" -> 2]]
+feed_collection/singleton	Disagrees	compiled [7] vs interpreted [() -> [7]]
+feed_collection/union	Disagrees	compiled [`0(0) -> 1, `0(1) -> 2, `1(0) -> 3, `1(1) -> 4] vs interpreted [() -> [`0(0) -> 1, `0(1) -> 2, `1(0) -> 3, `1(1) -> 4]]
+feed_in_loop/binder_in_comp[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+feed_in_loop/binder_in_comp_filter[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+generator_yield/binder_in_comp[x]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+generator_yield/binder_in_comp_filter[x]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+keyed_write_value/arith	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/call	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/comp_sum	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/filtered_sum	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/floordiv	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/generator_max	CompilerRejects	Conversion: LetRec reached operator conversion without pattern recognition — the unified phase and its recognizers … land
+keyed_write_value/groupby_sum	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/int_lit	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/max_lit	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/neg	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/nested_comp_sum	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/record_proj	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/sum_lit	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/sum_of_empty	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/ternary	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/tuple_proj	CompilerPanics	Aggregate expected a collection, got Scalar…
+keyed_write_value/union_sum	CompilerPanics	Aggregate expected a collection, got Scalar…
+lambda_body/binder_in_comp[e]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+lambda_body/binder_in_comp_filter[e]	CompilerRejects	Infer: Unbound variable: …
+lambda_body/generator_max	CompilerPanics	type residue survived channelize on …
+lambda_body/groupby_sum	CompilerRejects	Infer: Type Inference Error: collection domains have no common answer
+lambda_body/ternary	CompilerPanics	a source that must be *iterated* reached a refinement predicate: __elem ▷ …
+lambda_body/union_sum	CompilerPanics	a source that must be *iterated* reached a refinement predicate: __elem ▷ …
+lambda_body_in_loop/binder[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/binder_arith[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/binder_in_call[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/binder_in_comp[e]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+lambda_body_in_loop/binder_in_comp[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/binder_in_comp_filter[e]	CompilerRejects	Infer: Unbound variable: …
+lambda_body_in_loop/binder_in_comp_filter[i]	CompilerPanics	open bound recorded on ?#: … is free in the upper bound … but is neither
+lambda_body_in_loop/binder_ternary[i]	CompilerPanics	a source that must be *iterated* reached a refinement predicate: __elem ▷ …
+lambda_body_in_loop/generator_max	CompilerPanics	type residue survived channelize on …
+lambda_body_in_loop/groupby_sum	CompilerRejects	Infer: Type Inference Error: collection domains have no common answer
+lambda_body_in_loop/ternary	CompilerPanics	a source that must be *iterated* reached a refinement predicate: __elem ▷ …
+lambda_body_in_loop/two_binders[e,i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/two_binders[i,e]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/two_binders_arith[e,i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/two_binders_arith[i,e]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/two_binders_in_comp[e,i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+lambda_body_in_loop/two_binders_in_comp[i,e]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+lambda_body_in_loop/two_binders_in_filter[e,i]	CompilerRejects	Infer: Unbound variable: …
+lambda_body_in_loop/two_binders_in_filter[i,e]	CompilerRejects	Infer: Unbound variable: …
+lambda_body_in_loop/two_binders_ternary[e,i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/two_binders_ternary[i,e]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+lambda_body_in_loop/union_sum	CompilerPanics	a source that must be *iterated* reached a refinement predicate: __elem ▷ …
+loop_source/map_lit	CompilerPanics	an unnamed function's codomain references it: the index has no binder to open at, so nothing
+match_arm/binder_in_comp[v]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+match_arm/binder_in_comp_filter[v]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+match_arm_in_loop/binder_in_comp[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+match_arm_in_loop/binder_in_comp[v]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+match_arm_in_loop/binder_in_comp_filter[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+match_arm_in_loop/binder_in_comp_filter[v]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+match_arm_in_loop/two_binders_in_comp[i,v]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+match_arm_in_loop/two_binders_in_comp[v,i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+match_arm_in_loop/two_binders_in_filter[i,v]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+match_arm_in_loop/two_binders_in_filter[v,i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+max_arg/all_filtered	OracleGap	… of an empty collection is not defined
+mut_reads_itself/arith	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/binder_in_comp[acc]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+mut_reads_itself/binder_in_comp_filter[acc]	CompilerRejects	Infer: Scope violation …: type … at cast… references out-of-scope binder… …
+mut_reads_itself/call	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/comp_sum	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/filtered_sum	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/floordiv	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/generator_max	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/groupby_sum	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/int_lit	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/max_lit	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/neg	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/nested_comp_sum	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/record_proj	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/sum_lit	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/sum_of_empty	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/ternary	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/tuple_proj	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_reads_itself/union_sum	CompilerPanics	letrec recognition: decision is not a compose: …
+mut_write_rhs/binder_in_comp[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+mut_write_rhs/binder_in_comp_filter[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+mut_write_rhs/generator_max	CompilerRejects	Conversion: LetRec reached operator conversion without pattern recognition — the unified phase and its recognizers … land
+rec_comp_element/rec_binder_in_comp[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_comp_filter/cmp_on_sum	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+rec_comp_filter_in_loop/binder_cmp_on_comp[z]	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+rec_comp_filter_in_loop/cmp_on_sum	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+rec_comp_filter_in_loop/rec_and_int_cmp[r,z]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+rec_comp_filter_in_loop/rec_binder_cmp[r]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+rec_comp_in_loop/binder_in_comp[z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_comp_in_loop/binder_in_comp_filter[z]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+rec_comp_in_loop/rec_and_int[r,z]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_comp_in_loop/rec_binder_field[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_comp_in_loop/rec_binder_in_comp[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_comp_in_loop/rec_binder_sum[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_loop_feed/rec_binder_in_comp[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+rec_with_coll_feed/rec_with_comp	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_feed/rec_with_empty	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_feed/rec_with_list	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_feed/rec_with_map	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_feed/rec_with_singleton	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_feed/rec_with_union	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_in_loop/rec_with_binder_coll[i]	CompilerPanics	post-lambda-elim produced an invalid tree: …
+rec_with_coll_in_loop/rec_with_comp	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_in_loop/rec_with_empty	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_in_loop/rec_with_list	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_in_loop/rec_with_map	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_in_loop/rec_with_singleton	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_in_loop/rec_with_union	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_projected/rec_with_comp	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_projected/rec_with_empty	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_projected/rec_with_list	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_projected/rec_with_map	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_projected/rec_with_union	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_scalar_field/rec_with_comp	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_scalar_field/rec_with_empty	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_scalar_field/rec_with_list	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_scalar_field/rec_with_map	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_scalar_field/rec_with_singleton	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+rec_with_coll_scalar_field/rec_with_union	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/all_filtered	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/comp	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/dup_union	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/filtered_comp	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/generator_coll	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/list_lit	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/map_lit	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/singleton	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_collection_field/union	CompilerPanics	FanIn pairs collections over # ambient level…, got Fn… and Int
+record_in_list/comp_sum	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/filtered_sum	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/generator_max	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/groupby_sum	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/max_lit	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/nested_comp_sum	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/record_proj	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/sum_lit	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/sum_of_empty	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/ternary	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+record_in_list/union_sum	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+terminal_read/terminal_in_agg[pool]	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+terminal_read_after_guard/terminal_in_agg[pool]	CompilerRejects	Conversion: a list element has to be a value here, and constant folding did not reduce this
+terminal_read_guard/cmp_on_sum	CompilerRejects	Conversion: list literal reached op-conversion without an input — planning should have inserted iterate… before any standalone
+terminal_read_guard/terminal_cmp[pool]	CompilerPanics	letrec recognition: dangling reference to transaction binding … in the continuation
+two_feed_sites/binder_in_comp[i]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+two_feed_sites/binder_in_comp_filter[i]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+txn_reply/binder_in_comp[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+txn_reply/binder_in_comp_filter[r]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+txn_reply/generator_max	CompilerRejects	Conversion: LetRec reached operator conversion without pattern recognition — the unified phase and its recognizers … land
+txn_write_rhs/binder_in_comp[pool]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+txn_write_rhs/binder_in_comp[r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+txn_write_rhs/binder_in_comp_filter[pool]	CompilerRejects	Infer: Scope violation …: type … at cast… references out-of-scope binder… …
+txn_write_rhs/binder_in_comp_filter[r]	CompilerRejects	Conversion: unrecognised Var… in λ-free CCL
+txn_write_rhs/generator_max	CompilerRejects	Conversion: LetRec reached operator conversion without pattern recognition — the unified phase and its recognizers … land
+txn_write_rhs/two_binders_in_comp[pool,r]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+txn_write_rhs/two_binders_in_comp[r,pool]	CompilerRejects	Conversion: Only higher-order combinators … can take an input operator; found input for non-combinator curry
+txn_write_rhs/two_binders_in_filter[pool,r]	CompilerRejects	Infer: Scope violation …: type … at cast… references out-of-scope binder… …
+txn_write_rhs/two_binders_in_filter[r,pool]	CompilerRejects	Infer: Scope violation …: type … at cast… references out-of-scope binder… …
