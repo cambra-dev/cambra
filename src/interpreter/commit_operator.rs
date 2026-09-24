@@ -1196,7 +1196,10 @@ impl TileProducer for CommitProducer {
 /// list is the special case (its domain is already `[0, 1, …]`).
 fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     let Tile::DataFunction {
-        domain, codomain, ..
+        domain,
+        codomain,
+        deleted,
+        ..
     } = tile
     else {
         return Vec::new();
@@ -1206,6 +1209,11 @@ fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     }
     let keys = &domain;
     let mut pairs: Vec<(usize, Value)> = (0..keys.len())
+        // A `Restrict` marks a row deleted rather than dropping it, so a restricted source
+        // still carries its extent's keys. Reading them all makes the recurrence run at
+        // positions the source does not have — invisible wherever a later step compacts the
+        // tile first, which is every source whose writer reads the item.
+        .filter(|i| !deleted.contains(*i))
         .filter_map(|i| match keys.index_at(i) {
             Value::UInt(pos) => Some((pos, source_value_at(codomain, i))),
             _ => None,
