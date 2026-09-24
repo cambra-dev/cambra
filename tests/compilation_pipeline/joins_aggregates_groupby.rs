@@ -940,12 +940,15 @@ fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
 /// A column the comparison's type does not name does not reach the answer, whichever
 /// operand carries it.
 ///
-/// Both operands here are `{a: Int, b: Int}`: typing rejects a comparison between two
-/// different products, and the annotation on `t` is what narrows the argument's type.
-/// The tiling does not narrow with it, so the wider argument's column `c` is still on
-/// the tile at the comparison, and `compare_records` reads the value at its type by
-/// excluding it. Both operand orders are pinned because a one-sided field aborted the
-/// process in one order and answered `equal` in the other.
+/// Both operands are `{a: Int, b: Int}` at inference: typing rejects a comparison between
+/// two different products, and the annotation on `t` is what narrows the argument's type.
+/// Inlining then substitutes the argument for `t` and drops that annotation, so after it the
+/// operand's type is `{a: Int, b: Int, c: Int}` as well as its tiling, and the post-inference
+/// check admits the pair because the shapes nest (the vault issue
+/// `type-checker-inlining-drops-a-narrowing-annotation`). The wider argument's column `c` is
+/// therefore on the tile at the comparison, and `compare_records` reads the value at the
+/// narrower type by excluding it. Both operand orders are pinned because a one-sided field
+/// aborted the process in one order and answered `equal` in the other.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::wider_on_the_left("t == (a=1, b=2)")]
@@ -975,6 +978,31 @@ fn a_surplus_column_does_not_reach_the_comparison(#[case] comparison: &str) {
 #[case::not_equals("(1, 2) != (1, 9)", Value::Int(1))]
 fn products_compare_componentwise(#[case] comparison: &str, #[case] expected: Value) {
     check_scalar(&format!("x = {comparison}\n1 if x else 0"), expected);
+}
+
+/// Two spellings of one record type, fields written in different orders, compare as one
+/// product.
+///
+/// A record literal's fields reach inference in one order however they are written, so the
+/// annotation is the spelling that carries its own. Inference answers both operands on one
+/// obligation and compares their shapes as field sets (`traits::product_shape`); read in
+/// declaration order, `{b: Int, a: Int}` and `{a: Int, b: Int}` are two shapes and the
+/// comparison is a type error.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::against_a_literal("(a=1, b=2)")]
+#[case::against_an_annotation("u")]
+fn record_types_in_two_field_orders_compare(#[case] right: &str) {
+    let code = formatdoc! {r#"
+        def f(t: {{b: Int, a: Int}}, u: {{a: Int, b: Int}}):
+            t == {right}
+
+        if f((a=1, b=2), (a=1, b=2)):
+            1
+        else:
+            0
+    "#};
+    check_scalar(&code, Value::Int(1));
 }
 
 /// A group-by's groups are themselves collections, so a checked lookup on one would carry
