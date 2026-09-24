@@ -2,7 +2,8 @@
 //!
 //! Every program here observes through a sink rather than through a trailing bare
 //! expression, so it compiles down the record-of-sinks path
-//! (`convert_record_fields_to_operators`) that only the HTTP demos reached before.
+//! (`convert_record_fields_to_operators`), which a program otherwise reaches only through
+//! `http_serve`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -17,7 +18,7 @@ use indoc::indoc;
 /// Run `source` to completion and answer what it wrote to each named sink.
 ///
 /// The drive loop is capped so a program that never completes fails the test rather than
-/// hanging it — the same bound `tests/cli_driver_convergence.rs` puts on the same loop.
+/// hanging it.
 fn observe(source: &str, names: &[&str]) -> Vec<Result<Value, SinkReadError>> {
     const CAP: usize = 10_000;
 
@@ -42,9 +43,13 @@ fn observe(source: &str, names: &[&str]) -> Vec<Result<Value, SinkReadError>> {
     sinks.iter().map(|s| s.value()).collect()
 }
 
-/// Compile `source`, expecting it to fail, and render the errors.
-fn compile_error(source: &str) -> String {
+/// Compile `source` with a test sink registered under each of `names`, expecting it to
+/// fail, and render the errors.
+fn compile_error(source: &str, names: &[&str]) -> String {
     let mut ctx = GlobalContext::default();
+    for name in names {
+        ctx.register_test_sink(*name);
+    }
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, source, consumer) {
         Ok(_) => String::new(),
@@ -98,19 +103,26 @@ fn two_sinks_are_observed_independently() {
     assert_eq!(rendered, ["Function [ () -> 1 ]", "Function [ () -> 2 ]"]);
 }
 
+/// A sink nobody wrote and an empty collection must not read alike: a registered sink the
+/// program never declares still says nothing was written once the program completes.
 #[test]
 fn an_unwritten_sink_says_so_rather_than_answering_empty() {
-    // A sink nobody wrote and an empty collection must not read alike.
-    let sink = {
-        let mut ctx = GlobalContext::default();
-        ctx.register_test_sink("out")
-    };
-    assert_eq!(sink.value(), Err(SinkReadError::NothingWritten));
+    let observed = observe(
+        indoc! {r#"
+            other = test_sink()
+            other << [x for x in [1, 2] if x > 5]
+        "#},
+        &["out", "other"],
+    );
+    assert_eq!(observed[0], Err(SinkReadError::NothingWritten));
+    assert_eq!(
+        format!("{}", observed[1].clone().expect("a value")),
+        "Function [  ]"
+    );
 }
 
 /// Filtering preserves a collection's keys: the survivors keep the positions they had,
-/// rather than being renumbered densely. Nothing reindexes today, and anything that ever
-/// does will be an explicit program-level construct.
+/// rather than being renumbered densely.
 #[test]
 fn a_filtered_collection_keeps_the_keys_of_its_survivors() {
     let v = observe_one(indoc! {r#"
@@ -124,7 +136,8 @@ fn a_filtered_collection_keeps_the_keys_of_its_survivors() {
 }
 
 // ---------------------------------------------------------------------------
-// Value shapes: one case per tile the reader walks.
+// Value shapes reachable from source. The reader's unit tests in
+// `src/interpreter/test_sink.rs` build the rest directly.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -170,10 +183,13 @@ fn a_record_holding_a_collection_does_not_compile() {
 /// to be reached from source yet.
 #[test]
 fn a_collection_of_collections_does_not_compile() {
-    let err = compile_error(indoc! {r#"
+    let err = compile_error(
+        indoc! {r#"
         out = test_sink()
         out << [[y * x for y in [1, 2]] for x in [1, 2]]
-    "#});
+    "#},
+        &["out"],
+    );
     assert!(
         err.contains("non-combinator curry"),
         "expected the curry conversion error, got: {err}"
@@ -248,13 +264,16 @@ fn a_variant_feed() {
 /// A sink is a program output, so it is declared where the program's outputs are.
 #[test]
 fn test_sink_outside_the_top_level_is_rejected() {
-    let err = compile_error(indoc! {r#"
+    let err = compile_error(
+        indoc! {r#"
         def f(x):
             out = test_sink()
             x
 
         f(1)
-    "#});
+    "#},
+        &["out"],
+    );
     assert!(
         err.contains("top level"),
         "expected a top-level restriction, got: {err}"
@@ -264,23 +283,78 @@ fn test_sink_outside_the_top_level_is_rejected() {
 /// The form takes no arguments; anything else is an ordinary call to a name nothing binds.
 #[test]
 fn test_sink_with_an_argument_is_not_the_sink_form() {
-    let err = compile_error(indoc! {r#"
+    let err = compile_error(
+        indoc! {r#"
         out = test_sink(1)
         out << 2
+    "#},
+        &["out"],
+    );
+    assert!(
+        err.contains("Unbound variable: 'test_sink'"),
+        "expected an unbound call, got: {err}"
+    );
+}
+
+/// A sink nothing registered has no reader, so the program is refused rather than run
+/// against a sink whose output nobody can observe.
+#[test]
+fn an_unregistered_test_sink_is_rejected() {
+    let err = compile_error(
+        indoc! {r#"
+        out = test_sink()
+        out << 2
+    "#},
+        &[],
+    );
+    assert!(
+        err.contains("no test sink is registered under `out`"),
+        "expected an unregistered-sink refusal, got: {err}"
+    );
+}
+
+/// A second declaration of one sink would leave the first's writes with no reader.
+#[test]
+fn a_sink_declared_twice_is_rejected() {
+    let err = compile_error(
+        indoc! {r#"
+            out = test_sink()
+            out << 1
+            out = test_sink()
+            out << 2
+        "#},
+        &["out"],
+    );
+    assert!(
+        err.contains("`out` is already declared as a sink"),
+        "expected a duplicate-sink refusal, got: {err}"
+    );
+}
+
+/// A sink written only under a condition that does not hold observes the empty channel.
+#[test]
+fn a_sink_fed_only_under_a_false_condition_is_empty() {
+    let v = observe_one(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2, 3]:
+            if x > 5:
+                out << x
     "#});
-    assert!(!err.is_empty(), "expected a compile error");
+    assert_eq!(format!("{}", v.expect("a value")), "Function [  ]");
 }
 
 /// Declaring a sink and never writing to it is rejected by channelization, which should
-/// instead observe the empty channel it is. Pinned at the error it reaches; a program that
-/// writes to a sink only under some condition hits the same defect.
+/// instead observe the empty channel it is. Pinned at the error it reaches.
 #[test]
 fn a_sink_that_is_never_fed_is_rejected_which_is_a_defect() {
-    let err = compile_error(indoc! {r#"
+    let err = compile_error(
+        indoc! {r#"
         out = test_sink()
         other = test_sink()
         other << 1
-    "#});
+    "#},
+        &["out", "other"],
+    );
     assert!(
         err.contains("NoFeedOrDefine"),
         "expected channelization to reject the unfed sink, got: {err}"
@@ -300,10 +374,21 @@ fn a_collection_keyed_by_strings() {
         out = test_sink()
         out << [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
     "#});
-    let rendered = format!("{}", v.expect("a value"));
-    assert!(
-        rendered.contains("\"east\" -> 4") && rendered.contains("\"west\" -> 2"),
-        "expected both group totals, got: {rendered}"
+    let Value::Function(bindings) = v.expect("a value") else {
+        panic!("a collection");
+    };
+    // Compared as a set of bindings: the group order is not part of the value.
+    let mut groups: Vec<(String, String)> = bindings
+        .iter()
+        .map(|b| (b.input.to_string(), b.output.to_string()))
+        .collect();
+    groups.sort();
+    assert_eq!(
+        groups,
+        vec![
+            ("\"east\"".to_string(), "4".to_string()),
+            ("\"west\"".to_string(), "2".to_string()),
+        ]
     );
 }
 
@@ -349,12 +434,15 @@ fn a_sink_accumulates_across_two_deliveries() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(2))]);
     src.borrow_mut().set_yield_predicate(Predicate::True);
+    let mut completed = false;
     for _ in 0..200 {
         ctx.scheduler().check_for_notifications();
         if program.done.try_recv().is_ok() {
+            completed = true;
             break;
         }
     }
+    assert!(completed, "the program did not complete within 200 pulls");
 
     assert_eq!(
         format!("{}", sink.value().expect("a value")),
