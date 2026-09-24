@@ -5,6 +5,7 @@
 use crate::ccl::ccl_utils::{TermMemo, strip_refinements};
 use crate::ccl::infer::solver::{
     ConstrainCache, Derivation, PolyScheme, constrain_subtype, fresh_var, prim,
+    traits::{product_components, product_fields},
 };
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::infer_var::{Telescope, TelescopeWalk};
@@ -12,8 +13,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Expr, Level, Name, Refinement, RefinementSet, Type, TypedBinding, TypedExpr,
-    TypedExprNode,
+    BaseType, Expr, FieldKey, Level, Name, Refinement, RefinementSet, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
 };
 
 use super::emit::{
@@ -187,6 +188,74 @@ impl Typing for CheckCtx {
         // across the suite: it never fires.
         let bases: Option<Vec<&BaseType>> = operand_types.iter().map(|t| offered_base(t)).collect();
         let Some(bases) = bases else {
+            // **A product is determined, so it is not residue.** A structural trait is
+            // answered componentwise, so the operands' components pair and each pair has to
+            // answer the trait in turn. Checked here rather than excused: this rule is what
+            // catches a later pass rewriting the tree into something ill-typed, and a
+            // product is the shape inference answers structurally rather than through the
+            // candidate set (`traits::narrow_product`), so nothing else downstream would.
+            if trait_.is_structural()
+                && operand_types
+                    .iter()
+                    .all(|t| matches!(strip_refinements(t), Type::Tuple(_) | Type::Record(_)))
+            {
+                let shapes: Vec<Vec<FieldKey>> = operand_types
+                    .iter()
+                    .map(|t| product_fields(&strip_refinements(t)))
+                    .collect();
+                let components: Vec<Vec<Type>> = operand_types
+                    .iter()
+                    .map(|t| product_components(&strip_refinements(t)))
+                    .collect();
+                // The narrowest operand is the product the comparison reads: products are
+                // width-subtyped, so an operand wider than the position's type carries
+                // fields that are not part of the value there, and `compare_records` reads
+                // the same intersection at run time. Two shapes that are not nested pair
+                // nothing — a tuple and a record share no field at all — so without this
+                // the loop below would run zero times and answer `Ok` for a comparison
+                // inference refuses (`traits::narrow_product`). Inference settles one shape
+                // here; the shapes differ only after inlining drops a narrowing annotation
+                // (the vault issue `type-checker-inlining-drops-a-narrowing-annotation`).
+                let narrowest = shapes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, s)| s.len())
+                    .map(|(i, _)| i)
+                    .expect("a trait has at least one operand");
+                if let Some(position) = shapes
+                    .iter()
+                    .position(|s| !shapes[narrowest].iter().all(|f| s.contains(f)))
+                {
+                    let located = self.raise(InferError::NoTraitInstance {
+                        trait_: trait_.to_string(),
+                        position: position as u8,
+                        found: Box::new((*operand_types[position]).clone()),
+                        accepted: vec![(*operand_types[narrowest]).clone()],
+                        at: at(),
+                    });
+                    self.errors.push(located);
+                    return Ok(assoc.map(|_| fresh_var(self.level)));
+                }
+                for field in &shapes[narrowest] {
+                    let at_field: Vec<&Type> = shapes
+                        .iter()
+                        .zip(&components)
+                        .map(|(s, c)| {
+                            let at = s.iter().position(|g| g == field).expect("nested shapes");
+                            &c[at]
+                        })
+                        .collect();
+                    self.require_trait(
+                        trait_,
+                        operator_node_id,
+                        &at_field,
+                        operand_exprs,
+                        None,
+                        at,
+                    )?;
+                }
+                return Ok(assoc.map(|_| self.fresh()));
+            }
             // Pre-channelize residue (a `Feed` handle, an un-eliminated `Mut`, a
             // still-`Infer` position under `Strictness::PreChannelize`) is not something
             // this rule can judge — the strictness wall decides whether a residual

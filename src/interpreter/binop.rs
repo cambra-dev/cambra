@@ -1,5 +1,6 @@
 //! BinOp operator: binary arithmetic operations on dataflow values.
 
+use std::collections::HashMap;
 use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 
 use bit_vec::BitVec;
@@ -192,8 +193,70 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
         (BinOpKind::Compare(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
             ColumnValue::Bools(zip_bool_compare(op, l, r))
         }
+        // A product compares **componentwise**, which is the whole of what makes one
+        // equatable (`src/ccl/design/type-inference.md`, "What the tables hold").
+        (
+            BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),
+            ColumnValue::Records(l),
+            ColumnValue::Records(r),
+        ) => ColumnValue::Bools(compare_records(op, l, r)),
         (op, left, right) => panic!("Unsupported binop: {:?} on {:?}, {:?}", op, left, right),
     }
+}
+
+/// Compare two record columns field by field, `Equals` conjoining the results and
+/// `NotEquals` disjoining them.
+///
+/// **The fields both columns carry are the product the type names.** Typing rejects a
+/// comparison between two different products, so the two field sets differ only where
+/// width subtyping let a wider value reach a narrower position and the tiling kept the
+/// surplus column. A column the position's type does not name is not part of the value
+/// there, and the intersection reads the value at its type whichever operand carries it.
+///
+/// The length is the shortest column the intersection reads, a column still filling being
+/// one whose later positions have not been decided. A surplus column is excluded from that
+/// minimum for the same reason it is excluded from the answer: its extent belongs to the
+/// wider value, and a short one would truncate a result the named fields already decided.
+///
+/// A value carrying exactly the fields its type names would retire the intersection. What
+/// keeps the surplus is inlining dropping the parameter's annotation — see the vault issue
+/// `type-checker-inlining-drops-a-narrowing-annotation`.
+fn compare_records(
+    op: CompareKind,
+    left: HashMap<String, ColumnValue>,
+    right: &HashMap<String, ColumnValue>,
+) -> BitVec {
+    let rows = left
+        .iter()
+        .filter(|(field, _)| right.contains_key(*field))
+        .flat_map(|(field, l)| [l.len(), right[field].len()])
+        .min()
+        .unwrap_or(0);
+    let mut acc = BitVec::from_elem(rows, op == CompareKind::Equals);
+    for (field, l) in left {
+        // A column only one side carries is the surplus of a wider value, not a field of
+        // the product being compared.
+        let Some(r) = right.get(&field) else {
+            continue;
+        };
+        let mut field_eq = match apply_binop_column(BinOpKind::Compare(op), l, r) {
+            ColumnValue::Bools(b) => b,
+            other => unreachable!("a comparison yields a Bool column, got {other:?}"),
+        };
+        // A nested product reports the length of one of its own fields, so a recursive
+        // comparison can answer for fewer positions than `rows`. Both sides shrink to what
+        // arrived: `and`/`or` require equal lengths, and padding would invent positions.
+        if field_eq.len() < acc.len() {
+            acc.truncate(field_eq.len());
+        }
+        field_eq.truncate(acc.len());
+        match op {
+            CompareKind::Equals => acc.and(&field_eq),
+            CompareKind::NotEquals => acc.or(&field_eq),
+            _ => unreachable!("guarded by the caller's match"),
+        };
+    }
+    acc
 }
 
 #[cfg(test)]

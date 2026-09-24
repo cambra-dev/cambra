@@ -16,7 +16,7 @@ use cambra::interpreter::{
     BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value,
     sort_sealed_function_by_domain,
 };
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -851,6 +851,158 @@ fn test_grouping_built_once(#[case] code: &str) {
 )]
 fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// A **product** keys a collection end to end: built, grouped, and looked up by a tuple or
+/// a record.
+///
+/// One key value either way. A product key is spread over a column per field where it is
+/// computed and held as one `Records` column where it is a collection's domain, so the
+/// lookup pivots the first into the second and searches with a single value.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map_over_tuples(
+    indoc! {r#"
+        m = map([((1, 2), 10), ((3, 4), 20)])
+        sum([v for v in m])
+    "#},
+    Value::Int(30)
+)]
+#[case::map_over_records(
+    indoc! {r#"
+        m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
+        sum([v for v in m])
+    "#},
+    Value::Int(30)
+)]
+#[case::group_by_a_tuple(
+    indoc! {r#"
+        g = groupby([(1, 2), (1, 2), (3, 4)], \x -> x)
+        sum([sum([y.1 for y in grp]) for grp in g])
+    "#},
+    Value::Int(8)
+)]
+#[case::group_by_a_record(
+    indoc! {r#"
+        g = groupby([(a=1, b=2), (a=1, b=2), (a=3, b=4)], \x -> x)
+        sum([sum([y.b for y in grp]) for grp in g])
+    "#},
+    Value::Int(8)
+)]
+// A component every key shares, which is the ordinary shape of keyed data — every row
+// for one account, every order for one SKU. That component's type is its own singleton
+// rather than the join two distinct values would give, so these are the cases that read
+// a refinement at the invariant position (`src/ccl/design/type-inference.md`, "An
+// invariant position reads both sides however the walk reached it").
+#[case::map_over_tuples_sharing_a_component(
+    indoc! {r#"
+        m = map([((1, 2), 10), ((1, 4), 20)])
+        sum([v for v in m])
+    "#},
+    Value::Int(30)
+)]
+#[case::map_over_records_sharing_a_field(
+    indoc! {r#"
+        m = map([((a=1, b=2), 10), ((a=1, b=4), 20)])
+        sum([v for v in m])
+    "#},
+    Value::Int(30)
+)]
+#[case::one_entry_map_over_tuples(
+    indoc! {r#"
+        m = map([((1, 2), 10)])
+        sum([v for v in m])
+    "#},
+    Value::Int(10)
+)]
+fn a_product_keys_a_collection(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A tuple-keyed checked lookup, present and absent.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::present("(1, 2)", Value::Int(10))]
+#[case::absent("(9, 9)", Value::Int(0))]
+fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
+    let code = indoc! {r#"
+        m = map([((1, 2), 10), ((3, 4), 20)])
+        match m[KEY]?:
+            case `some(v):
+                v
+            case `none:
+                0
+    "#}
+    .replace("KEY", key);
+    check_scalar(&code, expected);
+}
+
+/// A column the comparison's type does not name does not reach the answer, whichever
+/// operand carries it.
+///
+/// Both operands are `{a: Int, b: Int}` at inference: typing rejects a comparison between
+/// two different products, and the annotation on `t` is what narrows the argument's type.
+/// Inlining then substitutes the argument for `t` and drops that annotation, so after it the
+/// operand's type is `{a: Int, b: Int, c: Int}` as well as its tiling, and the post-inference
+/// check admits the pair because the shapes nest (the vault issue
+/// `type-checker-inlining-drops-a-narrowing-annotation`). The wider argument's column `c` is
+/// therefore on the tile at the comparison, and `compare_records` reads the value at the
+/// narrower type by excluding it. Both operand orders are pinned because a one-sided field
+/// aborted the process in one order and answered `equal` in the other.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::wider_on_the_left("t == (a=1, b=2)")]
+#[case::wider_on_the_right("(a=1, b=2) == t")]
+fn a_surplus_column_does_not_reach_the_comparison(#[case] comparison: &str) {
+    let code = formatdoc! {r#"
+        def f(t: {{a: Int, b: Int}}):
+            {comparison}
+
+        if f((a=1, b=2, c=9)):
+            1
+        else:
+            0
+    "#};
+    check_scalar(&code, Value::Int(1));
+}
+
+/// Equality on a product, which is what a keyed collection's group predicate compares and
+/// what a program can now write directly.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::tuple_equal("(1, 2) == (1, 2)", Value::Int(1))]
+#[case::tuple_unequal("(1, 2) == (1, 9)", Value::Int(0))]
+#[case::record_equal("(a=1, b=\"x\") == (a=1, b=\"x\")", Value::Int(1))]
+#[case::record_unequal("(a=1, b=\"x\") == (a=1, b=\"y\")", Value::Int(0))]
+#[case::nested("(1, (2, \"a\")) == (1, (2, \"a\"))", Value::Int(1))]
+#[case::not_equals("(1, 2) != (1, 9)", Value::Int(1))]
+fn products_compare_componentwise(#[case] comparison: &str, #[case] expected: Value) {
+    check_scalar(&format!("x = {comparison}\n1 if x else 0"), expected);
+}
+
+/// Two spellings of one record type, fields written in different orders, compare as one
+/// product.
+///
+/// A record literal's fields reach inference in one order however they are written, so the
+/// annotation is the spelling that carries its own. Inference answers both operands on one
+/// obligation and compares their shapes as field sets (`traits::product_shape`); read in
+/// declaration order, `{b: Int, a: Int}` and `{a: Int, b: Int}` are two shapes and the
+/// comparison is a type error.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::against_a_literal("(a=1, b=2)")]
+#[case::against_an_annotation("u")]
+fn record_types_in_two_field_orders_compare(#[case] right: &str) {
+    let code = formatdoc! {r#"
+        def f(t: {{b: Int, a: Int}}, u: {{a: Int, b: Int}}):
+            t == {right}
+
+        if f((a=1, b=2), (a=1, b=2)):
+            1
+        else:
+            0
+    "#};
+    check_scalar(&code, Value::Int(1));
 }
 
 /// A group-by's groups are themselves collections, so a checked lookup on one would carry
