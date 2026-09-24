@@ -1211,8 +1211,7 @@ fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     let mut pairs: Vec<(usize, Value)> = (0..keys.len())
         // A `Restrict` marks a row deleted rather than dropping it, so a restricted source
         // still carries its extent's keys. Reading them all makes the recurrence run at
-        // positions the source does not have — invisible wherever a later step compacts the
-        // tile first, which is every source whose writer reads the item.
+        // positions the source does not have.
         .filter(|i| !deleted.contains(*i))
         .filter_map(|i| match keys.index_at(i) {
             Value::UInt(pos) => Some((pos, source_value_at(codomain, i))),
@@ -6666,6 +6665,24 @@ mod tests {
             decode_source_positioned(&tile),
             vec![(0, int(10)), (1, int(20)), (2, int(30))],
             "items must be paired with their domain position and sorted ascending"
+        );
+    }
+
+    #[test]
+    fn decode_source_positioned_skips_deleted_rows() {
+        // A `Restrict` marks a row deleted and keeps its key, so the decode is what drops
+        // it: the recurrence runs over the positions the source still has.
+        let mut deleted = bit_set::BitSet::new();
+        deleted.insert(1);
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10, 20, 30]))),
+            Predicate::True,
+            deleted,
+        );
+        assert_eq!(
+            decode_source_positioned(&tile),
+            vec![(0, int(10)), (2, int(30))],
         );
     }
 

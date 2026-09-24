@@ -531,7 +531,7 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
-/// The transactional half: a `with begin():` block whose write reads nothing, over a source
+/// A `with begin():` block whose write reads nothing, over a source
 /// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
 #[test]
 fn a_constant_transactional_write_over_an_empty_filtered_source() {
