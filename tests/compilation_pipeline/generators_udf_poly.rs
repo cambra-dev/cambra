@@ -7,6 +7,7 @@ use std::time::Duration;
 use bit_set::BitSet;
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -230,7 +231,11 @@ fn test_poly_calls_poly_at_two_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_list_body() {
-    let code = "f = \\x -> [x for z in [1, 2]]\ng = \\y -> f(y)\nsum(g(5))";
+    let code = indoc! {r"
+        f = \x -> [x for z in [1, 2]]
+        g = \y -> f(y)
+        sum(g(5))
+    "};
     check_scalar(code, Value::Int(10));
 }
 
@@ -367,10 +372,18 @@ fn test_poly_chain_with_extra_param() {
 fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let result = compile_program(&mut ctx, "f = \\x -> [x, x]\nf", consumer);
+    let code = indoc! {r"
+        f = \x -> [x for z in [1, 2]]
+        f
+    "};
+    let result = compile_program(&mut ctx, code, consumer);
+    let Err(errs) = result else {
+        panic!("ambiguous (never-exercised) generic must fail with a diagnostic");
+    };
+    let rendered = format!("{errs:?}");
     assert!(
-        result.is_err(),
-        "ambiguous (never-exercised) generic must fail with a diagnostic"
+        rendered.starts_with("[Infer") && rendered.contains("Unresolved inference variable"),
+        "expected the residual-inference-variable wall, got: {rendered}"
     );
 }
 
