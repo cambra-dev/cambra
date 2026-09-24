@@ -530,8 +530,65 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
-/// A `with begin():` block whose write reads nothing, over a source filtered to nothing. No
-/// block runs, so no commit lands and the terminal read is the seed.
+/// A loop whose body overwrites an accumulator with a value that reads neither the
+/// accumulator nor the loop item. The decision is a constant, so the snapshot scaffold and
+/// the source term are both gone by recognition and the writer's extent is all that is left
+/// of its source.
+#[test]
+fn a_loop_overwriting_an_accumulator_with_a_constant() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [1, 2]:
+            acc := 7
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// Two accumulators, both written constantly, so neither writer reads a snapshot.
+#[test]
+fn two_accumulators_both_written_with_constants() {
+    agree(indoc! {r#"
+        a := 1
+        b := 10
+        for i in [1, 2]:
+            a := 7
+            b := 9
+        out = test_sink()
+        out << a + b
+    "#});
+}
+
+/// The same overwrite over a source filtered to **nothing**. The writer's extent is then a
+/// declared superset of the positions the source has, and only the source operator knows the
+/// difference — so the accumulator keeps its seed rather than taking the write.
+#[test]
+fn a_constant_overwrite_over_an_empty_filtered_source() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [z for z in [1, 2] if z > 9]:
+            acc := 7
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// Filtered to one survivor out of three: the loop body runs once, at the surviving
+/// position, and the sink is keyed by it. A writer reading every declared position would
+/// feed three.
+#[test]
+fn a_constant_overwrite_over_a_filtered_source_runs_once_per_survivor() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        for i in [z for z in [1, 2, 3] if z > 2]:
+            acc := 7
+            out << acc
+    "#});
+}
+
+/// The transactional half: a `with begin():` block whose write reads nothing, over a source
+/// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
 #[test]
 fn a_constant_transactional_write_over_an_empty_filtered_source() {
     agree(indoc! {r#"
