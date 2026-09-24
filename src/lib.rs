@@ -1,8 +1,8 @@
 #![warn(unused_qualifications)]
 
 pub mod ccl;
-// The parser is its own crate; re-exported here so `cambra::chl_parser` and
-// `crate::chl_parser` keep naming it.
+// The parser is its own crate; re-exported so `cambra::chl_parser` and
+// `crate::chl_parser` name it.
 pub use chl_parser;
 pub mod control_port;
 pub mod inspector_model;

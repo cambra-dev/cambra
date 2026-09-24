@@ -5,6 +5,10 @@
 //! keys carry information (a filter keeps the positions its survivors had, a group-by is
 //! keyed by the group key), so dropping them would make two different answers compare equal.
 //! Order, by contrast, carries nothing: [`PartialEq`] compares entries as a multiset.
+//!
+//! A commit time ([`Value::CommitTime`]) is the one key whose number carries nothing either:
+//! "8.5 Ordering and concurrency" orders commits without numbering them, so two collections
+//! keyed by commit times are compared by the order of those times, not by their values.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -15,8 +19,13 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Unit,
+    /// A commit time: the key a reply fed inside a `with begin():` block carries.
+    CommitTime(i64),
     Record(Vec<(String, Value)>),
-    Variant { tag: String, payload: Box<Value> },
+    Variant {
+        tag: String,
+        payload: Box<Value>,
+    },
     Collection(Collection),
 }
 
@@ -31,9 +40,27 @@ impl Collection {
         Self::default()
     }
 
-    /// Build from entries in any order. A repeated key is a caller error, not a merge.
+    /// Build from entries in any order.
+    ///
+    /// # Panics
+    ///
+    /// When two entries share a key: a collection is a function of its keys, and a caller
+    /// holding entries that may repeat one uses [`Self::try_from_entries`].
     pub fn from_entries(entries: Vec<(Value, Value)>) -> Self {
-        Self { entries }
+        match Self::try_from_entries(entries) {
+            Ok(c) => c,
+            Err(key) => panic!("two entries share the key {key}"),
+        }
+    }
+
+    /// Build from entries in any order, answering the first key two entries share.
+    pub fn try_from_entries(entries: Vec<(Value, Value)>) -> Result<Self, Value> {
+        let mut keys: Vec<&Value> = entries.iter().map(|(k, _)| k).collect();
+        keys.sort_by(|a, b| total_cmp(a, b));
+        if let Some(w) = keys.windows(2).find(|w| w[0] == w[1]) {
+            return Err(w[0].clone());
+        }
+        Ok(Self { entries })
     }
 
     /// The positional form: keys `0..n` in order, which is what a list literal denotes.
@@ -45,10 +72,6 @@ impl Collection {
                 .map(|(i, v)| (Value::Int(i as i64), v))
                 .collect(),
         }
-    }
-
-    pub fn push(&mut self, key: Value, value: Value) {
-        self.entries.push((key, value));
     }
 
     pub fn entries(&self) -> &[(Value, Value)] {
@@ -73,14 +96,84 @@ impl Collection {
 
 impl PartialEq for Collection {
     /// Multiset equality over `(key, value)` pairs: order is not part of the value, and the
-    /// key is.
+    /// key is, with each commit time replaced by its rank ([`Collection::ranked_commit_times`]).
     fn eq(&self, other: &Self) -> bool {
-        self.entries.len() == other.entries.len()
-            && self
-                .sorted()
+        let (a, b) = (self.ranked_commit_times(), other.ranked_commit_times());
+        a.entries.len() == b.entries.len()
+            && a.sorted()
                 .iter()
-                .zip(other.sorted())
-                .all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+                .zip(b.sorted())
+                .all(|(x, y)| x.0 == y.0 && x.1 == y.1)
+    }
+}
+
+impl Collection {
+    /// This collection with every commit time in a key replaced by its rank among the commit
+    /// times that share the rest of that key.
+    ///
+    /// Keys that differ outside their commit time, such as the site tags of a reply channel
+    /// fed from two blocks, rank their commit times separately, since only commits of one site are
+    /// ordered against each other.
+    fn ranked_commit_times(&self) -> Collection {
+        fn context(key: &Value) -> Option<Value> {
+            match key {
+                Value::CommitTime(_) => Some(Value::Unit),
+                Value::Variant { tag, payload } => context(payload).map(|c| Value::Variant {
+                    tag: tag.clone(),
+                    payload: Box::new(c),
+                }),
+                _ => None,
+            }
+        }
+        fn commit_time(key: &Value) -> Option<i64> {
+            match key {
+                Value::CommitTime(t) => Some(*t),
+                Value::Variant { payload, .. } => commit_time(payload),
+                _ => None,
+            }
+        }
+        fn replace(key: &Value, rank: i64) -> Value {
+            match key {
+                Value::CommitTime(_) => Value::CommitTime(rank),
+                Value::Variant { tag, payload } => Value::Variant {
+                    tag: tag.clone(),
+                    payload: Box::new(replace(payload, rank)),
+                },
+                other => other.clone(),
+            }
+        }
+        let mut by_context: Vec<(Value, Vec<i64>)> = Vec::new();
+        for (key, _) in &self.entries {
+            if let (Some(c), Some(t)) = (context(key), commit_time(key)) {
+                match by_context.iter_mut().find(|(k, _)| *k == c) {
+                    Some((_, times)) => times.push(t),
+                    None => by_context.push((c, vec![t])),
+                }
+            }
+        }
+        for (_, times) in &mut by_context {
+            times.sort_unstable();
+        }
+        let entries = self
+            .entries
+            .iter()
+            .map(|(key, value)| {
+                let key = match (context(key), commit_time(key)) {
+                    (Some(c), Some(t)) => {
+                        let times = &by_context
+                            .iter()
+                            .find(|(k, _)| *k == c)
+                            .expect("collected")
+                            .1;
+                        let rank = times.binary_search(&t).expect("collected") as i64;
+                        replace(key, rank)
+                    }
+                    _ => key.clone(),
+                };
+                (key, value.clone())
+            })
+            .collect();
+        Collection { entries }
     }
 }
 
@@ -91,6 +184,7 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
+            (Value::CommitTime(a), Value::CommitTime(b)) => a == b,
             // A record is its fields; the order they were written in is not part of it.
             (Value::Record(a), Value::Record(b)) => {
                 if a.len() != b.len() {
@@ -119,12 +213,14 @@ impl PartialEq for Value {
 
 /// A total order over values, used only to canonicalize for comparison and rendering.
 ///
-/// Values of different shapes never compare equal, so ordering them by shape first is
-/// enough; nothing reads the order itself.
+/// Two values that compare `Equal` here are equal under [`PartialEq`], which is what lets
+/// [`Collection`]'s equality zip two sorted entry lists. Values of different shapes never
+/// compare equal, so ordering them by shape first keeps that property.
 fn total_cmp(a: &Value, b: &Value) -> Ordering {
     fn rank(v: &Value) -> u8 {
         match v {
             Value::Unit => 0,
+            Value::CommitTime(_) => 7,
             Value::Bool(_) => 1,
             Value::Int(_) => 2,
             Value::Str(_) => 3,
@@ -138,7 +234,17 @@ fn total_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Str(x), Value::Str(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Unit, Value::Unit) => Ordering::Equal,
-        (Value::Variant { tag: x, .. }, Value::Variant { tag: y, .. }) => x.cmp(y),
+        (Value::CommitTime(x), Value::CommitTime(y)) => x.cmp(y),
+        (
+            Value::Variant {
+                tag: x,
+                payload: px,
+            },
+            Value::Variant {
+                tag: y,
+                payload: py,
+            },
+        ) => x.cmp(y).then_with(|| total_cmp(px, py)),
         // Records and collections order by rendering: a stable tie-break, never a claim
         // about their contents.
         (x, y) if rank(x) == rank(y) => x.to_string().cmp(&y.to_string()),
@@ -153,11 +259,12 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "{s:?}"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Unit => write!(f, "()"),
+            Value::CommitTime(t) => write!(f, "t{t}"),
             Value::Record(fields) => {
                 let mut sorted = fields.clone();
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
                 let body: Vec<String> = sorted.iter().map(|(n, v)| format!("{n}: {v}")).collect();
-                write!(f, "{{{}}}", body.join(", "))
+                write!(f, "({})", body.join(", "))
             }
             Value::Variant { tag, payload } => write!(f, "`{tag}({payload})"),
             Value::Collection(c) => {
@@ -180,5 +287,43 @@ impl fmt::Display for Value {
                 write!(f, "[{}]", body.join(", "))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(key: Value, v: i64) -> (Value, Value) {
+        (key, Value::Int(v))
+    }
+
+    fn site(tag: &str, t: i64) -> Value {
+        Value::Variant {
+            tag: tag.to_string(),
+            payload: Box::new(Value::CommitTime(t)),
+        }
+    }
+
+    /// Only the order of commit times is compared, per site.
+    #[test]
+    fn commit_times_compare_by_their_order_within_each_site() {
+        let a = Collection::from_entries(vec![
+            at(site("0", 1), 10),
+            at(site("0", 2), 30),
+            at(site("1", 1), 5),
+        ]);
+        let b = Collection::from_entries(vec![
+            at(site("0", 3), 10),
+            at(site("0", 7), 30),
+            at(site("1", 4), 5),
+        ]);
+        assert_eq!(a, b);
+        let swapped = Collection::from_entries(vec![
+            at(site("0", 3), 30),
+            at(site("0", 7), 10),
+            at(site("1", 4), 5),
+        ]);
+        assert_ne!(a, swapped);
     }
 }

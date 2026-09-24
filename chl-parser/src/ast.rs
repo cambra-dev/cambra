@@ -1,8 +1,7 @@
 //! CHL surface AST.
 //!
-//! Produced by [`super::parser`] and consumed (in a later phase) by
-//! `cambra::ccl::lower`. Until the lowering migration lands, this AST is only
-//! used by the parser's own tests.
+//! Produced by [`super::parser`] and consumed by `cambra::ccl::lower` and by the
+//! reference interpreter, `chl-interp`.
 //!
 //! # Design choices vs. `rustpython_ast`
 //!
