@@ -1,0 +1,17 @@
+[package]
+name = "chl-parser"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Parser for the Cambra High-level Language (CHL): lexer, grammar, AST, and error recovery"
+repository = "https://github.com/cambra-dev/cambra"
+
+[dependencies]
+ariadne = "0.4"
+chumsky = "1.0.0-alpha.8"
+logos = "0.14"
+serde = { version = "1", features = ["derive"] }
+smol_str = "0.3.6"
+
+[dev-dependencies]
+indoc = "1.0"

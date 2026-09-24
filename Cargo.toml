@@ -9,6 +9,7 @@
 # unification `ci_clippy_lib` relies on arrived in 2 and is unchanged in 3, so
 # that gate is not what this setting decides.
 resolver = "3"
+members = ["chl-parser"]
 
 [package]
 name = "cambra"
@@ -37,7 +38,9 @@ rstest-log = "0.2.0"
 test-log = "0.2.19"
 
 [dependencies]
-# CHL parser stack. See src/chl_parser/design-chl-parser.md.
+# CHL parser, its own crate so a consumer can depend on the front end alone.
+# See chl-parser/design-chl-parser.md.
+chl-parser = { path = "chl-parser" }
 chumsky = "1.0.0-alpha.8"
 logos = "0.14"
 ariadne = "0.4"

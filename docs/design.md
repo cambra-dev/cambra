@@ -145,7 +145,7 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ```
 CHL source
-  → parse            (chl_parser, see src/chl_parser/design-chl-parser.md)
+  → parse            (chl_parser, see chl-parser/design-chl-parser.md)
   → lower            (ccl/lower/: CHL AST → CCL Expr)
   → uniquify         (ccl/uniquify.rs: α-uniquify binders — Barendregt convention, base+uid Names)
   → infer            (ccl/infer/: type inference; delegates to ccl/infer/solver/, the constraint solver;
@@ -181,7 +181,7 @@ CHL source
   → tile producer/consumer dataflow
 ```
 
-Why the pass order is what it is: parsing recovers from errors (partial ASTs with placeholder nodes, multiple diagnostics per file — see [src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md)); uniquify establishes the Barendregt convention so every later pass can substitute without capture; inference runs early, on the user-shaped tree, so type errors report against the program as written and every later pass transforms fully-typed trees. The three-pass middle — `transact_phase`, `mut_elim`, `channelize` — is **mutability elimination**: transactions, mutation loops, and feeds each become pure, causally-guarded `letrec` groups, so everything downstream sees only the pure value language. Lambda elimination then rewrites the program into point-free combinators because **operators are point-free** — an operator graph has no binders, so lambdas must be compiled away, not closed over; loop planning lowers the letrec groups onto runtime carriers on that same point-free form; and planning is where comprehension shapes become joins and keyed aggregates. Each pass's own design doc is indexed in [src/ccl/design/README.md](../src/ccl/design/README.md) and [src/design.md](../src/design.md).
+Why the pass order is what it is: parsing recovers from errors (partial ASTs with placeholder nodes, multiple diagnostics per file — see [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)); uniquify establishes the Barendregt convention so every later pass can substitute without capture; inference runs early, on the user-shaped tree, so type errors report against the program as written and every later pass transforms fully-typed trees. The three-pass middle — `transact_phase`, `mut_elim`, `channelize` — is **mutability elimination**: transactions, mutation loops, and feeds each become pure, causally-guarded `letrec` groups, so everything downstream sees only the pure value language. Lambda elimination then rewrites the program into point-free combinators because **operators are point-free** — an operator graph has no binders, so lambdas must be compiled away, not closed over; loop planning lowers the letrec groups onto runtime carriers on that same point-free form; and planning is where comprehension shapes become joins and keyed aggregates. Each pass's own design doc is indexed in [src/ccl/design/README.md](../src/ccl/design/README.md) and [src/design.md](../src/design.md).
 
 ## The execution model
 
