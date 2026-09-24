@@ -98,6 +98,7 @@ use crate::{
 };
 
 mod comprehension;
+mod constant_lists;
 mod exprs;
 mod functions;
 mod http;
@@ -1195,7 +1196,7 @@ fn lower_expr_inner(
 /// `channelize` removes all `Feed` nodes and then collapses the `ExprStmt` to
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
-    let mut errors: Vec<LoweringError> = Vec::new();
+    let mut errors: Vec<LoweringError> = constant_lists::check_constant_list_elements(stmts);
     let value = lower_stmts_recovering(stmts, ctx, &mut errors);
     LoweringResult { value, errors }
 }

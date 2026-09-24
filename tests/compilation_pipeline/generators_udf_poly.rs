@@ -230,7 +230,7 @@ fn test_poly_calls_poly_at_two_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_list_body() {
-    let code = "f = \\x -> [x, x]\ng = \\y -> f(y)\nsum(g(5))";
+    let code = "f = \\x -> [x for z in [1, 2]]\ng = \\y -> f(y)\nsum(g(5))";
     check_scalar(code, Value::Int(10));
 }
 
