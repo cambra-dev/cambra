@@ -1,0 +1,16 @@
+[package]
+name = "chl-interp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A reference interpreter for CHL, used as a differential oracle against the compiler"
+repository = "https://github.com/cambra-dev/cambra"
+
+# Only the parser. The point of this crate is to state what a CHL program means
+# without consulting the compiler that is under test, so `cambra` is deliberately
+# absent and Cargo is what holds it out.
+[dependencies]
+chl-parser = { path = "../chl-parser" }
+
+[dev-dependencies]
+indoc = "1.0"
