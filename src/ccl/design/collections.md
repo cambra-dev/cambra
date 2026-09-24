@@ -94,9 +94,10 @@ a value carrying no information — there is no uninhabited type
 require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)).
 
 Emptiness is the premise the pin rests on, not a stand-in for "no value reached the element type".
-A non-empty literal whose elements are themselves undetermined — `\x -> [x, x]`, never called —
-has a value-free element type too, and there the variable is a type parameter the program left
-ambiguous; pinning it would accept a program that has no type.
+A non-empty collection whose elements are themselves undetermined, such as
+`\x -> [x for z in [1, 2]]` never called, has a value-free element type too, and there the
+variable is a type parameter the program left ambiguous; pinning it would accept a program that
+has no type.
 
 ### The empty collection has no key morphism [Interim]
 

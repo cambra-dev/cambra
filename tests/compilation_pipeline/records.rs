@@ -524,11 +524,10 @@ fn a_per_element_record_holding_a_list_literal_is_not_yet_planned() {
     run_pipeline("xs = [1, 2]; ys = [(a=l, b=[1, 2]) for l in xs]; ys");
 }
 
-/// A record built per element whose collection component reads the element fails the
-/// type check after `lambda_elim`, on the lowered component `[id, id]`. Pinned for the
-/// reason [`a_per_element_record_holding_a_list_literal_is_not_yet_planned`] gives.
+/// A record built per element whose collection component reads the element is refused at
+/// lowering: a list literal's elements may not vary with the enclosing binder.
 #[test]
-#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
-fn a_per_element_record_holding_a_computed_list_fails_the_post_lambda_elim_check() {
+#[should_panic(expected = "a list element must be a constant, but this one varies with `x`")]
+fn a_per_element_record_holding_a_computed_list_is_refused() {
     run_pipeline("xs = [1, 2]; ys = [(a=x, b=[x, x]) for x in xs]; ys");
 }
