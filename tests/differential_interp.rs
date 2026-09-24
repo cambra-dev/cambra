@@ -532,8 +532,8 @@ fn a_terminal_read_of_a_transactional_store() {
 }
 
 /// A terminal read inside a conditional's test. The test compiles to a refinement predicate
-/// on the branch domain, so the read sits in a type slot rather than in the term — the
-/// position `rewrite_txn_reads` walks.
+/// on the branch domain, so the read sits in a type slot rather than in the term, which is
+/// the only position `rewrite_txn_reads` walks.
 #[test]
 fn a_terminal_read_in_a_conditional_test() {
     agree(indoc! {r#"
@@ -547,7 +547,7 @@ fn a_terminal_read_in_a_conditional_test() {
 }
 
 /// The same read against a threshold the final value does not clear, so the two sides agree
-/// on the branch *not* taken. Without it a predicate the compiler dropped would still agree.
+/// on the other branch. Without it a predicate the compiler dropped would still agree.
 #[test]
 fn a_terminal_read_in_a_conditional_test_that_fails() {
     agree(indoc! {r#"
