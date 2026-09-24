@@ -548,13 +548,12 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     let hist = Name::fresh("__hist");
     let mut body = body;
     rewrite_txn_reads(&mut body, &hist, &hist_ty, &read_map);
-    // A reference inside a refinement predicate is a reference. The wall below counts with
-    // `count_free`, which walks every type slot; the term walk above walks none, so a
-    // predicate holding a transactional read reads as a dangling binding. A predicate holds
-    // one whenever such a read reaches a position whose domain the read refines — a terminal
-    // read in a conditional's test is one. Rebuilding a predicate mints node ids, so the
-    // rebuilding walk runs only once the term walk has left something behind.
-    if binding_names.iter().any(|n| count_free(n, &body) > 0) {
+    // A reference inside a refinement predicate is a reference. The assertion below counts
+    // with `count_free`, which walks every type slot, and the term walk above walks none. A
+    // conditional's test refines the branch domain, so a transactional read in the test
+    // lands in that refinement's predicate. Rebuilding a predicate mints node ids, so the
+    // predicate walk runs only when the term walk has left a read behind.
+    if read_map.keys().any(|n| count_free(n, &body) > 0) {
         let memo = PredMemo::new();
         rewrite_txn_reads_in_predicates(&mut body, &hist, &hist_ty, &read_map, &memo);
     }
@@ -598,8 +597,10 @@ fn rewrite_txn_reads(
     e.walk_children_mut(|c| rewrite_txn_reads(c, hist, hist_ty, read_map));
 }
 
-/// Rewrite every history / tap binding reference sitting in a **refinement predicate**
-/// reachable from the continuation's type slots, which [`rewrite_txn_reads`] does not reach.
+/// Rewrite every history / tap binding reference sitting in a refinement predicate
+/// reachable from the continuation's type slots, which [`rewrite_txn_reads`] does not reach,
+/// and collapse the snapshot sources the rewrite leaves in it, as
+/// [`collapse_snapshot_sources`] does for the term.
 ///
 /// Recurses into each rebuilt predicate's own type slots: a predicate is an `Expr` and
 /// carries types like any other.
@@ -615,6 +616,7 @@ fn rewrite_txn_reads_in_predicates(
             let held = read_map.keys().any(|n| count_free(n, pred) > 0);
             if held {
                 rewrite_txn_reads(pred, hist, hist_ty, read_map);
+                collapse_snapshot_sources(pred, hist, hist_ty);
                 rewrite_txn_reads_in_predicates(pred, hist, hist_ty, read_map, memo);
             }
             held
