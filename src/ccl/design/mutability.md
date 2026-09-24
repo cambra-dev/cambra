@@ -107,10 +107,11 @@ kinds of variable:
 
 Feeds — the **append-only** form of mutability — are realized as the letrec's **outputs**: the
 body of the letrec is a record of channels (one field per defer/sink), each a function over its
-contributing loop's domain, free to reference the letrec's bindings. (They are outputs by
-*realization*, not by nature: `<<` is impure surface mutation like `:=`, discharged into a pure
-history by the same eliminator — it is only the *append* merge law, with no carry-forward, that
-lets a feed be a plain output rather than a cyclic binding.)
+contributing loop's domain, or over `Txn` for a feed inside a `with begin():` block, free to
+reference the letrec's bindings. (They are outputs by *realization*, not by nature: `<<` is impure
+surface mutation like `:=`, discharged into a pure history by the same eliminator — it is only the
+*append* merge law, with no carry-forward, that lets a feed be a plain output rather than a cyclic
+binding.)
 
 ### A mutable variable read is an explicit operation
 
@@ -465,7 +466,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries; an iteration that denied has no commit and no key. Heads each in-block reply tap, so a reply's keys have type `Txn` |
+| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too; the tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Over a `Txn` history it is only ever the surface [`await_final`](#await_final)'s read — a fed-out read is an `as_of_read`, a different term |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_or_default` over the mutable variable's history binding. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
@@ -672,10 +673,10 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    `get_prev_seq` / read-your-writes shadows); per `with begin():` site, a commit-record binding
    over the site's loop domain; per `Txn` variable, the history
    `λ 𝑡 → get_prev_txn(view, 𝑡, init)` over the (merged, per-key-viewed) commit streams.
-4. **Routes feeds**: each channel becomes a letrec-body output — a function over its contributing
-   loop's domain, unioned (`++`) across sites. A feed inside a `with begin():` block reads its
-   value off the commit record (a per-commit tap), keyed by commit time through
-   `by_commit_time`, so its domain is `Txn` rather than the loop's.
+4. **Routes feeds**: each channel becomes a letrec-body output, unioned (`++`) across sites. A
+   feed outside a `with begin():` block is a function over its contributing loop's domain. A feed
+   inside one reads its value off the commit record (a per-commit tap), keyed by commit time
+   through `by_commit_time`, so its domain is `Txn`.
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator
@@ -1032,6 +1033,23 @@ nothing. The tap may read an induction accumulator (`resp << cnt`), which compos
 commit-decision co-iteration above. Contrast a sibling reply *outside* the block (`resp << cnt`),
 which rides the induction domain and fires every iteration regardless of commit — value-correct,
 request-indexed, but not commit-ordered. To gate or commit-order a reply, put it in the block.
+
+### A reply's `Txn` domain overstates its keys [Interim]
+
+A commit-gated reply is typed `Txn ⤇ 𝑉`, but it holds a value only at the commits where its own
+site fired the tap: another site's commit, a denied iteration and an idle tap leave no key. The type
+names the clock the keys are drawn from rather than the keys present. `Txn` has no static extent, so
+a reader iterates the tile's keys rather than the domain. The one place the domain decides anything
+is op-conversion's choice of a commit store for a `Txn` domain, and `recognize_group` asserts that
+no induction recurrence reaches it with one. Two further gaps follow from the same typing:
+
+- Every store's clock is `Txn`, so the type does not keep apart two stores' commit times, which are
+  separate sequences.
+- A channel fed from two sites is `Txn | Txn`, whose positional arm records which site replied,
+  although one store's commit times never collide.
+
+Typing a reply at its image, `{Txn | __elem ▷ ((commits_j ≫ .time) ▷ collection_contains)}`, makes
+its domain its key set; a clock indexed by its store closes both gaps above.
 
 ## `await_final`
 

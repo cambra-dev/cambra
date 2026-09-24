@@ -630,17 +630,19 @@ channel's concrete domain, each `Feed` history to its bare `Fun` — possible on
 inference typed every consumer against the rigid name instead of leaving an `Infer`.
 
 **Example B**'s tail after it. The two taps become one channel, and `out`'s domain is the
-**union** of the two sites' commit times — one reply channel fed from two writers. Each tap
-is keyed by its commit time (`by_commit_time` over the site's commit records),
-not by the iteration that produced it, since a denied iteration commits nothing:
+**union** of the two sites' commit times — one reply channel fed from two writers. Each tap is
+keyed by its commit time (`by_commit_time` over the site's commit records), not by the iteration
+that produced it, since a denied iteration commits nothing:
 
 ```
 in letrec out : (Txn | Txn ⤇ Int) = to_out_0 ⊎ to_out_1
 in pool ▷ final_read
 ```
 
-That `|` is a `Union` domain — an anonymous positional sum, not a tagged variant — because a
-reader of `out` has no use for which site produced an element.
+That `|` is a `Union` domain — an anonymous positional sum, not a tagged variant. Its arm still
+records which site replied; [A reply's `Txn` domain overstates its keys
+[Interim]](../src/ccl/design/mutability.md#a-replys-txn-domain-overstates-its-keys-interim)
+records why that is more than one store's clock needs.
 
 ### `rewrite_as_of_reads`, then `plan_loops` and the rest of planning
 
@@ -678,7 +680,7 @@ in x
 variable's history:
 
 ```
-let __hist : {pool#6: (Txn ⤇ Int), to_out_0: (Txn ⤇ Int), to_out_1: (Txn ⤇ Int)} =
+let __hist : {pool#6: (Txn ⤇ Int), __to_out_0: (Txn ⤇ Int), __to_out_1: (Txn ⤇ Int)} =
   transact (pool = 100) { [pool]⇒[pool] over iterate ≫ [10, 20, 30] do <decision>;
                           [pool]⇒[pool] over iterate ≫ [unit]         do <decision> }
 in let out : (Txn | Txn ⤇ Int) = __hist.__to_out_0 ⊎ __hist.__to_out_1
