@@ -2331,8 +2331,8 @@ fn extract_for_defer_impl(
             while let Type::Refinement(inner, _) = vty {
                 vty = inner;
             }
-            let is_function = matches!(vty, Type::Fun { .. });
-            let lifted = if in_inner_scope || is_function {
+            let has_domain = matches!(vty, Type::Fun { .. });
+            let lifted = if in_inner_scope || has_domain {
                 value
             } else {
                 // The channel is a collection — inference says so on the handle, and every

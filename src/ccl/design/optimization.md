@@ -340,8 +340,8 @@ There are two compilation passes that translate CCL into tile-dataflow operators
 | CCL form | Operator |
 |---|---|
 | `Compose([f, g, …])` | sequential pipeline: output of each feeds next |
-| `zip(f, g)` | `FanIn` over a shared `FanOut`-wrapped domain (via the `fan_in` factory) |
-| `zip({k: f, …})` | `fan_in_named` — record-of-morphisms fused via `FanIn::new_named` or `ScalarFanIn::new_named` |
+| `zip(f, g)` | `Zip` over a shared `FanOut`-wrapped domain (via the `zip_arms` factory) |
+| `zip({k: f, …})` | `zip_arms_named` — record-of-morphisms fused via `Zip::new_named` or `MakeRecord::new_named` |
 | `id` | identity (pass-through) |
 | `const(c)` | `MapResultToConst` |
 | `map(g)` | pass-through: compiles `g` with the upstream threaded in as input (emits no operator of its own) |
@@ -351,7 +351,7 @@ There are two compilation passes that translate CCL into tile-dataflow operators
 | `iterate(p)` | chain-head iteration source: `IterateExtent` (when `p` is `true ▷ const`) or `IterateExtent ≫ Restrict` (otherwise) |
 | `restrict(p)` | mid-chain filter: `Restrict` over the upstream input |
 | `Lit` | `Constant` scalar |
-| `Tuple([…])` | `ScalarFanIn` |
+| `Tuple([…])` | `MakeRecord` |
 | `List([…])` | `MapResult` over index stream |
 | `Source(name)` | data-source operator |
 | `Let { binding, … }` | `Memo`-wrapped `FanOut` bound in scope |

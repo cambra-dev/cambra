@@ -86,6 +86,19 @@ pub struct NotifyOrSubscribeResult {
 }
 
 impl Extent {
+    /// Whether a collection sits anywhere inside this extent.
+    ///
+    /// The question a producer asks before putting a value of this extent in a column: a
+    /// column holds one value per row, so a collection inside one is materialized into a
+    /// cell rather than carried as a level.
+    pub fn holds_a_collection(&self) -> bool {
+        match self {
+            Extent::Function { .. } => true,
+            Extent::Record(fields) => fields.values().any(Extent::holds_a_collection),
+            _ => false,
+        }
+    }
+
     /// When subscribing to this extent as an iteration, returns whether to immediately
     /// notify true and whether to add the iterating variable to the scheduler.
     pub fn subscribe_to_iteration_action(&self) -> NotifyOrSubscribeResult {

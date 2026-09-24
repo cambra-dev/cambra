@@ -15,11 +15,12 @@ pub enum TileGuard {
     Aggregation(bool),
     /// The union of multiple guards — matches anything admitted by any arm.
     ///
-    /// Produced when two [`TileGuard::Record`] guards are unioned: because
-    /// `Record` has AND semantics (a record matches iff *all* fields match),
-    /// OR cannot be pushed down through the conjunction field-by-field.  All
-    /// other guard variants can represent their own union directly, so `Or`
-    /// only appears at the `Record` level.
+    /// Built where no single variant holds the union. A collection of collections is
+    /// covered partly by its own keys and partly by the inner ones, so
+    /// [`Tile::to_guard`](crate::interpreter::Tile::to_guard) names both and
+    /// [`FunctionGuard::union`] has no `Domain`-with-`Codomain` arm to merge them.
+    /// Every other shape represents its own union directly — a record's union is its
+    /// fields'.
     ///
     /// Invariant: arms never directly nest another `Or` (always flattened by
     /// [`TileGuard::flatten_or`]).
@@ -56,12 +57,37 @@ fn union_in_place(a: &TileGuard, b: &TileGuard) -> TileGuard {
     }
 }
 
+/// Combine two record guards field by field.
+///
+/// Both guards describe the same `Tiling::Record`, so they name the same fields;
+/// a mismatch means two guards for different tilings met, which no producer can
+/// act on.
+fn zip_fields(
+    m1: &HashMap<String, TileGuard>,
+    m2: &HashMap<String, TileGuard>,
+    combine: impl Fn(&TileGuard, &TileGuard) -> TileGuard,
+) -> HashMap<String, TileGuard> {
+    assert_eq!(
+        m1.len(),
+        m2.len(),
+        "Incompatible record guards: {m1:?} vs {m2:?}"
+    );
+    m1.iter()
+        .map(|(k, g)| {
+            let other = m2.get(k).unwrap_or_else(|| {
+                panic!("Incompatible record guards: {m1:?} vs {m2:?}");
+            });
+            (k.clone(), combine(g, other))
+        })
+        .collect()
+}
+
 impl TileGuard {
     /// Builds a `TileGuard` from a list of arms, flattening any nested `Or`
     /// variants.  Returns the single element directly when `arms` has length
     /// one to avoid gratuitous wrapping.
     /// TODO consolidate redundant arms.
-    pub(super) fn flatten_or(arms: Vec<TileGuard>) -> TileGuard {
+    pub(crate) fn flatten_or(arms: Vec<TileGuard>) -> TileGuard {
         let mut flat: Vec<TileGuard> = arms
             .into_iter()
             .flat_map(|g| match g {
@@ -104,16 +130,7 @@ impl TileGuard {
                 TileGuard::Function(f1.intersect(f2))
             }
             (TileGuard::Record(m1), TileGuard::Record(m2)) => {
-                assert_eq!(
-                    m1.len(),
-                    m2.len(),
-                    "Incompatible record guards: {m1:?} vs {m2:?}"
-                );
-                TileGuard::Record(
-                    m1.iter()
-                        .map(|(k, g)| (k.clone(), g.intersect(&m2[k])))
-                        .collect(),
-                )
+                TileGuard::Record(zip_fields(m1, m2, TileGuard::intersect))
             }
             // Or distributes over intersect: (A | B) & C = (A & C) | (B & C).
             (TileGuard::Or(arms), g) | (g, TileGuard::Or(arms)) => {
@@ -129,9 +146,6 @@ impl TileGuard {
     /// consumer that has released `[0,1]` and then `[2,3]` has collectively seen
     /// `[0,3]`, so the stored guard must grow via union rather than replacement.
     ///
-    /// For [`TileGuard::Record`] guards, the result is a [`TileGuard::Or`] because
-    /// OR cannot be pushed through the AND semantics of a record guard.
-    ///
     /// Note for future implementation: All TileGuards we currently have are compatible with
     /// union, but future stuff like conditional function guards (e.g. constraints like
     /// "positive inputs produce positive outputs") are *not* closed under union and need to
@@ -143,10 +157,19 @@ impl TileGuard {
                 TileGuard::Aggregation(*u1 || *u2)
             }
             (TileGuard::Function(f1), TileGuard::Function(f2)) => TileGuard::Function(f1.union(f2)),
-            // Record guards have AND semantics, so their union cannot be
-            // represented as a single Record guard.  Wrap in Or instead.
-            (TileGuard::Record(_), TileGuard::Record(_)) => {
-                TileGuard::flatten_or(vec![self.clone(), other.clone()])
+            // A record guard covers the cells of each field its map names, so two of
+            // them union field by field, as `intersect` above combines them.
+            //
+            // [`Predicate::Record`](crate::interpreter::Predicate::Record) reads
+            // alike and does not union alike: it admits a record *value* only when
+            // every field admits its component, so it is a product and two products
+            // do not union to one. That is why `Predicate` keeps an `Or` arm for this
+            // and a guard does not need one. Reaching for `TileGuard::Or` here leaves
+            // a guard no record-tiled producer can act on: a consumer releasing one
+            // field twice hands `MakeRecord` two arms naming that field, and the
+            // operand that owns it hears about neither.
+            (TileGuard::Record(m1), TileGuard::Record(m2)) => {
+                TileGuard::Record(zip_fields(m1, m2, TileGuard::union))
             }
             // Or: accumulate all arms, flattening nested Ors.
             (TileGuard::Or(arms), g) | (g, TileGuard::Or(arms)) => {
@@ -350,10 +373,23 @@ mod tests {
         )
     }
 
+    /// A domain guard over the positions up to and including `bound`.
+    fn upto(bound: usize) -> TileGuard {
+        domain_guard(Predicate::LessThanEq(crate::interpreter::Value::UInt(
+            bound,
+        )))
+    }
+
+    /// `upto` one level in, so an `Or` of the two has an arm per level.
+    fn inner_upto(bound: usize) -> TileGuard {
+        codomain_guard(upto(bound))
+    }
+
+    /// A record guard names a region per field, so two of them union field by
+    /// field and the result is a record guard again. That is what a record-tiled
+    /// producer can act on: each field's operand is handed its own field's union.
     #[test]
-    fn guard_union_record_produces_or() {
-        // Two different record guards cannot be merged field-by-field; the
-        // result must be an Or so that neither arm's values are over-admitted.
+    fn guard_union_record_is_field_wise() {
         let g1 = record_guard(&[
             ("a", TileGuard::Scalar(true)),
             ("b", TileGuard::Scalar(false)),
@@ -362,54 +398,39 @@ mod tests {
             ("a", TileGuard::Scalar(false)),
             ("b", TileGuard::Scalar(true)),
         ]);
-        let result = g1.union(&g2);
-        assert!(
-            matches!(result, TileGuard::Or(_)),
-            "expected Or, got {result:?}"
+        assert_eq!(
+            g1.union(&g2),
+            record_guard(&[
+                ("a", TileGuard::Scalar(true)),
+                ("b", TileGuard::Scalar(true)),
+            ]),
         );
-        assert!(!result.is_empty());
-        assert!(!result.is_universal());
+    }
+
+    /// A field unions as that field's own shape does. A collection field released
+    /// in pieces therefore accumulates the positions it has handed over, which is
+    /// what a consumer reading one field of a growing product does every pull.
+    #[test]
+    fn guard_union_record_accumulates_a_function_field() {
+        let first = record_guard(&[("n", TileGuard::Scalar(false)), ("xs", upto(0))]);
+        let second = record_guard(&[("n", TileGuard::Scalar(false)), ("xs", upto(2))]);
+        assert_eq!(
+            first.union(&second),
+            record_guard(&[("n", TileGuard::Scalar(false)), ("xs", upto(2))]),
+        );
     }
 
     #[test]
-    fn guard_union_record_identical_stays_record() {
-        // When both arms are the same, flatten_or reduces the Or to a single guard.
+    fn guard_union_record_identical_is_that_record() {
         let g = record_guard(&[
             ("x", TileGuard::Scalar(true)),
             ("y", TileGuard::Scalar(true)),
         ]);
-        let result = g.clone().union(&g);
-        // flatten_or with two equal arms still produces Or([g, g]) — both arms
-        // are the same object but flatten_or does not deduplicate.  The important
-        // property is that the result is *not* under-admitting.
-        assert!(result.is_universal());
+        assert_eq!(g.union(&g), g);
     }
 
     #[test]
-    fn guard_union_or_accumulates_arms() {
-        let g1 = record_guard(&[
-            ("a", TileGuard::Scalar(true)),
-            ("b", TileGuard::Scalar(false)),
-        ]);
-        let g2 = record_guard(&[
-            ("a", TileGuard::Scalar(false)),
-            ("b", TileGuard::Scalar(true)),
-        ]);
-        let g3 = record_guard(&[
-            ("a", TileGuard::Scalar(true)),
-            ("b", TileGuard::Scalar(true)),
-        ]);
-        // g1 ∪ g2 → Or([g1, g2]); then ∪ g3 → Or([g1, g2, g3]) (flat, not nested).
-        let or12 = g1.union(&g2);
-        let result = or12.union(&g3);
-        let TileGuard::Or(arms) = &result else {
-            panic!("expected Or, got {result:?}");
-        };
-        assert_eq!(arms.len(), 3, "should be flat, not nested");
-    }
-
-    #[test]
-    fn guard_or_is_universal_when_any_arm_is() {
+    fn guard_union_record_is_universal_when_every_field_is() {
         let universal = record_guard(&[
             ("a", TileGuard::Scalar(true)),
             ("b", TileGuard::Scalar(true)),
@@ -418,46 +439,63 @@ mod tests {
             ("a", TileGuard::Scalar(false)),
             ("b", TileGuard::Scalar(false)),
         ]);
-        let result = empty.union(&universal);
-        assert!(result.is_universal());
+        assert!(empty.union(&universal).is_universal());
     }
 
     #[test]
-    fn guard_or_is_empty_only_when_all_arms_are() {
-        let empty1 = record_guard(&[
+    fn guard_union_record_is_empty_when_every_field_is() {
+        let empty = record_guard(&[
             ("a", TileGuard::Scalar(false)),
             ("b", TileGuard::Scalar(false)),
         ]);
-        let empty2 = record_guard(&[
-            ("a", TileGuard::Scalar(false)),
-            ("b", TileGuard::Scalar(false)),
-        ]);
-        let result = empty1.union(&empty2);
-        assert!(result.is_empty());
+        assert!(empty.union(&empty).is_empty());
     }
 
+    // ── TileGuard::Or ─────────────────────────────────────────────────────────
+    //
+    // Arms are built here rather than taken from a producer: what is under test is
+    // the algebra, and the one production shape that needs it (`Tile::to_guard` on a
+    // nested collection) mixes a `Domain` arm with a `Codomain` one, whose intersect is
+    // unimplemented.
+
+    /// Arms stay flat: a union against an existing `Or` appends rather than nests.
+    #[test]
+    fn guard_or_accumulates_arms() {
+        let or = TileGuard::Or(vec![upto(0), inner_upto(1)]);
+        let result = or.union(&codomain_guard(inner_upto(2)));
+        let TileGuard::Or(arms) = &result else {
+            panic!("expected Or, got {result:?}");
+        };
+        assert_eq!(arms.len(), 3, "should be flat, not nested");
+    }
+
+    /// Arms naming one level are one arm: the `Or` carries a predicate per level, so two
+    /// at the same level are that level's union. Without this a guard's shape would depend
+    /// on how it was assembled, and a consumer that matches on the shape would read two
+    /// spellings of one region as different guards.
+    #[test]
+    fn guard_or_merges_arms_at_one_level() {
+        let result = TileGuard::Or(vec![upto(0), upto(1)]).union(&upto(2));
+        assert_eq!(result, upto(2));
+    }
+
+    /// `Or` distributes through `intersect`: `(A | B) & C = (A & C) | (B & C)`, which for
+    /// arms at one level is that level's union — here `upto(1) | upto(3)`.
     #[test]
     fn guard_or_intersect_distributes() {
-        // (A | B) & C should equal (A & C) | (B & C).
-        let a = record_guard(&[
-            ("a", TileGuard::Scalar(true)),
-            ("b", TileGuard::Scalar(false)),
+        let or = TileGuard::Or(vec![upto(1), upto(5)]);
+        assert_eq!(or.intersect(&upto(3)), upto(3));
+    }
+
+    /// An `Or` is universal when any arm is, and empty only when every arm is.
+    #[test]
+    fn guard_or_is_universal_when_any_arm_is() {
+        let with_universal = TileGuard::Or(vec![
+            upto(1),
+            TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
         ]);
-        let b = record_guard(&[
-            ("a", TileGuard::Scalar(false)),
-            ("b", TileGuard::Scalar(true)),
-        ]);
-        let c = record_guard(&[
-            ("a", TileGuard::Scalar(true)),
-            ("b", TileGuard::Scalar(true)),
-        ]);
-        let or_ab = a.clone().union(&b);
-        let result = or_ab.intersect(&c);
-        // (A & C) = {a:true, b:false}, (B & C) = {a:false, b:true} — both non-empty.
-        let TileGuard::Or(arms) = &result else {
-            panic!("expected Or after distributing intersect, got {result:?}");
-        };
-        assert_eq!(arms.len(), 2);
+        assert!(with_universal.is_universal());
+        assert!(!TileGuard::Or(vec![upto(1), upto(2)]).is_universal());
     }
 
     // ── FunctionGuard::intersect ───────────────────────────────────────────────

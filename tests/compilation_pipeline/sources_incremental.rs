@@ -767,3 +767,189 @@ fn test_incremental_aggregates() {
         Predicate::True
     );
 }
+
+/// A collection component of a product value, read from a **data source** rather
+/// than written out as a literal.
+///
+/// The component keeps its own tiling, so what the product holds is the source's
+/// own sealed function and a projection reads what the source delivered. Covered
+/// here rather than beside the literal cases in `records.rs` because a literal's
+/// table is built at compile time, so those never exercise a component whose rows
+/// arrive over time.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::projected_and_summed("r = (n=1, xs=source1()); sum(r.xs)", 30)]
+#[case::scalar_component_beside("r = (n=1, xs=source1()); r.n", 1)]
+#[case::mapped("r = (n=1, xs=source1()); sum([z * 2 for z in r.xs])", 60)]
+#[case::filtered("r = (n=1, xs=source1()); sum([z for z in r.xs if z < 15])", 10)]
+#[case::tuple_component("t = (1, source1()); sum([z for z in t.1 if z < 15])", 10)]
+#[case::comprehension_component(
+    "r = (n=1, xs=[s + 1 for s in source1()]); sum([z for z in r.xs if z < 15])",
+    11
+)]
+fn test_source_backed_collection_component(#[case] code: &str, #[case] expected: i64) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    // The table a product holds is the whole table, so the source states that it
+    // has delivered all of it.
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.register_source(test_source.clone());
+
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    ctx.scheduler().check_for_notifications();
+
+    let mut tile = producer.get(producer.tiling().universal_guard());
+    tile.compact();
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// A collection component **grows**: rows reach it as the source delivers them,
+/// and the field settles when the source does.
+///
+/// This is what holding the component as a tile buys. A `Tile::DataFunction`
+/// merges by appending its domain and unioning its domain predicate, which is a
+/// collection arriving in pieces; boxed into one cell it would merge the way every
+/// `Tile::Scalar` does, by appending the column, so the deliveries below would land
+/// as three cells rather than one growing table.
+///
+/// The bare source is pulled alongside as the control: a component answers what
+/// the collection answers, at every pull rather than only at the last.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::component("r = (n=1, xs=source1()); r.xs")]
+#[case::bare_source("source1()")]
+fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    // One lap is one delivery followed by one pull. A `Memo` re-reads only after a
+    // delivery, so a component read through a `let` answers the previous tile to a
+    // pull that skipped one.
+    let mut pull = |source: &Rc<RefCell<TestDataSource>>, rows: &[(u64, i64)], done: bool| {
+        source.borrow_mut().add_data(
+            &rows
+                .iter()
+                .map(|(k, v)| (Value::UInt(*k as usize), Value::Int(*v)))
+                .collect::<Vec<_>>(),
+        );
+        if done {
+            source.borrow_mut().set_yield_predicate(Predicate::True);
+        }
+        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
+        tile.compact();
+        sort_function_by_domain(tile)
+    };
+
+    let expected = |keys: Vec<usize>, vals: Vec<i64>, done: bool| {
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::UInts(keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+            if done {
+                Predicate::True
+            } else {
+                Predicate::False
+            },
+            BitSet::new(),
+        ))
+    };
+
+    assert_eq!(
+        pull(&test_source, &[(0, 10), (1, 20)], false),
+        expected(vec![0, 1], vec![10, 20], false),
+        "the rows delivered so far, and the domain is not settled",
+    );
+    assert_eq!(
+        pull(&test_source, &[(2, 30)], false),
+        expected(vec![0, 1, 2], vec![10, 20, 30], false),
+        "the row added since joins the ones already there",
+    );
+    assert_eq!(
+        pull(&test_source, &[], true),
+        expected(vec![0, 1, 2], vec![10, 20, 30], true),
+        "the source says it is done, and the domain settles with no new rows",
+    );
+}
+
+/// Releasing a collection component reaches the source under it, and what was
+/// released does not come back.
+///
+/// A release travels to the product through the [`FanOut`] a `let` binding wraps
+/// it in, which accumulates each subscriber's guard by union. Two releases of one
+/// field are two record guards, and their union is the record guard naming that
+/// field's two regions — a shape the product can forward to the operand that owns
+/// the field. An `Or` of the two would name the field twice and reach nobody, and
+/// the product would reject it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::component("r = (n=1, xs=source1()); r.xs")]
+#[case::bare_source("source1()")]
+fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    let mut pull_and_release = |rows: &[(usize, i64)]| {
+        test_source.borrow_mut().add_data(
+            &rows
+                .iter()
+                .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+                .collect::<Vec<_>>(),
+        );
+        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 1, |_| false);
+        tile.compact();
+        producer.release(tile.to_guard());
+        sort_function_by_domain(tile)
+    };
+
+    let delivered = |keys: Vec<usize>, vals: Vec<i64>| {
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::UInts(keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+            Predicate::False,
+            BitSet::new(),
+        ))
+    };
+
+    assert_eq!(
+        pull_and_release(&[(0, 10), (1, 20)]),
+        delivered(vec![0, 1], vec![10, 20]),
+        "the rows delivered so far",
+    );
+    assert_eq!(
+        pull_and_release(&[(2, 30)]),
+        delivered(vec![2], vec![30]),
+        "only the row added since — the released ones are not re-delivered",
+    );
+    assert_eq!(
+        pull_and_release(&[(3, 40)]),
+        delivered(vec![3], vec![40]),
+        "and the release still lands after the accumulated guard has two regions",
+    );
+}

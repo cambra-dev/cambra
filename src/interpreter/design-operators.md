@@ -91,12 +91,14 @@ the previous version of the interpreter.
 | `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
 | `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
 | `Function(FunctionGuard)` | Structured interest in a function tile (see below). |
-| `Or(arms)` | Union of multiple guards; produced when two `Record` guards are unioned, because OR cannot be pushed through the AND semantics of a `Record` guard. Arms are always flat (no nested `Or`). |
+| `Or(arms)` | Union of two guards no single variant holds: a two-level tile is covered partly by its inner keys and partly by its outer, and `FunctionGuard` has no `Domain`-with-`Codomain` arm. Arms are always flat (no nested `Or`). |
 
-`TileGuard::intersect()` computes the overlap between two guards (conjunction of interest
-regions). `TileGuard::union()` computes the union; for `Record` guards this produces an `Or`
-variant because the field-wise AND semantics prevent distributing OR through the conjunction.
-`is_universal()` and `is_empty()` test the extremes.
+`TileGuard::intersect()` computes the overlap between two guards, and `TileGuard::union()` their
+union; `is_universal()` and `is_empty()` test the extremes. Both run field by field over a
+`Record` guard, which names a region per field rather than a product over them — unlike
+`Predicate::Record`, which admits a value only when every field does and so needs an `Or` of
+its own to union two. A record guard's union is a record guard, which is what lets a product
+forward a consumer's accumulated release to the operand holding the field it names.
 
 TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
 as a `split(guard: &TileGuard)` method on `Tile` in the future.
@@ -164,7 +166,35 @@ The tile layer chooses **how the runtime materialises that pointwise function**.
 
 Both compiled forms satisfy the same CCL type; which one a specific call site gets is determined at op-conversion by the upstream `input`'s tiling, which flows in from whatever sits above the operator in the dataflow graph. This is what makes UDFs like `lambda x: x + 1` compile cleanly whether they're called once on a literal or mapped over a source — no duplication at the CCL level, the tile layer specialises automatically.
 
-In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; fan-in is handled by [`fan_in_at`](./tile_operators/fan.rs), which dispatches to [`FanIn`] (function-tiled arms) or [`ScalarFanIn`] (scalar arms) based on what the compiled arms ended up with. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
+In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; a zip is handled by [`zip_arms`](./tile_operators/fan.rs), which builds [`Zip`] from function-tiled arms and [`MakeRecord`] from arms that all came out scalar, where there is no domain to share. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
+
+### A product value is a record of tiles
+
+A record or tuple **value** compiles to a `Tiling::Record`, each field keeping the tiling its own
+term produced: a scalar field stays a scalar, a collection field stays the collection it
+already was, with the domain it binds. `MakeRecord` assembles it and [`SelectField`] reads one
+field back out.
+
+Keeping a field a tile is what lets it grow. A `Tile::DataFunction` merges by appending its
+domain and unioning its domain predicate, which is a collection arriving in pieces. A collection
+boxed into one cell would merge the way every `Tile::Scalar` does, by appending the column, so two
+deliveries would land as two cells — two tables where the program has one collection. The fields
+also settle at their own moments, so a guard names one at a time: a settled scalar beside an
+unsettled collection releases the first alone.
+
+The other product is a **morphism**: `Tuple([acc, i])` under a binop is a pointwise pairing over the
+ambient iteration, and that is the zip [`Zip`] assembles. A value's extent is a record and a
+morphism's is a function, so the node's own type is what separates them. Assembling a value as a zip
+yields `𝐷 ⤇ (𝐴, 𝐵)`, a collection of products, where the type says a product of collections.
+
+A collection component is an iteration site like any other collection (`planning::iterate`'s
+`mark_component_source`), because it compiles as the collection it is. A list literal's elements are
+the exception: op-conversion evaluates each to a `Value` and compiles none of them, so nothing
+inside one is a site.
+
+Selecting a field is a tile operation, distinct from the value-level `RecordField` application that
+reads a record sitting in a function's codomain one row at a time. That application needs every
+field to be a value in a column, which a record holding a collection cannot supply.
 
 ---
 
@@ -247,11 +277,12 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::collection` | Produces a fixed `Value`. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
 | `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
 | `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values. |
-| `FanIn` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `fan_in_at` factory at op-conversion call sites: it dispatches to `FanIn` (function-tiled arms) or `ScalarFanIn` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
-| `ScalarFanIn` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling. The scalar counterpart of `FanIn`; reachable from op-conversion via the `fan_in_at` factory. Re-reads every operand on every pull, so the only release it can forward is the universal one. |
+| `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
+| `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a record **value**: each field keeps the tiling its operand produced. Nothing shares a domain here — that is `Zip`, and `build_product` chooses between the two by the node's own type. Pulls every operand whole; forwards a release naming one field to that field's operand alone. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
 | `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → Scalar)` | Replaces every codomain value of a function input with the same constant (or zips it in, per its mode), preserving the domain. The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `DataFunction(Unit → Scalar)` | `Scalar` | Unwraps a `DataFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
+| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's sub-tile — the eliminator for the product value `MakeRecord` builds. Pulls the product whole, since a narrowed pull through `Memo` would cache a partial record as a complete one; releases name the one field, so reading one field frees only it. |
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
@@ -273,7 +304,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 **Value-selecting `Case` in a writer decision body** (a conditional induction write `if 𝑝: acc += a else: acc += b`, or a `with begin():` per-key routing merge — a gate that varies with the element at a site with **no visible iteration source**). `lambda_elim` compiles it to the same **union of domain-restricts** as every other value-`Case`, over the *fed* element stream: `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`, first-match `π̂ᵢ`. `filter_values` (`Builtin::FilterValues` → the `Filter` tile operator, input stream + predicate) is a **value-preserving** filter — unlike `Restrict` (which returns the domain identity `{D|p}⤇{D|p}` for a source a map re-indexes), it keeps each surviving element's value `V`, so `eᵢ` maps the kept elements directly and a **partial op** (`//`) in `eᵢ` runs only where its guard holds — never eagerly at a rejected position (the retired `Select` computed both arms and faulted on the off-path one). The arms filter the *same* fed stream disjointly (first-match), so their union is a **flat merge** (`UnionOperator::new_flat`): it stays on one domain extent (not a tagged `Extent::Union`) and reassembles the full column sorted by domain key, co-iterating with the decision record's sibling `commit`/`writes` fields. The key is the arm's domain *value*, not a position: reassembly needs only a total order (to restore the fed order) and equality (to catch two arms claiming one key), and both hold for any single collection's keys, since its domain is one `Extent`. A `UInt` position is the common case; a fed stream whose own index set is a coproduct — a conditional-element comprehension, whose `Copair` domain is `Variant({Index(i): {D | π̂ᵢ}})` — carries `Union { tag, inner }` keys, which `Value`'s order compares lexicographically by tag then payload. Keys that are *not* mutually comparable mean the arms were fed different domains, which is a copairing rather than a disjoint join, and `flat_merge` says so. A sourceless value-`Case` (a top-level ternary) still takes the `UIntRange(1)`-driver C-form + `final_or_default` (a tagged union dispatch); the writer-body case differs only in filtering the fed stream rather than a synthetic driver.
 
-**Scrutinee-`Case` over a variant** (`λ 𝑥 → match 𝑥 { 𝑐ᵢ(𝑤ᵢ) → 𝑒ᵢ }` — sum elimination, the read-dual of `VariantCtor`). `lambda_elim` compiles it to the same **union of restricts** as the value-`Case`, keyed on **tag** rather than a boolean first-match gate: `⧺ᵢ (𝑥 ≫ variant_project(𝑐ᵢ) ≫ (λ 𝑤ᵢ → 𝑒ᵢ))` — a `≫`-chain, because every element of it is a morphism out of the eliminated binder: the scrutinee is `𝑥 ⇒ scrut_ty`, `variant_project(𝑐ᵢ)` is `scrut_ty ⇒ Pᵢ`, and the eliminated arm body is `Pᵢ ⇒ V`. `variant_project(𝑐ᵢ)` (`Builtin::VariantProject(tag)` → the `VariantProject` tile op) fuses the tag-restrict and the payload projection into one step (an arm stores its own rows — see the operator table). The tags **partition** the scrutinee's domain, so the arms' sub-domains are disjoint and the union is a **flat merge** (`UnionOperator::new_flat`), re-totaling to the full domain — exhaustive by typing (inference's width-subtyping demands one arm per scrutinee tag), so no `final_or_default` scalar collapse is needed (this is the fan-out shape, not the C-form). A const arm (`abort → 0`, ignoring its payload) keeps its `variant_project` through simplification: `try_const_reduce` refuses to collapse past either element that *narrows the domain at runtime with no refinement left to re-materialise* (`simplify`'s `narrows_domain_irrecoverably` — `variant_project` and `filter_values`), since dropping one would apply the constant at every position and make the arms overlap. **Outer-binder arms.** When an arm body reads the *outer* binder as well as its payload (`𝑒ᵢ(𝑥, 𝑤ᵢ)` — e.g. a per-key view `λ __c → match __c.decision { commit(w) → (time: __c.time, write: w.i) }`, reading both the record's sibling field and the commit payload), the arm zips the whole element alongside the projected payload: `⧺ᵢ (⟨id, 𝑥.f ≫ variant_project(𝑐ᵢ)⟩ ▷ zip ≫ (λ (𝑥, 𝑤ᵢ) → 𝑒ᵢ))`. Both components of the pair are morphisms out of the *outer* binder, which is why `id` sits beside the projection chain rather than inside it — `𝑥.f ≫ ⟨id, variant_project(𝑐ᵢ)⟩` would pair the *scrutinee* with the payload, not the element the arm body reads its sibling fields off. For this, `VariantProject` keeps the scrutinee's **real domain keys** (a union *stream* `DataFunction { D ⇒ Scalar(Union) }` carries them explicitly, unlike a bare `Scalar(Union)` whose implicit `0..N` positions become the keys), so the outer `id` arm and the tag-restricted payload co-iterate by key under the `zip`/`FanIn`, which inner-joins on shared keys — the outer arm need not be pre-restricted (the join drops the positions not carrying `𝑐ᵢ`). lambda_elim detects the outer-binder dependence structurally (the arm body has `𝑥` free beyond the payload binder) and merges the two into one pair binder (`𝑥 ↦ pair.0`, `𝑤ᵢ ↦ pair.1`); the payload-only path is unchanged. A scalar one-off `match` on a concrete value (rather than a per-element `λ x → match x`) would need the C-form scalar collapse; not built until a term needs it.
+**Scrutinee-`Case` over a variant** (`λ 𝑥 → match 𝑥 { 𝑐ᵢ(𝑤ᵢ) → 𝑒ᵢ }` — sum elimination, the read-dual of `VariantCtor`). `lambda_elim` compiles it to the same **union of restricts** as the value-`Case`, keyed on **tag** rather than a boolean first-match gate: `⧺ᵢ (𝑥 ≫ variant_project(𝑐ᵢ) ≫ (λ 𝑤ᵢ → 𝑒ᵢ))` — a `≫`-chain, because every element of it is a morphism out of the eliminated binder: the scrutinee is `𝑥 ⇒ scrut_ty`, `variant_project(𝑐ᵢ)` is `scrut_ty ⇒ Pᵢ`, and the eliminated arm body is `Pᵢ ⇒ V`. `variant_project(𝑐ᵢ)` (`Builtin::VariantProject(tag)` → the `VariantProject` tile op) fuses the tag-restrict and the payload projection into one step (an arm stores its own rows — see the operator table). The tags **partition** the scrutinee's domain, so the arms' sub-domains are disjoint and the union is a **flat merge** (`UnionOperator::new_flat`), re-totaling to the full domain — exhaustive by typing (inference's width-subtyping demands one arm per scrutinee tag), so no `final_or_default` scalar collapse is needed (this is the fan-out shape, not the C-form). A const arm (`abort → 0`, ignoring its payload) keeps its `variant_project` through simplification: `try_const_reduce` refuses to collapse past either element that *narrows the domain at runtime with no refinement left to re-materialise* (`simplify`'s `narrows_domain_irrecoverably` — `variant_project` and `filter_values`), since dropping one would apply the constant at every position and make the arms overlap. **Outer-binder arms.** When an arm body reads the *outer* binder as well as its payload (`𝑒ᵢ(𝑥, 𝑤ᵢ)` — e.g. a per-key view `λ __c → match __c.decision { commit(w) → (time: __c.time, write: w.i) }`, reading both the record's sibling field and the commit payload), the arm zips the whole element alongside the projected payload: `⧺ᵢ (⟨id, 𝑥.f ≫ variant_project(𝑐ᵢ)⟩ ▷ zip ≫ (λ (𝑥, 𝑤ᵢ) → 𝑒ᵢ))`. Both components of the pair are morphisms out of the *outer* binder, which is why `id` sits beside the projection chain rather than inside it — `𝑥.f ≫ ⟨id, variant_project(𝑐ᵢ)⟩` would pair the *scrutinee* with the payload, not the element the arm body reads its sibling fields off. For this, `VariantProject` keeps the scrutinee's **real domain keys** (a union *stream* `DataFunction { D ⇒ Scalar(Union) }` carries them explicitly, unlike a bare `Scalar(Union)` whose implicit `0..N` positions become the keys), so the outer `id` arm and the tag-restricted payload co-iterate by key under the `zip`/`Zip`, which inner-joins on shared keys — the outer arm need not be pre-restricted (the join drops the positions not carrying `𝑐ᵢ`). lambda_elim detects the outer-binder dependence structurally (the arm body has `𝑥` free beyond the payload binder) and merges the two into one pair binder (`𝑥 ↦ pair.0`, `𝑤ᵢ ↦ pair.1`); the payload-only path is unchanged. A scalar one-off `match` on a concrete value (rather than a per-element `λ x → match x`) would need the C-form scalar collapse; not built until a term needs it.
 
 **`VariantCtor` inside a lambda body** (sum *introduction*, the dual of the scrutinee-`Case`). A `VariantCtor` in a lambda (``λ 𝑝 → `𝑐ᵢ(𝑒ᵢ(𝑝))``) must elaborate to a composable morphism `param_ty ⇒ Union` so it can be the RHS of a `≫` — e.g. a writer-decision arm ``filter_values(π̂ᵢ) ≫ 𝑒ᵢ ≫ variant_wrap(`commit)`` in the value-`Case` fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ 𝑒ᵢ)`. `lambda_elim` compiles it to `𝑒ᵢ ≫ variant_wrap(𝑐ᵢ)` (`Builtin::VariantWrap(tag)` → the `VariantWrap` tile, fed the payload stream, wrapping it element-wise). The full arm set resolves from the node's `Type::Variant` codomain, mirroring `variant_project`. A `VariantCtor` whose payload is *constant* in the binder never reaches this arm — the `const` rule lifts the whole scalar variant with ``const(`𝑐ᵢ(…))``, which `MapResultToConst` broadcasts over the stream (`ColumnValue::repeat` handles a singleton `Union`). A genuinely scalar `VariantCtor` outside any lambda keeps its own node and its `expect_no_input` op-conversion arm (`Scalar(Union)`).
 
@@ -446,11 +477,11 @@ Three arms share an input across multiple downstream consumers:
 
 - **`Apply(_, Zip)` with `Tuple` / `Record` arguments** fans the input out to
   each tuple / record element; the elements get `Some(fan_out_branch)` and
-  combine via [`fan_in_at`] (function-tiled arms) or [`ScalarFanIn`] (scalar arms).
+  combine via [`zip_arms`] (function-tiled arms) or [`MakeRecord`] (scalar arms).
   The 2-arm Zip-with-const fast path skips the fan-out and emits a single
   `MapResultToConst` instead. A **store-read arm** (`__hist.k`) is a *leaf*
   source over its own domain, so it is converted with **no** input (rather than
-  the fanned branch, which it would reject); `fan_in_at` co-aligns it with the
+  the fanned branch, which it would reject); `zip_arms` co-aligns it with the
   input-driven arms by domain position. This is the cross-domain co-iteration a
   commit writer's source uses — `zip((reqs, __cnt.acc))` pairs the request stream
   with a request-indexed induction accumulator read so a commit decision can read
@@ -474,9 +505,9 @@ The pipeline always bottoms out at one of three consumer shapes:
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`
    at `compile_program`.
-3. A trailing `Record` of sink-bound names — `convert_record_fields_to_operators`
-   compiles one operator per field, sharing the scope (and therefore the
-   `FanOut` / `Memo` of let-bound upstream) across every field.  Each field
+3. A trailing `Record` of sink-bound names — `convert_outputs_to_operators`
+   compiles one operator per entry, sharing the scope (and therefore the
+   `FanOut` / `Memo` of let-bound upstream) across every entry.  Each entry
    is subscribed by its corresponding `SinkConsumer`.
 
 In all three cases planning has ensured every iteration site has an explicit
@@ -594,7 +625,7 @@ restricted-source multi-leg realization's cyclic-convergence desync from arising
 **`StoreDenseRead` — the dense changelog read.** A `__hist.k` read folds the changelog at
 *every* position of the loop extent → `Fun(D, V)`: an `IterateExtent(D)` trigger supplies
 the domain positions (a live enumeration — over a `DataSource` it re-reads the arrived keys
-each pull, so it spans live arrivals — and it aligns via `fan_in_at` with any co-iterated
+each pull, so it spans live arrivals — and it aligns via `zip_arms` with any co-iterated
 source over the same `D`), and each position `p` reads tick `p + 1` via `store_value_at`
 (which scans changes ≤ that tick — **independent of the store frontier**, so a carry
 position inherits the latest earlier write and a leading carry folds to the tick-0 seed).
@@ -603,7 +634,7 @@ arbitrary order, but the output domain must be position-ordered so that the **sc
 read — `ExtractFinal` over this dense stream, i.e. the *final column* — is the highest loop
 position (the final accumulator), not an arbitrary mid-loop value. (A **co-iterated** read —
 an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with begin(): store
-:= store + cnt` — aligns by domain *value* via `fan_in_at`, so ordering is immaterial there;
+:= store + cnt` — aligns by domain *value* via `zip_arms`, so ordering is immaterial there;
 sorting is correct for both.) One reader serves both shapes, and a downstream release of loop
 positions is forwarded to the trigger so the source is reclaimed. Reading by fold rather
 than by indexed projection is what unifies induction reads with transactional-variable reads.

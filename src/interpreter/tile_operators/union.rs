@@ -186,9 +186,14 @@ impl UnionOperator {
 /// compares lexicographically by tag then payload. Keying on `usize` is what
 /// restricted this to the former.
 fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling) -> Tile {
-    let value_extent = codomain_tiling.extent();
-    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    // The arms' codomains are concatenated and then gathered in key order, rather than
+    // reassembled as a list of `Value` pairs. A gather is shape-agnostic, so an arm whose
+    // codomain carries a level — a collection-valued mutable variable's write — travels like
+    // any other; boxing each row into a value could not carry one.
+    let mut pairs: Vec<(Value, usize)> = Vec::new();
+    let mut codomains: Option<Tile> = None;
     let mut domain_predicate = Predicate::False;
+    let mut offset = 0usize;
     for (i, tile) in tiles.into_iter().enumerate() {
         let Tile::DataFunction {
             domain,
@@ -200,30 +205,43 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         else {
             panic!("flat_merge: expected a collection arm, got {tile:?}");
         };
-        assert!(
-            !codomain.holds_a_level(),
-            "flat_merge interleaves arms by key, which names one level"
-        );
         if i == 0 {
             domain_predicate = dp;
         }
-        // The decision field's value is usually a scalar, but a compound
-        // (tuple/record) accumulator carries a struct-of-arrays `Tile::Record`
-        // codomain; box it to a single record-valued column so each row extracts
-        // as one `Value`. `scalar_tile_to_column_value` is identity on a scalar.
-        // A function-valued codomain (a collection-valued mutable variable) is out of
-        // scope and would panic generically inside the helper — name the boundary.
-        debug_assert!(
-            matches!(codomain.as_ref(), Tile::Scalar(_) | Tile::Record(_)),
-            "flat_merge: a writer-body value-Case arm must have a scalar or \
-             boxed-compound codomain, got {codomain:?}"
-        );
-        let values = scalar_tile_to_column_value(*codomain);
-        for row in 0..domain.len() {
-            if deleted.contains(row) {
-                continue;
-            }
-            pairs.push((domain.index_at(row), values.index_at(row)));
+        let live: Vec<usize> = (0..domain.len())
+            .filter(|r| !deleted.contains(*r))
+            .collect();
+        // An arm contributing no row is skipped rather than concatenated: it carries an
+        // empty column whose kind is whatever its producer happened to build, and
+        // concatenating that against a sibling's is a mismatch over nothing.
+        if live.is_empty() {
+            continue;
+        }
+        for row in live {
+            pairs.push((domain.index_at(row), offset + row));
+        }
+        offset += domain.len();
+        // Arms disagree on whether a compound value rides boxed (`Scalar(Records)`) or as
+        // a struct-of-arrays `Record`, so a value-shaped arm is restated in the declared
+        // shape before being concatenated. An arm carrying a level passes through: it is
+        // already the shape its tiling names, and boxing it is what has no column to go in.
+        let codomain = if codomain.holds_a_level() {
+            *codomain
+        } else if codomain_tiling.has_a_level() {
+            // An arm that contributed no row emits an empty column whatever its tiling
+            // says; restate it at the declared shape so the concatenation is like-for-like.
+            assert!(
+                codomain.is_empty(),
+                "flat_merge: an arm of a level-valued codomain carries levels unless it is \
+                 empty, got {codomain:?}"
+            );
+            codomain_tiling.empty_at_no_rows()
+        } else {
+            column_value_to_tile(scalar_tile_to_column_value(*codomain), codomain_tiling)
+        };
+        match &mut codomains {
+            Some(acc) => acc.merge_rows(codomain),
+            None => codomains = Some(codomain),
         }
     }
     // Disjoint by first-match, so a stable sort by key reassembles the full column
@@ -262,14 +280,14 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         );
     }
     let keys: Vec<Value> = pairs.iter().map(|(k, _)| k.clone()).collect();
-    let values: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
-    // Build the codomain to match the operator's *declared* tiling shape: a
-    // scalar field stays `Tile::Scalar`, a compound (tuple/record) field unboxes
-    // the record-valued column back into a struct-of-arrays `Tile::Record`.
-    let cv = ColumnValue::from_values(values, &value_extent);
+    let picked: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
+    let codomain = match codomains {
+        Some(all) => all.select_rows(&picked),
+        None => codomain_tiling.empty_at_no_rows(),
+    };
     Tile::data_function(
         ColumnValue::from_values(keys, domain_extent),
-        Box::new(column_value_to_tile(cv, codomain_tiling)),
+        Box::new(codomain),
         domain_predicate,
         BitSet::new(),
     )
@@ -384,10 +402,6 @@ impl TileProducer for UnionProducer {
                     deleted,
                     ..
                 } => {
-                    assert!(
-                        !codomain.holds_a_level(),
-                        "a union concatenates arms into one domain, which names one level"
-                    );
                     // Shift each deleted index into the combined domain's position space.
                     for idx in deleted.iter() {
                         combined_deleted.insert(idx + domain_offset);
@@ -418,25 +432,22 @@ impl TileProducer for UnionProducer {
         ));
         union_domain.debug_assert_union_invariants();
 
-        // Concatenate like columns. The arms always agree on column kind, because
-        // two alternative value spaces at one position can only be *tagged* — the
-        // solver won't infer an untagged sum from a collision — so differing arms
-        // are both `ColumnValue::Union` and `append` merges their tag maps.
+        // The arms' values stand one after another over the concatenated keys, in arm order
+        // — which is what [`Tile::merge_rows`] appends, whatever the values are. A column
+        // appends; a collection appends its rows with each run shifted past the keys already
+        // there, so an arm holding a collection per key keeps its own grouping.
+        //
+        // The arms always agree on shape, because two alternative value spaces at one
+        // position can only be *tagged* — the solver won't infer an untagged sum from a
+        // collision — so differing arms are both `ColumnValue::Union` and appending merges
+        // their tag maps.
         let codomain_tile: Tile = {
-            let mut cols = codomains.into_iter().map(|c| match c {
-                Tile::Scalar(cv) => cv,
-                other => panic!("UnionProducer: a merged arm is one column, got {other:?}"),
-            });
-            let mut combined = cols.next().expect("at least one arm");
-            for cv in cols {
-                debug_assert_eq!(
-                    std::mem::discriminant(&combined),
-                    std::mem::discriminant(&cv),
-                    "arms merging into one column disagree on column kind"
-                );
-                combined.append(cv);
+            let mut arms = codomains.into_iter();
+            let mut combined = arms.next().expect("at least one arm");
+            for arm in arms {
+                combined.merge_rows(arm);
             }
-            Tile::Scalar(combined)
+            combined
         };
 
         Tile::data_function(
