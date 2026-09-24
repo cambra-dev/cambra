@@ -561,11 +561,21 @@ impl Typing for InferCtx {
 
     fn scoped_let<R>(
         &mut self,
-        name: &Name,
-        bound_ty: &Type,
+        binding: &TypedBinding,
         generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        let (name, bound_ty) = (&binding.name, &binding.ty);
+        // An opaque binder carries no definiens, so a type lifted past it keeps
+        // the name (`close_let_type`) and what the name means there is the type
+        // it is bound at — a fact with no scope, recorded once here. Recorded on
+        // entry rather than on exit because a bound naming it is recorded
+        // *inside* the scope, on a variable that may have been minted outside
+        // (see [`Telescope`]).
+        if binding.transparency == BindingTransparency::Opaque {
+            self.telescope.enter_opaque(name);
+            self.opaque_binders.insert(name.clone(), bound_ty.clone());
+        }
         // Generalize at the current (outer) level: any variable in `bound_ty`
         // whose level exceeds `self.level` was minted inside the RHS and is
         // universally quantified; `instantiate` freshens it per use site.
@@ -628,12 +638,10 @@ impl Typing for InferCtx {
         // An opaque binder is the second exception, and for the reverse reason:
         // it carries no definiens to discharge, so the name stays in the lifted
         // type. What it means there is the type it was bound at, which outlives
-        // the scope as a standing fact ([`Self::opaque_binders`]) — that is how
-        // a refinement over the binder is still decided once the binder's scope
-        // has closed. Recorded here because `scoped_let` has just closed that
-        // scope and `binding.ty` is by now the type the variable is bound at.
+        // the scope as a standing fact ([`Self::opaque_binders`], recorded by
+        // `scoped_let` on the way in) — that is how a refinement over the binder
+        // is still decided once the binder's scope has closed.
         if binding.transparency == BindingTransparency::Opaque {
-            self.opaque_binders.insert(name.clone(), binding.ty.clone());
             return body_ty;
         }
         let lifted = self.fresh();

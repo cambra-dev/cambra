@@ -184,6 +184,17 @@ on a writer's spine is an operator in the graph, and the phases below recognize 
 Every use of a segment's binder precedes the write that ended the segment, which is what makes the
 substitution sound; `inline` moves uses, so it runs after.
 
+An unannotated mutable variable takes such a refinement as a contribution. Its value type is an
+inference variable minted at the declaration, outside every read binder. `x := 0` followed by
+`x := x ^+ 1` records `{Int | __elem == __read ^+ 1}` on that variable, over a binder the variable's
+own scope does not hold; the binder is opaque, which is what admits the reference
+(`src/ccl/design/type-inference.md`, "The invariant"). The join over the seed and the write
+establishes neither predicate, so the variable types as `Int`, and the joined value type of a
+mutable variable written more than once carries no refinement.
+
+A write inside a `for` body is the case still refused. Its contribution names the loop target, which
+carries neither a definiens to discharge nor a fact that outlives its scope.
+
 Five positions keep the read as lowering built it, each because a later pass reads the term there:
 an application's function and argument (the three handle positions above), a block's terminal
 expression (the tail rules, and rule 2's escape check), the value of a feed

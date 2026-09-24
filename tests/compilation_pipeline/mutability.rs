@@ -2385,20 +2385,51 @@ x
     )
 }
 
-/// Currently, the snapshots created for mutable variables cannot be
-/// captured in bounds on those variables.
-///
-/// Workaround is to always give mutable variables type annotations
-/// when they will be written to by ^+.
+/// A snapshot write to a mutable variable with no annotation. The contribution
+/// `{Int | __elem == __read ^+ 1}` names the read binder, and the value variable
+/// it lands on was minted at the declaration, outside that binder. The binder is
+/// opaque, which puts it in every telescope of the walk. The join over the seed
+/// and the write establishes neither predicate, so the variable types as `Int`.
 #[test]
-fn snapshot_write_to_unannotated_mut_var_leaves_an_open_bound() {
-    check_compile_error(
+fn snapshot_write_to_an_unannotated_mut_var() {
+    check_scalar(
         indoc! {r#"
 x := 0
 x := x ^+ 1
 x
 "#},
-        "open bound recorded",
+        Value::Int(1),
+    )
+}
+
+/// The same shape with the opaque binder written by hand rather than minted by
+/// `mut_read`: one rule covers both, since what admits the contribution is the
+/// binder's opacity and not which pass introduced it.
+#[test]
+fn snapshot_write_through_a_user_written_opaque_binder() {
+    check_scalar(
+        indoc! {r#"
+x := 0
+x0 ^= 5
+x := x0 ^+ 1
+x
+"#},
+        Value::Int(6),
+    )
+}
+
+/// A seed that reads another mutable variable, and no write to join it with. The
+/// seed's refinement is the value variable's only contribution, so it survives —
+/// naming the read binder outside the scope that bound it.
+#[test]
+fn a_seed_reading_another_mut_var_keeps_its_refinement() {
+    check_scalar(
+        indoc! {r#"
+y := 3
+x := y ^+ 1
+x
+"#},
+        Value::Int(4),
     )
 }
 
@@ -2447,7 +2478,13 @@ x
     )
 }
 
-/// Same problem as `snapshot_write_to_unannotated_mut_var_leaves_an_open_bound`.
+/// A loop's target binder is the gap the opaque-binder rule does not close. `p`
+/// is neither opaque nor discharged by the write's edge, so the contribution
+/// `{Int | __elem == __read ^+ p}` cannot be recorded on a value variable minted
+/// outside the loop. Annotating the mutable variable is the workaround: the
+/// contribution is then checked against the declared value type rather than
+/// joined into an inference variable
+/// (`refined_induction_variable_via_annotated_array_write_succeeds`).
 #[test]
 fn snapshot_write_in_loop_to_unannotated_mut_var_leaves_an_open_bound() {
     check_compile_error(

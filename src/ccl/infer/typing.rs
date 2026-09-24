@@ -140,15 +140,22 @@ pub(super) trait Typing {
     /// (it never generalizes).
     fn is_generalizable(&self, def: &Expr) -> bool;
 
-    /// Run `f` with a `let` name bound over the body. When `generalize` is set,
-    /// Emit generalizes `bound_ty` at the current level into a polymorphic
-    /// scheme (so each use site instantiates fresh quantified variables);
-    /// otherwise it binds monomorphically (shared). Check ignores `generalize`
-    /// and binds the name at `bound_ty` like any other binder.
+    /// Run `f` with a `let` binding in scope over the body, at the type
+    /// `binding.ty` records. When `generalize` is set, Emit generalizes that
+    /// type at the current level into a polymorphic scheme (so each use site
+    /// instantiates fresh quantified variables); otherwise it binds
+    /// monomorphically (shared). Check ignores `generalize` and binds the name
+    /// like any other binder.
+    ///
+    /// Entering is also where an
+    /// [opaque](crate::ccl::BindingTransparency::Opaque) binder's standing fact
+    /// is recorded, which is why this takes the whole binding: the fact is what
+    /// a query outside the binder's scope reads, and a bound recorded *inside*
+    /// it on a variable minted outside already needs the name accounted for
+    /// (see [`Telescope`](crate::ccl::infer_var::Telescope)).
     fn scoped_let<R>(
         &mut self,
-        name: &Name,
-        bound_ty: &Type,
+        binding: &TypedBinding,
         generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R

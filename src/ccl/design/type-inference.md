@@ -1368,6 +1368,20 @@ the bound is recorded, and it is a lookup, since uniquify gives every binding si
 violation names the variable and the reference and fails. Every build enforces it: a release
 compile rejects what a debug compile rejects.
 
+An opaque binder is in every telescope of the walk, whatever the lexical position. It carries no
+definiens, so a type lifted past it keeps the name and the name outlives its scope ([`let` binders
+and scope exit](#let-binders-and-scope-exit)). The telescope therefore holds an opaque set shared by
+every variable the walk mints, and entering the binder adds to it, reaching the variables minted
+before it as well. That is what admits a write to a mutable variable declared outside the binder:
+`x := 0` mints the value variable under an empty telescope, and `x := x ^+ 1` contributes
+`{Int | __elem == __read ^+ 1}` over the read binder `mut_read` minted inside
+(`src/ccl/design/mutability.md`, "A read is named while inference runs"). The end-of-inference check
+states the same rule tree-wide, seeding its root scope with every opaque binder the tree holds
+(`check_scope_valid`).
+
+A binder carrying a definiens stays out of that set, its reference being discharged rather than
+carried. A `for` target carries neither, so a contribution naming one still fails the check.
+
 Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
 and the pass-boundary re-derivations that check what a pass produced. A re-derivation walks a tree
 where a pass has erased term binders, and the refinements it meets still name them. The dependent
@@ -1446,6 +1460,11 @@ user-written refinement type needs (`{Int | __elem > n}` with `n` let-bound). Li
 the binding discharges the reference to the definiens. No re-addressing is needed: a uniquified name
 is its telescope entry's address, so the name-keyed discharge already speaks in entries. A Pi entry
 has no definiens, and lifting past one abstracts instead of discharging.
+
+An opaque entry (`x ^= e`) has no definiens either, and lifting past one does neither: the name
+stays in the lifted type, and what it means there is the type the binder was bound at, recorded when
+the binder is entered (`InferCtx::opaque_binders`) and read by every later refinement query. Entry
+rather than exit, because a bound naming the binder is recorded inside its scope.
 
 Emission records the lift, and cannot perform it: the body's type is an inference variable there,
 whose refinements sit in its bounds rather than in the type. `InferCtx::close_let_type` mints the

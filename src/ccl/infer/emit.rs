@@ -1785,9 +1785,7 @@ pub(super) fn emit_let<C: Typing>(
     // mutability checks to read `user_annotation` as a proxy for it.
     binding.ty = scheme_ty.clone();
     let generalize = ctx.is_generalizable(bound_expr);
-    let body_ty = ctx.scoped_let(&binding.name, &scheme_ty, generalize, |ctx| {
-        ctx.subexpr(body)
-    })?;
+    let body_ty = ctx.scoped_let(binding, generalize, |ctx| ctx.subexpr(body))?;
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
     // story.
