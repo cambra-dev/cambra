@@ -1,5 +1,5 @@
 [workspace]
-# The root package plus the CHL parser and the reference interpreter. The
+# The root package plus the CHL parser and the differential interpreter. The
 # inspector's Rust half is `src/inspector_server`, a module of this crate;
 # `web/` is its TypeScript frontend, a JS project with no Cargo manifest.
 # The root package is edition 2024, whose default resolver is 3, but a workspace
@@ -10,6 +10,9 @@
 # that gate is not what this setting decides.
 resolver = "3"
 members = ["chl-parser", "chl-interp"]
+# A bare `cargo test` or `cargo clippy` at the root covers every member, as it did when the
+# root was the only package.
+default-members = [".", "chl-parser", "chl-interp"]
 
 [package]
 name = "cambra"
@@ -29,8 +32,8 @@ readme = "README.md"
 test-helpers = []
 
 [dev-dependencies]
-# The reference interpreter, for the differential suite. A dev-dependency because only
-# the tests compare the two; the library must not consult its own oracle.
+# The differential interpreter, for the differential suite. A dev-dependency because only the
+# tests compare the two; the library must not consult the interpreter it is checked against.
 chl-interp = { path = "chl-interp" }
 # Self dev-dependency so the integration tests (separate crates) can see the
 # `test-helpers`-gated helpers. Cargo unifies this with the library under test.

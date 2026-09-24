@@ -233,7 +233,7 @@ directly.
 
 ### Threading partial ASTs through to lowering
 
-[`compile_program`](../src/ccl/context.rs) now runs the **lowering** stage even
+[`compile_program`](../src/ccl/context.rs) runs the **lowering** stage even
 when the parser reported errors, so users see parse + lowering diagnostics
 in one pass instead of having to fix parse errors before any lowering
 problem becomes visible.
@@ -389,5 +389,5 @@ unhelpful `'src must outlive 'static` error — were hit during development:
   function definitions with `yield`, multi-line bracketed expressions, …) and
   assert the AST shape only at the level required to catch regressions.
 
-Run with `cargo test chl_parser` for the unit tests and
+Run with `cargo test -p chl-parser` for the unit tests and
 `cargo test --test chl_parser_roundtrip` for the integration tests.

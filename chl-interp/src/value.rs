@@ -7,8 +7,9 @@
 //! Order, by contrast, carries nothing: [`PartialEq`] compares entries as a multiset.
 //!
 //! A commit time ([`Value::CommitTime`]) is the one key whose number carries nothing either:
-//! "8.5 Ordering and concurrency" orders commits without numbering them, so two collections
-//! keyed by commit times are compared by the order of those times, not by their values.
+//! `docs/chl-spec.md`, "8.5 Ordering and concurrency" orders commits without numbering them,
+//! so two collections keyed by commit times are compared by the order of those times, not by
+//! their values.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -36,10 +37,6 @@ pub struct Collection {
 }
 
 impl Collection {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Build from entries in any order.
     ///
     /// # Panics
@@ -213,9 +210,11 @@ impl PartialEq for Value {
 
 /// A total order over values, used only to canonicalize for comparison and rendering.
 ///
-/// Two values that compare `Equal` here are equal under [`PartialEq`], which is what lets
-/// [`Collection`]'s equality zip two sorted entry lists. Values of different shapes never
-/// compare equal, so ordering them by shape first keeps that property.
+/// [`Collection`]'s equality zips two entry lists sorted by this order, which pairs the
+/// entries up when values equal under [`PartialEq`] compare `Equal` here. A record or
+/// collection that holds commit times breaks that: it orders by its rendering, which shows
+/// raw times, while equality compares their ranks. The zip then pairs mismatched entries and
+/// reports a disagreement, never a false agreement.
 fn total_cmp(a: &Value, b: &Value) -> Ordering {
     fn rank(v: &Value) -> u8 {
         match v {
