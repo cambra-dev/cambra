@@ -1250,7 +1250,7 @@ not in CHL.
 ### 3.14 Recovery placeholders
 
 The parser may produce `Expr::Error` and `Stmt::Error` placeholders
-during error recovery (see [src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md)).
+during error recovery (see [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)).
 These appear only when the `ParseResult.errors` list is non-empty;
 they carry no runtime semantics — a program containing one cannot be
 compiled. Tools that consume a partial AST (LSP, editor diagnostics)
@@ -3357,7 +3357,7 @@ multiple diagnostics per file. Two recovery layers:
 
 A parse always returns a `ParseResult<T>` carrying *both* a partial AST
 (possibly containing recovery placeholders) and a list of errors. See
-[src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md)
+[chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)
 for the recovery design and error-rendering details.
 
 ### 10.3 Semantic errors
@@ -3490,7 +3490,7 @@ the demo programs.
 ## See also
 
 - [docs/design.md](design.md) — overall Cambra architecture.
-- [src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md) — the parser implementation.
+- [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md) — the parser implementation.
 - [src/ccl/design/](../src/ccl/design/README.md) — the CCL IR and the
   lowering/inference/optimization passes.
 - [docs/operational-semantics/summary.md](operational-semantics/summary.md) — CCL's operational semantics.

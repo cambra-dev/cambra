@@ -31,7 +31,7 @@
 //!
 //! Both layers preserve the original chumsky error in the returned
 //! `ParseResult::errors` list, so a file with multiple syntax errors
-//! reports them all in one pass. See the sibling `design-chl-parser.md`,
+//! reports them all in one pass. See `chl-parser/design-chl-parser.md`,
 //! "Statement-level recovery" — the load-bearing `.at_least(1)` detail and
 //! the lexer-level `UnclosedBracket` interaction.
 //!
@@ -58,12 +58,12 @@ use chumsky::input::{Input, ValueInput};
 use chumsky::prelude::*;
 use smol_str::SmolStr;
 
-use crate::chl_parser::ast::{
+use crate::ast::{
     AnnotationMode, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, Comprehension, Expr,
     IfBranch, Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, RecordField, Span,
     Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
 };
-use crate::chl_parser::lexer::{self, Token};
+use crate::lexer::{self, Token};
 
 mod error;
 // `error::*` is the public re-export surface for the diagnostics types. The

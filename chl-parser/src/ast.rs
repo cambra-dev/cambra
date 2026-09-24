@@ -1,7 +1,7 @@
 //! CHL surface AST.
 //!
 //! Produced by [`super::parser`] and consumed (in a later phase) by
-//! [`crate::ccl::lower`]. Until the lowering migration lands, this AST is only
+//! `cambra::ccl::lower`. Until the lowering migration lands, this AST is only
 //! used by the parser's own tests.
 //!
 //! # Design choices vs. `rustpython_ast`
@@ -232,7 +232,7 @@ pub enum Stmt {
     },
 
     /// ``match scrutinee: case `tag(binder): … case `tag2: …`` — tag dispatch over
-    /// a [`crate::ccl::Type::Variant`].
+    /// a `cambra::ccl::Type::Variant`.
     ///
     /// A block statement mirroring [`Stmt::If`], and value-yielding by the same
     /// rule: in a position that requires a value, every arm's block must end in
@@ -305,7 +305,7 @@ pub struct MatchArm {
     /// The tag this arm matches, or `None` for the **default arm** `case _:`,
     /// which matches whatever the tagged arms did not.
     ///
-    /// Mirrors [`crate::ccl::Branch`]'s `pattern: Option<Pattern>`, which is
+    /// Mirrors `cambra::ccl::Branch`'s `pattern: Option<Pattern>`, which is
     /// the shape this lowers to: a tag-less branch in a scrutinee-`Case`.
     pub pattern: Option<MatchPattern>,
     pub body: Vec<Spanned<Stmt>>,
@@ -352,7 +352,7 @@ pub struct Param {
 ///
 /// The two spellings differ only in the mode; the type expression is parsed
 /// identically. Lowering turns [`AnnotationMode::Bounded`] into a
-/// [`crate::ccl::Type::BoundedHole`] wrapper and leaves `Exact` bare.
+/// `cambra::ccl::Type::BoundedHole` wrapper and leaves `Exact` bare.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeAnnotation {
     pub mode: AnnotationMode,
@@ -394,7 +394,7 @@ pub enum AssignTarget {
     /// "Surface-marker nodes: `For`, `MutWrite`, `Begin`, `Feed`"); every other
     /// statement form rejects it at lowering, where the message can name the binder
     /// the form wanted. The checked spelling `m[k]? := v` is refused earlier, in
-    /// [`expr_to_assign_target`](crate::chl_parser::parser), because it is not a
+    /// [`expr_to_assign_target`](crate::parser), because it is not a
     /// target this enum can hold rather than a target used in the wrong statement.
     ///
     /// The target is an arbitrary expression rather than a name so that a write
@@ -502,7 +502,7 @@ pub enum Expr {
     ///
     /// Term-level braces are reserved for structural **type** syntax (see
     /// `docs/chl-spec.md`), so this is a record *type*: lowering reads it as a
-    /// [`crate::ccl::Type::Record`] in annotation position and rejects it in
+    /// `cambra::ccl::Type::Record` in annotation position and rejects it in
     /// value position (a record *value* is `(x=1, y=2)`, [`Expr::Record`]).
     BraceRecord(Vec<RecordField>),
 
@@ -510,7 +510,7 @@ pub enum Expr {
     ///
     /// Term-level braces are reserved for structural **type** syntax (see
     /// `docs/chl-spec.md`): a tuple type `{T, U}`. Lowering interprets it as a
-    /// [`crate::ccl::Type::Tuple`] in annotation position and rejects it in
+    /// `cambra::ccl::Type::Tuple` in annotation position and rejects it in
     /// value position.
     ///
     /// Braces in type position are always a *product*, never grouping, which
@@ -522,7 +522,7 @@ pub enum Expr {
     /// - **Zero elements** — `{}` — is the **unit type**, not a zero-field
     ///   product (`docs/chl-spec.md`, "6.6 The empty product is unit"). Lowering
     ///   maps the empty group there; it does *not* build an empty
-    ///   [`crate::ccl::Type::Tuple`], which is not a valid type.
+    ///   `cambra::ccl::Type::Tuple`, which is not a valid type.
     BraceGroup(Vec<Spanned<Expr>>),
 
     /// A refinement type `{ T where p }`: the base type `T`, the keyword
@@ -532,13 +532,13 @@ pub enum Expr {
     /// Term-level braces are reserved for structural **type** syntax like
     /// [`Expr::BraceRecord`] / [`Expr::BraceGroup`], so this too is only
     /// meaningful in annotation position: lowering reads it as a
-    /// [`crate::ccl::Type::Refinement`] and rejects it in value position.
+    /// `cambra::ccl::Type::Refinement` and rejects it in value position.
     ///
     /// `base` is a single colon-free type expression (the parser rejects a
     /// multi-item or `field: T` base before this variant is built). `predicate`
     /// is an ordinary CHL `Bool` expression in which `_` denotes the value being
     /// refined; lowering maps that `_` to the reserved refinement binder
-    /// (`crate::ccl::REFINEMENT_BINDER`).
+    /// (`cambra::ccl::REFINEMENT_BINDER`).
     BraceRefinement {
         base: Box<Spanned<Expr>>,
         predicate: Box<Spanned<Expr>>,
@@ -550,7 +550,7 @@ pub enum Expr {
     ///
     /// Like [`Expr::BraceRefinement`], this is structural **type** syntax,
     /// meaningful only in annotation position: lowering reads it as a
-    /// [`crate::ccl::Type::Fun`] (a compute function, `⇒`) and rejects it in
+    /// `cambra::ccl::Type::Fun` (a compute function, `⇒`) and rejects it in
     /// value position. It is right-associative — `A => B => C` parses as
     /// `A => (B => C)` — because the parser takes the whole expression to the
     /// right of `=>` as the codomain.
@@ -579,7 +579,7 @@ pub enum Expr {
     ///
     /// One node for both because they are one operation, projecting a field; what
     /// differs is only how the field is keyed, which
-    /// [`ProjKey`](crate::ccl::ProjKey) already models. Lowering resolves the key once,
+    /// `cambra::ccl::ProjKey` already models. Lowering resolves the key once,
     /// so the distinction is stated where projection is built rather than a third time
     /// here. An identifier cannot begin with a digit, so the forms never collide.
     Attribute {
@@ -595,7 +595,7 @@ pub enum Expr {
     /// The backtick is what distinguishes a tag from a name, in every position:
     /// without it `some(1)` would be a [`Expr::Call`] to a function named
     /// `some`, and `` {some{Int}} `` a type application. Tags need no
-    /// declaration — [`crate::ccl::Type::Variant`] is structural, so
+    /// declaration — `cambra::ccl::Type::Variant` is structural, so
     /// `` `tag(𝑒) `` synthesises the singleton variant `` {`tag{𝑇}} `` and width
     /// subtyping flows it into any consumer whose tag set contains it. See
     /// `docs/chl-spec.md`, "3.15 Variant constructors".

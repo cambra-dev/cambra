@@ -22,7 +22,7 @@
 //! emitted if the last token wasn't one, and the stack is fully unwound with
 //! `DEDENT`s so every `INDENT` has a partner.
 
-use crate::chl_parser::ast::Span;
+use crate::ast::Span;
 use logos::Logos;
 use smol_str::SmolStr;
 use std::fmt;

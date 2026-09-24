@@ -540,7 +540,7 @@ mod tests {
     /// Parse and lower a CHL program, *without* uniquifying.
     fn lower_only(code: &str) -> Expr {
         let mut ctx = LoweringContext::default();
-        let stmts = crate::chl_parser::parse_module(code)
+        let stmts = chl_parser::parse_module(code)
             .into_result()
             .expect("parse failed")
             .body;
