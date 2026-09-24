@@ -530,6 +530,20 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
+/// The transactional half: a `with begin():` block whose write reads nothing, over a source
+/// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
+#[test]
+fn a_constant_transactional_write_over_an_empty_filtered_source() {
+    agree(indoc! {r#"
+        pool: Mut(Int, Txn) := 100
+        for r in [z for z in [1, 2] if z > 9]:
+            with begin():
+                pool := 7
+        out = test_sink()
+        out << await_final(pool)
+    "#});
+}
+
 /// A terminal read inside a conditional's test. The test compiles to a refinement predicate
 /// on the branch domain, so the read sits in a type slot rather than in the term, and loop
 /// recognition's rewrite of transactional reads has to reach it there.
