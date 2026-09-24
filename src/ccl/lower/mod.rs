@@ -260,7 +260,7 @@ impl LoweringResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Endpoints {
     /// Open it. The pass is compiling the version that will serve it, and serving
-    /// an address the previous version did not is what adding an endpoint means.
+    /// an address the predecessor did not is what adding an endpoint means.
     #[default]
     Open,
     /// Leave it unopened, and lower it to an
@@ -344,7 +344,7 @@ pub struct LoweringContext {
     /// Every `http_serve` route lowered *in this pass*, by source name.
     ///
     /// Separate from [`sources`](Self::sources) because that map is seeded with
-    /// the endpoints a previous version of the program opened
+    /// the endpoints a predecessor of the program opened
     /// ([`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry)), so a name
     /// being present there means "already open", not "already lowered". Two
     /// `http_serve` calls on one route within a single program remain an error;
@@ -513,7 +513,7 @@ impl LoweringContext {
     ///
     /// A call naming one of these binds it; a call naming anything else opens
     /// it. Both are allowed in every version — a replacement inherits what the
-    /// running program has and may add to it.
+    /// predecessor has and may add to it.
     pub fn adopt_sources_and_sinks(
         &mut self,
         sources: impl IntoIterator<Item = (String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>)>,

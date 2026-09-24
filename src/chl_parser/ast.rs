@@ -193,7 +193,7 @@ pub enum Stmt {
         value: Spanned<Expr>,
     },
 
-    /// A declaration seeded from the version this source replaces:
+    /// A declaration seeded from the predecessor:
     ///
     /// ```text
     /// @LoadFrom(qty)

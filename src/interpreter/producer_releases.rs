@@ -84,7 +84,7 @@ impl ProducerReleases {
     /// operators the replacement rebuilds register as new producers, and a source
     /// hands a newly-registered one everything it has retained, so without this
     /// the replacement recomputes the program's history instead of continuing it
-    /// and re-emits an output for every input the replaced version answered.
+    /// and re-emits an output for every input the predecessor answered.
     ///
     /// The agreement is the safe answer: an index some producer has not finished
     /// with is not skipped, so an element that arrived but went unhandled is still

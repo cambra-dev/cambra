@@ -410,7 +410,7 @@ impl FanOut {
 /// a store's body reading the store's own prior value. Owning it from there
 /// closes a cycle through `FanOutShared::producer` that keeps the whole
 /// subgraph alive for the life of the process, which across a program reload
-/// means every retired version's operators are retained and the release
+/// means every predecessor's operators are retained and the release
 /// records their producers hold are never handed back.
 ///
 /// Reading through a `Weak` is sound in that position because the read happens

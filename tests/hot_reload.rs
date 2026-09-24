@@ -67,7 +67,7 @@
 //! | Two loops, or two transaction writers, swap which source they read | Accepted; each keeps its value and continues where its new source has got to |
 //! | A variable moves to a loop over a fixed collection | Accepted; same as above — the value seeds and the collection folds on top of it |
 //! | The body of a loop over a fixed collection is edited | Accepted; the fold resumes at the position it had reached, so the new rule governs the elements left |
-//! | The same, with the fold caught partway | Accepted; every element is folded once, and the cut falls at the position the retired version had reached |
+//! | The same, with the fold caught partway | Accepted; every element is folded once, and the cut falls at the position the predecessor had reached |
 //! | The collection itself is edited | Accepted; the edited collection is a different computation, so its iteration is rebuilt and the collection folded whole |
 //! | The same, over a collection a filter narrows | Accepted; the cut falls on a position the filter kept, which is a position of the collection it filters |
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
@@ -77,7 +77,7 @@
 //! | A reload after one that kept a stateful binding whole | Accepted; the variable under the kept binding is still carried and still guarded |
 //! | A variable is retired and a new one is seeded from it with `@LoadFrom(x)` | Accepted; the new variable starts at the value the retired one held |
 //! | The same, where the variable is a `Map` | Accepted; the collection carries whole and the new version writes on top of it |
-//! | The same, transformed on its way into the new variable | Accepted; the transform applies to every entry the retired version held, and the writer does not fire again |
+//! | The same, transformed on its way into the new variable | Accepted; the transform applies to every entry the predecessor held, and the writer does not fire again |
 //! | The same, where the collection's values are records | Accepted; every field of every entry survives the transform |
 //! | The same, over three versions, each loading from the one before | Accepted; a load is transitional per version, not once per program |
 //! | A version loads two variables | Accepted; each is taken over by its own load |
@@ -85,6 +85,7 @@
 //! | A load whose value seeds a loop over the collection it was folded from | Accepted; the store resumes above the positions the value summarizes, so nothing is folded twice |
 //! | The same, over a different collection | Accepted; the new collection is folded whole on top of the loaded value |
 //! | The same, with the retired variable also kept | Accepted; it resumes where it was, and the new one starts from the same value |
+//! | A load inside an `if` branch or a `match` arm | Accepted; a branch is no scope, so the spelling reads what it reads outside the branch |
 //!
 //! # What it may not
 //!
@@ -98,9 +99,11 @@
 //! | `@LoadFrom(x)` names a variable the program declares but has decided no value for | Refused, saying the value is missing rather than the variable |
 //! | A top-level `@LoadFrom(x)` names a variable that lives inside an instantiation | Refused; the search never descends, and that variable is dropped — including where the load's own target is spelled like the binding that variable sits under |
 //! | `@LoadFrom(x)` reads a variable at another type | Refused, naming both types |
-//! | Either of those two, where the variable is a `Map` | Refused alike; the comparison is against the extent the running program holds the collection at, and the bounded `<:` annotation does not weaken it |
+//! | Either of those two, where the variable is a `Map` | Refused alike; the comparison is against the extent the predecessor holds the collection at, and the bounded `<:` annotation does not weaken it |
 //! | `@LoadFrom(x)` sits inside a stateful function called more than once | Refused; the spelling names a declaration per call site, and a load edits the content that would tell those apart, so a reorder between them cannot be caught. Binding each call site to a name is the remedy, and resolves the load |
 //! | A source containing `@LoadFrom(x)` is started from nothing | Refused; such a version is an upgrade of a specific predecessor |
+//! | `@LoadFrom(x)` names a feed | Refused, naming the spelling; a feed is no mutable variable and holds nothing between versions |
+//! | `@LoadFrom(x)` seeds a store whose positions are counted in another domain | Refused, naming both domains; a commit count is no place among a loop's items |
 //! | The source does not compile | Refused |
 //!
 //! In every refusal the running program keeps serving. Diffing is covered

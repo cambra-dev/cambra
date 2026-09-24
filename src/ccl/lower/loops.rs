@@ -509,7 +509,9 @@ fn lower_for_body_stmts_scoped(
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     "only assignments, function definitions, `<<` feeds and `yield` \
-                     are supported as non-terminal statements in for-loop bodies",
+                     are supported as non-terminal statements in for-loop bodies. A \
+                     declaration goes above the loop, `@LoadFrom` included: its value is a \
+                     snapshot, so a per-iteration one would be the same constant every time",
                 ));
             }
         }

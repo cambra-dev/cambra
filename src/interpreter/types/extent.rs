@@ -293,7 +293,7 @@ pub trait DataSourceDomainExtentImpl {
     /// operators the replacement rebuilds register as new producers, and a source
     /// hands a newly-registered one everything it has retained, so without this
     /// the replacement recomputes the program's history instead of continuing it
-    /// and re-emits an output for every input the replaced version answered.
+    /// and re-emits an output for every input the predecessor answered.
     ///
     /// What is carried is the *agreed* release — the part every producer is
     /// finished with — so an element that arrived but went unhandled is still
@@ -340,7 +340,7 @@ pub trait DataSourceDomainExtentImpl {
     /// — see `src/ccl/design/hot-reload.md`, "A route a version stops serving is retired".
     /// A request that arrived before the retirement has no version left to
     /// compute its reply, and the source holding it is kept alive past the route
-    /// by the handover a retired version's operators sit in, so nothing else ends
+    /// by the handover a predecessor's operators sit in, so nothing else ends
     /// the client's wait.
     ///
     /// The default does nothing, unlike the release methods above: a source with

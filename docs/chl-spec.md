@@ -185,7 +185,7 @@ surface level.
 =  += -= *= //=
 :=
 <<  <<=
-(  )  [  ]  {  }  ,  :  .  ;  \  `
+(  )  [  ]  {  }  ,  :  .  ;  \  `  @
 ```
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
@@ -193,10 +193,12 @@ a mutable variable. It is *not* Python's walrus operator: it is an
 Algol-tradition assignment **statement**, and there is still no
 assignment-as-expression.
 
+`@` introduces a decorator and nothing else ([1.9 Decorators](#19-decorators));
+it is not an operator, and there is no matrix multiplication.
+
 **Notably absent vs. Python** at the lexical level: `/`, `%`, `**`, `>>`,
-`~`, `@` (no matmul, no decorators), walrus assignment-*expressions*, and
-`...`. The parser refuses these at the syntactic level rather than
-parsing-then-erroring.
+`~`, walrus assignment-*expressions*, and `...`. The parser refuses these at the
+syntactic level rather than parsing-then-erroring.
 
 `++` is not a Python token at all: it is CHL's collection-union operator
 (§3.3). There is no increment operator — `++` is always binary.
@@ -320,7 +322,7 @@ with_stmt       ::= "with" [ ident "=" ] expression ":" block
 def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" [ "=>" expression ] ":" block
 param           ::= ident [ ":" expression ]
 
--- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
+-- A declaration seeded from the predecessor, via `@LoadFrom`. The
 -- decorator and the declaration are one statement, which is why a declaration
 -- may carry an annotation and no value here and nowhere else.
 load_from_stmt  ::= "@" "LoadFrom" "(" ident ")" NEWLINE
@@ -719,7 +721,8 @@ point of use. Mutual recursion between top-level functions is
 | `a ++ b` | Collection union (multiset sum) of two collections of the same element type. Since collections are unordered (§3), this is not "concatenation"; it is the bag union. |
 
 Operators absent on purpose: `/` (no fractional type), `%`, `**`, `>>`,
-`~`, `@`. Attempting to use these in source is a parse error.
+`~`. Attempting to use these in source is a parse error. `@` is lexed, as the
+decorator introducer ([1.9 Decorators](#19-decorators)), and is no operator.
 
 > **Direction [Tentative] — `Real` and `/`.** The target language has a
 > fractional type, `Real`, and a division operator `/` on it. Neither
@@ -3157,11 +3160,13 @@ This is the one declaration that carries an annotation and no value — the
 decorator is where the value comes from. A bare `y: T` elsewhere is a parse error
 ([4. Statement semantics](#4-statement-semantics)). `LoadFrom` is the only decorator CHL has.
 
-A load is a declaration, so it appears where declarations do: the top level, or a
-`def` body. A `for` body and a `with begin():` block take statements rather than
-declarations and reject one. Inside a `def`, the name resolves to the variable
-that function's own instantiation declares before it resolves to a top-level one,
-the way a name resolves anywhere else.
+A load is a declaration, so it appears where declarations do: the top level, a
+`def` body, an `if` branch, or a `match` arm. A `for` body and a `with begin():`
+block take statements rather than declarations and reject one. A branch is no
+scope, so a load in one reads what the same spelling reads at the statement
+around it. Inside a `def`, the name resolves to the variable that function's own
+instantiation declares before it resolves to a top-level one, the way a name
+resolves anywhere else.
 
 A load inside a `def` is refused where the version being replaced called that
 `def` more than once. Each call site declares its own variable of the loaded
@@ -3170,9 +3175,11 @@ a reorder would move each site's value onto its neighbour with nothing in either
 version saying so. Binding each call site to a name — `a = f(…)` rather than a
 bare `f(…)` — tells them apart, and the load then resolves.
 
-`x` is a name, not an expression, and it is a variable the *previous* version
-declared: the version being compiled need not declare it, and retiring `qty`
-while seeding `qty_units` from it is the case the decorator exists for.
+`x` is a name, not an expression, and it is a mutable variable the *previous*
+version declared: the version being compiled need not declare it, and retiring
+`qty` while seeding `qty_units` from it is the case the decorator exists for. A
+mutable variable is the only thing that holds a value between versions, so `x`
+naming a feed reads nothing and is refused as a name no predecessor holds.
 
 **What it binds is an ordinary binding.** Nothing requires the declaration to be
 mutable. A version that only reads what its predecessor held declares nothing
@@ -3198,7 +3205,7 @@ and loading from `x` — leaves `x` running on its own value and starts the new
 variable at a copy of it taken at the swap. The two are separate variables from
 then on, and neither reads the other.
 
-**The annotation states the shape.** The value the running program holds has to fit
+**The annotation states the shape.** The value the predecessor holds has to fit
 it, and the two forms ([Two annotation forms: exact and
 bounded](#two-annotation-forms-exact-and-bounded)) read here as they do at any other
 binder: `held: T` binds at `T`, and `held <: T` binds at the loaded value's own type
@@ -3213,9 +3220,14 @@ qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
 A comprehension over a map binds each value and keeps the keys, so that scales
 every quantity the predecessor held.
 
+A collection takes the bounded form. The exact form pins the map's domain, the
+comprehension over the binding has a domain of its own, and the two do not meet —
+`held: Map(String, Int)` against the example above is refused where
+`held <: Map(String, Int)` compiles.
+
 **A running program is required today.** A source containing `@LoadFrom(x)` is an
 upgrade of a specific predecessor: compiled from nothing, it is an error naming
-`x`, and so is one naming a variable the running program does not hold. There is
+`x`, and so is one naming a variable the predecessor does not hold. There is
 no `@LoadFrom(x, default)` — a default would turn that error back into a silent
 wrong answer.
 
@@ -3224,6 +3236,17 @@ Durable state is **[Tentative]** ([design.md](design.md)), and a process
 restarting from a store on disk is the same migration against a predecessor that
 is not running; which predecessors a load may name is settled with durable state
 rather than here.
+
+**A seeded store resumes.** The value is the fold of the positions the predecessor
+folded into it, so the store built around it carries on above them rather than
+folding them again. Where the new version's loop reads a different collection
+there is nothing to resume over, and that collection folds whole on top of the
+loaded value ([A loaded value summarizes
+positions](../src/ccl/design/hot-reload.md#a-loaded-value-summarizes-positions)).
+
+That is why a load and the variable it seeds are sequenced the same way. A commit
+history seeds a commit history and a loop accumulator one over a loop; across the
+two it is refused, a commit count being no place among a loop's items.
 
 **It is transitional.** The seeding happens once, so the decorator comes out in
 the next version. A name a version loads and does not declare is gone after that

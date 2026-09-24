@@ -6,7 +6,8 @@ use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
-        BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Scheduler, Value,
+        BaseType, ColumnValue, Consumer, Extent, FuncBinding, FunctionDef, Predicate, Scheduler,
+        Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -101,11 +102,29 @@ impl TileOperator for Constant {
         _scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         consumer.notify();
+        let mode = match self.tiling() {
+            Tiling::SealedFunction { domain, codomain } => {
+                let Value::Function(bindings) = &self.value else {
+                    unreachable!(
+                        "a collection constant holds a bindings table — \
+                         `Constant::collection` is the only way to this tiling and checks it"
+                    )
+                };
+                ConstantMode::Collection(Box::new(ConstantTable {
+                    bindings: bindings.clone(),
+                    domain: domain.clone(),
+                    codomain: codomain.extent(),
+                    built: None,
+                }))
+            }
+            _ => ConstantMode::Scalar {
+                value: self.value.clone(),
+                released: false,
+            },
+        };
         Box::new(ConstantProducer {
             base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling()),
-            value: self.value.clone(),
-            released: false,
-            table: None,
+            mode,
         })
     }
 
@@ -123,85 +142,109 @@ impl TileOperator for Constant {
 
 struct ConstantProducer {
     base: ProducerBase,
-    value: Value,
-    released: bool,
-    /// The collection tile, built on the first pull that asks for one.
+    mode: ConstantMode,
+}
+
+/// Which of the two constants this is, holding what only that one has.
+///
+/// The tiling decides it once, at [`TileOperator::subscribe`], and the two
+/// states are exclusive from then on — a scalar has no table to build and a
+/// collection no whole-value release to record.
+enum ConstantMode {
+    /// One value at one position. There is no way to name part of it, which is
+    /// what makes its only release the whole of it.
+    Scalar { value: Value, released: bool },
+    /// The whole bindings table as one tile, keyed by its own domain. Boxed
+    /// because it carries the table's two extents and a scalar carries neither.
+    Collection(Box<ConstantTable>),
+}
+
+/// A collection constant's table and the extents it stands over.
+struct ConstantTable {
+    bindings: Vec<FuncBinding>,
+    domain: Extent,
+    codomain: Extent,
+    /// The tile, built on the first pull that asks for one.
     ///
     /// What holding it saves is the `Value` to [`ColumnValue`] conversion: the
     /// unzip into keys and values, and a `from_values` over each. The tile is
-    /// still cloned per pull, so the keys and values are re-cloned either way.
-    /// A constant's bindings table cannot change, and the obsolete guard that
-    /// does applies to the copy handed out.
-    table: Option<Tile>,
+    /// still cloned per pull, so the keys and values are re-cloned either way. A
+    /// constant's bindings table cannot change, and the obsolete guard that does
+    /// applies to the copy handed out.
+    built: Option<Tile>,
 }
 
 impl TileProducer for ConstantProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-        node.annotate(format!("{}", self.value))
+        match &self.mode {
+            ConstantMode::Scalar { value, .. } => node.annotate(format!("{value}")),
+            ConstantMode::Collection(table) => {
+                node.annotate(format!("{}", Value::Function(table.bindings.clone())))
+            }
+        }
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // `Predicate::True` because a constant is decided in full on the pull that
-        // yields it: the bindings are the whole collection, so there is no key it
-        // has yet to answer. A consumer reading a partial domain as the whole one
-        // is what the predicate exists to prevent, and there is no partial state
-        // here to mistake.
-        if matches!(self.tiling(), Tiling::SealedFunction { .. }) {
-            let table = match self.table.take() {
-                Some(table) => table,
-                None => {
-                    let Tiling::SealedFunction { domain, codomain } = self.tiling() else {
-                        unreachable!("matched immediately above")
-                    };
-                    let Value::Function(bindings) = &self.value else {
-                        unreachable!(
-                            "a collection constant holds a bindings table — \
-                             `Constant::collection` is the only way to this tiling and \
-                             checks it"
-                        )
-                    };
-                    let (keys, values): (Vec<Value>, Vec<Value>) = bindings
+        let obsolete = self.obsolete_guard().clone();
+        let empty = self.tiling().empty_tile();
+        match &mut self.mode {
+            ConstantMode::Scalar { value, released } => {
+                if *released {
+                    empty
+                } else {
+                    Tile::Scalar(ColumnValue::single(value.clone()))
+                }
+            }
+            // `Predicate::True` because a constant is decided in full on the pull
+            // that yields it: the bindings are the whole collection, so there is
+            // no key it has yet to answer. A consumer reading a partial domain as
+            // the whole one is what the predicate exists to prevent, and there is
+            // no partial state here to mistake.
+            ConstantMode::Collection(table) => {
+                let built = table.built.take().unwrap_or_else(|| {
+                    let (keys, values): (Vec<Value>, Vec<Value>) = table
+                        .bindings
                         .iter()
                         .map(|b| (b.input.clone(), b.output.clone()))
                         .unzip();
                     Tile::SealedFunction {
-                        domain: ColumnValue::from_values(keys, domain),
+                        domain: ColumnValue::from_values(keys, &table.domain),
                         codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
                             values,
-                            &codomain.extent(),
+                            &table.codomain,
                         ))),
                         domain_predicate: Predicate::True,
                         deleted: BitSet::new(),
                     }
-                }
-            };
-            let mut tile = table.clone();
-            self.table = Some(table);
-            // A collection's consumers release the keys they are done with, so the
-            // whole table is not what a later pull may return. `release` has already
-            // accumulated every guard into `obsolete_guard`, and returning released
-            // rows is what `get`'s post-condition forbids.
-            tile.remove_guarded(self.obsolete_guard().clone());
-            return tile;
+                });
+                let mut tile = built.clone();
+                table.built = Some(built);
+                // A collection's consumers release the keys they are done with, so
+                // the whole table is not what a later pull may return. `release`
+                // has already accumulated every guard into `obsolete_guard`, and
+                // returning released rows is what `get`'s post-condition forbids.
+                tile.remove_guarded(obsolete);
+                tile
+            }
         }
-        if self.released {
-            return self.tiling().empty_tile();
-        }
-        Tile::Scalar(ColumnValue::single(self.value.clone()))
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // A collection is released a key at a time, and `get_impl` filters against
-        // the guard `release` accumulates, so there is nothing to record here. A
-        // scalar has one position and no way to name part of it, which is what
-        // makes its only release the whole of it.
-        if matches!(self.tiling(), Tiling::SealedFunction { .. }) {
-            return;
-        }
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.released = true;
+        let name = self.name();
+        match &mut self.mode {
+            // A scalar has one position and no way to name part of it, which is
+            // what makes its only release the whole of it.
+            ConstantMode::Scalar { released, .. } => {
+                if obsolete_guard.expect_universal_or_empty(&name) {
+                    *released = true;
+                }
+            }
+            // A collection is released a key at a time, and `get_impl` filters
+            // against the guard `release` accumulates, so there is nothing to
+            // record here.
+            ConstantMode::Collection(_) => {}
         }
     }
 }

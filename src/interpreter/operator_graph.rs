@@ -406,7 +406,7 @@ struct Boundaries {
     sources: Vec<(String, NodeId)>,
     /// Each compiled output field's node.
     sinks: Vec<(String, NodeId)>,
-    /// Operators this compile took from the version it replaces, already rowed
+    /// Operators this compile took from the predecessor, already rowed
     /// by [`record_kept_operators`]. One fan-out reaches several bindings, and a
     /// second row for one id is a defect the table asserts on.
     rowed_kept: std::collections::HashSet<NodeId>,

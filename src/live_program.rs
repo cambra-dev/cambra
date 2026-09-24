@@ -7,7 +7,7 @@
 //! # What a reload may change
 //!
 //! Its logic freely, and its sources and sinks by addition: a version may open a
-//! source or a sink the running program does not have and serves it as soon as
+//! source or a sink the predecessor does not have and serves it as soon as
 //! the swap completes, and one it stops serving is retired. What it may not do is
 //! break the continuity of state — see [`reload`](LiveProgram::reload).
 //!
@@ -25,8 +25,9 @@
 //! carried-forward operator is never left reading a subgraph the reload rebuilt.
 //!
 //! A variable keeps its value even where its logic was edited. Its store is
-//! rebuilt, and each variable it still declares is seeded from what the retired
-//! version left it holding, so the new rule governs from the swap onwards without
+//! rebuilt, and each variable it still declares is seeded from what the
+//! predecessor left it holding, so the new rule governs from the swap onwards
+//! without
 //! discarding what came before. Neither how much a reload reuses nor what it
 //! carries depends on how many reloads preceded it: a kept binding hands on
 //! everything recorded under it, which is what keeps a variable declared inside a
@@ -68,7 +69,7 @@ pub struct ReloadReport {
     /// The rendered difference between the two versions, and nothing else: the
     /// report below is a second answer about the same pair, not part of it.
     pub diff: String,
-    /// How much of the replaced version's graph the new one kept.
+    /// How much of the predecessor's graph the new one kept.
     pub reuse: ReuseTally,
     /// The loops this version adds that begin above the beginning of what they
     /// read. Empty for a reload that adds no loop over a consumed input, which
@@ -219,7 +220,7 @@ impl LiveProgram {
     /// Replace this program with the version `code` describes.
     ///
     /// Rejected when the new version cannot **take over the state**: every
-    /// mutable variable the running program holds a value for must be one the
+    /// mutable variable the predecessor holds a value for must be one the
     /// new version still declares, at the same type, so that its value is seeded
     /// rather than discarded. Those are the refusals [`StateConflict`] names.
     /// Everything else is allowed: logic freely, sources and sinks by addition,
@@ -235,7 +236,7 @@ impl LiveProgram {
     /// answering and only the accumulated history is wrong. A version that
     /// retires a variable says where its value goes by reading it with
     /// `@LoadFrom`, and the other direction is refused too: a `@LoadFrom` naming
-    /// a variable no running program holds.
+    /// a variable no predecessor holds.
     ///
     /// On `Err` the running program is untouched and still serving: both the
     /// compile to [`Phase::Planning`] and this check run before anything is torn
@@ -277,15 +278,17 @@ impl LiveProgram {
             .compile_to_opening(code, Phase::Planning)
             .inspect_err(|_| ctx.sources_and_sinks_mut().release_unrouted_ports())?;
 
-        // What the new version can take over is read off its planned tree,
-        // before anything is built from it, so a version that would lose a value
-        // or change its type is refused while the running program is whole.
-        let conflicts = ctx.state_conflicts(&planned);
+        // Both questions about the new version are read off its planned tree,
+        // before anything is built from it: a version that would lose a value or
+        // change its type is refused while the running program is whole, and the
+        // prefixes a surviving loop will not see are reported without walking a
+        // graph that is gone. `/diff` answers the second off the same read.
+        let (conflicts, unreadable) = ctx.state_report(&self.program.ast, &planned);
         if !conflicts.is_empty() {
             ctx.sources_and_sinks_mut().release_unrouted_ports();
-            // Two failures, and they are opposite ways round: state the running
-            // program holds that this version cannot take over, and state this
-            // version asks for that no running program holds. They read as
+            // Two failures, and they are opposite ways round: state the
+            // predecessor holds that this version cannot take over, and state this
+            // version asks for that no predecessor holds. They read as
             // separate paragraphs because the remedy for one says nothing about
             // the other.
             let (absent, unseatable): (Vec<&StateConflict>, Vec<&StateConflict>) =
@@ -304,31 +307,51 @@ impl LiveProgram {
             };
             let mut paragraphs: Vec<String> = Vec::new();
             if !unseatable.is_empty() {
+                // Each remedy that applies is rendered, as in the `absent` group
+                // below and for the same reason: picking one leaves the other's
+                // names carrying advice that does not answer for them.
+                let mut remedy = String::new();
                 // Naming the declarations is the fix for a positional clash, and
                 // it is not one an author would guess from the other refusals.
-                let remedy = if unseatable.iter().any(|c| {
+                if unseatable.iter().any(|c| {
                     matches!(
                         c,
                         StateConflict::Moved { .. } | StateConflict::LoadFromAnonymous { .. }
                     )
                 }) {
-                    "\nBind each of those declarations to its own name — `a = f(…)` rather than a \
-                     bare `f(…)` — and a reload can follow them wherever they move, and a \
-                     `@LoadFrom` can say which one it reads."
-                } else if unseatable
+                    remedy.push_str(
+                        "\nBind each of those declarations to its own name — `a = f(…)` rather \
+                         than a bare `f(…)` — and a reload can follow them wherever they move, \
+                         and a `@LoadFrom` can say which one it reads.",
+                    );
+                }
+                if unseatable
                     .iter()
                     .any(|c| matches!(c, StateConflict::LoadFromAt { .. }))
                 {
                     // The declaration's annotation is what the value is read
-                    // at, so it has to state the whole of what the running
-                    // program holds rather than the part this version uses.
-                    "\nThe annotation on a `@LoadFrom` declaration is the shape the value is read at, so \
-                     it has to state the whole of what the running program holds."
-                } else {
-                    ""
-                };
+                    // at, so it has to state the whole of what the predecessor
+                    // holds rather than the part this version uses.
+                    remedy.push_str(
+                        "\nThe annotation on a `@LoadFrom` declaration is the shape the value is \
+                         read at, so it has to state the whole of what the predecessor holds.",
+                    );
+                }
+                if unseatable
+                    .iter()
+                    .any(|c| matches!(c, StateConflict::LoadFromDomain { .. }))
+                {
+                    // A seed says where a store resumes, so it has to have been
+                    // counted in the domain the store counts.
+                    remedy.push_str(
+                        "\nA seeded store resumes above the positions its value already \
+                         summarizes, so a `@LoadFrom` reads a variable sequenced the way the \
+                         variable it seeds is: a commit history seeds a commit history, and a \
+                         loop accumulator one over the same extent.",
+                    );
+                }
                 paragraphs.push(format!(
-                    "this version cannot take over state the running program is holding: {}. \
+                    "this version cannot take over state the predecessor is holding: {}. \
 A value carries forward into the same variable at the same type, or into what a `@LoadFrom` reads \
 it into, and only where the source says which variable it belongs to.\n\
 Nothing else is refused: logic may change freely, endpoints may come and go, and a variable \
@@ -339,7 +362,7 @@ may move between loops.{remedy}",
             if !absent.is_empty() {
                 // The two have different remedies: a name nothing declares is a
                 // source to fix, while a name declared but undecided is a value
-                // the running program has not produced, which no edit to this
+                // the predecessor has not produced, which no edit to this
                 // version reaches.
                 // Each remedy that applies is rendered: picking one leaves the other's
                 // names carrying advice that does not answer for them.
@@ -360,21 +383,17 @@ may move between loops.{remedy}",
                 {
                     remedy.push_str(
                         "\nA store nothing reads is never driven, so it decides no value to \
-                         hand on. Reading the variable somewhere in the running program is \
+                         hand on. Reading the variable somewhere in the predecessor is \
                          what gives it one.",
                     );
                 }
                 paragraphs.push(format!(
-                    "this version reads state the running program does not hold: {}.{remedy}",
+                    "this version reads state the predecessor does not hold: {}.{remedy}",
                     render(&absent),
                 ));
             }
             return Err(vec![CompileError::Unsupported(paragraphs.join("\n\n"))]);
         }
-
-        // Read before teardown, off the same planned tree the guard used, so this
-        // and `/diff` answer alike and neither has to walk a graph that is gone.
-        let unreadable = ctx.unreadable_inputs(&self.program.ast, &planned);
 
         self.tear_down();
         ctx.retire_version();
