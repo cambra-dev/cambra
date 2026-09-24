@@ -58,12 +58,14 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{PredMemo, free_among, is_free, strip_iterate_markers};
+use crate::ccl::ccl_utils::{
+    PredMemo, free_among, is_free, is_free_in_type, strip_iterate_markers,
+};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::scope::{
     ScopedItem, ScopedItemMut, for_each_scoped_item, for_each_scoped_item_mut,
 };
-use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Branch, Name, PredicateId, Type, TypedBinding, TypedExpr, TypedExprNode};
 
 /// A term binder name.
 pub type Binder = Name;
@@ -991,6 +993,38 @@ impl Subst {
         e
     }
 
+    /// Discharge `env` into a **binder's declared type**.
+    ///
+    /// A binder a caller holds beside its definition — `(TypedBinding, TypedExpr)`, as the
+    /// mutability-elimination phases pass a recurrence's binding around — is not inside any
+    /// expression tree, so [`discharge_env_in_place`](Self::discharge_env_in_place) cannot
+    /// reach it. Rewriting only the definition leaves the two halves disagreeing about the
+    /// same type, which surfaces later as a mismatch between a binding and its own body.
+    ///
+    /// A binder's type is written in the *enclosing* scope — a binder does not bind in its
+    /// own type — so the substitution applies unrestricted, exactly as it does to a binder
+    /// type the walk reaches inside a tree.
+    pub fn discharge_env_in_binder(b: &mut TypedBinding, env: &HashMap<Name, TypedExpr>) {
+        let live: BTreeMap<Binder, Mapping> = env
+            .iter()
+            .filter(|(name, _)| {
+                is_free_in_type(name, &b.ty)
+                    || b.user_annotation
+                        .as_ref()
+                        .is_some_and(|a| is_free_in_type(name, a))
+            })
+            .map(|(name, term)| (name.clone(), Mapping::Discharge(Box::new(term.clone()))))
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        let subst = Subst::of_binders(live);
+        b.ty = subst.apply_type(&b.ty);
+        if let Some(annotation) = &b.user_annotation {
+            b.user_annotation = Some(subst.apply_type(annotation));
+        }
+    }
+
     fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &PredMemo<Subst>) {
         // Inert subtree (no substituted binder free in value or type slots):
         // leave it untouched — predicates in particular stay un-rebuilt,
@@ -1801,7 +1835,7 @@ pub fn close_pi_binder(binder: &Name, ty: &Type) -> Type {
         "a `PiBound` is a reference, never a binder, so nothing abstracts over \
          one: closing at one would rewrite references to an unrelated function",
     );
-    if !crate::ccl::ccl_utils::is_free_in_type(binder, ty) {
+    if !is_free_in_type(binder, ty) {
         return ty.clone();
     }
     let enclosing = [Some(binder.clone())];

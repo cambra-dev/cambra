@@ -702,7 +702,8 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             keys,
             writers,
             domain,
-        } => emit_transact(keys, writers, domain, ctx)?,
+            parameter,
+        } => emit_transact(keys, writers, domain, parameter.as_ref(), ctx)?,
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 

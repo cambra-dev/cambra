@@ -2434,9 +2434,20 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
     key_types: &std::collections::HashMap<Name, Type>,
+    parameter: Option<&Type>,
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
     let s_ty = ctx.subexpr(&mut writer.source)?;
+    // A nested carrier's components are lifted pointwise over its enclosing context,
+    // so the source is an iteration source under that context: peel the context function
+    // and the iteration source is what a top-level carrier's is.
+    let s_ty = match parameter {
+        Some(_) => {
+            ctx.as_function(&s_ty, &|| "nested transaction source".to_string())?
+                .1
+        }
+        None => s_ty,
+    };
     let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
 
     let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
@@ -2492,9 +2503,13 @@ fn emit_transact_writer<C: Typing>(
     ]);
 
     let body_ty = ctx.subexpr(&mut writer.body)?;
-    ctx.require_sub(&body_ty, &fun(body_dom, decision_codom), &|| {
-        "transaction body".to_string()
-    })?;
+    // A nested writer's body takes the pair `lambda_elim` merged its binders into
+    // alongside the slots, which is the term as elimination leaves it.
+    let expected = match parameter {
+        Some(p) => fun(Type::Tuple(vec![p.clone(), body_dom]), decision_codom),
+        None => fun(body_dom, decision_codom),
+    };
+    ctx.require_sub(&body_ty, &expected, &|| "transaction body".to_string())?;
     for (new, contrib) in news {
         ctx.require_sub(&new, &contrib, &|| "transaction write".to_string())?;
     }
@@ -2506,8 +2521,8 @@ fn emit_transact_writer<C: Typing>(
 /// The node denotes the mutable variable **record** `{key: ⟦key⟧}` — each key's read type
 /// `Fun(domain, α)` (the value's history over the mutable variable's sequencing domain),
 /// what a variable projection `__hist.key` yields; a read reduces it to the
-/// latest `α` via `final_or_default(history, init)`. The init is the position-0
-/// value, so it bounds the codomain `α` (`init <: α`), not the whole collection.
+/// latest `α` via `final_or_default(history, init)`. The init is the value before the
+/// first position, so it bounds the codomain `α` (`init <: α`), not the whole collection.
 /// There is no recurrence *fixpoint* over a step type — the mutable variable↔writer cycle
 /// is realized operationally at op-conversion — so no `σ <: α` constraint, just
 /// each writer's per-key mutable variable round-trip.
@@ -2519,6 +2534,7 @@ pub(super) fn emit_transact<C: Typing>(
     keys: &mut [TransactKey],
     writers: &mut [WriterSite],
     domain: &Type,
+    parameter: Option<&Type>,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     use std::collections::HashMap;
@@ -2538,19 +2554,35 @@ pub(super) fn emit_transact<C: Typing>(
         // reach this variable too — each `with begin(): flag := True` is an ordinary
         // `MutWrite` against it — so `flag := False` written `True` joins to `Bool`
         // rather than claiming `False`.
-        ctx.require_sub(&init_ty, &value_ty, &|| "transact init".to_string())?;
+        // A nested carrier's seed is where the inner loop starts at each enclosing
+        // position — the enclosing accumulator — so it is a morphism of the enclosing
+        // context rather than a closed value.
+        let seeded = match parameter {
+            Some(p) => fun(p.clone(), value_ty.clone()),
+            None => value_ty.clone(),
+        };
+        ctx.require_sub(&init_ty, &seeded, &|| "transact init".to_string())?;
         fields.push((k.name.field_key(), read_ty));
         key_types.insert(k.name.clone(), value_ty);
     }
     for w in writers.iter_mut() {
-        emit_transact_writer(w, &key_types, ctx)?;
+        emit_transact_writer(w, &key_types, parameter, ctx)?;
         // A `__to_<defer>` field on the writer's decision record becomes a
         // virtual mutable variable key the consumer reads as `__hist.__to_…`. Its stream
         // is **site-domained** — one tap value per iteration of *this
         // writer's* source (the channel unions channelize assembled reference
         // it at that type) — unlike the key histories, which live over the
         // mutable variable's sequencing domain.
-        let site_dom = w.source.ty.domain().unwrap_or_else(|| domain.clone());
+        //
+        // A **nested** writer's source is curried by the enclosing parameter, one
+        // collection per enclosing position, so the iteration it taps is the codomain's
+        // domain. Reading the source's own domain there names the parameter, which is not
+        // a collection domain at all.
+        let site_dom = match parameter {
+            Some(_) => w.source.ty.codomain().and_then(|c| c.domain()),
+            None => w.source.ty.domain(),
+        }
+        .unwrap_or_else(|| domain.clone());
         for (field, value_ty) in writer_tap_fields(&w.body.ty) {
             fields.push((
                 field,

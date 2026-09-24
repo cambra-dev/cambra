@@ -671,17 +671,16 @@ fn mut_annotation_with_non_txn_domain_rejected() {
     );
 }
 
-/// A mutable variable *declared inside* a for-loop body (rather than before it) is
-/// rejected: its sequencing domain is the loop's own iteration extent, so the body
-/// would carry a nested recurrence the unified phase has no domain for.
+/// A mutable variable a for-loop body **introduces** accumulates over the rest of that
+/// iteration, so it is a recurrence nested inside the loop's — the carrier a nest builds.
+/// Its updates carry across the statements of one iteration and it restarts at its seed on
+/// the next, which is what makes `y := i; t += y` answer the same as `t += i`.
 ///
-/// Rejected at **every spelling**, because whether the introduction carries a type
-/// annotation says nothing about whether it introduces a mutable variable. Gating on the
-/// annotation instead accepted the bare `y := 0` — which then fell back to a
-/// per-iteration shadowing `let`, silently discarding each update at the iteration
-/// boundary, the very thing `:=` exists to avoid. (The spellings are the ones a
-/// `:=` binder accepts at all — see `mut_decl_annotation_is_exact_and_is_a_mut`.)
+/// Both spellings, because whether the introduction carries a type annotation says nothing
+/// about whether it introduces a mutable variable. (The spellings are the ones a `:=`
+/// binder accepts at all — see `mut_decl_annotation_is_exact_and_is_a_mut`.)
 #[rstest]
+#[timeout(Duration::from_secs(10))]
 #[case::annotated_mut(indoc! {r#"
     t := 0
     for i in [1, 2, 3]:
@@ -696,15 +695,86 @@ fn mut_annotation_with_non_txn_domain_rejected() {
         t += y
     t
 "#})]
-#[case::annotated_txn(indoc! {r#"
-    t := 0
-    for i in [1, 2, 3]:
-        y: Mut(Int, Txn) := i
-        t += y
-    t
-"#})]
-fn register_declared_inside_loop_rejected(#[case] code: &str) {
-    expect_compile_error(code, "introduced inside a for-loop body");
+fn a_mutable_variable_introduced_inside_a_loop_accumulates_over_the_iteration(#[case] code: &str) {
+    check_scalar(code, Value::Int(6));
+}
+
+/// The introduction is scoped to the block that writes it, so an `if` branch introduces
+/// one of its own and a sibling branch introduces a separate one. A branch body is a
+/// statement chain like the loop body around it, and the same rule reads it.
+///
+/// The splice that carries the post-`if` statements onto each branch goes *inside* the
+/// introduction, as it does inside a `let`. Splicing after it leaves the whole
+/// introduction in effect position, where the recurrence phase has no arm for it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::one_branch(
+    indoc! {r#"
+        t := 0
+        for i in [1, 2, 3]:
+            if i > 1:
+                y := 0
+                y += i
+                y += 10
+                t += y
+        t
+    "#},
+    25
+)]
+#[case::both_branches(
+    indoc! {r#"
+        t := 0
+        for i in [1, 2]:
+            if i > 1:
+                y := i
+                t += y
+            else:
+                z := i * 100
+                t += z
+        t
+    "#},
+    102
+)]
+fn a_mutable_variable_introduced_inside_a_branch_is_scoped_to_it(
+    #[case] code: &str,
+    #[case] total: i64,
+) {
+    check_scalar(code, Value::Int(total));
+}
+
+/// `x: Mut(V) = init` is rejected for its **operator**, in a loop body as anywhere else:
+/// `=` is a plain immutable binding and a mutable variable is introduced solely with `:=`.
+/// The message points at `:=` rather than at the loop, a loop body being somewhere a
+/// mutable variable may now be introduced.
+#[test]
+fn a_mut_annotation_with_the_immutable_operator_points_at_the_operator() {
+    expect_compile_error(
+        indoc! {r#"
+            t := 0
+            for i in [1, 2, 3]:
+                y: Mut(Int) = i
+                t += y
+            t
+        "#},
+        "use `:=` instead",
+    );
+}
+
+/// A **transactional** mutable variable introduced inside a for-loop body is rejected: it
+/// is sequenced by commit time rather than by the loop around it, so the introduction
+/// names no domain the nest can carry.
+#[test]
+fn a_transactional_mutable_variable_introduced_inside_a_loop_is_rejected() {
+    expect_compile_error(
+        indoc! {r#"
+            t := 0
+            for i in [1, 2, 3]:
+                y: Mut(Int, Txn) := i
+                t += y
+            t
+        "#},
+        "introduced inside a for-loop body",
+    );
 }
 
 /// An annotation on a `:=` binder is **exact** and is a **`Mut(…)`**. Both halves
@@ -1546,13 +1616,9 @@ acc",
     );
 }
 
-/// Nested `for` loops remain unsupported. The mutable variable machinery is why this
-/// matters: a fresh `:=` inside a loop body can only be a *sequential* mutable variable
-/// (the degenerate domain) precisely because there is no inner loop for it to
-/// accumulate over. If nested loops were ever admitted without also teaching the
-/// phase about a cross-iteration mutable variable declared inside a loop, that reasoning
-/// would silently stop holding — so the rejection is pinned here, next to what
-/// depends on it.
+/// A nested `for` that writes a mutable variable compiles to a carrier per enclosing row,
+/// which op-conversion does not realize: it builds one engine per carrier. Pinned by the
+/// error it reaches rather than ignored, so a change in how it fails is caught.
 #[test]
 fn nested_for_loops_stay_rejected() {
     expect_compile_error(
@@ -1563,7 +1629,7 @@ fn nested_for_loops_stay_rejected() {
                     s += y
             s
         "#},
-        "for-loop body",
+        "only a top-level carrier is realized",
     );
 }
 

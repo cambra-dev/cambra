@@ -118,9 +118,9 @@ use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
 use crate::ccl::{
-    BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, PredicateId, Refinement, Type,
-    TypedBinding, TypedExpr, TypedExprNode,
-    ccl_utils::{count_free, synthesize_arm_predicate, typed_compose, unit_expr},
+    BaseType, Branch, Builtin, Expr, FunKind, HistoryKind, Lit, Name, Pattern, PredicateId,
+    Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
+    ccl_utils::{apply_primitive, count_free, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance,
 };
@@ -563,6 +563,37 @@ fn contains_defer(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Defer) || expr.any_child(contains_defer)
 }
 
+/// A feed contribution flattened to one entry per position it was fed at.
+///
+/// `<<` appends at the site it is written, so a feed inside a loop contributes one value
+/// per position of that loop — which is what the loop's tap holds. Inside a **nest** the
+/// enclosing tap holds the inner loop's whole tap collection per enclosing position, one
+/// level per level the feed sits under, so the contribution arrives curried. Flattening
+/// each level away is what makes the channel the innermost positions rather than the
+/// groups they fall into.
+fn flatten_nested_contribution(mut value: Expr) -> Expr {
+    while let Type::Fun {
+        fun_kind: FunKind::Data(_),
+        domain: outer,
+        codomain: inner,
+        ..
+    } = value.ty.peel_refinements()
+        && let Type::Fun {
+            fun_kind: FunKind::Data(_),
+            domain: keys,
+            codomain: elem,
+            ..
+        } = inner.peel_refinements()
+    {
+        let flattened = Type::data_fun(
+            Type::Tuple(vec![(**outer).clone(), (**keys).clone()]),
+            (**elem).clone(),
+        );
+        value = apply_primitive(value, Builtin::Uncurry, flattened);
+    }
+    value
+}
+
 /// Return `true` if `expr` contains any `Feed(target, …)` or
 /// `Define(target, …)` node where `target == name`, respecting shadowing
 /// by `Let`/`Lambda` bindings that rebind `name`.
@@ -639,7 +670,7 @@ struct ChannelizeCtx {
     /// type says so: a witness reference carries no kind, so the slot cannot be
     /// reconstructed from the substituted domain. An alias records none and erases
     /// unbound, as it did before.
-    channel_kinds: Vec<(Name, crate::ccl::ty::FunKind)>,
+    channel_kinds: Vec<(Name, FunKind)>,
 }
 
 impl ChannelizeCtx {
@@ -693,7 +724,7 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // strict post-channelize `typecheck` in `compile_program` backstops the
     // invariant.
     let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
-    let kinds: HashMap<Name, crate::ccl::ty::FunKind> =
+    let kinds: HashMap<Name, FunKind> =
         std::mem::take(&mut ctx.channel_kinds).into_iter().collect();
     // One predicate memo for the whole erasure, so occurrences that shared a predicate
     // term still share one afterwards ([`PredMemo`], "One memo per pass").
@@ -804,7 +835,7 @@ fn subst_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 fn erase_chan_domains_in_type(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
-    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    kinds: &HashMap<Name, FunKind>,
 ) -> bool {
     if let Type::History {
         value,
@@ -824,7 +855,7 @@ fn erase_chan_domains_in_type(
         *ty = Type::Fun {
             name: None,
             // A feed channel reads as a collection: erase History → a data function.
-            fun_kind: fun_kind.unwrap_or(crate::ccl::ty::FunKind::Data(None)),
+            fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
             domain: Box::new(domain),
             codomain: Box::new(value),
         };
@@ -921,7 +952,7 @@ fn slot_holds_type(
 fn erase_chan_domains_in_predicates(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
-    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    kinds: &HashMap<Name, FunKind>,
     predicates: &PredMemo<()>,
 ) -> bool {
     if !predicates_hold_type(ty, &is_channel_type, &mut HashSet::new()) {
@@ -931,7 +962,7 @@ fn erase_chan_domains_in_predicates(
         fn go(
             e: &mut Expr,
             map: &HashMap<Name, Type>,
-            kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+            kinds: &HashMap<Name, FunKind>,
             memo: &PredMemo<()>,
         ) -> bool {
             let mut changed = false;
@@ -950,7 +981,7 @@ fn erase_chan_domains_in_predicates(
 fn erase_chan_domains_in_slot(
     ty: &mut Type,
     map: &HashMap<Name, Type>,
-    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    kinds: &HashMap<Name, FunKind>,
     predicates: &PredMemo<()>,
 ) -> bool {
     let mut changed = erase_chan_domains_in_type(ty, map, kinds);
@@ -973,7 +1004,7 @@ fn erase_chan_domains_in_slot(
 fn erase_chan_domains(
     expr: &mut Expr,
     map: &mut HashMap<Name, Type>,
-    kinds: &HashMap<Name, crate::ccl::ty::FunKind>,
+    kinds: &HashMap<Name, FunKind>,
     predicates: &PredMemo<()>,
 ) {
     // Erase this node's binder-declared type slots — both the declared type and
@@ -2326,7 +2357,7 @@ fn extract_for_defer_impl(
             // hoisted out of a loop by the letrec phase, or any collection
             // feed. It is not lifted (that would double-wrap it as
             // `Fun(Unit, Fun(D, T))`); it joins the channel union directly.
-            let value = *value;
+            let value = flatten_nested_contribution(*value);
             let mut vty = &value.ty;
             while let Type::Refinement(inner, _) = vty {
                 vty = inner;
@@ -3311,7 +3342,7 @@ mod tests {
         let refinement = Refinement::born(Rc::new(pred));
         let typed = Expr::lit(Lit::Unit).with_ty(Type::Fun {
             name: None,
-            fun_kind: crate::ccl::ty::FunKind::Compute,
+            fun_kind: FunKind::Compute,
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
         });

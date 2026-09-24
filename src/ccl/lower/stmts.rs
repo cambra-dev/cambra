@@ -660,22 +660,7 @@ pub(super) fn lower_middle_stmt(
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
             if mut_annotation_parts(&annotation.ty, ctx).is_some() {
-                // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
-                // annotation with the *immutable* `=` operator. This is
-                // contradictory under the cutover: `=` is a plain immutable
-                // binding, and every mutable (induction or transactional) is
-                // introduced solely with `:=`. Reject and point at `:=` (the
-                // value type — and `Txn` — still ride the annotation:
-                // `x: Mut(V) := init`, `x: Mut(V, Txn) := init`).
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    format!(
-                        "`{name}: Mut(…) = …` introduces a mutable with the immutable \
-                         `=` operator; use `:=` instead (e.g. `{name}: Mut(V) := init`, \
-                         `{name}: Mut(V, Txn) := init`, or a bare `{name} := init` to \
-                         infer the value type)"
-                    ),
-                ));
+                return Err(mut_decl_with_assign_error(stmt.span, &name));
             }
             let annotation_ty = lower_type_annotation(annotation, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
@@ -1154,6 +1139,24 @@ pub(super) fn check_mut_write_context(
         ));
     }
     Ok(())
+}
+
+/// Rejection for `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut` annotation with
+/// the *immutable* `=` operator.
+///
+/// Contradictory wherever it is written: `=` is a plain immutable binding, and every
+/// mutable variable is introduced solely with `:=`. The message points at `:=` rather than
+/// at the context, because the context does not change the answer — a loop body may
+/// introduce a mutable variable, and this spelling is wrong there too.
+pub(super) fn mut_decl_with_assign_error(span: Span, name: &str) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        format!(
+            "`{name}: Mut(…) = …` introduces a mutable with the immutable `=` operator; \
+             use `:=` instead (e.g. `{name}: Mut(V) := init`, `{name}: Mut(V, Txn) := \
+             init`, or a bare `{name} := init` to infer the value type)"
+        ),
+    )
 }
 
 /// Resolve the annotation on a `:=` **introduction** to `(value type, transactional?)`,

@@ -142,6 +142,14 @@ fn inner_source<'a>(g: &'a Expr, inner_domain: &Type) -> Option<&'a Expr> {
         && let [head, source, ..] = elements.as_slice()
         && matches!(&head.node, TypedExprNode::Proj(ProjKey::Index(1)))
         && source.ty.domain().is_some_and(|d| &d == inner_domain)
+        // The result is `map_domain`'s argument, so it has to be a collection. The
+        // domain check alone lets a projection through wherever its domain happens to
+        // equal the inner one — two pairs of the same type routinely do — and
+        // `map_domain` of a projection denotes nothing.
+        && source
+            .ty
+            .fun_kind()
+            .is_some_and(|k| k.resolved().is_data())
     {
         return Some(source);
     }
