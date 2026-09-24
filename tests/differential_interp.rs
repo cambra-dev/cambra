@@ -546,6 +546,49 @@ fn a_loop_overwriting_an_accumulator_with_a_constant() {
     "#});
 }
 
+/// A constant write beside an accumulating one. The decision reads `b` and the item, so it is
+/// not constant, and the loop's one writer keeps its snapshot.
+#[test]
+fn a_constant_and_an_accumulating_writer_in_one_loop() {
+    agree(indoc! {r#"
+        a := 1
+        b := 0
+        for i in [1, 2, 3]:
+            a := 7
+            b := b + i
+        out = test_sink()
+        out << a * 100 + b
+    "#});
+}
+
+/// A constant reached through a local binding in the body is still a constant decision.
+#[test]
+fn a_constant_overwrite_through_a_local() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [1, 2]:
+            y = 3
+            acc := y
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// A constant written through a `Mut` parameter: inlining leaves the constant decision a
+/// write in the loop body would have.
+#[test]
+fn a_constant_overwrite_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def fw(c: Mut(Int)):
+            c := 5
+        c := 0
+        for x in [1, 2]:
+            fw(c)
+        out = test_sink()
+        out << c
+    "#});
+}
+
 /// Two accumulators, both written constantly, so neither writer reads a snapshot.
 #[test]
 fn two_accumulators_both_written_with_constants() {
@@ -561,8 +604,9 @@ fn two_accumulators_both_written_with_constants() {
 }
 
 /// The same overwrite over a source filtered to nothing. The writer's extent is then a
-/// declared superset of the positions the source has, and only the source operator knows the
-/// difference — so the accumulator keeps its seed rather than taking the write.
+/// declared superset of the positions the source has; the extent's refinement becomes a
+/// `restrict` on the source, so no position survives and the accumulator keeps its seed
+/// rather than taking the write.
 #[test]
 fn a_constant_overwrite_over_an_empty_filtered_source() {
     agree(indoc! {r#"

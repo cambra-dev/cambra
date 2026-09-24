@@ -728,6 +728,85 @@ await_final(pool)";
     );
 }
 
+/// A loop over a live source whose body overwrites the accumulator with a constant. The
+/// decision reads neither the accumulator nor the item, so the writer iterates the source's
+/// extent rather than a source term: it still waits for the source to finish, takes the
+/// write, and releases every position.
+#[test_log::test]
+fn test_incremental_constant_mutation_loop() {
+    let code = "\
+x := 0
+for i in source1():
+    x := 7
+x";
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    ctx.scheduler().check_for_notifications();
+    assert_eq!(
+        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        empty,
+        "a source that is not done yields no accumulator"
+    );
+
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    assert_eq!(
+        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        Tile::Scalar(ColumnValue::Ints(vec![7])),
+    );
+    assert_eq!(
+        test_source.borrow().get_released_predicate(),
+        Predicate::True
+    );
+}
+
+/// The same loop over a live source that finishes without delivering a row: the write never
+/// runs and the accumulator is its seed.
+#[test_log::test]
+fn test_incremental_constant_mutation_loop_over_nothing() {
+    let code = "\
+x := 0
+for i in source1():
+    x := 7
+x";
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    assert_eq!(
+        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        Tile::Scalar(ColumnValue::Ints(vec![0])),
+    );
+}
+
 #[test_log::test]
 fn test_incremental_aggregates() {
     let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
