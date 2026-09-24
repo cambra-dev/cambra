@@ -142,8 +142,8 @@ same terms as a tree node, plus:
 
 | field | what it holds |
 |---|---|
-| `role` | `operator`, `source` or `sink` |
-| `tiling` | the operator's output tiling, rendered; `null` for a boundary node |
+| `role` | `operator` or `sink` |
+| `tiling` | the operator's output tiling, rendered; `null` for a sink |
 | `inputs` | the nodes it subscribes, each `{ subscribed, role, kind, deferred }` |
 
 An input edge is a subscription, stored on the consumer: `subscribed` names the node the consumer

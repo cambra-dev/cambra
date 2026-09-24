@@ -64,8 +64,8 @@ errors are zero at the snapshots.
 | term | what it is |
 |---|---|
 | **pane** | A retained snapshot of the pipeline the inspector displays, materialized after a set of phases. A pane holds an expression tree, which costs a retained full-tree clone, or the operator graph, which the compile already retains. **Below** a pane means later in the pipeline, on a more lowered tree; it is neither tree depth nor a layering. |
-| **walk start** | A node of the operator pane that no `value` edge subscribes, and so where one tree of a consumer's walk of it begins: one per sink, per share point and per registered source. Derived from the edges on both sides of the wire, never shipped. Distinct from a tree pane's **root**, which the producer ships because it is the pane's own expression rather than something read back off the table. |
-| **boundary node** | A node of the operator pane that is not an operator: a source read by the program, or a sink it writes. It carries a label and an identity like any node and no tiling, because only an operator has one. |
+| **walk start** | A node of the operator pane that no `value` edge subscribes, and so where one tree of a consumer's walk of it begins: one per sink and per share point. Derived from the edges on both sides of the wire, never shipped. Distinct from a tree pane's **root**, which the producer ships because it is the pane's own expression rather than something read back off the table. |
+| **boundary node** | A node of the operator pane that is not an operator: a sink the program writes. It carries a label and an identity like any node and no tiling, because only an operator has one. A data source is not a node; the `IterateExtent` over its domain is where it is read from. |
 | **recording** | The scope `provenance::enter` opens over one rewrite, held as a `RecordingGuard`. Every node minted while it is the innermost open one takes the node it names as a parent. Prose here says "a recording" for the scope, "the recording site" for the code location, and "records against X"; the guard is the RAII value that closes it. |
 
 > This file is the reference for the shipped shape and wins on what the code

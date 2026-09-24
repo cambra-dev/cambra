@@ -76,8 +76,8 @@ export interface OperatorNode {
   // operator carries a `NodeId` so a pane pair spanning conversion is
   // homogeneous like every other.
   nodeId: number;
-  // Which of the three node kinds this is: "operator", "source", "sink". Data,
-  // not display policy.
+  // Which of the two node kinds this is: "operator" or "sink". Data, not
+  // display policy.
   role: string;
   // The operator's output tiling, rendered, and null for a boundary node.
   tiling: string | null;

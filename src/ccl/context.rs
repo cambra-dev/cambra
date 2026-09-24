@@ -37,9 +37,7 @@ use crate::{
             ConversionError, OpConversionContext, convert_record_fields_to_operators,
             convert_to_operators,
         },
-        operator_graph::{
-            BoundarySession, OperatorGraph, assert_graph_invariants, materialize_sources,
-        },
+        operator_graph::{BoundarySession, OperatorGraph, assert_graph_invariants},
         sinks::{DoneNotifier, SinkConsumer},
         tile_operators::{TileOperator, TileProducer},
     },
@@ -2197,17 +2195,12 @@ fn compile_version(
     // wire validators reject.
     let boundary_session = BoundarySession::install();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
-        let ops = if sink_bindings_registry.is_empty() {
+        if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
                 .map(|op| vec![("main".to_string(), op)])
         } else {
             convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())
-        };
-        // A source node names every expression that read it, so it can only be
-        // minted once the walk has found them all. Inside the phase scope,
-        // because each needs a row like any other node of the pane.
-        materialize_sources();
-        ops
+        }
     })
     .errs()?;
     // Conversion is over, so what the retired version offered and this one did

@@ -1,0 +1,12 @@
+# Accumulate every stdin line into a loop-carried mutable variable, then print
+# the collected text once the source closes.
+#
+# The loop's induction extent is the source's own domain, so the read of `seen`
+# compiles to a `StoreDenseRead` whose trigger iterates that source. That is a
+# second read of the source, from the store rather than from the chain that
+# reads the source's values.
+
+seen := ""
+for line in stdin():
+    seen := seen + line + ";"
+seen

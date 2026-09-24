@@ -29,24 +29,23 @@ describe("validateSnapshot: real fixtures", () => {
     });
   }
 
-  it("source_shared pins a source node: null tiling, shared by both readers", () => {
+  it("source_shared reads stdin from input-free IterateExtents, with no source node", () => {
     const snap = validateSnapshot(sourceSharedJson);
     const pane = snap.panes.find((p) => p.kind === "operators");
     expect(pane).toBeDefined();
-    const sources = pane!.nodes.filter((n) => "role" in n && n.role === "source");
-    expect(sources).toHaveLength(1);
-    const source = sources[0] as { nodeId: number; tiling: string | null; spans: unknown[] };
-    // A boundary node has no tiling, which the validator asserts and this pins
-    // as a real payload rather than a hand-built one.
-    expect(source.tiling ?? null).toBeNull();
-    expect(source.spans.length).toBeGreaterThanOrEqual(2);
-    const reads = pane!.nodes.flatMap((n) =>
-      "inputs" in n ? n.inputs.filter((e) => e.subscribed === source.nodeId) : [],
-    );
-    expect(reads.length).toBeGreaterThanOrEqual(2);
-    // A shared node has no owner: recording a read as `value` is what trips the
-    // producer's exclusive-ownership assertion.
-    expect(reads.every((e) => e.kind === "share")).toBe(true);
+    const nodes = pane!.nodes.filter((n) => "role" in n);
+    // A source is not a node: the iteration over its domain is the root it is
+    // read from, and the tiling names the source.
+    const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+    const readers = nodes.filter((n) => n.label === "MapResultWithSource");
+    expect(readers).toHaveLength(2);
+    for (const reader of readers) {
+      const input = reader.inputs.find((e) => "name" in e.role && e.role.name === "input");
+      const it = input === undefined ? undefined : byId.get(input.subscribed);
+      expect(it?.label).toBe("IterateExtent");
+      expect(it?.tiling).toContain("Source(stdin)");
+      expect(it?.inputs).toEqual([]);
+    }
   });
 
   it("the failed (degraded) fixture validates with empty panes", () => {
@@ -317,17 +316,20 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   });
 
   it("accepts a node reachable only through a share edge", () => {
-    // A source is subscribed by no value edge, so the derived walk starts at it.
-    // Under a shipped start set this was the source-shaped bug: the producer had
-    // to remember to list it, and omitting it stranded the node.
+    // A fan input is subscribed by no value edge, so the derived walk starts at
+    // it. Under a shipped start set the producer had to remember to list it, and
+    // omitting it stranded the node.
     const ok = minimalSuccess();
     const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
     pane.nodes = [
       {
         ...minimalOperatorNode(),
-        inputs: [{ role: { kind: "named", name: "source" }, kind: "share", deferred: false, subscribed: 1 }],
+        label: "FanOutBranch",
+        role: "operator",
+        tiling: "String",
+        inputs: [{ role: { kind: "named", name: "fan" }, kind: "share", deferred: false, subscribed: 1 }],
       },
-      { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
+      { ...minimalOperatorNode(), label: "Memo", role: "operator", tiling: "String", nodeId: 1 },
     ];
     expect(() => validateSnapshot(ok)).not.toThrow();
   });
@@ -392,12 +394,15 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     expect(() => validateSnapshot(bad)).toThrow(/paneLinks\[0\]\.edges\[0\].*pair/);
   });
 
-  it("throws on an operator node's role outside the three kinds", () => {
-    const bad = minimalSuccess();
-    operatorNodes(bad)[0].role = "fan";
-    expect(() => validateSnapshot(bad)).toThrow(
-      new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.role.*operator, source, sink`),
-    );
+  it("throws on an operator node's role outside the two kinds", () => {
+    // `source` included: a data source is not a node of the operator graph.
+    for (const role of ["fan", "source"]) {
+      const bad = minimalSuccess();
+      operatorNodes(bad)[0].role = role;
+      expect(() => validateSnapshot(bad)).toThrow(
+        new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.role.*operator, sink`),
+      );
+    }
   });
 
   it("throws when an operator carries no tiling, or a boundary carries one", () => {
@@ -479,7 +484,13 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     const ok = minimalSuccess();
     const pane = (ok.panes as Record<string, unknown>[])[OPERATORS];
     pane.nodes = [
-      { ...minimalOperatorNode(), label: "Source(stdin)", role: "source", nodeId: 1 },
+      {
+        ...minimalOperatorNode(),
+        label: "IterateExtent",
+        role: "operator",
+        tiling: "SF(Source(stdin) → Source(stdin))",
+        nodeId: 1,
+      },
       {
         ...minimalOperatorNode(),
         inputs: [

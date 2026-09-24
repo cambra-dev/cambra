@@ -31,7 +31,7 @@ use crate::{
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
             store_frontier, store_value_at,
         },
-        operator_graph::{record_kept_operators, record_sink, record_source_read},
+        operator_graph::{record_kept_operators, record_sink},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
@@ -1019,20 +1019,13 @@ records one and the only site a `Transact` reaches"
     }
 
     /// Record everything the previous version holds inside `term` as this
-    /// compilation's own, and note the sources the region reads.
+    /// compilation's own.
     ///
     /// Keeping an operator keeps the whole subgraph under it, and this
     /// compilation does not walk into that subgraph, so nothing inside reaches
     /// [`bind_let`](Self::bind_let), [`bind_store`](Self::bind_store) or
     /// [`iteration_input`](Self::iteration_input) to be recorded — and the
     /// version after this one would find nothing at those nodes.
-    ///
-    /// A source the region reads needs the same treatment for the same reason:
-    /// the `Source` arm of `convert_impl` is where a read is noted, and a kept
-    /// region never reaches it. The graph walk descends into the kept operators
-    /// regardless, so an unnoted read reaches
-    /// [`assert_graph_invariants`](crate::interpreter::operator_graph::assert_graph_invariants)
-    /// as an edge to a boundary node nothing minted.
     ///
     /// The region corresponds `Content::Same` throughout, so its nodes stand
     /// one-for-one against the previous version's and what it holds is whatever
@@ -1061,18 +1054,6 @@ records one and the only site a `Transact` reaches"
                 nodes_below(child, out);
             });
         }
-        fn source_reads<'a>(e: &'a Expr, out: &mut Vec<(&'a str, NodeId)>) {
-            if let TypedExprNode::Source(name) = &e.node {
-                out.push((name, e.node_id()));
-            }
-            e.walk_children(|child| source_reads(child, out));
-        }
-        let mut reads = Vec::new();
-        source_reads(term, &mut reads);
-        for (name, node) in reads {
-            record_source_read(name, node);
-        }
-
         let mut below = Vec::new();
         nodes_below(term, &mut below);
         for node in below {
@@ -2484,9 +2465,7 @@ fn convert_impl_inner(
         TypedExprNode::Source(name) => {
             let input = expect_input(input, &format!("Source({name})"))?;
             let source = ctx.get_source(name)?;
-            let reader = MapResultWithSource::new(source, input);
-            record_source_read(name, expr.node_id());
-            Ok(Box::new(reader))
+            Ok(Box::new(MapResultWithSource::new(source, input)))
         }
 
         // `@LoadFrom(x)`: the value the retired version held, as a constant.

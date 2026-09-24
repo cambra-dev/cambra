@@ -89,56 +89,69 @@ impl Extent {
     /// When subscribing to this extent as an iteration, returns whether to immediately
     /// notify true and whether to add the iterating variable to the scheduler.
     pub fn subscribe_to_iteration_action(&self) -> NotifyOrSubscribeResult {
+        NotifyOrSubscribeResult {
+            notify: self.iteration_is_ready(),
+            // Subscribing is reaching a source: the scheduling loop polls a source
+            // for notifications, and what it wakes is whatever registered against
+            // that same set.
+            subscribe: self.reads_a_source(),
+        }
+    }
+
+    /// Whether iterating this extent can notify immediately, because every
+    /// element is available from the start of the program.
+    ///
+    /// A compound extent is ready when every part of it is: a cross-product
+    /// still growing in one field is still growing, and so is a union with one
+    /// unfinished arm. An extent that cannot be iterated is not ready either.
+    fn iteration_is_ready(&self) -> bool {
         match self {
-            // DataSource extents need to be registered so that the scheduling loop can
-            // poll them for notifications
-            Extent::DataSourceDomain(..) => NotifyOrSubscribeResult {
-                notify: false,
-                subscribe: true,
-            },
-            // Literal range extents are fully ready immediately
-            Extent::UIntRange(..) => NotifyOrSubscribeResult {
-                notify: true,
-                subscribe: false,
-            },
-            // Record extents are immediately ready if all fields are ready,
-            // otherwise we register with the scheduler.
-            Extent::Record(fields) => fields
-                .values()
-                .map(|extent| extent.subscribe_to_iteration_action())
-                .fold(
-                    NotifyOrSubscribeResult {
-                        notify: true,
-                        subscribe: false,
-                    },
-                    |acc, value| NotifyOrSubscribeResult {
-                        notify: acc.notify && value.notify,
-                        subscribe: acc.subscribe || value.subscribe,
-                    },
-                ),
-            // Restricted extents behave like their base record, but also set up the
+            // A source's elements arrive over the life of the program.
+            Extent::DataSourceDomain(..) => false,
+            // Literal range extents are fully ready immediately.
+            Extent::UIntRange(..) => true,
+            Extent::Record(fields) => fields.values().all(Extent::iteration_is_ready),
+            Extent::Union(arms) => arms.values().all(Extent::iteration_is_ready),
+            // Restricted extents behave like their base, which also sets up the
             // restriction producer so it can compute correlation vectors at runtime.
-            Extent::Restricted { base, .. } => base.subscribe_to_iteration_action(),
-            // Union extents iterate each variant in turn; we are ready iff every
-            // variant is ready, and we subscribe iff any variant requires it.
-            Extent::Union(arms) => arms
-                .values()
-                .map(Extent::subscribe_to_iteration_action)
-                .fold(
-                    NotifyOrSubscribeResult {
-                        notify: true,
-                        subscribe: false,
-                    },
-                    |acc, value| NotifyOrSubscribeResult {
-                        notify: acc.notify && value.notify,
-                        subscribe: acc.subscribe || value.subscribe,
-                    },
-                ),
-            // Other Extents cannot be iterated, so nothing to do
-            _ => NotifyOrSubscribeResult {
-                notify: false,
-                subscribe: false,
-            },
+            Extent::Restricted { base, .. } => base.iteration_is_ready(),
+            Extent::Base(_) | Extent::Function { .. } => false,
+        }
+    }
+
+    /// Whether this extent reaches at least one data source.
+    pub fn reads_a_source(&self) -> bool {
+        let mut found = false;
+        self.for_each_source(&mut |_| found = true);
+        found
+    }
+
+    /// Every data source this extent reaches, duplicates included, with a
+    /// `Record`'s fields in map order.
+    ///
+    /// The compound arms are the iterable ones: a `Record` cross-product, a
+    /// `Union` of arms, a `Restricted` base. Iterating an extent registers a
+    /// wake-up against each source here, decides from it whether to subscribe, and
+    /// hands each source back its release record when the producer goes. All
+    /// three read this one answer, so no walk can reach an arm the others miss.
+    pub fn for_each_source(
+        &self,
+        f: &mut impl FnMut(&Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
+    ) {
+        match self {
+            Extent::DataSourceDomain(source) => f(source),
+            Extent::Record(fields) => {
+                for field in fields.values() {
+                    field.for_each_source(f);
+                }
+            }
+            Extent::Union(arms) => {
+                for arm in arms.values() {
+                    arm.for_each_source(f);
+                }
+            }
+            Extent::Restricted { base, .. } => base.for_each_source(f),
+            Extent::Base(_) | Extent::Function { .. } | Extent::UIntRange(_) => {}
         }
     }
 

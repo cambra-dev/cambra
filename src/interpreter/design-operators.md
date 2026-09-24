@@ -190,9 +190,9 @@ those edges are acyclic.
 An edge is a **subscription**: the consumer holds the operator the edge names and calls `get` on it.
 `notify` runs the other way along the same edges. Three properties ride each edge:
 
-- **Kind.** `Value` for an exclusively owned `Box`, `Share` for a node several consumers may reach —
-  a fan branch's edge to its fan input, or a read of a data source. The value edges form a forest,
-  which is what lets a renderer follow them with no cycle guard.
+- **Kind.** `Value` for an exclusively owned `Box`, `Share` for a node several consumers may reach:
+  a fan branch's edge to its fan input. The value edges form a forest, which is what lets a renderer
+  follow them with no cycle guard.
 - **`deferred`.** Set on a `Value` edge wired through a `CycleSlot` after its consumer was built.
   This is a property of the field rather than of the run: a slot is the only way an operator
   receives an input its constructor did not give it, so every slot-held input is deferred and no
@@ -201,14 +201,18 @@ An edge is a **subscription**: the consumer holds the operator the edge names an
 - **Role.** A field name, a position in a `Vec`, or a store key. The three stay distinct on the
   wire, because a field named `0` and the first element of a `Vec` render alike.
 
-**What the walk cannot produce.** A source and a sink are graph nodes and not operators, so neither
-has an identity a walk could read off an operator. A source node's provenance row names every
-expression that reads it, which only conversion knows — the walk sees reader operators, not the
-expressions they came from. Conversion therefore records boundary identity alone
-(`record_source_read`, `record_sink`, `materialize_sources`), and everything else about the graph —
-every operator, and every edge including the edges into those two node kinds — comes from the walk.
-A reader's edge to a source names it through `DataSourceDomainExtentImpl::get_id`, the same string
-the source was registered under.
+**What the walk cannot produce.** A sink is a graph node and not an operator, so it has no identity
+a walk could read off an operator. Conversion records sink identity alone (`record_sink`), and
+everything else about the graph comes from the walk: every operator, and every edge including the
+edge into a sink.
+
+**A data source is not a node.** Two operators read a source: an `IterateExtent` over its domain,
+which the scheduler wakes when the source produces, and a `MapResultWithSource`, which looks up
+values at the keys its `input` carries. That input descends from an `IterateExtent` over the same
+source, because inference admits no literal of a `source(name)` type and iteration is the only
+origin of such a key. The `IterateExtent` holds no input and its tiling names the source, so it is
+where a path from the source starts. Neither operator states an edge for its read of the source.
+`tests/inspector_goldens.rs` pins the descent (`a_source_read_descends_from_an_iteration_of_that_source`).
 
 **Serialization.** `src/inspector_model/design.md`, "A node on the wire" owns the payload shape. An
 operator node ships its label, its tiling, and its `inputs`; a boundary node ships no tiling,
@@ -218,7 +222,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
 | `Constant` | None | `Scalar` from `Constant::new`, `SealedFunction(domain → Scalar(codomain))` from `Constant::collection` | Produces a fixed `Value`. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
-| `IterateExtent` | None | `SealedFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping sealed function (domain = codomain = extent) |
+| `IterateExtent` | None | `SealedFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping sealed function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
 | `MapResultWithSource` | `SealedFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `SealedFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a sealed function from keys to their output values. |
 | `FanIn` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. Prefer the free `fan_in` factory at op-conversion call sites: it dispatches to `FanIn` (function-tiled arms) or `ScalarFanIn` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `ScalarFanIn` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling. The scalar counterpart of `FanIn`; reachable from op-conversion via the `fan_in` factory. Re-reads every operand on every pull, so the only release it can forward is the universal one. |

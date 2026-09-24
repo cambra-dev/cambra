@@ -46,10 +46,11 @@ Two programs need a small substitution before they'll run as-is:
   curl localhost:8080/greet
   ```
 
-- **`streaming_echo`** reads from stdin — pipe input:
+- **`streaming_echo`** and **`source_accumulator`** read from stdin — pipe input:
 
   ```bash
   printf "hello\nworld\n" | cargo run -- tests/programs/streaming_echo/program.cambra
+  printf "hello\nworld\n" | cargo run -- tests/programs/source_accumulator/program.cambra
   ```
 
 The `🚧 blocked` programs in the table will panic or be rejected at
@@ -117,6 +118,7 @@ plan and the full dependency map.
 | [inner_join](../tests/programs/inner_join/) | INNER JOIN of users × orders on user-id | hash-join (`if x.id == y.fk`), record fields, multi-source comp | ✅ working | The lowering planner sees the equality filter and lowers to a keyed lookup. |
 | [http_greeter](../tests/programs/http_greeter/) | Three HTTP endpoints sharing a `prefix` let | `http_serve`, `<<` feed, deferred output, multi-route on one port | ✅ working (sink) | Real HTTP roundtrip — test fires three requests on a background thread while the main thread drives the scheduler. Source uses `{PORT}` placeholder. |
 | [streaming_echo](../tests/programs/streaming_echo/) | Prefix each stdin line with "> " | `stdin()` source, list comprehension | ✅ working | Tested via subprocess so the real OS stdin file descriptor is exercised; substring-matched against captured stdout. |
+| [source_accumulator](../tests/programs/source_accumulator/) | Collect every stdin line into a loop-carried mutable variable | `stdin()` source, `:=` mutation operator, `for` loop | ✅ working | Returns `"hello;world;"` for two piped lines. The gallery's one program joining a store to a data source: the loop's induction extent is the source's domain, so the accumulator read compiles to a `StoreDenseRead` whose trigger iterates that source: a second `IterateExtent` over its domain, which `tests/inspector_goldens.rs` asserts. |
 | [for_accumulator](../tests/programs/for_accumulator/) | Sum 1..5 into a loop-carried mutable variable | `:=` mutation operator, `for` loop | ✅ working | Returns `15`. The natural imperative shape for "fold". Also the inspector's `Letrec` program: the induction phase's substituted reads and `step_view` scaffolding clones carry freshened, unique `NodeId`s, which `tests/inspector_goldens.rs` asserts as a dense channelize window. |
 | [while_counter](../tests/programs/while_counter/) | Count up with a while loop | `while`, mutability | 🚧 blocked | While-loop lowering is not yet implemented. Currently rejected at lowering. |
 | [reachability](../tests/programs/reachability/) | Transitive closure (recursive query) | self-referential binding, `Set(T)` dedup-by-type, `++`, hash-join in a cycle | 🚧 blocked | North-star recursive query. Parse-blocked on record-term syntax `(src=1, dst=2)`; then `Set(T)` + the self-referential (recursive) binding. |

@@ -31,12 +31,13 @@
 //! program added for backend coverage belongs in ratchet 5, which reads every
 //! gallery source and commits nothing.
 //!
-//! Two programs — `txn_multi_read` and `for_accumulator` — are in the corpus
-//! without a committed fixture. Their payloads run to five figures of lines
-//! each, which is a document nobody reads and a re-bless nobody can review, so
-//! what they are here for is asserted structurally over a fresh dump instead:
-//! the dense channelize window, and the `Transact`/`Letrec` rewrite tags that
-//! reach the wire.
+//! Three programs — `txn_multi_read`, `for_accumulator` and
+//! `source_accumulator` — are in the corpus without a committed fixture. Their
+//! payloads run to five figures of lines each, which is a document nobody reads
+//! and a re-bless nobody can review, so what they are here for is asserted
+//! structurally over a fresh dump instead: the dense channelize window, the
+//! `Transact`/`Letrec` rewrite tags that reach the wire, and a store's trigger
+//! iterating a data source.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -440,98 +441,168 @@ fn for_accumulator_produces_store_edge_shapes() {
     assert_store_edge_shapes("for_accumulator");
 }
 
-/// **One source node per registered source, attributed to every read site.**
-///
-/// The shape decision the source half of the graph rests on: a source read from
-/// several expressions is one node several readers point at, never a node
-/// duplicated per reader — sharing is reified everywhere else in this graph and
-/// the boundary is no exception.
-///
-/// The span count is the assertion that matters. A source node cannot be minted
-/// at the first read site, because its row names every site that reads it and a
-/// row's parents are fixed when its recording closes; `materialize_sources`
-/// mints once the walk is done, for that reason alone. Minting at the first read
-/// site instead would look correct, would keep the node count right, and would
-/// silently attribute the source to one of its readers. Only the span count
-/// catches it.
-#[test]
-fn a_source_read_twice_is_one_node_attributed_to_both_reads() {
-    let raw = dump("source_shared");
+/// The operator pane's nodes for a fresh dump of `example`.
+fn operator_nodes(example: &str) -> Vec<Value> {
+    let raw = dump(example);
     let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
     let pane = v["panes"]
         .as_array()
         .expect("panes is an array")
         .iter()
         .find(|p| p["kind"] == "operators")
-        .expect("source_shared has an operator pane");
+        .unwrap_or_else(|| panic!("{example} has an operator pane"))
+        .clone();
+    pane["nodes"].as_array().expect("nodes is an array").clone()
+}
 
-    let sources: Vec<&Value> = pane["nodes"]
-        .as_array()
-        .expect("nodes is an array")
+/// The `IterateExtent`s upstream of `id`, following every input edge.
+///
+/// Share edges are followed too: a fan branch reaches its fan input through
+/// one, and a source read downstream of a shared iteration crosses it.
+fn iterations_upstream(nodes: &[Value], id: u64) -> Vec<&Value> {
+    let by_id: std::collections::HashMap<u64, &Value> = nodes
         .iter()
-        .filter(|n| n["role"] == "source")
+        .map(|n| (n["nodeId"].as_u64().expect("nodeId is a number"), n))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![id];
+    let mut found = Vec::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let node = by_id[&id];
+        if node["label"] == "IterateExtent" {
+            found.push(node);
+        }
+        stack.extend(
+            node["inputs"]
+                .as_array()
+                .expect("inputs is an array")
+                .iter()
+                .filter_map(|e| e["subscribed"].as_u64()),
+        );
+    }
+    found
+}
+
+/// **A data source is read from an `IterateExtent` over its domain, not from a
+/// node of its own.**
+///
+/// The graph draws no source node, which is sound because nothing is lost: a
+/// `MapResultWithSource` reads a source's values at keys of its domain, and such
+/// a key comes only from iterating that domain. So every value read has, upstream
+/// of it, an `IterateExtent` whose tiling names the same source and which holds
+/// no input — the root the source is read from.
+///
+/// A source's attribution rides the reader: the program's every `stdin()` is the
+/// span of the `MapResultWithSource` built for it, so a selection of the call
+/// reaches an operator with no source node in between.
+#[test]
+fn a_source_read_descends_from_an_iteration_of_that_source() {
+    for example in ["source_shared", "source_accumulator"] {
+        let nodes = operator_nodes(example);
+        assert!(
+            nodes.iter().all(|n| n["role"] != "source"),
+            "{example}: a source is not a node of the operator graph"
+        );
+
+        let readers: Vec<&Value> = nodes
+            .iter()
+            .filter(|n| n["label"] == "MapResultWithSource")
+            .collect();
+        assert!(!readers.is_empty(), "{example} reads stdin's values");
+        for reader in &readers {
+            let id = reader["nodeId"].as_u64().expect("nodeId is a number");
+            let roots = iterations_upstream(&nodes, id);
+            assert!(
+                roots.iter().any(|it| {
+                    it["tiling"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("Source(stdin)"))
+                        && it["inputs"].as_array().is_some_and(|es| es.is_empty())
+                }),
+                "{example}: MapResultWithSource {id} reads stdin, but no input-free \
+                 `IterateExtent` over stdin's domain is upstream of it: {roots:?}"
+            );
+        }
+
+        let raw = dump(example);
+        let v: Value = serde_json::from_slice(&raw).expect("valid JSON");
+        let text = v["source"]["text"]
+            .as_str()
+            .expect("source.text is a string");
+        let reader_spans: std::collections::BTreeSet<(u64, u64)> = readers
+            .iter()
+            .flat_map(|r| r["spans"].as_array().expect("spans is an array"))
+            .map(|s| {
+                (
+                    s["start"].as_u64().expect("start is a number"),
+                    s["end"].as_u64().expect("end is a number"),
+                )
+            })
+            .collect();
+        for (start, call) in text.match_indices("stdin()") {
+            let site = (start as u64, (start + call.len()) as u64);
+            assert!(
+                reader_spans.contains(&site),
+                "{example}: the `stdin()` at {site:?} is the span of no MapResultWithSource; \
+                 reader spans are {reader_spans:?}"
+            );
+        }
+    }
+}
+
+/// **A store folding over a source's domain iterates the source a second time.**
+///
+/// `source_accumulator` loops over `stdin()` and accumulates into a mutable
+/// variable, so the loop's induction extent is the source's own domain and the
+/// accumulator read compiles to a `StoreDenseRead` whose trigger iterates that
+/// extent. Two `IterateExtent`s over stdin's domain are therefore roots of the
+/// graph: the one the value read descends from, and the store's trigger.
+///
+/// The gallery's other source programs iterate a source only where they read
+/// its values, so this is the one that pins an iteration of a source standing
+/// apart from any value read.
+#[test]
+fn a_store_over_a_source_domain_iterates_the_source_twice() {
+    let nodes = operator_nodes("source_accumulator");
+    let over_stdin: Vec<&Value> = nodes
+        .iter()
+        .filter(|n| {
+            n["label"] == "IterateExtent"
+                && n["tiling"]
+                    .as_str()
+                    .is_some_and(|t| t.contains("Source(stdin)"))
+        })
         .collect();
     assert_eq!(
-        sources.len(),
-        1,
-        "source_shared reads one source, so the graph holds one source node; got {}",
-        sources.len()
+        over_stdin.len(),
+        2,
+        "one `IterateExtent` heads the chain that reads stdin's values and one \
+         triggers the `StoreDenseRead`; got {over_stdin:?}"
     );
-    let source = sources[0];
-    let source_id = source["nodeId"].as_u64().expect("nodeId is a number");
+    for it in &over_stdin {
+        assert_eq!(
+            it["inputs"].as_array().map(Vec::len),
+            Some(0),
+            "an `IterateExtent` holds no input, so it is a root: {it:?}"
+        );
+    }
 
-    // Nothing subscribes a source with a `value` edge, so a walk of the value
-    // edges starts at it rather than reaching it. Were it owned, it would be a
-    // node the pane holds that no view draws and no selection reaches.
-    let owned: Vec<u64> = pane["nodes"]
-        .as_array()
-        .expect("nodes is an array")
+    let trigger_ids: Vec<u64> = nodes
         .iter()
+        .filter(|n| n["label"] == "StoreDenseRead")
         .flat_map(|n| n["inputs"].as_array().expect("inputs is an array"))
-        .filter(|e| e["kind"] == "value")
+        .filter(|e| e["role"]["name"] == "trigger")
         .filter_map(|e| e["subscribed"].as_u64())
         .collect();
     assert!(
-        !owned.contains(&source_id),
-        "the source node {source_id} is subscribed by a value edge, so the walk of the value \
-         edges never starts at it"
-    );
-
-    let readers: Vec<&Value> = pane["nodes"]
-        .as_array()
-        .expect("nodes is an array")
-        .iter()
-        .filter(|n| {
-            n["inputs"].as_array().is_some_and(|es| {
-                es.iter()
-                    .any(|e| e["subscribed"].as_u64() == Some(source_id))
-            })
-        })
-        .collect();
-    assert!(
-        readers.len() >= 2,
-        "source_shared reads stdin twice, so at least two operators read the source node; got {}",
-        readers.len()
-    );
-
-    for reader in &readers {
-        for edge in reader["inputs"].as_array().expect("inputs is an array") {
-            if edge["subscribed"].as_u64() == Some(source_id) {
-                assert_eq!(
-                    edge["kind"], "share",
-                    "a source has no single owner, so a read of it is a share edge"
-                );
-            }
-        }
-    }
-
-    let spans = source["spans"].as_array().expect("spans is an array");
-    assert!(
-        spans.len() >= readers.len(),
-        "the source node carries {} span(s) for {} read site(s): it was minted against one \
-         read rather than after the walk, so `also_consumes` reached none of the others",
-        spans.len(),
-        readers.len()
+        over_stdin
+            .iter()
+            .any(|it| trigger_ids.contains(&it["nodeId"].as_u64().expect("nodeId is a number"))),
+        "one of the two iterations is the `StoreDenseRead`'s trigger; triggers are \
+         {trigger_ids:?}"
     );
 }
 

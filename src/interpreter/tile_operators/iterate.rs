@@ -37,26 +37,9 @@ impl IterateExtent {
         consumer: SharedConsumer,
         scheduler: &mut Scheduler,
     ) {
-        match extent {
-            Extent::DataSourceDomain(extent_impl, ..) => {
-                scheduler.add_source_handle(extent_impl.clone(), Rc::downgrade(&consumer));
-            }
-            Extent::Record(fields) => {
-                for field_extent in fields.values() {
-                    Self::add_all_source_handles(field_extent, consumer.clone(), scheduler);
-                }
-            }
-            Extent::Restricted { base, .. } => {
-                Self::add_all_source_handles(base, consumer, scheduler);
-            }
-            Extent::Union(arms) => {
-                for extent in arms.values() {
-                    Self::add_all_source_handles(extent, consumer.clone(), scheduler);
-                }
-            }
-            // Nothing to do for other extents since they all complete from the start of the program
-            _ => {}
-        }
+        extent.for_each_source(&mut |source| {
+            scheduler.add_source_handle(source.clone(), Rc::downgrade(&consumer));
+        });
     }
 }
 
@@ -108,28 +91,20 @@ impl TileOperator for IterateExtent {
 /// Tell every source in `extent` that `producer` is gone, so its release record
 /// goes with it ([`DataSourceDomainExtentImpl::retire_producer`]).
 fn retire_producer_from_extent(extent: &Extent, producer: &str) {
-    match extent {
-        Extent::DataSourceDomain(source) => {
-            // A drop runs wherever the last owner goes, so the source may already
-            // be borrowed by a call further up that stack. Keeping the record is
-            // the conservative outcome — the source retains more than it must —
-            // and the borrow succeeding is the case worth knowing about.
-            match source.try_borrow_mut() {
-                Ok(mut source) => source.retire_producer(producer),
-                Err(_) => debug_assert!(
-                    false,
-                    "{producer} dropped while its source was borrowed, so its \
+    extent.for_each_source(&mut |source| {
+        // A drop runs wherever the last owner goes, so the source may already
+        // be borrowed by a call further up that stack. Keeping the record is
+        // the conservative outcome — the source retains more than it must —
+        // and the borrow succeeding is the case worth knowing about.
+        match source.try_borrow_mut() {
+            Ok(mut source) => source.retire_producer(producer),
+            Err(_) => debug_assert!(
+                false,
+                "{producer} dropped while its source was borrowed, so its \
 release record outlives it",
-                ),
-            }
+            ),
         }
-        Extent::Record(fields) => {
-            for e in fields.values() {
-                retire_producer_from_extent(e, producer);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Producer for [`IterateExtent`]: emits an identity sealed-function tile.
@@ -411,6 +386,45 @@ mod tests {
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value, tuple_field};
     use intervalsets::MaybeEmpty;
     use intervalsets::ops::Contains;
+
+    /// A producer's release record is retired from a source reached through a
+    /// `Union` arm, not only from one reached directly or through a `Record`.
+    ///
+    /// Subscribing registers the record through every compound arm
+    /// ([`release_extent`]), so retiring has to reach the same set. A record
+    /// left behind pins the source's agreement at wherever the dead producer
+    /// stopped, and the source never drops that data again.
+    #[test]
+    fn retire_reaches_a_source_under_a_union_arm() {
+        use crate::ccl::FieldKey;
+        use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
+
+        let src = Rc::new(RefCell::new(TestDataSource::new(
+            "s",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        let extent = Extent::Union(TagMap::from_arms(vec![(
+            FieldKey::Name("only".into()),
+            Extent::DataSourceDomain(as_domain),
+        )]));
+
+        src.borrow_mut().release("p", Predicate::True);
+        assert_eq!(
+            src.borrow().get_released_predicate(),
+            Predicate::True,
+            "`p` holds a record for the retire to find"
+        );
+
+        retire_producer_from_extent(&extent, "p");
+
+        assert_eq!(
+            src.borrow().get_released_predicate(),
+            Predicate::False,
+            "`p` is gone, so its record is gone: an empty agreement, not `p`'s last one"
+        );
+    }
 
     /// Helper: extract the `IntervalSet<usize>` from a `UIntRange` extent.
     fn uint_range_set(extent: &Extent) -> &IntervalSet<usize> {

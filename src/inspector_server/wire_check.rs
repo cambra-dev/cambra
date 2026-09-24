@@ -85,9 +85,9 @@ const ALLOWED_NATURE: &[&str] = &["expansion", "machinery"];
 /// nodes. `kind` is the node-shape discriminant, so the validator dispatches
 /// on it.
 const OPERATOR_PANE_KIND: &str = "operators";
-/// The operator-node `role` discriminants: an operator, or one of the two
-/// program boundaries.
-const ALLOWED_OPERATOR_ROLE: &[&str] = &["operator", "source", "sink"];
+/// The operator-node `role` discriminants: an operator, or the program's output
+/// boundary.
+const ALLOWED_OPERATOR_ROLE: &[&str] = &["operator", "sink"];
 /// The operator-input `kind` discriminants: an exclusively owned input, and one
 /// several consumers reach. A cycle is a `value` edge carrying `deferred`.
 const ALLOWED_EDGE_KIND: &[&str] = &["value", "share"];

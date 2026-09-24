@@ -2,7 +2,7 @@ use bit_set::BitSet;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::*;
-use crate::interpreter::operator_graph::{source, value};
+use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
         BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
@@ -747,9 +747,9 @@ impl TileOperator for MapResultWithSource {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        // The source is read here and states no edge: it is not a node of the
+        // graph, and `input` descends from the `IterateExtent` over its domain.
         visit(value("input", &*self.input));
-        let handle = self.source.borrow();
-        visit(source(handle.get_id()));
     }
 
     fn subscribe(

@@ -13,19 +13,23 @@
 //!
 //! An edge is a **subscription**: the consumer holds the operator the edge names
 //! and calls `get` on it. `notify` runs the other way along the same edges, so an
-//! edge is the pull direction rather than dataflow as a whole. Two edges are held
-//! without being subscribed — a read of a data source, which is not an operator,
-//! and a fan branch that lost `should_subscribe` while its sibling drove the
-//! subscribe for all of them.
+//! edge is the pull direction rather than dataflow as a whole. One edge is held
+//! without being subscribed: a fan branch that lost `should_subscribe` while its
+//! sibling drove the subscribe for all of them.
 //!
-//! Degrees are counted in dataflow direction — a source has in-degree 0, a sink
-//! out-degree 0 — while an edge is stored on the consumer and names the node it
-//! subscribes, so the stored relation runs the other way.
+//! Degrees are counted in dataflow direction — an operator holding no input has
+//! in-degree 0, a sink out-degree 0 — while an edge is stored on the consumer and
+//! names the node it subscribes, so the stored relation runs the other way.
 //!
-//! What the walk cannot produce is the two boundary node kinds. A source and a
-//! sink are graph nodes rather than operators, so neither has an identity to read
-//! off an operator, and a source's provenance row names every expression that
-//! reads it — which conversion knows and the walk does not. Conversion records
+//! A data source is not a node. The operators that read one are an
+//! `IterateExtent` over its domain, which the scheduler wakes when the source
+//! produces, and a `MapResultWithSource` downstream of that iteration. A key of a
+//! source's domain has no other origin, because inference admits no literal of a
+//! `source(name)` type. Both carry the source in their tilings, and the
+//! `IterateExtent` holds no input, so it is where a path from the source starts.
+//!
+//! What the walk cannot produce is the sink. A sink is a graph node rather than an
+//! operator, so it has no identity to read off an operator. Conversion records
 //! that much and nothing else; see [`Boundaries`].
 //!
 //! `src/interpreter/design-operators.md`, "Operator identity and the graph the
@@ -56,7 +60,7 @@ pub enum EdgeKind {
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
     Value { deferred: bool },
     /// An edge to a node more than one consumer may reach: a `FanOutBranch`'s
-    /// edge to its fan input, or a reader's edge to a data source.
+    /// edge to its fan input.
     ///
     /// What separates this from [`Value`](Self::Value) is exclusivity, not
     /// indirection. A node several consumers subscribe has no single owner,
@@ -99,22 +103,11 @@ pub struct InputEdge {
     pub(crate) subscribed: NodeId,
 }
 
-/// What an input edge points at.
-///
-/// A source is the one target that is not an operator, so it is the one target a
-/// walk stops at rather than descends into.
-pub enum InputTarget<'a> {
-    /// Another operator.
-    Operator(&'a dyn TileOperator),
-    /// A registered data source, under the name it was registered with.
-    Source(&'a str),
-}
-
 /// One input edge, as the operator holding it states it.
 pub struct InputEdgeSpec<'a> {
     pub(crate) role: EdgeRole,
     pub(crate) kind: EdgeKind,
-    pub(crate) target: InputTarget<'a>,
+    pub(crate) target: &'a dyn TileOperator,
 }
 
 /// An owned input held under a named field.
@@ -122,7 +115,7 @@ pub(crate) fn value<'a>(role: &'static str, op: &'a dyn TileOperator) -> InputEd
     InputEdgeSpec {
         role: EdgeRole::Named(role),
         kind: EdgeKind::Value { deferred: false },
-        target: InputTarget::Operator(op),
+        target: op,
     }
 }
 
@@ -131,7 +124,7 @@ pub(crate) fn value_at<'a>(index: usize, op: &'a dyn TileOperator) -> InputEdgeS
     InputEdgeSpec {
         role: EdgeRole::Positional(index),
         kind: EdgeKind::Value { deferred: false },
-        target: InputTarget::Operator(op),
+        target: op,
     }
 }
 
@@ -143,7 +136,7 @@ pub(crate) fn value_keyed<'a>(
     InputEdgeSpec {
         role: EdgeRole::StoreKey(key.into()),
         kind: EdgeKind::Value { deferred: false },
-        target: InputTarget::Operator(op),
+        target: op,
     }
 }
 
@@ -158,7 +151,7 @@ pub(crate) fn value_late<'a>(role: EdgeRole, op: &'a dyn TileOperator) -> InputE
     InputEdgeSpec {
         role,
         kind: EdgeKind::Value { deferred: true },
-        target: InputTarget::Operator(op),
+        target: op,
     }
 }
 
@@ -171,27 +164,15 @@ pub(crate) fn share<'a>(fan_input: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::Named("fan"),
         kind: EdgeKind::Share,
-        target: InputTarget::Operator(fan_input),
-    }
-}
-
-/// A read of a registered data source.
-///
-/// Shared, not owned: one registered source may be read by several expressions,
-/// and each reader holds it through an `Rc` the way a fan branch holds its fan.
-pub(crate) fn source(name: &str) -> InputEdgeSpec<'_> {
-    InputEdgeSpec {
-        role: EdgeRole::Named("source"),
-        kind: EdgeKind::Share,
-        target: InputTarget::Source(name),
+        target: fan_input,
     }
 }
 
 /// One node of the graph.
 ///
-/// Operators, plus the two program-boundary kinds. Without the boundary the graph
-/// begins and ends in the middle of nothing: a data source is not an operator, and
-/// an output is a field name the boundary holds rather than an operator itself.
+/// Operators, plus the program's output boundary. Without the sink the graph ends
+/// in the middle of nothing: an output is a field name the boundary holds rather
+/// than an operator itself.
 #[derive(Clone, Debug)]
 pub enum GraphNode {
     /// An operator, with the inputs it holds.
@@ -201,13 +182,6 @@ pub enum GraphNode {
         tiling: Tiling,
         inputs: Vec<InputEdge>,
     },
-    /// A registered data source. In-degree 0, and where a path through the graph
-    /// starts.
-    ///
-    /// One per registered source rather than one per read site, so the graph is
-    /// truthful about sharing the way it is everywhere else — a shared input is a
-    /// node several consumers point at, never a node duplicated per consumer.
-    Source { id: NodeId, name: String },
     /// A compiled output field. Out-degree 0, and a start of every walk.
     Sink {
         id: NodeId,
@@ -218,8 +192,8 @@ pub enum GraphNode {
 
 /// The static operator graph of one compiled program.
 ///
-/// Sources first, then each output's operators with a holder after everything it
-/// holds, then that output's sink. Deterministic: the walk visits an operator's
+/// Each output's operators with a holder after everything it holds, then that
+/// output's sink. Deterministic: the walk visits an operator's
 /// inputs in the order the operator states them.
 #[derive(Clone, Debug, Default)]
 pub struct OperatorGraph {
@@ -239,13 +213,11 @@ impl OperatorGraph {
     /// `Value` edge that names it, so the edge table already answers this and a
     /// stored copy could only disagree with it.
     ///
-    /// Three kinds of node qualify. A **sink**: nothing subscribes it. A **fan
+    /// Two kinds of node qualify. A **sink**: nothing subscribes it. A **fan
     /// input**: the `Rc<FanOut>` holding it is dropped when conversion ends, so
     /// only its branches survive, and each names it with a `Share` — and a
     /// binding whose variable is never used has a fan with no branches at all,
-    /// so nothing names it. A **source**: a source is a graph node rather than a
-    /// `TileOperator`, so nothing subscribes it and a reader's edge to it is a
-    /// `Share`.
+    /// so nothing names it.
     ///
     /// Every node of the graph is reachable from here along `Value` edges alone,
     /// which is what [`assert_graph_invariants`] pins.
@@ -261,9 +233,7 @@ impl OperatorGraph {
     /// Every node's id.
     pub(crate) fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes.iter().map(|n| match n {
-            GraphNode::Operator { id, .. }
-            | GraphNode::Source { id, .. }
-            | GraphNode::Sink { id, .. } => *id,
+            GraphNode::Operator { id, .. } | GraphNode::Sink { id, .. } => *id,
         })
     }
 
@@ -277,7 +247,6 @@ impl OperatorGraph {
                         Box::new(inputs.iter().map(move |e| (*id, e)))
                     }
                     GraphNode::Sink { id, input, .. } => Box::new(std::iter::once((*id, input))),
-                    GraphNode::Source { .. } => Box::new(std::iter::empty()),
                 }
             })
     }
@@ -329,7 +298,7 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
     }
 
     // `Value` edges only, from `walk_starts`: that is the relation a consumer walks,
-    // and every node nothing owns — a sink, a fan input, a source — is in
+    // and every node nothing owns — a sink, a fan input — is in
     // `walk_starts` already, so no share edge has to be followed to reach one.
     let mut seen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     let mut stack: Vec<NodeId> = graph.walk_starts();
@@ -337,9 +306,7 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
         .nodes()
         .iter()
         .map(|n| match n {
-            GraphNode::Operator { id, .. }
-            | GraphNode::Source { id, .. }
-            | GraphNode::Sink { id, .. } => (*id, n),
+            GraphNode::Operator { id, .. } | GraphNode::Sink { id, .. } => (*id, n),
         })
         .collect();
     while let Some(id) = stack.pop() {
@@ -356,14 +323,13 @@ pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
                 );
             }
             Some(GraphNode::Sink { input, .. }) => stack.push(input.subscribed),
-            Some(GraphNode::Source { .. }) | None => {}
+            None => {}
         }
     }
     let stranded: Vec<String> = ids
         .difference(&seen)
         .map(|id| match by_id.get(id) {
             Some(GraphNode::Operator { kind, tiling, .. }) => format!("{id:?} {kind} {tiling}"),
-            Some(GraphNode::Source { name, .. }) => format!("{id:?} Source({name})"),
             Some(GraphNode::Sink { name, .. }) => format!("{id:?} Sink({name})"),
             None => format!("{id:?} <no node>"),
         })
@@ -391,19 +357,13 @@ thread_local! {
 
 /// The program's boundary nodes, which no walk of the operators can produce.
 ///
-/// A source and a sink are graph nodes rather than operators, so neither has an
-/// identity or a provenance row that a walk could read off an operator. A
-/// source's row names every expression that reads it, which only conversion
-/// knows: the walk sees reader operators, not the expressions they came from.
+/// A sink is a graph node rather than an operator, so it has no identity or
+/// provenance row that a walk could read off an operator.
 ///
 /// Everything else comes from the walk — every operator, and every edge,
-/// including the edges into these nodes.
+/// including the edge into a sink.
 #[derive(Default)]
 struct Boundaries {
-    /// The expressions that read each registered source, in first-read order.
-    source_reads: Vec<(String, Vec<NodeId>)>,
-    /// Each read source's node, once [`materialize_sources`] has minted it.
-    sources: Vec<(String, NodeId)>,
     /// Each compiled output field's node.
     sinks: Vec<(String, NodeId)>,
     /// Operators this compile took from the version it replaces, already rowed
@@ -448,14 +408,8 @@ impl BoundarySession {
         let mut nodes = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        for (name, id) in &boundaries.sources {
-            nodes.push(GraphNode::Source {
-                id: *id,
-                name: name.clone(),
-            });
-        }
         for (name, op) in outputs {
-            walk_operator(&**op, &boundaries, &mut seen, &mut nodes);
+            walk_operator(&**op, &mut seen, &mut nodes);
             let (Some(id), Some(subscribed)) = (
                 boundaries
                     .sinks
@@ -493,7 +447,6 @@ impl Drop for BoundarySession {
 /// operators by hand.
 fn walk_operator(
     op: &dyn TileOperator,
-    boundaries: &Boundaries,
     seen: &mut std::collections::HashSet<NodeId>,
     nodes: &mut Vec<GraphNode>,
 ) {
@@ -505,25 +458,9 @@ fn walk_operator(
     }
     let mut inputs = Vec::new();
     op.visit_inputs(&mut |spec| {
-        let subscribed = match spec.target {
-            InputTarget::Operator(child) => {
-                walk_operator(child, boundaries, seen, nodes);
-                match child.operator_id() {
-                    Some(child_id) => child_id,
-                    None => return,
-                }
-            }
-            InputTarget::Source(name) => match boundaries.sources.iter().find(|(n, _)| n == name) {
-                Some((_, source_id)) => *source_id,
-                None => {
-                    debug_assert!(
-                        false,
-                        "operator graph: {name:?} is read but was never recorded as a \
-                             source, so its node was never minted"
-                    );
-                    return;
-                }
-            },
+        walk_operator(spec.target, seen, nodes);
+        let Some(subscribed) = spec.target.operator_id() else {
+            return;
         };
         inputs.push(InputEdge {
             role: spec.role,
@@ -568,67 +505,8 @@ pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
     }
     crate::ccl::provenance::on_mint(id);
     op.visit_inputs(&mut |spec| {
-        if let InputTarget::Operator(child) = spec.target {
-            record_kept_operators(child);
-        }
+        record_kept_operators(spec.target);
     });
-}
-
-/// Note that the expression `expr` reads the source registered under `name`.
-///
-/// The node itself is minted later, by [`materialize_sources`]: its row names
-/// every site that reads it, and a row's parents are fixed when its recording
-/// closes.
-pub(crate) fn record_source_read(name: &str, expr: NodeId) {
-    BOUNDARIES.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(boundaries) = slot.as_mut() else {
-            return;
-        };
-        match boundaries.source_reads.iter_mut().find(|(n, _)| n == name) {
-            Some((_, reads)) => reads.push(expr),
-            None => boundaries.source_reads.push((name.to_string(), vec![expr])),
-        }
-    });
-}
-
-/// Mint one node per registered source that something read.
-///
-/// Must run inside the conversion phase scope, since each node needs a provenance
-/// row like any other node of the pane. Each row names every read site: the first
-/// through the recording, the rest through
-/// [`RecordingGuard::also_consumes`](crate::ccl::provenance::RecordingGuard::also_consumes),
-/// which is what a node consumed from several places is for.
-pub(crate) fn materialize_sources() {
-    let pending = BOUNDARIES.with(|slot| {
-        slot.borrow_mut()
-            .as_mut()
-            .map(|b| std::mem::take(&mut b.source_reads))
-            .unwrap_or_default()
-    });
-    for (name, reads) in pending {
-        let Some(first) = reads.first() else {
-            continue;
-        };
-        let id = {
-            let guard = crate::ccl::provenance::enter(
-                *first,
-                "opconv.source",
-                crate::ccl::provenance::Nature::Machinery,
-            );
-            for extra in &reads[1..] {
-                guard.also_consumes(*extra);
-            }
-            let id = NodeId::fresh();
-            crate::ccl::provenance::on_mint(id);
-            id
-        };
-        BOUNDARIES.with(|slot| {
-            if let Some(boundaries) = slot.borrow_mut().as_mut() {
-                boundaries.sources.push((name, id));
-            }
-        });
-    }
 }
 
 /// Mint the node for a compiled output field.
