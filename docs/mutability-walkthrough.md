@@ -569,7 +569,7 @@ Reading it off — exactly the shape §3 predicted, now with two writers:
   it *rides* the commit.
 - **the trailing read is `final_read`**, which is what `await_final` resolves to: a sample of
   `pool`'s carried value at the position its own writers finish. It takes no seed operand,
-  tick 0 of the store being the seed.
+  the store carrying its own seed.
 
 *Why that second gate earns its keep:* an out-of-block write that slipped the lowering gate
 would otherwise become a shadowing `let` that quietly discards committed values.
@@ -703,7 +703,7 @@ per-key `carry_forward` flag picks what it means:
 
 | Store | A key read is | carrying — a variable | non-carrying — a reply tap |
 |---|---|---|---|
-| induction changelog | `StoreDenseRead` over the loop extent | every position folds the latest write ≤ it | only the positions that fired |
+| induction changelog | `StoreDenseRead` over the positions the store decided | every position folds the latest write ≤ it | only the positions that fired |
 | commit (`Txn`) | `StoreValueStream` over the commit log | a value at every tick | only the tick that wrote it |
 
 Carrying is what makes a variable a variable: a tick that wrote some *other* key leaves this
@@ -713,9 +713,11 @@ is why two writers' taps to one defer do not smear across the shared clock.
 Two wrappers sit on top of that, and neither is mutability-specific:
 
 - a **scalar** read of an accumulator — `x` after the loop — is `final_or_default(stream,
-  seed)`, which compiles to `ExtractFinal`. `await_final(x)` is not this read: it is
-  `final_read`, compiling to `StoreFinalRead`, which samples the key's carried value once the
-  store reports it settled rather than reducing any stream;
+  seed)`. Over an induction accumulator's own history it compiles to `StoreFinalRead`, which
+  samples the key's carried value once the store has settled rather than reducing a stream;
+  under a nest, where there is one history per enclosing row, it compiles to `ExtractFinal`
+  per row. `await_final(x)` is a different term, `final_read`, and reaches `StoreFinalRead`
+  too;
 - a **co-iterated** read consumes the stream directly, since it is already a `𝐷 ⇀ 𝑉`.
 
 The exception is a `Txn` variable read *out of* a block: `rewrite_as_of_reads` turned that
@@ -747,8 +749,8 @@ counter transactionally consistent declares it `Mut(Int, Txn)`.
 Induction and transactions dispatch to different operators, which makes it easy to assume
 two implementations of a store. There is one. Both run the same `CommitEngine` over the same
 `Tile::Store` changelog, consume the same `` `commit ``/`` `abort `` decision, and are read
-the same way. `InductionStore` owns an engine too, seeded at tick 0 with the accumulator's
-init. The design doc puts it exactly: an induction
+the same way. `InductionStore` owns an engine too, holding the accumulator's init as its
+seed. The design doc puts it exactly: an induction
 store is "the degenerate no-conflict dual of the commit store".
 
 What differs is only what *decides* a position:
@@ -802,7 +804,7 @@ against the direction of the `get` that causes it.
 |---|---|---|
 | store | `InductionStore` | `CommitOperator` + `TransactWriter` |
 | driver | `InductionDriver` | `TransactDriver` |
-| readers | `StoreDenseRead` → `ExtractFinal` | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
+| readers | `StoreDenseRead`, `StoreFinalRead` (`ExtractFinal` per row under a nest) | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
 
 **Why the driver is a separate operator.** The accumulator has to reach the body, and the
 only sanctioned route is a tile pulled along an edge. Splitting the roles puts it on one:
@@ -819,12 +821,13 @@ function of the store tile and the source tile.
 a snapshot taken before the traversal began, so a position decided *during* a pull is
 invisible until the next one. That is a property of the cycle, not of the split: the store's
 producer is on the stack for the whole traversal, so nothing can refresh the memo mid-pull.
-It is the rate every cyclic operator here runs at, and the driver re-arms on the wakeup queue
-while a position remains to feed.
+It is the rate every cyclic operator here runs at. The driver wakes its consumer on the wakeup
+queue when a pull emits a position, and the store wakes its readers when a pull decides one, so
+the operator that takes each step wakes what waits on it.
 
 It also makes the cycle well-founded. The driver emits the position the store says is next,
 so the body is never asked for a position whose predecessor is undecided; each round either
-advances the frontier or re-arms.
+emits the next position or decides the one emitted.
 
 ### What the transaction adds: the ack
 
@@ -863,7 +866,7 @@ the engine-level reason `get_prev_txn` needs no `commit: Bool` filter.
 
 | Operator | State it owns | What advances it | What it publishes |
 |---|---|---|---|
-| `InductionStore` / `CommitOperator` | a `CommitEngine`: `committed` (tick ⇀ write-set), `latest_write` (key ⇀ tick), `next_ts` | a decision consumed (`step`) / a proposal validated (`attempt`) | the changelog, with its frontier and terminal flag |
+| `InductionStore` / `CommitOperator` | `CommitEngine`s (one per open store): the seed, a changelog per key, the decided domain, the frontier | a decision consumed (`step`) / a proposal validated (`attempt`) | the changelog, with its frontier and terminal flag |
 | `InductionDriver` | only its own emitted window | a pull, from the store tile and the source tile | the body's `(prev…, item)` input |
 | `TransactDriver` | the item cursor, the emitted rows with their items, the `(item, frontier)` retry key | a pull, plus **release** — which is what advances the cursor | the body's `(snapshot…, item)` input |
 | `TransactWriter` | the in-flight proposals, its decided watermark | a decision read, plus the commit-ack release | the proposal stream |

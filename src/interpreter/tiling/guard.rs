@@ -59,6 +59,49 @@ impl TileGuard {
         }
     }
 
+    /// This guard with every collection level's predicate replaced by `f(depth, predicate)`,
+    /// outermost first: the guard's counterpart of
+    /// [`Tile::map_level_predicates`](crate::interpreter::Tile), for an operator that
+    /// restates the paths a region names when it hands the region to its input.
+    pub(crate) fn map_level_predicates(
+        &self,
+        f: &mut dyn FnMut(usize, &Predicate) -> Predicate,
+    ) -> TileGuard {
+        fn walk(
+            guard: &TileGuard,
+            depth: usize,
+            f: &mut dyn FnMut(usize, &Predicate) -> Predicate,
+        ) -> TileGuard {
+            match guard {
+                TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                    TileGuard::Function(FunctionGuard::Domain(f(depth, pred)))
+                }
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+                    FunctionGuard::Codomain(Box::new(walk(inner, depth + 1, f))),
+                ),
+                // A record stands over the same rows, so a collection in one of its fields
+                // is a level at the record's depth.
+                TileGuard::Record(fields) => TileGuard::Record(
+                    fields
+                        .iter()
+                        .map(|(name, field)| (name.clone(), walk(field, depth, f)))
+                        .collect(),
+                ),
+                TileGuard::Or(arms) => {
+                    TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, depth, f)).collect())
+                }
+                // A keyless leaf names the paths above it as a key of this depth would, so a
+                // qualified one is restated alike. An unqualified one names every path or none.
+                TileGuard::Scalar(pred) if pred.qualifies() => TileGuard::Scalar(f(depth, pred)),
+                TileGuard::Aggregation(pred) if pred.qualifies() => {
+                    TileGuard::Aggregation(f(depth, pred))
+                }
+                TileGuard::Scalar(_) | TileGuard::Aggregation(_) => guard.clone(),
+            }
+        }
+        walk(self, 0, f)
+    }
+
     /// Whether this guard names `path`, one component per level from the outermost.
     ///
     /// A guard is a region of paths, and this is the region read at one of them — what a

@@ -336,6 +336,7 @@ struct Entry {
 enum EntryValue {
     Key,
     Value(Option<Value>),
+    Frontier(Option<crate::interpreter::Position>),
     Row(Tile),
 }
 
@@ -414,6 +415,51 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                             complete: level > 0 && above.contains_path(path),
                         },
                     );
+                }
+            }
+            // A store's row is what it answers: its frontier, each key's seed, and each
+            // key's value at every position it has decided. Its changelog is only how it
+            // answers — reclaiming a released prefix keeps every carry source a live
+            // position folds to, so the answers outside what was released do not move.
+            Tile::Store { .. } if level > 0 => {
+                use crate::interpreter::commit_operator::{
+                    store_decided_positions, store_frontier, store_seed_value, store_value_at,
+                };
+                use crate::interpreter::operator_conversion::store_key;
+                for (row, path) in rows.iter().enumerate() {
+                    let Some(path) = path else { continue };
+                    let one = tile.select_rows(&[row]);
+                    let complete = level > 0 && above.contains_path(path);
+                    let entry = |value: EntryValue| Entry { value, complete };
+                    let at_label = |name: &str| {
+                        let mut l = label.to_vec();
+                        l.push(name.to_string());
+                        l
+                    };
+                    entries.insert(
+                        (at_label("frontier"), path.clone()),
+                        entry(EntryValue::Frontier(store_frontier(&one))),
+                    );
+                    let Tile::Store { decided, .. } = &one else {
+                        unreachable!("a store's rows are stores")
+                    };
+                    let positions = store_decided_positions(decided, 0);
+                    let names: Vec<String> = one.store_keys().cloned().collect();
+                    for name in names {
+                        let key = store_key(&name, Value::Unit);
+                        entries.insert(
+                            (at_label(&format!("seed.{name}")), path.clone()),
+                            entry(EntryValue::Value(store_seed_value(&one, &key))),
+                        );
+                        for position in &positions {
+                            let mut at = path.clone();
+                            at.push(position.value().clone());
+                            entries.insert(
+                                (at_label(&name), at),
+                                entry(EntryValue::Value(store_value_at(&one, position, &key))),
+                            );
+                        }
+                    }
                 }
             }
             // An aggregation is one accumulator per row, compared row by row. Beneath no

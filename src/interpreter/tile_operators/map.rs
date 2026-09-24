@@ -544,7 +544,7 @@ impl TileProducer for MapResultProducer {
             return input_tile;
         }
 
-        // An argument carrying a level cannot be boxed into a column, so a computable
+        // An argument carrying a level cannot be materialized into a column, so a computable
         // function that takes one is applied to the tile instead ([`FunctionDef::apply_tile`]
         // — `insert`, whose collection operand reaches it opened).
         if input_tile.deepest_values().holds_a_level()

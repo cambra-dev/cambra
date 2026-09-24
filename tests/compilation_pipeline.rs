@@ -38,6 +38,8 @@ mod joins_aggregates_groupby;
 mod misc;
 #[path = "compilation_pipeline/mutability.rs"]
 mod mutability;
+#[path = "compilation_pipeline/nested_loops.rs"]
+mod nested_loops;
 #[path = "compilation_pipeline/records.rs"]
 mod records;
 #[path = "compilation_pipeline/scalars_collections.rs"]

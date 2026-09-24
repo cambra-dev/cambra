@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::{
-    interpreter::{Consumer, Scheduler, forwarding_consumer, shared_consumer, tuple_field},
+    interpreter::{Consumer, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -193,11 +193,46 @@ impl TileProducer for ZipProducer {
         // intersection on a `cyclic: bool` constructor flag (mirroring
         // `FanOut::new` vs `FanOut::new_cyclic`) and keeping the simpler
         // "all inputs agree" path for zips that can't lag.
-        let tiles: Vec<Tile> = self
+        let mut tiles: Vec<Tile> = self
             .inputs
             .iter_mut()
             .map(|i| i.get(i.tiling().universal_guard()))
             .collect();
+
+        // Every level above the pair has to agree before anything pairs beneath it. The
+        // arms are pulled from their own branches, so one may already hold a row under a
+        // key the other has not reached, and beneath a standing level a key alone does not
+        // name that row — it repeats across its siblings' groups. So the arms are aligned
+        // over whole paths, level by level: each keeps the paths every arm holds.
+        //
+        // Level by level rather than by extension, because a group may legitimately be
+        // empty. A key holding nothing extends to no path of the level below, and reading
+        // the levels above off the deepest one's paths would take that key away — where
+        // what every arm agrees on is that the key is there and holds nothing.
+        // Only where something stands above the pair's own enclosing level. One level up is
+        // the flat case, which the presence intersection below already aligns over the
+        // outermost keys, and a path set per arm per pull is not worth building for it.
+        if let Some(above) = self.level.enclosing()
+            && above.index() >= 1
+            && tiles[0].is_data_function()
+        {
+            let present: Vec<HashSet<Vec<Value>>> = (0..=above.index())
+                .map(|depth| {
+                    let level = CurryLevel::new(depth);
+                    tiles
+                        .iter()
+                        .map(|tile| tile.paths_at(level).into_iter().collect())
+                        .reduce(|acc: HashSet<Vec<Value>>, held| {
+                            acc.intersection(&held).cloned().collect()
+                        })
+                        .expect("Zip has at least one input")
+                })
+                .collect();
+            let keep = |path: &[Value]| present[path.len() - 1].contains(path);
+            for tile in tiles.iter_mut() {
+                tile.retain_paths(above, &keep);
+            }
+        }
 
         match &tiles[0] {
             Tile::DataFunction { .. } => {
@@ -328,13 +363,11 @@ impl TileProducer for ZipProducer {
             i.release(match &obsolete_guard {
                 g if g.is_universal() => i.tiling().universal_guard(),
                 g if g.is_empty() => i.tiling().empty_guard(),
-                TileGuard::Function(FunctionGuard::Domain(p)) => {
-                    TileGuard::Function(FunctionGuard::Domain(p.clone()))
-                }
-                TileGuard::Function(FunctionGuard::Codomain(g)) => {
-                    TileGuard::Function(FunctionGuard::Codomain(g.clone()))
-                }
-                g => unimplemented!("Zip cannot honor the release guard {g:?}"),
+                // A zip pairs its arms at the same positions, so a region of the output
+                // names that same region of every arm and travels verbatim, whichever
+                // shape it takes. Only the universal and empty guards are rebuilt, being
+                // spelled against each arm's own tiling.
+                g => g.clone(),
             })
         });
     }

@@ -49,7 +49,22 @@ pub fn shared_consumer(mut consumer: Box<dyn Consumer>) -> SharedConsumer {
 /// impl something sized to bite on.
 pub fn forwarding_consumer(shared: &SharedConsumer) -> Box<dyn Consumer> {
     let shared = shared.clone();
-    Box::new(move || shared.borrow_mut().notify())
+    Box::new(move || {
+        // A notification that re-enters a consumer already being notified is dropped. A
+        // recurrence's notification graph is cyclic, and nesting closes a cycle through
+        // *two* inputs of one operator: the inner store sits downstream of the enclosing
+        // body and its read feeds back into it, so one upstream change reaches the body's
+        // `Zip` along both arms. Dropping the second is what a wake means — an edge, not a
+        // count. The call in progress has not returned, so whatever it wakes is woken once
+        // for this cascade and re-pulls with both arms' data.
+        //
+        // The drop rests on that pull not having happened yet, so it does not extend to a
+        // consumer this cascade woke and has since returned from: a cascade can contain a
+        // pull, and a wake after one carries what arrived too late for it.
+        if let Ok(mut consumer) = shared.try_borrow_mut() {
+            consumer.notify();
+        }
+    })
 }
 
 #[derive(Clone, Default)]
@@ -60,7 +75,14 @@ impl WakeupQueue {
     /// [`Scheduler::check_for_notifications`] — i.e. once the current `get`
     /// stack has fully unwound.
     pub fn request(&self, consumer: SharedConsumer) {
-        self.0.borrow_mut().push(consumer);
+        // A consumer already waiting is not queued twice. A wake is an edge, not a count,
+        // and a drive re-arms on every pull it makes progress on, so the same consumer is
+        // requested many times between drains.
+        let mut queued = self.0.borrow_mut();
+        if queued.iter().any(|waiting| Rc::ptr_eq(waiting, &consumer)) {
+            return;
+        }
+        queued.push(consumer);
     }
 
     /// Take the currently-queued wakeups, leaving the queue empty. A wakeup

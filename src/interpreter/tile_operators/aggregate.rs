@@ -376,14 +376,15 @@ impl TileProducer for MapExtractAggregateProducer {
         output
     }
 
+    /// Every level passes through and only what sits under the innermost changes, so a
+    /// region named on the output names the same region of the input — a key of any level,
+    /// or a path down to one, alike.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            g => todo!("MapExtractAggregate cannot honor the release guard {g:?}"),
+            g @ (TileGuard::Function(_) | TileGuard::Or(_)) => g,
+            g => unreachable!("MapExtractAggregate's tiling is a collection, released by {g:?}"),
         });
     }
 }
@@ -616,6 +617,9 @@ impl TileProducer for MapAggregateProducer {
 
         // The collection being folded is the innermost one, and the rows it stands over
         // are the groups: `parent_paths` names them, one path per group.
+        //
+        // Every level above it states its own completion, which is collected here: a level
+        // says which of *its* keys are closed, and no other level says it for it.
         let depth = input_tile.innermost_depth().unwrap_or_else(|| {
             panic!("MapAggregate folds a collection of collections, got {input_tile:?}")
         });
@@ -624,6 +628,17 @@ impl TileProducer for MapAggregateProducer {
             "MapAggregate folds a collection of collections, so the fold sits under a \
              level: {input_tile:?}"
         );
+        let level_predicates: Vec<Predicate> = (0..depth)
+            .map(|level| {
+                let Tile::DataFunction {
+                    domain_predicate, ..
+                } = input_tile.values_at(CurryLevel::new(level))
+                else {
+                    unreachable!("every level above the innermost one is a collection")
+                };
+                domain_predicate.clone()
+            })
+            .collect();
         let parent_paths = input_tile.row_paths_at(depth);
         let folded = input_tile.values_at(CurryLevel::new(depth));
         let Tile::DataFunction { codomain, .. } = folded else {
@@ -649,15 +664,17 @@ impl TileProducer for MapAggregateProducer {
 
         // Build the output from all known accumulators.
         //
-        // **Terminal per element, which is what the predicate says.** A `domain_predicate`
-        // names the region of the outermost domain that will see no new elements, each key
-        // together with every level below it — so an element
-        // whose outermost ancestor lies inside it has a complete group and its accumulator
-        // is the answer, whatever the rest of the domain is still doing. Reading the
-        // predicate as one bool answers "not yet" for every element whenever any part of the
-        // domain is open, which is never right for a live source: a collection held per row
-        // is complete as soon as its row arrives, and an aggregate over one would otherwise
-        // never settle.
+        // **Terminal per element, which is what the predicates say.** A level's
+        // `domain_predicate` names which of that level's keys are closed, and a key called
+        // closed is closed at every depth beneath it — so an element is final as soon as
+        // some level on its path calls that prefix closed, whatever the rest of the domain
+        // is still doing. Reading the predicate as one bool answers "not yet" for every
+        // element whenever any part of the domain is open, which is never right for a live
+        // source: a collection held per row is complete as soon as its row arrives, and an
+        // aggregate over one would otherwise never settle. Reading only the **outermost**
+        // level is the same mistake one level up: under a nested carrier the enclosing rows
+        // stay open while the row being run is decided, so an aggregate inside the nest
+        // would never settle either.
         let mut entries: Vec<(Vec<Value>, Tile)> = self
             .accumulators
             .iter()
@@ -669,7 +686,13 @@ impl TileProducer for MapAggregateProducer {
 
         let terminal: BitVec = entries
             .iter()
-            .map(|(path, _)| domain_predicate.contains(&path[0]))
+            .map(|(path, _)| {
+                level_predicates
+                    .iter()
+                    .take(path.len())
+                    .enumerate()
+                    .any(|(level, pred)| pred.contains_path(&path[..=level]))
+            })
             .collect();
         // One accumulator per key, run together in path order: a scalar fold's rows are a
         // column, and `Sole`'s are the elements' own levels.
@@ -698,14 +721,14 @@ impl TileProducer for MapAggregateProducer {
                 self.accumulators.clear();
                 self.input.release(self.input.tiling().universal_guard());
             }
-            TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                // The guard names the outermost domain, which is the head of every
-                // accumulator's path.
-                self.accumulators.retain(|path, _| !pred.contains(&path[0]));
-                self.input
-                    .release(TileGuard::Function(FunctionGuard::Domain(pred)));
+            // The guard is a region over the accumulators' own paths, whatever shape it
+            // names it at, so it is read at each of them rather than matched arm by arm.
+            // Keeping a released path would re-emit it on the next pull, `get_impl`
+            // building its output from every accumulator it holds.
+            g => {
+                self.accumulators.retain(|path, _| !g.covers_path(path));
+                self.input.release(g);
             }
-            g => todo!("Unimplemented guard in MapAggregateProducer: {g:?}"),
         }
     }
 }
@@ -867,11 +890,12 @@ mod tests {
 
     /// A per-key release **reaches the input**, which the case above cannot show.
     ///
-    /// The input's `domain_predicate` calls key 2's group whole and leaves key 1's open, so
-    /// [`Tile::to_guard`] names key 1 only through what its group holds, never the key
-    /// itself. The only guard naming key 1 is then the one `release_impl` forwards. The
-    /// input's own keys are this producer's accumulator key set, so nothing else would
-    /// reclaim the key.
+    /// Key 2's group is still growing, so [`Tile::to_guard`] stops inside it and the first
+    /// pull releases only the path as far as it got. Releasing key 2 whole reaches past
+    /// that path, making it the one guard the producer has to forward for the key to be
+    /// reclaimed — the input's own keys being this producer's accumulator key set. A key
+    /// the first pull already covered would be dropped by the release accumulation in
+    /// [`TileProducer::release`] instead, and show nothing about forwarding.
     #[test]
     fn map_aggregate_forwards_a_per_key_release_to_an_open_input() {
         let key_extent = Extent::Base(BaseType::Int);
@@ -882,16 +906,17 @@ mod tests {
                 Tiling::Scalar(Extent::Base(BaseType::Int)),
             ),
         );
+        // Key 1 holds its whole group; key 2 has delivered the first of its two.
         let tile = Tile::data_function(
             ColumnValue::Ints(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::from_uints(vec![0, 2]),
-                ColumnValue::Ints(vec![0, 1, 0, 1]),
-                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+                ColumnValue::Ints(vec![0, 1, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
                 Predicate::False,
                 BitSet::new(),
             )),
-            Predicate::point(Value::Int(2)),
+            Predicate::at_or_below(Value::Int(1)),
             BitSet::new(),
         );
         let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
@@ -915,15 +940,15 @@ mod tests {
             released.borrow()
         );
 
-        let key_one = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
+        let key_two = TileGuard::Function(FunctionGuard::Domain(Predicate::Intervals(
             intervalsets::IntervalSet::from(intervalsets::Interval::closed(
-                Value::Int(1),
-                Value::Int(1),
+                Value::Int(2),
+                Value::Int(2),
             )),
         )));
-        producer.release(key_one.clone());
+        producer.release(key_two.clone());
         assert!(
-            released.borrow().contains(&key_one),
+            released.borrow().contains(&key_two),
             "the per-key release must reach the input, got {:?}",
             released.borrow()
         );

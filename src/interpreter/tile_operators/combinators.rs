@@ -1,7 +1,8 @@
 use bit_set::BitSet;
 use bit_vec::BitVec;
 use log::trace;
-use std::{collections::HashMap, iter};
+use std::collections::HashMap;
+use std::iter::repeat_n;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
@@ -436,24 +437,39 @@ impl TileProducer for MapDomainProducer {
 /// Takes `A ⤇ B ⤇ C` and produces `{_0: A, _1: B} ⤇ C`: the two key extents are packed
 /// into a record key, and the values stand as they were.
 pub struct Uncurry {
-    /// Output tiling: `DataFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
+    /// Output tiling: `DataFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`,
+    /// beneath `depth` standing levels.
     base: OperatorBase,
     /// The two-level input.
     input: Box<dyn TileOperator>,
+    /// The level the pair is formed at — see [`Uncurry::new_at`].
+    level: CurryLevel,
 }
 
 impl Uncurry {
     /// Create an `Uncurry` operator that flattens two collection levels into one.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
+        Self::new_at(input, CurryLevel::OUTERMOST)
+    }
+
+    /// [`Uncurry::new`] at `level`, leaving every level above it standing.
+    ///
+    /// A nest three deep pairs the innermost loop's positions with the loop around them,
+    /// under the outermost as a standing level — so which two levels pair is the caller's
+    /// to say, not always the top two.
+    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
         // Flattening pairs a collection with the one inside it, so it takes exactly that:
         // a collection whose values are a collection. A deeper one flattens a level at a
         // time.
         let Tiling::DataFunction {
             domain: outer,
             codomain: inner,
-        } = input.tiling()
+        } = input.tiling().values_at(level)
         else {
-            panic!("Uncurry expected a collection, got {:?}", input.tiling())
+            panic!(
+                "Uncurry expected a collection at {level}, got {:?}",
+                input.tiling()
+            )
         };
         let Tiling::DataFunction {
             domain: inner_keys,
@@ -466,13 +482,14 @@ impl Uncurry {
             (tuple_field(0), outer.clone()),
             (tuple_field(1), inner_keys.clone()),
         ]));
-        let tiling = Tiling::DataFunction {
+        let paired = Tiling::DataFunction {
             domain: pair_extent,
             codomain: codomain.clone(),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new(with_values_at(input.tiling(), level, paired)),
             input,
+            level,
         }
     }
 }
@@ -495,6 +512,8 @@ impl TileOperator for Uncurry {
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            level: self.level,
+            empty_pair: self.tiling().values_at(self.level).empty_at_no_rows(),
         })
     }
 }
@@ -504,6 +523,10 @@ struct UncurryProducer {
     base: ProducerBase,
     /// The upstream producer whose two levels are flattened.
     input: Box<dyn TileProducer>,
+    /// The level the pair is formed at — see [`Uncurry::new_at`].
+    level: CurryLevel,
+    /// The paired level to answer with where no enclosing row has been reached.
+    empty_pair: Tile,
 }
 
 impl TileProducer for UncurryProducer {
@@ -515,104 +538,163 @@ impl TileProducer for UncurryProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        match input_tile {
-            Tile::DataFunction {
-                domain: domain1,
-                codomain: inner,
-                domain_predicate,
-                ..
-            } => {
-                let Tile::DataFunction {
-                    row_starts,
-                    domain: domain2,
-                    codomain,
-                    ..
-                } = *inner
-                else {
-                    panic!("Uncurry flattens two collections")
-                };
-                let domain2 = &domain2;
-                let codomain = scalar_tile_to_column_value(*codomain);
-                let ColumnValue::UInts(offsets_vec) = &row_starts else {
-                    panic!("row starts are UInts");
-                };
-
-                // Build an expansion index iterator: for each group i,
-                // emit i repeated (group_end - group_start) times.
-                let mut expansion_indices = Vec::new();
-                for i in 0..domain1.len() {
-                    let group_start = offsets_vec[i];
-                    let group_end = if i + 1 < offsets_vec.len() {
-                        offsets_vec[i + 1]
-                    } else {
-                        domain2.len()
-                    };
-                    for _ in group_start..group_end {
-                        expansion_indices.push(i);
-                    }
+        // Pair beneath the standing levels, which stand unchanged: a row's group is a
+        // curried collection in its own right, so the pairing below is the same one a
+        // depth-zero `Uncurry` does to the whole tile.
+        let mut result =
+            input_tile.regroup_beneath(self.level, self.empty_pair.clone(), &mut |row| {
+                match input_tile.group_at(self.level, row) {
+                    Some(group) => pair_two_levels(group.into_owned()),
+                    None => self.empty_pair.clone(),
                 }
-
-                let total_rows = expansion_indices.len();
-                let expanded_domain1 =
-                    domain1.select_indices(expansion_indices.into_iter(), total_rows);
-
-                // Build the pair domain column as Record with fields _0 and _1.
-                let pair_domain = ColumnValue::Records(HashMap::from([
-                    (tuple_field(0), expanded_domain1),
-                    (tuple_field(1), domain2.clone()),
-                ]));
-
-                let inner_pred = if domain_predicate.as_bool().unwrap_or(true) {
-                    Predicate::True
-                } else {
-                    Predicate::False
-                };
-                let mut result = Tile::data_function(
-                    pair_domain,
-                    Box::new(Tile::Scalar(codomain)),
-                    Predicate::Record(HashMap::from([
-                        (tuple_field(0), domain_predicate),
-                        (tuple_field(1), inner_pred),
-                    ])),
-                    BitSet::new(),
-                );
-                result.remove_guarded(self.base().obsolete_guard.clone());
-                result
-            }
-            _ => panic!("Uncurry expected DataFunction tile"),
-        }
+            });
+        result.remove_guarded(self.base().obsolete_guard.clone());
+        result
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let input_guard = match &obsolete_guard {
-            // Pass through empty and universal guards unchanged.
+        let input_guard = self.split_pair_guard(obsolete_guard, self.level);
+        trace!("{} releasing up with: {input_guard:?}", self.name());
+        self.input.release(input_guard);
+    }
+}
+
+/// Pair a curried collection's two levels into one keyed by `(outer, inner)` pairs.
+///
+/// The whole of what [`Uncurry`] does, on a tile that is exactly those two levels. An
+/// standing `Uncurry` applies it to each enclosing row's group, which is such a tile.
+fn pair_two_levels(tile: Tile) -> Tile {
+    let Tile::DataFunction {
+        domain: domain1,
+        codomain: inner,
+        domain_predicate,
+        ..
+    } = tile
+    else {
+        panic!("Uncurry expected a collection, got {tile:?}")
+    };
+    let Tile::DataFunction {
+        row_starts,
+        domain: domain2,
+        mut codomain,
+        domain_predicate: inner_statement,
+        ..
+    } = *inner
+    else {
+        panic!("Uncurry flattens two collections")
+    };
+    let fields = (tuple_field(0), tuple_field(1));
+    let fields = (fields.0.as_str(), fields.1.as_str());
+    // Everything beneath the inner level named its paths by outer and inner key apart, and
+    // the pair level names them together.
+    codomain.map_level_predicates(&mut |depth, pred| pred.with_levels_paired(depth + 2, 0, fields));
+    let ColumnValue::UInts(offsets_vec) = &row_starts else {
+        panic!("row starts are UInts")
+    };
+
+    // One copy of a group's key per key inside it, so the pair column lines up with the
+    // flattened codomain.
+    let mut expansion_indices = Vec::new();
+    for i in 0..domain1.len() {
+        let group_start = offsets_vec[i];
+        let group_end = if i + 1 < offsets_vec.len() {
+            offsets_vec[i + 1]
+        } else {
+            domain2.len()
+        };
+        for _ in group_start..group_end {
+            expansion_indices.push(i);
+        }
+    }
+    let total_rows = expansion_indices.len();
+    let expanded_domain1 = domain1.select_indices(expansion_indices.into_iter(), total_rows);
+
+    let pair_domain = ColumnValue::Records(HashMap::from([
+        (tuple_field(0), expanded_domain1),
+        (tuple_field(1), domain2),
+    ]));
+    // A pair is complete where its outer key is — complete beneath, by the closure — or
+    // where the inner level called it complete under its outer key.
+    let pair_statement = Predicate::record(HashMap::from([
+        (tuple_field(0), domain_predicate),
+        (tuple_field(1), Predicate::True),
+    ]))
+    .union(&inner_statement.with_levels_paired(1, 0, fields));
+    // The values stand as they were: they are already one entry per key of the flattened
+    // domain, in the same order, and materializing them into a column is what a
+    // level-carrying value — a nest whose elements are collections — has nowhere to go.
+    Tile::data_function(pair_domain, codomain, pair_statement, BitSet::new())
+}
+
+impl UncurryProducer {
+    /// The input guard a release of the paired level names.
+    ///
+    /// Standing levels are untouched by the pairing, so a guard naming one passes through
+    /// and the guard beneath it is split. At the paired level itself, a pair release
+    /// reaches the input's outer key only where it covers that key's **whole** inner
+    /// collection — a partial group leaves the outer key still live. A pair arm qualified by
+    /// the standing rows above it releases its outer keys under those same rows.
+    fn split_pair_guard(&self, guard: TileGuard, level: CurryLevel) -> TileGuard {
+        match guard {
             g if g.is_empty() => self.input.tiling().empty_guard(),
             g if g.is_universal() => self.input.tiling().universal_guard(),
-            // Split domain guards on the pair domain (_0, _1) into record predicates.
+            TileGuard::Function(FunctionGuard::Codomain(inner))
+                if level != CurryLevel::OUTERMOST =>
+            {
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                    self.split_pair_guard(*inner, level.in_codomain()),
+                )))
+            }
+            g @ TileGuard::Function(FunctionGuard::Domain(_)) if level != CurryLevel::OUTERMOST => {
+                g
+            }
+            // Part of every pair's value: the same part of every inner key's value under every
+            // outer key. What it names beneath the pairs names them by pair, and is split back
+            // into the two components the pairs were formed from.
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                let at = self.level.index();
+                let fields = (tuple_field(0), tuple_field(1));
+                let fields = (fields.0.as_str(), fields.1.as_str());
+                let inner = inner.map_level_predicates(&mut |depth, pred| {
+                    pred.with_levels_unpaired(at + 1 + depth, at, fields)
+                });
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                    FunctionGuard::Codomain(Box::new(inner)),
+                ))))
+            }
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 let pair_fields = HashMap::from([(tuple_field(0), ()), (tuple_field(1), ())]);
-
-                let preds: Box<dyn Iterator<Item = &Predicate>> = match pred {
-                    Predicate::Or(preds) => Box::new(preds.iter()),
-                    _ => Box::new(iter::once(pred)),
+                let arms = |p: &Predicate| -> Vec<Predicate> {
+                    match p {
+                        Predicate::Or(arms) => arms.clone(),
+                        one => vec![one.clone()],
+                    }
                 };
-
                 let mut domain_guard = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
-                for pred in preds {
-                    let mut split_preds = pred.split_record(&pair_fields);
-                    let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
-                    let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
-                    if inner_pred.as_bool().is_some_and(|x| x) {
-                        domain_guard = domain_guard
-                            .union(&TileGuard::Function(FunctionGuard::Domain(outer_pred)));
+                for arm in arms(&pred) {
+                    let (enclosing, pairs) = arm.split_qualification();
+                    for pair in arms(pairs) {
+                        let mut split_preds = pair.split_record(&pair_fields);
+                        let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
+                        let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
+                        if inner_pred.is_true() {
+                            domain_guard =
+                                domain_guard.union(&TileGuard::Function(FunctionGuard::Domain(
+                                    Predicate::qualified(enclosing.clone(), outer_pred),
+                                )));
+                        }
                     }
                 }
                 domain_guard
             }
-            g => panic!("Filter cannot honor the release guard {g:?}"),
-        };
-        trace!("{} releasing up with: {input_guard:?}", self.name());
-        self.input.release(input_guard);
+            // Each arm names its own region, so each splits on its own.
+            TileGuard::Or(arms) => arms
+                .into_iter()
+                .fold(self.input.tiling().empty_guard(), |all, arm| {
+                    all.union(&self.split_pair_guard(arm, level))
+                }),
+            g => todo!("Uncurry cannot honor the release guard {g:?}"),
+        }
     }
 }
 
@@ -1263,7 +1345,7 @@ struct ProductProducer {
     /// The inner_domain, kept after the inner collection has delivered all of them.
     ///
     /// **Every group holds the whole domain**, so a row cannot be emitted until the inner
-    /// side is complete — a group built from a prefix would claim a row finished with
+    /// side is complete — a group built from a prefix would claim a row complete with
     /// elements still to come. The inner side of a correlated comprehension is closed over
     /// the outer binder, so it is the same stream for every row and reading it once is all
     /// this needs.
@@ -1347,11 +1429,384 @@ impl TileProducer for ProductProducer {
     }
 }
 
+/// Each row of one stream paired with every key of **its own** group in another — the
+/// dependent sibling of [`Product`].
+///
+/// [`Product`] pairs every row against one *shared* inner domain, which is what a correlated
+/// comprehension over a source closed to the outer binder has. A **nested loop**, and a
+/// comprehension whose inner source is the row itself, has a domain that belongs to the row:
+/// `for xs in rows: for x in xs` gives each row its own collection, and a source whose
+/// elements are lists gives them differing lengths with no witness and no `box` involved.
+/// There is then no extent to enumerate — the element extent's domain is unbounded — so the
+/// keys come from the tile.
+///
+/// The output tiling is [`Product`]'s: the outer's levels with the inner domain appended,
+/// over `{_0: outer codomain, _1: inner domain}`. What differs is where a group comes from
+/// — the inner tile's own groups rather than a width every row repeats — so this needs no
+/// terminal inner side, a row being complete as soon as its own group is.
+/// Pair each key of `outer` with the keys of the collection `inner` holds for it, at one
+/// level: the shape [`ProductPerRow`] produces beneath whatever standing levels both sides
+/// carry.
+///
+/// Both sides are pulled from their own branch and need not have reached the same rows, so
+/// only the rows *both* have carry a group. A row the inner side has not delivered has no
+/// domain yet, and a group that could still gain keys is what the layout cannot hold
+/// ([`Tile::append_level`]).
+fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling) -> Tile {
+    let (
+        Tile::DataFunction {
+            domain: outer_keys, ..
+        },
+        Tile::DataFunction {
+            domain: inner_rows,
+            codomain: groups,
+            domain_predicate: inner_complete,
+            ..
+        },
+    ) = (outer, inner)
+    else {
+        unreachable!(
+            "ProductPerRow's constructor requires both operands to tile as collections; \
+             got {outer:?} and {inner:?}"
+        )
+    };
+    let Tile::DataFunction {
+        domain: group_keys, ..
+    } = &**groups
+    else {
+        unreachable!(
+            "ProductPerRow's constructor requires an inner side holding a collection per \
+             row; got {groups:?}"
+        )
+    };
+    let mut row_of_inner: HashMap<Value, usize> = HashMap::with_capacity(inner_rows.len());
+    for i in 0..inner_rows.len() {
+        row_of_inner.insert(inner_rows.index_at(i), i);
+    }
+    let paired: Vec<usize> = (0..outer_keys.len())
+        .filter(|r| row_of_inner.contains_key(&outer_keys.index_at(*r)))
+        .collect();
+    let runs: Vec<(usize, usize)> = paired
+        .iter()
+        .map(|r| {
+            let i = row_of_inner[&outer_keys.index_at(*r)];
+            groups.row_run(i)
+        })
+        .collect();
+    let mut kept = BitVec::from_elem(outer_keys.len(), false);
+    for r in &paired {
+        kept.set(*r, true);
+    }
+    let mut emitted = outer.clone();
+    emitted.retain_keys(&kept);
+    // A row is complete once nothing more arrives beneath it, which takes both sides: the
+    // enclosing row, and that row's collection on the inner side. The outer side's
+    // statement alone calls a row complete whose inner collection has not arrived, and a
+    // consumer releases what a statement calls complete, so that row's pairs are released
+    // before they exist and never delivered.
+    if let Tile::DataFunction {
+        domain_predicate, ..
+    } = &mut emitted
+    {
+        *domain_predicate = domain_predicate.intersect(inner_complete);
+    }
+    let total: usize = runs.iter().map(|(a, b)| b - a).sum();
+    emitted.append_level(|codomain| {
+        let key_indices: Vec<usize> = runs.iter().flat_map(|(a, b)| *a..*b).collect();
+        let keys = group_keys.select_indices(key_indices.into_iter(), total);
+        let row_indices: Vec<usize> = runs
+            .iter()
+            .enumerate()
+            .flat_map(|(r, (a, b))| repeat_n(r, b - a))
+            .collect();
+        // Each outer row's value now stands beneath the inner keys paired with it, so
+        // what it states of its own paths gains the inner key as a component.
+        let mut outer_values = codomain.select_rows(&row_indices);
+        outer_values
+            .map_level_predicates(&mut |depth, pred| pred.with_level_inserted(depth + 1, 1));
+        let mut starts = Vec::with_capacity(runs.len());
+        let mut at = 0;
+        for (a, b) in &runs {
+            starts.push(at);
+            at += b - a;
+        }
+        Tile::grouped(
+            ColumnValue::UInts(starts),
+            keys.clone(),
+            Box::new(pair_tile(outer_values, keys, pair)),
+            Predicate::False,
+            BitSet::new(),
+        )
+    })
+}
+
+/// The pair `{_0: element, _1: key}` in the representation `pair` names.
+///
+/// One rule, stated in [`ProductPerRow::new`] and read here: a materialized record column
+/// unless the element carries a level, which a column has nowhere to put.
+fn pair_tile(element: Tile, keys: ColumnValue, pair: &Tiling) -> Tile {
+    match pair {
+        Tiling::Record(_) => Tile::tuple(vec![element, Tile::Scalar(keys)]),
+        _ => Tile::Scalar(ColumnValue::Records(HashMap::from([
+            (tuple_field(0), scalar_tile_to_column_value(element)),
+            (tuple_field(1), keys),
+        ]))),
+    }
+}
+
+pub struct ProductPerRow {
+    /// Output tiling: the outer's levels with the inner domain appended.
+    base: OperatorBase,
+    /// The outer collection, one row per group.
+    outer: Box<dyn TileOperator>,
+    /// The per-row collections, aligned with `outer` row for row.
+    inner: Box<dyn TileOperator>,
+}
+
+impl ProductPerRow {
+    /// Pair every row of `outer` with the keys of the collection `inner` holds for it.
+    pub fn new(outer: Box<dyn TileOperator>, inner: Box<dyn TileOperator>) -> Self {
+        let outer_tiling = outer.tiling();
+        assert!(
+            outer_tiling.is_data_function(),
+            "ProductPerRow expected a collection as its outer operand, got {outer_tiling:?}"
+        );
+        // The row domain is the level the source **adds** — the one just past the levels it
+        // shares with the outer collection. Not its deepest: where the item is itself a
+        // collection, as in a nest whose elements are collections, the source carries the
+        // item's own levels below the one being paired, and reading the deepest pairs
+        // against those instead. The two coincide only for a scalar item.
+        let paired = CurryLevel::values_of(outer_tiling);
+        assert!(
+            inner.tiling().levels() > outer_tiling.levels(),
+            "ProductPerRow's inner side holds one collection per row of the outer, so it \
+             carries at least one level more — a shared inner domain is [`Product`]"
+        );
+        let Tiling::DataFunction {
+            domain: row_domain, ..
+        } = inner.tiling().values_at(paired)
+        else {
+            panic!(
+                "ProductPerRow reads each row's domain off a collection of collections, got {:?}",
+                inner.tiling()
+            )
+        };
+        let row_domain = row_domain.clone();
+        let element = outer_tiling.values_at(paired).clone();
+        // The pair rides materialized in one column unless the element carries a level, which a
+        // column has nowhere to put: a nest whose elements are collections pairs each of
+        // them against its own keys, so the pair is a struct of arrays there.
+        let pair = if element.holds_a_level() {
+            Tiling::tuple(&[element, Tiling::Scalar(row_domain.clone())])
+        } else {
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), element.extent()),
+                (tuple_field(1), row_domain.clone()),
+            ])))
+        };
+        let tiling = outer_tiling.append_level(row_domain, pair);
+        Self {
+            base: OperatorBase::new(tiling),
+            outer,
+            inner,
+        }
+    }
+}
+
+impl TileOperator for ProductPerRow {
+    impl_operator_base!();
+
+    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+        visit(value("outer", &*self.outer));
+        visit(value("inner", &*self.inner));
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let shared = shared_consumer(consumer);
+        let level = CurryLevel::innermost_of(self.outer.tiling())
+            .expect("ProductPerRow's outer operand is a collection");
+        let empty_level = self.tiling().values_at(level).empty_at_no_rows();
+        Box::new(ProductPerRowProducer {
+            base: ProducerBase::new(ProductPerRowProducer::alloc_id(), self.tiling()),
+            outer: self.outer.subscribe(
+                self.outer.tiling().universal_guard(),
+                forwarding_consumer(&shared),
+                scheduler,
+            ),
+            inner: self.inner.subscribe(
+                self.inner.tiling().universal_guard(),
+                forwarding_consumer(&shared),
+                scheduler,
+            ),
+            level,
+            empty_level,
+            pair: self.tiling().deepest_values().clone(),
+        })
+    }
+}
+
+/// Producer for [`ProductPerRow`].
+struct ProductPerRowProducer {
+    base: ProducerBase,
+    outer: Box<dyn TileProducer>,
+    inner: Box<dyn TileProducer>,
+    /// The levels both sides carry above the one being paired. The pair is formed at the
+    /// level the inner side *adds*, which is the outer's deepest — so a carrier inside a
+    /// deeper nest pairs beneath the levels it leaves standing rather than at the top,
+    /// where a key value repeats across enclosing rows and names no single row.
+    level: CurryLevel,
+    /// The paired level, empty — what an enclosing row that neither side has reached
+    /// contributes to the regrouped result.
+    empty_level: Tile,
+    /// The pair's own tiling, which says whether it rides materialized in one column.
+    pair: Tiling,
+}
+
+impl TileProducer for ProductPerRowProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("outer", self.outer.inspect(opts))
+            .child("inner", self.inner.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let mut outer_tile = self.outer.get(self.outer.tiling().universal_guard());
+        let mut inner_tile = self.inner.get(self.inner.tiling().universal_guard());
+        outer_tile.compact();
+        inner_tile.compact();
+        // The two sides are pulled from their own branches, so a row is matched by its path.
+        let (outer_paths, inner_row_at) = match self.level.enclosing() {
+            Some(enclosing) => (
+                outer_tile.paths_at(enclosing),
+                inner_tile.rows_by_path(enclosing),
+            ),
+            None => (vec![Vec::new()], HashMap::from([(Vec::new(), 0)])),
+        };
+        let mut tile =
+            outer_tile.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| {
+                let inner_row = inner_row_at.get(&outer_paths[row]);
+                let (Some(outer), Some(inner)) = (
+                    outer_tile.group_at(self.level, row),
+                    inner_row.and_then(|&at| inner_tile.group_at(self.level, at)),
+                ) else {
+                    // An enclosing row one side has not reached pairs nothing. The two are
+                    // pulled from their own branches, so either may be ahead.
+                    return self.empty_level.clone();
+                };
+                pair_one_level(&outer, &inner, &self.pair)
+            });
+        // Beneath a standing level both sides fill the row, so a row there is complete
+        // where both call it complete; the outer side's statement alone is about half of it.
+        for depth in (0..self.level.index()).map(CurryLevel::new) {
+            let (
+                Tile::DataFunction {
+                    domain_predicate: inner_complete,
+                    ..
+                },
+                Tile::DataFunction {
+                    domain_predicate, ..
+                },
+            ) = (inner_tile.values_at(depth), tile.values_at_mut(depth))
+            else {
+                unreachable!("the levels above the pair are collections on both sides")
+            };
+            *domain_predicate = domain_predicate.intersect(inner_complete);
+        }
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile
+    }
+
+    /// A row releases to both sides: each holds that row's own contribution, unlike
+    /// [`Product`]'s shared inner domain which no single row is done with.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        match obsolete_guard {
+            g if g.is_universal() => {
+                self.outer.release(self.outer.tiling().universal_guard());
+                self.inner.release(self.inner.tiling().universal_guard());
+            }
+            g if g.is_empty() => {
+                self.outer.release(self.outer.tiling().empty_guard());
+                self.inner.release(self.inner.tiling().empty_guard());
+            }
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                self.outer
+                    .release(TileGuard::Function(FunctionGuard::Domain(p.clone())));
+                self.inner
+                    .release(TileGuard::Function(FunctionGuard::Domain(p)));
+            }
+            TileGuard::Function(FunctionGuard::Codomain(_)) => {}
+            TileGuard::Or(arms) => {
+                for arm in arms {
+                    self.release_impl(arm);
+                }
+            }
+            g => todo!("ProductPerRow cannot honor the release guard {g:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
-    use crate::interpreter::{BaseType, ColumnValue, Extent};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, domain_prefix};
+
+    /// A release of the paired level beneath a standing level arrives as a path prefix
+    /// (`domain_prefix`): the standing rows before the running one whole, and under the
+    /// running one a staircase over the pair's fields. Each arm splits on its own, and a
+    /// pair arm qualified by its standing row releases outer keys under that row only, and
+    /// only those whose inner collection it covers whole.
+    #[test]
+    fn uncurry_splits_a_pair_prefix_beneath_a_standing_level() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let input_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::data_function(uint(), Tiling::Scalar(uint())),
+            ),
+        );
+        let pair_extent = Extent::Record(
+            [(tuple_field(0), uint()), (tuple_field(1), uint())]
+                .into_iter()
+                .collect(),
+        );
+        let output_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(pair_extent, Tiling::Scalar(uint())),
+        );
+        let uncurry = UncurryProducer {
+            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            input: Box::new(TestTileProducer::new(
+                input_tiling.empty_at_no_rows(),
+                input_tiling,
+            )),
+            level: CurryLevel::new(1),
+            empty_pair: output_tiling.empty_at_no_rows(),
+        };
+        let pair = Value::Record(HashMap::from([
+            (tuple_field(0), Value::UInt(2)),
+            (tuple_field(1), Value::UInt(0)),
+        ]));
+        let released = domain_prefix(vec![Value::UInt(1), pair]);
+        let domain = |p: Predicate| TileGuard::Function(FunctionGuard::Domain(p));
+        let expected = domain(Predicate::below(Value::UInt(1))).union(&TileGuard::Function(
+            FunctionGuard::Codomain(Box::new(domain(Predicate::qualified(
+                Predicate::point(Value::UInt(1)),
+                Predicate::below(Value::UInt(2)),
+            )))),
+        ));
+        assert_eq!(
+            uncurry.split_pair_guard(released, CurryLevel::new(1)),
+            expected
+        );
+    }
 
     #[test]
     fn uncurry_producer_basic() {
@@ -1406,6 +1861,8 @@ mod tests {
         let mut uncurry = UncurryProducer {
             base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
+            level: CurryLevel::OUTERMOST,
+            empty_pair: output_tiling.empty_at_no_rows(),
         };
 
         // Get the result from UncurryProducer
@@ -1523,6 +1980,8 @@ mod tests {
         let mut uncurry = UncurryProducer {
             base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
+            level: CurryLevel::OUTERMOST,
+            empty_pair: output_tiling.empty_at_no_rows(),
         };
 
         let result = uncurry.get(uncurry.tiling().universal_guard());
@@ -1556,15 +2015,8 @@ mod tests {
                     _ => panic!("domain should be a Record"),
                 }
 
-                // Verify domain_predicate is transformed appropriately
-                assert_eq!(
-                    domain_predicate,
-                    Predicate::Record(HashMap::from([
-                        (tuple_field(0), Predicate::False),
-                        (tuple_field(1), Predicate::False),
-                    ])),
-                    "domain_predicate should be preserved"
-                );
+                // No outer key is complete and no inner level says anything, so no pair is.
+                assert_eq!(domain_predicate, Predicate::False, "no pair is complete");
             }
             _ => panic!("Expected a collection result"),
         }
@@ -1617,6 +2069,8 @@ mod tests {
         let mut uncurry = UncurryProducer {
             base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
+            level: CurryLevel::OUTERMOST,
+            empty_pair: output_tiling.empty_at_no_rows(),
         };
 
         let result = uncurry.get(uncurry.tiling().universal_guard());
@@ -1686,6 +2140,8 @@ mod tests {
         let mut uncurry = UncurryProducer {
             base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
+            level: CurryLevel::OUTERMOST,
+            empty_pair: output_tiling.empty_at_no_rows(),
         };
 
         let result = uncurry.get(uncurry.tiling().universal_guard());
@@ -1694,15 +2150,8 @@ mod tests {
             Tile::DataFunction {
                 domain_predicate, ..
             } => {
-                // Verify domain_predicate is transformed into a Record with both fields False
-                assert_eq!(
-                    domain_predicate,
-                    Predicate::Record(HashMap::from([
-                        (tuple_field(0), Predicate::False),
-                        (tuple_field(1), Predicate::False),
-                    ])),
-                    "domain_predicate should be transformed into Record(_0: False, _1: False)"
-                );
+                // Neither level calls anything complete, so no pair is.
+                assert_eq!(domain_predicate, Predicate::False, "no pair is complete");
             }
             _ => panic!("Expected a collection result"),
         }
@@ -1904,6 +2353,92 @@ mod tests {
         expected.insert(1);
         assert_eq!(*deleted, expected);
     }
+    /// [`ProductPerRow`] takes each row's group from the inner tile, so rows with
+    /// **different numbers of keys** pair correctly — which is the case
+    /// [`Product`] cannot express, its every group being one shared domain.
+    ///
+    /// Rows `100` and `200` hold collections of two and three keys, so the output is
+    /// `(100,0) (100,1) ‖ (200,0) (200,1) (200,2)`: five pairs in two groups.
+    #[test]
+    fn product_per_row_takes_each_row_s_own_domain() {
+        let outer = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 200]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let outer_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        // Two rows, holding collections of two and three keys.
+        let inner = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0, 2]),
+                ColumnValue::from_uints(vec![0, 1, 0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8, 9, 10, 11]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let inner_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out_tiling = outer_tiling.append_level(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), Extent::Base(BaseType::Int)),
+                (tuple_field(1), Extent::Base(BaseType::UInt)),
+            ]))),
+        );
+        let mut producer = ProductPerRowProducer {
+            base: ProducerBase::new(ProductPerRowProducer::alloc_id(), &out_tiling),
+            outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
+            inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
+            level: CurryLevel::OUTERMOST,
+            empty_level: out_tiling.empty_at_no_rows(),
+            pair: out_tiling.deepest_values().clone(),
+        };
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::DataFunction { codomain, .. } = &out else {
+            panic!("ProductPerRow tiles as a collection of collections, got {out:?}")
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain: pairs,
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("the paired level is a collection")
+        };
+        assert_eq!(
+            row_starts,
+            &ColumnValue::from_uints(vec![0, 2]),
+            "the groups are the rows' own, two keys then three"
+        );
+        assert_eq!(domain, &ColumnValue::from_uints(vec![0, 1, 0, 1, 2]));
+        let Tile::Scalar(ColumnValue::Records(fields)) = pairs.as_ref() else {
+            panic!("a pair is a record of the row's value and its key")
+        };
+        assert_eq!(
+            fields[&tuple_field(0)],
+            ColumnValue::Ints(vec![100, 100, 200, 200, 200]),
+            "each row's value repeats across its own group"
+        );
+        assert_eq!(
+            fields[&tuple_field(1)],
+            ColumnValue::from_uints(vec![0, 1, 0, 1, 2])
+        );
+    }
+
     /// Pairing appends a level, so the outer's levels are the output's level for level and
     /// a removed outer row stays marked where it already was. `compact` takes the group of
     /// pairs it opened.

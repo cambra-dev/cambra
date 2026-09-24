@@ -460,9 +460,9 @@ fn final_mut_var_value(code: &str) -> Value {
 // Compound (tuple / record) transactional mutable variables
 //
 // A `Mut({Int, Int}, Txn)` / `Mut({x: Int}, Txn)` mutable variable holds one compound
-// `Value`; the commit-store path already threads it (it shares the induction
-// path's `read_initial_scalar` seeding and boxes/unboxes at the value-Case
-// decision merge). Enabling it needed only the tuple/record *type annotation*
+// `Value`; the commit-store path already threads it (it decodes its seed through the same
+// `seed_value` the induction path does, and materializes and opens at the value-Case
+// decision merge). Enabling it needed only the tuple/record type annotation
 // forms in `lower_type_annotation`.
 // ---------------------------------------------------------------------------
 
@@ -1926,6 +1926,30 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
             ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
         ])),
     );
+}
+
+/// **A cross-domain read carries across the positions that did not write it.** `cnt` is
+/// written under a guard, so its changelog holds positions 2 and 3 only, while the commit
+/// decision reads it at every request position: `a` folds `cnt` as 0, 0, 1, 2 and lands on
+/// 3. The two positions the guard skipped are the whole point — they hold a value the
+/// changelog does not record, so the read that serves them has to supply it.
+///
+/// [`a_cross_domain_read_coexists_with_a_second_store`] writes `cnt` unconditionally, where
+/// every position is a change and a reader could get away with folding the changelog alone.
+#[test]
+fn a_cross_domain_read_carries_across_the_positions_that_did_not_write_it() {
+    let code = indoc! {r#"
+        cnt := 0
+        a: Mut(Int, Txn) := 0
+        for x in [1, 2, 3, 4]:
+            if x > 2:
+                cnt := cnt + 1
+            with begin():
+                a := a + cnt
+        await_final(a)
+    "#};
+    assert_eq!(commit_stores(code), vec!["[0, 3][cnt]", "Txn[a]"]);
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
 }
 
 /// **Phase separation through a writer's iteration source.** The extent of `b`'s block
@@ -3707,5 +3731,40 @@ fn guarded_induction_write_in_a_match_arm_is_rejected() {
                             bal := bal - k
             await_final(bal)"},
         "is written under an `if` or a `match` arm inside",
+    );
+}
+
+/// A transactional mutable variable seeded from a loop long enough that the seed takes
+/// many pulls to settle.
+///
+/// A seed is ordinary dataflow on the commit side as on the induction side: the store
+/// opens on the pull its whole seed has arrived, and until then it is undecided, so a
+/// writer reads no frontier to build an attempt against. Resolving it inside `subscribe`
+/// instead bounded a program by how far its seed's input could advance before the runtime
+/// had started, which aborted above seven positions and passed below.
+#[rstest]
+#[case::seven(7, 28 - 1)]
+#[case::eight(8, 36 - 1)]
+#[case::twenty(20, 210 - 1)]
+fn a_transactional_variable_seeds_from_a_long_loops_result(#[case] n: i64, #[case] expect: i64) {
+    let items = (1..=n)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    check_tile(
+        &format!(
+            indoc! {r#"
+                first := 0
+                for x in [{items}]:
+                    first += x
+                total: Mut(Int, Txn) := first
+                for r in [1]:
+                    with begin():
+                        total := total - r
+                await_final(total)
+            "#},
+            items = items,
+        ),
+        Tile::Scalar(ColumnValue::Ints(vec![expect])),
     );
 }

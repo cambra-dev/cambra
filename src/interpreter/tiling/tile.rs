@@ -8,11 +8,12 @@ use bit_vec::BitVec;
 use std::borrow::Cow;
 
 use super::curry_level::CurryLevel;
+use super::guard::domain_prefix;
 use crate::{
     ccl::AggregateKind,
     interpreter::{
-        BinOpKind, ColumnValue, FunctionGuard, LogicKind, Predicate, TileGuard, Tiling, Value,
-        apply_binop_column, tuple_field,
+        BinOpKind, ColumnValue, Extent, FunctionGuard, LogicKind, Position, Predicate, TileGuard,
+        Tiling, Value, apply_binop_column, tuple_field,
     },
 };
 
@@ -103,21 +104,60 @@ pub enum Tile {
         /// several keys lands as one tick in each of their changelogs, which is what
         /// replaces a per-tick heterogeneous map.
         state: Box<Tile>,
-        /// The decided frontier: `at_or_below(w)` means every tick `≤ w` is decided
-        /// — the watermark `w` counts trailing carries (positions past the latest
-        /// *change*), because a store is a right-continuous step function over its
-        /// whole decided prefix, not a list of change events. `False` while
-        /// undecided (never stepped). **Not** `True`: terminality is the separate
-        /// `terminal` axis so the numeric watermark is never discarded (a terminal
-        /// store with trailing carries keeps `at_or_below(w)`, so `len` and
-        /// `store_frontier` read `w` directly instead of undercounting to the latest
-        /// change tick).
-        frontier: Predicate,
-        /// Whether the frontier is *closed* — no further commits will ever land, so
-        /// a *terminal* read (`ExtractFinal` / `final_or_default`) resolves. Distinct
-        /// from the decided *extent* (`frontier`): a live store decided up to `w`
-        /// has `terminal == false`; the same store, once its writers finish, flips
-        /// `terminal` to `true` while keeping `frontier = at_or_below(w)`.
+        /// The store's value before any change — one entry per key, the codomain
+        /// record over one row. It is the base of the step function, not a point of
+        /// its domain: a changelog is keyed by the positions writes land at, and
+        /// there is no position below the first, so the base is held beside the
+        /// changelog rather than inside it. Every fold that finds no change at or
+        /// below the position it asks about resolves here
+        /// ([`store_value_at`](crate::interpreter::commit_operator::store_value_at)).
+        ///
+        /// A key the seed omits (a collection-valued one, whose log starts empty) has
+        /// no value until its first change.
+        seed: Box<Tile>,
+        /// The store's **domain**: the positions it has decided, ascending. This is the
+        /// set the per-key changelogs are sparse against — a position here that a key's
+        /// changelog omits is decided-absent for that key, its value holding from the
+        /// latest earlier change or from `seed`.
+        ///
+        /// A reader that must present one row per position (an accumulator co-iterated
+        /// with another source) takes them from here. `frontier` bounds this set but
+        /// cannot enumerate it, and a domain whose positions are not a dense integer
+        /// range — a map's keys — cannot be enumerated from its type at all.
+        ///
+        /// A collection, so that it carries one run per row the way every other
+        /// vectorized field does: a nested recurrence is a store per enclosing row, and
+        /// each row decided its own positions. Its values are [`ColumnValue::Units`] —
+        /// the positions are the *keys*, and a set is a collection holding nothing.
+        ///
+        /// Reclaimed with the changelogs by the engine's release-driven GC, so a
+        /// long-lived loop does not retain it; `frontier` is what survives.
+        decided: Box<Tile>,
+        /// Each row's **frontier**: a collection over the store's rows whose run holds that
+        /// row's watermark `w` — every position `≤ w` is decided — or nothing for a row
+        /// decided through none. [`row_frontier`] reads one row's as `at_or_below(w)`.
+        ///
+        /// The watermark counts trailing carries (positions past the latest change), because
+        /// a store is a right-continuous step function over its whole decided prefix, not a
+        /// list of change events. It is not the highest of `decided`: a reclaim trims the
+        /// domain and leaves the frontier, and a store resuming its predecessor's run is
+        /// decided through positions it never ran.
+        ///
+        /// Per row, the way `seed` and `decided` are, because the rows of a nested carrier
+        /// are different stores that got to different places. Projecting one row out is then
+        /// the ordinary row retain, with no watermark to recover. Closing the domain is the
+        /// separate `terminal` axis, so a closed store keeps its watermarks.
+        frontier: Box<Tile>,
+        /// Whether the frontier is *closed* — no further commit will ever land, so a
+        /// *terminal* read (`ExtractFinal` / `final_or_default`) resolves. Distinct from
+        /// the decided *extent* (`frontier`): a live store decided up to `w` has
+        /// `terminal == false`; the same store, once its writers finish, flips `terminal`
+        /// to `true` while keeping `frontier = at_or_below(w)`.
+        ///
+        /// A flag rather than a region because a store's domain closes all at once. A
+        /// nested recurrence is a store **per enclosing row**, and which of those rows are
+        /// complete is the enclosing collection level's own `domain_predicate`, not
+        /// something this store says about a domain of pairs.
         terminal: bool,
         /// Keys that will receive no further write, deduplicated and in no
         /// meaningful order — it is read as a set (`Value` is not `Ord`, and
@@ -174,13 +214,10 @@ impl Tile {
             } => domain.len() == deleted.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.is_empty(),
             // A `Store` is a right-continuous *step function* over its decided prefix, not a
-            // list of change events: a tick absent from a key's changelog but at or below
-            // the frontier is *decided*, its value holding from the latest earlier change.
-            // So it is empty when nothing is decided, which an undecided (`False`) frontier
-            // says and an `at_or_below` watermark never does.
-            Tile::Store { frontier, .. } => {
-                !matches!(frontier.as_at_or_below(), Some(Value::UInt(_)))
-            }
+            // list of change events: a position absent from a key's changelog but at or below
+            // a row's watermark is *decided*, its value holding from the latest earlier
+            // change. So it is empty when no row has a watermark.
+            Tile::Store { frontier, .. } => frontier.level_width() == 0,
         }
     }
 
@@ -206,8 +243,24 @@ impl Tile {
             // The state is a changelog per key, which is what the tiling's own
             // `store_state` spells out; checking against that checks each key's change
             // ticks against the commit domain and its values against that key's tiling.
-            (Tile::Store { state, .. }, tiling @ Tiling::Store { .. }) => {
+            (
+                Tile::Store {
+                    state,
+                    seed,
+                    decided,
+                    frontier,
+                    ..
+                },
+                tiling @ Tiling::Store { domain, codomain },
+            ) => {
+                let positions = Tiling::data_function(
+                    domain.clone(),
+                    Tiling::Scalar(Extent::Base(crate::ccl::BaseType::Unit)),
+                );
                 state.check_from(&tiling.store_state())
+                    && seed.check_from(codomain)
+                    && decided.check_from(&positions)
+                    && frontier.check_from(&positions)
             }
             _ => false,
         }
@@ -223,10 +276,10 @@ impl Tile {
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
-            // A store is terminal once its commit frontier is closed (no more
-            // writes will commit) — the only state in which a *terminal* read of
-            // it resolves. Terminality is its own flag; the `frontier` predicate
-            // keeps the numeric watermark either way.
+            // A store is terminal once its commit frontier is closed (no more writes
+            // will commit) — the only state in which a *terminal* read of it resolves.
+            // Terminality is its own flag; the `frontier` predicate keeps the numeric
+            // watermark either way.
             Tile::Store { terminal, .. } => *terminal,
         }
     }
@@ -243,6 +296,61 @@ impl Tile {
     /// they are rows, because a key of the level above is a row of the level below.
     pub fn merge(&mut self, other: Tile) {
         self.merge_part(other, true);
+        self.drop_covered_completion();
+    }
+
+    /// Drop the completion a level above already states.
+    ///
+    /// A merge unions each level's completion, and a statement naming an enclosing path
+    /// the drive has left behind is never subsumed by the newer one beside it — they name
+    /// different paths. It is redundant all the same: a level calling a path complete
+    /// says so of everything beneath it, which is the closure the whole statement rests
+    /// on. Without this the union keeps one statement per position ever run, and the
+    /// predicate is copied whole on every pull, so the cost of a pull grows with how far
+    /// the drive has got.
+    ///
+    /// What survives is bounded by the drive rather than by its length: at most one row
+    /// of each level is open, every closed one is covered by its parent, so each level
+    /// keeps the statement for its open row and the tile keeps one per level.
+    fn drop_covered_completion(&mut self) {
+        // Only a statement naming an enclosing path can be covered by one above it, and
+        // only a nested carrier states one. Every other tile — which is nearly every tile
+        // — answers here without copying a predicate.
+        let mut level = &*self;
+        let qualified = loop {
+            let Tile::DataFunction {
+                codomain,
+                domain_predicate,
+                ..
+            } = level
+            else {
+                break false;
+            };
+            if domain_predicate.qualifies() {
+                break true;
+            }
+            level = codomain;
+        };
+        if !qualified {
+            return;
+        }
+        fn walk(tile: &mut Tile, above: &mut Vec<Predicate>) {
+            let Tile::DataFunction {
+                codomain,
+                domain_predicate,
+                ..
+            } = tile
+            else {
+                return;
+            };
+            if let Some(kept) = domain_predicate.without_covered(above) {
+                *domain_predicate = kept;
+            }
+            above.push(domain_predicate.clone());
+            walk(codomain, above);
+            above.pop();
+        }
+        walk(self, &mut Vec::new());
     }
 
     /// Append `other`'s rows after this tile's, rather than merging both into one row.
@@ -300,6 +408,15 @@ impl Tile {
         }
         s_domain.append(o_domain);
         s_codomain.merge_part(*o_codomain, false);
+        // The rule `merged_column` states for a merge that matches keys: a side that brings
+        // rows and no column, beside one that brings both, leaves a column that is neither
+        // empty nor one value per row, and there is no answer for the rows it lacks.
+        assert!(
+            columns_whole_or_absent(s_codomain, s_domain.len()),
+            "merging a side that carries no column with one that does leaves a column that is \
+             neither empty nor one value per row over {} rows: {s_codomain:?}",
+            s_domain.len(),
+        );
         *s_pred = s_pred.union(&o_pred);
         s_deleted.extend(o_deleted.iter().map(|i| i + shift));
     }
@@ -325,7 +442,15 @@ impl Tile {
             // One row, and both describe it.
             assert_eq!(self.rows(), 1, "a whole collection is its one row's group");
             assert_eq!(other.rows(), 1, "a whole collection is its one row's group");
-            *self = merged_rows(self, &other, &[RowSource::Both(0, 0)]);
+            // The whole value stands at one row, whose path is empty — the convention
+            // every other path walk here takes.
+            *self = merged_rows(
+                self,
+                &other,
+                &[RowSource::Both(0, 0)],
+                &[true],
+                &[Vec::new()],
+            );
             debug_assert!(validate_tile(self), "Invalid tile after merge: {self:?}");
             return;
         }
@@ -375,10 +500,13 @@ impl Tile {
             }
             // Change-append: `other`'s new commit ticks are strictly greater than any
             // already present (a changelog only grows forward in commit time), so
-            // appending preserves the ascending order the fold relies on. Each key's
-            // changelog is one row's collection, so the state merges as the whole value it
-            // is. The frontier advances to the union — for the watermark `at_or_below(w)`
-            // this is `at_or_below(max(w_self, w_other))`; the `terminal` flag ORs (either
+            // appending preserves the ascending order the fold relies on. A store's
+            // changelogs hold one row per store, so they merge the way the store itself
+            // does: a whole store's two arrivals describe its one row, and a store under a
+            // collection level is one row per enclosing row, whose logs follow one another.
+            // A whole store's frontier advances to the later of the two watermarks, and
+            // stores under a collection follow one another row by row; the `terminal` flag
+            // ORs (either
             // side declaring the frontier closed closes it), and `closed_keys` unions for
             // the same reason — closure is monotone, so a key either side reports closed
             // stays closed. A store releases by physically dropping a decided prefix (see
@@ -387,19 +515,46 @@ impl Tile {
             (
                 Tile::Store {
                     state: s_state,
+                    seed: s_seed,
+                    decided: s_decided,
                     frontier: s_frontier,
                     terminal: s_terminal,
                     closed_keys: s_closed,
                 },
                 Tile::Store {
                     state: o_state,
+                    seed: o_seed,
+                    decided: o_decided,
                     frontier: o_frontier,
                     terminal: o_terminal,
                     closed_keys: o_closed,
                 },
             ) => {
-                s_state.merge_part(*o_state, true);
-                *s_frontier = s_frontier.union(&o_frontier);
+                s_state.merge_part(*o_state, whole);
+                // The domain grows forward with the changelogs, so it appends the same
+                // way they do: a store gains positions as keys of its own run, and the
+                // rows it gains are the enclosing level's, which is what `whole` says.
+                s_decided.merge_part(*o_decided, whole);
+                // The seed is fixed for the store's whole life, so the two sides
+                // either agree or one of them is the empty tile a store starts as.
+                // Taking `other`'s when ours is empty is what carries the seed in
+                // from the first real tile; it is not a merge of two contributions.
+                if s_seed.is_empty() {
+                    *s_seed = o_seed;
+                } else if !whole {
+                    s_seed.merge_part(*o_seed, false);
+                }
+                // A whole store's two halves describe its one row, which has got as far as
+                // the later of them. Rows under a collection follow one another, as the
+                // domain's do.
+                if whole {
+                    let later = |f: &Tile| row_watermark(f, 0);
+                    if later(&o_frontier) > later(s_frontier) {
+                        *s_frontier = o_frontier;
+                    }
+                } else {
+                    s_frontier.merge_part(*o_frontier, false);
+                }
                 *s_terminal = *s_terminal || o_terminal;
                 s_closed.extend(o_closed);
             }
@@ -480,7 +635,24 @@ impl Tile {
                 accumulator: Box::new(accumulator.select_rows(rows)),
                 terminal: terminal.select_indices(rows.iter().copied(), rows.len()),
             },
-            other => panic!("select_rows is not defined for {other:?}"),
+            // A store is vectorized over rows like anything else — one changelog, seed,
+            // decided set and frontier per row — so gathering rows gathers each of them.
+            // `terminal` and `closed_keys` are the level's, not a row's, and carry over whole.
+            Tile::Store {
+                state,
+                seed,
+                decided,
+                frontier,
+                terminal,
+                closed_keys,
+            } => Tile::Store {
+                state: Box::new(state.select_rows(rows)),
+                seed: Box::new(seed.select_rows(rows)),
+                decided: Box::new(decided.select_rows(rows)),
+                frontier: Box::new(frontier.select_rows(rows)),
+                terminal: *terminal,
+                closed_keys: closed_keys.clone(),
+            },
         }
     }
 
@@ -491,6 +663,21 @@ impl Tile {
     /// a key's group once per row that asks for it — and what collapsing a family of groups
     /// into one does, which is the whole of applying a keyed collection at a single key.
     pub fn regroup_rows(&self, groups: &[Vec<usize>]) -> Tile {
+        let regrouped = self.regroup_rows_raw(groups);
+        debug_assert!(
+            valid_over(&regrouped, level_offsets_of(&regrouped).len()),
+            "Invalid collection: {regrouped:?}"
+        );
+        regrouped
+    }
+
+    /// [`regroup_rows`](Self::regroup_rows) with no well-formedness check, for a caller
+    /// that is mid-repair.
+    ///
+    /// Putting a key's two arrivals side by side leaves the level holding that key twice,
+    /// which no collection admits — and which [`collapse_grown_groups`] makes one key again on the
+    /// way back up. Checking here would reject the intermediate rather than the result.
+    fn regroup_rows_raw(&self, groups: &[Vec<usize>]) -> Tile {
         let Tile::DataFunction {
             domain,
             codomain,
@@ -516,13 +703,13 @@ impl Tile {
                 moved.insert(to);
             }
         }
-        Tile::grouped(
-            ColumnValue::UInts(starts),
-            domain.select_indices(picked.iter().copied(), picked.len()),
-            Box::new(codomain.select_rows(&picked)),
-            domain_predicate.clone(),
-            moved,
-        )
+        Tile::DataFunction {
+            row_starts: ColumnValue::UInts(starts),
+            domain: domain.select_indices(picked.iter().copied(), picked.len()),
+            codomain: Box::new(codomain.select_rows(&picked)),
+            domain_predicate: domain_predicate.clone(),
+            deleted: moved,
+        }
     }
 
     /// Keep the keys `mask` names, dropping the rest — a filter along the *key* axis,
@@ -747,14 +934,27 @@ impl Tile {
     /// constructing the guards. Doing it this way significantly reduces the fragmentation of
     /// the obsolete guards, which lets them use smaller representations.
     pub fn to_guard(&self) -> TileGuard {
+        // A guard names what the consumer may **release**, which is not everything the
+        // tile holds: a key stays until every field under it is complete, and a field with
+        // no keys of its own goes with its key rather than separately. What is left
+        // unnamed is delivered again, and the merge matches it by key rather than
+        // appending it, so under-naming costs a re-delivery and not an answer.
+        self.to_guard_impl(&[Vec::new()])
+    }
+
+    /// `to_guard`, with the path reaching each of this tile's rows — what a completion
+    /// statement naming an enclosing path is read against.
+    fn to_guard_impl(&self, row_paths: &[Vec<Value>]) -> TileGuard {
         match self {
             Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
             Tile::Aggregation { terminal, .. } => TileGuard::Aggregation(TileGuard::leaf(
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false),
             )),
-            Tile::Record(m) => {
-                TileGuard::Record(m.iter().map(|(k, t)| (k.clone(), t.to_guard())).collect())
-            }
+            Tile::Record(m) => TileGuard::Record(
+                m.iter()
+                    .map(|(k, t)| (k.clone(), t.to_guard_impl(row_paths)))
+                    .collect(),
+            ),
             // **A key is released once what it holds is complete.** A scalar under a key is
             // complete as soon as it is there, so every key present is releasable. A
             // collection under a key may still grow, and only `domain_predicate` says which
@@ -775,23 +975,36 @@ impl Tile {
                         Predicate::from_column_value(domain).union(domain_predicate),
                     ));
                 }
+                // A **prefix** where the held region is one — every key but the last
+                // complete, and the last holding a prefix of its own group. That is what a
+                // sequential drive delivers, and naming it exactly is what lets the
+                // consumer release exactly what it took; the arms below can only
+                // approximate it with a region read under every row.
+                if let Some(path) = self.held_prefix(row_paths) {
+                    return domain_prefix(path);
+                }
                 // The codomain arm names what the **open** keys hold. A key the predicate
                 // calls whole is released by its own key, and a codomain guard is read
                 // against every row of the values it wraps — so naming a whole group's
                 // keys would release the same key value under a sibling still growing.
-                let open = BitVec::from_fn(domain.len(), |key| {
-                    !domain_predicate.contains(&domain.index_at(key))
+                let key_paths = domain_predicate
+                    .qualifies()
+                    .then(|| self.key_paths(row_paths));
+                let open = BitVec::from_fn(domain.len(), |key| match &key_paths {
+                    Some(paths) => !domain_predicate.contains_path(&paths[key]),
+                    None => !domain_predicate.contains(&domain.index_at(key)),
                 });
                 if !open.any() {
                     return TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()));
                 }
                 let mut open_values = (**codomain).clone();
                 open_values.retain_rows(&open);
-                // The whole value is one row at the empty path, so an open key's path is
-                // the key itself.
-                let open_paths: Vec<Vec<Value>> = (0..domain.len())
-                    .filter(|key| open[*key])
-                    .map(|key| vec![domain.index_at(key)])
+                let open_paths: Vec<Vec<Value>> = key_paths
+                    .unwrap_or_else(|| self.key_paths(row_paths))
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(key, _)| open[*key])
+                    .map(|(_, path)| path)
                     .collect();
                 TileGuard::flatten_or(vec![
                     TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
@@ -813,7 +1026,7 @@ impl Tile {
                     TileGuard::Function(FunctionGuard::Domain(Predicate::True))
                 } else {
                     TileGuard::Function(FunctionGuard::Domain(
-                        store_change_ticks(state).union(frontier),
+                        store_change_positions(state).union(&running_frontier(frontier)),
                     ))
                 }
             }
@@ -1218,6 +1431,24 @@ impl Tile {
         }
     }
 
+    /// A store key's seed — its value before any change — as the one-entry column it
+    /// is held in. `None` for a tile that is not a store, for a key outside its key
+    /// space, and for a key the seed omits (whose value is unknown until its first
+    /// change).
+    pub fn store_seed(&self, key: &str) -> Option<&ColumnValue> {
+        let Tile::Store { seed, .. } = self else {
+            return None;
+        };
+        let Tile::Record(keys) = &**seed else {
+            unreachable!("a store's seed is a per-key record; got {seed:?}")
+        };
+        match keys.get(key)? {
+            Tile::Scalar(column) if !column.is_empty() => Some(column),
+            Tile::Scalar(_) => None,
+            other => unreachable!("a store key's seed is one value; got {other:?}"),
+        }
+    }
+
     /// A store's key space — the mutable variables and reply taps it holds, which is
     /// static and so complete whether or not a key has been written.
     pub fn store_keys(&self) -> impl Iterator<Item = &String> {
@@ -1287,6 +1518,19 @@ impl Tile {
             }));
         }
         paths
+    }
+
+    /// The flat index of each row of the level beneath `enclosing`, by the path reaching it.
+    ///
+    /// How a row of one tile is found in another holding the same levels. Two operands
+    /// pulled from their own branches need not hold the same rows, nor hold them at the
+    /// same positions, so a row index read off one names an unrelated row of the other.
+    pub fn rows_by_path(&self, enclosing: CurryLevel) -> HashMap<Vec<Value>, usize> {
+        self.paths_at(enclosing)
+            .into_iter()
+            .enumerate()
+            .map(|(row, path)| (path, row))
+            .collect()
     }
 
     /// The key path of every key of `level`, each extending its row's path.
@@ -1360,19 +1604,44 @@ impl Tile {
     /// **Every group the level names is whole.** A key's group is one contiguous run of the
     /// level below, so no later tile can add to it: [`Tile::merge`] runs whole subtrees
     /// together under new keys and never reaches inside an existing group. A caller holding
-    /// part of a group has nothing to append yet. The outermost `domain_predicate` follows
-    /// from that — every key present is final together with every level beneath it, unioned
-    /// with the region the arriving tile already called final.
+    /// part of a group has nothing to append yet.
+    ///
+    /// The **innermost** level's `domain_predicate` follows from that — the new level sits
+    /// beneath it, so each of its keys present is final together with the group opened
+    /// under it, unioned with the region the arriving tile already called final. The levels
+    /// above keep their own predicates: a row of one of them is complete once the level
+    /// beneath it will gain no more keys, which appending says nothing about.
     pub fn append_level(mut self, level: impl FnOnce(Tile) -> Tile) -> Tile {
-        let Tile::DataFunction {
-            domain,
-            domain_predicate,
-            ..
-        } = &mut self
-        else {
-            panic!("append_level expects a collection tile, got {self:?}")
+        assert!(
+            self.is_data_function(),
+            "append_level expects a collection tile, got {self:?}"
+        );
+        // The keys present are complete, the level appended beneath each arriving whole.
+        // Beneath standing levels a key is named by its path: a key value alone would say
+        // the same under every enclosing row, including rows this tile has not reached.
+        let depth = self
+            .innermost_depth()
+            .unwrap_or_else(|| unreachable!("a collection chain has an innermost level"));
+        let present = match depth {
+            0 => {
+                let Tile::DataFunction { domain, .. } = &self else {
+                    unreachable!("checked above")
+                };
+                Predicate::from_column_value(domain)
+            }
+            _ => self
+                .paths_at(CurryLevel::new(depth))
+                .iter()
+                .map(|path| Predicate::exactly(path))
+                .fold(Predicate::False, |all, one| all.union(&one)),
         };
-        *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+        let Some(Tile::DataFunction {
+            domain_predicate, ..
+        }) = self.innermost_level_mut()
+        else {
+            unreachable!("a collection chain has an innermost level")
+        };
+        *domain_predicate = domain_predicate.union(&present);
         let slot = self.deepest_values_mut();
         let built = level(std::mem::replace(slot, Tile::Record(HashMap::new())));
         // The appended level states nothing complete and has removed nothing: terminality
@@ -1476,6 +1745,71 @@ impl Tile {
             .fold(Predicate::False, |all, one| all.union(&one))
     }
 
+    /// The path of the last element held, where everything held is the prefix ending there
+    /// — `None` where it is not.
+    ///
+    /// A sequential drive delivers a prefix: the rows before the last are complete, and the
+    /// last holds a run of its own. That is checkable rather than assumed — every key but
+    /// the last must be one the `domain_predicate` calls complete — so this names the held
+    /// region exactly rather than guessing at its shape.
+    fn held_prefix(&self, row_paths: &[Vec<Value>]) -> Option<Vec<Value>> {
+        let Tile::DataFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        // Every key the tile ever held counts, `deleted` included — the contract
+        // [`to_guard`](Self::to_guard) reads by, a released key having been delivered and
+        // so named. Skipping them would shorten the path and re-deliver what a consumer
+        // already took.
+        let last = domain.len().checked_sub(1)?;
+        // Every key before the last has to be held whole, or what is held is a staircase
+        // rather than a prefix. A scalar under a key is whole as soon as it is there, and
+        // only a level needs the `domain_predicate` to say so — the same rule
+        // [`to_guard`](Self::to_guard) states and reads keys by.
+        // The paths are built only where the statement names an enclosing one. Building
+        // them regardless costs a `Value` per key, which for a record-keyed domain is a
+        // fresh map per key, on a path every release and every memo answer runs.
+        let qualified = domain_predicate.qualifies();
+        if codomain.holds_a_level() {
+            let whole = match qualified {
+                true => {
+                    let paths = self.key_paths(row_paths);
+                    (0..last).all(|i| domain_predicate.contains_path(&paths[i]))
+                }
+                false => (0..last).all(|i| domain_predicate.contains(&domain.index_at(i))),
+            };
+            if !whole {
+                return None;
+            }
+        }
+        let head = domain.index_at(last);
+        if !codomain.holds_a_level() {
+            return Some(vec![head]);
+        }
+        let mut group = (**codomain).clone();
+        group.retain_rows(&BitVec::from_fn(domain.len(), |i| i == last));
+        let mut path = vec![head.clone()];
+        // The group is the last row's alone, so that row's path is what its keys extend.
+        // Only that one path, not every key's: building them all costs a `Value` per key,
+        // which for a record-keyed domain is a fresh map per key.
+        let owner = (0..row_paths.len())
+            .rev()
+            .find(|row| {
+                let (from, to) = self.row_run(*row);
+                (from..to).contains(&last)
+            })
+            .unwrap_or(0);
+        let mut below = row_paths[owner].clone();
+        below.push(head.clone());
+        path.extend(group.held_prefix(std::slice::from_ref(&below))?);
+        Some(path)
+    }
+
     /// The half-open run of `domain` belonging to row `row`.
     pub fn row_run(&self, row: usize) -> (usize, usize) {
         let Tile::DataFunction {
@@ -1497,25 +1831,6 @@ impl Tile {
         };
         let offsets = level_offsets(row_starts);
         (0..offsets.len()).map(move |row| level_run(offsets, row, domain.len()))
-    }
-}
-
-/// The guard naming nothing, shaped to `tile`.
-///
-/// What a field contributes where its release belongs to its key rather than to itself.
-fn empty_guard_of(tile: &Tile) -> TileGuard {
-    match tile {
-        Tile::Scalar(_) => TileGuard::Scalar(Predicate::False),
-        Tile::Aggregation { .. } => TileGuard::Aggregation(Predicate::False),
-        Tile::Record(fields) => TileGuard::Record(
-            fields
-                .iter()
-                .map(|(name, field)| (name.clone(), empty_guard_of(field)))
-                .collect(),
-        ),
-        Tile::DataFunction { .. } | Tile::Store { .. } => {
-            TileGuard::Function(FunctionGuard::Domain(Predicate::False))
-        }
     }
 }
 
@@ -1586,6 +1901,81 @@ pub fn nest_levels(
     built
 }
 
+/// Whether `tile` is well formed as a whole value.
+///
+/// Nothing pins the row count at the top level: a tile there carries its own rows, as a
+/// `Scalar(Union)` stream does when its keys are the column's positions. Every depth below
+/// is pinned — a collection's values stand at its key count, and a record's fields at the
+/// rows the record does — and that pairing is what this checks.
+/// A store's frontier over its rows, from each row's watermark: a run holding the one
+/// position that row is decided through, or nothing for a row decided through none.
+pub(crate) fn store_frontier_rows(
+    watermarks: impl IntoIterator<Item = Option<Value>>,
+    domain: &Extent,
+) -> Tile {
+    let mut starts = Vec::new();
+    let mut positions = Vec::new();
+    for watermark in watermarks {
+        starts.push(positions.len());
+        positions.extend(watermark);
+    }
+    let len = positions.len();
+    Tile::grouped(
+        ColumnValue::UInts(starts),
+        ColumnValue::from_values(positions, domain),
+        Box::new(Tile::Scalar(ColumnValue::Units(len))),
+        Predicate::True,
+        BitSet::new(),
+    )
+}
+
+/// Row `row`'s watermark, or `None` for a row decided through nothing.
+pub(crate) fn row_watermark(frontier: &Tile, row: usize) -> Option<Value> {
+    let Tile::DataFunction { domain, .. } = frontier else {
+        unreachable!("a store's frontier is a collection over its rows, got {frontier:?}")
+    };
+    let (start, end) = frontier.row_run(row);
+    debug_assert!(
+        end - start <= 1,
+        "a row is decided through one watermark, got {frontier:?}"
+    );
+    (end > start).then(|| domain.index_at(start))
+}
+
+/// Row `row`'s frontier: `at_or_below(w)` for its watermark `w`, `False` for a row decided
+/// through nothing.
+pub fn row_frontier(frontier: &Tile, row: usize) -> Predicate {
+    row_watermark(frontier, row).map_or(Predicate::False, Predicate::at_or_below)
+}
+
+/// The frontier of a store's last row — the one still running, a drive being sequential —
+/// or `False` for a store with no rows.
+pub fn running_frontier(frontier: &Tile) -> Predicate {
+    match frontier.rows() {
+        0 => Predicate::False,
+        rows => row_frontier(frontier, rows - 1),
+    }
+}
+
+/// The guard naming nothing, shaped to `tile`.
+///
+/// What a field contributes where its release belongs to its key rather than to itself.
+fn empty_guard_of(tile: &Tile) -> TileGuard {
+    match tile {
+        Tile::Scalar(_) => TileGuard::Scalar(Predicate::False),
+        Tile::Aggregation { .. } => TileGuard::Aggregation(Predicate::False),
+        Tile::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), empty_guard_of(field)))
+                .collect(),
+        ),
+        Tile::DataFunction { .. } | Tile::Store { .. } => {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::False))
+        }
+    }
+}
+
 /// Where one row of a merge's result comes from.
 ///
 /// A merge reconciles two views of one value, so a row of the result is a row of the left
@@ -1603,9 +1993,15 @@ enum RowSource {
 ///
 /// A collection matches its two key runs per row and recurses into the matched groups
 /// ([`Tile::merge`]), so no level of the result holds a key twice.
-fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
+fn merged_rows(
+    left: &Tile,
+    right: &Tile,
+    order: &[RowSource],
+    settled: &[bool],
+    row_paths: &[Vec<Value>],
+) -> Tile {
     match (left, right) {
-        (Tile::Scalar(l), Tile::Scalar(r)) => Tile::Scalar(merged_column(l, r, order)),
+        (Tile::Scalar(l), Tile::Scalar(r)) => Tile::Scalar(merged_column(l, r, order, settled)),
         (Tile::Record(l), Tile::Record(r)) => {
             assert_eq!(l.len(), r.len(), "a record merges with its own shape");
             Tile::Record(
@@ -1614,7 +2010,10 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
                         let other = r
                             .get(field)
                             .unwrap_or_else(|| panic!("Record missing field {field}"));
-                        (field.clone(), merged_rows(tile, other, order))
+                        (
+                            field.clone(),
+                            merged_rows(tile, other, order, settled, row_paths),
+                        )
                     })
                     .collect(),
             )
@@ -1642,8 +2041,10 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
             // merges them.
             let mut starts = Vec::with_capacity(order.len());
             let mut keys: Vec<RowSource> = Vec::new();
-            for source in order {
+            let mut key_rows: Vec<usize> = Vec::new();
+            for (row, source) in order.iter().enumerate() {
                 starts.push(keys.len());
+                let before = keys.len();
                 match source {
                     RowSource::Left(row) => {
                         let (from, to) = level_run(l_offsets, *row, l_domain.len());
@@ -1670,7 +2071,38 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
                         }
                     }
                 }
+                key_rows.resize(keys.len(), row);
+                debug_assert!(keys.len() >= before, "a row's keys only ever extend");
             }
+            // Whether the side that delivered each key called it complete. An empty column
+            // under a settled key is a value that will never arrive; under an unsettled one
+            // it is a value that has not arrived yet, and the two are different defects.
+            //
+            // Each key's path is its row's extended by the key, and a level may state its
+            // completion per enclosing path ([`Predicate::Qualified`]), so the predicate is
+            // read against that path rather than the key alone — the reading `to_guard`
+            // and `remove_guarded` already take.
+            let key_paths: Vec<Vec<Value>> = keys
+                .iter()
+                .enumerate()
+                .map(|(at, key)| {
+                    let value = match key {
+                        RowSource::Left(i) | RowSource::Both(i, _) => l_domain.index_at(*i),
+                        RowSource::Right(j) => r_domain.index_at(*j),
+                    };
+                    let mut path = row_paths.get(key_rows[at]).cloned().unwrap_or_default();
+                    path.push(value);
+                    path
+                })
+                .collect();
+            let key_settled: Vec<bool> = keys
+                .iter()
+                .zip(&key_paths)
+                .map(|(key, path)| match key {
+                    RowSource::Left(_) | RowSource::Both(..) => l_pred.contains_path(path),
+                    RowSource::Right(_) => r_pred.contains_path(path),
+                })
+                .collect();
             // A key a merge names sits in one of the two key columns, so picking it is a
             // gather out of the two run together. A key both sides delivered is one key,
             // and the two spellings are equal, so either serves.
@@ -1699,7 +2131,13 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
             Tile::DataFunction {
                 row_starts: ColumnValue::UInts(starts),
                 domain: combined.select_indices(picked.iter().copied(), picked.len()),
-                codomain: Box::new(merged_rows(l_codomain, r_codomain, &keys)),
+                codomain: Box::new(merged_rows(
+                    l_codomain,
+                    r_codomain,
+                    &keys,
+                    &key_settled,
+                    &key_paths,
+                )),
                 domain_predicate: l_pred.union(r_pred),
                 deleted,
             }
@@ -1773,13 +2211,29 @@ fn gathered_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
     combined.select_rows(&picked)
 }
 
+/// Whether every column standing directly over `rows` rows, through records, is empty or
+/// holds one value per row. A level beneath is its own append's to check.
+fn columns_whole_or_absent(tile: &Tile, rows: usize) -> bool {
+    match tile {
+        Tile::Scalar(column) => column.is_empty() || column.len() == rows,
+        Tile::Record(fields) => fields.values().all(|f| columns_whole_or_absent(f, rows)),
+        Tile::DataFunction { row_starts, .. } => row_starts.len() == rows,
+        Tile::Aggregation { .. } | Tile::Store { .. } => true,
+    }
+}
+
 /// One column over the rows `order` names.
 ///
 /// A column is empty or holds one value per row ([`valid_over`]), so a row both sides name
 /// is carried by at most one of them: the other delivered that row to grow what sits beside
 /// it in the record and left this column alone. Both carrying it is one position delivered
 /// twice, which the release contract forbids and for which there is no answer.
-fn merged_column(left: &ColumnValue, right: &ColumnValue, order: &[RowSource]) -> ColumnValue {
+fn merged_column(
+    left: &ColumnValue,
+    right: &ColumnValue,
+    order: &[RowSource],
+    settled: &[bool],
+) -> ColumnValue {
     if left.is_empty() && right.is_empty() {
         return left.clone();
     }
@@ -1797,13 +2251,39 @@ fn merged_column(left: &ColumnValue, right: &ColumnValue, order: &[RowSource]) -
                 (false, true) => Some(*i),
                 (true, false) => Some(offset + j),
                 (true, true) => None,
-                (false, false) => panic!(
-                    "a regrown key restates a scalar beside it, which the release contract \
-                     forbids: {left:?} and {right:?}"
-                ),
+                // Both sides carry the row. A key that was never released is delivered
+                // again whole, which is the same value twice rather than a second one, so
+                // either serves. Two *different* values for one row is the restatement the
+                // release contract forbids, and there is no answer for which stands.
+                (false, false) => {
+                    assert_eq!(
+                        left.index_at(*i),
+                        right.index_at(*j),
+                        "a regrown key restates a scalar beside it, which the release \
+                         contract forbids: {left:?} and {right:?}"
+                    );
+                    Some(*i)
+                }
             },
         })
         .collect();
+    // A column is empty or holds one value per row, never part of one ([`valid_over`]), so
+    // every row the merge names is carried or none is. A side that brings rows and no
+    // column alongside one that brings both has no answer here: the rows it brought can
+    // never gain values, and producing the short column defers the contradiction to
+    // whichever consumer trips over it.
+    assert!(
+        picked.len() == order.len() || picked.is_empty(),
+        "merging a side that carries no column with one that does leaves {} values over {} \
+         rows, which is neither empty nor one per row. The rows without a value are {} by \
+         their own level: {left:?} and {right:?}",
+        picked.len(),
+        order.len(),
+        match settled.iter().all(|s| *s) {
+            true => "settled, so those values will never arrive",
+            false => "unsettled, so the merge has outrun the producer",
+        }
+    );
     combined.select_indices(picked.iter().copied(), picked.len())
 }
 
@@ -1856,9 +2336,9 @@ pub fn validate_tile(tile: &Tile) -> bool {
     }
 }
 
-/// Every commit tick at which a store's state records a write, as the predicate naming
-/// them: a tick is a change of the store when any one key's changelog carries it.
-fn store_change_ticks(state: &Tile) -> Predicate {
+/// Every position at which a store's state records a write, as the predicate naming
+/// them: a position is a change of the store when any one key's changelog carries it.
+fn store_change_positions(state: &Tile) -> Predicate {
     let Tile::Record(keys) = state else {
         unreachable!("a store's state is a record of per-key changelogs; got {state:?}")
     };
@@ -1872,19 +2352,32 @@ fn store_change_ticks(state: &Tile) -> Predicate {
 ///
 /// Checks the row counts [`Tile::DataFunction`] states, and nothing else.
 fn valid_over(tile: &Tile, rows: usize) -> bool {
+    valid_over_settled(tile, rows, false)
+}
+
+/// [`valid_over`], knowing whether the level above has called any of these rows settled.
+///
+/// A column that has not arrived is empty rather than `rows` long — what a producer emits
+/// before it has an answer and a consumer reads as "not ready" — so a record field may be
+/// empty while its siblings are full. That reading only holds while the answer may still
+/// come. A key the level above calls settled will gain nothing further, so an empty column
+/// beneath one is not "not yet" but a value that is never coming, and the two are the same
+/// spelling only if the completion statement is ignored. Caught here rather than at the
+/// merge that trips over it, which sees two tiles and not the producer of either.
+fn valid_over_settled(tile: &Tile, rows: usize, any_settled: bool) -> bool {
     match tile {
-        // A column that has not arrived is empty rather than `rows` long — what a producer
-        // emits before it has an answer and a consumer reads as "not ready". It holds
-        // wherever a column does, so a record field may be empty while its siblings are
-        // full: a binop over a lagging operand builds the record before both columns are
-        // in, and combines only the common prefix.
-        Tile::Scalar(cv) => cv.is_empty() || cv.len() == rows,
-        Tile::Record(fields) => fields.values().all(|t| valid_over(t, rows)),
+        Tile::Scalar(cv) => match cv.is_empty() {
+            true => !any_settled || rows == 0,
+            false => cv.len() == rows,
+        },
+        Tile::Record(fields) => fields
+            .values()
+            .all(|t| valid_over_settled(t, rows, any_settled)),
         Tile::DataFunction {
             row_starts,
             domain,
             codomain,
-            domain_predicate: _,
+            domain_predicate,
             deleted,
         } => {
             let ColumnValue::UInts(starts) = row_starts else {
@@ -1910,7 +2403,9 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
             }) {
                 return false;
             }
-            valid_over(codomain, domain.len())
+            let settled = (0..domain.len())
+                .any(|key| domain_predicate.contains_path(&[domain.index_at(key)]));
+            valid_over_settled(codomain, domain.len(), settled)
         }
         Tile::Aggregation {
             accumulator,
@@ -1920,34 +2415,60 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
             accumulator.rows() == terminal.len()
                 && (accumulator.is_empty() || accumulator.rows() == rows)
         }
-        // A store is a record of per-key changelogs, each a collection over the store's
-        // one row, and each one's ticks are strictly ascending — the fold
-        // ([`store_value_at`] et al.) and the change-append `merge` both depend on that,
-        // and neither is type-enforced. It is a whole value rather than something
-        // vectorized, so it stands at one row.
-        Tile::Store { state, .. } => {
+        // A store is its **domain** — the positions it decided, strictly ascending — and
+        // a record of per-key changelogs sparse against it, each a collection over the
+        // store's one row whose own positions are strictly ascending too. The fold
+        // ([`store_value_at`] et al.) and the change-append `merge` both depend on that
+        // order, and neither is type-enforced. A store is a whole value rather than
+        // something vectorized, so it stands at one row.
+        //
+        // Positions are compared as [`Position`]s rather than as integers: a loop over a
+        // map is keyed by its keys, and a nested one by `(outer, inner)` pairs.
+        Tile::Store {
+            state,
+            seed,
+            decided,
+            ..
+        } => {
             let Tile::Record(keys) = &**state else {
                 return false;
             };
-            rows == 1
-                && valid_over(state, 1)
-                && keys.values().all(|log| {
-                    let Tile::DataFunction { domain, .. } = log else {
-                        return false;
-                    };
-                    (1..domain.len()).all(|i| {
-                        matches!(
-                            (domain.index_at(i - 1), domain.index_at(i)),
-                            (Value::UInt(a), Value::UInt(b)) if a < b
-                        )
+            // Ascending **within a row**: a store per enclosing row decides its own
+            // positions in its own order, and two rows' positions never interleave
+            // because the drive that feeds them is sequential.
+            let ascends_per_row = |log: &Tile| {
+                let Tile::DataFunction { domain, .. } = log else {
+                    return false;
+                };
+                (0..rows).all(|r| {
+                    let (from, to) = log.row_run(r);
+                    (from + 1..to).all(|i| {
+                        Position::new(domain.index_at(i - 1)) < Position::new(domain.index_at(i))
                     })
                 })
+            };
+            ascends_per_row(decided)
+                && valid_over(state, rows)
+                && valid_over(seed, rows)
+                && valid_over(decided, rows)
+                && keys.values().all(ascends_per_row)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A store's decided positions as the one-row collection the tile holds.
+    fn one_row_decided(positions: ColumnValue) -> Tile {
+        let len = positions.len();
+        Tile::data_function(
+            positions,
+            Box::new(Tile::Scalar(ColumnValue::Units(len))),
+            Predicate::True,
+            BitSet::new(),
+        )
+    }
+
     use bit_set::BitSet;
     use bit_vec::BitVec;
 
@@ -3342,6 +3863,145 @@ mod tests {
 
     // ── Tile::merge ───────────────────────────────────────────────────────────
 
+    /// Three collection levels over int values, from the CSR columns directly: `a ⤇ b ⤇ c ⤇ Int`.
+    ///
+    /// Three because a level only merges its keys where its values are themselves a
+    /// collection — under a scalar a repeated key is a re-delivery, not growth.
+    fn three_levels_raw(
+        a: Vec<usize>,
+        b_starts: Vec<usize>,
+        b: Vec<usize>,
+        c_starts: Vec<usize>,
+        c: Vec<usize>,
+        values: Vec<i64>,
+    ) -> Tile {
+        Tile::data_function(
+            ColumnValue::UInts(a),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(b_starts),
+                ColumnValue::UInts(b),
+                Box::new(Tile::grouped(
+                    ColumnValue::UInts(c_starts),
+                    ColumnValue::UInts(c),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    /// Every element of a three-level tile, as the path that reaches it and its value.
+    fn elements(tile: &Tile) -> Vec<(Vec<Value>, i64)> {
+        let paths = tile.paths_at(CurryLevel::new(2));
+        let Tile::DataFunction { codomain, .. } = tile else {
+            panic!("a collection")
+        };
+        let Tile::DataFunction { codomain, .. } = codomain.as_ref() else {
+            panic!("two levels")
+        };
+        let Tile::DataFunction { codomain, .. } = codomain.as_ref() else {
+            panic!("three levels")
+        };
+        let Tile::Scalar(ColumnValue::Ints(values)) = codomain.as_ref() else {
+            panic!("int values")
+        };
+        paths.iter().cloned().zip(values.iter().copied()).collect()
+    }
+
+    /// An arrival that re-states a key whose group grew deeper down is the same key, and
+    /// the two runs beneath it are one — whether they abut or repeat.
+    ///
+    /// A nested drive emits exactly this: it re-states the enclosing path on every pull,
+    /// and the keys beneath restart at each of them.
+    #[test]
+    fn merge_joins_a_repeated_key_with_the_group_it_grew() {
+        // `a = 0` over `b = 0, 1`; under `b = 0` the element `c = 0`, under `b = 1` `c = 0`.
+        let mut tile = three_levels_raw(
+            vec![0],
+            vec![0],
+            vec![0, 1],
+            vec![0, 1],
+            vec![0, 0],
+            vec![10, 20],
+        );
+        // The same skeleton again, adding `c = 1` under `b = 0` and nothing under `b = 1`.
+        tile.merge(three_levels_raw(
+            vec![0],
+            vec![0],
+            vec![0, 1],
+            vec![0, 1],
+            vec![1],
+            vec![11],
+        ));
+        let key =
+            |a: usize, b: usize, c: usize| vec![Value::UInt(a), Value::UInt(b), Value::UInt(c)];
+        assert_eq!(
+            elements(&tile),
+            vec![(key(0, 0, 0), 10), (key(0, 0, 1), 11), (key(0, 1, 0), 20),]
+        );
+    }
+
+    /// An arrival carrying no elements still merges: it re-states the skeleton to carry a
+    /// predicate, and re-stating it must not leave the level holding its keys twice.
+    #[test]
+    fn merge_of_an_empty_arrival_leaves_the_keys_alone() {
+        let before = three_levels_raw(
+            vec![0],
+            vec![0],
+            vec![0, 1],
+            vec![0, 1],
+            vec![0, 0],
+            vec![10, 20],
+        );
+        let mut tile = before.clone();
+        tile.merge(three_levels_raw(
+            vec![0],
+            vec![0],
+            vec![0, 1],
+            vec![0, 0],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(elements(&tile), elements(&before));
+    }
+
+    /// Runs that interleave merge into one collection holding each key once, which is what
+    /// a drive that revisits an enclosing row produces and what an append alone cannot.
+    ///
+    /// The result is compared as a set: keys are matched by value, and a row's keys carry no
+    /// order — `valid_over` asks for uniqueness within a row and no more.
+    #[test]
+    fn merge_matches_two_runs_that_interleave() {
+        let mut tile = three_levels_raw(
+            vec![0],
+            vec![0],
+            vec![0, 2],
+            vec![0, 1],
+            vec![0, 0],
+            vec![10, 30],
+        );
+        tile.merge(three_levels_raw(
+            vec![0],
+            vec![0],
+            vec![1, 3],
+            vec![0, 1],
+            vec![0, 0],
+            vec![20, 40],
+        ));
+        let key = |b: usize| vec![Value::UInt(0), Value::UInt(b), Value::UInt(0)];
+        let mut held = elements(&tile);
+        held.sort_by_key(|(_, value)| *value);
+        assert_eq!(
+            held,
+            vec![(key(0), 10), (key(1), 20), (key(2), 30), (key(3), 40)]
+        );
+    }
+
     #[test]
     fn merge_scalar_empty_takes_other() {
         let mut tile = Tile::Scalar(ColumnValue::Ints(vec![]));
@@ -3425,7 +4085,12 @@ mod tests {
                     BitSet::new(),
                 ),
             )]))),
-            frontier: Predicate::False,
+            seed: Box::new(Tile::Record(HashMap::from([(
+                "acc".to_string(),
+                Tile::Scalar(ColumnValue::Ints(vec![0])),
+            )]))),
+            decided: Box::new(one_row_decided(ColumnValue::UInts(vec![0]))),
+            frontier: Box::new(one_row_decided(ColumnValue::UInts(vec![]))),
             terminal: false,
             closed_keys: Vec::new(),
         };
@@ -3517,8 +4182,10 @@ mod tests {
         );
     }
 
+    /// A single open group holds a prefix of itself, and the guard names it as the path to
+    /// its last key rather than as the group's keys under every row.
     #[test]
-    fn to_guard_two_levels_uses_the_inner_keys() {
+    fn to_guard_two_levels_names_the_path_to_the_last_inner_key() {
         let tile = two_level_uint_int(
             vec![0],
             vec![0],
@@ -3526,26 +4193,18 @@ mod tests {
             vec![100, 110],
             Predicate::False,
         );
-        let guard = tile.to_guard();
-        // The guard should cover inner keys 10 and 11.
-        let TileGuard::Function(FunctionGuard::Codomain(inner)) = guard else {
-            panic!("expected Codomain guard");
-        };
-        let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
-            panic!("expected Domain pred");
-        };
-        // Each named beneath the row holding it.
-        let at = |key: usize| pred.contains_path(&[Value::UInt(0), Value::UInt(key)]);
-        assert!(at(10) && at(11));
-        assert!(!at(99));
+        assert_eq!(
+            tile.to_guard(),
+            domain_prefix(vec![Value::UInt(0), Value::UInt(11)])
+        );
     }
 
-    /// A group the predicate calls whole is released by its own key; only the groups it
-    /// leaves open contribute a codomain arm. Keys repeat across groups here, which is what
-    /// makes the distinction observable: naming a whole group's keys would release them in
-    /// the open group too.
+    /// Whole groups before the last one make what is held a prefix, so the guard is the
+    /// path through the open group's last key. The groups repeat their keys, which is what
+    /// makes the precision observable: naming the open group's keys instead would release
+    /// them under the whole group too.
     #[test]
-    fn to_guard_two_levels_names_only_the_open_groups_keys() {
+    fn to_guard_two_levels_names_the_path_past_a_whole_group() {
         // Groups 0 and 1, both keyed 10 and 11; the predicate calls group 0 whole.
         let tile = two_level_uint_int(
             vec![0, 1],
@@ -3553,6 +4212,26 @@ mod tests {
             vec![10, 11, 10, 11],
             vec![100, 110, 200, 210],
             Predicate::at_or_below(Value::UInt(0)),
+        );
+        assert_eq!(
+            tile.to_guard(),
+            domain_prefix(vec![Value::UInt(1), Value::UInt(11)])
+        );
+    }
+
+    /// A group left open **between** whole ones makes the held region a staircase rather
+    /// than a prefix, which is what the codomain arm is for: it names only the open group's
+    /// keys, and the whole groups are released by their own keys. A filtered source
+    /// completes keys sparsely, so the gap is a shape the drive produces.
+    #[test]
+    fn to_guard_two_levels_names_only_the_open_groups_keys() {
+        // Groups 0, 1 and 2, all keyed 10 and 11; the predicate calls 0 and 2 whole.
+        let tile = two_level_uint_int(
+            vec![0, 1, 2],
+            vec![0, 2, 4],
+            vec![10, 11, 10, 11, 10, 11],
+            vec![100, 110, 200, 210, 300, 310],
+            Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2])),
         );
         let TileGuard::Or(arms) = tile.to_guard() else {
             panic!("expected an Or over the two halves")
@@ -4139,5 +4818,25 @@ mod tests {
             accumulator.as_ref(),
             &Tile::Scalar(ColumnValue::Ints(vec![3, 30]))
         );
+    }
+
+    /// A key delivered before its value, merged with one delivered with it, leaves the
+    /// value column neither empty nor one value per key, which the in-place append refuses
+    /// as the key-matching merge does.
+    #[test]
+    #[should_panic(expected = "neither empty nor one value per row")]
+    fn appending_a_value_beside_a_key_without_one_is_refused() {
+        let mut tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.merge(Tile::data_function(
+            ColumnValue::from_uints(vec![1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+            Predicate::False,
+            BitSet::new(),
+        ));
     }
 }

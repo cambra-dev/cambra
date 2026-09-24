@@ -1782,6 +1782,34 @@ dependencies, so a later update may refer to an earlier accumulator's
 just-computed value. The same covers generator functions with loop-carried
 state (`total := 0; for x in xs: total += x; yield total`).
 
+**Nested loops.** A `for` inside a `for` body is a recurrence of its own, running
+once per position of the loop around it. An accumulator declared before the outer
+loop is carried through both: at each outer position the inner recurrence starts
+from the value the accumulator holds there, and the outer one takes the value the
+inner left. The rule is per level rather than per depth, so a nest is unbounded in
+depth, and the inner source may read the outer binder — including where it *is* the
+outer element, which gives each outer position its own inner domain.
+
+```
+total := 0
+for xs in [[1, 2], [3, 4]]:
+    for x in xs:
+        total += x
+total                     # 10
+```
+
+Accumulators at different depths keep their own domains, so two in one nest are two
+recurrences rather than one with a wider key set.
+
+A `<<` feed from inside the nest appends at the innermost position, so the channel it
+builds carries one value per position of the nest rather than one per group.
+
+Three nested shapes do not compile yet: a filter on the inner source that reads the
+outer binder, a `with begin():` transaction inside a nested `for`, and an inner source
+whose rows are of differing length — rows of
+differing length are of differing type, so the collection is a sum and iterating one
+is its own missing piece.
+
 Accumulation **requires `:=`**. Because a plain `=` never mutates, a plain
 `=` to an outer-scope name inside a loop body is a lowering error — left to
 mean anything it could only be a silently-discarded per-iteration shadow,
@@ -1812,7 +1840,18 @@ total                     # 23
 ```
 
 An `if` branch is a block of its own, so a `:=` there introduces a variable that
-branch alone writes and reads.
+branch alone writes and reads. An inner `for` that writes it is what usually
+sequences it:
+
+```
+total := 0
+for x in [1, 2]:
+    inner := 0
+    for y in [10, 20]:
+        inner += y
+    total += inner
+total                     # 60
+```
 
 Two introductions are lowering errors. A **transactional** one, `y: Mut(Int,
 Txn) := 0` inside a loop body, names commit time, a sequencing domain the loop
@@ -1836,9 +1875,8 @@ silently discard every update at the iteration boundary, which is the one thing
 the old value, so a per-iteration rebind reads the binding's *initial* value on
 every iteration.
 
-*Currently unsupported* (see §12): nested for-loops with mutable
-variables, a mutable variable introduced inside a `with begin():` block, and
-`while` loops.
+*Currently unsupported* (see §12): a mutable variable introduced inside a
+`with begin():` block, and `while` loops.
 
 ### 4.7 `pass`
 
@@ -3434,11 +3472,9 @@ with parser-level support that lowering rejects:
 - **`while` loops** — currently a parse error (the `while` keyword is
   not yet recognised). Tracked as future work under mutability
   ("while loop lowering").
-- **Nested `for` loops with mutable variables** — a nested loop that
-  writes a mutable variable of the loop around it lowers and plans to a
-  carrier per enclosing row, which operator conversion does not realize
-  yet. A nested loop that writes no mutable variable declared outside it
-  is rejected at lowering.
+- **A nested `for` loop that writes no mutable variable declared outside
+  it** — rejected at lowering: it has no recurrence of the loops around
+  it to fold.
 - **A mutable variable introduced inside a transaction block** — a `with
   begin():` block may write mutable variables declared outside it but not
   introduce its own, which would need a sequencing domain nested inside commit

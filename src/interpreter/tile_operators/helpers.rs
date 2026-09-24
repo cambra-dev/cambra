@@ -79,6 +79,37 @@ pub(crate) fn open_collections(cells: &ColumnValue, extent: &Extent) -> Tile {
     }
 }
 
+/// One stored value per position, opened by [`open_collections`] into the shape
+/// [`Tiling::from_extent`] declares.
+pub(crate) fn stored_value_tile(values: Vec<Value>, value_extent: &Extent) -> Tile {
+    let tile = open_collections(
+        &ColumnValue::from_values(values, value_extent),
+        value_extent,
+    );
+    debug_assert!(
+        tile.check_from(&Tiling::from_extent(value_extent)),
+        "a store read's values take the tiling of their extent: {tile:?} vs {value_extent}"
+    );
+    tile
+}
+
+/// Rows that are already tiles, run together into the column they stand in.
+///
+/// The tile-side counterpart of [`stored_value_tile`]: that one opens a column of
+/// map values into the tile [`Tiling::from_extent`] gives, and this one takes
+/// rows already in that shape. An operator that gains and releases its rows one at a time
+/// — a driver's window — holds each as a one-row tile and renders its column here, so a
+/// row holding a collection never becomes a map value that something has to open again.
+///
+/// `tiling` is what says the shape when there are no rows, which the rows cannot.
+pub(crate) fn column_of_rows(rows: impl Iterator<Item = Tile>, tiling: &Tiling) -> Tile {
+    rows.reduce(|mut column, row| {
+        column.merge_rows(row);
+        column
+    })
+    .unwrap_or_else(|| tiling.empty_at_no_rows())
+}
+
 /// Repeat a whole value's tile `len` times along the domain axis.
 ///
 /// Used by [`MapResultToConstProducer`] to broadcast a constant value across all
@@ -230,6 +261,15 @@ pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
         }
         other => panic!("materialize_collections: not a value-shaped tile: {other:?}"),
     }
+}
+
+/// A **one-row** tile as the one value it holds.
+///
+/// [`materialize_collections`] at a single row, for the places a tile's row has to be read
+/// as what a store holds: a store keeps one value per key per tick, so an accumulator's
+/// seed and a snapshot slot are values however the producer that supplied them was shaped.
+pub(crate) fn materialized_row(tile: Tile) -> Value {
+    materialize_collections(tile).index_at(0)
 }
 
 /// Replace the tile sitting under every level of `input_tile` with what `transformation`
