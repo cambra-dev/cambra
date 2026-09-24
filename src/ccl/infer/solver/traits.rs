@@ -107,6 +107,14 @@ pub enum Trait {
     Multipliable,
     /// `//` over `(𝐴, 𝐵)`, associating `Output`.
     Divisible,
+    /// `**` over `(𝐴, 𝐵)`, associating `Output`, where `𝐵` is the exponent.
+    ///
+    /// The rows relate the two *bases*. That the exponent is **non-negative** is stated
+    /// where it can be discharged — as a refinement on the exponent's own binding
+    /// (`src/ccl/lower/exprs.rs`'s `pow_with_checked_exponent`) — because a row admits a
+    /// base and not a predicate over its values. The refinement names `Int`, so the `UInt`
+    /// row these share is unreachable for `**` while that holds.
+    Exponentiable,
     /// `==` and `!=` over `(𝐴, 𝐵)`, associating **nothing** — the `Bool` is the
     /// operator's, identical for every pair the trait accepts.
     Equatable,
@@ -291,7 +299,9 @@ impl Trait {
         match self {
             Trait::Addable => NUMERIC_OR_STRING,
             Trait::AddableRefined => ADDITION_REFINED,
-            Trait::Subtractable | Trait::Multipliable | Trait::Divisible => NUMERIC,
+            Trait::Subtractable | Trait::Multipliable | Trait::Divisible | Trait::Exponentiable => {
+                NUMERIC
+            }
             Trait::Equatable | Trait::Orderable => COMPARABLE,
             Trait::Negatable => NEGATABLE,
             Trait::Comparable => ORDERED,
@@ -343,6 +353,7 @@ impl Trait {
             Trait::Subtractable => "Subtractable",
             Trait::Multipliable => "Multipliable",
             Trait::Divisible => "Divisible",
+            Trait::Exponentiable => "Exponentiable",
             Trait::Equatable => "Equatable",
             Trait::Orderable => "Orderable",
             Trait::Negatable => "Negatable",
@@ -1889,6 +1900,7 @@ mod tests {
             Trait::Subtractable,
             Trait::Multipliable,
             Trait::Divisible,
+            Trait::Exponentiable,
             Trait::Equatable,
             Trait::Orderable,
             Trait::Negatable,

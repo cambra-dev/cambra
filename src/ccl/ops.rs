@@ -94,6 +94,13 @@ pub enum ArithmeticKind {
     Mul,
     /// Floor division (`//`).
     FloorDiv,
+    /// Exponentiation (`**`).
+    ///
+    /// The exponent is non-negative, which is what makes this total: lowering states
+    /// `{Int | __elem >= 0}` of it (`src/ccl/lower/exprs.rs`'s
+    /// `pow_with_checked_exponent`), so a negative one is a type error and never reaches
+    /// the interpreter.
+    Pow,
 }
 
 /// Comparison sub-operations for [`BinOpKind::Compare`].
@@ -133,7 +140,7 @@ pub enum LogicKind {
 /// Binary operation kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
-    /// An arithmetic operation (add, sub, mul, floor-div).
+    /// An arithmetic operation (add, sub, mul, floor-div, pow).
     Arithmetic(ArithmeticKind),
     /// A boolean logic operation (and, or, xor, …).
     BoolLogic(LogicKind),
@@ -156,6 +163,7 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::Sub) => "-",
             Self::Arithmetic(ArithmeticKind::Mul) => "*",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "//",
+            Self::Arithmetic(ArithmeticKind::Pow) => "**",
             Self::Concat => "++",
             Self::Compare(CompareKind::Less) => "<",
             Self::Compare(CompareKind::LessOrEq) => "<=",
@@ -186,6 +194,7 @@ impl BinOpKind {
             Self::Arithmetic(ArithmeticKind::Sub) => "sub",
             Self::Arithmetic(ArithmeticKind::Mul) => "mul",
             Self::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",
+            Self::Arithmetic(ArithmeticKind::Pow) => "pow",
             Self::Concat => "concat",
             Self::Compare(CompareKind::Equals) => "eq",
             Self::Compare(CompareKind::NotEquals) => "neq",

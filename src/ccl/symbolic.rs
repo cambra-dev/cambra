@@ -51,6 +51,10 @@ enum Precedence {
     /// `*`, `//` — multiplicative operators share this level; they bind tighter
     /// than additive operators, matching standard arithmetic convention.
     Mul,
+    /// `**` — exponentiation, tighter than the multiplicative operators (see
+    /// [`binop_binding`] for the side it groups towards and its straddle of the unary
+    /// minus).
+    Pow,
     /// `▷` chains — tighter than all binary operators so `x + y ▷ f` requires
     /// explicit parens: `(x + y) ▷ f`.
     Apply,
@@ -77,7 +81,8 @@ impl Precedence {
             Self::Cmp => Self::Compose,
             Self::Compose => Self::Add,
             Self::Add => Self::Mul,
-            Self::Mul => Self::Apply,
+            Self::Mul => Self::Pow,
+            Self::Pow => Self::Apply,
             Self::Apply => Self::Unary,
             Self::Unary => Self::Subscript,
             Self::Subscript => Self::Atom,
@@ -245,13 +250,15 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
 
         TypedExprNode::BinOp { left, op, right } => {
-            let op_prec = binop_prec(op);
+            let Binding {
+                own,
+                left: l,
+                right: r,
+            } = binop_binding(op);
             let sym = op.sym();
-            // Left at same prec is fine (left-associative).
-            let l = fmt(left, op_prec, opts);
-            // Right needs one level tighter to avoid right-association.
-            let r = fmt(right, op_prec.next_highest(), opts);
-            (op_prec, format!("{l} {sym} {r}"))
+            let l = fmt(left, l, opts);
+            let r = fmt(right, r, opts);
+            (own, format!("{l} {sym} {r}"))
         }
 
         TypedExprNode::UnaryOp(op, operand) => match op {
@@ -683,19 +690,56 @@ fn fmt_lit(lit: &Lit) -> String {
     }
 }
 
-/// Return the precedence level for a binary operator.
-fn binop_prec(op: &BinOpKind) -> Precedence {
+/// The level a binary operator renders at, and the threshold each operand renders under.
+///
+/// One pair per operator rather than a level plus an associativity rule. The side an
+/// operator groups towards is the side whose threshold equals its own level, so
+/// associativity is a *shape* of the pair; and `**`'s straddle of the unary minus is the
+/// same pair stating two different levels, which one number and an associativity cannot
+/// say between them.
+struct Binding {
+    /// What the rendering binds at, for the enclosing position to decide against.
+    own: Precedence,
+    /// The threshold the left operand renders under.
+    left: Precedence,
+    /// The threshold the right operand renders under.
+    right: Precedence,
+}
+
+/// Return the binding powers of a binary operator.
+fn binop_binding(op: &BinOpKind) -> Binding {
+    // Groups to the left: the left operand keeps a child of the same level bare, and the
+    // right parenthesises one, so the rendering re-parses with the grouping it was built
+    // from.
+    let leftward = |own: Precedence| Binding {
+        own,
+        left: own,
+        right: own.next_highest(),
+    };
     match op {
         BinOpKind::BoolLogic(LogicKind::Or | LogicKind::Nor | LogicKind::Xor | LogicKind::Xnor) => {
-            Precedence::Or
+            leftward(Precedence::Or)
         }
-        BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => Precedence::And,
-        BinOpKind::Compare(_) => Precedence::Cmp,
+        BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => leftward(Precedence::And),
+        BinOpKind::Compare(_) => leftward(Precedence::Cmp),
         BinOpKind::Arithmetic(
             ArithmeticKind::Add | ArithmeticKind::AddRefined | ArithmeticKind::Sub,
         )
-        | BinOpKind::Concat => Precedence::Add,
-        BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
+        | BinOpKind::Concat => leftward(Precedence::Add),
+        BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => {
+            leftward(Precedence::Mul)
+        }
+        BinOpKind::Arithmetic(ArithmeticKind::Pow) => Binding {
+            own: Precedence::Pow,
+            // **`**` straddles the unary minus**: tighter than the one on its left, looser
+            // than the one on its right (`docs/chl-spec.md`, "2.3 Expression precedence").
+            // At `Pow.next_highest()` a negated *base* renders bare and `-a ** b` reads
+            // back as `-(a ** b)`, the other tree.
+            left: Precedence::Unary.next_highest(),
+            // Groups to the right, so the exponent keeps a `**` of its own bare, and a
+            // minus there is already tighter than this level.
+            right: Precedence::Pow,
+        },
     }
 }
 
@@ -787,6 +831,68 @@ mod tests {
             ),
         ),
         "a + b * c"
+    )]
+    // BinOp: `**` groups to the right, so the nested exponent renders bare
+    #[case(
+        Expr::binop(
+            Expr::var("a"),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow),
+            Expr::binop(
+                Expr::var("b"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("c")
+            ),
+        ),
+        "a ** b ** c"
+    )]
+    // BinOp: and its nested *base* is the tree the bare form does not mean
+    #[case(
+        Expr::binop(
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("b")
+            ),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow),
+            Expr::var("c"),
+        ),
+        "(a ** b) ** c"
+    )]
+    // BinOp: a negated **base** parenthesises — `**` binds tighter than the minus on its
+    // left, so the bare `-a ** b` reads back as `-(a ** b)`.
+    #[case(
+        Expr::binop(
+            Expr::unary(UnaryOpKind::Neg, Expr::var("a")),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow),
+            Expr::var("b"),
+        ),
+        "(-a) ** b"
+    )]
+    // BinOp: a negated **exponent** does not — the minus there is already tighter.
+    #[case(
+        Expr::binop(
+            Expr::var("a"),
+            BinOpKind::Arithmetic(ArithmeticKind::Pow),
+            Expr::unary(UnaryOpKind::Neg, Expr::var("b")),
+        ),
+        "a ** -b"
+    )]
+    // BinOp: `**` binds tighter than `*` on either side
+    #[case(
+        Expr::binop(
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("b")
+            ),
+            BinOpKind::Arithmetic(ArithmeticKind::Mul),
+            Expr::binop(
+                Expr::var("c"),
+                BinOpKind::Arithmetic(ArithmeticKind::Pow),
+                Expr::var("d")
+            ),
+        ),
+        "a ** b * c ** d"
     )]
     // UnaryOp(Neg) inside Mul: Unary > Mul, so -a needs no parens as left child
     #[case(

@@ -80,7 +80,9 @@ public entry points:
 
 The grammar is precedence-climbed for binary operators, one combinator per level of
 [docs/chl-spec.md](../../docs/chl-spec.md), "2.3 Expression precedence", each built from the
-one tighter than it.
+one tighter than it. `**` is the exception: it straddles the unary `-`, tighter than one on
+its left and looser than one on its right, so it shares a `recursive` layer with unary `-`
+rather than sitting in its own.
 
 Every position a bracket encloses — a list or tuple element, a call argument, a
 subscript index, a record field, a brace item, a refinement predicate, a
@@ -91,10 +93,10 @@ keyword, so no `expr` can start with one and the choice needs no backtracking.
 See [docs/chl-spec.md](../../docs/chl-spec.md), "The one-line form" for the rule
 and why the bracket rather than the arm body carries it.
 
-Notably absent vs. Python: `/` (true division), `%` (modulo), `**`
-(power), `>>` (right shift), `~` (bitwise not), `is`, `in`, `not in`,
-`is not`. The lowering pass has never supported these, and the parser
-refuses them at the syntactic level rather than parsing-then-erroring.
+Notably absent vs. Python: `/` (true division), `%` (modulo), `>>`
+(right shift), `~` (bitwise not), `is`, `in`, `not in`, `is not`. The
+lowering pass has never supported these, and the parser refuses them at
+the syntactic level rather than parsing-then-erroring.
 
 ### Stage 3 — AST (`ast.rs`)
 
@@ -189,11 +191,13 @@ progress" diagnostic). With `.at_least(1)`, recovery cleanly declines at
 those positions and the outer `repeated()` terminates normally.
 
 **Load-bearing detail #2:** every precedence layer inside `expression()`
-(`product`, `sum`, `collection_union`, `bitand`, `bitxor`, `bitor`, `bool_not`,
-`bool_and`, `bool_or`, `ternary`, `feed`, plus `atom`, `postfix`, `unary`)
-ends in `.boxed()`. Without that, the 15-layer precedence chain
-monomorphises into nested generic combinator types, and each `expr.clone()`
-re-entry walks all 15 layers' frames on the stack. Just 4 levels of nested
+(`product`, `sum`, `collection_union`, `log_and`, `log_xor`, `log_or`,
+`comparison`, `bool_not`, `bool_and`, `bool_or`, `ternary`, `feed`, plus
+`atom`, `postfix`, `unary`) ends in `.boxed()`. Without that, those fifteen boxed
+combinators monomorphise into nested generic types, and each `expr.clone()` re-entry walks
+all fifteen frames on the stack. Fifteen counts the *combinators*, not the precedence
+ladder's levels: several levels share one combinator — `**` and unary `-` share `unary`,
+because the operator straddles it. Just 4 levels of nested
 function calls (`f(f(f(f(1))))`) was enough to overflow a 2 MiB test
 thread stack. Boxing collapses the type at each layer to a uniform
 `Boxed<…>` with predictable, small frame size, restoring well-bounded

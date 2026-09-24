@@ -612,9 +612,13 @@ impl<'a> Encode<'a> {
             BinOpKind::BoolLogic(LogicKind::Xnor) => c.eq(l, r),
             // Outside the fragment: a product of two unknowns is nonlinear, and
             // SMT-LIB's `div` is Euclidean rather than floor division, so `//`
-            // would encode as something else at a negative divisor. `++` is on
-            // strings, which have no sort here.
-            BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv)
+            // would encode as something else at a negative divisor. `**` is a
+            // repeated product, nonlinear for the reason `*` is, and SMT-LIB has
+            // no integer exponentiation to state it with. `++` is on strings,
+            // which have no sort here.
+            BinOpKind::Arithmetic(
+                ArithmeticKind::Mul | ArithmeticKind::FloorDiv | ArithmeticKind::Pow,
+            )
             | BinOpKind::Concat => {
                 return Err(format!(
                     "{} {} {} has no SMT encoding",

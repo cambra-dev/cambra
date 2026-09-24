@@ -129,7 +129,101 @@ fn test_collection_param_consumed(#[case] code: &str, #[case] expected: Value) {
 // maps both to the one runtime addition.
 #[case("2 ^+ 3", Value::Int(5))]
 #[case("1 ^+ 2 * 3 - 4", Value::Int(3))]
+// `**` scales a constant without spelling out the zeroes.
+#[case("10 ** 8", Value::Int(100_000_000))]
+// Parenthesised, an inner `**` is a base rather than an exponent. The other grouping is
+// rejected (`an_exponent_not_shown_non_negative_is_rejected`'s `chain`).
+#[case("(2 ** 3) ** 2", Value::Int(64))]
+// Tighter than `*` on either side.
+#[case("2 * 3 ** 2", Value::Int(18))]
+#[case("3 ** 2 * 2", Value::Int(18))]
+// Tighter than the unary minus on its left: `-(2 ** 2)`.
+#[case("-2 ** 2", Value::Int(-4))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// **`**` requires a non-negative exponent**, and states it as a refinement.
+///
+/// A reciprocal has no integer value, so rather than give `a ** -n` one the exponent has to
+/// carry `{Int | __elem >= 0}`, and a program that cannot show it is rejected where it is
+/// written. That is what leaves the runtime total: computing a reciprocal meant dividing by
+/// a magnitude that is zero for `0 ** -n` and, after `i64` overflow, for a large `n` too.
+///
+/// The demand is **strict** — an `Int` that carries no such refinement is rejected, not
+/// admitted — so what compiles is what a program can show.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::literal("2 ** -1")]
+#[case::zero_base("0 ** -1")]
+// Not a literal, so nothing bounds it: an unrefined `Int` cannot show itself non-negative.
+#[case::unrefined(indoc! {r#"
+    e = 0 - 1
+    2 ** e
+"#})]
+// A `**` answers a bare `Int`, so a chain is rejected at the inner result rather than
+// parsed differently: right-associativity is the parser's, pinned by
+// `src/chl_parser/parser.rs`'s `power_precedence_and_associativity`.
+#[case::chain("2 ** 3 ** 2")]
+fn an_exponent_not_shown_non_negative_is_rejected(#[case] code: &str) {
+    check_compile_error(code, "__elem >= 0");
+}
+
+/// What a program *can* show, which is what the refinement admits.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::literal("2 ** 3", Value::Int(8))]
+#[case::zero("2 ** 0", Value::Int(1))]
+// `a ** 0` is `1` for every base, `0` included: the fold seeds at the identity and the
+// loop never runs.
+#[case::zero_to_the_zero("0 ** 0", Value::Int(1))]
+// The caller carries the proof, so the body needs none of its own.
+#[case::annotated_parameter(
+    indoc! {r#"
+        def f(e: {Int where _ >= 0}):
+            2 ** e
+
+        f(3)
+    "#},
+    Value::Int(8)
+)]
+fn a_provably_non_negative_exponent_is_accepted(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// **This test pins a defect, not a decision — it should start failing when the defect is
+/// fixed.**
+///
+/// Inference admits the program: each of the source's elements discharges the exponent's
+/// `{Int | __elem >= 0}`. The join of `[1, 2, 3]`'s singletons is a bare `Int`, so the
+/// discharge leaves nothing in the element read's type, and the post-inference check then
+/// finds the mapped function's domain demanding a refinement the value reaching it does not
+/// carry. A well-typed program reports an internal invariant failure. The same panic
+/// arises with no `**`, from an annotated function called in a comprehension; `**` makes it
+/// reachable without refinement syntax. Once it passes, the program evaluates to `14`.
+#[test]
+#[should_panic(expected = "post-inference produced an invalid tree: [Type mismatch")]
+fn a_comprehension_exponent_reaches_the_wall() {
+    check_scalar("sum([2 ** x for x in [1, 2, 3]])", Value::Int(14));
+}
+
+/// A negative element is still rejected, and as a type error rather than at the wall.
+#[test]
+fn a_negative_comprehension_element_is_rejected_as_an_exponent() {
+    check_compile_error("sum([2 ** x for x in [1, 2, -3]])", "__elem >= 0");
+}
+
+/// Overflow **wraps**, in every profile.
+///
+/// The release profile sets no `overflow-checks`, so a plain `*` in `IntPow::raised` would
+/// panic here in debug and answer `0` in release. `zip_arithmetic`'s `+ - * //` still
+/// diverge that way — the vault issue `interpreter-integer-arithmetic-divergences` carries
+/// the class.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::past_the_width("2 ** 64", Value::Int(0))]
+#[case::the_sign_bit("2 ** 63", Value::Int(i64::MIN))]
+fn exponentiation_wraps(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
