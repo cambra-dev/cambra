@@ -563,8 +563,25 @@ impl LoweringContext {
     /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
     /// binding name so that the scheduler can subscribe a consumer to it after
     /// operator conversion.
-    pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
-        self.sink_bindings.insert(name.into(), sink);
+    ///
+    /// A name holds at most one sink. A second declaration would replace the first's
+    /// entry, and the first's writes would reach no sink, so it is refused at `span`.
+    pub fn register_sink_binding(
+        &mut self,
+        name: impl Into<String>,
+        sink: Arc<dyn DataSink>,
+        span: Span,
+    ) -> Result<(), LoweringError> {
+        match self.sink_bindings.entry(name.into()) {
+            std::collections::hash_map::Entry::Occupied(e) => Err(LoweringError::unsupported(
+                span,
+                format!("`{}` is already declared as a sink", e.key()),
+            )),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(sink);
+                Ok(())
+            }
+        }
     }
 
     /// Drain all sink bindings accumulated for this compilation.

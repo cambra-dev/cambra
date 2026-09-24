@@ -1,9 +1,8 @@
 //! `test_sink()`: what a program writes to a sink, read back as a value.
 //!
 //! Every program here observes through a sink rather than through a trailing bare
-//! expression, so it compiles down the record-of-sinks path
-//! (`convert_record_fields_to_operators`), which a program otherwise reaches only through
-//! `http_serve`.
+//! expression, so it compiles down the sink-record path (`convert_record_fields_to_operators`),
+//! which a program otherwise reaches only through `http_serve`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -166,8 +165,7 @@ fn a_collection_of_records() {
 
 /// A record whose components differ in depth — one a collection, one a scalar — does not
 /// compile: `FanIn::new_at` requires every operand to be a collection at the ambient level
-/// and panics otherwise. Pinned at the panic it reaches so the case is a ledger entry
-/// rather than an absence.
+/// and panics otherwise. Pinned at the panic it reaches.
 #[test]
 #[should_panic(expected = "FanIn pairs collections over")]
 fn a_record_holding_a_collection_does_not_compile() {
@@ -180,7 +178,7 @@ fn a_record_holding_a_collection_does_not_compile() {
 
 /// A comprehension whose elements are themselves collections does not convert. Pinned at
 /// the error it reaches; the reader's recursion into a nested `DataFunction` has no other way
-/// to be reached from source yet.
+/// to be reached from source.
 #[test]
 fn a_collection_of_collections_does_not_compile() {
     let err = compile_error(
@@ -280,6 +278,31 @@ fn test_sink_outside_the_top_level_is_rejected() {
     );
 }
 
+/// A loop body and a `with` block lower their statements apart from the top level, and
+/// refuse the form the same way.
+#[rstest::rstest]
+#[case::loop_body(indoc! {r#"
+    for x in [1, 2]:
+        out = test_sink()
+        out << x
+    0
+"#})]
+#[case::with_block(indoc! {r#"
+    pool: Mut(Int, Txn) := 0
+    for x in [1, 2]:
+        with begin():
+            out = test_sink()
+            pool := x
+    0
+"#})]
+fn test_sink_in_a_loop_or_block_is_rejected(#[case] source: &str) {
+    let err = compile_error(source, &["out"]);
+    assert!(
+        err.contains("only supported at the top level"),
+        "expected a top-level restriction, got: {err}"
+    );
+}
+
 /// The form takes no arguments; anything else is an ordinary call to a name nothing binds.
 #[test]
 fn test_sink_with_an_argument_is_not_the_sink_form() {
@@ -328,6 +351,42 @@ fn a_sink_declared_twice_is_rejected() {
     assert!(
         err.contains("`out` is already declared as a sink"),
         "expected a duplicate-sink refusal, got: {err}"
+    );
+}
+
+/// The sink record reads the innermost binding of a sink's name, so a later plain binding
+/// would reach the sink in place of every write made through the declaration.
+#[test]
+fn a_sink_name_bound_again_is_rejected() {
+    let err = compile_error(
+        indoc! {r#"
+            out = test_sink()
+            out << 1
+            out = [5]
+            0
+        "#},
+        &["out"],
+    );
+    assert!(
+        err.contains("`out` is a sink, so it cannot be bound again"),
+        "expected a sink-rebinding refusal, got: {err}"
+    );
+}
+
+/// The refusal lands on the rebinding, wherever it sits relative to the declaration.
+#[test]
+fn a_sink_name_bound_before_its_declaration_is_rejected_there() {
+    let source = indoc! {r#"
+        out = [5]
+        out = test_sink()
+        out << 1
+        0
+    "#};
+    let err = compile_error(source, &["out"]);
+    assert!(
+        err.contains("`out` is a sink, so it cannot be bound again")
+            && err.contains("span: Span { start: 0, end: 9 }"),
+        "expected the refusal at `out = [5]`, got: {err}"
     );
 }
 

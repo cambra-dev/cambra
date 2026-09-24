@@ -57,7 +57,7 @@ impl std::fmt::Display for SinkReadError {
 /// in a debug build, so [`Self::value`] validates the accumulated tile before reading it.
 #[derive(Default)]
 pub struct TestSink {
-    // shared-state-ok: the observation boundary, not the operator graph. A sink is a
+    // shared-state-ok: the I/O boundary, not the operator graph. A sink is a
     // terminal consumer — nothing reads this back into the graph, so no value crosses it
     // between operators — and `DataSink::process` takes `&self`, so a cell is what lets a
     // sink hold what it was handed. Same category as the HTTP sink's pending map.
@@ -235,6 +235,42 @@ mod tests {
             BitSet::new(),
         );
         assert_eq!(read(tile), Err(SinkReadError::Incomplete));
+    }
+
+    /// An aggregation or a store reaching a sink is refused as one, at the top level and as
+    /// a collection's values alike.
+    #[test]
+    fn a_fold_or_a_store_is_not_a_sink_tiling() {
+        let aggregation = || Tile::Aggregation {
+            kind: crate::ccl::AggregateKind::Sum,
+            accumulator: ints(vec![6]),
+            terminal: ColumnValue::Bools(bit_vec::BitVec::from_elem(1, true)),
+        };
+        let store = Tile::Store {
+            changes: ColumnValue::from_uints(vec![]),
+            deltas: ColumnValue::from_ints(vec![]),
+            frontier: Predicate::True,
+            terminal: true,
+            closed_keys: vec![],
+        };
+        assert!(matches!(
+            tile_rows(&aggregation(), 1),
+            Err(SinkReadError::NotASinkTiling(_))
+        ));
+        assert!(matches!(
+            tile_rows(&store, 1),
+            Err(SinkReadError::NotASinkTiling(_))
+        ));
+        let nested = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(aggregation()),
+            Predicate::True,
+            BitSet::new(),
+        );
+        assert!(matches!(
+            tile_rows(&nested, 1),
+            Err(SinkReadError::NotASinkTiling(_))
+        ));
     }
 
     #[test]
