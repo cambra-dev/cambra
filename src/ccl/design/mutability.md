@@ -559,7 +559,9 @@ tuple-param lambda applied to a snapshot (`(get_prev_*(…), 𝑟 ▷ iter) ▷ 
 for induction; the commit-record `decision` for transactions) — so after
 `lambda_elim` both domains share one shape, `(snapshot, source) ▷ zip ≫ body`,
 and `plan_loops` splits scaffold from body structurally, lifting the body
-**verbatim**. The `Transact` carrier is born at loop planning and spans only
+**verbatim**. A body that reads neither the snapshot nor the loop item is the one exception:
+`lambda_elim` point-frees it to `⟨record⟩ ▷ const`, and `simplify`'s const-reduce drops the
+snapshot and source in front of it. The `Transact` carrier is born at loop planning and spans only
 `plan_loops` → planning → op-conversion.
 
 Inlining runs before `mut_elim`: a UDF that writes a `Mut` parameter or feeds a `Feed` parameter
@@ -834,7 +836,10 @@ form — anchored on the builtins (`get_prev_seq`, `get_prev_txn`, `begin_<site>
 like aggregates, so `lambda_elim` normalizes *around* them without destroying the scaffold. Because
 `mut_elim` emits decision-factored bindings, the writer body arrives already point-free and loop
 planning lifts it verbatim; the causal accessor's defaults carry the key inits and the snapshot's
-trailing slot the source. The planned recurrence travels to op-conversion on the **carrier node**
+trailing slot the source. A constant decision, `⟨record⟩ ▷ const`, has neither snapshot nor
+source term, and `constant_decision_writer` recovers its writer from the site's domain alone: it
+reads no keys and iterates the extent, restricted when the extent is refined. The planned
+recurrence travels to op-conversion on the **carrier node**
 `Transact { keys, writers, domain }` — explicit key/writer header slots plus the opaque writer
 body — which `planning` iterate-wraps the writer sources of and op-conversion builds the engine
 from. One carrier serves both domains — there is no separate loop node. It is the loop analog of the
