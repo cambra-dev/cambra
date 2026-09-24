@@ -1495,3 +1495,81 @@ fn one_let_bound_conditional_consumed_by_two_generators(#[case] c: &str, #[case]
         Value::Int(expected),
     );
 }
+
+#[test]
+fn refined_ite1() {
+    check_scalar(
+        indoc! {r#"
+def f(x) => {Int where _ >= 0}:
+    if x >= 0:
+        1
+    else:
+        2
+
+f(-1)
+"#},
+        Value::Int(2),
+    )
+}
+
+#[test]
+fn refined_ite2() {
+    check_compile_error(
+        indoc! {r#"
+def f(x) => {Int where _ >= 2}:
+    if x >= 0:
+        1
+    else:
+        2
+
+f(-1)
+"#},
+        "Annotation mismatch",
+    )
+}
+
+#[test]
+fn refined_ite_use_condition_external() {
+    check_scalar(
+        indoc! {r#"
+def f(x) => {Int where _ >= 0 and _ >= x}:
+    if x >= 0:
+        x
+    else:
+        2
+
+f(-1)
+"#},
+        Value::Int(2),
+    )
+}
+
+#[test]
+fn refined_ite_use_condition_internal() {
+    check_scalar(
+        indoc! {r#"
+def g(x: {Int where _ == 3}):
+    x
+
+def h(x: {Int where _ == 4}):
+    x
+
+def j(x: {Int where _ != 3 and _ != 4}):
+    x
+
+
+def f(x):
+    if x == 3:
+        g(x)
+    elif x == 4:
+        h(x)
+    elif x ^+ 1 == 4:
+        h(x ^= 1)
+    else:
+        j(x)
+
+f(4)
+"#},
+        Value::Int(4),
+    )
+}
