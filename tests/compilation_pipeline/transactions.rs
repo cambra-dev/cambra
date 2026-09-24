@@ -562,6 +562,28 @@ fn progress_feed_grant_deny() {
     );
 }
 
+/// The reply is keyed by its commit time, so its key has type `Txn` and not the loop's
+/// position type: key 1 is the first commit, which is iteration 0, and iteration 1 denied.
+#[test]
+fn an_in_block_reply_is_typed_over_the_commit_clock() {
+    let mut ctx = GlobalContext::default();
+    let (ast, tile) = run_pipeline_with_ctx(
+        &mut ctx,
+        indoc! {r#"
+            out = defer()
+            pool: Mut(Int, Txn) := 100
+            for r in [70, 50]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+                        out << pool
+            out
+        "#},
+    );
+    assert_eq!(ast.ty.to_string(), "(Txn ⤇ Int)");
+    assert_eq!(tile, commit_stream(&[1], &[30]));
+}
+
 // ---------------------------------------------------------------------------
 // Value types: a transactional mutable variable holds any base value, not just int
 // ---------------------------------------------------------------------------
