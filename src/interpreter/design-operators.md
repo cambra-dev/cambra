@@ -593,6 +593,27 @@ its key sits. A tile that cannot answer every key answers none, since an undecid
 have to re-offset the groups it left.
 
 ### Where a collection is materialized
+A **filter** on the inner source rides the pair it filters, as a refinement `lambda_elim`
+writes on the product. Planning emits it as `filter_values` — a term, which is what applies
+it, since this site is a morphism under `curry` rather than one the iterate-then-restrict
+chain reaches. A keyed collection's carried present-key proof is a different kind of
+refinement and stays on the binder whose lookup reads it.
+
+[`Filter`] reads the resulting mask **positionally**: the predicate compiled over the same
+pairs, so its flat codomain is one boolean per entry in entry order, which is the mask
+`Tile::retain` takes and re-offsets the shortened groups from. Each side is pulled from its own
+branch of the pairs and they need not have reached the same rows. An input with nothing in it
+is already filtered, which is the ordinary end of a pull; anything else out of step is refused
+with a message that says so, rather than reading the mask across the misalignment, which drops
+the wrong entries silently, or answering empty, which waits for an alignment that is not
+coming. A source delivering its rows one at a time — a transaction's — is what produces that
+misalignment, so a correlated filter inside a transaction is not served yet.
+
+Still not compiled: a correlated filter whose **body reads nothing outer**, whose binder is
+free only in the type, so lambda elimination takes the Pi-const arm and the site never becomes
+a pair at all.
+
+### Reading a collection held per row
 
 A collection reaches an operator in one of two shapes. A **streamed** one carries its keys in
 a domain column, one row per key, and is what every consumer that iterates a collection reads.
