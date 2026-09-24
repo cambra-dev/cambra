@@ -562,17 +562,15 @@ pub enum Builtin {
     BeginTxn,
 
     /// `by_commit_time : (𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` — one `with
-    /// begin():` site's commit records, keyed by the commit time each carries rather than
-    /// by the iteration that produced it. An iteration whose transaction denied has no
-    /// commit, so it has no key.
+    /// begin():` site's commit records, keyed by the commit time each carries rather than by
+    /// the iteration that produced it. A site's records carry distinct times, so the re-keying
+    /// is a function. A denied iteration's record has a time too; the tap's
+    /// ``variant_project(`commit)`` drops it.
     ///
-    /// Heads each in-block reply tap [`crate::ccl::transact_phase`] binds, which is what
-    /// types the reply `Txn ⤇ 𝑉`: the store serves a reply at its commit time, so the
-    /// key a reader sees is that commit time and not the iteration's position.
-    /// Minted after inference with its type stamped, like [`Self::BeginTxn`], and consumed
-    /// with the tap binding by [`crate::ccl::planning::plan_loops`], which maps a read of
-    /// the tap to the store's field; so it never reaches op-conversion, and its arm there
-    /// is a deliberate error.
+    /// Heads each in-block reply tap [`crate::ccl::transact_phase`] binds, which types a reply
+    /// `Txn ⤇ 𝑉`, keyed as the store serves it. Minted after inference with its type stamped,
+    /// like [`Self::BeginTxn`], and consumed with the tap binding by
+    /// [`crate::ccl::planning::plan_loops`], so its op-conversion arm is a deliberate error.
     ByCommitTime,
 
     /// `await_final : Mut(𝑉, Txn) ⇒ 𝑉` — the **terminal read** of a transactional

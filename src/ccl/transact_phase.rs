@@ -2719,8 +2719,8 @@ fn record_field_ty(ty: &Type, field: &str) -> Type {
     }
 }
 
-/// A hoisted in-block feed: the target defer and the tap binding (`Txn ⤇ V`, its site's
-/// commit records keyed by commit time) whose per-commit values feed it.
+/// A hoisted in-block feed: the target defer and the tap binding (``Txn ⤇ {`fired{𝑉} |
+/// `idle}``, its site's commit records keyed by commit time) whose per-commit values feed it.
 /// `recognize` maps a read of `tap` to the history record's tap field.
 struct HoistedFeed {
     defer: Name,
@@ -2745,8 +2745,8 @@ struct HoistedFeed {
 ///   (verbatim) applied to the mutable variable snapshot `(hist_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
-/// - one **tap** binding per in-block feed — `(commits_j ▷ by_commit_time) ≫ .decision ≫
-///   .field`, keyed by commit time.
+/// - one **tap** binding per in-block feed — ``(commits_j ▷ by_commit_time) ≫ .decision ≫
+///   variant_project(`commit) ≫ .field``, keyed by commit time.
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
 /// `final_or_default(hist_x, init)` read over its history and hoists each
