@@ -511,14 +511,8 @@ fn a_sink_accumulates_across_two_deliveries() {
     );
 }
 
-/// A list literal's elements are constants ("3.11 List, tuple, record literals" in
-/// `docs/chl-spec.md`), so a list built from the loop variable is refused. Not a sink
-/// rule — the same program through a plain `defer()` and a trailing expression is refused
-/// identically.
-///
-/// It leaves one feed case unmeasured — whether such a channel takes the loop's keys with a
-/// collection under each, or splices the contributions into one flat domain — so nothing
-/// downstream should assume either.
+/// A list literal's elements are constants (`docs/chl-spec.md`, "3.11 List, tuple, record
+/// literals"), so a list built from the loop variable is refused.
 #[test]
 fn a_collection_fed_from_inside_a_loop_does_not_compile() {
     let source = indoc! {r#"

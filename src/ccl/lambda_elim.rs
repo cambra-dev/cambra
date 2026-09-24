@@ -1139,9 +1139,9 @@ fn elim_lambda_impl(
         // List: a list literal's elements are constants (`docs/chl-spec.md`, "3.11 List,
         // tuple, record literals"), and a body that reaches this arm has one that reads
         // `param`. Lowering refuses every element that names a varying variable at its span
-        // (`lower::constant_lists`), so an element reaches here only through a call, and is
-        // refused without a span. Constant elements never get here: the Pi-const rule above
-        // returns the whole list as a constant.
+        // (`lower::constant_lists`); an element that varies by a route that check does not
+        // follow is refused here, without a span. A list none of whose elements reads `param`
+        // as a value never gets here: the Constant and Pi-const rules above return it whole.
         //
         // The Tuple rule would be ill-typed here, not merely unsupported. A list's elements are
         // rows of a collection rather than slots of a row, and `Zip` is the product fanout,
@@ -1152,7 +1152,7 @@ fn elim_lambda_impl(
             assert!(
                 elts.iter().any(|e| is_free_in_value(param, e)),
                 "a list no element of which reads `{param}` as a value is a constant body, \
-                 which the Pi-const rule above has already returned"
+                 which the Constant and Pi-const rules above have already returned"
             );
             Err(LambdaElimError::VaryingListElement {
                 binder: param.clone(),
