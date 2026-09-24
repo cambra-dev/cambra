@@ -28,12 +28,12 @@
 //! though decided — its value holding from the latest earlier change. A writer's
 //! proposal carries its read and write sets as *maps*: each rides a tile cell as
 //! a [`map_to_value`] `Value::Function` in a `ColumnValue::Variants` column
-//! (heterogeneous key sets per cell, no `Function`), so the proposal
+//! (heterogeneous key sets per cell, no `DataFunction`), so the proposal
 //! stream is `step → {snap, reads, writes}` with `reads`/`writes` map-valued. The
 //! operator's output is the full store as a [`Tile::Store`] changelog in that
 //! same delta encoding, which the writers *fold* per key ([`store_current`] /
 //! [`store_value_at`]) when they read it back through the cycle — the step
-//! function, never mistaken for a directly-indexed `Function`.
+//! function, never mistaken for a directly-indexed `DataFunction`.
 //!
 //! # Concurrency is logical
 //!
@@ -285,7 +285,7 @@ impl CommitEngine {
     /// containing the key `≤ t`); a tick whose delta omits a key is decided-absent
     /// for it, its value holding from the latest earlier change. This is the
     /// multi-key operator's output — the writers read it back through the cycle,
-    /// and it is the step function, not a `Function`, so the fold cannot be
+    /// and it is the step function, not a `DataFunction`, so the fold cannot be
     /// mistaken for direct indexing.
     pub fn render_full_store_tile(&self) -> Tile {
         let ticks: Vec<usize> = self.committed.keys().copied().collect();
@@ -370,7 +370,7 @@ fn read_initial_scalar(
             // map, so it seeds as a single [`map_to_value`] cell. The seed is
             // acyclic and terminal, so the whole map is present on the pull that
             // yields it.
-            Tile::Function {
+            Tile::DataFunction {
                 domain,
                 codomain,
                 domain_predicate,
@@ -596,7 +596,7 @@ pub fn fold_changelog_key_ascending(
 /// not a store or has no change `≤ t`. This is the multi-key,
 /// **snapshot-consistent** read — one fold yields a coherent record across all
 /// keys at a single commit time, which a bank of independent per-key
-/// `Function` reads (the source of the read-skew divergence) cannot.
+/// `DataFunction` reads (the source of the read-skew divergence) cannot.
 pub fn store_snapshot_at(tile: &Tile, t: CommitTs) -> HashMap<Value, Value> {
     let Tile::Store {
         changes, deltas, ..
@@ -619,7 +619,7 @@ pub fn store_snapshot_at(tile: &Tile, t: CommitTs) -> HashMap<Value, Value> {
 
 /// `key`'s current value — its latest change at or below the decided frontier —
 /// with the frontier tick. `None` if the store is undecided/empty or `key` was
-/// never written. Unlike an `ExtractFinal` over a `Function`, this is
+/// never written. Unlike an `ExtractFinal` over a `DataFunction`, this is
 /// defined *without the stream ever terminating*: it reads the decided frontier,
 /// which a live store advances on every commit. This is the read the writers
 /// perform on the store they read back through the cycle.
@@ -698,7 +698,7 @@ enum ReleasedExtent {
 /// rides in a single tile cell: a column of these is a `ColumnValue::Variants`
 /// (row-wise, heterogeneous), so per-tick write sets and per-proposal read/write
 /// sets can have *different* key sets without a fixed `Record` extent or a
-/// `Function` CSR layout. The multi-key operator and the E4 proposal
+/// `DataFunction` CSR layout. The multi-key operator and the E4 proposal
 /// wrapper both use this encoding.
 pub fn map_to_value(map: &HashMap<Value, Value>) -> Value {
     Value::Function(
@@ -748,7 +748,7 @@ fn map_extent(key_extent: &Extent, value_extent: &Extent) -> Extent {
 /// `CommitTimestamp ⇀ (Key ⇀ Value)`, each change tick carrying a `Key ⇀ Value`
 /// delta cell. The codomain is a `Scalar` of the map extent because a whole
 /// delta rides one cell as a `Value::Function`. The `Store` tiling (not
-/// `Function`) is what marks the output as a changelog to be folded, not a
+/// `DataFunction`) is what marks the output as a changelog to be folded, not a
 /// function to be indexed.
 pub fn full_store_tiling(key_extent: &Extent, value_extent: &Extent) -> Tiling {
     Tiling::Store {
@@ -768,7 +768,7 @@ const F_READS: &str = "reads";
 /// where `reads`/`writes` are map-valued (`Key ⇀ Value`) cells.
 pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Tiling {
     let map = map_extent(key_extent, value_extent);
-    Tiling::function(
+    Tiling::data_function(
         Extent::Base(BaseType::UInt),
         Tiling::Record(HashMap::from([
             (
@@ -1045,7 +1045,7 @@ impl TileProducer for CommitProducer {
             let k = (self.drain_start + off) % n;
             let guard = self.writer_producers[k].tiling().universal_guard();
             let tile = self.writer_producers[k].get(guard);
-            let Tile::Function {
+            let Tile::DataFunction {
                 domain,
                 codomain,
                 domain_predicate,
@@ -1195,7 +1195,7 @@ impl TileProducer for CommitProducer {
 /// and the transaction driver needs to say which items it has finished. A finite
 /// list is the special case (its domain is already `[0, 1, …]`).
 fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
-    let Tile::Function {
+    let Tile::DataFunction {
         domain, codomain, ..
     } = tile
     else {
@@ -1595,7 +1595,7 @@ impl StoreValueStream {
         carry_forward: bool,
     ) -> Self {
         Self {
-            base: OperatorBase::new(Tiling::function(
+            base: OperatorBase::new(Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(value_extent.clone()),
             )),
@@ -1740,7 +1740,7 @@ impl TileProducer for StoreValueStreamProducer {
                 values.push(v);
             }
         }
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints(ticks),
             Box::new(Tile::Scalar(ColumnValue::from_values(
                 values,
@@ -1923,7 +1923,7 @@ impl TileProducer for StoreFinalReadProducer {
 /// at `p + 1` here, commit ticks there) and how they emit (full re-emit here for
 /// `fan_in`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
-    /// Output tiling `Function { domain: D, codomain: Scalar(V) }`.
+    /// Output tiling `DataFunction { domain: D, codomain: Scalar(V) }`.
     base: OperatorBase,
     /// Enumerates the loop extent `D` (its positions drive the output domain, so
     /// it aligns with any co-iterated source over the same `D`).
@@ -1950,7 +1950,7 @@ impl StoreDenseRead {
         value_extent: Extent,
         carry_forward: bool,
     ) -> Self {
-        let Tiling::Function { domain, .. } = trigger.tiling() else {
+        let Tiling::DataFunction { domain, .. } = trigger.tiling() else {
             panic!(
                 "StoreDenseRead trigger must be a function (the loop extent), got {}",
                 trigger.tiling()
@@ -1961,7 +1961,7 @@ impl StoreDenseRead {
             "StoreDenseRead source must be a Store, got {}",
             store_op.tiling()
         );
-        let tiling = Tiling::function(domain.clone(), Tiling::Scalar(value_extent.clone()));
+        let tiling = Tiling::data_function(domain.clone(), Tiling::Scalar(value_extent.clone()));
         Self {
             base: OperatorBase::new(tiling),
             trigger,
@@ -2034,7 +2034,7 @@ impl TileProducer for StoreDenseReadProducer {
         let trigger = self
             .trigger_producer
             .get(self.trigger_producer.tiling().universal_guard());
-        let Tile::Function {
+        let Tile::DataFunction {
             domain: positions,
             domain_predicate: trigger_pred,
             ..
@@ -2137,7 +2137,7 @@ impl TileProducer for StoreDenseReadProducer {
         } else {
             Predicate::from_column_value(&positions)
         };
-        Tile::function(
+        Tile::data_function(
             positions,
             Box::new(Tile::Scalar(ColumnValue::from_values(
                 values,
@@ -2276,7 +2276,7 @@ impl AsOfOutput {
 }
 
 pub struct AsOf {
-    /// Output tiling: `Function { domain: B, codomain }` where `codomain`
+    /// Output tiling: `DataFunction { domain: B, codomain }` where `codomain`
     /// is `Scalar(V)` (single mutable variable) or `Record{field: Scalar(V)}` (snapshot).
     base: OperatorBase,
     /// The trigger stream `Fun(B, _)` — drives one output position each.
@@ -2318,7 +2318,7 @@ impl AsOf {
         source: Box<dyn TileOperator>,
         output: AsOfOutput,
     ) -> Self {
-        let Tiling::Function { domain: b_ext, .. } = trigger.tiling() else {
+        let Tiling::DataFunction { domain: b_ext, .. } = trigger.tiling() else {
             panic!("AsOf trigger must be a function, got {}", trigger.tiling());
         };
         debug_assert!(
@@ -2326,7 +2326,7 @@ impl AsOf {
             "AsOf source must be a commit Store, got {}",
             source.tiling()
         );
-        let tiling = Tiling::function(b_ext.clone(), output.codomain_tiling());
+        let tiling = Tiling::data_function(b_ext.clone(), output.codomain_tiling());
         Self {
             base: OperatorBase::new(tiling),
             trigger,
@@ -2365,7 +2365,7 @@ impl TileOperator for AsOf {
             .source
             .subscribe(sg, forwarding_consumer(&consumer), scheduler);
         let b_extent = match self.tiling() {
-            Tiling::Function { domain, .. } => domain.clone(),
+            Tiling::DataFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiles as a function"),
         };
         Box::new(AsOfProducer {
@@ -2445,7 +2445,7 @@ impl AsOfProducer {
                     .collect(),
             ),
         };
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_values(bs, &self.b_extent),
             Box::new(codomain),
             // Terminality rides with the trigger: when no more requests will
@@ -2496,7 +2496,7 @@ impl TileProducer for AsOfProducer {
             .collect();
         let trigger_tile = self.trigger.get(self.trigger.tiling().universal_guard());
         let trigger_pred = match &trigger_tile {
-            Tile::Function {
+            Tile::DataFunction {
                 domain_predicate, ..
             } => domain_predicate.clone(),
             _ => Predicate::False,
@@ -2518,7 +2518,7 @@ impl TileProducer for AsOfProducer {
         // re-presents one (a lazily-compacting trigger's domain still legally carries
         // the position until it compacts). That skip is what makes the `release_impl`
         // compaction safe.
-        if let (Tile::Function { domain, .. }, Some(snap)) = (&trigger_tile, &snapshot) {
+        if let (Tile::DataFunction { domain, .. }, Some(snap)) = (&trigger_tile, &snapshot) {
             for i in 0..domain.len() {
                 let b = domain.index_at(i);
                 if self.is_released(&b) {
@@ -2553,7 +2553,7 @@ impl TileProducer for AsOfProducer {
         // value: the snapshot above is all-or-nothing, so a key with no decided value
         // withholds it. Every present position latches on the pull that finds a snapshot,
         // which is why this is otherwise false by the time the gate reads it.
-        let has_unlatched_position = matches!(&trigger_tile, Tile::Function { domain, .. }
+        let has_unlatched_position = matches!(&trigger_tile, Tile::DataFunction { domain, .. }
         if (0..domain.len()).any(|i| {
             let b = domain.index_at(i);
             !self.is_released(&b) && !self.seen.contains(&b)
@@ -2740,7 +2740,7 @@ impl DriverWindow {
                 .collect();
             Tile::Scalar(ColumnValue::from_values(column, ext))
         });
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints(self.rows.iter().map(|r| r.position).collect()),
             Box::new(Tile::Record(fields)),
             if done {
@@ -2789,7 +2789,7 @@ fn subscribe_driver_inputs(
 }
 
 /// The induction body's input, produced from the store read back through the
-/// cycle: `Function(UInt → {_0: prev_{k₀}, …, _{r-1}: prev_{k_{r-1}}, _r:
+/// cycle: `DataFunction(UInt → {_0: prev_{k₀}, …, _{r-1}: prev_{k_{r-1}}, _r:
 /// item})` — the flat `(prev…, item)` tuple the body's `let kᵢ = p.i … let item
 /// = p.r` shape expects.
 ///
@@ -3105,7 +3105,7 @@ impl TileProducer for InductionDriverProducer {
 }
 
 /// The transaction body's input, produced from the store read back through the
-/// cycle: `Function(UInt → {_0: snap_{k₀}, …, _{r-1}: snap_{k_{r-1}}, _r:
+/// cycle: `DataFunction(UInt → {_0: snap_{k₀}, …, _{r-1}: snap_{k_{r-1}}, _r:
 /// item})` — the [`InductionDriver`]'s sibling, differing only in how the item
 /// advances.
 ///
@@ -3425,7 +3425,7 @@ impl TileProducer for TransactDriverProducer {
 /// The body-input tiling both writers' drivers produce: `UInt → {_0…_{r-1}:
 /// read, _r: item}`.
 fn body_input_tiling(read_extents: &[Extent], item_extent: &Extent) -> Tiling {
-    Tiling::function(
+    Tiling::data_function(
         Extent::Base(BaseType::UInt),
         Tiling::Record(body_input_fields(read_extents, item_extent, |_, ext| {
             Tiling::Scalar(ext.clone())
@@ -3471,7 +3471,7 @@ fn is_fired_tag(tag: &crate::ccl::FieldKey) -> bool {
 /// currently deciding, superseding any older live one (see the caller). `None`
 /// when the driver has emitted nothing live.
 fn newest_body_position(tile: &Tile) -> Option<usize> {
-    let Tile::Function { domain, .. } = tile else {
+    let Tile::DataFunction { domain, .. } = tile else {
         return None;
     };
     (0..domain.len())
@@ -3489,7 +3489,7 @@ fn newest_body_position(tile: &Tile) -> Option<usize> {
 /// at consecutive positions: a restricted loop source iterates a subset of its
 /// extent, so the position after `p` in the decision stream need not be `p + 1`.
 fn next_decided_position(tile: &Tile, pos: usize) -> Option<usize> {
-    let Tile::Function { domain, .. } = tile else {
+    let Tile::DataFunction { domain, .. } = tile else {
         return None;
     };
     (0..domain.len())
@@ -3521,7 +3521,7 @@ fn body_decision_at(
     write_keys: &[Value],
     tap_fields: &[String],
 ) -> Option<(bool, Vec<Value>, Vec<bool>)> {
-    let Tile::Function {
+    let Tile::DataFunction {
         domain, codomain, ..
     } = tile
     else {
@@ -3801,7 +3801,7 @@ impl TransactWriterProducer {
         // momentarily drained, so the store (and any reply tap read off it) is
         // not prematurely declared complete.
         let terminal = self.driver_terminal && self.emitted.is_empty();
-        Tile::function(
+        Tile::data_function(
             // Absolute positions: the live window is `[committed_base, …)`; the
             // released prefix has been compacted away. Positions never renumber.
             ColumnValue::from_uints((self.committed_base..self.committed_base + n).collect()),
@@ -4254,7 +4254,7 @@ mod tests {
         );
     }
 
-    /// A test iteration source: one terminal `Function(pos → item)` tile
+    /// A test iteration source: one terminal `DataFunction(pos → item)` tile
     /// over a fixed item list (the loop extent), mirroring a lowered `cast(iter,
     /// …)` loop source.
     struct ItemSource {
@@ -4265,8 +4265,8 @@ mod tests {
     impl ItemSource {
         fn new(items: &[i64]) -> Self {
             let tiling =
-                Tiling::function(Extent::Base(BaseType::UInt), Tiling::Scalar(value_extent()));
-            let tile = Tile::function(
+                Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(value_extent()));
+            let tile = Tile::data_function(
                 ColumnValue::from_uints((0..items.len()).collect()),
                 Box::new(Tile::Scalar(ColumnValue::from_values(
                     items.iter().map(|n| int(*n)).collect(),
@@ -4366,7 +4366,7 @@ mod tests {
         fn new(input: Box<dyn TileOperator>, threshold: i64, key: &str) -> Self {
             // Decision variant `` {`commit{{writes: {_0}}} | `abort} `` — a
             // `Scalar(Union)` codomain (commit=0, abort=1).
-            let tiling = Tiling::function(
+            let tiling = Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(decision_union_extent(commit_payload_extent(key))),
             );
@@ -4414,7 +4414,7 @@ mod tests {
         impl_producer_base!();
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
             let in_tile = self.input.get(self.input.tiling().universal_guard());
-            let Tile::Function {
+            let Tile::DataFunction {
                 domain,
                 codomain,
                 domain_predicate,
@@ -4441,7 +4441,7 @@ mod tests {
                     abort_value()
                 });
             }
-            Tile::function(
+            Tile::data_function(
                 domain,
                 Box::new(Tile::Scalar(ColumnValue::from_values(
                     rows,
@@ -4627,7 +4627,7 @@ mod tests {
         // over several pulls rather than one.
         let tile = pull_to_terminal(&mut sched, &mut producer);
         assert!(validate_tile(&tile));
-        let Tile::Function { codomain, .. } = tile else {
+        let Tile::DataFunction { codomain, .. } = tile else {
             panic!("dense read is a Function");
         };
         let Tile::Scalar(col) = *codomain else {
@@ -4719,7 +4719,7 @@ mod tests {
             // converges over several pulls; a later re-read is already terminal
             // and returns immediately.
             let tile = pull_to_terminal(&mut sched, p);
-            let Tile::Function {
+            let Tile::DataFunction {
                 domain, codomain, ..
             } = tile
             else {
@@ -5254,7 +5254,7 @@ mod tests {
     }
 
     /// A test source operator that emits a fixed proposal stream as one
-    /// terminal `Function(step → {snap, read, write})` tile.
+    /// terminal `DataFunction(step → {snap, read, write})` tile.
     struct ProposalSource {
         tiling: Tiling,
         tile: Tile,
@@ -5532,7 +5532,7 @@ mod tests {
         impl_producer_base!();
         fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
             let tile = self.inner.get(projection_guard);
-            if let Tile::Function { domain, .. } = &tile {
+            if let Tile::DataFunction { domain, .. } = &tile {
                 let mut seen = self.seen.borrow_mut();
                 seen.max_window = seen.max_window.max(domain.len());
                 // Positions are absolute and one per attempt, so the highest ever
@@ -5730,7 +5730,7 @@ mod tests {
     /// window of grants starting at absolute position `base`, with the
     /// map-valued read/write sets riding `Variants` columns ([`map_to_value`]).
     fn proposal_tile(emitted: &[EmittedProposal], base: usize, terminal: bool) -> Tile {
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints((base..base + emitted.len()).collect()),
             Box::new(Tile::Record(HashMap::from([
                 (
@@ -6305,7 +6305,7 @@ mod tests {
         let mut p = stream.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
         let t = p.get(p.tiling().universal_guard());
         assert!(!t.is_terminal());
-        let Tile::Function { codomain, .. } = &t else {
+        let Tile::DataFunction { codomain, .. } = &t else {
             panic!("expected a value stream")
         };
         let Tile::Scalar(cv) = codomain.as_ref() else {
@@ -6433,13 +6433,13 @@ mod tests {
         // A producer that never yields a scalar tile → Diverged. Its tiling is
         // the (non-scalar) Function shape so the producer accepts the tile;
         // `read_initial_scalar` still never sees a `Tile::Scalar`.
-        let nonscalar_tiling = Tiling::function(
+        let nonscalar_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let mut nonscalar = FixedSource {
             tiling: nonscalar_tiling,
-            tile: Tile::function(
+            tile: Tile::data_function(
                 ColumnValue::from_uints(vec![]),
                 Box::new(Tile::Scalar(ColumnValue::from_ints(vec![]))),
                 Predicate::False,
@@ -6463,11 +6463,11 @@ mod tests {
     fn read_initial_scalar_takes_a_record_valued_map_either_way() {
         let seed = |codomain: Tile, codomain_tiling: Tiling| {
             let mut source = FixedSource {
-                tiling: Tiling::Function {
+                tiling: Tiling::DataFunction {
                     domain: Extent::Base(BaseType::String),
                     codomain: Box::new(codomain_tiling),
                 },
-                tile: Tile::function(
+                tile: Tile::data_function(
                     ColumnValue::from_values(
                         vec![Value::String("btc".into()), Value::String("eth".into())],
                         &Extent::Base(BaseType::String),
@@ -6648,7 +6648,7 @@ mod tests {
         // and sort — otherwise the position-driven driver reads the wrong item at
         // each tick, and a scalar-final `ExtractFinal` over the dense read (which
         // relies on the highest position being last) picks a mid-loop value.
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::from_uints(vec![2, 0, 1]),
             Box::new(Tile::Scalar(ColumnValue::from_ints(vec![30, 10, 20]))),
             Predicate::True,
@@ -6784,7 +6784,7 @@ mod tests {
 
     /// The `Int` codomain of a dense read, in domain order.
     fn dense_values(tile: &Tile) -> Vec<i64> {
-        let Tile::Function { codomain, .. } = tile else {
+        let Tile::DataFunction { codomain, .. } = tile else {
             panic!("dense read is a Function");
         };
         let Tile::Scalar(col) = codomain.as_ref() else {
@@ -6819,7 +6819,7 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = memo.subscribe(guard, Box::new(|| {}), &mut sched);
         let tile = pull_to_terminal(&mut sched, &mut producer);
-        let Tile::Function { codomain, .. } = &tile else {
+        let Tile::DataFunction { codomain, .. } = &tile else {
             panic!("dense read is a Function");
         };
         let Tile::Scalar(col) = codomain.as_ref() else {

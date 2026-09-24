@@ -4990,7 +4990,7 @@
           "label": "Aggregate",
           "nodeId": 625,
           "role": "operator",
-          "tiling": "agg(Sum, Scalar(Int))",
+          "tiling": "agg(Sum, Int)",
           "spans": [
             {
               "start": 46,
@@ -5204,7 +5204,7 @@
           "label": "Aggregate",
           "nodeId": 632,
           "role": "operator",
-          "tiling": "agg(Max, Scalar(Int))",
+          "tiling": "agg(Max, Int)",
           "spans": [
             {
               "start": 151,

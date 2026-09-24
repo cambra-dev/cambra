@@ -767,13 +767,13 @@ section is mostly about it.
 
 `Tile::Store` is the one thing mutability added to the substrate, and it is worth being
 precise about what kind of addition it is. Its **extent** is an ordinary function's:
-`Tiling::Store { domain, codomain }` and `Tiling::Function { domain, codomain }` both report
+`Tiling::Store { domain, codomain }` and `Tiling::DataFunction { domain, codomain }` both report
 `Function { domain, codomain }`. A store is a `Txn ⤇ {key: value}`; there is no new final
 value in the world.
 
 What is new is the **progress algebra** — which is exactly the split §2's table draws:
 
-| | `Collection` | `Store` |
+| | `DataFunction` | `Store` |
 |---|---|---|
 | a position present | its value is known | a write landed *at* that tick |
 | a position absent | **unknown** — may still arrive | **decided-absent**: the value holds from the latest earlier change |

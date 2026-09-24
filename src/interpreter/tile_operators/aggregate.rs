@@ -14,13 +14,13 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-/// Reduces a `Function` input to a single scalar via an aggregation operation.
+/// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
 ///
 /// On each `get`, reads all codomain values from the input and folds them into a
 /// running `Tile::Aggregation` accumulator. The result becomes terminal once the
 /// input's `domain_predicate` is `True` (all elements seen).
 pub struct Aggregate {
-    /// The `Function`-typed input whose codomain elements are aggregated.
+    /// The `DataFunction`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
     /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
     base: OperatorBase,
@@ -29,7 +29,7 @@ pub struct Aggregate {
 impl Aggregate {
     /// Construct an `Aggregate` operator.
     ///
-    /// Panics if `input` does not have a `Function` tiling, or if `kind`
+    /// Panics if `input` does not have a `DataFunction` tiling, or if `kind`
     /// does not support the codomain element type.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         let err = || panic!("Cannot apply {kind:?} to non-function {:?}", input.tiling());
@@ -124,7 +124,7 @@ impl TileProducer for AggregateProducer {
         let mut input_result = self.input.get(i_tiling.universal_guard());
         let upstream_guard = input_result.to_guard();
         input_result.compact();
-        let Tile::Function { codomain, .. } = input_result else {
+        let Tile::DataFunction { codomain, .. } = input_result else {
             panic!("Aggregate expected a collection, got {input_result:?}");
         };
         self.input.release(upstream_guard);
@@ -260,35 +260,35 @@ impl TileProducer for ExtractAggregateProducer {
     }
 }
 
-/// Extracts terminal aggregation results from a `Function(D, Aggregation)`, producing a
-/// `Function(D, Scalar)`.
+/// Extracts terminal aggregation results from a `DataFunction(D, Aggregation)`, producing a
+/// `DataFunction(D, Scalar)`.
 ///
 /// One level, which is the fold's own: [`MapAggregate`] collapses the innermost collection,
 /// so the levels above it stay and this operator reads the one that is left. A fold under
-/// two or more levels leaves `Function(D₀ … Dₙ₋₁, Aggregation)`, which this rejects.
+/// two or more levels leaves `DataFunction(D₀ … Dₙ₋₁, Aggregation)`, which this rejects.
 /// An element is emitted only where its terminal flag is set; the rest are filtered out.
 pub struct MapExtractAggregate {
-    /// The `Function(D, Aggregation)`-typed input.
+    /// The `DataFunction(D, Aggregation)`-typed input.
     input: Box<dyn TileOperator>,
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
-    /// Output tiling: `Function { domain: input.domain, codomain: Scalar(output_extent) }`.
+    /// Output tiling: `DataFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
     base: OperatorBase,
 }
 
 impl MapExtractAggregate {
     /// Create a new `MapExtractAggregate` operator.
     ///
-    /// `input` must have a `Function` tiling whose codomain is
+    /// `input` must have a `DataFunction` tiling whose codomain is
     /// `Aggregation { accumulator: A }`.  The output tiling is
-    /// `Function { domain: input.domain, codomain: Scalar(A) }`.
+    /// `DataFunction { domain: input.domain, codomain: Scalar(A) }`.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         let accumulator_of = |codomain: &Tiling| match codomain {
             Tiling::Aggregation { accumulator, .. } => (**accumulator).clone(),
             t => panic!("MapExtractAggregate expected an Aggregation codomain, got {t:?}"),
         };
         let tiling = match input.tiling() {
-            Tiling::Function { domain, codomain } => Tiling::Function {
+            Tiling::DataFunction { domain, codomain } => Tiling::DataFunction {
                 domain: domain.clone(),
                 codomain: Box::new(accumulator_of(codomain)),
             },
@@ -348,7 +348,7 @@ impl TileProducer for MapExtractAggregateProducer {
         // elements go. Rebuilding with the same levels is what keeps a deeper fold's
         // grouping intact for the fold above it.
         let (rebuild, codomain): (Box<dyn FnOnce(Tile) -> Tile>, Box<Tile>) = match input_result {
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts,
                 domain,
                 codomain,
@@ -408,7 +408,7 @@ impl TileProducer for MapExtractAggregateProducer {
 /// assumed. Treating an incomparable pair as equal would not restore the order: the
 /// comparison would fall through to the next component and sort a parent's children apart,
 /// leaving the rebuild to emit one key twice. `MapResult` makes the same demand of a domain
-/// it sorts (`Tile::Function`'s keys, `map.rs`).
+/// it sorts (`Tile::DataFunction`'s keys, `map.rs`).
 fn compare_paths(a: &[Value], b: &[Value]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
         match x.partial_cmp(y) {
@@ -463,7 +463,7 @@ fn build_levels_from_paths(
         .map(|(values, extent)| ColumnValue::from_values(values, extent))
         .collect();
     if depth == 1 {
-        return Tile::function(
+        return Tile::data_function(
             domains.pop().unwrap_or_else(|| unreachable!()),
             Box::new(codomain),
             domain_predicate,
@@ -494,29 +494,29 @@ pub struct MapAggregate {
     input: Box<dyn TileOperator>,
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
-    /// Output tiling: `Function { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
+    /// Output tiling: `DataFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
     base: OperatorBase,
 }
 
 impl MapAggregate {
     /// Create a new `MapAggregate` operator.
     ///
-    /// `input` must have a `Function` tiling whose codomain is a collection; `kind` must
+    /// `input` must have a `DataFunction` tiling whose codomain is a collection; `kind` must
     /// support that collection's element type. The innermost level becomes an
     /// `Aggregation` and the levels above it are left as they are
     /// ([`fold_innermost`]), so a two-level input yields
-    /// `Function { domain, codomain: Aggregation { .. } }`.
+    /// `DataFunction { domain, codomain: Aggregation { .. } }`.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         // A collection whose values are not themselves a collection has no level above the
         // one being folded, which is `Aggregate`'s shape rather than this one's.
-        let Tiling::Function { codomain, .. } = input.tiling() else {
+        let Tiling::DataFunction { codomain, .. } = input.tiling() else {
             panic!(
                 "MapAggregate requires a collection input, got {}",
                 input.tiling()
             )
         };
         assert!(
-            matches!(codomain.as_ref(), Tiling::Function { .. }),
+            matches!(codomain.as_ref(), Tiling::DataFunction { .. }),
             "MapAggregate folds a collection of collections, got {}",
             input.tiling()
         );
@@ -531,11 +531,11 @@ impl MapAggregate {
 
 /// Replace `tiling`'s innermost collection with the aggregation that folds it.
 fn fold_innermost(tiling: &Tiling, kind: AggregateKind) -> Tiling {
-    let Tiling::Function { domain, codomain } = tiling else {
+    let Tiling::DataFunction { domain, codomain } = tiling else {
         panic!("fold_innermost walks a chain of collections, got {tiling}")
     };
     match codomain.as_ref() {
-        Tiling::Function { .. } => Tiling::Function {
+        Tiling::DataFunction { .. } => Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(fold_innermost(codomain, kind)),
         },
@@ -558,7 +558,7 @@ fn folded_shape(tiling: &Tiling) -> (Vec<Extent>, Tiling) {
     let mut node = tiling;
     loop {
         match node {
-            Tiling::Function { domain, codomain } => {
+            Tiling::DataFunction { domain, codomain } => {
                 extents.push(domain.clone());
                 node = codomain;
             }
@@ -616,7 +616,7 @@ impl TileProducer for MapAggregateProducer {
         trace!("{} received {input_tile:?}", self.name());
         let upstream_guard = input_tile.to_guard();
         input_tile.compact();
-        let Tile::Function {
+        let Tile::DataFunction {
             domain_predicate, ..
         } = &input_tile
         else {
@@ -636,7 +636,7 @@ impl TileProducer for MapAggregateProducer {
         );
         let parent_paths = input_tile.row_paths_at(depth);
         let folded = input_tile.values_at(depth);
-        let Tile::Function { codomain, .. } = folded else {
+        let Tile::DataFunction { codomain, .. } = folded else {
             unreachable!("the loop breaks on a collection")
         };
         let values = (**codomain).clone();
@@ -726,7 +726,7 @@ mod tests {
     use crate::interpreter::tile_operators::test_helpers::{QuietSpy, ReleaseSpy};
     use crate::interpreter::{BaseType, Extent, Predicate, Tile};
     fn int_function(domain: Vec<usize>, values: Vec<i64>) -> Tile {
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints(domain),
             Box::new(Tile::Scalar(ColumnValue::Ints(values))),
             Predicate::True,
@@ -739,7 +739,7 @@ mod tests {
     /// return released data, which a caching consumer merges into itself twice.
     #[test]
     fn aggregate_goes_quiet_after_a_universal_release() {
-        let in_tiling = Tiling::function(
+        let in_tiling = Tiling::data_function(
             Extent::uint_range(2),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
@@ -772,7 +772,7 @@ mod tests {
     /// ran dry would otherwise strand the remainder upstream.
     #[test]
     fn aggregate_releases_its_input_universally() {
-        let in_tiling = Tiling::function(
+        let in_tiling = Tiling::data_function(
             Extent::uint_range(2),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
@@ -803,15 +803,15 @@ mod tests {
     #[test]
     fn map_aggregate_drops_a_per_key_release() {
         let key_extent = Extent::Base(BaseType::Int);
-        let in_tiling = Tiling::function(
+        let in_tiling = Tiling::data_function(
             key_extent.clone(),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::Int),
                 Tiling::Scalar(Extent::Base(BaseType::Int)),
             ),
         );
         // Keys 1 and 2, each with two values: 1 -> [10, 20], 2 -> [30, 40].
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::from_uints(vec![0, 2]),
@@ -824,7 +824,7 @@ mod tests {
             BitSet::new(),
         );
         let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
-        let out_tiling = Tiling::function(
+        let out_tiling = Tiling::data_function(
             key_extent,
             Tiling::Aggregation {
                 kind: AggregateKind::Sum,
@@ -839,7 +839,7 @@ mod tests {
         };
 
         let first = producer.get(out_tiling.universal_guard());
-        let Tile::Function { domain, .. } = &first else {
+        let Tile::DataFunction { domain, .. } = &first else {
             panic!("expected a collection, got {first:?}");
         };
         assert_eq!(domain.len(), 2, "both keys aggregate on the first pull");
@@ -864,7 +864,7 @@ mod tests {
             released.borrow()
         );
         let second = producer.get(out_tiling.universal_guard());
-        let Tile::Function { domain, .. } = &second else {
+        let Tile::DataFunction { domain, .. } = &second else {
             panic!("expected a collection, got {second:?}");
         };
         assert_eq!(
@@ -885,14 +885,14 @@ mod tests {
     #[test]
     fn map_aggregate_forwards_a_per_key_release_to_an_open_input() {
         let key_extent = Extent::Base(BaseType::Int);
-        let in_tiling = Tiling::function(
+        let in_tiling = Tiling::data_function(
             key_extent.clone(),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::Int),
                 Tiling::Scalar(Extent::Base(BaseType::Int)),
             ),
         );
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::from_uints(vec![0, 2]),
@@ -905,7 +905,7 @@ mod tests {
             BitSet::new(),
         );
         let (spy, released) = QuietSpy::new(tile, in_tiling.clone());
-        let out_tiling = Tiling::function(
+        let out_tiling = Tiling::data_function(
             key_extent,
             Tiling::Aggregation {
                 kind: AggregateKind::Sum,

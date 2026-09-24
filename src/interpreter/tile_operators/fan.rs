@@ -27,7 +27,7 @@ pub struct FanIn {
 /// The number of collection levels `tiling` carries before its values.
 pub fn level_count(tiling: &Tiling) -> usize {
     match tiling {
-        Tiling::Function { codomain, .. } => 1 + level_count(codomain),
+        Tiling::DataFunction { codomain, .. } => 1 + level_count(codomain),
         _ => 0,
     }
 }
@@ -37,10 +37,10 @@ fn with_values_at(tiling: &Tiling, depth: usize, inner: Tiling) -> Tiling {
     if depth == 0 {
         return inner;
     }
-    let Tiling::Function { domain, codomain } = tiling else {
+    let Tiling::DataFunction { domain, codomain } = tiling else {
         unreachable!("the depth was counted off this tiling")
     };
-    Tiling::Function {
+    Tiling::DataFunction {
         domain: domain.clone(),
         codomain: Box::new(with_values_at(codomain, depth - 1, inner)),
     }
@@ -61,8 +61,10 @@ impl FanIn {
         // 0..3 while another has 0..2), which `FanInProducer::get_impl` intersects.
         for op in ops.iter() {
             for d in 0..depth {
-                let (Tiling::Function { domain, .. }, Tiling::Function { domain: other, .. }) =
-                    (ops[0].tiling().values_at(d), op.tiling().values_at(d))
+                let (
+                    Tiling::DataFunction { domain, .. },
+                    Tiling::DataFunction { domain: other, .. },
+                ) = (ops[0].tiling().values_at(d), op.tiling().values_at(d))
                 else {
                     panic!(
                         "FanIn pairs collections over {depth} ambient level(s), got {} and {}",
@@ -189,8 +191,8 @@ impl TileProducer for FanInProducer {
             .collect();
 
         match &tiles[0] {
-            Tile::Function { .. } => {
-                // All inputs are Function tiles, but they may differ in
+            Tile::DataFunction { .. } => {
+                // All inputs are DataFunction tiles, but they may differ in
                 // which *actual rows* are present — one branch may have
                 // emitted positions 0..3 while another has only 0..2 (or one
                 // input's upstream release shrank its known region).  We
@@ -208,7 +210,7 @@ impl TileProducer for FanInProducer {
                 let mut presence: Option<Predicate> = None;
                 let mut domain_pred: Option<Predicate> = None;
                 for t in tiles.iter() {
-                    let Tile::Function {
+                    let Tile::DataFunction {
                         domain,
                         domain_predicate,
                         ..
@@ -235,7 +237,7 @@ impl TileProducer for FanInProducer {
                 let mut skeleton: Option<Tile> = None;
                 let mut codomains: Vec<Tile> = Vec::with_capacity(tiles.len());
                 for mut filtered in tiles.into_iter() {
-                    let Tile::Function { domain, .. } = &filtered else {
+                    let Tile::DataFunction { domain, .. } = &filtered else {
                         unreachable!()
                     };
                     let to_remove = Predicate::from_column_value(domain).minus(&presence);
@@ -250,7 +252,9 @@ impl TileProducer for FanInProducer {
                         filtered.values_at_mut(self.depth),
                         Tile::Record(HashMap::new()),
                     ));
-                    debug_assert!(
+                    // Presence is intersected over the outermost keys only, so arms that
+                    // disagree beneath them would pair one arm's values under another's keys.
+                    assert!(
                         skeleton.as_ref().is_none_or(|s: &Tile| {
                             s.key_levels()[..self.depth] == filtered.key_levels()[..self.depth]
                         }),
@@ -269,7 +273,7 @@ impl TileProducer for FanInProducer {
                 );
                 let mut out = skeleton.expect("FanIn has at least one input");
                 *out.values_at_mut(self.depth) = codomain_record;
-                let Tile::Function {
+                let Tile::DataFunction {
                     domain_predicate, ..
                 } = &mut out
                 else {
@@ -535,21 +539,21 @@ mod tests {
     // the inputs vec — fine for branches that always advance in lockstep,
     // wrong as soon as they don't.
     //
-    // We construct two `Function` test tiles over the same domain
+    // We construct two `DataFunction` test tiles over the same domain
     // type but with *different actual positions present* (branch A has
     // positions [0, 1, 2]; branch B has only [0, 1]) and a `FanInProducer`
     // directly over them, then check that the merged output is restricted
     // to the intersection [0, 1].
 
-    /// Two `Function` inputs with different sets of present positions.
+    /// Two `DataFunction` inputs with different sets of present positions.
     /// The output should restrict to the intersection of those positions.
     #[test]
     fn fan_in_producer_intersects_branch_presence() {
-        let input_tiling = Tiling::function(
+        let input_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::UInt)),
         );
-        let tile_a = Tile::function(
+        let tile_a = Tile::data_function(
             ColumnValue::UInts(vec![0, 1, 2]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 12]))),
             // Non-terminal: branch A has emitted [0, 1, 2] but its
@@ -557,14 +561,14 @@ mod tests {
             Predicate::False,
             BitSet::new(),
         );
-        let tile_b = Tile::function(
+        let tile_b = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![20, 21]))),
             Predicate::False,
             BitSet::new(),
         );
 
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Record(HashMap::from([
                 (
@@ -588,7 +592,7 @@ mod tests {
         };
 
         let result = fan_in.get(fan_in.tiling().universal_guard());
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = result
         else {

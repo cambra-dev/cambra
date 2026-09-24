@@ -57,7 +57,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 #[case("[y.0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
-    Tile::function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::Record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::Record(HashMap::from([
             (
                 tuple_field(0),
                 Tile::Scalar(ColumnValue::Records(HashMap::from([
@@ -89,11 +89,11 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
 #[case("[x for x in [1, 2, 3] if x > 10]", make_int_list(&[]))]
 #[case(
     "[x for x in [1, 2, 3] if x == 2]",
-    Tile::function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))), Predicate::True, BitSet::new())
 )]
 #[case(
     "[x for x in [1, 2, 3, 4, 5] if x > 1 if x < 5]",
-    Tile::function(ColumnValue::UInts(vec![1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![1, 2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))), Predicate::True, BitSet::new())
 )]
 fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -109,7 +109,7 @@ fn test_udf_used_inside_filter_predicate() {
     let code = "f = \\x -> x > 1\n[x for x in [1, 2, 3] if f(x)]";
     check_tile(
         code,
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,
@@ -128,7 +128,7 @@ fn test_udf_containing_filter() {
     let code = "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])";
     check_tile(
         code,
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,
@@ -154,7 +154,7 @@ fn test_generator_expressions(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(10))]
 #[case(
     "(x for x in [1, 2, 3, 4, 5] if x > 2)",
-    Tile::function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 4, 5]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 4, 5]))), Predicate::True, BitSet::new())
 )]
 fn test_generator_expression_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);

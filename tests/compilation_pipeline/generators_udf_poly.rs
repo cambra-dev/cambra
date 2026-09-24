@@ -150,7 +150,7 @@ def positives(xs):
         if x > n:
             yield x
 positives([-1, 2, -3, 4])"#,
-    Tile::function(ColumnValue::UInts(vec![1, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![1, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))), Predicate::True, BitSet::new())
 )]
 fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -322,7 +322,7 @@ fn test_filter_udf_through_poly_wrapper() {
     let code = "f = \\xs -> [x for x in xs if x > 1]\ng = \\ys -> f(ys)\ng([1, 2, 3])";
     check_tile(
         code,
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,
@@ -341,7 +341,7 @@ fn test_predicate_udf_used_inside_poly_wrapper_filter() {
     let code = "p = \\x -> x > 1\ng = \\ys -> [y for y in ys if p(y)]\ng([1, 2, 3])";
     check_tile(
         code,
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,
@@ -388,7 +388,7 @@ def doubles(xs):
     for x in xs:
         yield x * 2
 doubles(add_one([1, 2, 3]))"#,
-    Tile::function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6, 8]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6, 8]))), Predicate::True, BitSet::new())
 )]
 // sum(doubles(add_one([1,2,3]))) == 18
 #[case(
@@ -428,7 +428,7 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
 fn a_parameter_iterated_as_a_collection_resolves_data() {
     check_tile(
         "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])",
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,
@@ -450,7 +450,7 @@ fn a_parameter_iterated_as_a_collection_resolves_data() {
 fn destructuring_a_collection_does_not_demand_a_capability() {
     check_tile(
         "[x for x in [1, 2, 3] if x > 1]",
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
             Predicate::True,

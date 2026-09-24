@@ -16,10 +16,10 @@ use crate::{
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
 ///
 /// For an input `domain → codomain`, `Converse` produces a
-/// `Function { domain: codomain, codomain: domain }`.  Each codomain
+/// `DataFunction { domain: codomain, codomain: domain }`.  Each codomain
 /// value maps to the list of domain values that produce it.
 pub struct Converse {
-    /// Output tiling: `Function { domain: input.codomain, codomain: input.domain }`.
+    /// Output tiling: `DataFunction { domain: input.codomain, codomain: input.domain }`.
     base: OperatorBase,
     /// The function input to invert.
     input: Box<dyn TileOperator>,
@@ -32,9 +32,9 @@ impl Converse {
             .tiling()
             .split_function_extent()
             .unwrap_or_else(|| panic!("Converse expected function, got {:?}", input.tiling()));
-        let tiling = Tiling::Function {
+        let tiling = Tiling::DataFunction {
             domain: codomain,
-            codomain: Box::new(Tiling::Function {
+            codomain: Box::new(Tiling::DataFunction {
                 domain: domain.clone(),
                 codomain: Box::new(Tiling::Scalar(domain)),
             }),
@@ -115,7 +115,7 @@ fn converse_group_by_key<K: PartialOrd>(
         .collect();
     // The inner keys: the original keys, reordered to match the sorted groups.
     let domain2_col = domain.select_indices(order.into_iter(), n);
-    Tile::function(
+    Tile::data_function(
         domain1_col,
         Box::new(Tile::grouped(
             ColumnValue::UInts(group_starts),
@@ -143,7 +143,7 @@ impl TileProducer for ConverseProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         match input_tile {
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts,
                 domain,
                 codomain,
@@ -273,10 +273,10 @@ impl TileProducer for ConverseProducer {
 /// Replaces the codomain of a function with the domain values themselves,
 /// creating an identity mapping where the codomain is a copy of the domain.
 ///
-/// Takes a `Function(domain → codomain)` and produces `Function(domain → Scalar(domain))`.
+/// Takes a `DataFunction(domain → codomain)` and produces `DataFunction(domain → Scalar(domain))`.
 /// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
 pub struct MapDomain {
-    /// Output tiling: `Function { domain, codomain: Scalar(domain) }`.
+    /// Output tiling: `DataFunction { domain, codomain: Scalar(domain) }`.
     base: OperatorBase,
     /// The function input.
     input: Box<dyn TileOperator>,
@@ -285,14 +285,14 @@ pub struct MapDomain {
 impl MapDomain {
     /// Create a `MapDomain` operator that replaces the codomain with the domain values.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
-        let Tiling::Function { domain, .. } = input.tiling() else {
+        let Tiling::DataFunction { domain, .. } = input.tiling() else {
             panic!(
                 "MapDomain expected a function tiling, got {:?}",
                 input.tiling()
             )
         };
         let domain = domain.clone();
-        let tiling = Tiling::function(domain.clone(), Tiling::Scalar(domain));
+        let tiling = Tiling::data_function(domain.clone(), Tiling::Scalar(domain));
         Self {
             base: OperatorBase::new(tiling),
             input,
@@ -343,7 +343,7 @@ impl TileProducer for MapDomainProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         match input_tile {
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts,
                 domain,
                 domain_predicate,
@@ -380,7 +380,7 @@ impl TileProducer for MapDomainProducer {
 /// Takes `A ⤇ B ⤇ C` and produces `{_0: A, _1: B} ⤇ C`: the two key extents are packed
 /// into a record key, and the values stand as they were.
 pub struct Uncurry {
-    /// Output tiling: `Function { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
+    /// Output tiling: `DataFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
     base: OperatorBase,
     /// The two-level input.
     input: Box<dyn TileOperator>,
@@ -392,14 +392,14 @@ impl Uncurry {
         // Flattening pairs a collection with the one inside it, so it takes exactly that:
         // a collection whose values are a collection. A deeper one flattens a level at a
         // time.
-        let Tiling::Function {
+        let Tiling::DataFunction {
             domain: outer,
             codomain: inner,
         } = input.tiling()
         else {
             panic!("Uncurry expected a collection, got {:?}", input.tiling())
         };
-        let Tiling::Function {
+        let Tiling::DataFunction {
             domain: inner_keys,
             codomain,
         } = inner.as_ref()
@@ -410,7 +410,7 @@ impl Uncurry {
             (tuple_field(0), outer.clone()),
             (tuple_field(1), inner_keys.clone()),
         ]));
-        let tiling = Tiling::Function {
+        let tiling = Tiling::DataFunction {
             domain: pair_extent,
             codomain: codomain.clone(),
         };
@@ -460,13 +460,13 @@ impl TileProducer for UncurryProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         match input_tile {
-            Tile::Function {
+            Tile::DataFunction {
                 domain: domain1,
                 codomain: inner,
                 domain_predicate,
                 ..
             } => {
-                let Tile::Function {
+                let Tile::DataFunction {
                     row_starts,
                     domain: domain2,
                     codomain,
@@ -511,7 +511,7 @@ impl TileProducer for UncurryProducer {
                 } else {
                     Predicate::False
                 };
-                let mut result = Tile::function(
+                let mut result = Tile::data_function(
                     pair_domain,
                     Box::new(Tile::Scalar(codomain)),
                     Predicate::Record(HashMap::from([
@@ -523,7 +523,7 @@ impl TileProducer for UncurryProducer {
                 result.remove_guarded(self.base().obsolete_guard.clone());
                 result
             }
-            _ => panic!("Uncurry expected Function tile"),
+            _ => panic!("Uncurry expected DataFunction tile"),
         }
     }
 
@@ -650,9 +650,9 @@ impl TileProducer for FilterProducer {
 
         match (predicate_result, input_result) {
             // Scalar predicate applied element-wise to a collection's keys.
-            (Tile::Scalar(pred), input @ Tile::Function { .. }) => match pred.as_single() {
+            (Tile::Scalar(pred), input @ Tile::DataFunction { .. }) => match pred.as_single() {
                 Some(Value::ComputableFunction(f)) => {
-                    let Tile::Function { ref domain, .. } = input else {
+                    let Tile::DataFunction { ref domain, .. } = input else {
                         unreachable!("matched above")
                     };
                     let func_result = f.apply(domain.clone());
@@ -667,18 +667,18 @@ impl TileProducer for FilterProducer {
             },
             // Both predicate and input are collections over the same keys.
             (
-                Tile::Function {
+                Tile::DataFunction {
                     domain: pred_keys,
                     codomain: pred_outputs,
                     ..
                 },
-                mut input @ Tile::Function { .. },
+                mut input @ Tile::DataFunction { .. },
             ) => {
                 // We rely on the predicate and the input sharing exactly the same keys so
                 // the mask reads off the predicate's values positionally. The check is
                 // expensive, so only run it in debug builds.
                 debug_assert!(
-                    matches!(&input, Tile::Function { domain, .. } if *domain == pred_keys)
+                    matches!(&input, Tile::DataFunction { domain, .. } if *domain == pred_keys)
                 );
                 let pred_outputs = scalar_tile_to_column_value(*pred_outputs);
                 let mask = pred_outputs
@@ -693,7 +693,7 @@ impl TileProducer for FilterProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if matches!(self.predicate.tiling(), Tiling::Function { .. }) {
+        if matches!(self.predicate.tiling(), Tiling::DataFunction { .. }) {
             // Both predicate and input share the same underlying domain source, so both
             // must be released together; releasing only one leaves the other's upstream
             // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
@@ -734,14 +734,19 @@ impl MapFilter {
     /// operator is the inner domain, and a one-level collection has no inner domain to
     /// filter (use [`Filter`] or [`Restrict`]).
     pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
+        let two_levels = |tiling: &Tiling| {
+            matches!(tiling, Tiling::DataFunction { codomain, .. }
+                if matches!(codomain.as_ref(), Tiling::DataFunction { codomain: inner, .. }
+                    if !inner.holds_a_level()))
+        };
         let tiling = input.tiling().clone();
         assert!(
-            matches!(tiling, Tiling::Function { .. }),
-            "MapFilter expects a Function input, got {tiling:?}"
+            two_levels(&tiling),
+            "MapFilter expects a two-level DataFunction input, got {tiling:?}"
         );
         assert!(
-            matches!(predicate.tiling(), Tiling::Function { .. }),
-            "MapFilter expects a Function predicate, got {:?}",
+            two_levels(predicate.tiling()),
+            "MapFilter expects a two-level DataFunction predicate, got {:?}",
             predicate.tiling()
         );
         Self {
@@ -809,33 +814,33 @@ impl TileProducer for MapFilterProducer {
         let predicate_result = self.predicate.get(pred_guard);
         let mut input_result = self.input.get(input_guard);
 
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: pred_inner_tile,
             ..
         } = predicate_result
         else {
             panic!("MapFilter predicate produced a non-collection");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain: pred_inner,
             codomain: pred_rows,
             ..
         } = *pred_inner_tile
         else {
-            panic!("MapFilter predicate is a collection of collections");
+            panic!("MapFilter predicate is not a collection of collections");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: inner, ..
         } = &input_result
         else {
             panic!("MapFilter input produced {input_result:?}, expected a collection");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain: input_inner,
             ..
         } = inner.as_ref()
         else {
-            panic!("MapFilter input is a collection of collections");
+            panic!("MapFilter input is not a collection of collections");
         };
         let pred_inner = &pred_inner;
         // The mask is positional over the flattened rows, so the two sides must be
@@ -849,7 +854,7 @@ impl TileProducer for MapFilterProducer {
         let mask = pred_column
             .as_bitvec()
             .unwrap_or_else(|| panic!("MapFilter predicate codomain is not boolean"));
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: inner, ..
         } = &mut input_result
         else {
@@ -877,11 +882,11 @@ impl TileProducer for MapFilterProducer {
 /// predicate itself contains inner [`Filter`] operators that narrow the domain before
 /// the boolean values are produced.
 ///
-/// The predicate operator must produce a `Function { domain: D, codomain: Bool }`.
-/// `Restrict` returns `Function { domain: D', codomain: D' }` where D' ⊆ D is the
+/// The predicate operator must produce a `DataFunction { domain: D, codomain: Bool }`.
+/// `Restrict` returns `DataFunction { domain: D', codomain: D' }` where D' ⊆ D is the
 /// subset of domain elements for which the predicate is `true`.
 pub struct Restrict {
-    /// Output tiling — `Function(D, D)` mirroring an [`IterateExtent`] over D.
+    /// Output tiling — `DataFunction(D, D)` mirroring an [`IterateExtent`] over D.
     base: OperatorBase,
     /// The boolean predicate over the domain to restrict.
     predicate: Box<dyn TileOperator>,
@@ -890,13 +895,15 @@ pub struct Restrict {
 impl Restrict {
     /// Create a `Restrict` from a predicate operator.
     ///
-    /// Panics if `predicate` does not have a `Function` tiling.
+    /// Panics unless `predicate` has a one-level `DataFunction` tiling.
     pub fn new(predicate: Box<dyn TileOperator>) -> Self {
         let domain_extent = match predicate.tiling() {
-            Tiling::Function { domain, .. } => domain.clone(),
-            other => panic!("Restrict expects a function predicate tiling, got {other:?}"),
+            Tiling::DataFunction { domain, codomain } if !codomain.holds_a_level() => {
+                domain.clone()
+            }
+            other => panic!("Restrict expects a one-level DataFunction predicate, got {other:?}"),
         };
-        let tiling = Tiling::function(domain_extent.clone(), Tiling::Scalar(domain_extent));
+        let tiling = Tiling::data_function(domain_extent.clone(), Tiling::Scalar(domain_extent));
         Self {
             base: OperatorBase::new(tiling),
             predicate,
@@ -949,7 +956,7 @@ impl TileProducer for RestrictProducer {
         let pred_guard = self.predicate.tiling().universal_guard();
         let pred_result = self.predicate.get(pred_guard);
         match pred_result {
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts,
                 domain,
                 codomain,
@@ -972,7 +979,7 @@ impl TileProducer for RestrictProducer {
                 output.mark_deleted(mask);
                 output
             }
-            _ => panic!("Restrict: predicate must produce a Function tile"),
+            _ => panic!("Restrict: predicate must produce a DataFunction tile"),
         }
     }
 
@@ -1001,7 +1008,7 @@ mod tests {
         // Expected expanded_domain1: [1, 1, 2]
         // Expected pair domain: Record with _0=[1,1,2] and _1=[10,20,30]
 
-        let two_level_tile = Tile::function(
+        let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 2]),
@@ -1014,9 +1021,9 @@ mod tests {
             BitSet::new(),
         );
 
-        let two_level_tiling = Tiling::function(
+        let two_level_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -1025,7 +1032,7 @@ mod tests {
         let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling.clone());
 
         // Create UncurryProducer with the test producer as input
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Record(
                 [
                     (tuple_field(0), Extent::Base(BaseType::UInt)),
@@ -1047,7 +1054,7 @@ mod tests {
 
         // Verify the result is a Function
         match result {
-            Tile::Function {
+            Tile::DataFunction {
                 domain,
                 codomain,
                 domain_predicate,
@@ -1119,7 +1126,7 @@ mod tests {
         // Expected expansion_indices: [0, 1, 2]
         // Expected expanded_domain1: [A, B, C]
 
-        let two_level_tile = Tile::function(
+        let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![100, 200, 300]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -1132,9 +1139,9 @@ mod tests {
             BitSet::new(),
         );
 
-        let two_level_tiling = Tiling::function(
+        let two_level_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -1142,7 +1149,7 @@ mod tests {
 
         let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling);
 
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Record(
                 [
                     (tuple_field(0), Extent::Base(BaseType::UInt)),
@@ -1162,7 +1169,7 @@ mod tests {
         let result = uncurry.get(uncurry.tiling().universal_guard());
 
         match result {
-            Tile::Function {
+            Tile::DataFunction {
                 domain,
                 domain_predicate,
                 ..
@@ -1213,7 +1220,7 @@ mod tests {
         // Now, it should be transformed into a Record predicate with both
         // fields (_0 and _1) set to Predicate::True.
 
-        let two_level_tile = Tile::function(
+        let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2, 3]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -1226,9 +1233,9 @@ mod tests {
             BitSet::new(),
         );
 
-        let two_level_tiling = Tiling::function(
+        let two_level_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -1236,7 +1243,7 @@ mod tests {
 
         let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling);
 
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Record(
                 [
                     (tuple_field(0), Extent::Base(BaseType::UInt)),
@@ -1256,7 +1263,7 @@ mod tests {
         let result = uncurry.get(uncurry.tiling().universal_guard());
 
         match result {
-            Tile::Function {
+            Tile::DataFunction {
                 domain_predicate, ..
             } => {
                 // Verify domain_predicate is transformed into a Record with both fields True
@@ -1282,7 +1289,7 @@ mod tests {
         // Now, it should be transformed into a Record predicate with both
         // fields (_0 and _1) set to Predicate::False.
 
-        let two_level_tile = Tile::function(
+        let two_level_tile = Tile::data_function(
             ColumnValue::UInts(vec![1, 2]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1]),
@@ -1295,9 +1302,9 @@ mod tests {
             BitSet::new(),
         );
 
-        let two_level_tiling = Tiling::function(
+        let two_level_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -1305,7 +1312,7 @@ mod tests {
 
         let input_producer = TestTileProducer::new(two_level_tile, two_level_tiling);
 
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Record(
                 [
                     (tuple_field(0), Extent::Base(BaseType::UInt)),
@@ -1325,7 +1332,7 @@ mod tests {
         let result = uncurry.get(uncurry.tiling().universal_guard());
 
         match result {
-            Tile::Function {
+            Tile::DataFunction {
                 domain_predicate, ..
             } => {
                 // Verify domain_predicate is transformed into a Record with both fields False
@@ -1346,9 +1353,9 @@ mod tests {
     fn run_converse(input_tile: Tile, input_tiling: Tiling) -> Tile {
         let output_tiling = {
             let (domain, codomain) = input_tiling.split_function_extent().unwrap();
-            Tiling::function(
+            Tiling::data_function(
                 codomain,
-                Tiling::function(domain.clone(), Tiling::Scalar(domain)),
+                Tiling::data_function(domain.clone(), Tiling::Scalar(domain)),
             )
         };
         let mut producer = ConverseProducer {
@@ -1359,7 +1366,7 @@ mod tests {
     }
 
     fn one_level_tiling() -> Tiling {
-        Tiling::function(
+        Tiling::data_function(
             Extent::Base(BaseType::Int),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )
@@ -1369,14 +1376,14 @@ mod tests {
     /// Expected output: domain1=[10,20], each group lists the domain values that map to it.
     #[test]
     fn converse_producer_basic_grouping() {
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![0, 1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10]))),
             Predicate::True,
             BitSet::new(),
         );
         let result = run_converse(tile, one_level_tiling());
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             codomain: groups,
             domain_predicate,
@@ -1388,7 +1395,7 @@ mod tests {
         };
         // Two distinct codomain values: 10 and 20.
         assert_eq!(domain, ColumnValue::Ints(vec![10, 20]));
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts,
             domain: inner_keys,
             deleted: inner_deleted,
@@ -1411,20 +1418,20 @@ mod tests {
     /// Converse with no deleted entries on a single-entry input is a trivial sanity check.
     #[test]
     fn converse_producer_single_entry_no_deleted() {
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![42]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
             Predicate::True,
             BitSet::new(),
         );
         let result = run_converse(tile, one_level_tiling());
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: groups, ..
         } = result
         else {
             panic!("expected a collection");
         };
-        let Tile::Function { deleted, .. } = groups.as_ref() else {
+        let Tile::DataFunction { deleted, .. } = groups.as_ref() else {
             panic!("expected a collection of collections");
         };
         assert!(deleted.is_empty());
@@ -1439,20 +1446,20 @@ mod tests {
     fn converse_producer_deleted_remapped_through_sort() {
         let mut input_deleted = BitSet::new();
         input_deleted.insert(0); // row 0 is logically removed
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![0, 1, 2]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 10, 20]))),
             Predicate::True,
             input_deleted,
         );
         let result = run_converse(tile, one_level_tiling());
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: groups, ..
         } = result
         else {
             panic!("expected a collection");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, deleted, ..
         } = groups.as_ref()
         else {
@@ -1476,20 +1483,20 @@ mod tests {
         let mut input_deleted = BitSet::new();
         input_deleted.insert(1);
         input_deleted.insert(3);
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![0, 1, 2, 3]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 10, 20, 10]))),
             Predicate::True,
             input_deleted,
         );
         let result = run_converse(tile, one_level_tiling());
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: groups, ..
         } = result
         else {
             panic!("expected a collection");
         };
-        let Tile::Function { deleted, .. } = groups.as_ref() else {
+        let Tile::DataFunction { deleted, .. } = groups.as_ref() else {
             panic!("expected a collection of collections");
         };
         let mut expected = BitSet::new();

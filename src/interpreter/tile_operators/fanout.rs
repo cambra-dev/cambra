@@ -1104,7 +1104,7 @@ mod tests {
     /// A tiling whose tiles can be **incomplete**, so a memo over one never reaches
     /// `upstream_drained` and the gate is what the test observes.
     fn partial_tiling() -> Tiling {
-        Tiling::function(
+        Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )
@@ -1113,7 +1113,7 @@ mod tests {
     /// One row at `key`, under a domain predicate that claims only the prefix up to
     /// it — so the tile is not the whole function and the input is not drained.
     fn one_row(key: usize, value: i64) -> Tile {
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(vec![key]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
             Predicate::LessThanEq(Value::UInt(key)),

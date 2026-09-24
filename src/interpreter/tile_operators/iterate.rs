@@ -22,7 +22,7 @@ pub struct IterateExtent {
 
 impl IterateExtent {
     pub fn new(extent: Extent) -> Self {
-        let tiling = Tiling::function(extent.clone(), Tiling::Scalar(extent.clone()));
+        let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         Self {
             base: OperatorBase::new(tiling),
             extent,
@@ -348,7 +348,7 @@ impl TileProducer for IterateExtentProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let values = iterate_extent(&self.extent, &self.name());
         let domain_predicate = get_iterate_extent_predicate(&self.extent);
-        let mut tile = Tile::function(
+        let mut tile = Tile::data_function(
             values.clone(),
             Box::new(Tile::Scalar(values)),
             domain_predicate,
@@ -538,7 +538,7 @@ mod tests {
             let to_remove = IntervalSet::from(Interval::closed(1usize, 3usize));
             *set = set.difference(&to_remove);
         }
-        let tiling = Tiling::function(extent.clone(), Tiling::Scalar(extent.clone()));
+        let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         let mut producer = IterateExtentProducer {
             base: ProducerBase::new(0, &tiling),
             extent,
@@ -546,7 +546,7 @@ mod tests {
             source_wakeup: None,
         };
         let tile = producer.get(producer.tiling().universal_guard());
-        let Tile::Function { domain, .. } = tile else {
+        let Tile::DataFunction { domain, .. } = tile else {
             panic!()
         };
         let ColumnValue::UInts(vals) = domain else {

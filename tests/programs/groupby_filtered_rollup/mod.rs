@@ -9,10 +9,10 @@
 //! (`src/ccl/planning/map_filter.rs`).
 //!
 //! No sale in `north` passes the filter, so its group survives the filter holding
-//! nothing and `sum` over it answers the identity. Reaching that answer takes the
-//! non-decreasing offsets: under strictly ascending ones a group holding nothing had
-//! no representation, so `Tile::retain` dropped the key and the region went missing
-//! from the result entirely.
+//! nothing and `sum` over it answers the identity. Reaching that answer takes a group
+//! holding nothing to be representable: two equal `row_starts` are a key whose group is
+//! empty (`Tile::DataFunction`), which the filter leaves in place rather than dropping the
+//! key and the region with it.
 //!
 //! That row is also what separates this program from filtering before the group —
 //! `[s for s in sales if s.qty > 2]`, then `groupby`. The two agree on every region

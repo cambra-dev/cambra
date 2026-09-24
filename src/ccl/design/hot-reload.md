@@ -311,7 +311,7 @@ and `uniquify` leaves the spelling alone; the version that retires `x` has no bi
 to.
 
 A loaded value whose extent is a function is built with `Constant::collection`, which tiles it as a
-one-level `Function` (`src/interpreter/design-operators.md`, "Tile Operators") rather than as a bindings
+one-level `DataFunction` (`src/interpreter/design-operators.md`, "Tile Operators") rather than as a bindings
 table a consumer applies. Which of the two a value is cannot be read off the value, so the site
 holding it is the site that says. That is what lets a comprehension iterate a loaded collection, and
 so what makes a unit change on persisted state a declaration.

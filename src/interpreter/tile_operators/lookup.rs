@@ -76,7 +76,7 @@ impl CheckedLookup {
     /// Look each row's key up in that row's collection, over an assembled stream of
     /// `(collection, key)` pairs. The answer's domain is the stream's own.
     pub fn paired(pairs: Box<dyn TileOperator>, option_extent: Extent) -> Result<Self, String> {
-        let Tiling::Function { domain, codomain } = pairs.tiling() else {
+        let Tiling::DataFunction { domain, codomain } = pairs.tiling() else {
             return Err(format!(
                 "`lookup?` over an assembled pair needs a stream of rows, got {}",
                 pairs.tiling()
@@ -94,7 +94,8 @@ impl CheckedLookup {
             .get(&tuple_field(0))
             .ok_or_else(|| "`lookup?`'s input rows have no collection field".to_string())?;
         match collection {
-            Tiling::Function { .. } | Tiling::Scalar(Extent::Function { .. }) => {}
+            Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level() => {}
+            Tiling::Scalar(Extent::Function { .. }) => {}
             other => {
                 return Err(format!(
                     "`c[k]?` over a collection whose values are themselves collections is not \
@@ -115,7 +116,7 @@ impl CheckedLookup {
                 ));
             }
         }
-        let tiling = Tiling::Function {
+        let tiling = Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(option_extent)),
         };
@@ -136,7 +137,7 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
         return Tiling::Scalar(option_extent);
     }
     match keys {
-        Tiling::Function { domain, .. } => Tiling::Function {
+        Tiling::DataFunction { domain, .. } => Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(option_extent)),
         },
@@ -264,7 +265,7 @@ fn answer_in_value(key: &Value, m: &Value) -> Value {
 /// answers immediately ([`answer_in_value`]).
 fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
     match coll {
-        Tile::Function {
+        Tile::DataFunction {
             domain, codomain, ..
         } => {
             assert!(
@@ -348,7 +349,7 @@ impl TileProducer for CheckedLookupProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
-            Tiling::Function { codomain, .. } => codomain.extent(),
+            Tiling::DataFunction { codomain, .. } => codomain.extent(),
             other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
@@ -381,7 +382,7 @@ impl TileProducer for CheckedLookupProducer {
                     }
                     // A stream of keys, each answered against the same collection — read
                     // once, not lifted into every row.
-                    Tile::Function {
+                    Tile::DataFunction {
                         ref domain,
                         ref codomain,
                         ref domain_predicate,
@@ -415,7 +416,7 @@ impl TileProducer for CheckedLookupProducer {
                 tile.compact();
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty scalar, and this operator does the same until its rows arrive.
-                let Tile::Function {
+                let Tile::DataFunction {
                     ref domain,
                     ref codomain,
                     ref domain_predicate,
@@ -497,7 +498,7 @@ impl CheckedLookupProducer {
         domain_predicate: &Predicate,
         out_extent: &Extent,
     ) -> Tile {
-        let Tiling::Function {
+        let Tiling::DataFunction {
             domain: dom_ext, ..
         } = self.tiling()
         else {
@@ -512,7 +513,7 @@ impl CheckedLookupProducer {
         } else {
             Predicate::False
         };
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_values(kept, dom_ext),
             Box::new(Tile::Scalar(ColumnValue::from_values(answers, out_extent))),
             domain_predicate,

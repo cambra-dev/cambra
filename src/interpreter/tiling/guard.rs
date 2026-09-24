@@ -208,7 +208,7 @@ impl TileGuard {
             (TileGuard::Scalar(_), Tiling::Scalar(_)) => true,
             (TileGuard::Aggregation(_), Tiling::Aggregation { .. }) => true,
 
-            // Function tilings can have domain guards which are always allowed, or
+            // DataFunction tilings can have domain guards which are always allowed, or
             // codomain guards which match their codomain tiling. A Store shares the
             // function shape: consumers release a prefix of its commit-time domain
             // (a `Domain` guard) — that is its only release form (a store's
@@ -220,12 +220,13 @@ impl TileGuard {
             // A collection supports a `Domain` guard naming its own keys and a `Codomain`
             // guard naming what sits under them. The guard nests exactly as the tiling does,
             // so stepping in is one recursion with nothing to translate.
-            (TileGuard::Function(FunctionGuard::Domain(pred)), Tiling::Function { domain, .. }) => {
-                pred.is_applicable_to(domain)
-            }
+            (
+                TileGuard::Function(FunctionGuard::Domain(pred)),
+                Tiling::DataFunction { domain, .. },
+            ) => pred.is_applicable_to(domain),
             (
                 TileGuard::Function(FunctionGuard::Codomain(g)),
-                Tiling::Function { codomain, .. },
+                Tiling::DataFunction { codomain, .. },
             ) => g.check_from(codomain),
 
             // Record guards must have the same key set, with each field guard
@@ -243,7 +244,7 @@ impl TileGuard {
     }
 }
 
-/// A guard on a [`Tile::Function`](crate::interpreter::Tile::Function), naming which
+/// A guard on a [`Tile::DataFunction`](crate::interpreter::Tile::DataFunction), naming which
 /// part of it is of interest: its own keys, or what those keys hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionGuard {
@@ -544,7 +545,7 @@ mod tests {
         // A Codomain(Domain(_)) guard is valid against a Function whose
         // codomain is itself a function tiling.
         let nested = scalar_function(int(), bool_ext());
-        let outer = Tiling::function(int(), nested);
+        let outer = Tiling::data_function(int(), nested);
         let g = codomain_guard(domain_guard(Predicate::True));
         assert!(g.check_from(&outer));
     }

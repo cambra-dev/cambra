@@ -57,17 +57,15 @@ pub fn try_scalar_tile_to_column_value(tile: Tile) -> Option<ColumnValue> {
 
 /// Apply a function tile over a column of input values, producing a column of outputs.
 ///
-/// Handles all four function tile representations:
+/// Handles three function tile representations:
 /// - [`Tile::Scalar`] wrapping a [`Value::ComputableFunction`]: calls `f.apply` directly.
 /// - [`Tile::Scalar`] wrapping a [`Value::Function`] (bindings table): maps each element
 ///   through the table.
-/// - [`Tile::Function`]: treated as a point-lookup table keyed by domain value.
-/// - [`Tile::Function`]: each input value maps to a [`Value::Function`] bag of the
-///   matching codomain group.
+/// - A one-level [`Tile::DataFunction`]: a point-lookup table keyed by domain value.
 ///
-/// `output_extent` types the output column for the bindings-table and `Function`
-/// cases; it is unused for `ComputableFunction` (which determines its own output type)
-/// and `Function` (which always produces [`ColumnValue::Variants`]).
+/// `output_extent` types the output column for the bindings-table case and for an empty
+/// scalar; it is unused for `ComputableFunction`, which determines its own output type, and
+/// for a collection, whose values carry their own.
 pub(crate) fn apply_function_tile(
     function_tile: Tile,
     mut input: ColumnValue,
@@ -95,7 +93,7 @@ pub(crate) fn apply_function_tile(
             None => ColumnValue::from_values(Vec::new(), output_extent),
             _ => panic!("apply_function_tile: Scalar tile is not a function value"),
         },
-        Tile::Function {
+        Tile::DataFunction {
             row_starts,
             domain,
             codomain,
@@ -154,7 +152,7 @@ pub(crate) fn change_tiling_result(
                 t.extent()
             })))
         }
-        Tiling::Function { domain, codomain } => Tiling::Function {
+        Tiling::DataFunction { domain, codomain } => Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(change_tiling_result(codomain, transformation)),
         },
@@ -175,13 +173,13 @@ pub(crate) fn process_tile_result(
             transformation(scalar_tile_to_column_value(Tile::Record(fields))),
             input_tiling,
         ),
-        Tile::Function {
+        Tile::DataFunction {
             row_starts,
             domain,
             codomain,
             domain_predicate,
             deleted,
-        } => Tile::Function {
+        } => Tile::DataFunction {
             row_starts,
             domain,
             codomain: Box::new(process_tile_result(

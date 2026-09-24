@@ -287,7 +287,7 @@ pub(crate) fn run_to_tile(source: &str) -> Tile {
 /// is non-deterministic (GroupBy, join cross-products).
 ///
 /// - `Tile::Scalar` → the scalar's `Display`.
-/// - `Tile::Function` with a scalar or record codomain →
+/// - `Tile::DataFunction` with a scalar or record codomain →
 ///   `Function [ … ]`.  The list contents depend on the domain shape:
 ///   - Sequential UInt domain (plain list): `[v0, v1, …]` in domain order.
 ///   - Scalar non-sequential domain (GroupBy key column): `[k -> v, …]`
@@ -296,7 +296,7 @@ pub(crate) fn run_to_tile(source: &str) -> Tile {
 ///   - Record domain (synthetic join cross-product index, opaque to the
 ///     user): `[v0, v1, …]` sorted by codomain value.
 ///
-/// Other tile shapes (`Function`, `Aggregation`, deeply-nested
+/// Other tile shapes (a `DataFunction` of more than one level, `Aggregation`, deeply-nested
 /// codomains) panic; extend this function when a new program needs a new
 /// shape.
 pub fn tile_to_canonical(tile: Tile) -> String {
@@ -307,7 +307,7 @@ pub fn tile_to_canonical(tile: Tile) -> String {
                 .unwrap_or_else(|| panic!("scalar tile must hold exactly one element, got {cv:?}"));
             format!("{v}")
         }
-        Tile::Function {
+        Tile::DataFunction {
             domain, codomain, ..
         } => {
             // `scalar_tile_to_column_value` handles both `Tile::Scalar` and

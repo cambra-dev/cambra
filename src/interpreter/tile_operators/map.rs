@@ -38,7 +38,7 @@ impl MapResult {
         // beneath. [`apply_at`] puts that where the argument was, which is how the
         // function's levels come to sit under the input's.
         let (fn_domain_extent, fn_result) = match function_tiling {
-            Tiling::Function { domain, codomain } => (domain.clone(), (**codomain).clone()),
+            Tiling::DataFunction { domain, codomain } => (domain.clone(), (**codomain).clone()),
             other => (
                 other
                     .domain_extent()
@@ -77,7 +77,7 @@ fn apply_at(tiling: &Tiling, fn_domain: &Extent, result: Tiling) -> Option<Tilin
         return Some(result);
     }
     match tiling {
-        Tiling::Function { domain, codomain } => Some(Tiling::Function {
+        Tiling::DataFunction { domain, codomain } => Some(Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(apply_at(codomain, fn_domain, result)?),
         }),
@@ -171,10 +171,9 @@ impl TileProducer for MapResultProducer {
         // A function whose values are themselves a collection needs special-case handling.
         // The shape is read through a borrow so a one-level operand does not move the tile
         // out of the fall-through path below.
-        let function_is_nested =
-            matches!(&function_tile, Tile::Function { codomain, .. } if codomain.is_function());
+        let function_is_nested = matches!(&function_tile, Tile::DataFunction { codomain, .. } if codomain.is_data_function());
         if function_is_nested
-            && let Tile::Function {
+            && let Tile::DataFunction {
                 domain: f_domain,
                 codomain: f_groups,
                 domain_predicate: f_domain_predicate,
@@ -183,8 +182,8 @@ impl TileProducer for MapResultProducer {
         {
             // A function operand is the two-level lookup a keyed collection presents; a
             // deeper function reaches this operator as data, not here.
-            let Tile::Function {
-                domain: f_domain2,
+            let Tile::DataFunction {
+                domain: f_inner_keys,
                 codomain: f_codomain,
                 ..
             } = f_groups.as_ref()
@@ -193,28 +192,28 @@ impl TileProducer for MapResultProducer {
             };
             let f_codomain = scalar_tile_to_column_value((**f_codomain).clone());
             // For `A ⤇ B ⤇ C`, the inner keys are B and the values C.
-            let Tiling::Function {
+            let Tiling::DataFunction {
                 codomain: f_groups_tiling,
                 ..
             } = &f_tiling
             else {
                 panic!("Expected a collection tiling for a collection tile")
             };
-            let Tiling::Function {
-                domain: f_domain2_extent,
+            let Tiling::DataFunction {
+                domain: f_inner_key_extent,
                 codomain: c_tiling,
             } = f_groups_tiling.as_ref()
             else {
                 panic!("Expected a nested collection tiling for a nested collection tile")
             };
-            let (f_domain2_extent, f_codomain_extent) =
-                (f_domain2_extent.clone(), c_tiling.extent());
+            let (f_inner_key_extent, f_codomain_extent) =
+                (f_inner_key_extent.clone(), c_tiling.extent());
 
             // A **scalar** input is a single-key lookup — `groupby(c, k)(v)`. It is
             // the walk below at one key, yielding that key's group directly rather
             // than a family of groups keyed by the input's domain.
             if let Tile::Scalar(key_col) = input_tile {
-                let mut out_domain = ColumnValue::from_values(Vec::new(), &f_domain2_extent);
+                let mut out_domain = ColumnValue::from_values(Vec::new(), &f_inner_key_extent);
                 let mut out_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
                 // A key absent from a **settled** grouping is a genuinely empty
                 // group; one absent from an unsettled grouping is simply not
@@ -230,8 +229,8 @@ impl TileProducer for MapResultProducer {
                         let (group_start, group_end) = f_groups.row_run(f_idx);
                         for g in group_start..group_end {
                             out_domain.append(ColumnValue::from_values(
-                                vec![f_domain2.index_at(g)],
-                                &f_domain2_extent,
+                                vec![f_inner_keys.index_at(g)],
+                                &f_inner_key_extent,
                             ));
                             out_codomain.append(ColumnValue::from_values(
                                 vec![f_codomain.index_at(g)],
@@ -240,7 +239,7 @@ impl TileProducer for MapResultProducer {
                         }
                     }
                 }
-                return Tile::function(
+                return Tile::data_function(
                     out_domain,
                     Box::new(Tile::Scalar(out_codomain)),
                     if settled {
@@ -252,7 +251,7 @@ impl TileProducer for MapResultProducer {
                 );
             }
 
-            let Tile::Function {
+            let Tile::DataFunction {
                 domain,
                 codomain: input_codomain,
                 domain_predicate,
@@ -285,7 +284,7 @@ impl TileProducer for MapResultProducer {
                 codomain_values.select_indices(sort_indices.iter().cloned(), sort_indices.len());
 
             // For each element in sorted domain, find the corresponding codomain value,
-            // then look up that codomain value in f_domain to get f_domain2 and f_codomain values.
+            // then look up that codomain value in f_domain to get f_inner_keys and f_codomain values.
             // TODO this is doing filtering implicitly here, but we should do it in a separate step.
             // in order to do this we need to be able to construct a filter based on the presence of domain
             // elements in another function, and we don't have that capability yet.
@@ -293,7 +292,7 @@ impl TileProducer for MapResultProducer {
             let mut new_domain = ColumnValue::from_values(Vec::new(), &domain_extent);
             let mut new_offsets =
                 ColumnValue::from_values(Vec::new(), &Extent::Base(BaseType::UInt));
-            let mut new_domain2 = ColumnValue::from_values(Vec::new(), &f_domain2_extent);
+            let mut new_inner_keys = ColumnValue::from_values(Vec::new(), &f_inner_key_extent);
             let mut new_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
             // Collects `input`` keys values whose Function mapping is incomplete.
             // More precisely, this is the set of domain values of `input` such that the corresponding
@@ -334,15 +333,15 @@ impl TileProducer for MapResultProducer {
                         &Extent::Base(BaseType::UInt),
                     ));
 
-                    // Collect f_domain2 and f_codomain elements for this codomain value
+                    // Collect f_inner_keys and f_codomain elements for this codomain value
                     for f_idx in first..=last {
                         let (group_start, group_end) = f_groups.row_run(f_idx);
 
                         // Append the group's inner keys and values
                         for group_idx in group_start..group_end {
-                            new_domain2.append(ColumnValue::from_values(
-                                vec![f_domain2.index_at(group_idx)],
-                                &f_domain2_extent,
+                            new_inner_keys.append(ColumnValue::from_values(
+                                vec![f_inner_keys.index_at(group_idx)],
+                                &f_inner_key_extent,
                             ));
                             new_codomain.append(ColumnValue::from_values(
                                 vec![f_codomain.index_at(group_idx)],
@@ -367,11 +366,11 @@ impl TileProducer for MapResultProducer {
                 Predicate::from_column_value(&incomplete_domain).minus(&domain_obsolete);
             let output_domain_predicate = domain_predicate.minus(&incomplete_predicate);
             // Build the new collection with a filtered keys and a transformed values.
-            return Tile::function(
+            return Tile::data_function(
                 new_domain,
                 Box::new(Tile::grouped(
                     new_offsets,
-                    new_domain2,
+                    new_inner_keys,
                     Box::new(Tile::Scalar(new_codomain)),
                     Predicate::True,
                     BitSet::new(),
@@ -387,11 +386,11 @@ impl TileProducer for MapResultProducer {
         // dropped from this tile, and subtracted from its predicate — so the consumer pulls
         // again once the function has it. The nested branch above draws the same distinction
         // through `incomplete_domain`.
-        if let Tile::Function {
+        if let Tile::DataFunction {
             domain_predicate: f_domain_predicate,
             ..
         } = &function_tile
-            && input_tile.is_function()
+            && input_tile.is_data_function()
         {
             let Tile::Scalar(arguments) = input_tile.deepest_values() else {
                 panic!(
@@ -424,7 +423,7 @@ impl TileProducer for MapResultProducer {
                     .innermost_level_mut()
                     .unwrap_or_else(|| unreachable!("the chain was walked above"))
                     .retain_keys(&keep);
-                let Tile::Function {
+                let Tile::DataFunction {
                     domain_predicate, ..
                 } = &mut input_tile
                 else {
@@ -476,7 +475,7 @@ impl TileProducer for MapResultProducer {
 /// but with a constant codomain swapped or zipped in, as determined by the [`MapResultToConstMode`]
 /// param.
 ///
-/// `input` must be a `Function` or `Function` tile; `constant` must be a Scalar.
+/// `input` must be a `DataFunction` tile; `constant` must be a Scalar.
 pub struct MapResultToConst {
     /// Output tiling matches `input` tiling, transforming the codomain to `constant`.
     base: OperatorBase,
@@ -600,13 +599,13 @@ impl TileProducer for MapResultToConstProducer {
         // union / `final_or_default` sees this arm resolve to nothing rather than
         // waiting forever. The data-collection fan-out is lazy the same way (an
         // emptied restrict is never iterated); this brings the scalar form in line.
-        if let Tile::Function {
+        if let Tile::DataFunction {
             domain_predicate, ..
         } = &input_tile
             && input_tile.is_empty()
         {
             let mut out = self.tiling().empty_tile();
-            if let Tile::Function {
+            if let Tile::DataFunction {
                 domain_predicate: out_pred,
                 ..
             } = &mut out
@@ -664,13 +663,13 @@ impl TileProducer for MapResultToConstProducer {
         self.input.release(obsolete_guard);
     }
 }
-/// Produces a `Function` tile that maps each domain element of a data
+/// Produces a `DataFunction` tile that maps each domain element of a data
 /// source to its corresponding output value.
 ///
 /// Unlike [`IterateExtent`], which produces an identity function (domain→domain),
 /// `MapResultWithSource` calls [`DataSourceDomainExtentImpl::get`] for each domain key to
 /// look up the actual output value.  The result is
-/// `Function { domain: keys, codomain: Scalar(output_values) }`.
+/// `DataFunction { domain: keys, codomain: Scalar(output_values) }`.
 ///
 /// Notification at subscription time: if the source already has data when
 /// `subscribe` is called, the consumer is notified immediately.
@@ -678,7 +677,7 @@ pub struct MapResultWithSource {
     input: Box<dyn TileOperator>,
     /// The data source providing both domain keys and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    /// Output tiling: `Function { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
+    /// Output tiling: `DataFunction { domain: DataSourceDomain, codomain: Scalar(output_value_extent) }`.
     base: OperatorBase,
 }
 
@@ -832,19 +831,19 @@ mod tests {
 
     /// Build a `MapResultProducer` whose `function` operand records its releases.
     fn map_result_with_function_spy() -> (MapResultProducer, Rc<RefCell<Vec<TileGuard>>>, Tiling) {
-        let in_tiling = Tiling::function(
+        let in_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
-        let fn_tiling = Tiling::function(
+        let fn_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
         );
         let (fn_spy, released) = ReleaseSpy::new(
-            Tile::function(
+            Tile::data_function(
                 ColumnValue::UInts(vec![0]),
                 Box::new(Tile::grouped(
                     ColumnValue::UInts(vec![0]),
@@ -859,7 +858,7 @@ mod tests {
             fn_tiling,
         );
         let input = TestTileProducer::new(
-            Tile::function(
+            Tile::data_function(
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))),
                 Predicate::True,
@@ -910,8 +909,8 @@ mod tests {
         // Test MapResultProducer directly with unsorted domain input
         // This tests the actual MapResultProducer.get_impl implementation
 
-        // Create a Function tile
-        let two_level_fn_tile = Tile::function(
+        // Create a DataFunction tile
+        let two_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 2]),
@@ -924,23 +923,23 @@ mod tests {
             BitSet::new(),
         );
 
-        let function_tiling = Tiling::function(
+        let function_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
         );
 
-        // Create a Function tile with unsorted domain
-        let one_level_fn_tile = Tile::function(
+        // Create a DataFunction tile with unsorted domain
+        let one_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![2, 0, 1]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 0, 1]))),
             Predicate::True,
             BitSet::new(),
         );
 
-        let input_tiling = Tiling::function(
+        let input_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::UInt)),
         );
@@ -950,9 +949,9 @@ mod tests {
         let input_producer = TestTileProducer::new(one_level_fn_tile, input_tiling);
 
         // Create MapResultProducer and test it
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -969,12 +968,12 @@ mod tests {
 
         // Verify the result
         match result {
-            Tile::Function {
+            Tile::DataFunction {
                 domain: ref domain1,
                 codomain: ref groups,
                 ..
             } => {
-                let Tile::Function {
+                let Tile::DataFunction {
                     row_starts: offsets,
                     domain: domain2,
                     codomain,
@@ -1046,7 +1045,7 @@ mod tests {
     #[test]
     fn map_result_producer_two_levels_domain_predicate() {
         let f_pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
-        let two_level_fn_tile = Tile::function(
+        let two_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1]),
@@ -1058,28 +1057,28 @@ mod tests {
             f_pred,
             BitSet::new(),
         );
-        let function_tiling = Tiling::function(
+        let function_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
         );
 
-        let one_level_fn_tile = Tile::function(
+        let one_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1, 2, 3]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 2, 3]))),
             Predicate::True,
             BitSet::new(),
         );
-        let input_tiling = Tiling::function(
+        let input_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::UInt)),
         );
 
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -1092,7 +1091,7 @@ mod tests {
 
         let result = map_result.get(map_result.tiling().universal_guard());
 
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             domain_predicate: out_pred,
             ..
@@ -1119,7 +1118,7 @@ mod tests {
     /// When f_domain_predicate is True the output domain_predicate should equal the input's.
     #[test]
     fn map_result_producer_two_levels_domain_predicate_both_true() {
-        let two_level_fn_tile = Tile::function(
+        let two_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0, 1]),
@@ -1131,26 +1130,26 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         );
-        let function_tiling = Tiling::function(
+        let function_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
         );
-        let one_level_fn_tile = Tile::function(
+        let one_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1]))),
             Predicate::True,
             BitSet::new(),
         );
-        let input_tiling = Tiling::function(
+        let input_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
             Tiling::Scalar(Extent::Base(BaseType::UInt)),
         );
-        let output_tiling = Tiling::function(
+        let output_tiling = Tiling::data_function(
             Extent::Base(BaseType::UInt),
-            Tiling::function(
+            Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
@@ -1161,7 +1160,7 @@ mod tests {
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
         };
         let result = map_result.get(map_result.tiling().universal_guard());
-        let Tile::Function {
+        let Tile::DataFunction {
             domain_predicate: out_pred,
             ..
         } = result

@@ -75,7 +75,7 @@ fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) 
         .main_producer_mut()
         .expect("the program's value is `out`");
     let tile = producer.get(producer.tiling().universal_guard());
-    let Tile::Function {
+    let Tile::DataFunction {
         codomain,
         deleted,
         domain_predicate,

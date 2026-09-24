@@ -37,7 +37,7 @@ pub enum Tile {
     /// holding the same columns a flat level list would — and unlike a flat list it can say
     /// where a record sits between two levels, which is what lets records and collections
     /// nest freely.
-    Function {
+    DataFunction {
         /// Where each row's run of keys begins in `domain`, one entry per row. **Non-decreasing**:
         /// two equal starts are a row whose group holds nothing. A key with an empty group is
         /// a collection that is empty, which an aggregate folds to its identity; a key that is
@@ -76,7 +76,7 @@ pub enum Tile {
     /// **changelog** — the ticks that committed a write, each carrying that
     /// tick's write-set *delta*.
     ///
-    /// This is not a [`Tile::Function`] and must not be treated as one:
+    /// This is not a [`Tile::DataFunction`] and must not be treated as one:
     /// in a collection a key absent from `changes` is
     /// **unknown**, whereas here it is **decided-absent — the value holds from
     /// the latest earlier change** (step interpolation). The value at an
@@ -165,7 +165,7 @@ impl Tile {
             // empty, which is that level's own answer and not this one's — a full release
             // of what a nested collection holds leaves its keys standing, and they are
             // still what it knows.
-            Tile::Function {
+            Tile::DataFunction {
                 domain, deleted, ..
             } => domain.len() == deleted.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.is_empty(),
@@ -191,16 +191,16 @@ impl Tile {
                         .all(|(k, t)| tiling_fields.get(k).is_some_and(|s| t.check_from(s)))
             }
             (
-                Tile::Function {
+                Tile::DataFunction {
                     domain: key_column,
                     codomain: value_tile,
                     ..
                 },
-                Tiling::Function { domain, codomain },
+                Tiling::DataFunction { domain, codomain },
             ) => key_column.is_compatible_with_extent(domain) && value_tile.check_from(codomain),
             (Tile::Aggregation { .. }, Tiling::Aggregation { .. }) => true,
             // The change ticks must lie in the commit domain; the per-tick delta
-            // encoding is trusted (like `Function`).
+            // encoding is trusted (like `DataFunction`).
             (Tile::Store { changes, .. }, Tiling::Store { domain, .. }) => {
                 changes.is_compatible_with_extent(domain)
             }
@@ -212,7 +212,7 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => !cv.is_empty(),
             Tile::Record(m) => m.values().all(Tile::is_terminal),
-            Tile::Function {
+            Tile::DataFunction {
                 domain_predicate, ..
             } => domain_predicate.as_bool().unwrap_or(false),
             Tile::Aggregation { terminal, .. } => {
@@ -226,12 +226,16 @@ impl Tile {
         }
     }
 
-    /// Merge the contents of `other` into `self`. Requires the two tiles to be compatible
-    /// (i.e. non-overlapping).
+    /// Merge the contents of `other` into `self`: extend a value with a part of it that
+    /// arrived later. The two must not both hold one position.
     ///
-    /// A merge extends a value with a part of it that arrived later. At the top level that
-    /// means new **keys** of the outermost collection; everything beneath is then new
-    /// **rows**, because a key of the level above is a row of the level below.
+    /// A collection merges by key. A key both sides hold is one key whose group is the two
+    /// groups merged, so a collection delivered a part at a time re-states the key it adds
+    /// to. A key matches only where what it holds can grow ([`Self::holds_a_level`]). Under a
+    /// scalar a repeated key is one position delivered twice, and the two stay apart for
+    /// [`validate_tile`] to report, since matching them would lose one of the values
+    /// silently. At the top level the parts are keys of the outermost collection; beneath it
+    /// they are rows, because a key of the level above is a row of the level below.
     pub fn merge(&mut self, other: Tile) {
         self.merge_part(other, true);
     }
@@ -247,31 +251,77 @@ impl Tile {
         self.merge_part(other, false);
     }
 
+    /// Append `other`'s keys after this collection's, in place, matching none of them.
+    ///
+    /// For a whole value the keys join its one row's run. Otherwise `other`'s rows follow
+    /// this tile's, each run shifted past the keys already here.
+    fn append_keys(&mut self, other: Tile, whole: bool) {
+        let (
+            Tile::DataFunction {
+                row_starts: s_starts,
+                domain: s_domain,
+                codomain: s_codomain,
+                domain_predicate: s_pred,
+                deleted: s_deleted,
+            },
+            Tile::DataFunction {
+                row_starts: o_starts,
+                domain: o_domain,
+                codomain: o_codomain,
+                domain_predicate: o_pred,
+                deleted: o_deleted,
+            },
+        ) = (&mut *self, other)
+        else {
+            panic!("append_keys appends one collection to another")
+        };
+        let shift = s_domain.len();
+        if whole {
+            assert_eq!(
+                s_starts.len(),
+                1,
+                "a whole collection is its one row's group"
+            );
+            assert_eq!(
+                o_starts.len(),
+                1,
+                "a whole collection is its one row's group"
+            );
+        } else {
+            let (ColumnValue::UInts(s), ColumnValue::UInts(o)) = (&mut *s_starts, o_starts) else {
+                panic!("row_starts is a column of positions")
+            };
+            s.extend(o.into_iter().map(|start| start + shift));
+        }
+        s_domain.append(o_domain);
+        s_codomain.merge_part(*o_codomain, false);
+        *s_pred = s_pred.union(&o_pred);
+        s_deleted.extend(o_deleted.iter().map(|i| i + shift));
+    }
+
     /// `merge`, knowing whether this tile is the whole value or sits under one.
     fn merge_part(&mut self, other: Tile, whole: bool) {
-        // A collection merges **by key**: the two sides' runs are matched per row and the
-        // values follow the keys. A key both sides delivered is one key whose group is the
-        // two groups merged, which is what makes this more than a concatenation — and what
-        // keeps every intermediate a well-formed tile, so nothing downstream ever reads a
-        // level holding one key twice.
-        if self.is_function() && other.is_function() {
-            let order = if whole {
-                // One row, and both describe it.
-                assert_eq!(self.rows(), 1, "a whole collection is its one row's group");
-                assert_eq!(other.rows(), 1, "a whole collection is its one row's group");
-                vec![RowSource::Both(0, 0)]
-            } else {
-                // New rows, which no key of a row already here can collide with.
-                (0..self.rows())
-                    .map(RowSource::Left)
-                    .chain((0..other.rows()).map(RowSource::Right))
-                    .collect()
+        if self.is_data_function() && other.is_data_function() {
+            // Where no key can match, the merge is a concatenation, done in place so a
+            // collection delivered a part at a time costs the part and not what is already
+            // held. Rows under a collection never match, and a whole value's keys match only
+            // where what they hold can grow.
+            let Tile::DataFunction { codomain, .. } = &*self else {
+                unreachable!("checked above")
             };
-            *self = merged_rows(self, &other, &order);
-            debug_assert!(
-                !whole || validate_tile(self),
-                "Invalid tile after merge: {self:?}"
-            );
+            if !whole || !codomain.holds_a_level() {
+                self.append_keys(other, whole);
+                debug_assert!(
+                    !whole || validate_tile(self),
+                    "Invalid tile after merge: {self:?}"
+                );
+                return;
+            }
+            // One row, and both describe it.
+            assert_eq!(self.rows(), 1, "a whole collection is its one row's group");
+            assert_eq!(other.rows(), 1, "a whole collection is its one row's group");
+            *self = merged_rows(self, &other, &[RowSource::Both(0, 0)]);
+            debug_assert!(validate_tile(self), "Invalid tile after merge: {self:?}");
             return;
         }
         match (&mut *self, other) {
@@ -291,9 +341,18 @@ impl Tile {
                 },
             ) => {
                 assert_eq!(*s_kind, o_kind);
-                s_kind.accumulate(s_acc, &o_acc, 0, o_acc.rows());
-                let taken = std::mem::replace(s_term, ColumnValue::Units(0));
-                *s_term = apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), taken, &o_term);
+                // A whole aggregation is one row, and `other` is a later contribution to it,
+                // folded in by the aggregate's own law. Under a collection the two sides are
+                // different rows, each its own accumulator, so they follow one another.
+                if whole {
+                    s_kind.accumulate(s_acc, &o_acc, 0, o_acc.rows());
+                    let taken = std::mem::replace(s_term, ColumnValue::Units(0));
+                    *s_term =
+                        apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), taken, &o_term);
+                } else {
+                    s_acc.merge_part(*o_acc, false);
+                    s_term.append(o_term);
+                }
             }
             // A record's fields are whole exactly when the record is: a record of whole
             // values merges field by whole field, and one sitting under a collection merges
@@ -355,11 +414,17 @@ impl Tile {
     /// record keeps them in every field, and a collection keeps those rows' whole groups.
     pub fn retain_rows(&mut self, mask: &BitVec) {
         match self {
+            // A column that carries no row has nothing to filter, and a mask over the rows
+            // names nothing in it. A record's fields stand over the same rows without being
+            // filled together: a store's tap carries no value forward, and a scalar beside a
+            // growing collection may not have arrived, so either is empty at rows the
+            // others hold.
+            Tile::Scalar(cv) if cv.is_empty() => {}
             Tile::Scalar(cv) => cv.retain(mask),
             Tile::Record(fields) => fields.values_mut().for_each(|t| t.retain_rows(mask)),
             // A kept row brings its whole run of keys, so keeping a row is gathering it:
             // one group per survivor, in order, which is what [`Tile::regroup_rows`] does.
-            Tile::Function { .. } => {
+            Tile::DataFunction { .. } => {
                 let kept: Vec<Vec<usize>> = mask
                     .iter()
                     .enumerate()
@@ -389,6 +454,10 @@ impl Tile {
     /// collection by looking rows up.
     pub fn select_rows(&self, rows: &[usize]) -> Tile {
         match self {
+            // An empty column has no rows to gather. A record whose fields all hold
+            // scalars fills them together, but one holding a level does not: the scalar
+            // beside a collection that already has rows may still be unfilled.
+            Tile::Scalar(cv) if cv.is_empty() => Tile::Scalar(cv.clone()),
             Tile::Scalar(cv) => Tile::Scalar(cv.select_indices(rows.iter().copied(), rows.len())),
             Tile::Record(fields) => Tile::Record(
                 fields
@@ -396,7 +465,7 @@ impl Tile {
                     .map(|(k, t)| (k.clone(), t.select_rows(rows)))
                     .collect(),
             ),
-            Tile::Function { .. } => {
+            Tile::DataFunction { .. } => {
                 self.regroup_rows(&rows.iter().map(|r| vec![*r]).collect::<Vec<_>>())
             }
             Tile::Aggregation {
@@ -419,7 +488,7 @@ impl Tile {
     /// a key's group once per row that asks for it — and what collapsing a family of groups
     /// into one does, which is the whole of applying a keyed collection at a single key.
     pub fn regroup_rows(&self, groups: &[Vec<usize>]) -> Tile {
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             codomain,
             domain_predicate,
@@ -460,7 +529,7 @@ impl Tile {
     /// produces. A key goes with the value under it, as a row goes with its group; what
     /// differs is the axis, so rows keep their identity and only their groups shrink.
     pub fn retain_keys(&mut self, mask: &BitVec) {
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts,
             domain,
             codomain,
@@ -496,7 +565,7 @@ impl Tile {
     /// Physical arrays are untouched, so `to_guard` still reports every key that was ever
     /// present. Call [`Tile::compact`] to drop them for real.
     pub fn mark_deleted(&mut self, mask: &BitVec) {
-        let Tile::Function { deleted, .. } = self else {
+        let Tile::DataFunction { deleted, .. } = self else {
             panic!("mark_deleted is a collection's: {self:?}")
         };
         for (key, keep) in mask.iter().enumerate() {
@@ -519,7 +588,7 @@ impl Tile {
     /// it — a row holding one key twice, which no collection admits ([`valid_over`]).
     pub fn compact(&mut self) {
         match self {
-            Tile::Function {
+            Tile::DataFunction {
                 domain, deleted, ..
             } => {
                 if !deleted.is_empty() {
@@ -527,7 +596,7 @@ impl Tile {
                     let keep: BitVec = (0..domain.len()).map(|k| !removed.contains(k)).collect();
                     self.retain_keys(&keep);
                 }
-                let Tile::Function { codomain, .. } = self else {
+                let Tile::DataFunction { codomain, .. } = self else {
                     unreachable!("retaining keys leaves a collection a collection")
                 };
                 codomain.compact();
@@ -589,7 +658,7 @@ impl Tile {
             // [`Tile::compact`] takes its group with it — marking the keys beneath instead
             // would make a released group indistinguishable from one a filter emptied.
             (
-                Tile::Function {
+                Tile::DataFunction {
                     domain, deleted, ..
                 },
                 TileGuard::Function(FunctionGuard::Domain(pred)),
@@ -601,7 +670,7 @@ impl Tile {
                 }
             }
             (
-                Tile::Function { codomain, .. },
+                Tile::DataFunction { codomain, .. },
                 TileGuard::Function(FunctionGuard::Codomain(inner)),
             ) => codomain.remove_guarded(*inner),
             // A store release names a prefix of decided commit ticks the consumer
@@ -631,7 +700,7 @@ impl Tile {
     ///
     /// For Scalar: universal if the scalar is known and empty otherwise.
     /// For Aggregation: universal if terminal and empty otherwise.
-    /// For Collection: `Domain` over the keys whose groups are whole, plus
+    /// For DataFunction: `Domain` over the keys whose groups are whole, plus
     /// `Codomain(...)` over what the values hold under the keys that are not.
     ///
     /// Important note around logical deletes: we don't release eagerly when logically
@@ -651,11 +720,9 @@ impl Tile {
             // complete as soon as it is there, so every key present is releasable. A
             // collection under a key may still grow, and only `domain_predicate` says which
             // keys it will not; what an open key holds is named one step in, which is where
-            // a `Codomain` guard reads. A record stands over the same keys rather than
-            // introducing keys of its own, so a collection in one of its fields is a level
-            // under the key like any other — which is [`Tile::holds_a_level`] and not
-            // [`Tile::is_function`].
-            Tile::Function {
+            // a `Codomain` guard reads. A collection in a record's field is a level under the
+            // key like any other ([`Tile::holds_a_level`]).
+            Tile::DataFunction {
                 domain,
                 codomain,
                 domain_predicate,
@@ -708,7 +775,7 @@ impl Tile {
     }
 
     /// A collection over one row — the whole value — with dev-build-only validation.
-    pub fn function(
+    pub fn data_function(
         domain: ColumnValue,
         codomain: Box<Tile>,
         domain_predicate: Predicate,
@@ -731,7 +798,7 @@ impl Tile {
         domain_predicate: Predicate,
         deleted: BitSet,
     ) -> Tile {
-        let result = Tile::Function {
+        let result = Tile::DataFunction {
             row_starts,
             domain,
             codomain,
@@ -748,17 +815,14 @@ impl Tile {
     /// The tile sitting under this collection chain — what an operator transforms when it
     /// changes a collection's values and nothing else.
     ///
-    /// The chain is the spine of collection nodes, so a record ends it and is itself the
-    /// answer: a collection inside one of its fields is below a *field*, not below this
-    /// chain. [`Self::holds_a_level`] is the question of whether anything below can still
-    /// grow, which does look through a record.
+    /// A record ends the chain and is itself the answer ([`Self::holds_a_level`]).
     ///
     /// The runtime counterpart of what
     /// [`change_tiling_result`](crate::interpreter::tile_operators::change_tiling_result)
     /// does to a tiling. A tile that is not a collection is its own deepest values.
     pub fn deepest_values(&self) -> &Tile {
         match self {
-            Tile::Function { codomain, .. } => codomain.deepest_values(),
+            Tile::DataFunction { codomain, .. } => codomain.deepest_values(),
             other => other,
         }
     }
@@ -770,7 +834,7 @@ impl Tile {
     pub fn values_at(&self, depth: usize) -> &Tile {
         match (depth, self) {
             (0, _) => self,
-            (_, Tile::Function { codomain, .. }) => codomain.values_at(depth - 1),
+            (_, Tile::DataFunction { codomain, .. }) => codomain.values_at(depth - 1),
             (_, other) => panic!("no level {depth} in {other:?}"),
         }
     }
@@ -780,7 +844,7 @@ impl Tile {
         if depth == 0 {
             return self;
         }
-        let Tile::Function { codomain, .. } = self else {
+        let Tile::DataFunction { codomain, .. } = self else {
             panic!("no level {depth} in {self:?}")
         };
         codomain.values_at_mut(depth - 1)
@@ -789,7 +853,7 @@ impl Tile {
     /// [`Self::deepest_values`], to write through.
     pub fn deepest_values_mut(&mut self) -> &mut Tile {
         match self {
-            Tile::Function { codomain, .. } => codomain.deepest_values_mut(),
+            Tile::DataFunction { codomain, .. } => codomain.deepest_values_mut(),
             other => other,
         }
     }
@@ -800,12 +864,9 @@ impl Tile {
     /// [`Self::row_paths_at`] the key path of every row that level stands over, which is
     /// how an operator acting on a chain's elements finds its work.
     ///
-    /// The chain is the spine of collection nodes, so a record ends it and is the element:
-    /// a collection in one of its fields sits inside that element rather than continuing
-    /// the chain. Whether anything below can still *grow* is [`Self::holds_a_level`], which
-    /// does look through a record; the two questions differ exactly here.
+    /// A record ends the chain ([`Self::holds_a_level`]).
     pub fn innermost_depth(&self) -> Option<usize> {
-        let Tile::Function { codomain, .. } = self else {
+        let Tile::DataFunction { codomain, .. } = self else {
             return None;
         };
         Some(codomain.innermost_depth().map_or(0, |below| below + 1))
@@ -828,7 +889,7 @@ impl Tile {
         let mut node = self;
         for _ in 0..depth {
             paths = node.key_paths(&paths);
-            let Tile::Function { codomain, .. } = node else {
+            let Tile::DataFunction { codomain, .. } = node else {
                 panic!("no level {depth} in {self:?}")
             };
             node = codomain;
@@ -840,13 +901,12 @@ impl Tile {
     /// the values under it. Two collections carrying the same data over the same keys agree
     /// here whatever their predicates say.
     ///
-    /// The spine of collection nodes, so a record ends it: what sits in a record's fields
-    /// is below those fields rather than on this chain, and a caller comparing skeletons
-    /// is comparing the levels the two tiles share above their values.
+    /// A record ends the chain ([`Self::holds_a_level`]), so a caller comparing skeletons
+    /// compares the levels the two tiles share above their values.
     pub fn key_levels(&self) -> Vec<(&ColumnValue, &ColumnValue)> {
         let mut levels = Vec::new();
         let mut node = self;
-        while let Tile::Function {
+        while let Tile::DataFunction {
             row_starts,
             domain,
             codomain,
@@ -864,7 +924,7 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => cv.len(),
             Tile::Record(fields) => fields.values().map(Tile::rows).max().unwrap_or(0),
-            Tile::Function { row_starts, .. } => row_starts.len(),
+            Tile::DataFunction { row_starts, .. } => row_starts.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.rows(),
             Tile::Store { .. } => 1,
         }
@@ -872,8 +932,8 @@ impl Tile {
 
     /// Whether this tile is the keyed-data representation, the test an operator makes when
     /// it walks a chain of levels.
-    pub fn is_function(&self) -> bool {
-        matches!(self, Tile::Function { .. })
+    pub fn is_data_function(&self) -> bool {
+        matches!(self, Tile::DataFunction { .. })
     }
 
     /// Whether a level sits here, or inside a record here.
@@ -883,14 +943,17 @@ impl Tile {
     /// record. A [`Self::Aggregation`] and a [`Self::Store`] carry their own completeness,
     /// so what they hold is answered by their own guard rather than by descending into it.
     ///
-    /// Two questions about a codomain read alike and part here. *Does the chain continue?*
-    /// is [`Self::is_function`], which a record answers no to because it **is** the element
-    /// the chain ends at. *Can what this holds still grow?* is this one, and a record
-    /// answers yes for its fields — which is what a guard asks, and what an operator asks
-    /// before boxing a value into a column, a column having nowhere to put a level.
+    /// Two questions about a codomain read alike and differ at a record. Whether the chain
+    /// continues is [`Self::is_data_function`], which a record answers no to: the record is the
+    /// element the chain ends at, so `MapAggregate` over `𝐾 ⤇ 𝐽 ⤇ {a: Int, b: (𝐿 ⤇ Int)}`
+    /// folds `𝐽`'s records and `𝐿` sits inside the element it folds. Whether what this holds
+    /// can still grow is this one, and a record answers yes for its fields. Guards, the
+    /// merge's key matching, and an operator putting a value into a column ask this one, a
+    /// column having nowhere to put a level. The chain walks ([`Self::deepest_values`],
+    /// [`Self::innermost_depth`], [`Self::key_levels`]) ask the first.
     pub fn holds_a_level(&self) -> bool {
         match self {
-            Tile::Function { .. } => true,
+            Tile::DataFunction { .. } => true,
             Tile::Record(fields) => fields.values().any(Tile::holds_a_level),
             Tile::Scalar(_) | Tile::Aggregation { .. } | Tile::Store { .. } => false,
         }
@@ -902,7 +965,7 @@ impl Tile {
     /// `row_paths` of whatever collection sits in `codomain`. A key repeats across its
     /// siblings' groups, so below the top level only the whole path identifies an element.
     pub fn key_paths(&self, row_paths: &[Vec<Value>]) -> Vec<Vec<Value>> {
-        let Tile::Function { domain, .. } = self else {
+        let Tile::DataFunction { domain, .. } = self else {
             panic!("key_paths is a collection's: {self:?}")
         };
         let mut paths = Vec::with_capacity(domain.len());
@@ -936,7 +999,7 @@ impl Tile {
                     .map(|(name, field)| (name.clone(), field.held_guard()))
                     .collect(),
             ),
-            Tile::Function {
+            Tile::DataFunction {
                 domain, codomain, ..
             } => {
                 let keys_guard = TileGuard::Function(FunctionGuard::Domain(
@@ -956,7 +1019,7 @@ impl Tile {
 
     /// The half-open run of `domain` belonging to row `row`.
     pub fn row_run(&self, row: usize) -> (usize, usize) {
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts, domain, ..
         } = self
         else {
@@ -968,7 +1031,7 @@ impl Tile {
 
 /// A collection's own `row_starts`, for the validation a constructor does.
 fn level_offsets_of(tile: &Tile) -> &[usize] {
-    let Tile::Function { row_starts, .. } = tile else {
+    let Tile::DataFunction { row_starts, .. } = tile else {
         unreachable!("only a collection is constructed this way")
     };
     level_offsets(row_starts)
@@ -1014,7 +1077,7 @@ pub fn nest_levels(
     let mut built = *innermost;
     for (level, keys) in levels.into_iter().enumerate().rev() {
         built = if level == 0 {
-            Tile::function(
+            Tile::data_function(
                 keys,
                 Box::new(built),
                 domain_predicate.clone(),
@@ -1048,11 +1111,8 @@ enum RowSource {
 /// `left` and `right` standing over the rows `order` names, each row taking its content
 /// from whichever side delivered it.
 ///
-/// The whole of a merge, at every level. A collection matches its two key runs per row and
-/// recurses into the matched groups, so a key both sides delivered becomes one key whose
-/// group is the two groups merged. Nothing is appended and then repaired, which is what
-/// lets every intermediate satisfy [`valid_over`]: there is no point at which a level holds
-/// a key twice, and no fixup pass to leave a record's fields disagreeing about their rows.
+/// A collection matches its two key runs per row and recurses into the matched groups
+/// ([`Tile::merge`]), so no level of the result holds a key twice.
 fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
     match (left, right) {
         (Tile::Scalar(l), Tile::Scalar(r)) => Tile::Scalar(merged_column(l, r, order)),
@@ -1070,14 +1130,14 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
             )
         }
         (
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts: l_starts,
                 domain: l_domain,
                 codomain: l_codomain,
                 domain_predicate: l_pred,
                 deleted: l_deleted,
             },
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts: r_starts,
                 domain: r_domain,
                 codomain: r_codomain,
@@ -1106,10 +1166,7 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
                     RowSource::Both(l_row, r_row) => {
                         let (l_from, l_to) = level_run(l_offsets, *l_row, l_domain.len());
                         let (r_from, r_to) = level_run(r_offsets, *r_row, r_domain.len());
-                        // A key grows only where what it holds can. Under a scalar a
-                        // repeated key is one position delivered twice, so the two stay
-                        // apart for `validate_tile` to report: matching them would turn a
-                        // duplicate delivery into a silently lost value.
+                        // A key matches only where what it holds can grow ([`Tile::merge`]).
                         if l_codomain.holds_a_level() {
                             keys.extend(matched_keys(
                                 l_domain,
@@ -1149,7 +1206,7 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
                 })
                 .map(|(at, _)| at)
                 .collect();
-            Tile::Function {
+            Tile::DataFunction {
                 row_starts: ColumnValue::UInts(starts),
                 domain: combined.select_indices(picked.iter().copied(), picked.len()),
                 codomain: Box::new(merged_rows(l_codomain, r_codomain, &keys)),
@@ -1157,12 +1214,35 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
                 deleted,
             }
         }
-        // An aggregation and a store carry their own completeness rather than standing over
-        // keys, so a row both sides deliver would have to be combined here rather than
-        // picked — which is the aggregate's own accumulate law and the store's merge, and
-        // is not written because no producer grows a key over either.
-        (Tile::Aggregation { .. }, Tile::Aggregation { .. })
-        | (Tile::Store { .. }, Tile::Store { .. }) => {
+        // An aggregation stands over rows without keys of its own. A row one side delivered
+        // is picked, and a row both sides delivered is that row's two contributions folded
+        // by the aggregate's own law, as a whole aggregation's two halves are
+        // ([`Tile::merge`]). A key reaches here from both sides when a record holds the
+        // aggregation beside a level the delivery grew.
+        (Tile::Aggregation { .. }, Tile::Aggregation { .. }) => {
+            if !order
+                .iter()
+                .any(|source| matches!(source, RowSource::Both(..)))
+            {
+                return gathered_rows(left, right, order);
+            }
+            let mut rows = order.iter().map(|source| match *source {
+                RowSource::Left(i) => left.select_rows(&[i]),
+                RowSource::Right(j) => right.select_rows(&[j]),
+                RowSource::Both(i, j) => {
+                    let mut row = left.select_rows(&[i]);
+                    row.merge_part(right.select_rows(&[j]), true);
+                    row
+                }
+            });
+            let mut out = rows.next().expect("a `Both` row is one of the rows");
+            rows.for_each(|row| out.merge_part(row, false));
+            out
+        }
+        // A store carries its own completeness rather than standing over keys, so a row both
+        // sides deliver would have to be combined by the store's merge, which is not written
+        // for a store under a collection because no producer grows a key over one.
+        (Tile::Store { .. }, Tile::Store { .. }) => {
             if !order
                 .iter()
                 .any(|source| matches!(source, RowSource::Both(..)))
@@ -1172,9 +1252,8 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
             assert_eq!(
                 order.len(),
                 1,
-                "a row both sides deliver is combined by that value's own law — the \
-                 aggregate's accumulate, the store's merge — which reaches here only at \
-                 the whole value"
+                "a store row both sides deliver is combined by the store's merge, which is \
+                 written for the whole store only"
             );
             let mut taken = left.clone();
             taken.merge_part(right.clone(), true);
@@ -1186,30 +1265,22 @@ fn merged_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
 
 /// The rows `order` names, taken from whichever side holds each, with no combining — for
 /// the tiles whose rows are picked rather than merged.
+///
+/// The picks are read out of the two sides' rows run together, so the result follows
+/// `order` even where it interleaves the sides.
 fn gathered_rows(left: &Tile, right: &Tile, order: &[RowSource]) -> Tile {
-    let l_rows: Vec<usize> = order
+    let offset = left.rows();
+    let picked: Vec<usize> = order
         .iter()
-        .filter_map(|source| match source {
-            RowSource::Left(i) => Some(*i),
-            _ => None,
+        .map(|source| match *source {
+            RowSource::Left(i) => i,
+            RowSource::Right(j) => offset + j,
+            RowSource::Both(..) => unreachable!("a row both sides deliver is combined, not picked"),
         })
         .collect();
-    let r_rows: Vec<usize> = order
-        .iter()
-        .filter_map(|source| match source {
-            RowSource::Right(j) => Some(*j),
-            _ => None,
-        })
-        .collect();
-    if r_rows.is_empty() {
-        return left.select_rows(&l_rows);
-    }
-    if l_rows.is_empty() {
-        return right.select_rows(&r_rows);
-    }
-    let mut taken = left.select_rows(&l_rows);
-    taken.merge_part(right.select_rows(&r_rows), false);
-    taken
+    let mut combined = left.clone();
+    combined.merge_part(right.clone(), false);
+    combined.select_rows(&picked)
 }
 
 /// One column over the rows `order` names.
@@ -1248,8 +1319,7 @@ fn merged_column(left: &ColumnValue, right: &ColumnValue, order: &[RowSource]) -
 
 /// Two rows' key runs matched into the one run they describe.
 ///
-/// The left run's order is kept and the keys only it holds stay where they are, because a
-/// merge **extends** what is already there; the right run's new keys follow. Keys are
+/// The left run's order is kept and the right run's new keys follow ([`Tile::merge`]). Keys are
 /// unique within a row ([`valid_over`]), so each matches at most one key on the other side
 /// and no ordering between the two runs is assumed — a producer that re-states an enclosing
 /// key delivers its runs interleaved rather than abutting.
@@ -1279,8 +1349,7 @@ fn matched_keys(
 ///
 /// Nothing pins the row count at the top level: a tile there carries its own rows, as a
 /// `Scalar(Union)` stream does when its keys are the column's positions. Every depth below
-/// is pinned — a collection's values stand at its key count, and a record's fields at the
-/// rows the record does — and that pairing is what this checks.
+/// is pinned by the row count [`Tile::DataFunction`] states, which is what this checks.
 pub fn validate_tile(tile: &Tile) -> bool {
     match tile {
         Tile::Scalar(_) => true,
@@ -1292,16 +1361,14 @@ pub fn validate_tile(tile: &Tile) -> bool {
             terminal,
             ..
         } => accumulator.rows() == terminal.len(),
-        Tile::Function { row_starts, .. } => valid_over(tile, row_starts.len()),
+        Tile::DataFunction { row_starts, .. } => valid_over(tile, row_starts.len()),
         Tile::Store { .. } => valid_over(tile, 1),
     }
 }
 
 /// Whether `tile` is well formed as a value vectorized over `rows` rows.
 ///
-/// The three rules, and nothing else: a scalar is one entry per row, a record is its fields
-/// over the same rows, and a collection is one run of keys per row with its values over
-/// those keys.
+/// Checks the row counts [`Tile::DataFunction`] states, and nothing else.
 fn valid_over(tile: &Tile, rows: usize) -> bool {
     match tile {
         // A column that has not arrived is empty rather than `rows` long — what a producer
@@ -1311,7 +1378,7 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
         // in, and combines only the common prefix.
         Tile::Scalar(cv) => cv.is_empty() || cv.len() == rows,
         Tile::Record(fields) => fields.values().all(|t| valid_over(t, rows)),
-        Tile::Function {
+        Tile::DataFunction {
             row_starts,
             domain,
             codomain,
@@ -1321,8 +1388,7 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
             let ColumnValue::UInts(starts) = row_starts else {
                 return false;
             };
-            // A run per row, beginning at 0 and never going backwards — two equal starts
-            // are the row whose group holds nothing — and ending inside `domain`.
+            // A run per row, beginning at 0, non-decreasing, and ending inside `domain`.
             if starts.len() != rows
                 || starts.first().is_some_and(|s| *s != 0)
                 || !starts.windows(2).all(|w| w[0] <= w[1])
@@ -1385,7 +1451,7 @@ mod tests {
 
     /// One enclosing row's group, for a collection of collections.
     fn one_group(row: usize, inner: Vec<usize>, values: Vec<i64>) -> Tile {
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints(vec![row]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0]),
@@ -1436,7 +1502,7 @@ mod tests {
             Predicate::False,
             BitSet::new(),
         );
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints(groups.iter().map(|(k, _)| *k).collect()),
             Box::new(b),
             outer_pred,
@@ -1466,10 +1532,10 @@ mod tests {
     /// count is rejected even though the two levels above it agree.
     #[test]
     fn a_third_level_at_the_wrong_row_count_is_rejected() {
-        let Tile::Function { codomain, .. } = abc() else {
+        let Tile::DataFunction { codomain, .. } = abc() else {
             unreachable!()
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts,
             domain,
             codomain: c,
@@ -1479,7 +1545,7 @@ mod tests {
             unreachable!()
         };
         // `B` keeps its three keys; `C` is rebuilt over two rows instead of three.
-        let Tile::Function {
+        let Tile::DataFunction {
             domain: c_domain,
             codomain: c_values,
             ..
@@ -1487,14 +1553,14 @@ mod tests {
         else {
             unreachable!()
         };
-        let short = Tile::Function {
+        let short = Tile::DataFunction {
             row_starts: ColumnValue::UInts(vec![0, 1]),
             domain: c_domain,
             codomain: c_values,
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
         };
-        let b = Tile::Function {
+        let b = Tile::DataFunction {
             row_starts,
             domain,
             codomain: Box::new(short),
@@ -1531,7 +1597,8 @@ mod tests {
     }
 
     /// A delivery that re-states a key two levels down grows the innermost group, and the
-    /// levels above it keep their keys: the collapse runs at the level that repeated.
+    /// levels above it keep their keys: the merge matches keys at each level down to the one
+    /// that repeated.
     #[test]
     fn merging_three_levels_grows_the_innermost_group() {
         let mut tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::False);
@@ -1555,7 +1622,7 @@ mod tests {
         let mut tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::False);
         tile.merge(three_levels(&[(10, &[(2, &[(200, 2)])])], Predicate::False));
 
-        let Tile::Function { domain, .. } = &tile else {
+        let Tile::DataFunction { domain, .. } = &tile else {
             unreachable!()
         };
         assert_eq!(
@@ -1574,11 +1641,15 @@ mod tests {
         assert!(validate_tile(&tile));
     }
 
-    /// The re-collapse joins a group that grew; it does not absorb a position delivered
+    /// Matching keys joins a group that grew; it does not absorb a position delivered
     /// twice. Two deliveries naming the same innermost key are one position claimed twice,
     /// which the release contract forbids, and the recursion stops at the level whose
     /// values hold none so `valid_over` still sees the repeat.
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "pins the merge's `debug_assert!` on `validate_tile`"
+    )]
     #[should_panic(expected = "Invalid tile after merge")]
     fn merging_three_levels_still_rejects_a_repeated_element() {
         let mut tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::False);
@@ -1686,7 +1757,7 @@ mod tests {
             inner_pred,
             BitSet::new(),
         );
-        Tile::function(
+        Tile::data_function(
             ColumnValue::from_uints(groups.iter().map(|(k, _, _)| *k).collect()),
             Box::new(Tile::Record(HashMap::from([
                 (
@@ -1704,7 +1775,7 @@ mod tests {
 
     /// The record's two fields, as the `n` column and `xs`'s `(domain, codomain)`.
     fn record_fields(tile: &Tile) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
-        let Tile::Function { codomain, .. } = tile else {
+        let Tile::DataFunction { codomain, .. } = tile else {
             panic!("expected a collection, got {tile:?}");
         };
         let Tile::Record(fields) = codomain.as_ref() else {
@@ -1713,7 +1784,7 @@ mod tests {
         let Tile::Scalar(n) = &fields["n"] else {
             panic!("expected a scalar at `n`, got {:?}", fields["n"]);
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = &fields["xs"]
         else {
@@ -1777,7 +1848,7 @@ mod tests {
         tile.remove_guarded(guard);
         tile.compact();
 
-        let Tile::Function { domain, .. } = &tile else {
+        let Tile::DataFunction { domain, .. } = &tile else {
             panic!("expected a collection, got {tile:?}");
         };
         assert_eq!(domain.len(), 2, "the unsettled keys stay: {domain:?}");
@@ -1804,7 +1875,7 @@ mod tests {
             Predicate::False,
         ));
 
-        let Tile::Function { domain, .. } = &tile else {
+        let Tile::DataFunction { domain, .. } = &tile else {
             panic!("expected a collection, got {tile:?}");
         };
         assert_eq!(
@@ -1825,7 +1896,7 @@ mod tests {
 
     /// The other half of that rule: a repeat that re-states the scalar beside the grown
     /// collection has delivered one position twice, and there is no answer for which value
-    /// stands. `join_rows` says so rather than picking.
+    /// stands. `merged_column` says so rather than picking.
     #[test]
     #[should_panic(expected = "restates a scalar beside it")]
     fn a_regrown_key_may_not_restate_the_scalar_beside_it() {
@@ -1875,10 +1946,8 @@ mod tests {
         );
     }
 
-    /// A record ends the chain and is the element, so the collection inside one of its
-    /// fields does not extend the chain: the innermost level is the one the record sits
-    /// under. An operator folding `K ⤇ J ⤇ {a: Int, b: (L ⤇ Int)}` folds `J`'s records,
-    /// and `L` is inside the element it folds.
+    /// The innermost level is the one a record sits under, not a collection in one of its
+    /// fields ([`Tile::holds_a_level`]).
     #[test]
     fn a_record_ends_the_chain_and_is_the_element() {
         assert_eq!(
@@ -1891,7 +1960,7 @@ mod tests {
             Some(0),
             "the record is `K`'s element, so `K` is the innermost level"
         );
-        let nested = Tile::function(
+        let nested = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(record_between_levels(
                 &[(0, Some(1), &[(100, 10)])],
@@ -1908,12 +1977,11 @@ mod tests {
         );
     }
 
-    /// What can still grow looks through a record and stops at an aggregation. A record is
-    /// its fields over the same rows, so a collection in one is a level under the record's
-    /// keys; an aggregation carries `terminal` and answers for itself.
+    /// What can still grow looks through a record and stops at an aggregation
+    /// ([`Tile::holds_a_level`]).
     #[test]
     fn holds_a_level_looks_through_a_record_and_stops_at_an_aggregation() {
-        let collection = Tile::function(
+        let collection = Tile::data_function(
             ColumnValue::from_uints(vec![100]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
             Predicate::False,
@@ -1957,10 +2025,10 @@ mod tests {
         ))));
         tile.compact();
 
-        let Tile::Function { codomain, .. } = &tile else {
+        let Tile::DataFunction { codomain, .. } = &tile else {
             panic!("expected a collection, got {tile:?}");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, deleted, ..
         } = codomain.as_ref()
         else {
@@ -1975,7 +2043,7 @@ mod tests {
     /// collection under a field is as much a level as one under a key.
     #[test]
     fn compacting_reaches_a_record_field() {
-        let mut field = Tile::function(
+        let mut field = Tile::data_function(
             ColumnValue::from_uints(vec![0, 1]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
             Predicate::False,
@@ -1990,7 +2058,7 @@ mod tests {
         let Tile::Record(fields) = &tile else {
             panic!("expected a record, got {tile:?}");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, deleted, ..
         } = &fields["a"]
         else {
@@ -2029,7 +2097,7 @@ mod tests {
         let Tile::Aggregation { accumulator, .. } = &tile else {
             panic!("expected an aggregation, got {tile:?}");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts,
             domain,
             deleted,
@@ -2055,16 +2123,13 @@ mod tests {
         );
     }
 
-    /// A merge **extends** a collection, so a key it already holds is that row's group
-    /// growing rather than a second key. A collection delivered a row at a time re-states
-    /// the row it is adding to, which is the only way a level gains elements under a key
-    /// it already has.
+    /// A re-stated key grows its group rather than repeating ([`Tile::merge`]).
     #[test]
     fn merging_a_row_that_grew_extends_its_group() {
         let mut tile = one_group(0, vec![0], vec![10]);
         tile.merge(one_group(0, vec![1], vec![20]));
 
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = &tile
         else {
@@ -2078,14 +2143,14 @@ mod tests {
         );
     }
 
-    /// A different key is a new row, which is what the merge did before any row could
-    /// grow — so the collapse must not fold two rows that merely sit next to each other.
+    /// A different key is a new row, so the merge keeps two rows that sit next to each other
+    /// apart.
     #[test]
     fn merging_a_new_row_keeps_it_apart() {
         let mut tile = one_group(0, vec![0, 1], vec![10, 20]);
         tile.merge(one_group(1, vec![0], vec![30]));
 
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = &tile
         else {
@@ -2100,15 +2165,15 @@ mod tests {
         );
     }
 
-    /// A row that grows twice collapses each time, so a collection delivered one element
-    /// per pull ends with one key and the whole run under it.
+    /// A row that grows twice matches its key each time, so a collection delivered one
+    /// element per pull ends with one key and the whole run under it.
     #[test]
     fn a_row_that_grows_repeatedly_stays_one_key() {
         let mut tile = one_group(0, vec![0], vec![10]);
         tile.merge(one_group(0, vec![1], vec![20]));
         tile.merge(one_group(0, vec![2], vec![30]));
 
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = &tile
         else {
@@ -2127,10 +2192,14 @@ mod tests {
     /// growth. It is left for the merge's own check to report rather than folded away,
     /// because folding it would turn a duplicate delivery into a silently lost value.
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "pins the merge's `debug_assert!` on `validate_tile`"
+    )]
     #[should_panic(expected = "Invalid tile after merge")]
     fn a_repeated_scalar_key_is_reported_not_folded() {
         let leaf = |v: i64| {
-            Tile::function(
+            Tile::data_function(
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![v]))),
                 Predicate::False,
@@ -2151,7 +2220,7 @@ mod tests {
 
     #[test]
     fn tile_function_true_predicate_is_terminal() {
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![1]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
             Predicate::True,
@@ -2162,7 +2231,7 @@ mod tests {
 
     #[test]
     fn tile_function_false_predicate_not_terminal() {
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::Ints(vec![]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
             Predicate::False,
@@ -2173,7 +2242,7 @@ mod tests {
 
     #[test]
     fn tile_lookup_function_true_predicate_is_terminal() {
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::UInts(vec![]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![]),
@@ -2192,7 +2261,7 @@ mod tests {
 
     /// A one-level function tile mapping `domain` ints to `codomain` ints.
     fn fn_int(domain: Vec<i64>, codomain: Vec<i64>, pred: Predicate) -> Tile {
-        Tile::function(
+        Tile::data_function(
             ColumnValue::Ints(domain),
             Box::new(Tile::Scalar(ColumnValue::Ints(codomain))),
             pred,
@@ -2208,7 +2277,7 @@ mod tests {
         cod: Vec<i64>,
         pred: Predicate,
     ) -> Tile {
-        Tile::function(
+        Tile::data_function(
             ColumnValue::UInts(d1),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(offsets),
@@ -2244,11 +2313,11 @@ mod tests {
     /// A component whose rows disagree with the level above it is not a codomain.
     #[test]
     fn a_collection_component_at_the_wrong_row_count_is_rejected() {
-        let Tile::Function { codomain, .. } = rows_with_a_collection_component() else {
+        let Tile::DataFunction { codomain, .. } = rows_with_a_collection_component() else {
             unreachable!()
         };
         // Built as a literal: the constructor's own check is what this is about.
-        let mismatched = Tile::Function {
+        let mismatched = Tile::DataFunction {
             // One row above, two rows inside the component.
             row_starts: ColumnValue::UInts(vec![0]),
             domain: ColumnValue::UInts(vec![0]),
@@ -2267,7 +2336,7 @@ mod tests {
     fn retaining_a_key_takes_its_group_from_a_collection_component() {
         let mut tile = rows_with_a_collection_component();
         tile.retain_keys(&BitVec::from_fn(2, |i| i == 0));
-        let Tile::Function { codomain, .. } = &tile else {
+        let Tile::DataFunction { codomain, .. } = &tile else {
             unreachable!()
         };
         let Tile::Record(fields) = codomain.as_ref() else {
@@ -2278,7 +2347,7 @@ mod tests {
             Tile::Scalar(ColumnValue::Ints(vec![5])),
             "a column keeps the entry the mask names"
         );
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts,
             domain,
             codomain: inner,
@@ -2299,9 +2368,9 @@ mod tests {
 
     /// A first start above 0 leaves the elements before it under no parent.
     ///
-    /// `level_run` reads a run as `[starts[i], starts[i + 1])`, so nothing reaches them:
-    /// they are neither an empty group, which two equal starts say, nor a removal, which a
-    /// `deleted` bit says.
+    /// `level_run` reads a run as `[starts[i], starts[i + 1])`, so nothing reaches them,
+    /// and they are neither an empty group nor a removed key ([`Tile::DataFunction`]'s
+    /// `row_starts`).
     #[test]
     #[cfg_attr(
         not(debug_assertions),
@@ -2323,7 +2392,7 @@ mod tests {
     /// those keys against the middle level's own keys.
     #[test]
     fn to_guard_names_the_innermost_keys_one_codomain_per_level() {
-        let tile = Tile::function(
+        let tile = Tile::data_function(
             ColumnValue::UInts(vec![0]),
             Box::new(Tile::grouped(
                 ColumnValue::UInts(vec![0]),
@@ -2393,7 +2462,7 @@ mod tests {
     fn merge_function_appends_domain_and_codomain() {
         let mut tile = fn_int(vec![1], vec![10], Predicate::False);
         tile.merge(fn_int(vec![2], vec![20], Predicate::False));
-        let Tile::Function {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = &tile
         else {
@@ -2412,7 +2481,7 @@ mod tests {
         let p2 = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
         let mut tile = fn_int(vec![1], vec![10], p1.clone());
         tile.merge(fn_int(vec![2], vec![20], p2.clone()));
-        let Tile::Function {
+        let Tile::DataFunction {
             domain_predicate, ..
         } = &tile
         else {
@@ -2681,7 +2750,7 @@ mod tests {
         let pred = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
         let mut tile = fn_int(vec![1, 2], vec![10, 20], Predicate::True);
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred)));
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             codomain,
             deleted,
@@ -2723,13 +2792,13 @@ mod tests {
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![11]));
         tile.remove_guarded(inner_release_guard(pred));
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: groups, ..
         } = &tile
         else {
             panic!("expected a collection");
         };
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             codomain,
             deleted,
@@ -2763,13 +2832,13 @@ mod tests {
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![10, 11]));
         tile.remove_guarded(inner_release_guard(pred));
-        let Tile::Function {
+        let Tile::DataFunction {
             codomain: groups, ..
         } = &tile
         else {
             panic!("expected a collection");
         };
-        let Tile::Function { deleted, .. } = groups.as_ref() else {
+        let Tile::DataFunction { deleted, .. } = groups.as_ref() else {
             panic!("expected a collection of collections");
         };
         assert!(deleted.contains(0));
@@ -2792,7 +2861,7 @@ mod tests {
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred)));
-        let Tile::Function {
+        let Tile::DataFunction {
             deleted,
             codomain: groups,
             ..
@@ -2802,7 +2871,7 @@ mod tests {
         };
         assert!(deleted.contains(0), "the named group is marked");
         assert!(!deleted.contains(1), "its sibling is not");
-        let Tile::Function { deleted: inner, .. } = groups.as_ref() else {
+        let Tile::DataFunction { deleted: inner, .. } = groups.as_ref() else {
             panic!("expected a collection of collections");
         };
         assert!(
@@ -2811,7 +2880,7 @@ mod tests {
         );
 
         tile.compact();
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             codomain: groups,
             ..
@@ -2820,7 +2889,7 @@ mod tests {
             panic!("expected a collection");
         };
         assert_eq!(*domain, ColumnValue::UInts(vec![1]), "group 0 is gone");
-        let Tile::Function {
+        let Tile::DataFunction {
             row_starts,
             domain: inner_keys,
             ..
@@ -2884,7 +2953,7 @@ mod tests {
         // The inner level is empty: every entry it holds is logically deleted. The outer
         // is not: the guard never named its keys, because nothing says their groups are
         // complete, and a collection that still knows its keys still knows something.
-        let Tile::Function { codomain, .. } = &tile else {
+        let Tile::DataFunction { codomain, .. } = &tile else {
             unreachable!("a collection stays a collection")
         };
         assert!(
@@ -2909,7 +2978,7 @@ mod tests {
     #[test]
     fn retain_keys_keep_all_is_noop() {
         let mut tile = three_groups();
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_elem(6, true));
@@ -2919,7 +2988,7 @@ mod tests {
     #[test]
     fn retain_keys_keep_none_leaves_every_group_empty() {
         let mut tile = three_groups();
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_elem(6, false));
@@ -2939,7 +3008,7 @@ mod tests {
     fn retain_keys_keep_entire_first_group() {
         let mut tile = three_groups();
         // Keep positions 0,1 (group 10); groups 20 and 30 are left empty.
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i < 2));
@@ -2958,7 +3027,7 @@ mod tests {
     #[test]
     fn retain_keys_keep_entire_middle_group() {
         let mut tile = three_groups();
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| (2..5).contains(&i)));
@@ -2977,7 +3046,7 @@ mod tests {
     #[test]
     fn retain_keys_keep_entire_last_group() {
         let mut tile = three_groups();
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i == 5));
@@ -2996,7 +3065,7 @@ mod tests {
     #[test]
     fn retain_keys_drop_entire_middle_group() {
         let mut tile = three_groups();
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| !(2..5).contains(&i)));
@@ -3016,7 +3085,7 @@ mod tests {
     fn retain_keys_partial_mask_within_group() {
         let mut tile = three_groups();
         // One survivor in each of groups 10 and 20; group 30 keeps nothing.
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i == 1 || i == 3));
@@ -3036,7 +3105,7 @@ mod tests {
     fn retain_keys_partial_mask_empties_the_groups_it_clears() {
         let mut tile = three_groups();
         // Keep d2[2] and d2[4] (both in group 20); groups 10 and 30 are left empty.
-        let Tile::Function { codomain, .. } = &mut tile else {
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
             unreachable!("three_groups is a collection of collections")
         };
         codomain.retain_keys(&BitVec::from_fn(6, |i| i == 2 || i == 4));
@@ -3049,6 +3118,123 @@ mod tests {
                 vec![200, 220],
                 Predicate::False
             )
+        );
+    }
+
+    /// `Sum` accumulators, one row per key, each row already terminal.
+    fn sums(acc: Vec<i64>) -> Tile {
+        let rows = acc.len();
+        Tile::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Box::new(Tile::Scalar(ColumnValue::Ints(acc))),
+            terminal: ColumnValue::Bools(BitVec::from_elem(rows, true)),
+        }
+    }
+
+    /// The accumulator column of the aggregation at `level`.
+    fn accumulated(tile: &Tile, level: usize) -> ColumnValue {
+        let Tile::Aggregation { accumulator, .. } = tile.values_at(level) else {
+            panic!("expected an aggregation at level {level}: {tile:?}");
+        };
+        let Tile::Scalar(column) = accumulator.as_ref() else {
+            panic!("expected a column accumulator: {accumulator:?}");
+        };
+        column.clone()
+    }
+
+    /// A delivery of new keys over aggregations appends one accumulator per key, and
+    /// folds none of them into another.
+    #[test]
+    fn merging_new_keys_over_aggregations_keeps_one_accumulator_each() {
+        let mut tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(sums(vec![10, 20])),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.merge(Tile::data_function(
+            ColumnValue::from_uints(vec![2]),
+            Box::new(sums(vec![30])),
+            Predicate::False,
+            BitSet::new(),
+        ));
+        assert!(validate_tile(&tile), "{tile:?}");
+        assert_eq!(accumulated(&tile, 1), ColumnValue::Ints(vec![10, 20, 30]));
+    }
+
+    /// Two outer keys both grown: the inner keys interleave the two sides, `0`'s old and
+    /// new keys and then `1`'s, and each aggregation follows its own key.
+    #[test]
+    fn merging_interleaved_rows_over_aggregations_keeps_each_with_its_key() {
+        let two_groups = |inner: usize, acc: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::grouped(
+                    ColumnValue::UInts(vec![0, 1]),
+                    ColumnValue::from_uints(vec![inner, inner]),
+                    Box::new(sums(acc)),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let mut tile = two_groups(100, vec![1, 3]);
+        tile.merge(two_groups(200, vec![2, 4]));
+        assert!(validate_tile(&tile), "{tile:?}");
+        assert_eq!(
+            tile.values_at(1)
+                .key_paths(&[vec![Value::UInt(0)], vec![Value::UInt(1)]]),
+            vec![
+                vec![Value::UInt(0), Value::UInt(100)],
+                vec![Value::UInt(0), Value::UInt(200)],
+                vec![Value::UInt(1), Value::UInt(100)],
+                vec![Value::UInt(1), Value::UInt(200)],
+            ]
+        );
+        assert_eq!(accumulated(&tile, 2), ColumnValue::Ints(vec![1, 2, 3, 4]));
+    }
+
+    /// An aggregation beside a level the delivery grew is one row both sides delivered, at
+    /// every key they share, and folds its two contributions by the aggregate's law.
+    #[test]
+    fn a_regrown_key_folds_the_aggregation_beside_it() {
+        let keyed = |xs: usize, acc: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::Record(HashMap::from([
+                    ("agg".to_string(), sums(acc)),
+                    (
+                        "xs".to_string(),
+                        Tile::grouped(
+                            ColumnValue::UInts(vec![0, 1]),
+                            ColumnValue::from_uints(vec![xs, xs]),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                            Predicate::False,
+                            BitSet::new(),
+                        ),
+                    ),
+                ]))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let mut tile = keyed(100, vec![1, 10]);
+        tile.merge(keyed(200, vec![2, 20]));
+        assert!(validate_tile(&tile), "{tile:?}");
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            panic!("expected a collection: {tile:?}");
+        };
+        let Tile::Record(fields) = codomain.as_ref() else {
+            panic!("expected a record: {codomain:?}");
+        };
+        let Tile::Aggregation { accumulator, .. } = &fields["agg"] else {
+            panic!("expected an aggregation: {fields:?}");
+        };
+        assert_eq!(
+            accumulator.as_ref(),
+            &Tile::Scalar(ColumnValue::Ints(vec![3, 30]))
         );
     }
 }

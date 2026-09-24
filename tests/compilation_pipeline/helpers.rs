@@ -144,7 +144,7 @@ pub fn check_compile_error(code: &str, needle: &str) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn make_int_list(v: &[i64]) -> Tile {
-    Tile::function(
+    Tile::data_function(
         ColumnValue::UInts((0..v.len()).collect()),
         Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
         Predicate::True,
@@ -171,7 +171,7 @@ pub(crate) fn make_record(fields: &[(&str, Value)]) -> Value {
 
 /// Extract a single named field from the record values of a collection tile.
 pub(crate) fn extract_record_field(tile: Tile, field: &str) -> ColumnValue {
-    let Tile::Function { codomain, .. } = tile else {
+    let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected a collection, got {tile:?}");
     };
     let Tile::Record(mut fields) = *codomain else {

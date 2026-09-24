@@ -90,7 +90,7 @@ fn test_comp_with_record_body() {
 )]
 #[case(
     r#"[r.y for r in [(x=1, y="a"), (x=2, y="b"), (x=3, y="c")]]"#,
-    Tile::function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Strings(vec![
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Scalar(ColumnValue::Strings(vec![
             "a".into(),
             "b".into(),
             "c".into(),
@@ -107,7 +107,7 @@ fn test_comp_filter_on_record_field() {
     let tile = sort_function_by_domain(run_pipeline(
         r#"[r.name for r in [(name="alice", age=30), (name="bob", age=17), (name="carol", age=25)] if r.age >= 18]"#,
     ));
-    let Tile::Function { codomain, .. } = tile else {
+    let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected Function");
     };
     assert_eq!(
@@ -245,7 +245,7 @@ fn test_datasource_named_record_join() {
 
     let tile = sort_function_by_domain(producer.get(producer.tiling().universal_guard()));
     // Only (id=1, "a") × (id=1, "x") should match
-    let Tile::Function { codomain, .. } = tile else {
+    let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected Function, got {tile:?}");
     };
     let Tile::Record(mut fields) = *codomain else {

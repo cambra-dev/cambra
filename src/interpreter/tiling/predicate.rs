@@ -670,7 +670,7 @@ where
     Predicate::Intervals(IntervalSet::new_unchecked(intervals))
 }
 
-/// Sort a `Tile::Function` by its domain values for deterministic comparison.
+/// Sort a `Tile::DataFunction` by its domain values for deterministic comparison.
 ///
 /// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all
 /// other tile forms are returned unchanged.  This is needed wherever key order
@@ -687,7 +687,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
         let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
         pairs.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
         let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
-        Tile::function(
+        Tile::data_function(
             mk_domain(sorted_d),
             Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
             domain_predicate,
@@ -704,7 +704,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
     }
 
     match tile {
-        Tile::Function {
+        Tile::DataFunction {
             row_starts,
             domain,
             codomain,
@@ -749,7 +749,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
                     });
                     let domain = ColumnValue::Union(canonical);
                     domain.debug_assert_union_invariants();
-                    Tile::function(
+                    Tile::data_function(
                         domain,
                         Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod))),
                         domain_predicate,
@@ -757,7 +757,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
                     )
                 }
                 (other_codomain, domain) => {
-                    Tile::function(domain, Box::new(other_codomain), domain_predicate, deleted)
+                    Tile::data_function(domain, Box::new(other_codomain), domain_predicate, deleted)
                 }
             }
         }

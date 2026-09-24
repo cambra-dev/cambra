@@ -422,7 +422,7 @@ impl DataSink for HttpServerSharedState {
     /// lock, then releases the lock and sends each response outside of it so that
     /// HTTP I/O does not block other threads waiting on the pending map.
     fn process(&self, tile: &Tile) {
-        let Tile::Function {
+        let Tile::DataFunction {
             domain,
             codomain,
             deleted,

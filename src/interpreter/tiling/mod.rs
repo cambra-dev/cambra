@@ -44,12 +44,15 @@ pub(super) mod tests {
 
     /// A one-level function tiling over a scalar codomain.
     pub(crate) fn scalar_function(domain: Extent, codomain: Extent) -> Tiling {
-        Tiling::function(domain, Tiling::Scalar(codomain))
+        Tiling::data_function(domain, Tiling::Scalar(codomain))
     }
 
     /// A two-level tiling, the shape most callers want.
     pub(crate) fn two_level(outer: Extent, inner: Extent, codomain: Extent) -> Tiling {
-        Tiling::function(outer, Tiling::function(inner, Tiling::Scalar(codomain)))
+        Tiling::data_function(
+            outer,
+            Tiling::data_function(inner, Tiling::Scalar(codomain)),
+        )
     }
 
     pub(crate) fn record_tiling(fields: &[(&str, Tiling)]) -> Tiling {

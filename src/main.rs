@@ -156,7 +156,7 @@ fn run_program(
 
         let release_guard = match &tile {
             Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
-            Tile::Function {
+            Tile::DataFunction {
                 domain_predicate, ..
             } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
             other => panic!("Unexpected top-level tile shape: {other:?}"),
@@ -169,7 +169,7 @@ fn run_program(
         // Producers can return empty tiles, but still have more data.
         let is_empty = match &tile {
             Tile::Scalar(cv) => cv.is_empty(),
-            Tile::Function { domain, .. } => domain.is_empty(),
+            Tile::DataFunction { domain, .. } => domain.is_empty(),
             _ => false,
         };
         if !is_empty || done {

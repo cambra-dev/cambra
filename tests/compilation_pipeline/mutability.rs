@@ -177,7 +177,7 @@ for j in [4, 5]:
     x := x + j
     o << x
 o"#,
-    Tile::function(
+    Tile::data_function(
         // Tags map each domain entry to its source variant: index 0 (pre-loop
         // feed of `x = 0`) → variant 0; indices 1-3 (loop1 running sums) →
         // variant 1; indices 4-5 (loop2 running sums) → variant 2.
@@ -281,7 +281,7 @@ for i in [1, 2, 3]:
     o << x
     o << x + 100
 o"#,
-    Tile::function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
+    Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
@@ -303,7 +303,7 @@ for i in [1, 2, 3]:
     x := x + i
     o << x * 10
 o"#,
-    Tile::function(ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2, 2], vec![
+    Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
@@ -435,7 +435,7 @@ for i in [10, 20, 30]:
     if i > 15:
         o << i
 o"#,
-    Tile::function(ColumnValue::from_uints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::from_uints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30]))), Predicate::True, BitSet::new())
 )]
 // A **conditional write** with an unconditional feed after it: `cnt` increments
 // only when `i > 15`, and `o << cnt` fires every position. The post-`if` feed
@@ -451,7 +451,7 @@ for i in [10, 20, 30]:
         cnt := cnt + 1
     o << cnt
 o"#,
-    Tile::function(ColumnValue::positional_union(&[0, 0, 1], vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1], vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // A full `if/else` write with a trailing feed: each position takes exactly one
 // arm (`i < 2` → `x += i`, else `x += 100`) and feeds the post-arm `x`. The two
@@ -468,7 +468,7 @@ for i in [0, 1, 2, 3]:
         x := x + 100
     o << x
 o"#,
-    Tile::function(ColumnValue::positional_union(&[0, 0, 1, 1], vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+    Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1], vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // A `mut` accumulator over a **filtered** source. `restrict` keeps an element at
 // its original position, so `kept`'s domain is the subset `{1, 2}` of the
@@ -533,7 +533,7 @@ o"#,
             n := n + l
             o << n
         o"#},
-    Tile::function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 7, 12]))), Predicate::True, BitSet::new())
+    Tile::data_function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 7, 12]))), Predicate::True, BitSet::new())
 )]
 #[ignore] // TODO support nested loops with mutations.
 #[case(

@@ -625,7 +625,7 @@ fn test_default_only_match_still_types_its_scrutinee() {
 ///
 /// A `def` whose body matches on its parameter is a UDF with a non-enumerable
 /// domain, so it must be *inlined at its call sites* rather than tabulated: op
-/// conversion materialises a `let`-bound function as a `Function` table by
+/// conversion materialises a `let`-bound function as a `DataFunction` table by
 /// enumerating its domain, and a variant of `Int` has no enumeration. The applied
 /// argument then threads in as the fan-out's input, which is what `Apply` already
 /// does for every other morphism.
