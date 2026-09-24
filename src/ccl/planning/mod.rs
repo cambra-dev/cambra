@@ -37,6 +37,7 @@ use crate::ccl::{
 
 mod conditionals;
 mod const_fold;
+mod correlated;
 mod groupby;
 mod iterate;
 mod join;
@@ -102,6 +103,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // predicate compilation — sees one shape rather than needing a `Case` case.
     let discharged = conditionals::realize_conditional_collections(&mut expr);
     groupby::recognize_groupby_sites(&mut expr);
+    correlated::name_correlated_sources(&mut expr);
     let mut expr = simplify(expr);
     // Constant-fold before the iteration walk so a collection literal's elements are
     // already values when op conversion reads them. It runs after `simplify` because

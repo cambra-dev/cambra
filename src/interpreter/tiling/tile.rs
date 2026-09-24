@@ -872,8 +872,13 @@ impl Tile {
         Some(codomain.innermost_depth().map_or(0, |below| below + 1))
     }
 
-    /// The innermost collection of this chain, to write through
-    /// ([`Self::innermost_depth`]).
+    /// The innermost collection of this chain ([`Self::innermost_depth`]).
+    pub fn innermost_level(&self) -> Option<&Tile> {
+        let depth = self.innermost_depth()?;
+        Some(self.values_at(depth))
+    }
+
+    /// [`Self::innermost_level`], to write through.
     pub fn innermost_level_mut(&mut self) -> Option<&mut Tile> {
         let depth = self.innermost_depth()?;
         Some(self.values_at_mut(depth))
@@ -978,6 +983,51 @@ impl Tile {
             }));
         }
         paths
+    }
+
+    /// This collection with `level` appended below its innermost one.
+    ///
+    /// `level` builds that level out of the values the tile arrives with, which is the data
+    /// the new level is made of: a pairing repeats each row's value across the group it
+    /// opens, and a column of collection values holds each row's own keys. The values are
+    /// replaced rather than kept, because the arriving ones carry an entry per key of what
+    /// is now the level above and the new ones carry an entry per key of the level below.
+    ///
+    /// An operator that appends a level is closed under its own output — a collection is
+    /// the base case and each append gives another — which is what lets correlated
+    /// comprehensions nest to any depth.
+    ///
+    /// **Every group the level names is whole.** A key's group is one contiguous run of the
+    /// level below, so no later tile can add to it: [`Tile::merge`] runs whole subtrees
+    /// together under new keys and never reaches inside an existing group. A caller holding
+    /// part of a group has nothing to append yet. The outermost `domain_predicate` follows
+    /// from that — every key present is final together with every level beneath it, unioned
+    /// with the region the arriving tile already called final.
+    pub fn append_level(mut self, level: impl FnOnce(Tile) -> Tile) -> Tile {
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &mut self
+        else {
+            panic!("append_level expects a collection tile, got {self:?}")
+        };
+        *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+        let slot = self.deepest_values_mut();
+        let built = level(std::mem::replace(slot, Tile::Record(HashMap::new())));
+        // The appended level states nothing complete and has removed nothing: terminality
+        // rides the outermost `domain_predicate` updated above, and a level that has just
+        // been built cannot have had a key taken from it.
+        assert!(
+            matches!(
+                &built,
+                Tile::DataFunction { domain_predicate: Predicate::False, deleted, .. }
+                    if deleted.is_empty()
+            ),
+            "an appended level names no complete keys and has removed nothing: {built:?}"
+        );
+        *slot = built;
+        self
     }
 
     /// The guard naming what this tile **holds**, with no allowance for what it has been
@@ -2452,6 +2502,144 @@ mod tests {
             TileGuard::Or(arms) => arms.iter().find_map(codomain_arm),
             _ => None,
         }
+    }
+
+    // ── Tile::append_level ────────────────────────────────────────────────────
+
+    /// Two keys per parent, so a level is built without the test restating the layout.
+    fn two_keys_per_parent(codomain: Tile) -> Tile {
+        let Tile::Scalar(values) = codomain else {
+            unreachable!("the test tiles carry scalar codomains")
+        };
+        let rows = values.len();
+        Tile::grouped(
+            ColumnValue::UInts((0..rows).map(|r| r * 2).collect()),
+            ColumnValue::UInts((0..rows * 2).map(|i| i % 2).collect()),
+            Box::new(Tile::Scalar(
+                values.select_indices((0..rows * 2).map(|i| i / 2), rows * 2),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    #[test]
+    fn append_level_reads_a_one_level_function() {
+        let appended =
+            fn_int(vec![7, 8], vec![70, 80], Predicate::False).append_level(two_keys_per_parent);
+        let levels = appended.key_levels();
+        assert_eq!(levels.len(), 2, "the input's keys are the level above");
+        assert_eq!(*levels[0].1, ColumnValue::Ints(vec![7, 8]));
+        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 1, 0, 1]));
+    }
+
+    #[test]
+    fn append_level_is_closed_under_its_own_output() {
+        let twice = fn_int(vec![7, 8], vec![70, 80], Predicate::False)
+            .append_level(two_keys_per_parent)
+            .append_level(two_keys_per_parent);
+        let levels = twice.key_levels();
+        assert_eq!(levels.len(), 3, "each append adds one level");
+        assert_eq!(
+            *levels[1].0,
+            ColumnValue::UInts(vec![0, 2]),
+            "level 0 is untouched"
+        );
+        assert_eq!(*levels[2].0, ColumnValue::UInts(vec![0, 2, 4, 6]));
+        assert_eq!(levels[2].1.len(), 8);
+    }
+
+    #[test]
+    fn append_level_keeps_removals_at_the_level_that_named_them() {
+        let mut row_gone = BitSet::new();
+        row_gone.insert(1);
+        let one_level = Tile::data_function(
+            ColumnValue::Ints(vec![7, 8]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![70, 80]))),
+            Predicate::False,
+            row_gone.clone(),
+        );
+        let appended = one_level
+            .append_level(two_keys_per_parent)
+            .append_level(two_keys_per_parent);
+        let Tile::DataFunction {
+            deleted,
+            codomain: level1,
+            ..
+        } = &appended
+        else {
+            panic!("appending a level leaves a collection, got {appended:?}")
+        };
+        // The bit names a key of the level that owns it, and appending beneath that key does
+        // not move it: each level carries its own removals.
+        assert_eq!(*deleted, row_gone);
+        let Tile::DataFunction {
+            deleted: d1,
+            codomain: level2,
+            ..
+        } = level1.as_ref()
+        else {
+            panic!("two appends leave three levels")
+        };
+        let Tile::DataFunction { deleted: d2, .. } = level2.as_ref() else {
+            panic!("two appends leave three levels")
+        };
+        assert!(
+            d1.is_empty() && d2.is_empty(),
+            "an appended level has removed nothing"
+        );
+    }
+
+    #[test]
+    fn append_level_calls_every_key_present_final() {
+        let appended =
+            fn_int(vec![7, 8], vec![70, 80], Predicate::False).append_level(two_keys_per_parent);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &appended
+        else {
+            panic!("appending a level leaves a collection, got {appended:?}")
+        };
+        // The level is whole for every parent it names, so each key present is done —
+        // whether further keys arrive stays the region the input claimed.
+        assert!(
+            domain_predicate.contains(&Value::Int(7)) && domain_predicate.contains(&Value::Int(8))
+        );
+        assert!(!domain_predicate.contains(&Value::Int(9)));
+    }
+
+    #[test]
+    fn append_level_gives_a_parent_with_no_keys_two_equal_starts() {
+        let empty_middle = |codomain: Tile| {
+            let Tile::Scalar(values) = codomain else {
+                unreachable!("the test tile carries a scalar codomain")
+            };
+            Tile::grouped(
+                ColumnValue::UInts(vec![0, 1, 1]),
+                ColumnValue::UInts(vec![0, 0]),
+                Box::new(Tile::Scalar(values.select_indices([0, 2].into_iter(), 2))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let appended =
+            fn_int(vec![7, 8, 9], vec![70, 80, 90], Predicate::False).append_level(empty_middle);
+        let Tile::DataFunction { codomain, .. } = &appended else {
+            panic!("appending a level leaves a collection, got {appended:?}")
+        };
+        let Tile::DataFunction {
+            row_starts, domain, ..
+        } = codomain.as_ref()
+        else {
+            panic!("the appended level is a collection")
+        };
+        assert_eq!(*row_starts, ColumnValue::UInts(vec![0, 1, 1]));
+        assert_eq!(
+            domain.len(),
+            2,
+            "the middle key holds nothing, and is present"
+        );
     }
 
     /// Build a TileGuard for releasing the inner keys described by `pred` from a collection.

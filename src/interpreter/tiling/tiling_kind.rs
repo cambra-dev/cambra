@@ -271,6 +271,32 @@ impl Tiling {
         }
     }
 
+    /// This collection tiling with a level appended below its innermost one — the shape
+    /// [`Tile::append_level`] gives the tiles.
+    ///
+    /// A collection is the base case, so an operator that appends a level tiles one deeper
+    /// than its input at whatever depth it arrives, and is closed under its own output.
+    pub fn append_level(&self, domain: Extent, codomain: Tiling) -> Tiling {
+        match self {
+            Tiling::DataFunction {
+                domain: outer,
+                codomain: inner,
+            } if inner.is_data_function() => Tiling::DataFunction {
+                domain: outer.clone(),
+                codomain: Box::new(inner.append_level(domain, codomain)),
+            },
+            // The innermost collection: the new level takes the place of its values.
+            Tiling::DataFunction { domain: outer, .. } => Tiling::DataFunction {
+                domain: outer.clone(),
+                codomain: Box::new(Tiling::DataFunction {
+                    domain,
+                    codomain: Box::new(codomain),
+                }),
+            },
+            other => panic!("append_level expects a collection tiling, got {other}"),
+        }
+    }
+
     /// Helper to create a tuple tiling, i.e. a Record tiling where all fields are from `tuple_field`
     pub fn tuple(tilings: &[Tiling]) -> Tiling {
         Tiling::Record(
@@ -637,5 +663,31 @@ mod tests {
         }
         .to_string();
         assert!(s.starts_with("agg("), "expected 'agg(' in '{s}'");
+    }
+
+    // ── Tiling::append_level ──────────────────────────────────────────────────
+
+    #[test]
+    fn append_level_reads_a_one_level_collection_as_the_base_case() {
+        let deeper =
+            scalar_function(int(), bool_ext()).append_level(range(4), Tiling::Scalar(bool_ext()));
+        assert_eq!(deeper, two_level(int(), range(4), bool_ext()));
+    }
+
+    #[test]
+    fn append_level_is_closed_under_its_own_output() {
+        let deeper =
+            two_level(int(), range(4), bool_ext()).append_level(int(), Tiling::Scalar(int()));
+        assert_eq!(
+            deeper,
+            Tiling::data_function(
+                int(),
+                Tiling::data_function(
+                    range(4),
+                    Tiling::data_function(int(), Tiling::Scalar(int()))
+                )
+            ),
+            "the new level is innermost"
+        );
     }
 }
