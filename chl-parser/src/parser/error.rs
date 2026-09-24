@@ -26,8 +26,8 @@ use std::fmt;
 use ariadne::{Color, Config, Label, Report, ReportKind, Source};
 use chumsky::error::{Rich, RichPattern, RichReason};
 
-use crate::chl_parser::ast::Span;
-use crate::chl_parser::lexer::{LexError, Token};
+use crate::ast::Span;
+use crate::lexer::{LexError, Token};
 
 /// Errors produced by [`parse_module`](super::parse_module) /
 /// [`parse_expression`](super::parse_expression).
@@ -159,8 +159,8 @@ impl fmt::Display for ParseError {
 ///
 /// Carries *both* a (possibly partial) AST and a list of errors, so callers
 /// can take advantage of error recovery: when a syntax error is hit, the
-/// parser inserts an [`Expr::Error`](crate::chl_parser::ast::Expr::Error) or
-/// [`Stmt::Error`](crate::chl_parser::ast::Stmt::Error) placeholder, records
+/// parser inserts an [`Expr::Error`](crate::ast::Expr::Error) or
+/// [`Stmt::Error`](crate::ast::Stmt::Error) placeholder, records
 /// the error, and keeps going. A file with three independent syntax errors
 /// produces a `value: Some(_)` AST with three `Error` holes and a `errors`
 /// vector of length three — all reported in one pass.
