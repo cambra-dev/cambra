@@ -531,6 +531,35 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
+/// A terminal read inside a conditional's test. The test compiles to a refinement predicate
+/// on the branch domain, so the read sits in a type slot rather than in the term — the
+/// position `rewrite_txn_reads` walks.
+#[test]
+fn a_terminal_read_in_a_conditional_test() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [1, 2]:
+            with begin():
+                pool := pool - r
+        out << (1 if await_final(pool) > 90 else 0)
+    "#});
+}
+
+/// The same read against a threshold the final value does not clear, so the two sides agree
+/// on the branch *not* taken. Without it a predicate the compiler dropped would still agree.
+#[test]
+fn a_terminal_read_in_a_conditional_test_that_fails() {
+    agree(indoc! {r#"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in [1, 2]:
+            with begin():
+                pool := pool - r
+        out << (1 if await_final(pool) > 990 else 0)
+    "#});
+}
+
 /// Read-your-writes: a read after a write in the same block sees it.
 #[test]
 fn read_your_writes_within_a_block() {

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{commit_payload_ty, count_free},
+    ccl_utils::{PredMemo, commit_payload_ty, count_free, walk_refined_predicates_mut},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, tvar},
     provenance,
@@ -548,6 +548,16 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     let hist = Name::fresh("__hist");
     let mut body = body;
     rewrite_txn_reads(&mut body, &hist, &hist_ty, &read_map);
+    // A reference inside a refinement predicate is a reference. The wall below counts with
+    // `count_free`, which walks every type slot; the term walk above walks none, so a
+    // predicate holding a transactional read reads as a dangling binding. A predicate holds
+    // one whenever such a read reaches a position whose domain the read refines — a terminal
+    // read in a conditional's test is one. Rebuilding a predicate mints node ids, so the
+    // rebuilding walk runs only once the term walk has left something behind.
+    if binding_names.iter().any(|n| count_free(n, &body) > 0) {
+        let memo = PredMemo::new();
+        rewrite_txn_reads_in_predicates(&mut body, &hist, &hist_ty, &read_map, &memo);
+    }
     collapse_snapshot_sources(&mut body, &hist, &hist_ty);
     for n in &binding_names {
         assert_eq!(
@@ -586,6 +596,31 @@ fn rewrite_txn_reads(
         return;
     }
     e.walk_children_mut(|c| rewrite_txn_reads(c, hist, hist_ty, read_map));
+}
+
+/// Rewrite every history / tap binding reference sitting in a **refinement predicate**
+/// reachable from the continuation's type slots, which [`rewrite_txn_reads`] does not reach.
+///
+/// Recurses into each rebuilt predicate's own type slots: a predicate is an `Expr` and
+/// carries types like any other.
+fn rewrite_txn_reads_in_predicates(
+    e: &mut Expr,
+    hist: &Name,
+    hist_ty: &Type,
+    read_map: &HashMap<Name, (String, Type)>,
+    memo: &PredMemo<()>,
+) {
+    e.walk_type_slots_mut(|ty| {
+        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            let held = read_map.keys().any(|n| count_free(n, pred) > 0);
+            if held {
+                rewrite_txn_reads(pred, hist, hist_ty, read_map);
+                rewrite_txn_reads_in_predicates(pred, hist, hist_ty, read_map, memo);
+            }
+            held
+        });
+    });
+    e.walk_children_mut(|c| rewrite_txn_reads_in_predicates(c, hist, hist_ty, read_map, memo));
 }
 
 /// Collapse a multi-variable as-of read\'s snapshot source: the pre-elim
