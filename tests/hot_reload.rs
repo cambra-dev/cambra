@@ -130,6 +130,8 @@
 // the gallery's HTTP and scheduler glue, compiled into this binary too.
 #[path = "hot_reload/cases.rs"]
 mod cases;
+#[path = "hot_reload/fanout_lag.rs"]
+mod fanout_lag;
 #[path = "hot_reload/harness.rs"]
 mod harness;
 #[path = "support/serving.rs"]
