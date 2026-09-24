@@ -1,15 +1,9 @@
 //! [`TestSink`]: a sink that keeps what a program wrote to it, readable as a [`Value`].
 //!
-//! Every sink turns tiles into external effects. [`HttpServerSharedState`] does it for one
-//! shape — a `UInt` key column carrying `String` values — because that is the only shape an
-//! HTTP response can be. A test observes programs of every shape, so this one reads a tile
-//! generically, and reports a shape it cannot read rather than writing nothing.
-//!
-//! A tile carries no types, so a key of type `Txn`, a commit time, reads as a `UInt` like an
-//! iteration position does. The sink's static type is the field named after it in the
-//! compiled program's type (`CompiledProgram::ast`), which is what tells the two apart.
-//!
-//! [`HttpServerSharedState`]: crate::interpreter::http_server::HttpServerSharedState
+//! It reads a tile of any shape and reports one it cannot read as a [`SinkReadError`]. A tile
+//! carries no types, so a `Txn` key, a commit time, reads as a `UInt` like an iteration
+//! position; the sink's field in the compiled program's type (`CompiledProgram::ast`) tells the
+//! two apart.
 
 use std::sync::Mutex;
 
@@ -25,16 +19,11 @@ pub enum SinkReadError {
     /// Distinct from [`Self::NothingWritten`], and both are distinct from an empty
     /// collection, which is a complete value.
     Incomplete,
-    /// A tiling that cannot reach a sink arrived at one.
-    ///
-    /// Not a gap in this reader: an aggregation in progress and a transactional store are
-    /// interior states, and a sink is handed the value they are folded into. Reporting it
-    /// is how a compiler bug that routes one here stops being silent — a sink that answered
-    /// "nothing" would be indistinguishable from a program that wrote nothing.
+    /// An aggregation in progress or a transactional store arrived at the sink. A program
+    /// writes out the value either is folded into, so this is a compiler bug.
     NotASinkTiling(String),
     /// The tile contradicts its own shape (a column shorter than its row count, a
-    /// `row_starts` that runs backwards, a key delivered twice). An invariant break
-    /// upstream, not a gap here.
+    /// `row_starts` that runs backwards, a key delivered twice): a broken invariant upstream.
     Malformed(String),
 }
 
@@ -57,7 +46,7 @@ impl std::fmt::Display for SinkReadError {
 /// in a debug build, so [`Self::value`] validates the accumulated tile before reading it.
 #[derive(Default)]
 pub struct TestSink {
-    // shared-state-ok: the observation boundary, not the operator graph. A sink is a
+    // shared-state-ok: the I/O boundary, not the operator graph. A sink is a
     // terminal consumer — nothing reads this back into the graph, so no value crosses it
     // between operators — and `DataSink::process` takes `&self`, so a cell is what lets a
     // sink hold what it was handed. Same category as the HTTP sink's pending map.
@@ -89,9 +78,8 @@ impl DataSink for TestSink {
     }
 }
 
-/// Read a tile as `rows` values — the model its own definition states: *a tile is a value of
-/// its type vectorized over `R` rows*, where `R` is 1 at the top level and a collection's key
-/// count beneath one.
+/// Read a tile as `rows` values. A tile is a value of its type vectorized over its rows: one
+/// at the top level, and a collection's key count beneath one.
 fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
     match tile {
         Tile::Scalar(cv) => {
@@ -158,9 +146,8 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
                 .collect())
         }
 
-        // Neither reaches a sink: an aggregation is a fold in progress and a store is a step
-        // function over commit time, and what a program writes out is the value each is read
-        // into.
+        // A program writes out the value an aggregation or a store is read into, never either
+        // one itself.
         Tile::Aggregation { .. } => Err(SinkReadError::NotASinkTiling(
             "an aggregation accumulator".to_string(),
         )),
@@ -235,6 +222,42 @@ mod tests {
             BitSet::new(),
         );
         assert_eq!(read(tile), Err(SinkReadError::Incomplete));
+    }
+
+    /// An aggregation or a store reaching a sink is refused as one, at the top level and as
+    /// a collection's values alike.
+    #[test]
+    fn a_fold_or_a_store_is_not_a_sink_tiling() {
+        let aggregation = || Tile::Aggregation {
+            kind: crate::ccl::AggregateKind::Sum,
+            accumulator: ints(vec![6]),
+            terminal: ColumnValue::Bools(bit_vec::BitVec::from_elem(1, true)),
+        };
+        let store = Tile::Store {
+            changes: ColumnValue::from_uints(vec![]),
+            deltas: ColumnValue::from_ints(vec![]),
+            frontier: Predicate::True,
+            terminal: true,
+            closed_keys: vec![],
+        };
+        assert!(matches!(
+            tile_rows(&aggregation(), 1),
+            Err(SinkReadError::NotASinkTiling(_))
+        ));
+        assert!(matches!(
+            tile_rows(&store, 1),
+            Err(SinkReadError::NotASinkTiling(_))
+        ));
+        let nested = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(aggregation()),
+            Predicate::True,
+            BitSet::new(),
+        );
+        assert!(matches!(
+            tile_rows(&nested, 1),
+            Err(SinkReadError::NotASinkTiling(_))
+        ));
     }
 
     #[test]

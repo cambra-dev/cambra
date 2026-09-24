@@ -380,6 +380,8 @@ fn lower_for_body_stmts_scoped(
             // A type alias binds nothing, so it contributes no `Let` to the frame.
             ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => {}
             ChlStmt::Assign { target, value } => {
+                #[cfg(any(test, feature = "test-helpers"))]
+                refuse_nested_test_sink(target, value, stmt.span)?;
                 let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));

@@ -108,6 +108,7 @@ pub(super) fn lower_stmts_recovering(
     if ctx.sink_bindings.is_empty() {
         return Some(body);
     }
+    errors.extend(sink_rebindings(stmts, ctx));
 
     // Build a Record whose fields are the sink-bound names in sorted order
     // (sort for determinism — HashMap iteration is unordered). The record, its
@@ -207,8 +208,8 @@ fn append_record_at_tail(
 /// (reassignment of variables from enclosing scopes).
 ///
 /// `is_top_level` is `true` only for the outermost call from [`lower_stmts`].
-/// It is `false` for if/else arms and function bodies so that `http_serve`
-/// assignments are rejected outside the top-level program scope.
+/// It is `false` for if/else arms, match arms and function bodies, so that `http_serve`
+/// and `test_sink` assignments are rejected outside the top-level program scope.
 pub(super) fn lower_stmts_inner(
     stmts: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
@@ -511,8 +512,8 @@ pub(super) fn lower_block_value(
 /// `preceding` are the statements that come before `stmt` in the block
 /// `body` is the already-lowered expression for the rest of the block after `stmt`
 /// `outer_bindings` are the names already in scope above this block (e.g., function parameters)
-/// `is_top_level` is `false` inside if/else arms and function bodies; `http_serve` and
-/// `test_sink` are only permitted at the top level of a program.
+/// `is_top_level` is `false` inside if/else arms, match arms and function bodies; `http_serve`
+/// and `test_sink` are only permitted at the top level of a program.
 pub(super) fn lower_middle_stmt(
     stmt: &Spanned<ChlStmt>,
     preceding: &[Spanned<ChlStmt>],
@@ -523,16 +524,12 @@ pub(super) fn lower_middle_stmt(
 ) -> Result<Expr, LoweringError> {
     match &stmt.node {
         // `out = test_sink()` — a `Defer` channel that is also a program output. The
-        // binding name is the sink's name, so the tail record's field for it is the name
+        // binding name is the sink's name, so the sink record's field for it is the name
         // the program already wrote to.
         #[cfg(any(test, feature = "test-helpers"))]
         ChlStmt::Assign { target, value } if let Some(name) = test_sink_name(target, value) => {
             if !is_top_level {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    "test_sink is only supported at the top level of a program, \
-                     not inside an if/else branch or function body",
-                ));
+                return Err(test_sink_not_top_level(stmt.span));
             }
             // A sink nothing registered has no reader, so writing to it would drop the
             // program's output without a trace.
@@ -542,15 +539,7 @@ pub(super) fn lower_middle_stmt(
                     format!("no test sink is registered under `{name}`"),
                 ));
             };
-            // A second declaration would replace the first's binding, and the first's
-            // writes would reach no sink.
-            if ctx.sink_bindings.contains_key(&name) {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    format!("`{name}` is already declared as a sink"),
-                ));
-            }
-            ctx.register_sink_binding(name.clone(), sink);
+            ctx.register_sink_binding(name.clone(), sink, stmt.span)?;
             let defer = ctx.tag_machinery(
                 Expr::new(TypedExprNode::Defer),
                 stmt.span,
@@ -663,7 +652,7 @@ pub(super) fn lower_middle_stmt(
                 stmt.span,
                 "lower.http_serve",
             );
-            ctx.register_sink_binding(resp_name.clone(), sink);
+            ctx.register_sink_binding(resp_name.clone(), sink, stmt.span)?;
             // The outer `requests` binding images the assignment statement (the
             // real source construct); the inner `responses` Defer let, the
             // Source node, and the Defer are manufactured plumbing of the
@@ -1796,6 +1785,53 @@ pub(super) fn pre_declare_type_aliases(
                      and its right-hand side must be a type: {inner}"
                 ),
             )),
+        }
+    }
+    errors
+}
+
+/// Every top-level statement that binds a sink's name other than the one declaring it.
+///
+/// The program's sink record is built at the tail of the `let` chain, so its field for a
+/// sink reads whichever binding of the name is innermost there. A later `out = e` would
+/// send `e` to the sink `out = test_sink()` declared and drop every write made before it.
+/// So a sink name has one binding statement, its declaration, and every other top-level
+/// binding of the name is refused at its own span. A second declaration is
+/// [`LoweringContext::register_sink_binding`]'s to refuse.
+fn sink_rebindings(stmts: &[Spanned<ChlStmt>], ctx: &LoweringContext) -> Vec<LoweringError> {
+    fn target_names<'a>(t: &'a AssignTarget, out: &mut Vec<&'a str>) {
+        match t {
+            AssignTarget::Name(n) => out.push(n.as_str()),
+            AssignTarget::Tuple(elts) => elts.iter().for_each(|e| target_names(&e.node, out)),
+            _ => {}
+        }
+    }
+    fn declares_a_sink(target: &Spanned<AssignTarget>, value: &Spanned<ChlExpr>) -> bool {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if test_sink_name(target, value).is_some() {
+            return true;
+        }
+        is_http_serve_tuple_assign(target, value)
+    }
+    let mut errors = Vec::new();
+    for stmt in stmts {
+        let mut bound = Vec::new();
+        match &stmt.node {
+            ChlStmt::Assign { target, value } if declares_a_sink(target, value) => {}
+            ChlStmt::Assign { target, .. }
+            | ChlStmt::AnnAssign { target, .. }
+            | ChlStmt::MutAssign { target, .. }
+            | ChlStmt::LoadFrom { target, .. } => target_names(&target.node, &mut bound),
+            ChlStmt::FunctionDef { name, .. } => bound.push(name.as_str()),
+            _ => {}
+        }
+        for name in bound {
+            if ctx.sink_bindings.contains_key(name) {
+                errors.push(LoweringError::unsupported(
+                    stmt.span,
+                    format!("`{name}` is a sink, so it cannot be bound again"),
+                ));
+            }
         }
     }
     errors
