@@ -2191,6 +2191,31 @@ fn convert_impl_inner(
             }
         }
 
+        // The empty map is a **producer**, so it takes no input to compose with — unlike
+        // every other standalone builtin below, which transforms one.
+        //
+        // Its extent comes from its type, for the reason `Constant::new` states: a value
+        // does not determine one, and here there is not even an entry to read a key or a
+        // value off. Realization has resolved the witness by now, so the type names the
+        // key and value the annotation supplied, and the two columns are born at those.
+        TypedExprNode::Builtin(Builtin::EmptyMap) => {
+            expect_no_input(input, "empty_map")?;
+            // `Constant::collection` panics unless the extent is a function, so the shape is
+            // decided here and a non-collection one is reported rather than aborting the
+            // compile — the same treatment the `LoadFrom` arm gives it.
+            let extent = ctx.extent_of(&expr.ty)?;
+            if !matches!(extent, Extent::Function { .. }) {
+                return Err(ConversionError::TypeError(format!(
+                    "`empty_map()` is a collection, so its type is a function; this one is \
+                     {extent:?}"
+                )));
+            }
+            Ok(Box::new(Constant::collection(
+                Value::Function(Vec::new()),
+                extent,
+            )))
+        }
+
         // Standalone reference to a built-in primitive — composed with an
         // input rather than applied directly.
         TypedExprNode::Builtin(b) => {
