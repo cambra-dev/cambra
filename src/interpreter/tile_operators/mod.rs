@@ -452,7 +452,8 @@ pub trait TileProducer {
         debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
         assert!(
             result.check_from(self.tiling()),
-            "{result:?} vs {:?}",
+            "{} produced {result:?}, which does not tile as {}",
+            self.name(),
             self.tiling()
         );
         result
