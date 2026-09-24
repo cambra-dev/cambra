@@ -96,6 +96,12 @@ what it has released upstream, and a source seeds a newly-registered producer th
 (`ProducerReleases`, `carry_release_to_new_producers`). This asks one thing of every producer — that
 it release what it has finished, and only that.
 
+A loop driver has finished a row its source's filter removed once it reads past it, so it releases
+that row too (`test_filtered_rows_of_a_live_transaction_source_are_released`). A source seeds a
+newly registered producer from the release every reader agrees on (`ProducerReleases`), so once
+every other reader of the source has released such a row as well, a replacement version is not
+offered it, even where the replacement's filter would keep it.
+
 Nothing establishes a frontier across the graph. Each rebuilt operator resumes wherever its own
 input still has work, and two of them can resume at unrelated positions in unrelated inputs.
 
