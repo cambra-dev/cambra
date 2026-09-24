@@ -1,14 +1,10 @@
-//! The value domain: what a CHL program means, with none of the apparatus that makes it
-//! computable incrementally.
+//! The values a program's meaning is stated in.
 //!
-//! A [`Collection`] is a key-to-value map, because that is what a CHL collection is — the
-//! keys carry information (a filter keeps the positions its survivors had, a group-by is
-//! keyed by the group key), so dropping them would make two different answers compare equal.
-//! Order, by contrast, carries nothing: [`PartialEq`] compares entries as a multiset.
-//!
-//! A commit time ([`Value::CommitTime`]) is the one key whose number carries nothing either:
-//! "8.5 Ordering and concurrency" orders commits without numbering them, so two collections
-//! keyed by commit times are compared by the order of those times, not by their values.
+//! A [`Collection`] is a key-to-value map, and [`PartialEq`] compares its entries as a
+//! multiset: its keys are part of its value (a filter keeps its survivors' positions, a
+//! group-by is keyed by the group key) and its order is not. A commit time
+//! ([`Value::CommitTime`]) compares by its rank, not its number, since `docs/chl-spec.md`, "8.5
+//! Ordering and concurrency" orders commits without numbering them.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -36,10 +32,6 @@ pub struct Collection {
 }
 
 impl Collection {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Build from entries in any order.
     ///
     /// # Panics
@@ -96,7 +88,7 @@ impl Collection {
 
 impl PartialEq for Collection {
     /// Multiset equality over `(key, value)` pairs: order is not part of the value, and the
-    /// key is, with each commit time replaced by its rank ([`Collection::ranked_commit_times`]).
+    /// key is, with each commit time replaced by its rank (`Collection::ranked_commit_times`).
     fn eq(&self, other: &Self) -> bool {
         let (a, b) = (self.ranked_commit_times(), other.ranked_commit_times());
         a.entries.len() == b.entries.len()
@@ -213,9 +205,11 @@ impl PartialEq for Value {
 
 /// A total order over values, used only to canonicalize for comparison and rendering.
 ///
-/// Two values that compare `Equal` here are equal under [`PartialEq`], which is what lets
-/// [`Collection`]'s equality zip two sorted entry lists. Values of different shapes never
-/// compare equal, so ordering them by shape first keeps that property.
+/// [`Collection`]'s equality zips two entry lists sorted by this order, which pairs the
+/// entries up when values equal under [`PartialEq`] compare `Equal` here. A record or
+/// collection that holds commit times breaks that: it orders by its rendering, which shows
+/// raw times, while equality compares their ranks. The zip then pairs mismatched entries and
+/// reports a disagreement, never a false agreement.
 fn total_cmp(a: &Value, b: &Value) -> Ordering {
     fn rank(v: &Value) -> u8 {
         match v {

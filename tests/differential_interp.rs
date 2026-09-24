@@ -1,4 +1,4 @@
-//! The differential: what the compiler computes against what the reference interpreter
+//! The differential: what the compiler computes against what the differential interpreter
 //! says the program means.
 //!
 //! Both sides are observed the same way — through a sink — so the comparison is over what
@@ -24,7 +24,7 @@ fn compiled(source: &str) -> Value {
     }
 }
 
-/// What sink `out` observed under the reference interpreter.
+/// What sink `out` observed under the differential interpreter.
 fn interpreted(source: &str) -> Value {
     run_interpreted(source).expect("the interpreter ran")
 }
@@ -166,9 +166,8 @@ fn a_groupby_rollup() {
     "#});
 }
 
-/// A comprehension inside a loop that reads the loop variable does not convert — the
-/// correlated case. Pinned at the compiler's error, so the differential records why it
-/// cannot reach this shape rather than omitting it.
+/// A comprehension inside a loop that reads the loop variable does not convert (the
+/// correlated case). Pinned at the compiler's error.
 #[test]
 fn a_correlated_comprehension_does_not_compile() {
     let source = indoc! {r#"
@@ -381,6 +380,89 @@ fn a_defer_channel_read_back() {
     "#});
 }
 
+/// A checked lookup answers `` `some `` for a key the map has and `` `none `` for one it
+/// lacks.
+#[test]
+fn a_checked_lookup_on_a_map() {
+    agree(indoc! {r#"
+        m = map([("a", 1)])
+        r = m["a"]?
+        s = m["b"]?
+        out = test_sink()
+        out << r
+        out << s
+    "#});
+}
+
+/// A function body ending in `if`/`else` denotes its taken branch's value.
+#[test]
+fn a_function_ending_in_a_conditional() {
+    agree(indoc! {r#"
+        def sign(n):
+            if n > 0:
+                1
+            else:
+                0
+        out = test_sink()
+        out << sign(5) + sign(-5)
+    "#});
+}
+
+#[test]
+fn a_function_ending_in_a_match() {
+    agree(indoc! {r#"
+        def f(v):
+            match v:
+                case `some(x):
+                    x
+                case `none:
+                    0
+        out = test_sink()
+        out << f(`some(4))
+    "#});
+}
+
+/// A call resolves its function where the caller was defined, so a later `def` of the same
+/// name does not reach it.
+#[test]
+fn a_function_is_resolved_where_its_caller_is_defined() {
+    agree(indoc! {r#"
+        def g(n):
+            n + 1
+        def f(n):
+            g(n)
+        def g(n):
+            n + 100
+        out = test_sink()
+        out << f(0)
+    "#});
+}
+
+/// A parameter named like a channel shadows it.
+#[test]
+fn a_parameter_shadows_a_channel() {
+    agree(indoc! {r#"
+        ch = defer()
+        out = test_sink()
+        for c in [1]:
+            ch << c
+        def h(ch):
+            ch + 1
+        out << h(10)
+    "#});
+}
+
+/// A loop over a filtered comprehension runs at its survivors' positions, and each
+/// contribution is keyed by the position its element had.
+#[test]
+fn a_filter_keeps_its_survivors_positions() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for y in [x for x in [1, 2, 3, 4] if x > 2]:
+            out << y
+    "#});
+}
+
 // ---------------------------------------------------------------------------
 // Transactions. A block is one commit record, at the next commit time or none at all, and
 // a reply fed inside it is indexed by that commit time rather than by the iteration.
@@ -399,9 +481,12 @@ fn an_in_block_reply_per_commit() {
 }
 
 /// A guard no path takes is a denial: no write, no reply, no commit time.
+///
+/// Agreement compares commit times by rank, which cannot see a single reply's time, so the
+/// compiled side's raw time is pinned too.
 #[test]
 fn a_denied_block_takes_no_commit_time() {
-    agree(indoc! {r#"
+    let source = indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
         for r in [70, 50]:
@@ -409,13 +494,18 @@ fn a_denied_block_takes_no_commit_time() {
                 if pool >= r:
                     pool := pool - r
                     out << pool
-    "#});
+    "#};
+    agree(source);
+    assert_eq!(compiled(source).to_string(), "[t1 -> 30]");
 }
 
 /// Commit times are dense: the denied iteration leaves no gap.
+///
+/// Agreement compares commit times by rank, which cannot see a gap, so the compiled side's
+/// raw times are pinned too.
 #[test]
 fn commit_times_are_dense_across_a_denial() {
-    agree(indoc! {r#"
+    let source = indoc! {r#"
         out = test_sink()
         q: Mut(Int, Txn) := 0
         for r in [0, 1, 2]:
@@ -423,7 +513,9 @@ fn commit_times_are_dense_across_a_denial() {
                 if r != 0:
                     q := r + 1
                     out << q
-    "#});
+    "#};
+    agree(source);
+    assert_eq!(compiled(source).to_string(), "[t1 -> 2, t2 -> 3]");
 }
 
 #[test]
@@ -465,9 +557,9 @@ fn two_stores_written_in_one_block() {
     "#});
 }
 
-/// Two writer sites on one store. Their commits are unordered ("8.5 Ordering and
-/// concurrency"), so the interpreter refuses to judge the program; the compiler picks an
-/// order, and this checks only that it runs the program to completion.
+/// Two writer sites on one store. Their commits are unordered (`docs/chl-spec.md`, "8.5
+/// Ordering and concurrency"), so the interpreter refuses to judge the program; the compiler
+/// picks an order, and this checks only that it runs the program to completion.
 #[test]
 fn two_writer_sites_on_one_store_are_not_judged() {
     let source = indoc! {r#"
@@ -519,9 +611,9 @@ fn a_function_writing_through_a_mut_parameter() {
     "#});
 }
 
-/// A function captures the values of free names at its definition ("4.1 `def` — function
-/// definition"), so a later write to a captured mutable variable does not reach it. The
-/// compiler reads the variable's latest value instead. Pinned at both answers.
+/// A function captures the values of free names at its definition (`docs/chl-spec.md`, "4.1
+/// `def` — function definition"), so a later write to a captured mutable variable does not
+/// reach it. The compiler reads the variable's latest value instead. Pinned at both answers.
 #[test]
 fn a_captured_mutable_variable_is_read_late() {
     let source = indoc! {r#"
@@ -538,8 +630,8 @@ fn a_captured_mutable_variable_is_read_late() {
     assert_eq!(interpreted(source).to_string(), "[() -> 1]");
 }
 
-/// A user function named like a builtin shadows it: the nearest binding wins ("3.2
-/// Names"). The compiler calls the builtin. Pinned at both answers.
+/// A user function named like a builtin shadows it: the nearest binding wins
+/// (`docs/chl-spec.md`, "3.2 Names"). The compiler calls the builtin. Pinned at both answers.
 #[test]
 fn a_user_function_named_like_a_builtin_is_ignored() {
     let source = indoc! {r#"
@@ -601,9 +693,9 @@ fn a_seeded_mutable_collection_aggregates() {
     "#});
 }
 
-/// `//` is floor division ("3.3 Arithmetic and logical operators"). The runtime's integer
-/// kernel (`src/scalar_ops.rs`) truncates toward zero instead, which differs when
-/// the operands' signs differ. Pinned at both answers.
+/// `//` is floor division (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators"). The
+/// runtime's integer kernel (`src/scalar_ops.rs`) truncates toward zero instead, which
+/// differs when the operands' signs differ. Pinned at both answers.
 #[test]
 fn floor_division_with_a_negative_divisor_truncates() {
     let source = indoc! {r#"

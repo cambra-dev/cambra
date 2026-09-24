@@ -1,24 +1,7 @@
-//! Evaluating a CHL program to what each of its sinks observed.
+//! Evaluating a CHL program to what each of its sinks received.
 //!
-//! A program's observable is its sinks, not a returned value, so evaluation answers a map
-//! from sink name to the collection of contributions that sink received. A trailing bare
-//! expression is a test convenience in the compiler; here it is evaluated and observed by
-//! nothing.
-//!
-//! **A feed nests.** The channel a sink reads is indexed by the feed site's iteration
-//! domain — unit where the site does not iterate, the loop's key under one loop, and the
-//! tuple of the enclosing loops' keys under several — and whatever was fed sits under that
-//! key whatever its shape. So `out << [2, 4, 6]` is one contribution holding a
-//! three-element collection, and `for x in xs: out << e` is one contribution per iteration
-//! under the key `x` was drawn from.
-//!
-//! **What it refuses to judge.** Where `docs/chl-spec.md` leaves a value undefined
-//! (partial arithmetic, "Partiality is not yet defined \[Open\]") or arbitrary (an as-of
-//! read, "8.3 Reads"; two `with` blocks writing one variable, whose commits "8.5 Ordering and
-//! concurrency" leaves unordered), evaluation answers an [`Error`] rather than picking a
-//! value, so a compiler that picks a different one is not reported as wrong. A read of a
-//! channel before every feed to it has run is refused for the same reason: the read denotes
-//! the whole collection, which evaluation in program order has not built yet.
+//! A trailing bare expression is evaluated and observed by nothing: a program's observable is
+//! its sinks.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,14 +37,22 @@ pub type Observations = BTreeMap<String, Value>;
 struct MutCell {
     value: Value,
     /// Sequenced by `Txn` rather than by an induction extent, which decides where a read
-    /// of it is determinate ("8.3 Reads").
+    /// of it is determinate (`docs/chl-spec.md`, "8.3 Reads").
     txn: bool,
 }
 
+/// What a name is bound to. Every binding form lives in [`Interp::scopes`], so a function
+/// or a channel is shadowed and captured by the same rules a value is: names resolve
+/// statically (`docs/chl-spec.md`, "3.2 Names"). A channel's state is keyed by its name, so
+/// a program declares each channel name once.
 #[derive(Clone)]
 enum Slot {
     Val(Value),
     Mut(Rc<RefCell<MutCell>>),
+    Fn(Rc<Function>),
+    /// A channel `defer()` or `test_sink()` opened; its state is in [`Interp::channels`]
+    /// under the same name.
+    Chan,
 }
 
 type Scope = Vec<(String, Slot)>;
@@ -77,9 +68,8 @@ struct Function {
 
 /// A `with begin():` block in progress.
 ///
-/// Whether the block commits is decided by what it did: a block that wrote nothing and
-/// replied nothing took no path to a write, which is a denial. `wrote` records that, so no
-/// state has real writes and no commit.
+/// A block that neither writes nor replies is a denial and takes no commit time; `wrote`
+/// records whether it wrote.
 struct TxnFrame {
     wrote: bool,
     /// The mutable variables the block writes anywhere in its body. A read of a `Txn`
@@ -90,6 +80,12 @@ struct TxnFrame {
 }
 
 /// An open channel: what `defer()` or `test_sink()` made.
+///
+/// A feed nests: `target << value` appends `value` as one element (`docs/chl-spec.md`, "3.7
+/// Feed operator `<<`"), keyed by its site's iteration domain (`docs/chl-spec.md`, "8.4 Feeds
+/// are the second form of mutability"). So `out << [2, 4, 6]` is one contribution holding a
+/// three-element collection, and `for x in xs: out << e` is one contribution per iteration,
+/// under the key `x` was drawn from.
 #[derive(Default)]
 struct Channel {
     /// Contributions: the feed site that made each, its key, and its value.
@@ -98,10 +94,14 @@ struct Channel {
     defined: Option<Value>,
     /// Every feed site naming this channel, in source order.
     ///
-    /// A channel fed from more than one place is a union of those places, and its keys are
+    /// A channel fed from more than one place is a union (`++`) of those places
+    /// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and its keys are
     /// tagged by which one. The tagging is a property of the program text, so a site that
     /// never fires still counts.
     sites: Vec<usize>,
+    /// Every `<<=` naming this channel. A read before one has run is refused like a read
+    /// before a feed.
+    define_sites: Vec<usize>,
 }
 
 pub(crate) struct Interp {
@@ -112,6 +112,8 @@ pub(crate) struct Interp {
     observed: BTreeSet<String>,
     /// Feed sites per channel name, collected from the program text before it runs.
     feed_sites: BTreeMap<String, Vec<usize>>,
+    /// `<<=` sites per channel name, collected the same way.
+    define_sites: BTreeMap<String, Vec<usize>>,
     /// The values a generator has yielded, while one is running.
     yielded: Option<Vec<(Value, Value)>>,
     /// The commit times transaction blocks have taken. They are dense and 1-based: a block
@@ -119,20 +121,17 @@ pub(crate) struct Interp {
     commit_time: i64,
     /// The block in progress, while one is.
     txn: Option<TxnFrame>,
-    /// For each feed site, the source position where the top-level statement enclosing it
-    /// ends: the point past which that site contributes nothing more.
+    /// For each feed or `<<=` site, the source position where the top-level statement
+    /// enclosing it ends: the point past which that site contributes nothing more.
     feed_done_at: BTreeMap<usize, usize>,
-    /// Sources the harness supplied, by the name a zero-argument call names.
-    sources: BTreeMap<String, Collection>,
-    functions: BTreeMap<String, Function>,
     /// The keys of the loops enclosing the current statement, outermost first.
     loop_keys: Vec<Value>,
 }
 
 impl Interp {
     fn new(
-        sources: BTreeMap<String, Collection>,
         feed_sites: BTreeMap<String, Vec<usize>>,
+        define_sites: BTreeMap<String, Vec<usize>>,
         feed_done_at: BTreeMap<usize, usize>,
     ) -> Self {
         Self {
@@ -140,12 +139,11 @@ impl Interp {
             channels: BTreeMap::new(),
             observed: BTreeSet::new(),
             feed_sites,
+            define_sites,
             yielded: None,
             commit_time: 0,
             txn: None,
             feed_done_at,
-            sources,
-            functions: BTreeMap::new(),
             loop_keys: Vec::new(),
         }
     }
@@ -161,7 +159,7 @@ impl Interp {
     fn mut_cell(&self, name: &str) -> Option<Rc<RefCell<MutCell>>> {
         match self.slot(name)? {
             Slot::Mut(cell) => Some(cell.clone()),
-            Slot::Val(_) => None,
+            _ => None,
         }
     }
 
@@ -206,23 +204,24 @@ fn collection(entries: Vec<(Value, Value)>) -> Result<Collection, Error> {
 }
 
 /// Run `source`, answering what each sink observed.
-pub fn run(source: &str, sources: BTreeMap<String, Collection>) -> Result<Observations, Error> {
+pub fn run(source: &str) -> Result<Observations, Error> {
     let module = chl_parser::parse_module(source)
         .into_result()
         .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
-    let mut feed_sites = BTreeMap::new();
-    collect_feed_sites(&module.body, &mut feed_sites);
+    let (mut feed_sites, mut define_sites) = (BTreeMap::new(), BTreeMap::new());
+    collect_feed_sites(&module.body, &mut feed_sites, &mut define_sites);
     let mut feed_done_at = BTreeMap::new();
     for stmt in &module.body {
-        let mut inner = BTreeMap::new();
-        collect_feed_sites(std::slice::from_ref(stmt), &mut inner);
-        for site in inner.into_values().flatten() {
+        let (mut feeds, mut defines) = (BTreeMap::new(), BTreeMap::new());
+        collect_feed_sites(std::slice::from_ref(stmt), &mut feeds, &mut defines);
+        for site in feeds.into_values().chain(defines.into_values()).flatten() {
             feed_done_at.insert(site, stmt.span.end);
         }
     }
 
-    // Two `with` sites writing one variable commit in an order the program does not
-    // determine, so every read and reply downstream of them has more than one right answer.
+    // Two `with` sites writing one variable commit in an order the program does not determine
+    // (`docs/chl-spec.md`, "8.5 Ordering and concurrency"), so every read and reply downstream
+    // of them has more than one right answer.
     let mut writers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     collect_with_writes(&module.body, &mut writers);
     if let Some((name, _)) = writers.iter().find(|(_, sites)| sites.len() > 1) {
@@ -232,7 +231,7 @@ pub fn run(source: &str, sources: BTreeMap<String, Collection>) -> Result<Observ
         ));
     }
 
-    let mut interp = Interp::new(sources, feed_sites, feed_done_at);
+    let mut interp = Interp::new(feed_sites, define_sites, feed_done_at);
     interp.exec_block(&module.body)?;
 
     interp
@@ -243,81 +242,186 @@ pub fn run(source: &str, sources: BTreeMap<String, Collection>) -> Result<Observ
         .collect()
 }
 
-/// Every feed site in `body`, by the channel name it feeds, in source order.
-fn collect_feed_sites(body: &[Spanned<Stmt>], out: &mut BTreeMap<String, Vec<usize>>) {
+/// Whether a walk enters a `def` or lambda body. Its statements run where it is called
+/// rather than where it stands, so a question about what runs here skips them and a
+/// question about the program text enters them.
+#[derive(Clone, Copy, PartialEq)]
+enum Bodies {
+    Enter,
+    Skip,
+}
+
+/// Call `f` on every statement in `body` and every statement nested in it, outermost first:
+/// the bodies of `if`, `match`, `for` and `with`, every block in expression position, and a
+/// `def` or lambda body when `bodies` enters them.
+///
+/// The one walk every question about the program text asks, so that no question enters a
+/// construct another one skips.
+fn for_each_stmt<'a>(
+    body: &'a [Spanned<Stmt>],
+    bodies: Bodies,
+    f: &mut dyn FnMut(&'a Spanned<Stmt>),
+) {
     for s in body {
+        f(s);
         match &s.node {
-            Stmt::Expr(e) => {
-                if let Expr::Feed { target, value } = &e.node
-                    && let Expr::Name(n) = &target.node
-                {
-                    out.entry(n.to_string()).or_default().push(value.span.start);
-                }
-            }
             Stmt::If {
                 branches,
                 else_body,
             } => {
                 for b in branches {
-                    collect_feed_sites(&b.body, out);
+                    for_each_block(&b.cond, bodies, f);
+                    for_each_stmt(&b.body, bodies, f);
                 }
                 if let Some(body) = else_body {
-                    collect_feed_sites(body, out);
+                    for_each_stmt(body, bodies, f);
                 }
             }
-            Stmt::Match { arms, .. } => {
+            Stmt::Match { scrutinee, arms } => {
+                for_each_block(scrutinee, bodies, f);
                 for a in arms {
-                    collect_feed_sites(&a.body, out);
+                    for_each_stmt(&a.body, bodies, f);
                 }
             }
-            Stmt::For { body, .. } | Stmt::FunctionDef { body, .. } | Stmt::With { body, .. } => {
-                collect_feed_sites(body, out)
+            Stmt::For { iter, body, .. } => {
+                for_each_block(iter, bodies, f);
+                for_each_stmt(body, bodies, f);
             }
+            Stmt::With { body, .. } => for_each_stmt(body, bodies, f),
+            Stmt::FunctionDef { body, .. } => {
+                if bodies == Bodies::Enter {
+                    for_each_stmt(body, bodies, f);
+                }
+            }
+            Stmt::Expr(e)
+            | Stmt::Return(Some(e))
+            | Stmt::Assign { value: e, .. }
+            | Stmt::AnnAssign { value: e, .. }
+            | Stmt::AugAssign { value: e, .. }
+            | Stmt::MutAssign { value: e, .. }
+            | Stmt::Define { value: e, .. } => for_each_block(e, bodies, f),
             _ => {}
         }
     }
+}
+
+/// [`for_each_stmt`] over every block in expression position inside `e`.
+fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'a Spanned<Stmt>)) {
+    let mut sub = |c: &'a Spanned<Expr>| for_each_block(c, bodies, f);
+    match &e.node {
+        Expr::Block(stmt) => for_each_stmt(std::slice::from_ref(&**stmt), bodies, f),
+        Expr::Lambda { body, .. } => {
+            if bodies == Bodies::Enter {
+                sub(body);
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            sub(left);
+            sub(right);
+        }
+        Expr::UnaryOp { operand, .. } => sub(operand),
+        Expr::BoolOp { operands, .. } => operands.iter().for_each(sub),
+        Expr::Compare {
+            left, comparators, ..
+        } => {
+            sub(left);
+            comparators.iter().for_each(sub);
+        }
+        Expr::Call { func, args } => {
+            sub(func);
+            args.iter().for_each(sub);
+        }
+        Expr::List(items) | Expr::Tuple(items) | Expr::BraceGroup(items) => {
+            items.iter().for_each(sub)
+        }
+        Expr::Record(fields) | Expr::BraceRecord(fields) => {
+            fields.iter().for_each(|field| sub(&field.value))
+        }
+        Expr::Subscript { target, index, .. } => {
+            sub(target);
+            sub(index);
+        }
+        Expr::Attribute { target, .. } => sub(target),
+        Expr::VariantCtor {
+            payload: Some(VariantPayload::Term(inner)),
+            ..
+        }
+        | Expr::Yield(inner) => sub(inner),
+        Expr::IfExp {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            sub(cond);
+            sub(then_expr);
+            sub(else_expr);
+        }
+        Expr::ListComp(comp) | Expr::GenExp(comp) => {
+            for clause in &comp.clauses {
+                match clause {
+                    CompClause::For { iter, .. } => sub(iter),
+                    CompClause::If(guard) => sub(guard),
+                }
+            }
+            sub(&comp.element);
+        }
+        Expr::Feed { target, value } => {
+            sub(target);
+            sub(value);
+        }
+        // Literals, names and type syntax hold no statement.
+        _ => {}
+    }
+}
+
+/// Every `<<` site in `body` into `feeds` and every `<<=` site into `defines`, by the
+/// channel name each names, in source order.
+fn collect_feed_sites(
+    body: &[Spanned<Stmt>],
+    feeds: &mut BTreeMap<String, Vec<usize>>,
+    defines: &mut BTreeMap<String, Vec<usize>>,
+) {
+    for_each_stmt(body, Bodies::Enter, &mut |s| match &s.node {
+        Stmt::Expr(e) => {
+            if let Expr::Feed { target, value } = &e.node
+                && let Expr::Name(n) = &target.node
+            {
+                feeds
+                    .entry(n.to_string())
+                    .or_default()
+                    .push(value.span.start);
+            }
+        }
+        Stmt::Define { target, value } => {
+            if let AssignTarget::Name(n) = &target.node {
+                defines
+                    .entry(n.to_string())
+                    .or_default()
+                    .push(value.span.start);
+            }
+        }
+        _ => {}
+    });
 }
 
 /// The `with` sites that write each variable, by the site's source position.
 fn collect_with_writes(body: &[Spanned<Stmt>], out: &mut BTreeMap<String, Vec<usize>>) {
-    for s in body {
-        match &s.node {
-            Stmt::With { body, .. } => {
-                let mut names = BTreeSet::new();
-                written_names(body, &mut names);
-                for n in names {
-                    out.entry(n).or_default().push(s.span.start);
-                }
+    for_each_stmt(body, Bodies::Enter, &mut |s| {
+        if let Stmt::With { body, .. } = &s.node {
+            let mut names = BTreeSet::new();
+            written_names(body, &mut names);
+            for n in names {
+                out.entry(n).or_default().push(s.span.start);
             }
-            Stmt::If {
-                branches,
-                else_body,
-            } => {
-                for b in branches {
-                    collect_with_writes(&b.body, out);
-                }
-                if let Some(body) = else_body {
-                    collect_with_writes(body, out);
-                }
-            }
-            Stmt::Match { arms, .. } => {
-                for a in arms {
-                    collect_with_writes(&a.body, out);
-                }
-            }
-            Stmt::For { body, .. } | Stmt::FunctionDef { body, .. } => {
-                collect_with_writes(body, out)
-            }
-            _ => {}
         }
-    }
+    });
 }
 
-/// The mutable variables `body` writes anywhere, by name.
+/// The mutable variables `body` writes where it runs, by name.
 fn written_names(body: &[Spanned<Stmt>], out: &mut BTreeSet<String>) {
-    for s in body {
-        match &s.node {
-            Stmt::MutAssign { target, .. } | Stmt::AugAssign { target, .. } => match &target.node {
+    for_each_stmt(body, Bodies::Skip, &mut |s| {
+        if let Stmt::MutAssign { target, .. } | Stmt::AugAssign { target, .. } = &s.node {
+            match &target.node {
                 AssignTarget::Name(n) => {
                     out.insert(n.to_string());
                 }
@@ -327,27 +431,22 @@ fn written_names(body: &[Spanned<Stmt>], out: &mut BTreeSet<String>) {
                     }
                 }
                 _ => {}
-            },
-            Stmt::If {
-                branches,
-                else_body,
-            } => {
-                for b in branches {
-                    written_names(&b.body, out);
-                }
-                if let Some(body) = else_body {
-                    written_names(body, out);
-                }
             }
-            Stmt::Match { arms, .. } => {
-                for a in arms {
-                    written_names(&a.body, out);
-                }
-            }
-            Stmt::For { body, .. } => written_names(body, out),
-            _ => {}
         }
-    }
+    });
+}
+
+/// Whether some statement `body` runs satisfies `pred`.
+fn runs_any(body: &[Spanned<Stmt>], pred: impl Fn(&Stmt) -> bool) -> bool {
+    let mut found = false;
+    for_each_stmt(body, Bodies::Skip, &mut |s| found |= pred(&s.node));
+    found
+}
+
+/// Whether `body` holds a `with begin():` block, whose commits a loop around it takes in
+/// its iteration order.
+fn contains_with(body: &[Spanned<Stmt>]) -> bool {
+    runs_any(body, |s| matches!(s, Stmt::With { .. }))
 }
 
 /// Whether an annotation sequences its mutable variable by `Txn`: `Mut(V, Txn)`.
@@ -379,14 +478,23 @@ impl Interp {
                 let name = name_of(target)?;
                 let is_sink = is_zero_arg_call(&value.node, "test_sink");
                 if is_sink || is_zero_arg_call(&value.node, "defer") {
+                    if self.channels.contains_key(&name) {
+                        return err(format!(
+                            "`{name}` is declared as a channel twice, and a channel's state is \
+                             keyed by its name"
+                        ));
+                    }
                     let sites = self.feed_sites.get(&name).cloned().unwrap_or_default();
+                    let define_sites = self.define_sites.get(&name).cloned().unwrap_or_default();
                     self.channels.insert(
                         name.clone(),
                         Channel {
                             sites,
+                            define_sites,
                             ..Channel::default()
                         },
                     );
+                    self.bind(name.clone(), Slot::Chan);
                     if is_sink {
                         self.observed.insert(name);
                     }
@@ -477,7 +585,8 @@ impl Interp {
             Stmt::Define { target, value } => {
                 let name = name_of(target)?;
                 let v = self.eval(value)?;
-                match self.channels.get_mut(&name) {
+                let is_channel = matches!(self.slot(&name), Some(Slot::Chan));
+                match self.channels.get_mut(&name).filter(|_| is_channel) {
                     Some(channel) => {
                         if channel.defined.is_some() || !channel.sites.is_empty() {
                             return err(format!(
@@ -491,11 +600,14 @@ impl Interp {
                 Ok(None)
             }
 
+            // A branch is a block with its own scope, as a `match` arm is: "each branch's
+            // block is itself a statement block" (`docs/chl-spec.md`, "4.5 `if` / `elif` /
+            // `else`"), so a binding made in a branch is not visible after the `if`.
             Stmt::If {
                 branches,
                 else_body,
             } => match self.select_branch(branches, else_body)? {
-                Some(body) => self.exec_block(&body),
+                Some(body) => self.scoped(|me| me.exec_block(&body)),
                 None => Ok(None),
             },
 
@@ -525,7 +637,7 @@ impl Interp {
                     body: body.clone(),
                     env: self.captured_scopes(),
                 };
-                self.functions.insert(name.to_string(), function);
+                self.bind(name.to_string(), Slot::Fn(Rc::new(function)));
                 Ok(None)
             }
 
@@ -545,7 +657,31 @@ impl Interp {
                 let Value::Collection(c) = source else {
                     return err("a `for` loop iterates a collection");
                 };
-                for (key, elem) in c.entries().to_vec() {
+                // A body that accumulates, or holds a block whose commits take the loop's
+                // order, may depend on the iteration order, which is `[Open]`
+                // (`docs/chl-spec.md`, "Accumulator iteration order is not yet defined
+                // [Open]"). Both sides run a list in index order, so such a loop runs over
+                // integer keys ascending and is refused over any other key. The compiler
+                // refuses one over an integer-keyed collection that is not a list, so that
+                // answer is never compared.
+                let mut written = BTreeSet::new();
+                written_names(body, &mut written);
+                let accumulates = written.iter().any(|n| self.mut_cell(n).is_some());
+                let mut entries = c.entries().to_vec();
+                if accumulates || contains_with(body) {
+                    if !entries.iter().all(|(k, _)| matches!(k, Value::Int(_))) {
+                        return err(
+                            "a loop whose result may depend on its iteration order iterates a \
+                             collection not keyed by position, whose order is not defined, \
+                             which is not judgeable",
+                        );
+                    }
+                    entries.sort_by_key(|(k, _)| match k {
+                        Value::Int(i) => *i,
+                        _ => unreachable!("checked above"),
+                    });
+                }
+                for (key, elem) in entries {
                     // The loop's key extends the feed site's key: a contribution from inside
                     // this body lands under the position its element came from.
                     self.loop_keys.push(key);
@@ -562,8 +698,8 @@ impl Interp {
             }
 
             Stmt::Expr(e) => {
-                // A feed is the only expression statement that does anything; a trailing
-                // bare expression is not an observable.
+                // A feed and a `yield` are the expression statements that do anything; a
+                // trailing bare expression is not an observable.
                 if let Expr::Feed { target, value } = &e.node {
                     self.feed(target, value)?;
                     return Ok(None);
@@ -629,8 +765,8 @@ impl Interp {
     }
 
     /// The scopes a function defined here closes over: every value as it stands now
-    /// ("4.1 `def` — function definition" captures values at definition time), except a
-    /// `Txn` store, which a function reaches through the store itself.
+    /// (`docs/chl-spec.md`, "4.1 `def` — function definition" captures values at definition
+    /// time), except a `Txn` store, which a function reaches through the store itself.
     fn captured_scopes(&self) -> Vec<Scope> {
         self.scopes
             .iter()
@@ -658,9 +794,9 @@ impl Interp {
         }
     }
 
-    /// Read a mutable variable where "8.3 Reads" makes the read determinate, and refuse
-    /// where it does not: a `Txn` variable outside a block, or inside one that does not
-    /// write it.
+    /// Read a mutable variable where `docs/chl-spec.md`, "8.3 Reads" makes the read
+    /// determinate, and refuse where it does not: a `Txn` variable outside a block, or inside
+    /// one that does not write it.
     fn read_mut(&self, name: &str, cell: &Rc<RefCell<MutCell>>) -> Result<Value, Error> {
         let cell = cell.borrow();
         if cell.txn {
@@ -668,7 +804,8 @@ impl Interp {
                 None => return err(format!("`{name}` is a `Txn` variable read outside a block")),
                 Some(frame) if !frame.writes.contains(name) => {
                     return err(format!(
-                        "`{name}` is read as of an arbitrary commit position, which is not judgeable"
+                        "`{name}` is read as of an arbitrary commit position, which is not \
+                         judgeable"
                     ));
                 }
                 Some(_) => {}
@@ -699,7 +836,7 @@ impl Interp {
             return err("a feed's target is a name");
         };
         let name = name.to_string();
-        if !self.channels.contains_key(&name) {
+        if !matches!(self.slot(&name), Some(Slot::Chan)) {
             return err(format!("`{name}` is not a channel"));
         }
         let contributed = self.eval(value)?;
@@ -725,8 +862,19 @@ impl Interp {
 
 impl Interp {
     /// The value a block denotes: its statements run, and its last one is an expression
-    /// whose value is the block's. `return` is the other way out.
-    fn block_value(&mut self, body: &[Spanned<Stmt>]) -> Result<Value, Error> {
+    /// whose value is the block's, or an `if`/`else` or `match` whose taken branch denotes
+    /// it (`docs/chl-spec.md`, "4.1 `def` — function definition"; `docs/chl-spec.md`, "4.10
+    /// `match` — tag dispatch"). `return` is the other way out.
+    ///
+    /// With `effects_denote_unit`, a block ending in a statement that denotes no value (a
+    /// write through a `Mut` parameter, a feed) runs for its effects and denotes unit, which
+    /// is what a function body ending that way returns. Without it, such a block is refused,
+    /// which is what a block in expression position requires.
+    fn block_value(
+        &mut self,
+        body: &[Spanned<Stmt>],
+        effects_denote_unit: bool,
+    ) -> Result<Value, Error> {
         let Some((last, rest)) = body.split_last() else {
             return err("an empty block has no value");
         };
@@ -734,11 +882,46 @@ impl Interp {
             return Ok(v);
         }
         match &last.node {
-            Stmt::Expr(e) => self.eval(e),
+            Stmt::Expr(e) if !matches!(e.node, Expr::Feed { .. } | Expr::Yield(_)) => self.eval(e),
             Stmt::Return(Some(e)) => self.eval(e),
+            Stmt::If {
+                else_body: Some(_), ..
+            }
+            | Stmt::Match { .. } => self.branch_value(last, effects_denote_unit),
+            _ if effects_denote_unit => self
+                .exec(last)
+                .map(|returned| returned.unwrap_or(Value::Unit)),
             other => err(format!(
                 "a block ends with {other:?}, which denotes no value"
             )),
+        }
+    }
+
+    /// The value an `if`/`else` chain or a `match` denotes: its taken branch's.
+    fn branch_value(
+        &mut self,
+        stmt: &Spanned<Stmt>,
+        effects_denote_unit: bool,
+    ) -> Result<Value, Error> {
+        match &stmt.node {
+            Stmt::Match { scrutinee, arms } => {
+                let (bound, body) = self.match_arm(scrutinee, arms)?;
+                let body = body.to_vec();
+                self.scoped(|me| {
+                    if let Some((n, v)) = bound {
+                        me.bind(n, Slot::Val(v));
+                    }
+                    me.block_value(&body, effects_denote_unit)
+                })
+            }
+            Stmt::If {
+                branches,
+                else_body,
+            } => match self.select_branch(branches, else_body)? {
+                Some(body) => self.scoped(|me| me.block_value(&body, effects_denote_unit)),
+                None => err("an `if` with no `else` denotes no value"),
+            },
+            other => err(format!("{other:?} in expression position")),
         }
     }
 
@@ -772,8 +955,8 @@ impl Interp {
 /// What a channel holds: the value a `<<=` defined it as, or its contributions keyed as
 /// the channel's domain keys them.
 ///
-/// One feed site leaves the keys alone. Several make the channel a union of them, so each
-/// key is tagged by the site's position among the channel's sites in source order.
+/// One feed site leaves the keys alone. Several make the channel a union (`++`) of them, so
+/// each key is tagged by the site's position among the channel's sites in source order.
 fn channel_value(channel: &Channel) -> Result<Value, Error> {
     if let Some(v) = &channel.defined {
         return Ok(v.clone());
@@ -781,11 +964,11 @@ fn channel_value(channel: &Channel) -> Result<Value, Error> {
     let mut entries = Vec::with_capacity(channel.fed.len());
     for (site, key, value) in &channel.fed {
         let key = if channel.sites.len() > 1 {
-            let tag = channel
-                .sites
-                .iter()
-                .position(|s| s == site)
-                .expect("every site that fires was collected from the program text");
+            let Some(tag) = channel.sites.iter().position(|s| s == site) else {
+                return err(format!(
+                    "the feed at {site} fired but was not collected from the program text"
+                ));
+            };
             Value::Variant {
                 tag: tag.to_string(),
                 payload: Box::new(key.clone()),
@@ -816,19 +999,10 @@ fn is_zero_arg_call(e: &Expr, name: &str) -> bool {
 
 /// Whether a body yields, which is what makes a `def` a generator.
 fn contains_yield(body: &[Spanned<Stmt>]) -> bool {
-    body.iter().any(|s| match &s.node {
-        Stmt::Expr(e) => matches!(e.node, Expr::Yield(_)),
-        Stmt::For { body, .. } => contains_yield(body),
-        Stmt::If {
-            branches,
-            else_body,
-        } => {
-            branches.iter().any(|b| contains_yield(&b.body))
-                || else_body.as_deref().is_some_and(contains_yield)
-        }
-        Stmt::Match { arms, .. } => arms.iter().any(|a| contains_yield(&a.body)),
-        _ => false,
-    })
+    runs_any(
+        body,
+        |s| matches!(s, Stmt::Expr(e) if matches!(e.node, Expr::Yield(_))),
+    )
 }
 
 impl Interp {
@@ -838,29 +1012,33 @@ impl Interp {
             Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.clone())),
             Expr::Lit(Lit::Bool(b)) => Ok(Value::Bool(*b)),
 
-            Expr::Name(n) => {
-                if let Some(channel) = self.channels.get(n.as_str()) {
-                    if let Some(site) = channel.sites.iter().find(|s| {
-                        self.feed_done_at
-                            .get(s)
-                            .is_none_or(|end| *end > e.span.start)
-                    }) {
+            Expr::Name(n) => match self.slot(n) {
+                Some(Slot::Val(v)) => Ok(v.clone()),
+                Some(Slot::Mut(cell)) => {
+                    let cell = cell.clone();
+                    self.read_mut(n, &cell)
+                }
+                // The read denotes the whole collection, which evaluation in program order has
+                // not built while a feed or `<<=` to it is still to run.
+                Some(Slot::Chan) => {
+                    let channel = &self.channels[n.as_str()];
+                    if let Some(site) =
+                        channel.sites.iter().chain(&channel.define_sites).find(|s| {
+                            self.feed_done_at
+                                .get(s)
+                                .is_none_or(|end| *end > e.span.start)
+                        })
+                    {
                         return err(format!(
-                            "`{n}` is read before its feed at {site} has run, and the read \
-                             denotes the whole collection"
+                            "`{n}` is read before its feed or define at {site} has run, and \
+                             the read denotes the whole collection"
                         ));
                     }
-                    return channel_value(channel);
+                    channel_value(channel)
                 }
-                match self.slot(n) {
-                    Some(Slot::Val(v)) => Ok(v.clone()),
-                    Some(Slot::Mut(cell)) => {
-                        let cell = cell.clone();
-                        self.read_mut(n, &cell)
-                    }
-                    None => err(format!("unbound name: {n}")),
-                }
-            }
+                Some(Slot::Fn(_)) => err(format!("`{n}` is a function, which is not a value")),
+                None => err(format!("unbound name: {n}")),
+            },
 
             Expr::List(items) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -991,16 +1169,35 @@ impl Interp {
                 Ok(Value::Record(fields))
             }
 
-            Expr::Subscript { target, index, .. } => {
+            // `c[k]` is the entry at `k`; the checked `c[k]?` answers `` `some(v) `` for an
+            // entry and `` `none `` where there is none (`docs/chl-spec.md`, "3.9 Subscript
+            // and attribute access").
+            Expr::Subscript {
+                target,
+                index,
+                checked,
+            } => {
                 let t = self.eval(target)?;
                 let k = self.eval(index)?;
                 match t {
-                    Value::Collection(c) => c
-                        .entries()
-                        .iter()
-                        .find(|(key, _)| *key == k)
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| Error(format!("no entry at key {k}"))),
+                    Value::Collection(c) => {
+                        let found = c.entries().iter().find(|(key, _)| *key == k);
+                        match (found, *checked) {
+                            (Some((_, v)), false) => Ok(v.clone()),
+                            (None, false) => err(format!("no entry at key {k}")),
+                            (Some((_, v)), true) => Ok(Value::Variant {
+                                tag: "some".to_string(),
+                                payload: Box::new(v.clone()),
+                            }),
+                            (None, true) => Ok(Value::Variant {
+                                tag: "none".to_string(),
+                                payload: Box::new(Value::Unit),
+                            }),
+                        }
+                    }
+                    Value::Record(_) if *checked => {
+                        err("a checked subscript of a product is not defined")
+                    }
                     Value::Record(fields) => {
                         let Value::Int(i) = k else {
                             return err("a product is subscripted by position");
@@ -1017,26 +1214,7 @@ impl Interp {
 
             // A statement in expression position: `match` and `if`/`else` denote the value
             // of the branch they take.
-            Expr::Block(stmt) => match &stmt.node {
-                Stmt::Match { scrutinee, arms } => {
-                    let (bound, body) = self.match_arm(scrutinee, arms)?;
-                    let body = body.to_vec();
-                    self.scoped(|me| {
-                        if let Some((n, v)) = bound {
-                            me.bind(n, Slot::Val(v));
-                        }
-                        me.block_value(&body)
-                    })
-                }
-                Stmt::If {
-                    branches,
-                    else_body,
-                } => match self.select_branch(branches, else_body)? {
-                    Some(body) => self.scoped(|me| me.block_value(&body)),
-                    None => err("an `if` with no `else` denotes no value"),
-                },
-                other => err(format!("{other:?} in expression position")),
-            },
+            Expr::Block(stmt) => self.branch_value(stmt, false),
 
             Expr::Call { func, args } => self.call(func, args),
 
@@ -1044,7 +1222,7 @@ impl Interp {
         }
     }
 
-    /// The builtins the corpus reaches, plus a zero-argument call naming a source.
+    /// The builtins the differential suite reaches.
     ///
     /// A lambda is applied where it is written rather than becoming a value: nothing in
     /// CHL observes a function, so the comparison domain has no reason to carry one.
@@ -1053,14 +1231,15 @@ impl Interp {
             return err("only a named function can be called");
         };
         // A user function shadows a builtin of the same name: the nearest binding wins
-        // ("3.2 Names").
-        if let Some(function) = self.functions.get(name.as_str()).cloned() {
-            return self.call_user(name, function, args);
+        // (`docs/chl-spec.md`, "3.2 Names").
+        if let Some(Slot::Fn(function)) = self.slot(name) {
+            let function = function.clone();
+            return self.call_user(name, &function, args);
         }
 
         match (name.as_str(), args.len()) {
-            // `await_final` consumes its variable ("8.6 `await_final`"): no write may name
-            // it afterwards, so its current value is its final one.
+            // `await_final` consumes its variable (`docs/chl-spec.md`, "8.6 `await_final`"): no
+            // write may name it afterwards, so its current value is its final one.
             ("await_final", 1) => {
                 let Expr::Name(n) = &args[0].node else {
                     return err("`await_final` takes a mutable variable");
@@ -1111,11 +1290,6 @@ impl Interp {
                     .ok_or_else(|| Error("`max` of an empty collection is not defined".into()))
             }
 
-            (name, 0) => match self.sources.get(name) {
-                Some(c) => Ok(Value::Collection(c.clone())),
-                None => err(format!("unknown zero-argument function: {name}")),
-            },
-
             ("sum", 1) => {
                 let Value::Collection(c) = self.eval(&args[0])? else {
                     return err("`sum` takes a collection");
@@ -1161,7 +1335,7 @@ impl Interp {
     fn call_user(
         &mut self,
         name: &str,
-        function: Function,
+        function: &Function,
         args: &[Spanned<Expr>],
     ) -> Result<Value, Error> {
         if function.params.len() != args.len() {
@@ -1187,7 +1361,7 @@ impl Interp {
             params.push((param.clone(), slot));
         }
 
-        let mut env = function.env;
+        let mut env = function.env.clone();
         env.push(params);
         let caller = std::mem::replace(&mut self.scopes, env);
         let outcome = if contains_yield(&function.body) {
@@ -1200,16 +1374,8 @@ impl Interp {
                 std::mem::replace(&mut self.yielded, outer_yielded).expect("installed above");
             self.loop_keys = outer_keys;
             ran.and_then(|_| collection(collected).map(Value::Collection))
-        } else if matches!(
-            function.body.last().map(|s| &s.node),
-            Some(Stmt::Expr(_) | Stmt::Return(_))
-        ) {
-            self.block_value(&function.body)
         } else {
-            // A body ending in a statement, such as a write through a `Mut` parameter, is
-            // run for its effects and denotes unit.
-            self.exec_block(&function.body)
-                .map(|returned| returned.unwrap_or(Value::Unit))
+            self.block_value(&function.body, true)
         };
         self.scopes = caller;
         outcome
@@ -1279,14 +1445,16 @@ impl Interp {
     }
 }
 
-/// Integer division rounding toward negative infinity, the `//` of "3.3 Arithmetic and
-/// logical operators".
+/// Integer division rounding toward negative infinity, the `//` of `docs/chl-spec.md`, "3.3
+/// Arithmetic and logical operators".
 fn floor_div(a: i64, b: i64) -> Option<i64> {
     let q = a.checked_div(b)?;
     let rounds_down = a % b != 0 && ((a < 0) != (b < 0));
     Some(if rounds_down { q - 1 } else { q })
 }
 
+/// Apply a binary operator. An overflow or a division by zero is an [`Error`]: the spec leaves
+/// it undefined (`docs/chl-spec.md`, "Partiality is not yet defined [Open]").
 fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
     let int = |v: Option<i64>| {
         v.map(Value::Int)
@@ -1352,16 +1520,14 @@ mod tests {
     use indoc::indoc;
 
     fn out(source: &str) -> Value {
-        run(source, BTreeMap::new())
+        run(source)
             .expect("the program runs")
             .remove("out")
             .expect("sink `out`")
     }
 
     fn refused(source: &str) -> String {
-        run(source, BTreeMap::new())
-            .expect_err("the program is refused")
-            .0
+        run(source).expect_err("the program is refused").0
     }
 
     #[test]
@@ -1457,6 +1623,112 @@ mod tests {
                 out << b
         "#});
         assert!(e.contains("more than one `with` block"), "{e}");
+    }
+
+    /// A binding made in an `if` branch is not visible after the `if`, as one made in a
+    /// `match` arm is not.
+    #[test]
+    fn an_if_branch_binding_does_not_escape() {
+        let e = refused(indoc! {r#"
+            if 3 > 2:
+                y = 1
+            else:
+                y = 2
+            out = test_sink()
+            out << y
+        "#});
+        assert!(e.contains("unbound name: y"), "{e}");
+    }
+
+    /// A feed inside a block in expression position is a site of its channel like any other.
+    #[test]
+    fn a_feed_in_an_expression_block_is_a_site() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            out << 1
+            y = if 2 > 1:
+                    out << 2
+                    3
+                else:
+                    4
+            out << y
+        "#});
+        assert_eq!(v.to_string(), "[`0(()) -> 1, `1(()) -> 2, `2(()) -> 3]");
+    }
+
+    #[test]
+    fn a_channel_read_before_its_define_runs_is_refused() {
+        let e = refused(indoc! {r#"
+            ch = defer()
+            out = test_sink()
+            out << sum(ch)
+            ch <<= [1, 2]
+        "#});
+        assert!(e.contains("is read before its feed"), "{e}");
+    }
+
+    /// Two equal maps written in different orders would give 12 and 21.
+    #[test]
+    fn an_accumulating_loop_over_a_keyed_collection_is_refused() {
+        let e = refused(indoc! {r#"
+            acc := 0
+            for v in map([("b", 1), ("a", 2)]):
+                acc := acc * 10 + v
+            out = test_sink()
+            out << acc
+        "#});
+        assert!(e.contains("may depend on its iteration order"), "{e}");
+    }
+
+    /// Integer keys run in ascending order whatever order the entries were written in, so two
+    /// equal collections give one answer.
+    #[test]
+    fn an_accumulating_loop_over_integer_keys_runs_in_key_order() {
+        let program = |pairs: &str| {
+            indoc::formatdoc! {r#"
+                acc := 0
+                for v in map([{pairs}]):
+                    acc := acc * 10 + v
+                out = test_sink()
+                out << acc
+            "#}
+        };
+        assert_eq!(out(&program("(2, 6), (1, 5)")).to_string(), "[() -> 56]");
+        assert_eq!(out(&program("(1, 5), (2, 6)")).to_string(), "[() -> 56]");
+    }
+
+    /// A channel's state is keyed by its name, so a second declaration of the name is refused
+    /// rather than sharing the first's state.
+    #[test]
+    fn a_channel_declared_twice_is_refused() {
+        let e = refused(indoc! {r#"
+            ch = defer()
+            def f(n):
+                ch = defer()
+                ch << n
+                0
+            out = test_sink()
+            out << f(1)
+        "#});
+        assert!(e.contains("declared as a channel twice"), "{e}");
+    }
+
+    /// A branch ending in a nested `if`/`else` denotes that `if`'s taken branch.
+    #[test]
+    fn a_block_ending_in_a_nested_conditional_has_its_branch_value() {
+        let v = out(indoc! {r#"
+            def f(n):
+                if n > 0:
+                    if n > 5:
+                        2
+                    else:
+                        1
+                else:
+                    0
+            out = test_sink()
+            out << f(3)
+        "#});
+        assert_eq!(v.to_string(), "[() -> 1]");
     }
 
     #[test]

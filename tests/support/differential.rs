@@ -1,9 +1,7 @@
-//! Running one program through the compiler and through the reference interpreter, each
+//! Running one program through the compiler and through the differential interpreter, each
 //! observed through the sink `out`, and reading both answers in the interpreter's domain.
 //!
 //! Compiled into the differential suite `tests/differential_interp.rs`.
-
-use std::collections::BTreeMap;
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{GlobalContext, compile_program};
@@ -70,19 +68,18 @@ pub fn run_compiled(source: &str) -> Compiled {
     }
 }
 
-/// Run `source` through the reference interpreter, answering what sink `out` observed.
+/// Run `source` through the differential interpreter, answering what sink `out` observed.
 pub fn run_interpreted(source: &str) -> Result<Value, String> {
-    let mut obs = chl_interp::run(source, BTreeMap::new()).map_err(|e| e.to_string())?;
+    let mut obs = chl_interp::run(source).map_err(|e| e.to_string())?;
     obs.remove("out")
         .ok_or_else(|| "the program declares no sink `out`".to_string())
 }
 
 /// Read a compiled value of type `ty` in the interpreter's domain.
 ///
-/// Two decisions. `UInt` is `Int`: a key the compiler numbers is the same key the
-/// interpreter numbers, and keeping two integer types apart here would make every
-/// positional collection differ for a reason that is about representation. And a key
-/// of type `Txn` is a commit time, which the runtime represents as a plain `UInt`.
+/// `UInt` reads as `Int`: a key the compiler numbers is the key the interpreter numbers, and
+/// the two integer types differ only in representation. A key of type `Txn` is a commit
+/// time, which the runtime represents as a plain `UInt`.
 pub fn convert(v: TileValue, ty: &Type) -> Value {
     match (v, ty.peel_refinements()) {
         (

@@ -1,7 +1,7 @@
 //! CHL surface AST.
 //!
 //! Produced by [`super::parser`] and consumed by `cambra::ccl::lower` and by the
-//! reference interpreter, `chl-interp`.
+//! differential interpreter, `chl-interp`.
 //!
 //! # Design choices vs. `rustpython_ast`
 //!

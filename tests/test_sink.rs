@@ -73,9 +73,9 @@ fn a_scalar_feed_is_one_contribution_keyed_by_unit() {
 }
 
 /// A collection fed at a site that does not iterate lands flat: the channel takes the
-/// collection's own keys, rather than one unit-keyed contribution holding it. Pinned as
-/// observed, not endorsed — a feed is meant to nest, which would make this
-/// `() -> [2, 4, 6]`, and the raw tile is one level (`keys: UInts([0, 1, 2])`).
+/// collection's own keys (`keys: UInts([0, 1, 2])`) rather than one unit-keyed contribution
+/// holding it, `() -> [2, 4, 6]`, which `docs/chl-spec.md`, "3.7 Feed operator `<<`" makes
+/// it. Pinned as observed.
 #[test]
 fn a_collection_feed_lands_flat_rather_than_nesting() {
     let v = observe_one(indoc! {r#"
@@ -512,12 +512,7 @@ fn a_sink_accumulates_across_two_deliveries() {
 }
 
 /// Feeding a collection built from the loop variable, from inside the loop, produces a tree
-/// that fails the compiler's own post-lambda-elim typecheck. Not a sink defect: the same
-/// program through a plain `defer()` and a trailing expression panics identically.
-///
-/// It leaves one feed case unmeasured — whether such a channel takes the loop's keys with a
-/// collection under each, or splices the contributions into one flat domain — so nothing
-/// downstream should assume either.
+/// that fails the compiler's own post-lambda-elim typecheck. Pinned at the panic it reaches.
 #[test]
 #[should_panic(expected = "post-lambda-elim produced an invalid tree")]
 fn a_collection_fed_from_inside_a_loop_does_not_compile() {
