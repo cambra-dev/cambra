@@ -564,10 +564,11 @@ write). What the driver does keep is the **item** cursor `emitted_through`, beca
 restricted source's positions are sparser than its extent's and the frontier therefore does
 not name one; the next position to iterate is the smallest delivered position above it. An
 emitted row is otherwise a pure function of the store tile and the source tile, with nothing
-cached that could drift. It decodes the source
-into `(absolute position, item)` pairs (`decode_source_positioned`), since an async source's
-domain arrives *unordered* and *compacts* as its consumed prefix is released; it reclaims
-that prefix incrementally and releases the whole source (`True`) once the loop is done. It
+cached that could drift. It decodes the source into `(absolute position, item)` pairs
+(`decode_source_positioned`), since an async source's domain arrives *unordered* and
+*compacts* as its consumed prefix is released. The decode skips the rows the source marks
+deleted, because a `Restrict` marks a filtered row deleted rather than dropping it. The driver
+reclaims the consumed prefix incrementally and releases the whole source (`True`) once the loop is done. It
 also releases the changelog through the frontier — the store's keep-latest GC preserves each
 key's latest write inside a released prefix, so the fold is never stranded, and without it
 the store's `FanOut`-intersected watermark could never advance past the cycle branch.
