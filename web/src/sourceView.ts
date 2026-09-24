@@ -9,16 +9,18 @@
 //   - selection highlight: a StateField that marks the resolved source spans,
 //     distinguishing the primary anchor span from transitively-linked spans
 //
-// A plain source click selects `{ kind: "source", byteOffset }`; the store
-// reseeds every pane's tightest node from that offset, so all panes light up.
-// Squiggles work on the degraded snapshot too (no IR, but diagnostics present).
+// A source selection is `{ kind: "source", from, to }` over source bytes, taken
+// from CodeMirror's own selection: a click leaves a caret (`from === to`) and a
+// drag leaves a range. The store reseeds every pane from it, so all panes light
+// up. Squiggles work on the degraded snapshot too (no IR, but diagnostics
+// present).
 
 import { EditorState, StateEffect, StateField } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
   EditorView,
-  highlightActiveLine,
+  drawSelection,
   hoverTooltip,
   lineNumbers,
   type Tooltip,
@@ -27,7 +29,7 @@ import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lin
 
 import type { Indices } from "./indices";
 import type { OffsetMap } from "./offsets";
-import type { Resolved, Selection, Store } from "./store";
+import { SOURCE_PANE, type Resolved, type Selection, type Store } from "./store";
 import type { RewriteInfo } from "./types";
 
 // The data a hover tooltip renders at a byte offset: the tightest enclosing
@@ -61,11 +63,11 @@ export function hoverPayloadAt(
   };
 }
 
-// The selection a source-side click produces. With `mods.goto` set (Ctrl/Cmd)
-// on a use-site, it is the goto-definition jump (a source selection at the
-// def-site's start); otherwise a plain source selection at the clicked byte.
-// Pure, so the decision is unit-tested without CM geometry; the CM `mousedown`
-// handler calls it. `anchor` may be undefined on a degraded snapshot.
+// The selection a source-side click produces, as a caret at one byte. With
+// `mods.goto` set (Ctrl/Cmd) on a use-site it is the goto-definition jump — a
+// caret at the def-site's start — and otherwise a caret at the clicked byte.
+// Pure, so the decision is unit-tested without CM geometry. `anchor` may be
+// undefined on a degraded snapshot.
 export function resolveSourceClick(
   anchor: Indices | undefined,
   byte: number,
@@ -73,12 +75,12 @@ export function resolveSourceClick(
 ): Selection {
   if (mods.goto && anchor) {
     const def = anchor.definitionAt(byte);
-    if (def) return { kind: "source", byteOffset: def.defSpan.start };
+    if (def) return { kind: "source", from: def.defSpan.start, to: def.defSpan.start };
   }
-  return { kind: "source", byteOffset: byte };
+  return { kind: "source", from: byte, to: byte };
 }
 
-interface HighlightSpan {
+export interface HighlightSpan {
   from: number;
   to: number;
   primary: boolean;
@@ -89,6 +91,62 @@ const setHighlights = StateEffect.define<HighlightSpan[] | null>();
 
 const primaryMark = Decoration.mark({ class: "cm-sel-node" });
 const linkedMark = Decoration.mark({ class: "cm-link-node" });
+
+type Interval = { from: number; to: number };
+
+/** Overlapping and touching intervals joined into one, ascending. */
+function merge(xs: Interval[]): Interval[] {
+  const out: Interval[] = [];
+  for (const x of [...xs].sort((a, b) => a.from - b.from || a.to - b.to)) {
+    if (x.to <= x.from) continue;
+    const last = out[out.length - 1];
+    if (last && x.from <= last.to) last.to = Math.max(last.to, x.to);
+    else out.push({ from: x.from, to: x.to });
+  }
+  return out;
+}
+
+/** `a` minus `b`, both already merged and ascending. */
+function subtract(a: Interval[], b: Interval[]): Interval[] {
+  const out: Interval[] = [];
+  let j = 0;
+  for (const iv of a) {
+    let from = iv.from;
+    while (j < b.length && b[j].to <= from) j += 1;
+    for (let k = j; k < b.length && b[k].from < iv.to; k += 1) {
+      if (b[k].from > from) out.push({ from, to: Math.min(b[k].from, iv.to) });
+      from = Math.max(from, b[k].to);
+      if (from >= iv.to) break;
+    }
+    if (from < iv.to) out.push({ from, to: iv.to });
+  }
+  return out;
+}
+
+/**
+ * The highlight spans as a **partition** of the text: no offset is covered
+ * twice, and a primary region wins over a linked one.
+ *
+ * The marks are translucent, so a doubly-covered offset paints its colour twice
+ * and reads as a third shade nobody chose. That is not hypothetical: a source
+ * click seeds every pane's tightest node, and the panes disagree about extent —
+ * clicking the `if` in `txn_multi_read` gives `post-inference` the statement and
+ * the two downstream panes the enclosing `with` block, two primary spans
+ * nesting one inside the other. Flattening first is what makes the rendered
+ * shade mean "primary" or "linked" rather than "however many spans happened to
+ * land here".
+ */
+export function flattenHighlights(spans: HighlightSpan[]): HighlightSpan[] {
+  const primary = merge(spans.filter((s) => s.primary));
+  const linked = subtract(
+    merge(spans.filter((s) => !s.primary)),
+    primary,
+  );
+  return [
+    ...primary.map((iv) => ({ ...iv, primary: true })),
+    ...linked.map((iv) => ({ ...iv, primary: false })),
+  ].sort((a, b) => a.from - b.from || a.to - b.to);
+}
 
 const highlightField = StateField.define<DecorationSet>({
   create() {
@@ -101,12 +159,12 @@ const highlightField = StateField.define<DecorationSet>({
         if (!e.value || e.value.length === 0) {
           next = Decoration.none;
         } else {
-          // CodeMirror requires ranges sorted by `from` (ties: startSide).
-          const ranges = e.value
-            .filter((s) => s.to > s.from)
-            .sort((a, b) => a.from - b.from || a.to - b.to)
-            .map((s) => (s.primary ? primaryMark : linkedMark).range(s.from, s.to));
-          next = Decoration.set(ranges, true);
+          // Flattened first, so no offset carries two translucent marks; the
+          // result is already sorted by `from`, which `Decoration.set` needs.
+          const ranges = flattenHighlights(e.value).map((s) =>
+            (s.primary ? primaryMark : linkedMark).range(s.from, s.to),
+          );
+          next = ranges.length === 0 ? Decoration.none : Decoration.set(ranges, true);
         }
       }
     }
@@ -209,25 +267,24 @@ export class SourceView {
       };
     });
 
-    // Source-side click, on the primary (left) button:
-    //   - Ctrl/Cmd-click a use-site -> goto-definition (the IDE/LSP-standard
-    //     gesture); selects the def-site as a source selection so all panes
-    //     follow.
-    //   - plain click -> select the source byte offset (the store reseeds each
-    //     pane's tightest node), without suppressing the editor's own cursor.
+    // Ctrl/Cmd-click a use-site -> goto-definition (the IDE/LSP-standard
+    // gesture), which selects the def-site so all panes follow. Only that
+    // gesture is handled here: a plain click and a drag both land as an
+    // ordinary CodeMirror selection, which `selectionSync` below picks up.
     const interactions = EditorView.domEventHandlers({
       mousedown: (event, view) => {
         if (event.button !== 0) return false;
+        if (!event.ctrlKey && !event.metaKey) return false;
         const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
         if (pos === null) return false;
         const byte = offsets.charToByte(pos);
-        const goto = event.ctrlKey || event.metaKey;
-        const selection = resolveSourceClick(anchor, byte, { goto });
-        store.setSelection(selection);
-        // A goto-def jump landed elsewhere than the clicked byte: suppress CM's
-        // own ctrl/cmd-click handling and consume the event. A plain click lets
-        // the editor place its cursor / select text.
-        if (selection?.kind === "source" && selection.byteOffset !== byte) {
+        const selection = resolveSourceClick(anchor, byte, { goto: true });
+        // Only a jump that actually landed elsewhere is consumed. Consuming it
+        // keeps CodeMirror from placing a caret at the clicked byte, which
+        // would re-enter `selectionSync` and overwrite the jump. A modified
+        // click over a non-use falls through to the ordinary path.
+        if (selection?.kind === "source" && selection.from !== byte) {
+          store.setSelection(selection);
           event.preventDefault();
           return true;
         }
@@ -235,17 +292,44 @@ export class SourceView {
       },
     });
 
+    // CodeMirror owns the selection: it paints the drag and reports the range
+    // even under `editable: false`, so the gesture needs no mouse handling of
+    // its own and keyboard selection (shift+arrow) arrives the same way.
+    //
+    // Deferred through a microtask because `renderSelection` dispatches back
+    // into this view, and CodeMirror refuses a dispatch made while an update is
+    // in progress. The reply carries no selection change, so it does not
+    // re-enter this listener.
+    //
+    // Every `selectionSet` update is forwarded, pointer and keyboard alike, so
+    // a drag reports its range as it grows. The range is taken as the reader
+    // drew it: nothing snaps it to a construct boundary, because `resolve`
+    // already widens it to the construct it explains (`selectionRegion`), and
+    // rewriting the reader's own range mid-drag would move the end they are
+    // still dragging.
+    const selectionSync = EditorView.updateListener.of((update) => {
+      if (!update.selectionSet) return;
+      const range = update.state.selection.main;
+      const from = offsets.charToByte(range.from);
+      const to = offsets.charToByte(range.to);
+      queueMicrotask(() => store.setSelection({ kind: "source", from, to }, SOURCE_PANE));
+    });
+
     const state = EditorState.create({
       doc: snapshot.source.text,
       extensions: [
         lineNumbers(),
-        highlightActiveLine(),
+        // CodeMirror draws no caret in non-editable content, so nothing showed
+        // where the reader clicked; `drawSelection` draws both the caret and
+        // the selection itself, and puts their colours under this app's CSS.
+        drawSelection(),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         EditorView.lineWrapping,
         highlightField,
         hover,
         interactions,
+        selectionSync,
       ],
     });
     this.view = new EditorView({ state, parent });
@@ -260,32 +344,40 @@ export class SourceView {
   /** Reflect the resolved selection as source-span highlights. */
   private renderSelection(resolved: Resolved): void {
     const spans = resolved.result.sourceSpans;
-    if (spans.length === 0) {
+    const pointedAt = resolved.pointedAt;
+    if (spans.length === 0 && pointedAt === null) {
       this.view.dispatch({ effects: setHighlights.of(null) });
       return;
-    }
-
-    // The primary span(s): the source spans of the per-pane primary anchors.
-    const primaryKeys = new Set<string>();
-    for (const [paneId, nodeId] of resolved.primaryByPane) {
-      if (nodeId === null) continue;
-      const span = this.store.indicesFor(paneId)?.nodeById.get(nodeId)?.spans[0];
-      if (span) primaryKeys.add(`${span.start}:${span.end}`);
     }
 
     // Call on the OffsetMap object: `byteToChar` reads `this.byteAt`, so a
     // destructured `const { byteToChar } = ...` would lose its binding and throw.
     const offsets = this.store.offsets;
-    const highlights: HighlightSpan[] = spans.map((span) => ({
-      from: offsets.byteToChar(span.start),
-      to: offsets.byteToChar(span.end),
-      primary: primaryKeys.has(`${span.start}:${span.end}`),
-    }));
-
-    // Scroll to the first primary span (or the first span if none is primary).
-    const focus = highlights.find((h) => h.primary) ?? highlights[0];
-    this.view.dispatch({
-      effects: [setHighlights.of(highlights), EditorView.scrollIntoView(focus.from, { y: "center" })],
+    const mark = (from: number, to: number, primary: boolean): HighlightSpan => ({
+      from: offsets.byteToChar(from),
+      to: offsets.byteToChar(to),
+      primary,
     });
+
+    // Strong is what the reader pointed at, and nothing else — never a node's
+    // extent. Every span the resolution reached is a trace, including the one
+    // the pointed-at bytes sit inside; `flattenHighlights` subtracts the strong
+    // region out of them, so the token reads as itself and the statement around
+    // it as what it resolved to.
+    const highlights: HighlightSpan[] = [];
+    if (pointedAt !== null) highlights.push(mark(pointedAt.from, pointedAt.to, true));
+    for (const span of spans) highlights.push(mark(span.start, span.end, false));
+
+    // Not when the selection was made here: the caret is already where the
+    // reader put it, and scrolling under a drag fights the gesture. A jump —
+    // goto-definition, or a click in another pane — carries a different origin
+    // and does move the editor.
+    const effects: StateEffect<unknown>[] = [setHighlights.of(highlights)];
+    if (resolved.origin !== SOURCE_PANE && highlights.length > 0) {
+      const focus = highlights.reduce((a, b) => (b.from < a.from ? b : a));
+      effects.push(EditorView.scrollIntoView(focus.from, { y: "start" }));
+    }
+    this.view.dispatch({ effects });
   }
+
 }

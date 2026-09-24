@@ -14,31 +14,69 @@ import {
   type PaneNode,
   type ResolveResult,
 } from "./links";
-import { OffsetMap } from "./offsets";
+import { OffsetMap, wordRangeAt } from "./offsets";
 import { isIrPane } from "./types";
 import type { PaneEntry, Snapshot, Span } from "./types";
 
-// A click in any pane: a node in a specific pane, a raw source byte offset, or
-// nothing selected.
+// A selection in any pane: a node in a specific pane, a half-open range of
+// source bytes, or nothing selected.
+//
+// A source selection is a range because a click and a drag are one gesture:
+// `from === to` is a caret, which is what a click leaves behind, and `from <
+// to` is a dragged range. There is no separate point variant to keep in step.
 export type Selection =
   | { kind: "node"; paneId: string; nodeId: number }
-  | { kind: "source"; byteOffset: number }
+  | { kind: "source"; from: number; to: number }
   | null;
+
+/**
+ * The pane id a selection came from, or `null` when it came from a gesture that
+ * means "go there" rather than "look here".
+ *
+ * A pane does not scroll itself: the reader is already looking at the row they
+ * clicked, and moving it under them is the one motion they did not ask for.
+ * Every other pane scrolls to its topmost highlighted row. `null` opts a
+ * gesture out of the exemption — goto-definition and the operator pane's
+ * reference rows are jumps, so their own pane has to move too.
+ */
+export const SOURCE_PANE = "source";
 
 export interface Resolved {
   selection: Selection;
+  /** Which pane the selection came from; see {@link SOURCE_PANE}. */
+  origin: string | null;
+  /**
+   * The source bytes the reader **pointed at**, as opposed to what those bytes
+   * resolve to: the token under a click, the dragged range, or the span of a
+   * row clicked in a pane. `null` when nothing is selected.
+   *
+   * This is the source pane's strong highlight, and it is deliberately not
+   * derived from any node's span. Painting the resolved node's extent strongly
+   * is what made a click on `if` claim the whole statement, and a click
+   * anywhere inside a block look identical.
+   */
+  pointedAt: { from: number; to: number } | null;
   /** Per-pane highlight sets + the union of source spans (see `links.ts`). */
   result: ResolveResult;
   /**
-   * The strong-highlight anchor per pane: the directly-clicked node, or — for
-   * a source click — that pane's tightest enclosing node. `null` for a pane
-   * with no anchor (it shows only transitively-linked highlights).
+   * Per pane, the nodes that **are** the selection: the anchor and its images
+   * under the pane links. Everything else in
+   * [`highlightsByPane`](ResolveResult) is something the resolution reached
+   * from it.
+   *
+   * A pane can hold none. `ExprStmt` is rewritten away by channelize, so a
+   * click on a statement has no counterpart downstream at all — five panes
+   * light up entirely as traces. That is the truth about the program rather
+   * than a gap to paper over, and the tree pane says so instead of leaving the
+   * reader to wonder.
    */
-  primaryByPane: Map<string, number | null>;
+  primaryByPane: Map<string, Set<number>>;
 }
 
 const EMPTY_RESOLVED = (selection: Selection): Resolved => ({
   selection,
+  origin: null,
+  pointedAt: null,
   result: { highlightsByPane: new Map(), sourceSpans: [] },
   primaryByPane: new Map(),
 });
@@ -66,6 +104,12 @@ export class Store {
   // the type *set*. Empty/absent for nodes with no downstream type. Precomputed.
   private readonly resolvedTypesByPane: Map<string, Map<number, string[]>>;
   private resolved: Resolved = EMPTY_RESOLVED(null);
+  /**
+   * Each pane's narrowest span per node. Keyed by pane id and read off the node
+   * tables, so it answers for the operator pane too — `indicesFor` is
+   * tree-shaped and has nothing for it.
+   */
+  private readonly narrowestByPane = new Map<string, Map<number, Span | null>>();
   private readonly listeners = new Set<Listener>();
 
   constructor(snapshot: Snapshot) {
@@ -83,7 +127,10 @@ export class Store {
     this.indicesByPane = new Map();
     for (const pane of this.panes) {
       if (!isIrPane(pane)) continue;
-      this.indicesByPane.set(pane.id, buildIndices(pane.root, pane.nodes, snapshot.definitions));
+      this.indicesByPane.set(
+        pane.id,
+        buildIndices(pane.root, pane.nodes, snapshot.definitions, snapshot.source.text),
+      );
     }
 
     // Hover/goto-def/squiggles read fully-resolved types, so they anchor on the
@@ -98,11 +145,15 @@ export class Store {
     // an id relation over the whole pipeline, and both node shapes carry the id
     // and the spans the resolver reads. Built from the node tables directly, so
     // it needs no tree-shaped index.
+    for (const pane of this.panes) {
+      // The narrowest span, which is the first one a node carries.
+      const narrowest = new Map<number, Span | null>();
+      for (const node of pane.nodes) narrowest.set(node.nodeId, node.spans[0] ?? null);
+      this.narrowestByPane.set(pane.id, narrowest);
+    }
     this.linkGraph = buildLinkGraph(
       this.panes.map((pane) => {
-        // The narrowest span, which is the first one a node carries.
-        const narrowest = new Map<number, Span | null>();
-        for (const node of pane.nodes) narrowest.set(node.nodeId, node.spans[0] ?? null);
+        const narrowest = this.narrowestByPane.get(pane.id) ?? new Map();
         return {
           id: pane.id,
           nodeIds: new Set(narrowest.keys()),
@@ -176,10 +227,34 @@ export class Store {
     return this.resolved;
   }
 
-  /** Replace the selection and re-resolve it across all panes. */
-  setSelection(selection: Selection): void {
-    if (selectionsEqual(selection, this.resolved.selection)) return;
-    this.resolved = this.resolve(selection);
+  /**
+   * A node's narrowest source span, in whichever pane holds it, or `null` when
+   * the node traces to no source. Works for both node shapes.
+   */
+  spanOf(paneId: string, nodeId: number): Span | null {
+    return this.narrowestByPane.get(paneId)?.get(nodeId) ?? null;
+  }
+
+  /**
+   * Replace the selection and re-resolve it across all panes.
+   *
+   * `origin` is the pane the gesture happened in, which that pane reads to
+   * leave its own scroll position alone; omit it for a jump (see
+   * {@link SOURCE_PANE}).
+   */
+  setSelection(selection: Selection, origin: string | null = null): void {
+    // `origin` is part of the answer, not just of the request: a pane reads it
+    // to leave its own scroll alone. Re-selecting what is already selected from
+    // a *different* origin is therefore a real change — it is how "go to this
+    // node" reaches a pane that already has that node selected and scrolled
+    // away. Comparing the selection alone swallowed exactly that gesture.
+    if (
+      selectionsEqual(selection, this.resolved.selection) &&
+      origin === this.resolved.origin
+    ) {
+      return;
+    }
+    this.resolved = this.resolve(selection, origin);
     // Notify every subscriber even if one throws: a single broken view must not
     // starve the others. We do NOT swallow the error — it is surfaced via
     // console.error so the bug stays visible (this is exactly how Bug 1 hid: a
@@ -199,32 +274,89 @@ export class Store {
     return () => this.listeners.delete(fn);
   }
 
-  private resolve(selection: Selection): Resolved {
+  private resolve(selection: Selection, origin: string | null): Resolved {
     if (selection === null) return EMPTY_RESOLVED(null);
 
-    const seeds: PaneNode[] = [];
-    const primaryByPane = new Map<string, number | null>();
-    for (const pane of this.panes) primaryByPane.set(pane.id, null);
+    const anchorPane = this.sourceAnchorPaneId;
+    const anchorIdx = anchorPane === null ? undefined : this.indicesByPane.get(anchorPane);
+
+    // Two extents, and the whole colouring rests on their being different:
+    //   `pointedAt` is what the reader indicated — a token, a dragged range, a
+    //     row's span — and is what the source pane paints strongly;
+    //   `region` is the construct that extent sits inside, and is how much the
+    //     traces explain.
+    //
+    // One rule computes the region for every gesture: the tightest node
+    // containing what was pointed at (`selectionRegion`). A caret takes the node
+    // it is in, a drag the node it is inside, a clicked row its own extent.
+    // These were three separate computations and so disagreed about how much to
+    // explain — a drag ending part-way through an expression traced only the
+    // nodes it fully covered, while a click inside the same statement traced
+    // the whole of it.
+    let pointedAt: { from: number; to: number } | null = null;
+    // The nodes that *are* the selection. Their images are the strong
+    // highlight in the panes; everything else resolved is a trace.
+    const anchorSeeds: PaneNode[] = [];
 
     if (selection.kind === "node") {
-      seeds.push({ paneId: selection.paneId, nodeId: selection.nodeId });
-      primaryByPane.set(selection.paneId, selection.nodeId);
+      anchorSeeds.push({ paneId: selection.paneId, nodeId: selection.nodeId });
+      const span = this.spanOf(selection.paneId, selection.nodeId);
+      pointedAt = span === null ? null : { from: span.start, to: span.end };
+    } else if (selection.from < selection.to) {
+      // A drag says its own extent: that is what was pointed at, however much
+      // of a construct it happens to cover.
+      pointedAt = { from: selection.from, to: selection.to };
+      if (anchorPane !== null && anchorIdx) {
+        for (const nodeId of anchorIdx.nodesInRange(pointedAt.from, pointedAt.to)) {
+          anchorSeeds.push({ paneId: anchorPane, nodeId });
+        }
+      }
     } else {
-      // A source click has no node: resolve the byte offset to each pane's
-      // tightest enclosing node, seed them all, and let the graph merge them.
-      // The operator pane has no such index and so takes no seed of its own; the
-      // graph still reaches it through the post-planning window.
+      const char = this.offsets.byteToChar(selection.from);
+      const word = wordRangeAt(this.snapshot.source.text, char);
+      pointedAt = {
+        from: this.offsets.charToByte(word.from),
+        to: this.offsets.charToByte(word.to),
+      };
+      const nodeId = anchorIdx?.tightestNodeAt(selection.from) ?? null;
+      if (anchorPane !== null && nodeId !== null) {
+        anchorSeeds.push({ paneId: anchorPane, nodeId });
+      }
+    }
+
+    const region =
+      pointedAt === null
+        ? null
+        : (anchorIdx?.selectionRegion(pointedAt.from, pointedAt.to) ?? pointedAt);
+
+    // Each tree pane's own answer over the region. Two things need it: a pane
+    // whose nodes are all wider than the region would otherwise go dark, and
+    // the enclosing construct's span — `with begin():` on the line above a
+    // clicked `if` — reaches the source pane only this way. Both arrive as
+    // traces, never as anchors, so a wide downstream node can no longer widen
+    // the strong highlight.
+    const traceSeeds: PaneNode[] = [];
+    if (region !== null) {
       for (const pane of this.panes) {
-        const node =
-          this.indicesByPane.get(pane.id)?.tightestNodeAt(selection.byteOffset) ?? null;
-        if (node !== null) {
-          seeds.push({ paneId: pane.id, nodeId: node });
-          primaryByPane.set(pane.id, node);
+        const idx = this.indicesByPane.get(pane.id);
+        if (!idx) continue;
+        for (const nodeId of idx.nodesInRange(region.from, region.to)) {
+          traceSeeds.push({ paneId: pane.id, nodeId });
         }
       }
     }
 
-    return { selection, result: resolveLinks(this.linkGraph, seeds), primaryByPane };
+    // Two walks over one graph: the anchors alone, then everything. The
+    // difference is what "reached from here" means, and it cannot be recovered
+    // from a single walk.
+    const anchored = resolveLinks(this.linkGraph, anchorSeeds);
+    const result = resolveLinks(this.linkGraph, [...anchorSeeds, ...traceSeeds]);
+    const primaryByPane = new Map<string, Set<number>>();
+    for (const pane of this.panes) {
+      primaryByPane.set(pane.id, anchored.highlightsByPane.get(pane.id) ?? new Set());
+    }
+
+    return { selection, origin, pointedAt, result, primaryByPane };
   }
 }
 
@@ -235,7 +367,7 @@ function selectionsEqual(a: Selection, b: Selection): boolean {
     return a.paneId === b.paneId && a.nodeId === b.nodeId;
   }
   if (a.kind === "source" && b.kind === "source") {
-    return a.byteOffset === b.byteOffset;
+    return a.from === b.from && a.to === b.to;
   }
   return false;
 }
