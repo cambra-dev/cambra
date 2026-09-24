@@ -1,5 +1,5 @@
 //! The [`Predicate`] type: subset-of-an-extent descriptions used by guards, plus
-//! the column-value conversions and the sealed-function domain-sort helper.
+//! the column-value conversions and the function domain-sort helper.
 
 use std::collections::HashMap;
 
@@ -670,12 +670,12 @@ where
     Predicate::Intervals(IntervalSet::new_unchecked(intervals))
 }
 
-/// Sort a `Tile::SealedFunction` by its domain values for deterministic comparison.
+/// Sort a `Tile::DataFunction` by its domain values for deterministic comparison.
 ///
 /// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all
 /// other tile forms are returned unchanged.  This is needed wherever key order
 /// depends on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
-pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
+pub fn sort_function_by_domain(tile: Tile) -> Tile {
     /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
     /// then rebuild the tile.
     fn sort_and_rebuild<K: PartialOrd + Clone>(
@@ -687,12 +687,12 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
         let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
         pairs.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
         let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
-        Tile::SealedFunction {
-            domain: mk_domain(sorted_d),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
+        Tile::data_function(
+            mk_domain(sorted_d),
+            Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
             domain_predicate,
-            deleted: BitSet::new(),
-        }
+            BitSet::new(),
+        )
     }
 
     fn record_cv_to_extent(fields: &HashMap<String, ColumnValue>) -> Extent {
@@ -704,63 +704,63 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
     }
 
     match tile {
-        Tile::SealedFunction {
+        Tile::DataFunction {
+            row_starts,
             domain,
             codomain,
             domain_predicate,
             deleted,
-        } => match (*codomain, domain) {
-            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
-                sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
-            }
-            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
-                sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
-            }
-            (
-                Tile::Scalar(ColumnValue::Ints(cod_ints)),
-                ref r @ ColumnValue::Records(ref fields),
-            ) => sort_and_rebuild(
-                r.clone().drain_to_value_iter().collect(),
-                cod_ints,
-                domain_predicate,
-                |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
-            ),
-            // Union domain: canonicalize entries by `(tag, slot)` so two tiles
-            // representing the same multiset of `(tag, payload) → cod` entries
-            // compare equal regardless of the order the arms happened to be
-            // drained in.
-            //
-            // The arm-keyed column already *stores* that pair — arms are in
-            // canonical tag order and each arm's rows ascend by slot — so
-            // concatenating the arms in order **is** the canonical sequence, and
-            // the codomain just follows the same permutation.
-            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Union(arms)) => {
-                let mut sorted_cod: Vec<i64> = Vec::with_capacity(cod_ints.len());
-                let mut next_row = 0usize;
-                let canonical = arms.map(|_, arm| {
-                    for &row in arm.rows() {
-                        sorted_cod.push(cod_ints[row]);
-                    }
-                    let rows: Vec<usize> = (next_row..next_row + arm.len()).collect();
-                    next_row += arm.len();
-                    UnionArm::new(rows, arm.values().clone())
-                });
-                let domain = ColumnValue::Union(canonical);
-                domain.debug_assert_union_invariants();
-                Tile::SealedFunction {
-                    domain,
-                    codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod))),
+        } if row_starts.len() == 1 => {
+            match (*codomain, domain) {
+                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
+                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
+                }
+                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
+                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
+                }
+                (
+                    Tile::Scalar(ColumnValue::Ints(cod_ints)),
+                    ref r @ ColumnValue::Records(ref fields),
+                ) => sort_and_rebuild(
+                    r.clone().drain_to_value_iter().collect(),
+                    cod_ints,
                     domain_predicate,
-                    deleted: BitSet::new(),
+                    |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
+                ),
+                // Union domain: canonicalize entries by `(tag, slot)` so two tiles
+                // representing the same multiset of `(tag, payload) → cod` entries
+                // compare equal regardless of the order the arms happened to be
+                // drained in.
+                //
+                // The arm-keyed column already *stores* that pair — arms are in
+                // canonical tag order and each arm's rows ascend by slot — so
+                // concatenating the arms in order **is** the canonical sequence, and
+                // the codomain just follows the same permutation.
+                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Union(arms)) => {
+                    let mut sorted_cod: Vec<i64> = Vec::with_capacity(cod_ints.len());
+                    let mut next_row = 0usize;
+                    let canonical = arms.map(|_, arm| {
+                        for &row in arm.rows() {
+                            sorted_cod.push(cod_ints[row]);
+                        }
+                        let rows: Vec<usize> = (next_row..next_row + arm.len()).collect();
+                        next_row += arm.len();
+                        UnionArm::new(rows, arm.values().clone())
+                    });
+                    let domain = ColumnValue::Union(canonical);
+                    domain.debug_assert_union_invariants();
+                    Tile::data_function(
+                        domain,
+                        Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod))),
+                        domain_predicate,
+                        BitSet::new(),
+                    )
+                }
+                (other_codomain, domain) => {
+                    Tile::data_function(domain, Box::new(other_codomain), domain_predicate, deleted)
                 }
             }
-            (other_codomain, domain) => Tile::SealedFunction {
-                domain,
-                codomain: Box::new(other_codomain),
-                domain_predicate,
-                deleted,
-            },
-        },
+        }
         other => other,
     }
 }

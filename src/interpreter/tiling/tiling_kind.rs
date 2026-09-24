@@ -23,26 +23,24 @@ pub enum Tiling {
     Scalar(Extent),
     /// A record of tilings.
     Record(HashMap<String, Tiling>),
-    /// A function from a domain extent to a (possibly structured) codomain tiling,
-    /// represented as a mapping plus progress information (the seal).
-    SealedFunction {
+    /// A collection level: the static shape of a
+    /// [`Tile::DataFunction`](crate::interpreter::tiling::Tile).
+    DataFunction {
+        /// The key extent this level introduces.
         domain: Extent,
+        /// The values, over those keys — an [`Tiling::Aggregation`] is what a fold leaves
+        /// here.
         codomain: Box<Tiling>,
-    },
-    /// A function of type A -> B -> C
-    CurriedFunction {
-        domain1: Extent,
-        domain2: Extent,
-        codomain: Extent,
     },
     /// Result of an aggregation
     Aggregation {
         kind: AggregateKind,
-        accumulator: Extent,
+        /// The shape the fold leaves, which for `Sole` is the element's own.
+        accumulator: Box<Tiling>,
     },
     /// A transactional store — the static shape of a [`Tile::Store`]: a step
     /// function from the commit-time domain to a per-key state record. Its
-    /// extent is `Fun(domain, codomain)`, identical to a `SealedFunction`; the
+    /// extent is `Fun(domain, codomain)`, identical to a `DataFunction`; the
     /// distinction is the runtime step semantics (see [`Tile::Store`]).
     Store {
         /// The commit-time domain (`Txn`).
@@ -58,25 +56,23 @@ impl Tiling {
         match self {
             Tiling::Scalar(e) => e.clone(),
             Tiling::Record(m) => Extent::Record(transform_hashmap_values(m, Tiling::extent)),
-            Tiling::SealedFunction { domain, codomain } | Tiling::Store { domain, codomain } => {
-                Extent::Function {
-                    domain: Box::new(domain.clone()),
-                    codomain: Box::new(codomain.extent()),
-                }
-            }
-            Tiling::CurriedFunction {
-                domain1,
-                domain2,
-                codomain,
-            } => Extent::Function {
-                domain: Box::new(domain1.clone()),
-                codomain: Box::new(Extent::Function {
-                    domain: Box::new(domain2.clone()),
-                    codomain: Box::new(codomain.clone()),
-                }),
+            Tiling::Store { domain, codomain } => Extent::Function {
+                domain: Box::new(domain.clone()),
+                codomain: Box::new(codomain.extent()),
             },
-            Tiling::Aggregation { accumulator, .. } => accumulator.clone(),
+            // One level per collection, and the nesting is the tiling's own.
+            Tiling::DataFunction { domain, codomain } => Extent::Function {
+                domain: Box::new(domain.clone()),
+                codomain: Box::new(codomain.extent()),
+            },
+            Tiling::Aggregation { accumulator, .. } => accumulator.extent(),
         }
+    }
+
+    /// This tiling's empty tile at **no rows**, which is what a partial fold seeds with:
+    /// its accumulator carries presence in its row count, so an empty one must have none.
+    pub fn empty_at_no_rows(&self) -> Tile {
+        self.empty_over(0)
     }
 
     pub fn universal_guard(&self) -> TileGuard {
@@ -85,9 +81,9 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.universal_guard()))
             }
-            Tiling::SealedFunction { .. }
-            | Tiling::CurriedFunction { .. }
-            | Tiling::Store { .. } => TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
+            Tiling::DataFunction { .. } | Tiling::Store { .. } => {
+                TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+            }
             Tiling::Aggregation { .. } => TileGuard::Aggregation(true),
         }
     }
@@ -98,9 +94,9 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
-            Tiling::SealedFunction { .. }
-            | Tiling::CurriedFunction { .. }
-            | Tiling::Store { .. } => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+            Tiling::DataFunction { .. } | Tiling::Store { .. } => {
+                TileGuard::Function(FunctionGuard::Domain(Predicate::False))
+            }
             Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
         }
     }
@@ -110,22 +106,19 @@ impl Tiling {
             Tiling::Scalar(Extent::Function { codomain, .. }) => {
                 Some(Tiling::Scalar(*codomain.clone()))
             }
-            Tiling::SealedFunction { codomain, .. } | Tiling::Store { codomain, .. } => {
-                Some(*codomain.clone())
-            }
+            Tiling::Store { codomain, .. } => Some(*codomain.clone()),
+            Tiling::DataFunction { codomain, .. } => Some(*codomain.clone()),
             _ => None,
         }
     }
 
     /// Return the domain extent if the the tiling represents a function.  This returns Some
-    /// for Scalar(Function), SealedFunction, CurriedFunction, and Store.
+    /// for Scalar(Function), Function, and Store.
     pub fn domain_extent(&self) -> Option<Extent> {
         match self {
             Tiling::Scalar(Extent::Function { domain, .. }) => Some(*domain.clone()),
-            Tiling::SealedFunction { domain, .. } | Tiling::Store { domain, .. } => {
-                Some(domain.clone())
-            }
-            Tiling::CurriedFunction { domain1, .. } => Some(domain1.clone()),
+            Tiling::Store { domain, .. } => Some(domain.clone()),
+            Tiling::DataFunction { domain, .. } => Some(domain.clone()),
             _ => None,
         }
     }
@@ -136,39 +129,38 @@ impl Tiling {
             Tiling::Scalar(Extent::Function { domain, codomain }) => {
                 Some((*domain.clone(), *codomain.clone()))
             }
-            Tiling::SealedFunction { domain, codomain } | Tiling::Store { domain, codomain } => {
-                Some((domain.clone(), codomain.extent()))
-            }
+            Tiling::Store { domain, codomain } => Some((domain.clone(), codomain.extent())),
+            // Split this collection off the front; what is left is its values' extent,
+            // which for a deeper tiling is itself a collection.
+            Tiling::DataFunction { domain, codomain } => Some((domain.clone(), codomain.extent())),
             _ => None,
         }
     }
 
     pub fn empty_tile(&self) -> Tile {
+        self.empty_over(1)
+    }
+
+    /// The empty tile of this tiling, vectorized over `rows` rows.
+    ///
+    /// A collection's run is empty at every row, so whatever sits under it stands at no rows
+    /// at all — which is what makes the chain well formed rather than each level restating
+    /// one row it does not have.
+    fn empty_over(&self, rows: usize) -> Tile {
         match self {
             Tiling::Scalar(e) => Tile::Scalar(ColumnValue::from_values(Vec::new(), e)),
-            Tiling::Record(m) => Tile::Record(transform_hashmap_values(m, |t| t.empty_tile())),
-            Tiling::SealedFunction { domain, codomain } => Tile::SealedFunction {
-                domain: ColumnValue::from_values(Vec::new(), domain),
-                codomain: Box::new(codomain.empty_tile()),
-                domain_predicate: Predicate::False,
-                deleted: BitSet::new(),
-            },
-            Tiling::CurriedFunction {
-                domain1: domain1_extent,
-                domain2: domain2_extent,
-                codomain: codomain_extent,
-            } => Tile::curried_function(
-                ColumnValue::from_values(Vec::new(), domain1_extent),
-                ColumnValue::UInts(Vec::new()),
-                ColumnValue::from_values(Vec::new(), domain2_extent),
-                ColumnValue::from_values(Vec::new(), codomain_extent),
+            Tiling::Record(m) => Tile::Record(transform_hashmap_values(m, |t| t.empty_over(rows))),
+            Tiling::DataFunction { domain, codomain } => Tile::grouped(
+                ColumnValue::UInts(vec![0; rows]),
+                ColumnValue::from_values(Vec::new(), domain),
+                Box::new(codomain.empty_over(0)),
                 Predicate::False,
                 BitSet::new(),
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
                 kind: *kind,
                 terminal: ColumnValue::Bools(BitVec::new()),
-                accumulator: ColumnValue::from_values(Vec::new(), accumulator),
+                accumulator: Box::new(accumulator.empty_at_no_rows()),
             },
             // An empty store: no change events yet, frontier undecided, live, and
             // no key closed — a writer that has not been pulled yet may still
@@ -191,23 +183,67 @@ impl Tiling {
         }
     }
 
-    pub fn is_function(&self) -> bool {
+    pub fn has_domain(&self) -> bool {
         self.domain_extent().is_some()
+    }
+
+    /// Whether this tiling is a collection **level**, the test an operator makes when it
+    /// walks a chain of them.
+    ///
+    /// Narrower than [`Self::has_domain`], which a materialized function cell and a store
+    /// also answer: only a collection has keys in a column and a nested tiling under them.
+    pub fn is_data_function(&self) -> bool {
+        matches!(self, Tiling::DataFunction { .. })
+    }
+
+    /// Whether a level sits here, or inside a record here — the static counterpart of
+    /// [`Tile::holds_a_level`](crate::interpreter::Tile::holds_a_level), which carries the rule.
+    pub fn holds_a_level(&self) -> bool {
+        match self {
+            Tiling::DataFunction { .. } => true,
+            Tiling::Record(fields) => fields.values().any(Tiling::holds_a_level),
+            Tiling::Scalar(_) | Tiling::Aggregation { .. } | Tiling::Store { .. } => false,
+        }
+    }
+
+    /// The tiling `depth` levels in, which is `self` at depth 0 — the static counterpart of
+    /// [`Tile::values_at`].
+    pub fn values_at(&self, depth: usize) -> &Tiling {
+        match (depth, self) {
+            (0, _) => self,
+            (_, Tiling::DataFunction { codomain, .. }) => codomain.values_at(depth - 1),
+            (_, other) => panic!("no level {depth} in {other}"),
+        }
+    }
+
+    /// The tiling sitting under this chain, the static counterpart of
+    /// [`Tile::deepest_values`], which carries the rule. A tiling that is not a collection
+    /// is its own deepest values, a record included.
+    pub fn deepest_values(&self) -> &Tiling {
+        match self {
+            Tiling::DataFunction { codomain, .. } => codomain.deepest_values(),
+            other => other,
+        }
     }
 
     /// Return the tiling produced by mapping `output_extent` over this tiling's
     /// domain (if any).
     ///
     /// If `self` has no domain (i.e. is scalar), returns `Tiling::Scalar(output_extent)`.
-    /// If `self` is a `SealedFunction`, returns a new `SealedFunction` with the same
-    /// domain but `Tiling::Scalar(output_extent)` as the codomain.
+    /// If `self` is a function, returns a one-level function with the same domain but
+    /// `Tiling::Scalar(output_extent)` as the codomain.
     pub fn map_output(&self, output_extent: Extent) -> Tiling {
         match self.domain_extent() {
             None => Tiling::Scalar(output_extent),
-            Some(domain) => Tiling::SealedFunction {
-                domain: domain.clone(),
-                codomain: Box::new(Tiling::Scalar(output_extent)),
-            },
+            Some(domain) => Tiling::data_function(domain, Tiling::Scalar(output_extent)),
+        }
+    }
+
+    /// The collection `domain ⤇ codomain`.
+    pub fn data_function(domain: Extent, codomain: Tiling) -> Tiling {
+        Tiling::DataFunction {
+            domain,
+            codomain: Box::new(codomain),
         }
     }
 
@@ -228,17 +264,20 @@ impl fmt::Display for Tiling {
         match self {
             Tiling::Scalar(e) => write!(f, "{e:?}"),
             Tiling::Record(fields) => fmt_record(f, fields),
-            Tiling::SealedFunction { domain, codomain } => write!(f, "SF({domain:?} → {codomain})"),
             Tiling::Store { domain, codomain } => write!(f, "Store({domain:?} → {codomain})"),
-            Tiling::CurriedFunction {
-                domain1,
-                domain2,
-                codomain,
-            } => {
-                write!(f, "CF({domain1:?} → {domain2:?} → {codomain:?})")
+            // One `→` per level rather than a nested `Fn(…)` each, which is how a curried
+            // function reads.
+            Tiling::DataFunction { domain, codomain } => {
+                write!(f, "Fn({domain:?} → ")?;
+                let mut node = codomain.as_ref();
+                while let Tiling::DataFunction { domain, codomain } = node {
+                    write!(f, "{domain:?} → ")?;
+                    node = codomain;
+                }
+                write!(f, "{node})")
             }
             Tiling::Aggregation { kind, accumulator } => {
-                write!(f, "agg({kind:?}, {accumulator:?})")
+                write!(f, "agg({kind:?}, {accumulator})")
             }
         }
     }
@@ -258,8 +297,8 @@ mod tests {
     }
 
     #[test]
-    fn tiling_extent_sealed_function() {
-        let t = sealed(int(), bool_ext());
+    fn tiling_extent_one_level() {
+        let t = scalar_function(int(), bool_ext());
         assert_eq!(
             t.extent(),
             Extent::Function {
@@ -271,7 +310,7 @@ mod tests {
 
     #[test]
     fn tiling_extent_lookup_function() {
-        let t = curried(range(4), int(), int());
+        let t = two_level(range(4), int(), int());
         assert_eq!(
             t.extent(),
             Extent::Function {
@@ -288,7 +327,7 @@ mod tests {
     fn tiling_extent_aggregation() {
         let t = Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: int(),
+            accumulator: Box::new(Tiling::Scalar(int())),
         };
         assert_eq!(t.extent(), int());
     }
@@ -308,7 +347,7 @@ mod tests {
     #[test]
     fn universal_guard_lookup_function() {
         assert!(
-            curried(int(), int(), bool_ext())
+            two_level(int(), int(), bool_ext())
                 .universal_guard()
                 .is_universal()
         );
@@ -316,14 +355,14 @@ mod tests {
 
     #[test]
     fn empty_guard_lookup_function() {
-        assert!(curried(int(), int(), bool_ext()).empty_guard().is_empty());
+        assert!(two_level(int(), int(), bool_ext()).empty_guard().is_empty());
     }
 
     #[test]
     fn universal_guard_aggregation() {
         let t = Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: int(),
+            accumulator: Box::new(Tiling::Scalar(int())),
         };
         assert!(t.universal_guard().is_universal());
     }
@@ -332,21 +371,21 @@ mod tests {
     fn empty_guard_aggregation() {
         let t = Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: int(),
+            accumulator: Box::new(Tiling::Scalar(int())),
         };
         assert!(t.empty_guard().is_empty());
     }
 
     #[test]
-    fn universal_guard_sealed_function() {
-        let g = sealed(int(), bool_ext()).universal_guard();
+    fn universal_guard_one_level() {
+        let g = scalar_function(int(), bool_ext()).universal_guard();
         assert!(g.is_universal());
         assert!(!g.is_empty());
     }
 
     #[test]
-    fn empty_guard_sealed_function() {
-        let g = sealed(int(), bool_ext()).empty_guard();
+    fn empty_guard_one_level() {
+        let g = scalar_function(int(), bool_ext()).empty_guard();
         assert!(g.is_empty());
         assert!(!g.is_universal());
     }
@@ -360,8 +399,8 @@ mod tests {
     // ── Tiling::codomain ──────────────────────────────────────────────────────
 
     #[test]
-    fn codomain_sealed_function() {
-        let t = sealed(int(), bool_ext());
+    fn codomain_one_level() {
+        let t = scalar_function(int(), bool_ext());
         assert_eq!(t.codomain(), Some(Tiling::Scalar(bool_ext())));
     }
 
@@ -379,24 +418,30 @@ mod tests {
         assert_eq!(Tiling::Scalar(int()).codomain(), None);
     }
 
+    /// The codomain is what sits one level in, which for a chain is the collection below
+    /// rather than the value at the bottom — applying a key yields the rest of the chain.
     #[test]
-    fn codomain_lookup_function_is_none() {
-        // CurriedFunction has no structured codomain tiling via codomain().
-        // Its codomain is accessed through domain2 and codomain extents directly.
-        assert_eq!(curried(int(), bool_ext(), int()).codomain(), None);
+    fn codomain_of_two_levels_is_the_level_below_it() {
+        assert_eq!(
+            two_level(int(), bool_ext(), int()).codomain(),
+            Some(Tiling::data_function(bool_ext(), Tiling::Scalar(int())))
+        );
     }
 
     // ── Tiling::domain_extent ─────────────────────────────────────────────────
 
     #[test]
-    fn domain_extent_sealed_function() {
-        assert_eq!(sealed(int(), bool_ext()).domain_extent(), Some(int()));
+    fn domain_extent_one_level() {
+        assert_eq!(
+            scalar_function(int(), bool_ext()).domain_extent(),
+            Some(int())
+        );
     }
 
     #[test]
     fn domain_extent_lookup_function() {
         assert_eq!(
-            curried(range(4), int(), bool_ext()).domain_extent(),
+            two_level(range(4), int(), bool_ext()).domain_extent(),
             Some(range(4))
         );
     }
@@ -418,10 +463,26 @@ mod tests {
     // ── Tiling::split_function_extent ─────────────────────────────────────────
 
     #[test]
-    fn split_function_extent_sealed() {
+    fn split_function_extent_one_level() {
         assert_eq!(
-            sealed(int(), bool_ext()).split_function_extent(),
+            scalar_function(int(), bool_ext()).split_function_extent(),
             Some((int(), bool_ext()))
+        );
+    }
+
+    /// Splitting takes one level off the front, so a deeper tiling's codomain is the
+    /// collection that is left.
+    #[test]
+    fn split_function_extent_two_level_leaves_a_collection() {
+        assert_eq!(
+            two_level(int(), bool_ext(), int()).split_function_extent(),
+            Some((
+                int(),
+                Extent::Function {
+                    domain: Box::new(bool_ext()),
+                    codomain: Box::new(int()),
+                }
+            ))
         );
     }
 
@@ -437,13 +498,9 @@ mod tests {
     #[test]
     fn split_function_extent_non_function_is_none() {
         assert_eq!(Tiling::Scalar(int()).split_function_extent(), None);
-        assert_eq!(
-            curried(int(), bool_ext(), int()).split_function_extent(),
-            None
-        );
     }
 
-    // ── Tiling::is_scalar / is_function ──────────────────────────────────────
+    // ── Tiling::is_scalar / has_domain ──────────────────────────────────────
 
     #[test]
     fn is_scalar_plain_scalar() {
@@ -461,28 +518,28 @@ mod tests {
 
     #[test]
     fn is_scalar_record_with_non_scalar_field() {
-        let t = record_tiling(&[("a", sealed(int(), bool_ext()))]);
+        let t = record_tiling(&[("a", scalar_function(int(), bool_ext()))]);
         assert!(!t.is_scalar());
     }
 
     #[test]
-    fn is_scalar_sealed_function_is_false() {
-        assert!(!sealed(int(), bool_ext()).is_scalar());
+    fn is_scalar_one_level_is_false() {
+        assert!(!scalar_function(int(), bool_ext()).is_scalar());
     }
 
     #[test]
-    fn is_function_sealed() {
-        assert!(sealed(int(), bool_ext()).is_function());
+    fn is_data_function_one_level() {
+        assert!(scalar_function(int(), bool_ext()).has_domain());
     }
 
     #[test]
-    fn is_function_lookup() {
-        assert!(curried(int(), bool_ext(), int()).is_function());
+    fn is_data_function_lookup() {
+        assert!(two_level(int(), bool_ext(), int()).has_domain());
     }
 
     #[test]
-    fn is_function_scalar_is_false() {
-        assert!(!Tiling::Scalar(int()).is_function());
+    fn is_data_function_scalar_is_false() {
+        assert!(!Tiling::Scalar(int()).has_domain());
     }
 
     // ── Tiling::map_output ────────────────────────────────────────────────────
@@ -494,15 +551,12 @@ mod tests {
     }
 
     #[test]
-    fn map_output_from_sealed_preserves_domain() {
-        let t = sealed(int(), bool_ext());
+    fn map_output_from_one_level_preserves_domain() {
+        let t = scalar_function(int(), bool_ext());
         let result = t.map_output(range(3));
         assert_eq!(
             result,
-            Tiling::SealedFunction {
-                domain: int(),
-                codomain: Box::new(Tiling::Scalar(range(3))),
-            }
+            Tiling::data_function(int(), Tiling::Scalar(range(3)))
         );
     }
 
@@ -516,15 +570,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_tile_sealed_function_is_empty() {
-        let tile = sealed(int(), bool_ext()).empty_tile();
+    fn empty_tile_one_level_is_empty() {
+        let tile = scalar_function(int(), bool_ext()).empty_tile();
         assert!(tile.is_empty());
         assert!(!tile.is_terminal());
     }
 
     #[test]
     fn empty_tile_lookup_function_is_empty() {
-        let tile = curried(int(), bool_ext(), int()).empty_tile();
+        let tile = two_level(int(), bool_ext(), int()).empty_tile();
         assert!(tile.is_empty());
         assert!(!tile.is_terminal());
     }
@@ -537,25 +591,25 @@ mod tests {
     }
 
     #[test]
-    fn display_sealed_function() {
-        let s = sealed(int(), bool_ext()).to_string();
+    fn display_one_level() {
+        let s = scalar_function(int(), bool_ext()).to_string();
         assert!(s.contains("→"), "expected arrow in '{s}'");
     }
 
     #[test]
-    fn display_curried_function() {
+    fn display_two_levels() {
         // The whole rendering, not a substring: a `[` test passes on the range
         // domain whichever way the brackets fall, which is how an unbalanced
         // one survived here.
-        let s = curried(range(4), int(), bool_ext()).to_string();
-        assert_eq!(s, "CF({[0, 3]} → Int → Bool)");
+        let s = two_level(range(4), int(), bool_ext()).to_string();
+        assert_eq!(s, "Fn({[0, 3]} → Int → Bool)");
     }
 
     #[test]
     fn display_aggregation() {
         let s = Tiling::Aggregation {
             kind: AggregateKind::Sum,
-            accumulator: int(),
+            accumulator: Box::new(Tiling::Scalar(int())),
         }
         .to_string();
         assert!(s.starts_with("agg("), "expected 'agg(' in '{s}'");

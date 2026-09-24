@@ -42,19 +42,17 @@ pub(super) mod tests {
         Extent::uint_range(end)
     }
 
-    pub(crate) fn sealed(domain: Extent, codomain: Extent) -> Tiling {
-        Tiling::SealedFunction {
-            domain,
-            codomain: Box::new(Tiling::Scalar(codomain)),
-        }
+    /// A one-level function tiling over a scalar codomain.
+    pub(crate) fn scalar_function(domain: Extent, codomain: Extent) -> Tiling {
+        Tiling::data_function(domain, Tiling::Scalar(codomain))
     }
 
-    pub(crate) fn curried(domain1: Extent, domain2: Extent, codomain: Extent) -> Tiling {
-        Tiling::CurriedFunction {
-            domain1,
-            domain2,
-            codomain,
-        }
+    /// A two-level tiling, the shape most callers want.
+    pub(crate) fn two_level(outer: Extent, inner: Extent, codomain: Extent) -> Tiling {
+        Tiling::data_function(
+            outer,
+            Tiling::data_function(inner, Tiling::Scalar(codomain)),
+        )
     }
 
     pub(crate) fn record_tiling(fields: &[(&str, Tiling)]) -> Tiling {

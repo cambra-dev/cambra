@@ -4843,7 +4843,7 @@
           "label": "IterateExtent",
           "nodeId": 623,
           "role": "operator",
-          "tiling": "SF(Unit → Unit)",
+          "tiling": "Fn(Unit → Unit)",
           "spans": [
             {
               "start": 46,
@@ -4861,7 +4861,7 @@
           "label": "IterateExtent",
           "nodeId": 619,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → {[0, 3]})",
+          "tiling": "Fn({[0, 3]} → {[0, 3]})",
           "spans": [
             {
               "start": 73,
@@ -4897,7 +4897,7 @@
           "label": "MapResult",
           "nodeId": 621,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → Int)",
+          "tiling": "Fn({[0, 3]} → Int)",
           "spans": [
             {
               "start": 73,
@@ -4934,7 +4934,7 @@
           "label": "Memo",
           "nodeId": 622,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → Int)",
+          "tiling": "Fn({[0, 3]} → Int)",
           "spans": [
             {
               "start": 61,
@@ -4962,7 +4962,7 @@
           "label": "FanOutBranch",
           "nodeId": 624,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → Int)",
+          "tiling": "Fn({[0, 3]} → Int)",
           "spans": [
             {
               "start": 50,
@@ -5046,7 +5046,7 @@
           "label": "MapResultToConst",
           "nodeId": 627,
           "role": "operator",
-          "tiling": "SF(Unit → Int)",
+          "tiling": "Fn(Unit → Int)",
           "spans": [
             {
               "start": 46,
@@ -5083,7 +5083,7 @@
           "label": "FanOutBranch",
           "nodeId": 628,
           "role": "operator",
-          "tiling": "SF({[0, 3]} → Int)",
+          "tiling": "Fn({[0, 3]} → Int)",
           "spans": [
             {
               "start": 125,
@@ -5111,7 +5111,7 @@
           "label": "UnionOperator",
           "nodeId": 629,
           "role": "operator",
-          "tiling": "SF({`0 | `1{[0, 3]}} → Int)",
+          "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",
           "spans": [
             {
               "start": 85,
@@ -5148,7 +5148,7 @@
           "label": "Memo",
           "nodeId": 630,
           "role": "operator",
-          "tiling": "SF({`0 | `1{[0, 3]}} → Int)",
+          "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",
           "spans": [
             {
               "start": 85,
@@ -5176,7 +5176,7 @@
           "label": "FanOutBranch",
           "nodeId": 631,
           "role": "operator",
-          "tiling": "SF({`0 | `1{[0, 3]}} → Int)",
+          "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",
           "spans": [
             {
               "start": 155,

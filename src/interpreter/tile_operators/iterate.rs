@@ -9,23 +9,20 @@ use crate::interpreter::{
     UnionArm, Value, scheduler::shared_consumer,
 };
 
-/// Produces a sealed-function tile whose domain and codomain both equal `extent`.
+/// Produces a function tile whose domain and codomain both equal `extent`.
 ///
 /// Used to enumerate all values in an extent: the resulting tile maps each
 /// element to itself (`identity`)
 pub struct IterateExtent {
     /// The extent to iterate over.
     pub extent: Extent,
-    /// The tiling — always `Tiling::SealedFunction { domain: extent, codomain: extent }`.
+    /// The tiling — always the one-level `extent → extent`.
     base: OperatorBase,
 }
 
 impl IterateExtent {
     pub fn new(extent: Extent) -> Self {
-        let tiling = Tiling::SealedFunction {
-            domain: extent.clone(),
-            codomain: Box::new(Tiling::Scalar(extent.clone())),
-        };
+        let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         Self {
             base: OperatorBase::new(tiling),
             extent,
@@ -107,7 +104,7 @@ release record outlives it",
     });
 }
 
-/// Producer for [`IterateExtent`]: emits an identity sealed-function tile.
+/// Producer for [`IterateExtent`]: emits an identity function tile.
 struct IterateExtentProducer {
     base: ProducerBase,
     /// The extent being iterated.
@@ -351,12 +348,12 @@ impl TileProducer for IterateExtentProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let values = iterate_extent(&self.extent, &self.name());
         let domain_predicate = get_iterate_extent_predicate(&self.extent);
-        let mut tile = Tile::SealedFunction {
-            domain: values.clone(),
-            codomain: Box::new(Tile::Scalar(values)),
+        let mut tile = Tile::data_function(
+            values.clone(),
+            Box::new(Tile::Scalar(values)),
             domain_predicate,
-            deleted: BitSet::new(),
-        };
+            BitSet::new(),
+        );
         // Filter out any domain rows that have already been released.
         // Values may also be removed from underlying sources for efficiency, but
         // this filter here is ultimately responsible for not returning released data.
@@ -541,10 +538,7 @@ mod tests {
             let to_remove = IntervalSet::from(Interval::closed(1usize, 3usize));
             *set = set.difference(&to_remove);
         }
-        let tiling = Tiling::SealedFunction {
-            domain: extent.clone(),
-            codomain: Box::new(Tiling::Scalar(extent.clone())),
-        };
+        let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));
         let mut producer = IterateExtentProducer {
             base: ProducerBase::new(0, &tiling),
             extent,
@@ -552,7 +546,7 @@ mod tests {
             source_wakeup: None,
         };
         let tile = producer.get(producer.tiling().universal_guard());
-        let Tile::SealedFunction { domain, .. } = tile else {
+        let Tile::DataFunction { domain, .. } = tile else {
             panic!()
         };
         let ColumnValue::UInts(vals) = domain else {

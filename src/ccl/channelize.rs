@@ -2315,7 +2315,7 @@ fn extract_for_defer_impl(
             // Top-level (non-iteration) Feeds carry scalar values that need
             // lifting to `Fun(Unit, T)` to match the defer-handle's
             // expected function shape (the consumer compiles to a
-            // SealedFunction operator with Unit domain).  Inside an
+            // Function operator with Unit domain).  Inside an
             // iteration scope (Lambda body / Loop body), the surrounding
             // Compose/Loop machinery already provides the function shape,
             // so we leave the value scalar — the Compose-with-Lambda case
@@ -2331,8 +2331,8 @@ fn extract_for_defer_impl(
             while let Type::Refinement(inner, _) = vty {
                 vty = inner;
             }
-            let is_collection = matches!(vty, Type::Fun { .. });
-            let lifted = if in_inner_scope || is_collection {
+            let is_function = matches!(vty, Type::Fun { .. });
+            let lifted = if in_inner_scope || is_function {
                 value
             } else {
                 // The channel is a collection — inference says so on the handle, and every

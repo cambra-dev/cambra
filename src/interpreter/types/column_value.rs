@@ -33,7 +33,7 @@ pub struct FuncBinding {
 /// into the next write slot.  A faster two-pointer swap-with-end algorithm
 /// (similar to the one used for the `Bools` variant of `ColumnValue::retain`)
 /// would not preserve order, which is incompatible with how mutation-loop
-/// outputs land in a `Tile::SealedFunction` with a `Union`-domain: the
+/// outputs land in a `Tile::DataFunction` with a `Union`-domain: the
 /// `Union` variants in `ColumnValue::retain` use a stable `select_indices`
 /// filter (their order has to match the stably-filtered `tags`), so the
 /// codomain — retained via this function — must also stay in source order

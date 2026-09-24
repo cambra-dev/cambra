@@ -14,7 +14,7 @@ use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::pull_laps;
 use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
-    sort_sealed_function_by_domain, tuple_field,
+    sort_function_by_domain, tuple_field,
 };
 use rstest_log::rstest;
 use smol_str::SmolStr;
@@ -69,11 +69,11 @@ fn test_test_source(#[case] code: &str) {
     *notified.borrow_mut() = false;
 
     // Extract domain and codomain; sort by domain key for deterministic comparison.
-    let Tile::SealedFunction {
+    let Tile::DataFunction {
         domain, codomain, ..
     } = tile
     else {
-        panic!("expected SealedFunction tile");
+        panic!("expected DataFunction tile");
     };
     let Tile::Scalar(codomain_cv) = *codomain else {
         panic!("expected Scalar codomain");
@@ -129,13 +129,13 @@ fn test_source_filter_nonterminal() {
     let mut tile = producer.get(producer.tiling().universal_guard());
     tile.compact();
     assert_eq!(
-        sort_sealed_function_by_domain(tile),
-        sort_sealed_function_by_domain(Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
-            domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
-        })
+        sort_function_by_domain(tile),
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+            Predicate::False,
+            BitSet::new()
+        ))
     );
 }
 
@@ -207,18 +207,18 @@ fn test_inner_join(#[case] code: &str) {
     let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
 
-    // Extract rows from a SealedFunction tile where:
+    // Extract rows from a DataFunction tile where:
     //   domain   = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
     //   codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
     // Returns pairs sorted by (domain._0, domain._1) for deterministic comparison.
     type DomainKey = (usize, usize);
     type JoinOutput = (i64, SmolStr, SmolStr);
     fn extract_join_rows(tile: Tile) -> Vec<(DomainKey, JoinOutput)> {
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = tile
         else {
-            panic!("expected SealedFunction tile, got {tile:?}");
+            panic!("expected DataFunction tile, got {tile:?}");
         };
         // domain  = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
         // codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
@@ -383,15 +383,15 @@ fn test_incremental_join_simple(#[case] code: &str) {
     let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
 
-    // Unpack SealedFunction where:
+    // Unpack Function where:
     //   domain   = Records { _0: UInts (src1 domain key), _1: UInts (src2 domain key) }
     //   codomain = Record  { _0: Scalar(Ints src1 value), _1: Scalar(Ints src2 value) }
     fn extract_rows(tile: Tile) -> Vec<((usize, usize), i64)> {
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
             domain, codomain, ..
         } = tile
         else {
-            panic!("expected SealedFunction, got {tile:?}");
+            panic!("expected Function, got {tile:?}");
         };
         let ColumnValue::Records(mut df) = domain else {
             panic!("expected Records domain, got {domain:?}");
@@ -590,13 +590,13 @@ o";
     let result = pull_laps(ctx.scheduler(), &mut *producer, 16, Tile::is_terminal);
     // Compare as a function (position → value), independent of internal ordering.
     assert_eq!(
-        sort_sealed_function_by_domain(result),
-        Tile::SealedFunction {
-            domain: ColumnValue::from_uints(vec![0, 1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        },
+        sort_function_by_domain(result),
+        Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            Predicate::True,
+            BitSet::new()
+        ),
         "the tap stream must be position-ordered (cnt at position p is p+1)"
     );
 }
@@ -724,12 +724,12 @@ fn test_incremental_aggregates() {
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
-        Tile::SealedFunction {
-            domain: ColumnValue::Ints(vec![]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
-            domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
-        }
+        Tile::data_function(
+            ColumnValue::Ints(vec![]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            Predicate::False,
+            BitSet::new()
+        )
     );
 
     test_source.borrow_mut().add_data(&[
@@ -739,12 +739,12 @@ fn test_incremental_aggregates() {
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         result,
-        Tile::SealedFunction {
-            domain: ColumnValue::Ints(vec![]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
-            domain_predicate: Predicate::False,
-            deleted: BitSet::new(),
-        }
+        Tile::data_function(
+            ColumnValue::Ints(vec![]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            Predicate::False,
+            BitSet::new()
+        )
     );
 
     test_source
@@ -753,13 +753,13 @@ fn test_incremental_aggregates() {
 
     let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
-        sort_sealed_function_by_domain(result),
-        sort_sealed_function_by_domain(Tile::SealedFunction {
-            domain: ColumnValue::Ints(vec![1, 2, 3]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        })
+        sort_function_by_domain(result),
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30]))),
+            Predicate::True,
+            BitSet::new()
+        ))
     );
 
     assert_eq!(

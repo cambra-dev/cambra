@@ -63,7 +63,7 @@ fn drive_main_output(code: &str) -> Tile {
         let tile = producer.get(universal.clone());
         let release_guard = match &tile {
             Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
-            Tile::SealedFunction {
+            Tile::DataFunction {
                 domain_predicate, ..
             } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
             other => panic!("unexpected top-level tile shape: {other:?}"),
@@ -129,11 +129,11 @@ fn aggregate_converges_in_one_pull() {
 /// standalone read-only transaction's `AsOf` reply).
 fn drive_single_int(code: &str) -> i64 {
     match drive_main_output(code) {
-        Tile::SealedFunction { codomain, .. } => match *codomain {
+        Tile::DataFunction { codomain, .. } => match *codomain {
             Tile::Scalar(ColumnValue::Ints(v)) if v.len() == 1 => v[0],
             other => panic!("expected a one-element Ints stream, got {other:?}"),
         },
-        other => panic!("expected a SealedFunction stream, got {other:?}"),
+        other => panic!("expected a Function stream, got {other:?}"),
     }
 }
 

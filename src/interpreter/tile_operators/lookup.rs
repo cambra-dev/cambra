@@ -76,7 +76,7 @@ impl CheckedLookup {
     /// Look each row's key up in that row's collection, over an assembled stream of
     /// `(collection, key)` pairs. The answer's domain is the stream's own.
     pub fn paired(pairs: Box<dyn TileOperator>, option_extent: Extent) -> Result<Self, String> {
-        let Tiling::SealedFunction { domain, codomain } = pairs.tiling() else {
+        let Tiling::DataFunction { domain, codomain } = pairs.tiling() else {
             return Err(format!(
                 "`lookup?` over an assembled pair needs a stream of rows, got {}",
                 pairs.tiling()
@@ -94,7 +94,8 @@ impl CheckedLookup {
             .get(&tuple_field(0))
             .ok_or_else(|| "`lookup?`'s input rows have no collection field".to_string())?;
         match collection {
-            Tiling::SealedFunction { .. } | Tiling::Scalar(Extent::Function { .. }) => {}
+            Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level() => {}
+            Tiling::Scalar(Extent::Function { .. }) => {}
             other => {
                 return Err(format!(
                     "`c[k]?` over a collection whose values are themselves collections is not \
@@ -115,7 +116,7 @@ impl CheckedLookup {
                 ));
             }
         }
-        let tiling = Tiling::SealedFunction {
+        let tiling = Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(option_extent)),
         };
@@ -136,7 +137,7 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
         return Tiling::Scalar(option_extent);
     }
     match keys {
-        Tiling::SealedFunction { domain, .. } => Tiling::SealedFunction {
+        Tiling::DataFunction { domain, .. } => Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(Tiling::Scalar(option_extent)),
         },
@@ -264,24 +265,30 @@ fn answer_in_value(key: &Value, m: &Value) -> Value {
 /// answers immediately ([`answer_in_value`]).
 fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
     match coll {
-        Tile::SealedFunction {
+        Tile::DataFunction {
             domain, codomain, ..
-        } => match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
-            Some(i) => {
-                // `None` here would read as "still deciding" for a shape that will never
-                // change, and the lookup would spin instead of answering. Op-conversion's
-                // `reject_unanswerable_lookup_collection` is what makes this unreachable.
-                let Tile::Scalar(values) = codomain.as_ref() else {
-                    panic!(
-                        "CheckedLookup: an answer's `some` payload is one column value, so the \
+        } => {
+            assert!(
+                !codomain.holds_a_level(),
+                "a streamed collection maps keys to values, so its keys are one level"
+            );
+            match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
+                Some(i) => {
+                    // `None` here would read as "still deciding" for a shape that will never
+                    // change, and the lookup would spin instead of answering. Op-conversion's
+                    // `reject_unanswerable_lookup_collection` is what makes this unreachable.
+                    let Tile::Scalar(values) = codomain.as_ref() else {
+                        panic!(
+                            "CheckedLookup: an answer's `some` payload is one column value, so the \
                          collection's codomain tiles as a scalar; got {codomain:?}"
-                    )
-                };
-                Some(some_of(values.index_at(i)))
+                        )
+                    };
+                    Some(some_of(values.index_at(i)))
+                }
+                None if coll.is_terminal() => Some(none()),
+                None => None,
             }
-            None if coll.is_terminal() => Some(none()),
-            None => None,
-        },
+        }
         Tile::Scalar(col) if !col.is_empty() => Some(answer_in_value(key, &col.index_at(0))),
         // A materialized collection that has not arrived yet.
         Tile::Scalar(_) => None,
@@ -342,7 +349,7 @@ impl TileProducer for CheckedLookupProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
-            Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+            Tiling::DataFunction { codomain, .. } => codomain.extent(),
             other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
@@ -375,7 +382,7 @@ impl TileProducer for CheckedLookupProducer {
                     }
                     // A stream of keys, each answered against the same collection — read
                     // once, not lifted into every row.
-                    Tile::SealedFunction {
+                    Tile::DataFunction {
                         ref domain,
                         ref codomain,
                         ref domain_predicate,
@@ -409,7 +416,7 @@ impl TileProducer for CheckedLookupProducer {
                 tile.compact();
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty scalar, and this operator does the same until its rows arrive.
-                let Tile::SealedFunction {
+                let Tile::DataFunction {
                     ref domain,
                     ref codomain,
                     ref domain_predicate,
@@ -491,7 +498,7 @@ impl CheckedLookupProducer {
         domain_predicate: &Predicate,
         out_extent: &Extent,
     ) -> Tile {
-        let Tiling::SealedFunction {
+        let Tiling::DataFunction {
             domain: dom_ext, ..
         } = self.tiling()
         else {
@@ -506,14 +513,11 @@ impl CheckedLookupProducer {
         } else {
             Predicate::False
         };
-        Tile::SealedFunction {
-            domain: ColumnValue::from_values(kept, dom_ext),
-            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(answers, out_extent))),
+        Tile::data_function(
+            ColumnValue::from_values(kept, dom_ext),
+            Box::new(Tile::Scalar(ColumnValue::from_values(answers, out_extent))),
             domain_predicate,
-            // The rows are the live keys the collection has decided, a subsequence of an
-            // already-compacted domain. Carrying the input's bitset forward would name
-            // positions of a column this one no longer shares.
-            deleted: BitSet::new(),
-        }
+            BitSet::new(),
+        )
     }
 }

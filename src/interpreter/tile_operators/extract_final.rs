@@ -11,7 +11,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Extracts the final value from a changelog store's dense read (or any
-/// `SealedFunction`) output, converting the accumulated `SealedFunction` tiling
+/// `DataFunction`) output, converting the accumulated `DataFunction` tiling
 /// back to a `Scalar` — the scalar-final read of a mutation loop's accumulator.
 ///
 /// When the source becomes terminal but emits no values (the empty-source
@@ -22,7 +22,7 @@ use crate::{
 ///
 /// Used as the terminal stage of a loop: `ExtractFinal(body.step, init)`.
 pub struct ExtractFinal {
-    /// Operator producing the `SealedFunction` tiling to extract from.
+    /// Operator producing the `DataFunction` tiling to extract from.
     source: Box<dyn TileOperator>,
     /// Fallback scalar operator, pulled when `source` is terminal and emits zero
     /// values.  Must have a `Scalar` tiling whose extent the output extent
@@ -33,7 +33,7 @@ pub struct ExtractFinal {
     /// case to fall back from and no default value has to be invented. An empty
     /// source with no default is an invariant violation, not a fallback.
     default: Option<Box<dyn TileOperator>>,
-    /// Output tiling — the codomain of the source SealedFunction (always `Scalar`).
+    /// Output tiling — the codomain of the source Function (always `Scalar`).
     base: OperatorBase,
 }
 
@@ -41,7 +41,7 @@ impl ExtractFinal {
     /// Construct a new `ExtractFinal` wrapping `source`, with `default`
     /// as the fallback for the empty-source case.
     ///
-    /// `source` must have a `SealedFunction` tiling and `default` a `Scalar`
+    /// `source` must have a `DataFunction` tiling and `default` a `Scalar`
     /// tiling whose extent that codomain includes. The output tiling becomes
     /// the scalar codomain.
     pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
@@ -89,8 +89,8 @@ impl ExtractFinal {
 
     fn source_codomain_tiling(source: &dyn TileOperator) -> Tiling {
         match source.tiling() {
-            Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
-            other => panic!("ExtractFinal source must have SealedFunction tiling, got {other}"),
+            Tiling::DataFunction { codomain, .. } => *codomain.clone(),
+            other => panic!("ExtractFinal source must have a function tiling, got {other}"),
         }
     }
 }
@@ -207,7 +207,7 @@ impl TileProducer for ExtractFinalProducer {
             // dense read, the store prefix below the tail's carry source). Without
             // it, a never-terminating loop would pin the whole changelog until a
             // terminal that never comes.
-            if let Tile::SealedFunction {
+            if let Tile::DataFunction {
                 domain, deleted, ..
             } = &source_tile
             {
@@ -236,17 +236,19 @@ impl TileProducer for ExtractFinalProducer {
         // reach the underlying data source.  Release is idempotent, so
         // a repeated call from the consumer's outer pull loop is fine.
         self.source.release(source_tiling.universal_guard());
-        let Tile::SealedFunction {
-            codomain, deleted, ..
+        let Tile::DataFunction {
+            codomain,
+            deleted: removed,
+            ..
         } = source_tile
         else {
-            panic!("ExtractFinal source must be a SealedFunction tile");
+            panic!("ExtractFinal source must be a collection tile");
         };
         let cv = scalar_tile_to_column_value(*codomain);
         let n = cv.len();
         // Try to extract the final non-deleted value from the source.
         // TODO don't assume sorting; we need to sort by the domain value instead.
-        if let Some(final_idx) = (0..n).rev().find(|&i| !deleted.contains(i)) {
+        if let Some(final_idx) = (0..n).rev().find(|&i| !removed.contains(i)) {
             let value = cv.index_at(final_idx);
             self.final_value = Some(value.clone());
             return Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
@@ -297,7 +299,7 @@ mod tests {
     use crate::interpreter::tile_operators::{FunctionGuard, Predicate};
     use crate::interpreter::{BaseType, Extent};
 
-    /// A non-terminal `SealedFunction` source with domain `[0, 1, 2]`, recording
+    /// A non-terminal `DataFunction` source with domain `[0, 1, 2]`, recording
     /// every domain-release watermark it receives. Never becomes terminal, so it
     /// exercises `ExtractFinal`'s incremental (pre-terminal) release path.
     struct PartialSource {
@@ -332,12 +334,12 @@ mod tests {
     impl TileProducer for PartialSourceProducer {
         impl_producer_base!();
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            Tile::SealedFunction {
-                domain: ColumnValue::from_uints(vec![0, 1, 2]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
-                domain_predicate: Predicate::False, // never terminal
-                deleted: bit_set::BitSet::new(),
-            }
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+                Predicate::False,
+                bit_set::BitSet::new(),
+            )
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
             if let TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(
@@ -349,7 +351,7 @@ mod tests {
         }
     }
 
-    /// A **terminal** `SealedFunction` source carrying `codomain_tile` over
+    /// A **terminal** `DataFunction` source carrying `codomain_tile` over
     /// `domain`, used to drive `ExtractFinal` to its extract / default paths.
     struct TerminalSource {
         tiling: Tiling,
@@ -386,12 +388,12 @@ mod tests {
     impl TileProducer for TerminalSourceProducer {
         impl_producer_base!();
         fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-            Tile::SealedFunction {
-                domain: self.domain.clone(),
-                codomain: Box::new(Tile::Scalar(self.codomain_tile.clone())),
-                domain_predicate: Predicate::True, // terminal
-                deleted: bit_set::BitSet::new(),
-            }
+            Tile::data_function(
+                self.domain.clone(),
+                Box::new(Tile::Scalar(self.codomain_tile.clone())),
+                Predicate::True,
+                bit_set::BitSet::new(),
+            )
         }
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
     }
@@ -433,10 +435,10 @@ mod tests {
             ("pos", Extent::Base(BaseType::Int)),
         ]);
         let source = TerminalSource {
-            tiling: Tiling::SealedFunction {
-                domain: Extent::Base(BaseType::UInt),
-                codomain: Box::new(Tiling::Scalar(merged.clone())),
-            },
+            tiling: Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(merged.clone()),
+            ),
             domain: ColumnValue::from_uints(vec![0]),
             codomain_tile: ColumnValue::from_values(
                 vec![union_value("pos", Value::Int(5))],
@@ -473,10 +475,10 @@ mod tests {
             ("pos", Extent::Base(BaseType::Int)),
         ]);
         let source = TerminalSource {
-            tiling: Tiling::SealedFunction {
-                domain: Extent::Base(BaseType::UInt),
-                codomain: Box::new(Tiling::Scalar(merged.clone())),
-            },
+            tiling: Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(merged.clone()),
+            ),
             domain: ColumnValue::from_uints(vec![]),
             codomain_tile: ColumnValue::from_values(vec![], &merged),
         };
@@ -508,10 +510,7 @@ mod tests {
         let value_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let releases = Rc::new(RefCell::new(Vec::<usize>::new()));
         let source = PartialSource {
-            tiling: Tiling::SealedFunction {
-                domain: Extent::Base(BaseType::UInt),
-                codomain: Box::new(value_tiling.clone()),
-            },
+            tiling: Tiling::data_function(Extent::Base(BaseType::UInt), value_tiling.clone()),
             releases: releases.clone(),
         };
         let default = Constant::new(Value::Int(0), Extent::Base(BaseType::Int));

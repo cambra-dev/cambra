@@ -422,18 +422,18 @@ impl DataSink for HttpServerSharedState {
     /// lock, then releases the lock and sends each response outside of it so that
     /// HTTP I/O does not block other threads waiting on the pending map.
     fn process(&self, tile: &Tile) {
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
             domain,
             codomain,
             deleted,
             ..
         } = tile
         else {
-            debug!("HttpServerSharedState::process: expected SealedFunction tile, got {tile:?}");
+            debug!("HttpServerSharedState::process: expected a collection, got {tile:?}");
             return;
         };
         let ColumnValue::UInts(indices) = domain else {
-            debug!("HttpServerSharedState::process: expected UInt domain, got {domain:?}");
+            debug!("HttpServerSharedState::process: expected UInt keys, got {domain:?}");
             return;
         };
         let Tile::Scalar(ColumnValue::Strings(responses)) = codomain.as_ref() else {

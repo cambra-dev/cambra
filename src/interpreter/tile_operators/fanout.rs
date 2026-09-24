@@ -751,7 +751,7 @@ impl TileProducer for FanOutProducer {
         // The match is total for a fan-out a recurrence reads, rather than a
         // shape test with a fallthrough. Every function tiling's empty and
         // universal guards are `Function(Domain(_))` (`Tiling::empty_guard`,
-        // including the curried case), which supplies both the seed each
+        // including a nested one), which supplies both the seed each
         // `release_guards` entry starts at and this fold's identity; `Domain` is
         // closed under the union and intersection applied to it; and both drives
         // release only `Domain` to an iteration source — `InductionDriver`
@@ -1104,21 +1104,21 @@ mod tests {
     /// A tiling whose tiles can be **incomplete**, so a memo over one never reaches
     /// `upstream_drained` and the gate is what the test observes.
     fn partial_tiling() -> Tiling {
-        Tiling::SealedFunction {
-            domain: Extent::Base(BaseType::UInt),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        }
+        Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
     }
 
     /// One row at `key`, under a domain predicate that claims only the prefix up to
     /// it — so the tile is not the whole function and the input is not drained.
     fn one_row(key: usize, value: i64) -> Tile {
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![key]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
-            domain_predicate: Predicate::LessThanEq(Value::UInt(key)),
-            deleted: BitSet::new(),
-        }
+        Tile::data_function(
+            ColumnValue::UInts(vec![key]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
+            Predicate::LessThanEq(Value::UInt(key)),
+            BitSet::new(),
+        )
     }
 
     /// A memo whose input has said nothing since its last pull answers from the

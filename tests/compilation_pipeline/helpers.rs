@@ -37,8 +37,7 @@ use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_sealed_function_by_domain,
-    tuple_field,
+    ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,8 +93,8 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
 /// Assert `code` produces `expected` via the pipeline path.
 pub(crate) fn check_tile(code: &str, expected: Tile) {
     assert_eq!(
-        sort_sealed_function_by_domain(run_pipeline(code)),
-        sort_sealed_function_by_domain(expected),
+        sort_function_by_domain(run_pipeline(code)),
+        sort_function_by_domain(expected),
         "pipeline path"
     );
 }
@@ -145,12 +144,12 @@ pub fn check_compile_error(code: &str, needle: &str) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn make_int_list(v: &[i64]) -> Tile {
-    Tile::SealedFunction {
-        domain: ColumnValue::UInts((0..v.len()).collect()),
-        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
-        domain_predicate: Predicate::True,
-        deleted: BitSet::new(),
-    }
+    Tile::data_function(
+        ColumnValue::UInts((0..v.len()).collect()),
+        Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
+        Predicate::True,
+        BitSet::new(),
+    )
 }
 
 pub(crate) fn make_tuple(v: &[Value]) -> Value {
@@ -170,10 +169,10 @@ pub(crate) fn make_record(fields: &[(&str, Value)]) -> Value {
     )
 }
 
-/// Extract a single named field from the record codomain of a SealedFunction tile.
+/// Extract a single named field from the record values of a collection tile.
 pub(crate) fn extract_record_field(tile: Tile, field: &str) -> ColumnValue {
-    let Tile::SealedFunction { codomain, .. } = tile else {
-        panic!("expected SealedFunction, got {tile:?}");
+    let Tile::DataFunction { codomain, .. } = tile else {
+        panic!("expected a collection, got {tile:?}");
     };
     let Tile::Record(mut fields) = *codomain else {
         panic!("expected Record codomain");

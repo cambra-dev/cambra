@@ -8,7 +8,7 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-/// An operator that permutes the fields of the domain of a `SealedFunction`, according
+/// An operator that permutes the fields of the domain of a `DataFunction`, according
 /// to a specified permutation of field indices.
 ///
 /// For now, this only supports record types that represent tuples, but can
@@ -32,19 +32,19 @@ fn permute_record<T>(mut input: HashMap<String, T>, permutation: &[usize]) -> Ha
 
 impl PermuteRecordDomain {
     pub fn new(input: Box<dyn TileOperator>, permutation: Vec<usize>) -> Self {
-        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
+        let Tiling::DataFunction { domain, codomain } = input.tiling() else {
             panic!(
-                "PermuteRecordDomain requires SealedFunction input, got {}",
+                "PermuteRecordDomain requires a collection input, got {}",
                 input.tiling()
             );
         };
         let Extent::Record(input_fields) = domain else {
             panic!(
-                "PermuteRecordDomain requires input with Record domain, got {}",
+                "PermuteRecordDomain requires input with Record keys, got {}",
                 input.tiling()
             );
         };
-        let tiling = Tiling::SealedFunction {
+        let tiling = Tiling::DataFunction {
             domain: Extent::Record(permute_record(input_fields.clone(), &permutation)),
             codomain: codomain.clone(),
         };
@@ -119,7 +119,8 @@ impl TileProducer for PermuteRecordDomainProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
+            row_starts,
             domain,
             codomain,
             domain_predicate,
@@ -139,12 +140,13 @@ impl TileProducer for PermuteRecordDomainProducer {
             }
             _ => unreachable!(),
         };
-        Tile::SealedFunction {
-            domain: output_domain,
+        Tile::grouped(
+            row_starts,
+            output_domain,
             codomain,
-            domain_predicate: output_domain_pred,
+            output_domain_pred,
             deleted,
-        }
+        )
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -302,7 +304,7 @@ fn flatten_result_correlation(
     }
 }
 
-/// Flattens selected fields of a `SealedFunction` whose domain is a tuple into a single-level tuple domain.
+/// Flattens selected fields of a `DataFunction` whose domain is a tuple into a single-level tuple domain.
 ///
 /// Only outer fields whose indices appear in `indices_to_flatten` are expanded; all other outer
 /// fields are passed through unchanged. For flattened fields, the inner `Record` fields are
@@ -312,7 +314,7 @@ fn flatten_result_correlation(
 /// For example, with domain `(_0: (_0: A, (_0: B, _1: C)), _1: (_0: D), _2: E)` and `indices_to_flatten = [0, 1]`,
 /// the output domain is `(_0: A, _1: (_0: B, _1: C), _2: D, _3: E)`.
 pub struct FlattenTupleDomain {
-    /// Output tiling: `SealedFunction` with a single-level `Record` domain.
+    /// Output tiling: `DataFunction` with a single-level `Record` domain.
     base: OperatorBase,
     /// Input operator whose domain is a `Record`.
     input: Box<dyn TileOperator>,
@@ -327,18 +329,18 @@ impl FlattenTupleDomain {
     ///
     /// Outer fields whose tuple index is in `indices_to_flatten` must be `Record`-typed and will
     /// be expanded; all other outer fields are passed through as-is. Panics if the input tiling
-    /// is not a `SealedFunction` with a `Record` domain, or if a field marked for flattening is
+    /// is not a `DataFunction` with a `Record` domain, or if a field marked for flattening is
     /// not a `Record`.
     pub fn new(input: Box<dyn TileOperator>, indices_to_flatten: Vec<usize>) -> Self {
-        let Tiling::SealedFunction { domain, codomain } = input.tiling() else {
+        let Tiling::DataFunction { domain, codomain } = input.tiling() else {
             panic!(
-                "FlattenTupleDomain requires SealedFunction input, got {}",
+                "FlattenTupleDomain requires a collection input, got {}",
                 input.tiling()
             )
         };
         let Extent::Record(outer_fields) = domain else {
             panic!(
-                "FlattenTupleDomain requires a Record domain, got {}",
+                "FlattenTupleDomain requires Record keys, got {}",
                 input.tiling()
             )
         };
@@ -372,7 +374,7 @@ impl FlattenTupleDomain {
             }
         }
 
-        let tiling = Tiling::SealedFunction {
+        let tiling = Tiling::DataFunction {
             domain: Extent::Record(flat_extent),
             codomain: codomain.clone(),
         };
@@ -431,14 +433,15 @@ impl TileProducer for FlattenTupleDomainProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
+            row_starts,
             domain,
             codomain,
             domain_predicate,
             deleted,
         } = input_tile
         else {
-            panic!("FlattenTupleDomain expected SealedFunction tile");
+            panic!("FlattenTupleDomain expected a collection");
         };
         let ColumnValue::Records(outer_cols) = domain else {
             panic!("FlattenTupleDomain expected Records domain column");
@@ -469,12 +472,7 @@ impl TileProducer for FlattenTupleDomainProducer {
 
         let flat_pred = flatten_predicate(&domain_predicate, &self.field_map);
 
-        Tile::SealedFunction {
-            domain: flat_domain,
-            codomain,
-            domain_predicate: flat_pred,
-            deleted,
-        }
+        Tile::grouped(row_starts, flat_domain, codomain, flat_pred, deleted)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -522,15 +520,15 @@ mod tests {
     /// Expected output domain: `(_0: Int, _1: Int, _2: Int)`
     #[test]
     fn flatten_tuple_domain_tiling_is_correct() {
-        // IterateExtent produces SealedFunction(outer → outer); the codomain is
-        // irrelevant here — FlattenTupleDomain only inspects the domain.
+        // IterateExtent produces `outer → outer`; the codomain is irrelevant here —
+        // FlattenTupleDomain only inspects the domain.
         let input = Box::new(IterateExtent::new(nested_outer_extent()));
         let op = FlattenTupleDomain::new(input, vec![0, 1]);
-        let Tiling::SealedFunction { domain, .. } = op.tiling() else {
-            panic!("expected SealedFunction tiling");
+        let Tiling::DataFunction { domain, .. } = op.tiling() else {
+            panic!("expected a collection tiling");
         };
         let Extent::Record(fields) = domain else {
-            panic!("expected Record domain");
+            panic!("expected a record key extent");
         };
         assert_eq!(fields.len(), 3);
         assert!(matches!(
@@ -691,22 +689,22 @@ mod tests {
 
     /// Returns a nested outer `Tiling` matching `nested_outer_extent()`.
     fn nested_outer_tiling() -> Tiling {
-        Tiling::SealedFunction {
-            domain: nested_outer_extent(),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        }
+        Tiling::data_function(
+            nested_outer_extent(),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
     }
 
     /// Returns a flat three-field `Tiling` with all-`Int` domain.
     fn flat_three_int_tiling() -> Tiling {
-        Tiling::SealedFunction {
-            domain: Extent::Record(HashMap::from([
+        Tiling::data_function(
+            Extent::Record(HashMap::from([
                 (tuple_field(0), Extent::Base(BaseType::Int)),
                 (tuple_field(1), Extent::Base(BaseType::Int)),
                 (tuple_field(2), Extent::Base(BaseType::Int)),
             ])),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        }
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
     }
 
     /// `FlattenTupleDomainProducer::get_impl` flattens a nested `Records` domain column.
@@ -720,8 +718,8 @@ mod tests {
             (tuple_field(0), Some(tuple_field(1))),
             (tuple_field(1), Some(tuple_field(0))),
         ];
-        let input_tile = Tile::SealedFunction {
-            domain: ColumnValue::Records(HashMap::from([
+        let input_tile = Tile::data_function(
+            ColumnValue::Records(HashMap::from([
                 (
                     tuple_field(0),
                     ColumnValue::Records(HashMap::from([
@@ -737,10 +735,10 @@ mod tests {
                     )])),
                 ),
             ])),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        };
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
+            Predicate::True,
+            BitSet::new(),
+        );
         let flat_tiling = flat_three_int_tiling();
         let mut producer = FlattenTupleDomainProducer {
             base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &flat_tiling),
@@ -748,16 +746,16 @@ mod tests {
             field_map,
         };
         let result = producer.get(producer.tiling().universal_guard());
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
             domain,
             domain_predicate,
             ..
         } = result
         else {
-            panic!("expected SealedFunction");
+            panic!("expected a collection");
         };
         let ColumnValue::Records(cols) = domain else {
-            panic!("expected Records domain");
+            panic!("expected record keys");
         };
         assert_eq!(cols[&tuple_field(0)], ColumnValue::Ints(vec![10, 20]));
         assert_eq!(cols[&tuple_field(1)], ColumnValue::Ints(vec![30, 40]));
@@ -775,8 +773,8 @@ mod tests {
             (tuple_field(0), Some(tuple_field(0))),
             (tuple_field(1), None),
         ];
-        let pass_through_tiling = Tiling::SealedFunction {
-            domain: Extent::Record(HashMap::from([
+        let pass_through_tiling = Tiling::data_function(
+            Extent::Record(HashMap::from([
                 (
                     tuple_field(0),
                     Extent::Record(HashMap::from([(
@@ -786,10 +784,10 @@ mod tests {
                 ),
                 (tuple_field(1), Extent::Base(BaseType::Int)),
             ])),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
-        let input_tile = Tile::SealedFunction {
-            domain: ColumnValue::Records(HashMap::from([
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let input_tile = Tile::data_function(
+            ColumnValue::Records(HashMap::from([
                 (
                     tuple_field(0),
                     ColumnValue::Records(HashMap::from([(
@@ -799,25 +797,25 @@ mod tests {
                 ),
                 (tuple_field(1), ColumnValue::Ints(vec![99, 88])),
             ])),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        };
-        let out_tiling = Tiling::SealedFunction {
-            domain: Extent::Record(HashMap::from([
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let out_tiling = Tiling::data_function(
+            Extent::Record(HashMap::from([
                 (tuple_field(0), Extent::Base(BaseType::Int)),
                 (tuple_field(1), Extent::Base(BaseType::Int)),
             ])),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
         let mut producer = FlattenTupleDomainProducer {
             base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input_tile, pass_through_tiling)),
             field_map,
         };
         let result = producer.get(producer.tiling().universal_guard());
-        let Tile::SealedFunction { domain, .. } = result else {
-            panic!("expected SealedFunction");
+        let Tile::DataFunction { domain, .. } = result else {
+            panic!("expected Function");
         };
         let ColumnValue::Records(cols) = domain else {
             panic!("expected Records domain");
@@ -828,26 +826,26 @@ mod tests {
 
     // ── PermuteRecordDomainProducer ───────────────────────────────────────────
 
-    /// Helper: build a three-field `SealedFunction` tile and tiling with all-`Int` `Records` domain.
+    /// Helper: build a three-field `DataFunction` tile and tiling with all-`Int` `Records` domain.
     fn make_three_field_records_tile_and_tiling() -> (Tile, Tiling) {
-        let tiling = Tiling::SealedFunction {
-            domain: Extent::Record(HashMap::from([
+        let tiling = Tiling::data_function(
+            Extent::Record(HashMap::from([
                 (tuple_field(0), Extent::Base(BaseType::Int)),
                 (tuple_field(1), Extent::Base(BaseType::Int)),
                 (tuple_field(2), Extent::Base(BaseType::Int)),
             ])),
-            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
-        };
-        let tile = Tile::SealedFunction {
-            domain: ColumnValue::Records(HashMap::from([
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let tile = Tile::data_function(
+            ColumnValue::Records(HashMap::from([
                 (tuple_field(0), ColumnValue::Ints(vec![1, 2])),
                 (tuple_field(1), ColumnValue::Ints(vec![3, 4])),
                 (tuple_field(2), ColumnValue::Ints(vec![5, 6])),
             ])),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
-            domain_predicate: Predicate::True,
-            deleted: BitSet::new(),
-        };
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0]))),
+            Predicate::True,
+            BitSet::new(),
+        );
         (tile, tiling)
     }
 
@@ -867,8 +865,8 @@ mod tests {
             permutation,
         };
         let result = producer.get(producer.tiling().universal_guard());
-        let Tile::SealedFunction { domain, .. } = result else {
-            panic!("expected SealedFunction");
+        let Tile::DataFunction { domain, .. } = result else {
+            panic!("expected Function");
         };
         let ColumnValue::Records(cols) = domain else {
             panic!("expected Records domain");
@@ -892,8 +890,8 @@ mod tests {
             permutation,
         };
         let result = producer.get(producer.tiling().universal_guard());
-        let Tile::SealedFunction { domain, .. } = result else {
-            panic!("expected SealedFunction");
+        let Tile::DataFunction { domain, .. } = result else {
+            panic!("expected Function");
         };
         let ColumnValue::Records(cols) = domain else {
             panic!("expected Records domain");
@@ -911,7 +909,7 @@ mod tests {
     fn permute_producer_get_permutes_record_predicate() {
         let (mut input_tile, input_tiling) = make_three_field_records_tile_and_tiling();
         // Override the predicate on the input tile.
-        if let Tile::SealedFunction {
+        if let Tile::DataFunction {
             ref mut domain_predicate,
             ..
         } = input_tile
@@ -932,11 +930,11 @@ mod tests {
             permutation,
         };
         let result = producer.get(producer.tiling().universal_guard());
-        let Tile::SealedFunction {
+        let Tile::DataFunction {
             domain_predicate, ..
         } = result
         else {
-            panic!("expected SealedFunction");
+            panic!("expected Function");
         };
         let Predicate::Record(fields) = domain_predicate else {
             panic!("expected Record predicate");

@@ -3,7 +3,7 @@
 use smol_str::SmolStr;
 
 use crate::ccl::BaseType;
-use crate::interpreter::{ColumnValue, Extent};
+use crate::interpreter::{ColumnValue, Extent, Tile, Tiling};
 
 /// Types of aggregations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,6 +51,18 @@ impl AggregateKind {
         }
     }
 
+    /// The shape a fold leaves where the values it folded stood.
+    ///
+    /// `Sole` yields **an element of the group**, so a collection-valued element keeps its
+    /// levels rather than collapsing to a boxed cell. Every other fold reduces to a value,
+    /// so it leaves a scalar.
+    pub fn output_tiling(&self, input: &Tiling) -> Option<Tiling> {
+        match self {
+            AggregateKind::Sole => Some(input.clone()),
+            _ => self.output_extent(&input.extent()).map(Tiling::Scalar),
+        }
+    }
+
     pub fn output_extent(&self, input_extent: &Extent) -> Option<Extent> {
         match (self, input_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
@@ -67,8 +79,8 @@ impl AggregateKind {
     ///
     /// Used to seed the [`Tile::Aggregation`](crate::interpreter::tiling::Tile::Aggregation)
     /// accumulator before the first batch of values arrives.
-    pub fn initial_accumulator(&self, accumulator_extent: &Extent) -> ColumnValue {
-        let seed = self.seed(accumulator_extent);
+    pub fn initial_accumulator(&self, accumulator: &Tiling) -> Tile {
+        let seed = self.seed(accumulator);
         // **Presence is in-band exactly when the fold is total.** A total aggregate has an
         // identity of the element type to seed with, so its accumulator is a column of one;
         // a partial one has none, and its length is what carries presence. The two halves
@@ -82,7 +94,17 @@ impl AggregateKind {
         seed
     }
 
-    fn seed(&self, accumulator_extent: &Extent) -> ColumnValue {
+    fn seed(&self, accumulator: &Tiling) -> Tile {
+        // A partial fold seeds no value, so its accumulator is that shape at no rows —
+        // whatever the shape is. A total one seeds one value of the element type, which is
+        // always a column.
+        if self.is_partial() {
+            return accumulator.empty_at_no_rows();
+        }
+        Tile::Scalar(self.scalar_seed(&accumulator.extent()))
+    }
+
+    fn scalar_seed(&self, accumulator_extent: &Extent) -> ColumnValue {
         match (self, accumulator_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0]),
             (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
@@ -93,26 +115,38 @@ impl AggregateKind {
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
             (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),
-            // `Sole`'s identity is `none`, and `none` is an empty column: the
-            // accumulator's length is what carries presence, so the seed cannot be a
-            // value of the element type.
-            (AggregateKind::Sole, e) => ColumnValue::from_values(Vec::new(), e),
             _ => panic!("No identity for {self:?} over {accumulator_extent:?}"),
         }
     }
 
-    /// Fold `values[start..end]` into `accumulator` in place.
+    /// Fold rows `start..end` of `values` into `accumulator` in place.
     ///
-    /// `accumulator` holds the running state (a single-element `ColumnValue`);
-    /// `values` is the source column and `start..end` is the slice of elements
-    /// to incorporate.  Passing `0..values.len()` incorporates the whole column.
-    pub fn accumulate(
-        &self,
-        accumulator: &mut ColumnValue,
-        values: &ColumnValue,
-        start: usize,
-        end: usize,
-    ) {
+    /// Both are tiles because a fold may yield an element rather than reduce to a value:
+    /// `Sole`'s accumulator carries whatever shape the element has, levels included.
+    pub fn accumulate(&self, accumulator: &mut Tile, values: &Tile, start: usize, end: usize) {
+        // `Sole` selects rather than reduces, so it is stated over tiles; every other fold
+        // reduces a column and is stated over columns.
+        if let AggregateKind::Sole = self {
+            let incoming = end - start;
+            // At most one element survives. Exceeding that means two elements share one
+            // key, which is the duplicate a map literal forbids — enforced here rather than
+            // at compile time because only the key *values* decide it
+            // (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
+            // now, constant-folding later").
+            let held = accumulator.rows();
+            assert!(
+                held + incoming <= 1,
+                "sole: {} elements under one key; a map literal's keys are distinct",
+                held + incoming
+            );
+            if incoming > 0 {
+                accumulator.merge_rows(values.select_rows(&(start..end).collect::<Vec<_>>()));
+            }
+            return;
+        }
+        let (Tile::Scalar(accumulator), Tile::Scalar(values)) = (accumulator, values) else {
+            panic!("{self:?} reduces a column, so its accumulator and values are columns");
+        };
         match (self, accumulator, values) {
             (AggregateKind::Sum, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
                 acc[0] += vs[start..end].iter().sum::<i64>()
@@ -130,43 +164,26 @@ impl AggregateKind {
             // collapses to; folding in more elements is a no-op (any positive
             // multiplicity yields one `unit`). The values column is ignored.
             (AggregateKind::Drain, ColumnValue::Units(_), _) => {}
-            // `Sole`: at most one element survives, so the fold is an append under a
-            // length bound. Exceeding it means two elements share one key, which is
-            // the duplicate a map literal forbids — enforced here rather than at
-            // compile time because only the key *values* decide it
-            // (`src/ccl/design/collections.md`, "Constructor lowering: runtime
-            // `groupby` now, constant-folding later"). `select_indices` and `append`
-            // recurse through a record column, so a group whose elements are pairs
-            // folds by the same two calls as a scalar one.
-            (AggregateKind::Sole, acc, vs) => {
-                let incoming = end - start;
-                assert!(
-                    acc.len() + incoming <= 1,
-                    "sole: {} elements under one key; a map literal's keys are distinct",
-                    acc.len() + incoming
-                );
-                if incoming > 0 {
-                    acc.append(vs.select_indices(start..end, incoming));
-                }
-            }
             _ => panic!("Invalid accumulate"),
         };
     }
 
     /// Convert accumulator state into output state.
     /// Currently, we only have aggregates where the extracted state is equal to the accumulators.
-    pub fn extract(&self, accumulator: ColumnValue) -> ColumnValue {
-        match (self, &accumulator) {
+    pub fn extract(&self, accumulator: Tile) -> Tile {
+        // `Sole` yields the element it held, whatever shape that is.
+        if let AggregateKind::Sole = self {
+            return accumulator;
+        }
+        let Tile::Scalar(column) = &accumulator else {
+            panic!("{self:?} reduces a column, so its accumulator is a column");
+        };
+        match (self, column) {
             (AggregateKind::Sum, ColumnValue::Ints(_))
             | (AggregateKind::Max, ColumnValue::Ints(_))
             | (AggregateKind::Max, ColumnValue::UInts(_))
             | (AggregateKind::Max, ColumnValue::Strings(_))
             | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
-            // Extraction is per *column*, and under `MapAggregate` that column holds
-            // one accumulated value per key — so its length is the key count, not a
-            // group's size. `Sole`'s bound is therefore checked in `accumulate`, where
-            // the slice arriving is one group's.
-            (AggregateKind::Sole, _) => accumulator,
             _ => panic!("Invalid accumulate"),
         }
     }
