@@ -532,8 +532,8 @@ fn a_terminal_read_of_a_transactional_store() {
 }
 
 /// A terminal read inside a conditional's test. The test compiles to a refinement predicate
-/// on the branch domain, so the read sits in a type slot rather than in the term, which is
-/// the only position `rewrite_txn_reads` walks.
+/// on the branch domain, so the read sits in a type slot rather than in the term, and loop
+/// recognition's rewrite of transactional reads has to reach it there.
 #[test]
 fn a_terminal_read_in_a_conditional_test() {
     agree(indoc! {r#"
@@ -546,17 +546,19 @@ fn a_terminal_read_in_a_conditional_test() {
     "#});
 }
 
-/// The same read against a threshold the final value does not clear, so the two sides agree
-/// on the other branch. Without it a predicate the compiler dropped would still agree.
+/// The same read against a threshold only the final value, 97, fails to clear: the seed, 100,
+/// and the value between the commits, 99, both clear it. So the two sides agree on the other
+/// branch only when the predicate reads the final value, and a dropped predicate disagrees
+/// too.
 #[test]
-fn a_terminal_read_in_a_conditional_test_that_fails() {
+fn a_terminal_read_in_a_conditional_test_not_taken() {
     agree(indoc! {r#"
         out = test_sink()
         pool: Mut(Int, Txn) := 100
         for r in [1, 2]:
             with begin():
                 pool := pool - r
-        out << (1 if await_final(pool) > 990 else 0)
+        out << (1 if await_final(pool) > 98 else 0)
     "#});
 }
 
