@@ -195,30 +195,31 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     let mut domain_predicate = Predicate::False;
     let mut offset = 0usize;
     for (i, tile) in tiles.into_iter().enumerate() {
+        assert!(
+            tile.is_data_function(),
+            "flat_merge: expected a collection arm, got {tile:?}"
+        );
+        let live: Vec<(usize, Value)> = tile.live_keys().collect();
         let Tile::DataFunction {
             domain,
             codomain,
             domain_predicate: dp,
-            deleted,
             ..
         } = tile
         else {
-            panic!("flat_merge: expected a collection arm, got {tile:?}");
+            unreachable!("checked above");
         };
         if i == 0 {
             domain_predicate = dp;
         }
-        let live: Vec<usize> = (0..domain.len())
-            .filter(|r| !deleted.contains(*r))
-            .collect();
         // An arm contributing no row is skipped rather than concatenated: it carries an
         // empty column whose kind is whatever its producer happened to build, and
         // concatenating that against a sibling's is a mismatch over nothing.
         if live.is_empty() {
             continue;
         }
-        for row in live {
-            pairs.push((domain.index_at(row), offset + row));
+        for (row, key) in live {
+            pairs.push((key, offset + row));
         }
         offset += domain.len();
         // Arms disagree on whether a compound value rides boxed (`Scalar(Records)`) or as

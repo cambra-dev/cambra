@@ -530,8 +530,8 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
-/// A `with begin():` block whose write reads nothing, over a source
-/// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
+/// A `with begin():` block whose write reads nothing, over a source filtered to nothing. No
+/// block runs, so no commit lands and the terminal read is the seed.
 #[test]
 fn a_constant_transactional_write_over_an_empty_filtered_source() {
     agree(indoc! {r#"
@@ -541,6 +541,20 @@ fn a_constant_transactional_write_over_an_empty_filtered_source() {
                 pool := 7
         out = test_sink()
         out << await_final(pool)
+    "#});
+}
+
+/// The same write over a source filtered to two survivors of three: a block runs once per
+/// survivor, keyed by its own commit, and none runs at the filtered position.
+#[test]
+fn a_constant_transactional_write_runs_once_per_survivor() {
+    agree(indoc! {r#"
+        pool: Mut(Int, Txn) := 100
+        out = test_sink()
+        for r in [z for z in [1, 2, 3] if z != 2]:
+            with begin():
+                pool := 7
+                out << 7
     "#});
 }
 
