@@ -649,14 +649,15 @@ on its output.
 ### Accumulator iteration order is not yet defined [Open]
 
 A loop-carried accumulator sequences its loop's iterations "in the order the dependency
-requires" (§4.6), and an accumulator whose update does not commute (`last := v`) makes the
-result depend on that order. This document does not say what the order is. The compiler runs
-a list's iterations in index order, but over a keyed collection, such as a `Map` or a
-`groupby` result, no order is implied, so two equal maps could give different results.
-Whether the order is the keys' order, an ordering supplied as a given (the direction above),
-or a refusal of non-commuting accumulation over an unordered collection is **[Open]**.
-Today's compiler refuses an accumulating loop whose source is not indexed by iteration
-position, so the question does not arise in a program it accepts.
+requires" ([4.6 `for` — iteration](#46-for--iteration)), and an accumulator whose update does
+not commute (`last := v`) makes the result depend on that order. This document does not say
+what the order is. The compiler runs a list's iterations in index order, but over a keyed
+collection, such as a `Map` or a `groupby` result, no order is implied, so two equal maps could
+give different results. Whether the order is the keys' order, an ordering supplied as a given
+(the direction above), or a refusal of non-commuting accumulation over an unordered collection
+is **[Open]**. The compiler refuses an accumulating loop whose source is not indexed by
+iteration position (``a `mut` loop's source must be indexed by iteration position``), so the
+question does not arise in a program it accepts.
 
 ### Evaluation order is unspecified
 

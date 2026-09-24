@@ -474,7 +474,7 @@ fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
 "#})]
 // A `**` answers a bare `Int`, so a chain is rejected at the inner result rather than
 // parsed differently: right-associativity is the parser's, pinned by
-// `src/chl_parser/parser.rs`'s `power_precedence_and_associativity`.
+// `chl-parser/src/parser.rs`'s `power_precedence_and_associativity`.
 #[case::chain("2 ** 3 ** 2")]
 fn an_exponent_not_shown_non_negative_is_rejected(#[case] code: &str) {
     check_compile_error(code, "__elem >= 0");

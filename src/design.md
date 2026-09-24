@@ -21,13 +21,13 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 
 The parser is its own crate, so a consumer can depend on the CHL front end without the
 compiler and runtime behind it. `cambra` re-exports it, so `cambra::chl_parser` names
-it. The reference interpreter depends on the parser and not on `cambra`, so that it states
+it. The differential interpreter depends on the parser and not on `cambra`, so that it states
 what a program means without consulting the compiler it is compared against.
 
 | Path | Role | Design docs |
 | --- | --- | --- |
 | `chl-parser/` | Parser for the Cambra High-level Language: lexer, grammar, AST, and error recovery. | [design-chl-parser.md](../chl-parser/design-chl-parser.md) |
-| `chl-interp/` | Reference interpreter for CHL: the differential oracle the `tests/differential_*` suites compare the compiler against. | — |
+| `chl-interp/` | Differential interpreter for CHL: what `tests/differential_interp.rs` compares the compiler against. | — |
 
 ## Operational semantics
 

@@ -3,7 +3,7 @@ name = "chl-interp"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "A reference interpreter for CHL, used as a differential oracle against the compiler"
+description = "A differential interpreter for CHL, which the differential suite compares the compiler against"
 repository = "https://github.com/cambra-dev/cambra"
 
 # Only the parser. The point of this crate is to state what a CHL program means
