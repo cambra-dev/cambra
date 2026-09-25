@@ -100,6 +100,8 @@ mod functions;
 mod http;
 mod loops;
 mod stmts;
+#[cfg(any(test, feature = "test-helpers"))]
+mod test_sink;
 mod transactions;
 
 /// The names a type alias may not rebind, re-exported so the test that pins the
@@ -118,6 +120,8 @@ use functions::*;
 use http::*;
 use loops::*;
 use stmts::*;
+#[cfg(any(test, feature = "test-helpers"))]
+use test_sink::*;
 use transactions::*;
 
 // ---------------------------------------------------------------------------
@@ -318,6 +322,14 @@ pub struct LoweringContext {
     /// `pub(super)` so the statement submodule can inspect it when deciding
     /// whether to wrap the program tail in the sink-binding `Record`.
     pub(super) sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+
+    /// Test sinks registered before compiling, by binding name.
+    ///
+    /// A test reads a sink back through a handle it holds before the program that writes
+    /// to it exists, so `test_sink()` binds the sink registered under its binding name and
+    /// refuses a name nothing registered.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(super) test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 
     /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
     /// that use the same port.  Created lazily on the first `http_serve` for a port
@@ -525,6 +537,15 @@ impl LoweringContext {
         self.shared_servers.extend(servers);
     }
 
+    /// Seed this context with the test sinks a registry holds.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn adopt_test_sinks(
+        &mut self,
+        test_sinks: impl IntoIterator<Item = (String, Arc<crate::interpreter::TestSink>)>,
+    ) {
+        self.test_sinks.extend(test_sinks);
+    }
+
     /// Drain all sources accumulated for this compilation.
     ///
     /// Returns every source that was either pre-registered (e.g. stdin, test
@@ -538,12 +559,29 @@ impl LoweringContext {
 
     /// Register a sink for the CCL binding named `name`.
     ///
-    /// Called during `http_serve` lowering: the responses binding is assigned a
+    /// Called during `http_serve` and `test_sink` lowering: the binding is assigned a
     /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
-    /// binding name so that the scheduler can subscribe an
-    /// `HttpServerSinkConsumer` to it after operator conversion.
-    pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
-        self.sink_bindings.insert(name.into(), sink);
+    /// binding name so that the scheduler can subscribe a consumer to it after
+    /// operator conversion.
+    ///
+    /// A name holds at most one sink. A second declaration would replace the first's
+    /// entry, and the first's writes would reach no sink, so it is refused at `span`.
+    pub fn register_sink_binding(
+        &mut self,
+        name: impl Into<String>,
+        sink: Arc<dyn DataSink>,
+        span: Span,
+    ) -> Result<(), LoweringError> {
+        match self.sink_bindings.entry(name.into()) {
+            std::collections::hash_map::Entry::Occupied(e) => Err(LoweringError::unsupported(
+                span,
+                format!("`{}` is already declared as a sink", e.key()),
+            )),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(sink);
+                Ok(())
+            }
+        }
     }
 
     /// Drain all sink bindings accumulated for this compilation.

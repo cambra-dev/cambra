@@ -80,7 +80,7 @@ when the front is released.
 
 ## Multi-endpoint programs
 
-Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `LoweringContext::sink_bindings`.
+Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `LoweringContext::sink_bindings`. Two calls naming one `responses` binding are refused, as is any other top-level binding of a `responses` name: the sink record reads the innermost binding of each sink name.
 
 ---
 
