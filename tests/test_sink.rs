@@ -72,11 +72,12 @@ fn a_scalar_feed_is_one_contribution_keyed_by_unit() {
     assert_eq!(format!("{}", v.expect("a value")), "Function [ () -> 3 ]");
 }
 
-/// Feeding a collection contributes its elements, so the channel carries three
-/// positionally-keyed entries rather than one entry holding a collection — the contrast
-/// with the scalar feed above.
+/// A collection fed at a site that does not iterate lands flat: the channel takes the
+/// collection's own keys, rather than one unit-keyed contribution holding it. Pinned as
+/// observed, not endorsed — a feed is meant to nest, which would make this
+/// `() -> [2, 4, 6]`, and the raw tile is one level (`keys: UInts([0, 1, 2])`).
 #[test]
-fn a_collection_feed_contributes_its_elements() {
+fn a_collection_feed_lands_flat_rather_than_nesting() {
     let v = observe_one(indoc! {r#"
         out = test_sink()
         out << [x * 2 for x in [1, 2, 3]]
@@ -508,4 +509,22 @@ fn a_sink_accumulates_across_two_deliveries() {
         "Function [ 10, 20 ]",
         "both deliveries are in the accumulated value"
     );
+}
+
+/// Feeding a collection built from the loop variable, from inside the loop, produces a tree
+/// that fails the compiler's own post-lambda-elim typecheck. Not a sink defect: the same
+/// program through a plain `defer()` and a trailing expression panics identically.
+///
+/// It leaves one feed case unmeasured — whether such a channel takes the loop's keys with a
+/// collection under each, or splices the contributions into one flat domain — so nothing
+/// downstream should assume either.
+#[test]
+#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
+fn a_collection_fed_from_inside_a_loop_does_not_compile() {
+    observe_one(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2]:
+            out << [x, x * 10]
+    "#})
+    .expect("a value");
 }

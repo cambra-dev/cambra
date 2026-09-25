@@ -1211,7 +1211,7 @@ pub(crate) mod test_helpers {
 
     /// Parse a CHL expression and return the AST node.
     pub(crate) fn parse_expr(code: &str) -> Spanned<ChlExpr> {
-        crate::chl_parser::parse_expression(code)
+        chl_parser::parse_expression(code)
             .into_result()
             .expect("Failed to parse expression")
     }
@@ -1228,7 +1228,7 @@ pub(crate) mod test_helpers {
 
     /// Parse a CHL module and return the statement list.
     pub(crate) fn parse_module(code: &str) -> Vec<Spanned<ChlStmt>> {
-        crate::chl_parser::parse_module(code)
+        chl_parser::parse_module(code)
             .into_result()
             .expect("Failed to parse module")
             .body
@@ -1272,7 +1272,7 @@ mod tests {
             "x = 0\nx.field += 1\nx",
         ];
         for code in cases {
-            let result = crate::chl_parser::parse_module(code);
+            let result = chl_parser::parse_module(code);
             assert!(
                 !result.errors.is_empty(),
                 "expected parse error for:\n{code}"
@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn a_subscript_target_is_rejected_by_every_form_but_mut_assign() {
         for code in ["x = [1]\nx[0] += 1\nx", "x = [1]\nx[0] = 1\nx"] {
-            let module = crate::chl_parser::parse_module(code)
+            let module = chl_parser::parse_module(code)
                 .into_result()
                 .expect("a subscript target parses");
             let mut ctx = super::LoweringContext::default();

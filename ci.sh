@@ -12,12 +12,12 @@ ci_fmt() {
 # targets regardless. That extra target-checking is why `ci_fast` drops
 # `--all-targets` for the local iteration loop (it is kept here so the full gate
 # still lints test code).
-ci_clippy() { cargo clippy -p cambra --all-targets -- -D warnings; }
+ci_clippy() { cargo clippy -p cambra -p chl-parser -p chl-interp --all-targets -- -D warnings; }
 # Same lint, in release. The debug checks never compile the test target in
 # release, so a `#[cfg(debug_assertions)]`-gated item referenced by ungated code
 # (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
 # scoped to our crate, not deps.
-ci_clippy_release() { cargo clippy -p cambra --release --all-targets -- -D warnings; }
+ci_clippy_release() { cargo clippy -p cambra -p chl-parser -p chl-interp --release --all-targets -- -D warnings; }
 # The library alone, with no features unified in. Every pass above uses
 # `--all-targets`, which pulls in the dev-dependencies — including the *self*
 # dev-dependency that enables `test-helpers`. Cargo unifies that feature into the
@@ -37,7 +37,13 @@ ci_clippy_lib() { cargo clippy -p cambra --lib -- -D warnings; }
 # reaches planning too, which recovers the order a nested filter's predicate
 # implies rather than reading it off the storage this reverses. Same argument as
 # `ci_clippy_lib`: a configuration nothing runs is a configuration that rots.
-ci_test() { cargo test -p cambra -q; }
+# Every workspace member: `-p cambra` alone does not reach the parser's or the
+# interpreter's tests, and a member left out of this list passes by not running.
+#
+# `--no-fail-fast` because the suite is many binaries: without it the first failing binary
+# ends the run and the rest never execute, so a red run reports the failure it found plus
+# an unknown number it did not look for.
+ci_test() { cargo test -p cambra -p chl-parser -p chl-interp -q --no-fail-fast; }
 # The suite with `debug_assertions` off, which no other gate runs: `ci_test`
 # runs it on, and `ci_clippy_release` lints that configuration without running
 # it. A check compiled out here and nowhere else makes two compilers, and the
@@ -47,7 +53,7 @@ ci_test() { cargo test -p cambra -q; }
 # Behavior that depends on *optimization* is out of scope, which is what lets
 # `profile.no-assertions` keep `dev`'s `opt-level` and this gate cost about what
 # `ci_test` costs.
-ci_test_no_assertions() { cargo test -p cambra -q --profile no-assertions; }
+ci_test_no_assertions() { cargo test -p cambra -p chl-parser -p chl-interp -q --no-fail-fast --profile no-assertions; }
 # The formal model (`formal/`): building it is what elaborates every theorem,
 # evaluates every `#guard`, and checks every headline result's axiom list
 # (`CclFormal/Axioms.lean`) in the Lean development, and the differential tests
@@ -95,7 +101,7 @@ ci_solver() {
 }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
-    cargo doc -p cambra --no-deps
+    cargo doc -p cambra -p chl-parser -p chl-interp --no-deps
 }
 # The web frontend: typecheck + vitest, plus a freshness check on the committed
 # single-file bundle (R7 — `dist/index.html` is `include_str!`'d so `cargo build`
@@ -254,7 +260,7 @@ ci_fast() {
   ci_fmt || failed=1
   # Lib+bins only (no --all-targets) — see the comment on `ci_clippy`.
   # shellcheck disable=SC2310
-  { cargo clippy -p cambra -- -D warnings; } || failed=1
+  { cargo clippy -p cambra -p chl-parser -p chl-interp -- -D warnings; } || failed=1
   # Before `ci_test`, so a missing solver reads as one line rather than as the
   # suite's failures.
   # shellcheck disable=SC2310

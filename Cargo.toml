@@ -1,7 +1,7 @@
 [workspace]
-# One package. The inspector's Rust half is `src/inspector_server`, a module of
-# this crate; `web/` is its TypeScript frontend, a JS project
-# with no Cargo manifest.
+# The root package plus the CHL parser and the differential interpreter. The
+# inspector's Rust half is `src/inspector_server`, a module of this crate;
+# `web/` is its TypeScript frontend, a JS project with no Cargo manifest.
 # The root package is edition 2024, whose default resolver is 3, but a workspace
 # table overrides the member's edition default — so leaving this unset or at 2
 # silently downgrades the whole build. 3 is MSRV-aware version selection (it
@@ -9,6 +9,10 @@
 # unification `ci_clippy_lib` relies on arrived in 2 and is unchanged in 3, so
 # that gate is not what this setting decides.
 resolver = "3"
+members = ["chl-parser", "chl-interp"]
+# A bare `cargo test` or `cargo clippy` at the root covers every member, as it did when the
+# root was the only package.
+default-members = [".", "chl-parser", "chl-interp"]
 
 [package]
 name = "cambra"
@@ -28,6 +32,9 @@ readme = "README.md"
 test-helpers = []
 
 [dev-dependencies]
+# The differential interpreter, for the differential suite. A dev-dependency because only the
+# tests compare the two; the library must not consult the interpreter it is checked against.
+chl-interp = { path = "chl-interp" }
 # Self dev-dependency so the integration tests (separate crates) can see the
 # `test-helpers`-gated helpers. Cargo unifies this with the library under test.
 cambra = { path = ".", features = ["test-helpers"] }
@@ -37,9 +44,9 @@ rstest-log = "0.2.0"
 test-log = "0.2.19"
 
 [dependencies]
-# CHL parser stack. See src/chl_parser/design-chl-parser.md.
-chumsky = "1.0.0-alpha.8"
-logos = "0.14"
+# CHL parser, its own crate so a consumer can depend on the front end alone.
+# See chl-parser/design-chl-parser.md.
+chl-parser = { path = "chl-parser" }
 ariadne = "0.4"
 easy-smt = "0.3.2"
 indoc = "1.0"

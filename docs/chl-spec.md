@@ -646,6 +646,19 @@ on its output.
 > compiler treats every collection as a bag, exactly as this section
 > describes.
 
+### Accumulator iteration order is not yet defined [Open]
+
+A loop-carried accumulator sequences its loop's iterations "in the order the dependency
+requires" ([4.6 `for` — iteration](#46-for--iteration)), and an accumulator whose update does
+not commute (`last := v`) makes the result depend on that order. This document does not say
+what the order is. The compiler runs a list's iterations in index order, but over a keyed
+collection, such as a `Map` or a `groupby` result, no order is implied, so two equal maps could
+give different results. Whether the order is the keys' order, an ordering supplied as a given
+(the direction above), or a refusal of non-commuting accumulation over an unordered collection
+is **[Open]**. The compiler refuses an accumulating loop whose source is not indexed by
+iteration position (``a `mut` loop's source must be indexed by iteration position``), so the
+question does not arise in a program it accepts.
+
 ### Evaluation order is unspecified
 
 Most CHL expressions are *pure* (see the effect inventory above): a pure
@@ -1250,7 +1263,7 @@ not in CHL.
 ### 3.14 Recovery placeholders
 
 The parser may produce `Expr::Error` and `Stmt::Error` placeholders
-during error recovery (see [src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md)).
+during error recovery (see [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)).
 These appear only when the `ParseResult.errors` list is non-empty;
 they carry no runtime semantics — a program containing one cannot be
 compiled. Tools that consume a partial AST (LSP, editor diagnostics)
@@ -3357,7 +3370,7 @@ multiple diagnostics per file. Two recovery layers:
 
 A parse always returns a `ParseResult<T>` carrying *both* a partial AST
 (possibly containing recovery placeholders) and a list of errors. See
-[src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md)
+[chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)
 for the recovery design and error-rendering details.
 
 ### 10.3 Semantic errors
@@ -3490,7 +3503,7 @@ the demo programs.
 ## See also
 
 - [docs/design.md](design.md) — overall Cambra architecture.
-- [src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md) — the parser implementation.
+- [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md) — the parser implementation.
 - [src/ccl/design/](../src/ccl/design/README.md) — the CCL IR and the
   lowering/inference/optimization passes.
 - [docs/operational-semantics/summary.md](operational-semantics/summary.md) — CCL's operational semantics.
