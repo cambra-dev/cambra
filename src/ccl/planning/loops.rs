@@ -228,11 +228,66 @@ fn split_causal_compose(guard: Expr) -> (Expr, Builtin) {
     (default, b)
 }
 
+/// Whether a writer's decision collapsed to a constant function `⟨record⟩ ▷ const`.
+///
+/// A decision that reads neither a snapshot nor the loop item does: lambda elimination
+/// point-frees it to a `const`, and `simplify`'s const-reduce then drops the composition in
+/// front of it, taking the snapshot scaffold and the source term with it.
+fn is_constant_decision(decision: &Expr) -> bool {
+    matches!(&decision.node, TypedExprNode::Apply { function, .. }
+        if matches!(&function.node, TypedExprNode::Builtin(Builtin::Const)))
+}
+
+/// The source and body of a writer whose decision is constant — what
+/// [`split_decision_compose`] recovers for every other decision, where there is no compose
+/// left to destructure.
+///
+/// A writer iterates its site's **extent**, which `site_dom` carries whether or not a term
+/// spells its elements out: a domain `extent_of` resolves, a `UIntRange` or a
+/// `DataSourceDomain` refined or not. A bare witness domain has no extent, and op-conversion
+/// refuses a sum with no concrete domain (`src/ccl/planning/iterate.rs` leaves it unmarked).
+/// The values the dropped source term held are the ones a constant decision does not read.
+/// So the source is the identity over that extent — the extent is its data, exactly as for
+/// the `iterate(p)` this slot is wrapped in (`ccl_utils::make_iterate`) — and the engine
+/// still runs one position per element, feeding a position the body ignores.
+///
+/// A refined extent's surviving positions are a runtime subset of the declared ones, and the
+/// source operator carries them: planning wraps the identity in the `iterate` of a
+/// `restrict` by the extent's predicate, and the driver reads the positions that survive.
+fn constant_decision_writer(decision: Expr, site_dom: &Type, decision_ty: &Type) -> (Expr, Expr) {
+    let mut source = Expr::builtin(Builtin::Id);
+    source.ty = Type::data_fun(site_dom.clone(), site_dom.clone());
+    // The writer-body convention is `Fun(Tuple(reads…, item), decision)`; with no reads and
+    // the position as the (ignored) item, restamp the const application accordingly —
+    // nominal only, since const ignores its input.
+    let mut body = decision;
+    body.ty = Type::fun(Type::Tuple(vec![site_dom.clone()]), decision_ty.clone());
+    // The strict check re-derives the application from the `const` builtin's recorded type —
+    // keep it in step with the restamp.
+    if let TypedExprNode::Apply { argument, function } = &mut body.node {
+        function.ty = Type::fun(argument.ty.clone(), body.ty.clone());
+    }
+    (source, body)
+}
+
+/// Split a post-elim writer decision into its snapshot slots, its source and its body.
+///
+/// Every decision is `(⟨slot₀⟩, …, ⟨source⟩) ▷ zip ≫ ⟨body⟩` except a constant one, which
+/// has no slots and whose source [`constant_decision_writer`] recovers from the site's
+/// domain.
+fn split_decision(decision: Expr, site_dom: &Type, decision_ty: &Type) -> (Vec<Expr>, Expr, Expr) {
+    if is_constant_decision(&decision) {
+        let (source, body) = constant_decision_writer(decision, site_dom, decision_ty);
+        return (Vec::new(), source, body);
+    }
+    split_decision_compose(decision, decision_ty)
+}
+
 /// Destructure a post-elim decision compose
 /// `(⟨slot₀⟩, …, ⟨source⟩) ▷ zip ≫ ⟨body…⟩` into its snapshot slots, the
 /// trailing source, and the writer body (the tail elements re-composed,
-/// verbatim). `p_tys` are the body's tuple-parameter element types (snapshot
-/// value types then the item), used only to stamp the rebuilt body compose.
+/// verbatim). The body's tuple-parameter element types (snapshot value types
+/// then the item) stamp the rebuilt body compose.
 fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Expr, Expr) {
     if !matches!(decision.node, TypedExprNode::Compose(_)) {
         panic!(
@@ -274,6 +329,22 @@ fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Exp
         c
     };
     (slots, source, body)
+}
+
+/// The accumulator label an induction snapshot slot `__prev ≫ .acc` projects.
+fn snapshot_slot_label(slot: &Expr) -> String {
+    let projected = match &slot.node {
+        TypedExprNode::Compose(elts) => elts.last(),
+        TypedExprNode::Apply { function, .. } => Some(&**function),
+        _ => None,
+    };
+    match projected.map(|e| &e.node) {
+        Some(TypedExprNode::Proj(ProjKey::Field(label))) => label.clone(),
+        _ => panic!(
+            "letrec recognition: snapshot slot is not `__prev ≫ .acc`: {}",
+            symbolic(slot)
+        ),
+    }
 }
 
 /// Which binding a transaction `LetRec` binding is (dispatched on its body\'s
@@ -365,39 +436,7 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         .ty
         .codomain()
         .expect("letrec recognition: decision is a function");
-    // A writer whose decision uses neither a snapshot read nor the loop item
-    // (`flag := True`) elim-collapses to a constant function `⟨record⟩ ▷ const`
-    // — the snapshot scaffold (and with it the source term) is gone. The
-    // writer then has an empty read set, the const application itself as its
-    // (input-ignoring) body, and the identity over the site domain as its
-    // source: the engine still iterates one commit per site position, feeding
-    // a position the body ignores.
-    if let TypedExprNode::Apply { function, .. } = &decision.node
-        && matches!(&function.node, TypedExprNode::Builtin(Builtin::Const))
-    {
-        let mut source = Expr::builtin(Builtin::Id);
-        // The identity on the site's extent, which is the collection of the writer's
-        // positions — the extent is its data, exactly as for the `iterate(p)` this slot
-        // is wrapped in (`ccl_utils::make_iterate`).
-        source.ty = Type::data_fun(site_dom.clone(), site_dom.clone());
-        // The writer-body convention is `Fun(Tuple(reads…, item), decision)`;
-        // with no reads and the position as the (ignored) item, restamp the
-        // const application accordingly — nominal only, const ignores input.
-        let mut body = decision;
-        body.ty = Type::fun(Type::Tuple(vec![site_dom.clone()]), decision_ty.clone());
-        // The strict check re-derives the application from the `const`
-        // builtin's recorded type — keep it in step with the restamp.
-        if let TypedExprNode::Apply { argument, function } = &mut body.node {
-            function.ty = Type::fun(argument.ty.clone(), body.ty.clone());
-        }
-        return WriterSite {
-            read_keys: Vec::new(),
-            write_keys,
-            source,
-            body,
-        };
-    }
-    let (reads, source, body) = split_decision_compose(decision, &decision_ty);
+    let (reads, source, body) = split_decision(decision, site_dom, &decision_ty);
     // Each snapshot read is `__t ≫ hist_k` — the key is the trailing
     // history var.
     let read_keys: Vec<Name> = reads
@@ -646,12 +685,14 @@ fn collapse_snapshot_sources(
 ///
 /// ```text
 /// __hist = let __prev = (⟨view⟩ ▷ const, id, (init…) ▷ const) ▷ zip ≫ get_prev_seq
-///          in (__prev ≫ .0, …, ⟨source⟩) ▷ zip ≫ ⟨body⟩
+///          in (__prev ≫ .acc₀, …, ⟨source⟩) ▷ zip ≫ ⟨body⟩
 /// ```
 ///
 /// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
 /// defaults record, under the accumulators\' own labels; the source off the
-/// snapshot\'s trailing slot. Reads of `__hist` in the letrec body
+/// snapshot\'s trailing slot; the writer's read keys off the labels its snapshot slots
+/// project. A constant decision has no compose to destructure and is recovered by
+/// [`constant_decision_writer`]. Reads of `__hist` in the letrec body
 /// (`__hist ≫ .writes ≫ .acc` extracts and `__hist ≫ .__to_<feed>` taps) become
 /// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
@@ -697,19 +738,52 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         panic!("letrec recognition: guard defaults are not the accumulators' inits record");
     };
 
-    let (prev_slots, source, writer_body) = split_decision_compose(*applied, &decision_ty);
-    assert_eq!(
-        prev_slots.len(),
-        inits.len(),
-        "letrec recognition: snapshot slots must match the key inits"
-    );
-    let acc_tys: Vec<Type> = prev_slots
+    let (prev_slots, source, writer_body) = split_decision(*applied, &domain_ty, &decision_ty);
+    // Each snapshot slot is `__prev ≫ .acc`, the previous value of the accumulator its label
+    // names. The slots are what the body reads, in its parameter order, so they give the
+    // writer's read keys: every accumulator for a decision that reads them all, none for a
+    // constant one.
+    let labels: Vec<String> = inits.iter().map(|(label, _)| label.clone()).collect();
+    let slot_accumulators: Vec<usize> = prev_slots
         .iter()
-        .map(|e| {
-            e.ty.codomain()
-                .expect("letrec recognition: previous-value slot is a function")
+        .map(|slot| {
+            let label = snapshot_slot_label(slot);
+            labels.iter().position(|l| *l == label).unwrap_or_else(|| {
+                panic!(
+                    "letrec recognition: snapshot slot reads `{label}`, which no key initializes"
+                )
+            })
         })
         .collect();
+    // The accumulator types come off the commit payload's `writes` record — what the
+    // recurrence's own type declares it writes — rather than off the snapshot reads, of
+    // which a constant decision makes none.
+    let Some((_, Type::Record(write_field_tys))) =
+        payload_field_tys.iter().find(|(n, _)| n == F_WRITES)
+    else {
+        panic!("letrec recognition: commit payload carries a `writes` record: {payload_ty}");
+    };
+    let acc_tys: Vec<Type> = inits
+        .iter()
+        .map(|(label, _)| {
+            write_field_tys
+                .iter()
+                .find(|(n, _)| n == label)
+                .map(|(_, t)| t.clone())
+                .unwrap_or_else(|| {
+                    panic!("letrec recognition: `writes` carries every accumulator: {label}")
+                })
+        })
+        .collect();
+    // `mut_elim` builds the `writes` record from the accumulators' own types, so a snapshot
+    // slot reads the type its accumulator writes.
+    for (slot, &acc) in prev_slots.iter().zip(&slot_accumulators) {
+        assert_eq!(
+            slot.ty.codomain().as_ref(),
+            Some(&acc_tys[acc]),
+            "letrec recognition: a snapshot slot reads the type its accumulator writes"
+        );
+    }
 
     // One store key per accumulator, under the name the program gave it.
     // `mut_elim` labels the write set by `field_key`, so the accumulators arrive
@@ -745,7 +819,10 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let hist_ty = hist_record(hist_field_tys);
 
     let writer = WriterSite {
-        read_keys: key_names.clone(),
+        read_keys: slot_accumulators
+            .iter()
+            .map(|&acc| key_names[acc].clone())
+            .collect(),
         write_keys: key_names,
         source,
         body: writer_body,
