@@ -207,9 +207,10 @@ fn a_feed_replays_its_prefix_when_an_unpulled_sibling_holds_its_store() {
 /// In-process only: through the binary over `stdin` the recurrence has caught up at
 /// the quiet point where `--control` reloads, and nothing is replayed.
 ///
-/// No reader here is unpulled. The induction driver's recurrence branch reads the
-/// store's previous tick, so its release trails the tap reader's by one tick, and
-/// the rebuilt tap reader is seeded at the driver's frontier.
+/// No reader here is unpulled. The induction driver's recurrence branch reads each key
+/// at the store's frontier, the position before the one it feeds, so its release trails
+/// the tap reader's by one position, and the rebuilt tap reader is seeded at the driver's
+/// frontier.
 #[test]
 fn a_feed_repeats_the_position_the_recurrence_still_reads() {
     let pinned: Vec<Vec<String>> = (0..=10)

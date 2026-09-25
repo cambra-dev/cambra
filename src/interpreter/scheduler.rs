@@ -47,22 +47,23 @@ pub fn shared_consumer(mut consumer: Box<dyn Consumer>) -> SharedConsumer {
 /// `Consumer`, because the blanket impl over `Rc<RefCell<C>>` needs a *sized* `C`,
 /// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
 /// impl something sized to bite on.
-pub fn forwarding_consumer(shared: &SharedConsumer) -> Box<dyn Consumer> {
+pub fn forwarding_consumer(shared: &SharedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
     let shared = shared.clone();
+    let wakeups = wakeups.clone();
     Box::new(move || {
-        // A notification that re-enters a consumer already being notified is dropped. A
-        // recurrence's notification graph is cyclic, and nesting closes a cycle through
-        // *two* inputs of one operator: the inner store sits downstream of the enclosing
-        // body and its read feeds back into it, so one upstream change reaches the body's
-        // `Zip` along both arms. Dropping the second is what a wake means — an edge, not a
-        // count. The call in progress has not returned, so whatever it wakes is woken once
-        // for this cascade and re-pulls with both arms' data.
-        //
-        // The drop rests on that pull not having happened yet, so it does not extend to a
-        // consumer this cascade woke and has since returned from: a cascade can contain a
-        // pull, and a wake after one carries what arrived too late for it.
-        if let Ok(mut consumer) = shared.try_borrow_mut() {
-            consumer.notify();
+        // A notification that re-enters a consumer already being notified is deferred to
+        // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
+        // and nesting closes a cycle through *two* inputs of one operator: the inner store
+        // sits downstream of the enclosing body and its read feeds back into it, so one
+        // upstream change reaches the body's `Zip` along both arms. Delivering the second
+        // inside the first would re-enter the consumer. Dropping it would lose a change the
+        // call in progress may already have pulled past: a cascade can contain a pull, and
+        // a wake after one carries what arrived too late for it. Deferred, it is delivered
+        // outside any cascade, where it cannot re-enter, and at worst wakes a consumer
+        // whose next pull finds nothing new.
+        match shared.try_borrow_mut() {
+            Ok(mut consumer) => consumer.notify(),
+            Err(_) => wakeups.request(shared.clone()),
         }
     })
 }
@@ -236,6 +237,40 @@ pub fn pull_laps(
 mod tests {
     use super::*;
 
+    /// A notification that re-enters a consumer still being notified reaches it later rather
+    /// than being lost: the downstream here pulls on notify, as `SinkConsumer` does, and
+    /// the cascade then reaches the second arm, whose data changed after the pull.
+    #[test]
+    fn a_reentrant_wake_after_a_pull_in_the_cascade_is_not_lost() {
+        use std::cell::Cell;
+        let data = Rc::new(Cell::new(0u32));
+        let seen = Rc::new(Cell::new(0u32));
+        let feedback: Rc<RefCell<Option<Box<dyn Consumer>>>> = Rc::new(RefCell::new(None));
+        let (d, s, fb) = (data.clone(), seen.clone(), feedback.clone());
+        let downstream: Box<dyn Consumer> = Box::new(move || {
+            // The pull.
+            s.set(d.get());
+            // The rest of the cascade, once: arm B's data changes, and its notification
+            // re-enters the operator this notification is still inside.
+            let rest = fb.borrow_mut().take();
+            if let Some(mut arm_b) = rest {
+                d.set(d.get() + 1);
+                arm_b.notify();
+            }
+        });
+        let shared = shared_consumer(downstream);
+        let mut scheduler = Scheduler::new();
+        let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
+        *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
+        arm_a.notify();
+        scheduler.check_for_notifications();
+        assert_eq!(
+            seen.get(),
+            data.get(),
+            "the downstream never pulled what arm B delivered after its pull"
+        );
+    }
+
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the
     /// wakeup is delivered by the next lap, and the producer it wakes answers anew.
     #[test]
@@ -262,11 +297,13 @@ mod tests {
                     self.queue
                         .request(Rc::new(RefCell::new(move || *woken.borrow_mut() = true)));
                 }
-                let value = match *self.woken.borrow() {
-                    true => 2,
-                    false => 1,
+                // Nothing until woken: a scalar holding a value is its whole answer, so the
+                // pull before the wakeup answers what the first did by having none.
+                let values = match *self.woken.borrow() {
+                    true => vec![2],
+                    false => Vec::new(),
                 };
-                Tile::Scalar(ColumnValue::Ints(vec![value]))
+                Tile::Scalar(ColumnValue::Ints(values))
             }
             fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
         }

@@ -370,7 +370,7 @@ impl TileOperator for UnionOperator {
             .map(|op| {
                 op.subscribe(
                     op.tiling().universal_guard(),
-                    forwarding_consumer(&shared),
+                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                     scheduler,
                 )
             })
@@ -453,16 +453,35 @@ impl UnionProducer {
             .map(|tile| tile.rows_by_path(enclosing))
             .collect();
         let paths = standing.paths_at(enclosing);
+        let empty_group = self.tiling().values_at(self.level).empty_tile();
         standing.per_group(self.tiling(), self.level, &mut |row| {
-            // An arm that has not reached this row contributes nothing to it. The arms are
-            // disjoint slices of one collection, so a missing arm is an absence rather
-            // than a gap the merge has to reconcile.
+            // An arm that has not reached this row holds nothing of it, but still says
+            // whether more may come: complete where the arm calls the row complete, and not
+            // otherwise. The arms are disjoint slices of one collection, so its keys are an
+            // absence the merge takes as none, and its statement is one the merged row's
+            // has to meet.
             let per_arm: Vec<Tile> = tiles
                 .iter()
                 .zip(&rows)
-                .filter_map(|(tile, rows)| {
-                    let at = *rows.get(&paths[row])?;
-                    tile.group_at(self.level, at).map(|g| g.into_owned())
+                .map(|(tile, rows)| {
+                    if let Some(group) = rows
+                        .get(&paths[row])
+                        .and_then(|&at| tile.group_at(self.level, at))
+                    {
+                        return group.into_owned();
+                    }
+                    let mut group = empty_group.clone();
+                    if let Tile::DataFunction {
+                        domain_predicate, ..
+                    } = &mut group
+                    {
+                        *domain_predicate =
+                            match tile.completion_at(enclosing).contains_path(&paths[row]) {
+                                true => Predicate::True,
+                                false => Predicate::False,
+                            };
+                    }
+                    group
                 })
                 .collect();
             flat_merge(per_arm, domain_extent, codomain_tiling)
@@ -624,9 +643,17 @@ impl TileProducer for UnionProducer {
             // it and ignores the rest. That holds whatever shape the region takes: a
             // prefix of the positions, the `Codomain` half of a nested release, or the
             // `Or` of the two that `to_guard` emits for a collection of collections.
+            // The arms share the flat domain's keys and may hold their values in different
+            // representations, so a release reaches each arm's values only whole.
             g if self.flat => {
+                let levels = self.tiling().levels();
                 for input in &mut self.inputs {
-                    input.release(g.clone());
+                    let guard = crate::interpreter::tiling::through_shared_levels(
+                        g.clone(),
+                        levels,
+                        input.tiling(),
+                    );
+                    input.release(guard);
                 }
             }
             other => panic!("UnionProducer::release_impl: unexpected guard {other:?}"),
@@ -1148,6 +1175,66 @@ mod tests {
         assert!(
             !domain_predicate.contains_path(&[Value::UInt(1), Value::UInt(8)]),
             "arm B's row 1 is open, yet the merged inner level calls [1, 8] complete: {merged:?}"
+        );
+    }
+
+    /// Beneath a standing level, a row one arm has not reached stays open: that arm may
+    /// still deliver keys under it, whatever the arm that holds the row says.
+    #[test]
+    fn a_flat_union_keeps_a_row_open_that_one_arm_has_not_reached() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        let uint = || Extent::Base(BaseType::UInt);
+        let tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        // Arm 0 holds row 0 whole (key 0 under it) and calls every row complete.
+        let arm0 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        // Arm 1 has reached no row yet and calls nothing complete.
+        let arm1 = tiling.empty_tile();
+        let mut producer = UnionProducer {
+            base: ProducerBase::new(UnionProducer::alloc_id(), &tiling),
+            level: CurryLevel::new(1),
+            inputs: vec![
+                Box::new(TestTileProducer::new(arm0, tiling.clone())),
+                Box::new(TestTileProducer::new(arm1, tiling.clone())),
+            ],
+            flat: true,
+        };
+        let out = producer.get(tiling.universal_guard());
+        let Tile::DataFunction {
+            domain_predicate: rows,
+            codomain,
+            ..
+        } = &out
+        else {
+            panic!("a flat union tiles as a collection, got {out:?}")
+        };
+        assert!(
+            !rows.contains(&Value::UInt(0)),
+            "row 0 is open while arm 1 has not reached it: {rows:?}"
+        );
+        let Tile::DataFunction {
+            domain_predicate: keys,
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("the merged level is a collection, got {codomain:?}")
+        };
+        assert!(
+            !keys.contains_path(&[Value::UInt(0), Value::UInt(5)]),
+            "arm 1 may still deliver key 5 under row 0, so (0, 5) is not complete: {keys:?}"
         );
     }
 }

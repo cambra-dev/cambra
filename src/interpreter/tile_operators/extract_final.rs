@@ -98,50 +98,48 @@ impl ExtractFinal {
     }
 
     /// One reduction per row: `source : K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ (Pos ⤇ V)` against
-    /// `default : K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ V`, output `K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ V`.
+    /// `default : K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ V`, output `K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ V`, where `rows` is `n`.
     ///
-    /// The rows are the default's innermost level, and the source holds each row's
-    /// positions beneath them, so the depth follows from the operands rather than being
-    /// given and every level above is left standing.
-    pub fn per_row(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
-        let rows = default.tiling().levels();
+    /// `rows` is the iteration the reduction sits in, which the caller states from where it
+    /// is in the program. It is not read off the default: a value that is a collection
+    /// carries levels of its own, which a count of the default's levels would take for rows.
+    /// Every level above the rows is left standing.
+    pub fn per_row_at(
+        source: Box<dyn TileOperator>,
+        default: Box<dyn TileOperator>,
+        rows: CurryLevel,
+    ) -> Self {
         assert!(
-            rows > 0,
+            rows.index() > 0,
             "a reduction per row takes one default per row of a collection; a default of \
              {} is one reduction over the whole source, which is `ExtractFinal::new`",
             default.tiling()
         );
-        assert_eq!(
-            source.tiling().levels(),
-            rows + 1,
-            "a per-row reduction's source holds each row's positions beneath the rows its \
-             default keys: source {}, default {}",
-            source.tiling(),
-            default.tiling()
-        );
-        let values = source
-            .tiling()
-            .values_at(CurryLevel::values_of(source.tiling()))
-            .clone();
+        let Tiling::DataFunction {
+            codomain: values, ..
+        } = source.tiling().values_at(rows)
+        else {
+            panic!(
+                "a per-row reduction's source holds each row's positions beneath its {rows} \
+                 rows: source {}, default {}",
+                source.tiling(),
+                default.tiling()
+            )
+        };
+        let values = (**values).clone();
         let value_extent = values.extent();
-        let default_values = default
-            .tiling()
-            .values_at(CurryLevel::values_of(default.tiling()));
+        let default_values = default.tiling().values_at(rows);
         debug_assert!(
             value_extent.includes(&default_values.extent()),
             "a per-row reduction's default must be representable in the source's values: \
              default {default_values} is not included in {value_extent}",
         );
-        let tiling = with_values_at(
-            default.tiling(),
-            CurryLevel::values_of(default.tiling()),
-            values,
-        );
+        let tiling = with_values_at(default.tiling(), rows, values);
         Self {
             base: OperatorBase::new(tiling),
             source,
             default: Some(default),
-            rows,
+            rows: rows.index(),
             value_extent,
         }
     }
@@ -180,13 +178,13 @@ impl TileOperator for ExtractFinal {
         let shared = shared_consumer(consumer);
         let source = self.source.subscribe(
             self.source.tiling().universal_guard(),
-            forwarding_consumer(&shared),
+            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
             scheduler,
         );
         let default = self.default.as_mut().map(|d| {
             d.subscribe(
                 d.tiling().universal_guard(),
-                forwarding_consumer(&shared),
+                forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                 scheduler,
             )
         });
@@ -361,6 +359,27 @@ impl TileProducer for ExtractFinalProducer {
             // With rows above, the default is pulled every pull because it is the row set.
             (None, Some(_)) => unreachable!("a reduction per row takes its rows from a default"),
         };
+        // A row the default has decided it does not hold is one this reduction never
+        // answers, so the source holding a group there is a row lost rather than a row not
+        // yet arrived.
+        #[cfg(debug_assertions)]
+        if let (Some(tile), Some(above)) = (&default, self.rows.checked_sub(1)) {
+            let decided = level_completion(tile, CurryLevel::new(above));
+            let rows: std::collections::HashSet<&Vec<Value>> = row_paths.iter().collect();
+            let lost: Vec<&Vec<Value>> = in_source
+                .keys()
+                .filter(|path| {
+                    !self.released.contains_path(path)
+                        && decided.contains_path(path)
+                        && !rows.contains(path)
+                })
+                .collect();
+            debug_assert!(
+                lost.is_empty(),
+                "every row of a per-row reduction's source is one of its default's rows: the \
+                 default has decided rows {lost:?} absent that the source holds"
+            );
+        }
         // Answer every group that has closed and is neither answered nor released. A group
         // with no live position ran nothing, so it falls back to its default — collected
         // and filled below, because the default is not pulled until one does.
@@ -456,26 +475,21 @@ impl TileProducer for ExtractFinalProducer {
                 // Not yet final. Only the highest position is ever wanted, so every
                 // position below the highest seen so far is dead — release it. Without
                 // this a never-terminating loop pins the whole changelog waiting for a
-                // terminal that never comes.
+                // terminal that never comes. Positions ascend, so the highest is the last
+                // live one, whatever the loop's domain is: a map-domain loop's positions are
+                // its keys. A union key has no prefix spelling ([`Predicate::below`]), so
+                // those positions wait for the whole release instead.
                 if let Tile::DataFunction {
                     domain, deleted, ..
                 } = &source
+                    && let Some(last) = (0..domain.len()).rev().find(|i| !deleted.contains(*i))
+                    && let highest = domain.index_at(last)
+                    && !matches!(highest, Value::Union { .. })
                 {
-                    let max = (0..domain.len())
-                        .filter(|i| !deleted.contains(*i))
-                        .filter_map(|i| match domain.index_at(i) {
-                            Value::UInt(p) => Some(p),
-                            _ => None,
-                        })
-                        .max();
-                    if let Some(max) = max
-                        && max >= 1
-                    {
-                        self.source
-                            .release(TileGuard::Function(FunctionGuard::Domain(
-                                Predicate::at_or_below(Value::UInt(max - 1)),
-                            )));
-                    }
+                    self.source
+                        .release(TileGuard::Function(FunctionGuard::Domain(
+                            Predicate::below(highest),
+                        )));
                 }
                 return self.tiling().empty_tile();
             };
@@ -580,7 +594,8 @@ impl TileProducer for ExtractFinalProducer {
             });
         }
         // The rows sit one level above the reductions, so that is the depth the guard
-        // names them at; one that stops above or descends past says nothing about them.
+        // names them at; one that stops above names every row beneath what it names, and
+        // one that descends past says nothing about them.
         let Some(rows) = released_rows(&obsolete_guard, rows_above) else {
             return;
         };
@@ -612,10 +627,12 @@ fn level_completion(tile: &Tile, level: CurryLevel) -> Predicate {
     }
 }
 
-/// The keys `guard` names `depth` levels in, or `None` where it names none there.
+/// The keys `guard` names `depth` levels in, over whole paths, or `None` where it names
+/// none there.
 ///
-/// A guard that stops above that depth names nothing about those keys, and one that
-/// descends past it is about what sits under them — neither is a release of rows.
+/// A guard that stops above that depth names every key beneath the ones it names, so it
+/// is lifted to them as [`Tile::completion_at`] lifts a statement. One that descends past
+/// it is about what sits under them, which is not a release of rows.
 fn released_rows(guard: &TileGuard, depth: usize) -> Option<Predicate> {
     match guard {
         // A universal guard names every key of every level, whatever depth it is spelled
@@ -629,7 +646,11 @@ fn released_rows(guard: &TileGuard, depth: usize) -> Option<Predicate> {
         TileGuard::Function(FunctionGuard::Codomain(inner)) if depth > 0 => {
             released_rows(inner, depth - 1)
         }
-        TileGuard::Function(FunctionGuard::Domain(pred)) if depth == 0 => Some(pred.clone()),
+        TileGuard::Function(FunctionGuard::Domain(pred)) => {
+            Some((0..depth).fold(pred.clone(), |above, _| {
+                Predicate::qualified(above, Predicate::True)
+            }))
+        }
         _ => None,
     }
 }
@@ -957,7 +978,8 @@ mod tests {
             tile: default,
             releases: def_rel.clone(),
         };
-        let mut op = ExtractFinal::per_row(Box::new(source), Box::new(default));
+        let mut op =
+            ExtractFinal::per_row_at(Box::new(source), Box::new(default), CurryLevel::new(1));
         let guard = op.tiling().universal_guard();
         Wired {
             producer: op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new()),
@@ -1138,7 +1160,8 @@ mod tests {
             ),
             releases: def_rel.clone(),
         };
-        let mut op = ExtractFinal::per_row(Box::new(source), Box::new(default));
+        let mut op =
+            ExtractFinal::per_row_at(Box::new(source), Box::new(default), CurryLevel::new(2));
         let guard = op.tiling().universal_guard();
         Wired {
             producer: op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new()),
@@ -1183,6 +1206,23 @@ mod tests {
         );
     }
 
+    /// A release naming a standing row names every row beneath it, so it reaches the source
+    /// and retires the answers held there.
+    #[test]
+    fn a_release_of_a_standing_row_reaches_the_source() {
+        let Wired {
+            mut producer,
+            source_releases,
+            ..
+        } = standing_map_extract_final();
+        let _ = producer.get(producer.tiling().universal_guard());
+        let standing = TileGuard::Function(FunctionGuard::Domain(Predicate::from_column_value(
+            &ColumnValue::from_uints(vec![0]),
+        )));
+        producer.release(standing.clone());
+        assert_eq!(*source_releases.borrow(), vec![standing]);
+    }
+
     /// On a non-terminal pull, `ExtractFinal` needs only the highest-domain value,
     /// so it releases everything below it — `[0, max)`. Over a source with domain
     /// `[0, 1, 2]`, it forwards a release `≤ 1`, freeing the prefix that a
@@ -1210,6 +1250,38 @@ mod tests {
             releases.borrow().last().copied(),
             Some(1),
             "ExtractFinal must release below the running max (positions 0, 1), keeping position 2"
+        );
+    }
+
+    /// A loop over a map runs its keys as its positions, so the release below the highest
+    /// one seen is stated over those keys rather than skipped for not being counters.
+    #[test]
+    fn a_running_release_takes_the_loops_own_positions() {
+        let releases = Rc::new(RefCell::new(Vec::new()));
+        let string = Extent::Base(BaseType::String);
+        let source = Fixed {
+            tiling: Tiling::data_function(string.clone(), Tiling::Scalar(int())),
+            tile: Tile::data_function(
+                ColumnValue::from_values(
+                    vec![Value::String("a".into()), Value::String("b".into())],
+                    &string,
+                ),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                Predicate::False,
+                bit_set::BitSet::new(),
+            ),
+            releases: releases.clone(),
+        };
+        let default = Constant::new(Value::Int(0), int());
+        let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let _ = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            *releases.borrow(),
+            vec![TileGuard::Function(FunctionGuard::Domain(
+                Predicate::below(Value::String("b".into()))
+            ))]
         );
     }
 }

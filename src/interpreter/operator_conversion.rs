@@ -39,9 +39,9 @@ use crate::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Product, ProductPerRow, Restrict,
-            SelectField, TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject,
-            VariantWrap, zip_arms_at, zip_arms_named_at,
+            MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
+            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
+            zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
     },
@@ -466,6 +466,14 @@ pub(crate) struct OpenIteration {
     /// The curried source: one inner collection per enclosing row, which is the keys a
     /// binding from outside is spread over.
     source: Rc<FanOut>,
+    /// The level the iteration adds beneath its enclosing rows, which a lifted binding is
+    /// paired at ([`Product::per_row_at`]).
+    paired: CurryLevel,
+    /// Where the reference reads the pairs **flattened**, the level they are flattened at:
+    /// a nested carrier's seed runs over `(enclosing, position)` pair keys, as the pairs it
+    /// is converted against do, where its body reads the two levels as two. `None` for the
+    /// body.
+    flattened_at: Option<CurryLevel>,
 }
 
 /// What one compilation hands the version that replaces it: the operator behind
@@ -1724,6 +1732,17 @@ fn convert_impl_inner(
     // `provenance::converting`.
     let _scope = crate::ccl::provenance::converting(expr.node_id());
     trace!("Converting {}", symbolic(expr));
+    // A nested store's read, `__hist ≫ .k`: a morphism of the enclosing row, one inner
+    // history per row, which is the shape the store's read produces. Its steps take that
+    // history's values, as the steps after a top-level store's read do.
+    if let Some(read) = as_nested_store_read(expr, ctx) {
+        expect_no_input(input, "nested store read")?;
+        let mut op = convert_store_read(&read.store, &read.field, ctx)?;
+        for step in read.steps {
+            op = convert_impl(step, Some(op), ctx)?;
+        }
+        return Ok(op);
+    }
     let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
@@ -1735,6 +1754,19 @@ fn convert_impl_inner(
                 _ => input,
             };
             let mut rest = elems.as_slice();
+            // A nested store's read heads the chain as two elements, `__hist ≫ .k` or its
+            // zip with the steps on its values, and is the leaf the rest takes.
+            if let [head @ .., _] = elems.as_slice()
+                && head.len() >= 2
+                && let Some(read) = nested_store_read_of(&elems[..2], ctx)
+            {
+                let mut op = convert_store_read(&read.store, &read.field, ctx)?;
+                for step in read.steps {
+                    op = convert_impl(step, Some(op), ctx)?;
+                }
+                result = Some(op);
+                rest = &elems[2..];
+            }
             while let [elem, after @ ..] = rest {
                 // `⟨source, default⟩ ▷ zip ≫ final_or_default` — the per-row reduction,
                 // built from the two legs rather than from the zip they are written as.
@@ -1815,16 +1847,6 @@ fn convert_impl_inner(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Const) =>
         {
-            // A nested store's read is the exception, and the lift is the identity on
-            // it: `convert_store_read` already gives it one inner history per enclosing
-            // row, which is the level `const` would otherwise add. CCL types the read as
-            // the bare inner history because that is what the enclosing body sees at a
-            // row, so the lift is there; the operator is a level taller than the type.
-            // `is_leaf_zip_arm` keeps the fanned iteration input from reaching here.
-            if reads_a_nested_store(argument, ctx) {
-                expect_no_input(input, "const over a nested store's read")?;
-                return convert_impl(argument, None, ctx);
-            }
             let input = expect_input(input, "const")?;
             let const_op = convert_impl(argument, None, ctx)?;
             Ok(Box::new(MapResultToConst::new(
@@ -1931,7 +1953,7 @@ fn convert_impl_inner(
         {
             let converse = Box::new(Converse::new(convert_impl(argument, None, ctx)?));
             if let Some(input) = input {
-                Ok(Box::new(MapResult::new(input, converse)))
+                Ok(Box::new(MapResult::new_at(input, converse, ctx.level())))
             } else {
                 Ok(converse)
             }
@@ -2161,8 +2183,13 @@ fn convert_impl_inner(
         {
             let upstream = expect_input(input, "map_filter")?;
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
-            let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
-            Ok(Box::new(MapFilter::new(fan.branch(), pred_op)))
+            // The predicate asks of each key of each element collection, one level in.
+            let pred_op = convert_lifted(argument, Some(fan.branch()), ctx)?;
+            Ok(Box::new(MapFilter::new_at(
+                fan.branch(),
+                pred_op,
+                ctx.level(),
+            )))
         }
 
         // cast(value): pure type-level assertion — re-views `value` under
@@ -2424,7 +2451,7 @@ fn convert_impl_inner(
                 )));
             };
             let inner = convert_impl(source, None, ctx)?;
-            let pairs = Box::new(Product::new(outer, inner));
+            let pairs = Box::new(Product::shared_at(outer, inner, ctx.level()));
             // The morphism runs once per pair, over the inner iteration `Product` appends.
             convert_lifted(morphism, Some(pairs), ctx)
         }
@@ -2438,7 +2465,7 @@ fn convert_impl_inner(
         // `const` and no pair.
         //
         // The inner side comes from the type, which is what makes it the same set for every
-        // row. A per-row inner collection is the same output shape from a different builder
+        // row. A per-row inner collection is the same operator's per-row form, built elsewhere
         // (`src/interpreter/design-operators.md`, "Where a collection is materialized").
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Curry)
@@ -2460,7 +2487,11 @@ fn convert_impl_inner(
                 )));
             };
             let inner = ctx.extent_of(inner)?;
-            let pairs = Box::new(Product::new(outer, Box::new(IterateExtent::new(inner))));
+            let pairs = Box::new(Product::shared_at(
+                outer,
+                Box::new(IterateExtent::new(inner)),
+                ctx.level(),
+            ));
             // 𝑔 runs once per pair, over the inner iteration `Product` appends.
             convert_lifted(argument, Some(pairs), ctx)
         }
@@ -2481,20 +2512,25 @@ fn convert_impl_inner(
                     )));
                 }
                 let collection = convert_impl_inner(expr, None, ctx)?;
-                return Ok(Box::new(MapResult::new(input, collection)));
+                return Ok(Box::new(MapResult::new_at(input, collection, ctx.level())));
             }
+            // The argument is a root, a stream of its own, so the function applied to it
+            // runs over the root's iteration rather than the enclosing node's.
             let arg = convert_impl(argument, None, ctx)?;
-            convert_impl(function, Some(arg), ctx)
+            let level = CurryLevel::new(usize::from(argument.ty.is_collection()));
+            convert_at(function, Some(arg), level, ctx)
         }
 
         // Standalone projection morphism: project field _n from codomain of input.
         TypedExprNode::Proj(ProjKey::Index(n)) => {
-            proj_field(expect_input(input, &format!("Proj({n})"))?, *n)
+            proj_field(expect_input(input, &format!("Proj({n})"))?, *n, ctx.level())
         }
 
-        TypedExprNode::Proj(ProjKey::Field(name)) => {
-            proj_named_field(expect_input(input, &format!("Proj({name})"))?, name)
-        }
+        TypedExprNode::Proj(ProjKey::Field(name)) => proj_named_field(
+            expect_input(input, &format!("Proj({name})"))?,
+            name,
+            ctx.level(),
+        ),
 
         TypedExprNode::Var(name) => {
             if let Some(binding) = ctx.lookup(name) {
@@ -2519,7 +2555,9 @@ fn convert_impl_inner(
                         .iter()
                         .try_fold(op, |op, open| lift_into_iteration(op, open)),
                     (BindingKind::Free, None) => Ok(op),
-                    (BindingKind::Free, Some(input)) => Ok(Box::new(MapResult::new(input, op))),
+                    (BindingKind::Free, Some(input)) => {
+                        Ok(Box::new(MapResult::new_at(input, op, ctx.level())))
+                    }
                 }
             } else {
                 Err(ConversionError::Unsupported(format!(
@@ -2594,15 +2632,16 @@ fn convert_impl_inner(
                         ))
                     })?;
                     let fn_extent = Extent::Function {
-                        domain: Box::new(result_extent(input.tiling())),
+                        domain: Box::new(value_extent_at(input.tiling(), ctx.level())),
                         codomain: Box::new(ctx.extent_of(&out_extent)?),
                     };
-                    Ok(Box::new(MapResult::new(
+                    Ok(Box::new(MapResult::new_at(
                         input,
                         Box::new(Constant::new(
                             Value::ComputableFunction(FunctionDef::Insert),
                             fn_extent,
                         )),
+                        ctx.level(),
                     )))
                 }
                 // `lookup?` over an assembled collection of `(collection, key)` rows — what the
@@ -2730,15 +2769,19 @@ fn convert_impl_inner(
                 // (`src/ccl/planning/conditionals.rs`, `binds_an_undetermined_witness`), which
                 // is how one reaches here at all.
                 Builtin::Box => Ok(input),
-                b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
-                b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
+                b if let Some(op) = builtin_to_binop(b.clone()) => {
+                    apply_binop(input, op, ctx.level())
+                }
+                b if let Some(op) = builtin_to_unaryop(b.clone()) => {
+                    apply_unaryop(input, op, ctx.level())
+                }
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
                 b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(
                     Box::new(MapAggregate::new(input, kind)),
                     kind,
                 ))),
                 // Composed rather than applied, so the reduction runs **per enclosing
-                // row** — [`ExtractFinal::per_row`], which the `Compose` arm builds from the two
+                // row** — [`ExtractFinal::per_row_at`], which the `Compose` arm builds from the two
                 // legs of the `zip` in front of it. Reaching here means there was no such
                 // zip, so there is no default to fall back to and no rows to fall back
                 // over.
@@ -2776,7 +2819,11 @@ fn convert_impl_inner(
                         .into(),
                 )
             })?;
-            Ok(Box::new(MapResult::new(index_stream, fn_const)))
+            Ok(Box::new(MapResult::new_at(
+                index_stream,
+                fn_const,
+                ctx.level(),
+            )))
         }
 
         // Tuple: compile to a record.
@@ -3161,7 +3208,10 @@ fn build_product(
     let product: Box<dyn TileOperator> = if matches!(want, Extent::Record(_)) {
         Box::new(MakeRecord::new_named(components))
     } else {
-        let level = leaf_level(components.iter().map(|(_, op)| op.tiling()));
+        // The components pair at the domains the node's type is curried over, which is where
+        // it takes its argument: a component whose values are collections keeps them as
+        // values, rather than having them read as more of the iteration.
+        let level = CurryLevel::new(curried_levels(&expr.ty));
         zip_arms_named_at(components, level)
     };
     let got = product.tiling().extent();
@@ -3174,25 +3224,16 @@ fn build_product(
     Ok(product)
 }
 
-/// The level a product's **leaf** components pair at: the values every level of theirs
-/// stands over ([`CurryLevel::values_of`]).
-///
-/// A product former with no input compiles components that each carry their own iteration,
-/// so there is nothing to read the level off except the components themselves, and they
-/// must agree on it. Scalar components answer [`CurryLevel::OUTERMOST`], where
-/// [`zip_arms_named_at`] builds a record and reads no level.
-fn leaf_level<'a>(mut tilings: impl Iterator<Item = &'a Tiling>) -> CurryLevel {
-    let Some(first) = tilings.next().map(CurryLevel::values_of) else {
-        return CurryLevel::OUTERMOST;
-    };
-    for t in tilings {
-        assert_eq!(
-            CurryLevel::values_of(t),
-            first,
-            "a product's leaf components stand over one iteration, so they nest alike: {t}",
-        );
+/// How many domains `ty` is curried over before its value: the levels a morphism of that
+/// type takes its argument through.
+fn curried_levels(ty: &Type) -> usize {
+    let mut ty = ty.clone();
+    let mut levels = 0;
+    while let Some(codomain) = ty.peel_refinements().codomain() {
+        levels += 1;
+        ty = codomain;
     }
-    first
+    levels
 }
 
 /// Evaluate a constant CCL expression to a [`Value`].
@@ -3426,8 +3467,8 @@ fn build_commit_store(
     }
     let key_extent = store_key_extent(key_arms);
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
-    // Per scalar key, an acyclic init operator seeding its tick-0 value (a literal
-    // init is the trivial op; a computed init drains to its scalar).
+    // Per scalar key, an acyclic init operator giving its seed, the value it holds before
+    // any commit (a literal init is the trivial op; a computed init streams to its value).
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     // The store-wide per-commit value extent types a *proposal's* read and write set
     // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
@@ -3467,7 +3508,7 @@ fn build_commit_store(
         if !value_extents.contains(&key_value_extent) {
             value_extents.push(key_value_extent.clone());
         }
-        // Seed tick 0 from the value the retired version left this variable
+        // Seed the key from the value the retired version left this variable
         // holding, or from the key's (literal or computed) init op when this
         // version introduces it. Rebuilding a commit store therefore changes how
         // a transaction decides without discarding what it has committed — the
@@ -3606,7 +3647,7 @@ fn build_commit_store(
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
         // `Fun(Txn, V)` value-stream off the shared log. A tap takes no `init_op` —
-        // it has no tick-0 value, so its stream starts at the first reply.
+        // it has no seed, so its stream starts at the first reply.
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
         let mut tap_fields: Vec<String> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
@@ -4480,14 +4521,13 @@ struct CarrierStoreParts {
 /// it recurs over.
 ///
 /// A carrier reseeds at one enclosing row and sequences positions within it, which is the
-/// **bottom two** levels of the source. Everything above stands: the carrier is
-/// replicated once per row of it, the way [`Zip::new_at`] and [`VariantWrap::new_at`] leave
-/// theirs standing.
+/// two levels just below the `standing` ones the enclosing context already has, counted
+/// from the top. Everything above stands: the carrier is replicated once per row of it, the
+/// way [`Zip::new_at`] and [`VariantWrap::new_at`] leave theirs standing.
 ///
 /// A nest three deep is therefore two carriers, the inner one standing over the outer's
-/// rows — not one carrier whose positions carry three components. Reading the top two
-/// levels instead pairs the outermost loop with the middle one and never reaches the
-/// innermost.
+/// rows — not one carrier whose positions carry three components. The levels below the two
+/// are the item's own, where the item is itself a collection.
 fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>, Extent, Extent)> {
     let mut levels: Vec<Extent> = Vec::new();
     let mut at = tiling;
@@ -4495,14 +4535,26 @@ fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>,
         levels.push(domain.clone());
         at = codomain;
     }
-    // Counted from the top, by how many levels the enclosing context already has. Counting
-    // the carrier's two from the *bottom* instead reads them off the item where the item is
-    // itself a collection — a nest whose elements are collections carries those levels
-    // below the pair, and taking the last two pairs against them.
+    // Counted from the top: counting the carrier's two from the bottom would read them off
+    // the item where the item is itself a collection.
     let inner = levels.get(standing + 1)?.clone();
     let row = levels.get(standing)?.clone();
     levels.truncate(standing);
     Some((levels, row, inner))
+}
+
+/// Each key's seed, a morphism of the `(enclosing, position)` pairs, converted against them.
+///
+/// At the carrier's own level, not one in: the pairs are flattened, so they hold one level
+/// where the body's input, the driver, holds the carrier's rows and positions as two.
+fn convert_nested_seeds(
+    keys: &[TransactKey],
+    pairs_fan: &Rc<FanOut>,
+    ctx: &mut OpConversionContext,
+) -> Result<Vec<Box<dyn TileOperator>>, ConversionError> {
+    keys.iter()
+        .map(|k| convert_impl(&k.init, Some(pairs_fan.branch()), ctx))
+        .collect()
 }
 
 /// Compile a **nested** carrier's components against the enclosing body's input.
@@ -4518,8 +4570,8 @@ fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>,
 ///   (asserted where the carrier is recognized), so evaluating it at every position and
 ///   using it only at an enclosing boundary reads the same value the denotation names.
 ///
-/// The body is not compiled here: it reads the driver's rows, and the driver is what
-/// does not exist yet.
+/// The body is compiled last: it reads the driver's rows, and the driver is built from
+/// the rest.
 fn build_nested_induction_store(
     keys: &[TransactKey],
     w: &WriterSite,
@@ -4542,9 +4594,8 @@ fn build_nested_induction_store(
     // collection — so neither is matched for.
     let source_nested = convert_impl(&w.source, Some(enclosing_fan.branch()), ctx)?;
     // The two levels this carrier recurs over, and the levels above it that it leaves
-    // standing. Everything below reads the pair off the bottom of the source, so a carrier
-    // inside a deeper nest pairs the loop it belongs to rather than the outermost one.
-    // The levels the enclosing context already stands over: the level the carrier is
+    // standing, so a carrier inside a deeper nest pairs the loop it belongs to rather than
+    // the outermost one. The levels the enclosing context already stands over: the level the carrier is
     // converted at, less the row it is iterating, which is the level this carrier's source
     // adds beneath it.
     let above = ctx.level().enclosing().map_or(0, CurryLevel::index);
@@ -4558,12 +4609,17 @@ fn build_nested_induction_store(
     };
     let source_fan = Rc::new(FanOut::new(Box::new(Memo::new(source_nested))));
     // The seed and the body take `(ᴘ, Pos)`, so each row's parameter is paired with the
-    // keys of **its own** collection. `Product` would pair against one shared inner
-    // stream, which a nested loop does not have.
+    // keys of **its own** collection. A shared inner side ([`Product::shared_at`]) would pair
+    // against one stream, which a nested loop does not have.
+    // The carrier's rows stand beneath the levels left standing, and the pairing adds the
+    // level beneath them: where the program puts this loop, not what the operands' tilings
+    // happen to hold.
+    let paired = CurryLevel::new(standing.len() + 1);
     let pairs = Box::new(Uncurry::new_at(
-        Box::new(ProductPerRow::new(
+        Box::new(Product::per_row_at(
             enclosing_fan.branch(),
             source_fan.branch(),
+            paired,
         )),
         CurryLevel::new(standing.len()),
     ));
@@ -4585,7 +4641,16 @@ fn build_nested_induction_store(
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut seed_ops: Vec<Box<dyn TileOperator>> = Vec::new();
     let mut store_seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    for k in keys {
+    // A seed runs over the pairs, one iteration deeper than the enclosing body, so a binding
+    // made there and read by a seed is lifted onto the pairs, flattened as they are.
+    ctx.iterations.push(OpenIteration {
+        source: source_fan.clone(),
+        paired,
+        flattened_at: Some(CurryLevel::new(standing.len())),
+    });
+    let seeds = convert_nested_seeds(keys, &pairs_fan, ctx);
+    ctx.iterations.pop();
+    for (k, seed) in keys.iter().zip(seeds?) {
         let field = k.name.field_key();
         let rk = store_key(&field, Value::Unit);
         // A nested seed is `(ᴘ, Pos) ⇒ V`, so the accumulator's own type is its codomain.
@@ -4600,11 +4665,7 @@ fn build_nested_induction_store(
         // the body with it at an enclosing boundary, and the store folds a carry to it at
         // a position that writes nothing. One reader would leave the other disagreeing —
         // which is the shape of every "write between the loops" case.
-        let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(convert_lifted(
-            &k.init,
-            Some(pairs_fan.branch()),
-            ctx,
-        )?))));
+        let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(seed))));
         seed_ops.push(seed_fan.branch());
         store_seed_ops.push((rk.clone(), seed_fan.branch()));
         let prior = keys_map.insert(
@@ -4685,6 +4746,8 @@ fn build_nested_induction_store(
     // which is what the depth tells the `Var` arm.
     ctx.iterations.push(OpenIteration {
         source: source_fan.clone(),
+        paired,
+        flattened_at: None,
     });
     let body = convert_lifted(&w.body, Some(Box::new(driver)), ctx);
     ctx.iterations.pop();
@@ -4973,9 +5036,9 @@ fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> 
 /// Compile a surface `await_final(x)` — a [`Builtin::FinalRead`] naming `x`'s history
 /// binding — as a [`StoreFinalRead`] over the store branch.
 ///
-/// A commit store only: an induction accumulator's trailing read is a genuine reduction
-/// over its dense per-position stream, because a loop ends positionally rather than by a
-/// key's writers draining, and `transact_phase` never mints a `FinalRead` for one.
+/// A commit store only: `transact_phase` never mints a `FinalRead` for an induction
+/// accumulator, whose trailing read is `final_or_default` over its history. That reaches
+/// the same [`convert_store_settled_read`] from `final_or_default`'s applied arm.
 fn convert_store_final_read(
     store_name: &Name,
     field: &str,
@@ -5118,21 +5181,23 @@ fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
 fn proj_field(
     input: Box<dyn TileOperator>,
     n: usize,
+    level: CurryLevel,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let field_name = tuple_field(n);
     if selects_a_tile(input.tiling(), &field_name) {
         return Ok(Box::new(SelectField::new(input, field_name)));
     }
-    let record_extent = result_extent(input.tiling());
+    let record_extent = value_extent_at(input.tiling(), level);
     let field_extent = field_extent_of(&record_extent, &field_name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
         codomain: Box::new(field_extent),
     };
-    Ok(Box::new(MapResult::new(
+    Ok(Box::new(MapResult::new_at(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
+        level,
     )))
 }
 
@@ -5187,7 +5252,7 @@ fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), Conversi
 /// A binding is not inlined into the deeper term and not recompiled against it — a `Let` is
 /// where sharing is decided, so a collection-valued binding would become several tiles over
 /// unrelated domains and a non-recomputable one would be built twice. It stays the one tile
-/// it already is, paired with the keys under each of its rows ([`ProductPerRow`]) and read
+/// it already is, paired with the keys under each of its rows ([`Product`]) and read
 /// back off the pair. The level it gains is the level the reference runs over, which is why
 /// the pair is left standing rather than flattened: a nested body reads its two levels as
 /// two.
@@ -5195,8 +5260,16 @@ fn lift_into_iteration(
     op: Box<dyn TileOperator>,
     open: &OpenIteration,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let paired = Box::new(ProductPerRow::new(op, open.source.branch()));
-    proj_named_field(paired, &tuple_field(0))
+    let paired: Box<dyn TileOperator> =
+        Box::new(Product::per_row_at(op, open.source.branch(), open.paired));
+    let paired = match open.flattened_at {
+        Some(level) => Box::new(Uncurry::new_at(paired, level)),
+        None => paired,
+    };
+    // The pairing adds its level at `open.paired`, so the pairs stand one level further in,
+    // or at it where the two levels were flattened into one.
+    let level = CurryLevel::new(open.paired.index() + 1 - usize::from(open.flattened_at.is_some()));
+    proj_named_field(paired, &tuple_field(0), level)
 }
 
 /// Build an operator that extracts a named field from the record codomain of `input`.
@@ -5205,20 +5278,22 @@ fn lift_into_iteration(
 fn proj_named_field(
     input: Box<dyn TileOperator>,
     name: &str,
+    level: CurryLevel,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     if selects_a_tile(input.tiling(), name) {
         return Ok(Box::new(SelectField::new(input, name)));
     }
-    let record_extent = result_extent(input.tiling());
+    let record_extent = value_extent_at(input.tiling(), level);
     let field_extent = field_extent_of(&record_extent, name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(name.to_string()));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
         codomain: Box::new(field_extent),
     };
-    Ok(Box::new(MapResult::new(
+    Ok(Box::new(MapResult::new_at(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
+        level,
     )))
 }
 
@@ -5230,17 +5305,19 @@ fn proj_named_field(
 fn apply_binop(
     input: Box<dyn TileOperator>,
     op: InterpreterBinOp,
+    level: CurryLevel,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let record_extent = result_extent(input.tiling());
+    let record_extent = value_extent_at(input.tiling(), level);
     let out_extent = binop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::BinOp(op));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
         codomain: Box::new(out_extent),
     };
-    Ok(Box::new(MapResult::new(
+    Ok(Box::new(MapResult::new_at(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
+        level,
     )))
 }
 
@@ -5353,17 +5430,19 @@ fn union_operand_ops(
 fn apply_unaryop(
     input: Box<dyn TileOperator>,
     op: UnaryOpKind,
+    level: CurryLevel,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let in_extent = result_extent(input.tiling());
+    let in_extent = value_extent_at(input.tiling(), level);
     let out_extent = unaryop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::UnaryOp(op));
     let fn_extent = Extent::Function {
         domain: Box::new(in_extent),
         codomain: Box::new(out_extent),
     };
-    Ok(Box::new(MapResult::new(
+    Ok(Box::new(MapResult::new_at(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
+        level,
     )))
 }
 
@@ -5437,21 +5516,10 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
 /// For `Scalar(e)` returns `e`; for `Record(fields)` returns `Extent::Record` over
 /// the field extents (arising when a non-constant tuple is compiled via [`MakeRecord`]);
 /// for `DataFunction { codomain, .. }` returns `codomain.extent()`.
-fn result_extent(tiling: &Tiling) -> Extent {
-    match tiling {
-        Tiling::Scalar(e) => e.clone(),
-        Tiling::Record(_) => tiling.extent(),
-        // A chain of collections holds its result under every level, so descend the whole
-        // chain: a binop or a projection acts on one element, not on a group of them. The
-        // descent stops at a `Scalar`, so a materialized collection — one cell holding a
-        // whole map — is itself the result.
-        Tiling::DataFunction { codomain, .. } => result_extent(codomain),
-        // A fold's result is what it accumulates, so the descent goes on through it rather
-        // than stopping: an operation over a not-yet-extracted aggregation is typed at the
-        // accumulator, and `Sole`'s accumulator is an element with levels of its own.
-        Tiling::Aggregation { accumulator, .. } => result_extent(accumulator),
-        t => panic!("unexpected tiling in result_extent: {t:?}"),
-    }
+/// The extent of the values `tiling` holds at `level`: what an operation applied there
+/// takes.
+fn value_extent_at(tiling: &Tiling, level: CurryLevel) -> Extent {
+    tiling.values_at(level).extent()
 }
 
 /// Extract the extent of a named record field.
@@ -5503,16 +5571,34 @@ fn map_extract_final(
     let source_op = convert_impl(source, source_input, ctx)?;
     let default_input = (!is_leaf_zip_arm(default, ctx)).then(|| fan.branch());
     let default_op = convert_impl(default, default_input, ctx)?;
-    // One default per row, so the rows are its own. A scalar there is one reduction rather
-    // than a family of them, which is `ExtractFinal`'s shape and reaches the applied arm.
-    if default_op.tiling().levels() == 0 {
+    // One default per row, and the rows are the iteration this reduction is converted
+    // inside. None is one reduction rather than a family of them, which is
+    // `ExtractFinal`'s shape and reaches the applied arm.
+    let rows = ctx.level().index();
+    if rows == 0 {
         return Err(ConversionError::Unsupported(format!(
             "final_or_default composed over a default of {} — a per-row reduction takes one \
              default per row",
             default_op.tiling()
         )));
     }
-    Ok(Box::new(ExtractFinal::per_row(source_op, default_op)))
+    // Each row's positions sit beneath it, one level below the rows the default keys.
+    if !matches!(
+        source_op.tiling().values_at(CurryLevel::new(rows)),
+        Tiling::DataFunction { .. }
+    ) {
+        return Err(ConversionError::Unsupported(format!(
+            "final_or_default composed over a source of {} and a default of {} — a per-row \
+             reduction's source holds each row's positions beneath the rows its default keys",
+            source_op.tiling(),
+            default_op.tiling()
+        )));
+    }
+    Ok(Box::new(ExtractFinal::per_row_at(
+        source_op,
+        default_op,
+        CurryLevel::new(rows),
+    )))
 }
 
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
@@ -5523,19 +5609,17 @@ fn map_extract_final(
 /// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a reply
 /// combining the request with a store read (`zip((trigger, as_of(store)))`).
 fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
+    // A nested store's read, `__hist ≫ .k` — one inner history per enclosing row, over the
+    // store's own rows.
+    if as_nested_store_read(expr, ctx).is_some() {
+        return true;
+    }
     match &expr.node {
         // `__hist.k` — a store read.
         TypedExprNode::Apply { argument, function }
             if matches!(&function.node, TypedExprNode::Proj(ProjKey::Field(_))) =>
         {
             matches!(&argument.node, TypedExprNode::Var(n) if ctx.lookup_store(n).is_some())
-        }
-        // `const(__hist.k)` on a **nested** store — the read is already one inner
-        // history per enclosing row, so the arm is that leaf and the lift is nothing.
-        TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::Const) =>
-        {
-            reads_a_nested_store(argument, ctx)
         }
         // `as_of((trigger, store))` — a live as-of read (a leaf that internally
         // drives its trigger).
@@ -5544,23 +5628,69 @@ fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
     }
 }
 
-/// Whether `expr` reads a key of a **nested** induction store.
-///
-/// Such a read compiles to one inner history per enclosing row, so it is already at the
-/// level the enclosing body consumes it at — which is what makes a `const` lift over it
-/// the identity and `final_or_default` over it a per-row reduction.
-fn reads_a_nested_store(expr: &Expr, ctx: &OpConversionContext) -> bool {
-    // A chain **headed** by such a read stands at the same levels: the steps after it
-    // replace the values and add none, so a projection of the read is as much a leaf as
-    // the read is.
-    let head = match &expr.node {
-        TypedExprNode::Compose(elts) => elts.first().unwrap_or(expr),
-        _ => expr,
+/// A read of key `field` of a nested induction store, and the steps after it.
+struct NestedStoreRead<'a> {
+    store: Name,
+    field: String,
+    steps: Vec<&'a Expr>,
+}
+
+/// `expr` as a read of a **nested** induction store's key: `__hist ≫ .k`, a morphism of the
+/// enclosing row (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence
+/// carrier"). Steps on the read history's values are spelled the way `plan_loops` spells
+/// them for a per-row value, `(__hist ≫ .k, steps ▷ const) ▷ zip ≫ compose`.
+fn as_nested_store_read<'a>(
+    expr: &'a Expr,
+    ctx: &OpConversionContext,
+) -> Option<NestedStoreRead<'a>> {
+    let TypedExprNode::Compose(elts) = &expr.node else {
+        return None;
     };
-    as_store_read(head, ctx).is_some_and(|(store, _)| {
-        ctx.lookup_store(&store)
-            .is_some_and(|info| info.kind == StoreReadKind::NestedInductionChangelog)
-    })
+    nested_store_read_of(elts, ctx)
+}
+
+/// [`as_nested_store_read`] over the elements of a compose: exactly the read, so a chain
+/// it heads can take the rest as steps on it.
+fn nested_store_read_of<'a>(
+    elts: &'a [Expr],
+    ctx: &OpConversionContext,
+) -> Option<NestedStoreRead<'a>> {
+    match elts {
+        [paired, compose] if as_builtin(compose) == Some(Builtin::Compose) => {
+            let (read, lifted) = zip_pair(paired)?;
+            let TypedExprNode::Apply { argument, function } = &lifted.node else {
+                return None;
+            };
+            if as_builtin(function) != Some(Builtin::Const) {
+                return None;
+            }
+            let mut read = as_nested_store_read(read, ctx)?;
+            // Steps on the values ride inside the zip; one nested inside another is not a
+            // shape `plan_loops` emits.
+            if !read.steps.is_empty() {
+                return None;
+            }
+            read.steps = match &argument.node {
+                TypedExprNode::Compose(steps) => steps.iter().collect(),
+                _ => vec![argument.as_ref()],
+            };
+            Some(read)
+        }
+        [carrier, proj] => {
+            let (TypedExprNode::Var(store), TypedExprNode::Proj(ProjKey::Field(field))) =
+                (&carrier.node, &proj.node)
+            else {
+                return None;
+            };
+            let info = ctx.lookup_store(store)?;
+            (info.kind == StoreReadKind::NestedInductionChangelog).then(|| NestedStoreRead {
+                store: store.clone(),
+                field: field.clone(),
+                steps: Vec::new(),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Returns `Some(x)` if `expr` is `x ▷ const` where `x` has scalar CCL type.
@@ -5875,182 +6005,6 @@ mod variant_ctor_tests {
             ty,
             user_annotation: None,
         }
-    }
-
-    /// `λ x → match x { commit(w) → w + 1 ; abort(a) → 0 }`, fully typed —
-    /// the scrutinee-`Case` shape the elimination compiles.
-    fn two_arm_matcher() -> TypedExpr {
-        let int_ty = Type::Base(CclBase::Int);
-        let x_ty = commit_abort_ty(int_ty.clone());
-
-        let w_plus_1 = typed(
-            TypedExprNode::BinOp {
-                left: Box::new(typed(TypedExprNode::Var("w".into()), int_ty.clone())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(typed(TypedExprNode::Lit(Lit::Int(1)), int_ty.clone())),
-            },
-            int_ty.clone(),
-        );
-        let commit_branch = Branch {
-            pattern: Some(Pattern {
-                tag: "commit".into(),
-                binding: binding("w", int_ty.clone()),
-                empty_payload: false,
-            }),
-            guard: bool_true(),
-            body: w_plus_1,
-        };
-        let abort_branch = Branch {
-            pattern: Some(Pattern {
-                tag: "abort".into(),
-                binding: binding("a", Type::Base(CclBase::Unit)),
-                empty_payload: false,
-            }),
-            guard: bool_true(),
-            body: typed(TypedExprNode::Lit(Lit::Int(0)), int_ty.clone()),
-        };
-        let case = typed(
-            TypedExprNode::Case {
-                scrutinee: Some(Box::new(typed(
-                    TypedExprNode::Var("x".into()),
-                    x_ty.clone(),
-                ))),
-                branches: vec![commit_branch, abort_branch],
-            },
-            int_ty.clone(),
-        );
-        typed(
-            TypedExprNode::Lambda {
-                param: binding("x", x_ty.clone()),
-                body: Box::new(case),
-            },
-            Type::fun(x_ty, int_ty),
-        )
-    }
-
-    /// Run `matcher(scrutinee)` through channelize → lambda_elim →
-    /// op-conversion, drive it once, and return the resulting tile.
-    fn drive_match(scrutinee: TypedExpr, matcher: TypedExpr) -> Tile {
-        let applied = typed(
-            TypedExprNode::Apply {
-                argument: Box::new(scrutinee),
-                function: Box::new(matcher),
-            },
-            Type::Base(CclBase::Int),
-        );
-        let channelized = crate::ccl::channelize::run(applied).expect("channelize");
-        let lowered = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
-        let mut ctx = OpConversionContext::new();
-        let op = convert_to_operators(&lowered, &mut ctx).expect("op-conversion");
-        drive(op)
-    }
-
-    /// The value at the single row of a driven eliminator's re-totaled
-    /// `DataFunction` result.
-    fn single_row(tile: Tile) -> Value {
-        let Tile::DataFunction {
-            domain, codomain, ..
-        } = tile
-        else {
-            panic!("expected a Function (re-totaled fan-out), got {tile:?}");
-        };
-        assert_eq!(domain.len(), 1, "one-element scrutinee → one output row");
-        let Tile::Scalar(cv) = *codomain else {
-            panic!("expected a scalar codomain");
-        };
-        cv.index_at(0)
-    }
-
-    /// Two-arm `match` on a `commit(7)` scrutinee fires the `commit(w) → w + 1`
-    /// arm end-to-end: ``variant_project(`commit)`` narrows to the tag-0 sub-domain,
-    /// binds `w = 7`, maps `w + 1`, and the flat union re-totals to `[0 ↦ 8]`.
-    #[test]
-    fn variant_elim_two_arm_commit_arm() {
-        let scrut = typed(
-            TypedExprNode::VariantCtor {
-                tag: "commit".into(),
-                payload: Box::new(typed(
-                    TypedExprNode::Lit(Lit::Int(7)),
-                    Type::Base(CclBase::Int),
-                )),
-            },
-            commit_abort_ty(Type::Base(CclBase::Int)),
-        );
-        let out = drive_match(scrut, two_arm_matcher());
-        assert_eq!(single_row(out), Value::Int(8));
-    }
-
-    /// The same two-arm `match` on an `abort` scrutinee fires the
-    /// `` `abort(a) → 0 `` arm: ``variant_project(`abort)`` narrows to tag-1, the commit
-    /// arm contributes nothing, and the union yields `[0 ↦ 0]`.
-    #[test]
-    fn variant_elim_two_arm_abort_arm() {
-        let scrut = typed(
-            TypedExprNode::VariantCtor {
-                tag: "abort".into(),
-                payload: Box::new(typed(
-                    TypedExprNode::Lit(Lit::Unit),
-                    Type::Base(CclBase::Unit),
-                )),
-            },
-            commit_abort_ty(Type::Base(CclBase::Int)),
-        );
-        let out = drive_match(scrut, two_arm_matcher());
-        assert_eq!(single_row(out), Value::Int(0));
-    }
-
-    /// A **one-arm** `match { commit(w) → w + 1 }` over a single-tag
-    /// ``{`commit{Int}}`` scrutinee — the read-side shape Phase B uses.
-    /// Exhaustiveness holds (the sole tag is covered), so the eliminator
-    /// collapses to a single ``variant_project(`commit) ≫ (w → w + 1)`` with no
-    /// union wrapper.
-    #[test]
-    fn variant_elim_one_arm() {
-        let int_ty = Type::Base(CclBase::Int);
-        let commit_only_ty = Type::variant(vec![(FieldKey::Name("commit".into()), int_ty.clone())]);
-
-        let w_plus_1 = typed(
-            TypedExprNode::BinOp {
-                left: Box::new(typed(TypedExprNode::Var("w".into()), int_ty.clone())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(typed(TypedExprNode::Lit(Lit::Int(1)), int_ty.clone())),
-            },
-            int_ty.clone(),
-        );
-        let case = typed(
-            TypedExprNode::Case {
-                scrutinee: Some(Box::new(typed(
-                    TypedExprNode::Var("x".into()),
-                    commit_only_ty.clone(),
-                ))),
-                branches: vec![Branch {
-                    pattern: Some(Pattern {
-                        tag: "commit".into(),
-                        binding: binding("w", int_ty.clone()),
-                        empty_payload: false,
-                    }),
-                    guard: bool_true(),
-                    body: w_plus_1,
-                }],
-            },
-            int_ty.clone(),
-        );
-        let matcher = typed(
-            TypedExprNode::Lambda {
-                param: binding("x", commit_only_ty.clone()),
-                body: Box::new(case),
-            },
-            Type::fun(commit_only_ty.clone(), int_ty.clone()),
-        );
-        let scrut = typed(
-            TypedExprNode::VariantCtor {
-                tag: "commit".into(),
-                payload: Box::new(typed(TypedExprNode::Lit(Lit::Int(41)), int_ty)),
-            },
-            commit_only_ty,
-        );
-        let out = drive_match(scrut, matcher);
-        assert_eq!(single_row(out), Value::Int(42));
     }
 
     /// A test operator yielding one fixed tile, then empty after a universal

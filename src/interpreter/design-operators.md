@@ -284,7 +284,7 @@ Operators split into two families by what they replace at their level:
   `*values_at_mut(level)`. Nothing is grouped, so nothing is split per row. A member that
   *reads* the rows above it takes them from the level they sit at rather than from the top,
   because a standing level answers for every carrier beneath it and not for those rows.
-- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `ProductPerRow`,
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`,
   `StoreDenseRead`. Each takes the level apart one row of the level above at a time and puts
   it back: `Tile::per_group`, which derives the empty level from the operator's own output
   tiling so a row that has been reached by nothing still answers at the right shape. Operands
@@ -347,7 +347,7 @@ way; an operator putting a value into a column asks it, a column having nowhere 
 maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
 and `materialize_collections` turns this form back into maps where one value is required.
 
-A pair an operator *forms* follows the same rule, and states it at construction. `ProductPerRow`
+A pair an operator *forms* follows the same rule, and states it at construction. `Product`
 pairs each row's element with the keys under it: where the element is a plain value the pair rides
 materialized in one column, and where it carries a level — a nest whose elements are collections — the
 pair is a `Tiling::Record` whose `_0` keeps its levels. `Uncurry` reads the rule from the other end:
@@ -739,13 +739,17 @@ carry one level and two.
 |---|---|
 | a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
 | `map(𝑓)` | 𝑓 one level in |
+| `map_filter(𝑞)` | 𝑞 one level in: it asks of each key of each element collection |
+| an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
 | `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
 | a top-level carrier | its body at level 1, over the store's own domain |
-| a nested carrier | its source at the carrier's level, its seed and body one level in |
+| a nested carrier | its source and its seed (over the flattened pairs) at the carrier's level, its body one level in |
 | every other node, composition included | the level it is converted at |
 
 The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
-pairs at it. A composed `VariantWrap` wraps at it, and an applied one at its payload's root level.
+pairs at it, and so does a product morphism with no input, at the domains its type is curried
+over. `MapResult` applies at it, `MapFilter` filters the element collections there, and a
+per-row `ExtractFinal` reduces the rows above it. A composed `VariantWrap` wraps at it, and an applied one at its payload's root level.
 A fed copairing merges one level above it, and a nested carrier leaves standing the levels above
 its own row, one fewer than it.
 
@@ -821,7 +825,8 @@ Four arms share an input across multiple downstream consumers:
   each tuple / record element; the elements get `Some(fan_out_branch)` and
   combine via [`zip_arms_at`] (function-tiled arms) or [`MakeRecord`] (scalar arms).
   The 2-arm Zip-with-const fast path skips the fan-out and emits a single
-  `MapResultToConst` instead. A **store-read arm** (`__hist.k`) is a *leaf*
+  `MapResultToConst` instead. A **store-read arm** (`__hist.k`, or a nested store's
+  `__hist ≫ .k`, one history per enclosing row) is a *leaf*
   source over its own domain, so it is converted with **no** input (rather than
   the fanned branch, which it would reject); `zip_arms_at` co-aligns it with the
   input-driven arms by domain position. This is the cross-domain co-iteration a
@@ -876,8 +881,11 @@ Compiling it is the pairing. [`Product`] gives each outer row a group holding th
 domain, one level deeper than the outer collection — a collection per row — and `𝑔` then compiles over
 that like any other morphism over a stream, its result inheriting the grouping.
 The inner source does not mention the outer binder, so every row iterates the same domain and
-the pairing is a cartesian product. A source that differs per row is the same output shape
-from a different builder ([Where a collection is materialized](#where-a-collection-is-materialized)),
+the pairing is a cartesian product (`Product::shared_at`). While the inner side is still
+arriving, each row is paired with the elements it holds so far and left open: no row is complete
+until the inner side is, since every row can gain its next element. Every row reads the whole
+inner side, so it is released only when everything is. A source that differs per row is the same
+operator's per-row form (`Product::per_row_at`, [Where a collection is materialized](#where-a-collection-is-materialized)),
 where the per-row collection arrives as a value rather than being selected by the binder.
 
 Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
@@ -1220,7 +1228,7 @@ releases its seed streams through the path it has decided. Both name the region 
 pair-keyed domain, `domain_prefix` over the path with its last two components composed back into
 the pair, which `Predicate::at_or_below` spells as a staircase over the pair's fields. The seed and
 reseed streams are one stream behind a `FanOut`, so either consumer holding its branch would pin
-the pair stream, and the operators pairing it (`Uncurry`, `ProductPerRow`) would re-deliver the
+the pair stream, and the operators pairing it (`Uncurry`, `Product`) would re-deliver the
 whole run on every pull. `Uncurry` releases an outer key where a pair release covers that key's
 whole inner collection, under whatever standing rows qualify it.
 

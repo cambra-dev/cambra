@@ -152,7 +152,7 @@ impl TileOperator for Zip {
                 .map(|i| {
                     i.subscribe(
                         i.tiling().universal_guard(),
-                        forwarding_consumer(&shared),
+                        forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                         scheduler,
                     )
                 })
@@ -359,17 +359,23 @@ impl TileProducer for ZipProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.inputs.iter_mut().for_each(|i| {
-            i.release(match &obsolete_guard {
-                g if g.is_universal() => i.tiling().universal_guard(),
-                g if g.is_empty() => i.tiling().empty_guard(),
-                // A zip pairs its arms at the same positions, so a region of the output
-                // names that same region of every arm and travels verbatim, whichever
-                // shape it takes. Only the universal and empty guards are rebuilt, being
-                // spelled against each arm's own tiling.
-                g => g.clone(),
-            })
-        });
+        let level = self.level.index();
+        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+            let guard = match &obsolete_guard {
+                g if g.is_universal() => input.tiling().universal_guard(),
+                g if g.is_empty() => input.tiling().empty_guard(),
+                // A zip pairs its arms at the same positions, so the levels above the pair
+                // name the same keys of every arm; at the pair each arm is one field of the
+                // record, and takes that field's part.
+                g => crate::interpreter::tiling::onto_record_field(
+                    g.clone(),
+                    level,
+                    name,
+                    input.tiling(),
+                ),
+            };
+            input.release(guard);
+        }
     }
 }
 
@@ -446,7 +452,7 @@ impl TileOperator for MakeRecord {
                 .map(|i| {
                     i.subscribe(
                         i.tiling().universal_guard(),
-                        forwarding_consumer(&shared),
+                        forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                         scheduler,
                     )
                 })
@@ -1027,5 +1033,64 @@ mod tests {
             ColumnValue::UInts(vec![20, 21]),
             "branch b's values should remain [0, 1] (already its full presence)",
         );
+    }
+
+    /// A release naming part of the pair record reaches each arm as that arm's field, spelled
+    /// against the arm's own tiling. The guard is the one a consumer builds with `to_guard`
+    /// while row 0 of the collection-valued arm is still open.
+    #[test]
+    fn a_zip_release_reaches_each_arm_as_its_own_field() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm0_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let arm1_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let arm0 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let arm1 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(int())),
+                (
+                    tuple_field(1),
+                    Tiling::data_function(uint(), Tiling::Scalar(int())),
+                ),
+            ])),
+        );
+        let (spy0, released0) = ReleaseSpy::new(arm0, arm0_tiling.clone());
+        let (spy1, released1) = ReleaseSpy::new(arm1, arm1_tiling.clone());
+        let mut zip = ZipProducer {
+            base: ProducerBase::new(ZipProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0), tuple_field(1)],
+            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            level: CurryLevel::new(1),
+        };
+        let out = zip.get(out_tiling.universal_guard());
+        let guard = out.to_guard();
+        zip.release(guard.clone());
+        for (log, tiling) in [(&released0, &arm0_tiling), (&released1, &arm1_tiling)] {
+            for g in log.borrow().iter() {
+                assert!(
+                    g.check_from(tiling),
+                    "{g:?} is not a guard over the arm's tiling {tiling}, from {guard:?}"
+                );
+            }
+        }
     }
 }

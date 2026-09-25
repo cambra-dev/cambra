@@ -29,8 +29,7 @@ use smol_str::SmolStr;
 /// All six code variants project or transform the string elements of `testsource1`
 /// and should produce the same sorted key→value mapping: `{10 → "foo", 20 → "bar"}`.
 ///
-/// Also confirms that updating the yield guard without adding new data does not
-/// trigger a spurious notification.
+/// Also confirms that changing the yield guard notifies, and restating it does not.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("testsource1()")]
@@ -90,7 +89,15 @@ fn test_test_source(#[case] code: &str) {
     pairs.sort_by_key(|(k, _)| *k);
     assert_eq!(pairs, vec![(10, "foo".into()), (20, "bar".into())]);
 
-    // Changing the yield guard without adding new data must not notify.
+    // Changing the yield guard is news without new data: it closes the source here, which
+    // readers holding a cached tile would otherwise never learn.
+    data_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow());
+    // Restating the guard it already has changes nothing, and must not notify.
+    *notified.borrow_mut() = false;
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
@@ -1029,5 +1036,144 @@ fn a_constant_arm_waits_for_its_constant_after_a_filtered_batch(#[case] code: &s
             Predicate::True,
             BitSet::new(),
         )
+    );
+}
+
+/// A group arriving below one already held: a groupby over a stream opens groups in
+/// whatever order their keys first appear, so what it holds is not a prefix of its groups,
+/// and a release naming everything below the last one held would release a group before
+/// it arrives.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_group_arriving_below_one_held_is_not_released_early() {
+    let tile = run_in_batches(
+        "[sum(x) for x in groupby(source1(), \\x -> x // 10)]",
+        &[(&[(0, 20)], 0), (&[(1, 10)], 1)],
+    );
+    assert_eq!(
+        sort_function_by_domain(tile),
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            Predicate::True,
+            BitSet::new(),
+        ))
+    );
+}
+
+/// A loop over a source nested in a loop over a list, with the source read in the nest or
+/// bound before it, and the comprehension forms of the same pairing: the inner side streams
+/// into every row's group as it arrives rather than waiting for the source to close, and a
+/// binding's cached tile learns of the close.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+#[case::inner_source(indoc::indoc! {r"
+    total := 0
+    for x in [1, 2]:
+        for y in source1():
+            total += x * y
+    total
+"}, 9)]
+#[case::bound_outside(indoc::indoc! {r"
+    ys = source1()
+    total := 0
+    for x in [1]:
+        for y in ys:
+            total += x * y
+    total
+"}, 3)]
+#[case::comprehension("sum([sum([y * x for y in source1()]) for x in [1, 2]])", 9)]
+#[case::comprehension_bound_outside(
+    "ys = source1()\nsum([sum([y * x for y in ys]) for x in [1]])",
+    3
+)]
+fn a_nest_over_a_streamed_source_runs_as_the_source_arrives(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// A collection per row paired against a streamed source keeps each row's values as they
+/// arrive.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+fn a_collection_per_row_over_a_streamed_source() {
+    let tile = run_in_batches(
+        "[(x, [y * x for y in source1()]) for x in [1, 2]]",
+        &[(&[(0, 1)], 0), (&[(1, 2)], 1)],
+    );
+    let Tile::DataFunction { codomain, .. } = sort_function_by_domain(tile) else {
+        panic!("a collection of rows")
+    };
+    let Tile::Record(fields) = *codomain else {
+        panic!("each row is a pair")
+    };
+    let Tile::DataFunction { codomain, .. } = &fields[&tuple_field(1)] else {
+        panic!("the pair's `_1` is a collection per row")
+    };
+    let Tile::Scalar(ColumnValue::Ints(mut values)) = (**codomain).clone() else {
+        panic!("of Ints")
+    };
+    values.sort();
+    assert_eq!(values, vec![1, 2, 2, 4]);
+}
+
+/// A collection per row over a streamed source, read as a sink reads it: each pull's tile
+/// is released whole once taken. Each later pull delivers only what arrived since — the
+/// pairs of the new element under every row — and closing it delivers nothing more.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+fn a_collection_per_row_released_as_it_is_read() {
+    let code = "[[y * x for y in source1()] for x in [1, 2]]";
+    let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    // The values the pull delivers, sorted, after which the whole tile is released.
+    let mut read = |rows: &[(usize, i64)], yielded: Predicate, until: fn(&Tile) -> bool| {
+        let data: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+            .collect();
+        source.borrow_mut().add_data(&data);
+        source.borrow_mut().set_yield_predicate(yielded);
+        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, until);
+        tile.compact();
+        producer.release(tile.to_guard());
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            panic!("a collection of rows, got {tile:?}")
+        };
+        let Tile::DataFunction { codomain, .. } = codomain.as_ref() else {
+            panic!("a collection per row, got {codomain:?}")
+        };
+        let Tile::Scalar(ColumnValue::Ints(mut values)) = (**codomain).clone() else {
+            panic!("of Ints, got {codomain:?}")
+        };
+        values.sort();
+        (values, tile.is_terminal())
+    };
+    let never: fn(&Tile) -> bool = |_| false;
+    assert_eq!(
+        read(&[(0, 1)], Predicate::at_or_below(Value::UInt(0)), never),
+        (vec![1, 2], false),
+        "the first element under both rows"
+    );
+    assert_eq!(
+        read(&[(1, 5)], Predicate::at_or_below(Value::UInt(1)), never),
+        (vec![5, 10], false),
+        "only the element added since — the released pairs are not re-delivered"
+    );
+    assert_eq!(
+        read(&[], Predicate::True, Tile::is_terminal),
+        (vec![], true),
+        "closing the source completes every row and delivers nothing new"
     );
 }

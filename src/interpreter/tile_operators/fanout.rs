@@ -838,7 +838,7 @@ impl TileOperator for Memo {
             ),
             input: self.input.subscribe(
                 intent_guard,
-                notified.consumer(forwarding_consumer(&consumer)),
+                notified.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
                 scheduler,
             ),
             cached_tile: self.tiling().empty_tile(),

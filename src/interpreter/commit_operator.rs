@@ -165,10 +165,9 @@ impl CommitEngine {
     ///
     /// A store replacing one in a running program starts where its predecessor had
     /// reached, so everything up to `resumed_after` is already decided. This store has
-    /// no record of what those positions held — a read of one folds to the seed,
-    /// which is the value the predecessor handed over — but a reader enumerating a
-    /// fixed collection asks about every position of it, and the last value is the
-    /// one such a read is after.
+    /// no record of what those positions held, so they are not its domain: a read of the
+    /// store as it stands folds to the seed, which is the value the predecessor handed
+    /// over.
     pub fn seeded_at(resumed_after: Option<Position>, init: HashMap<Value, Value>) -> Self {
         Self {
             decided: resumed_after,
@@ -274,6 +273,38 @@ impl CommitEngine {
             "no change lands above a store's frontier {:?}",
             self.decided
         );
+        // A change is made at a position the store decided. A reclaim drops positions from
+        // the domain but keeps, per key, the latest change at or before the earliest live
+        // one, since a live position folds to it: that one carry source may lie below
+        // the domain, and nothing else outside it.
+        #[cfg(debug_assertions)]
+        {
+            let stray: Vec<(&Value, Vec<&Position>)> = self
+                .changes
+                .iter()
+                .map(|(key, log)| {
+                    let outside: Vec<&Position> = log
+                        .keys()
+                        .filter(|p| self.decided_positions.binary_search(p).is_err())
+                        .collect();
+                    (key, outside)
+                })
+                .filter(|(_, outside)| {
+                    outside.len() > 1
+                        || outside.iter().any(|p| {
+                            self.decided_positions
+                                .first()
+                                .is_some_and(|first| *p > first)
+                        })
+                })
+                .collect();
+            debug_assert!(
+                stray.is_empty(),
+                "a store's changes lie at its decided positions, bar one carry source per key \
+                 below them: {stray:?} outside {:?}",
+                self.decided_positions
+            );
+        }
     }
 
     /// Validate and (if valid) commit one proposal. Allocate-on-commit: a valid
@@ -345,6 +376,22 @@ impl CommitEngine {
     /// on the caller passing only a region every consumer has released (the `FanOut`'s
     /// meet), so nothing dropped here is read again.
     pub fn gc_released_prefix(&mut self, through: &Position) {
+        #[cfg(debug_assertions)]
+        let (keys, live) = (
+            self.changes
+                .keys()
+                .chain(self.seed.keys())
+                .cloned()
+                .collect::<Vec<_>>(),
+            self.decided_positions
+                .iter()
+                .filter(|p| *p > through)
+                .chain(self.decided.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        #[cfg(debug_assertions)]
+        let before = self.folds_at(&keys, &live);
         // Read before the domain is trimmed: whether a key's carry source is reachable is
         // asked against the earliest position still live.
         let earliest_live = self
@@ -377,6 +424,21 @@ impl CommitEngine {
         }
         self.changes.retain(|_, log| !log.is_empty());
         self.debug_check();
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.folds_at(&keys, &live) == before,
+            "a reclaim changes no fold still reachable: reclaiming through {through} changed \
+             the value of some key at a live position or the frontier ({live:?})"
+        );
+    }
+
+    /// Every key's value at every one of `positions`, for the check that a reclaim leaves
+    /// each reachable fold as it was.
+    #[cfg(debug_assertions)]
+    fn folds_at(&self, keys: &[Value], positions: &[Position]) -> Vec<Option<Value>> {
+        keys.iter()
+            .flat_map(|key| positions.iter().map(|p| self.read_as_of(p, key)))
+            .collect()
     }
 
     /// Render the full store as a [`Tile::Store`] over `tiling`: one changelog per key,
@@ -464,8 +526,15 @@ fn render_carrier_level(
         // One store, whether or not its seed has arrived: there is no level above to key it
         // by, so the node exists from the start and an unopened one renders as what it
         // holds — an undecided frontier, no change, no value before any position.
+        // Terminal only once open: a store's value before any position is its seed, so a
+        // loop that ran no position answers with it, and a store without one has not
+        // answered yet.
         let unopened = CommitEngine::unopened();
-        return store_tile(&[engine.as_ref().unwrap_or(&unopened)], tiling, terminal);
+        return store_tile(
+            &[engine.as_ref().unwrap_or(&unopened)],
+            tiling,
+            terminal && engine.is_some(),
+        );
     };
     let Engines::Rows(rows) = engines else {
         panic!("a carrier with rows above it holds one engine per row, got a bare store")
@@ -752,6 +821,14 @@ impl Engines {
         let at = match rows.iter().position(|(r, _)| r == row) {
             Some(at) => at,
             None => {
+                debug_assert!(
+                    rows.last().is_none_or(|(last, _)| {
+                        Position::new(row.clone()) > Position::new(last.clone())
+                    }),
+                    "a level's rows open in ascending order: opening row {row} at or below \
+                     {:?}, the last row opened",
+                    rows.last().map(|(last, _)| last)
+                );
                 let opened = if rest.is_empty() {
                     Engines::Store(None)
                 } else {
@@ -862,15 +939,13 @@ enum SeedNotReady {
 /// whole of it — an open one would seed the store with whichever keys had arrived, which
 /// is a partial map presented as the value before any position.
 fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
+    if !is_whole_value(tile) {
+        return Err(SeedNotReady::Undecided);
+    }
     match tile {
-        Tile::DataFunction {
-            domain_predicate, ..
-        } if !matches!(domain_predicate, Predicate::True) => Err(SeedNotReady::Undecided),
         // A decided collection is a value at every row it has, the empty map included, so
         // there is no emptiness to test past the domain being closed.
         Tile::DataFunction { .. } => Ok(materialized_row(tile.clone())),
-        // A record field holding a collection is the whole of it on the same terms.
-        Tile::Record(_) if !fields_decided(tile) => Err(SeedNotReady::Undecided),
         Tile::Scalar(_) | Tile::Record(_) => {
             let column = materialize_collections(tile.clone());
             if column.is_empty() {
@@ -885,15 +960,18 @@ fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
     }
 }
 
-/// Whether every collection a record's fields hold has a decided domain, the test
-/// [`seed_value`] makes of a collection seed, applied through the record.
-fn fields_decided(tile: &Tile) -> bool {
+/// Whether every collection in a one-row value tile is complete, so the tile is the whole
+/// value rather than part of it. Completeness is downward-closed, so a collection closed at
+/// its outermost level is closed beneath; a record's fields stand over the same row, so each
+/// must be whole on its own.
+fn is_whole_value(tile: &Tile) -> bool {
     match tile {
-        Tile::Record(fields) => fields.values().all(fields_decided),
         Tile::DataFunction {
             domain_predicate, ..
         } => matches!(domain_predicate, Predicate::True),
-        _ => true,
+        Tile::Scalar(_) => true,
+        Tile::Record(fields) => fields.values().all(is_whole_value),
+        _ => false,
     }
 }
 
@@ -1387,32 +1465,45 @@ pub fn frontier_path(store: &Tile) -> Option<Path> {
 /// Sorted, because an async source's domain arrives unordered and the drive takes
 /// positions in path order.
 fn decode_source_paths(tile: &Tile, levels: usize) -> Vec<(Path, Tile)> {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         level: &Tile,
         run: std::ops::Range<usize>,
         below: usize,
+        complete_above: bool,
         prefix: &mut Vec<Value>,
         items: &Tile,
         out: &mut Vec<(Path, Tile)>,
     ) {
         let Tile::DataFunction {
-            domain, codomain, ..
+            domain,
+            codomain,
+            domain_predicate,
+            ..
         } = level
         else {
             return;
         };
         for k in run {
             prefix.push(domain.index_at(k));
+            // Completeness is downward-closed: a path some level calls complete is
+            // complete at every depth beneath it, whatever those levels state.
+            let complete = complete_above || domain_predicate.contains_path(prefix);
             if below == 0 {
                 // An item is a value in its own right, so its statements are restated over
                 // its own paths ([`Predicate::within`]); whoever places it again qualifies
-                // them by where it goes.
+                // them by where it goes. One under a complete path is whole, and taken out
+                // on its own it has no level above to read that from, so it says so itself,
+                // as [`Tile::group_at`]'s group does.
                 let mut item = items.select_rows(&[k]);
-                item.map_level_predicates(&mut |depth, pred| pred.within(prefix, depth));
+                item.map_level_predicates(&mut |depth, pred| match complete {
+                    true => Predicate::True,
+                    false => pred.within(prefix, depth),
+                });
                 out.push((Path::from(prefix.clone()), item));
             } else {
                 let (from, to) = codomain.row_run(k);
-                walk(codomain, from..to, below - 1, prefix, items, out);
+                walk(codomain, from..to, below - 1, complete, prefix, items, out);
             }
             prefix.pop();
         }
@@ -1440,6 +1531,7 @@ fn decode_source_paths(tile: &Tile, levels: usize) -> Vec<(Path, Tile)> {
         tile,
         0..domain.len(),
         levels - 1,
+        false,
         &mut Vec::new(),
         under,
         &mut out,
@@ -1678,7 +1770,11 @@ impl TileOperator for CommitOperator {
                 let g = op.tiling().universal_guard();
                 (
                     key,
-                    op.subscribe(g, forwarding_consumer(&consumer), scheduler),
+                    op.subscribe(
+                        g,
+                        forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                        scheduler,
+                    ),
                 )
             })
             .collect();
@@ -1695,7 +1791,11 @@ impl TileOperator for CommitOperator {
                     )
                 });
                 let guard = input.tiling().universal_guard();
-                input.subscribe(guard, forwarding_consumer(&consumer), scheduler)
+                input.subscribe(
+                    guard,
+                    forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                    scheduler,
+                )
             })
             .collect::<Vec<_>>();
         let n = writer_producers.len();
@@ -1711,6 +1811,8 @@ impl TileOperator for CommitOperator {
             output_tiling: self.tiling().clone(),
             drain_start: 0,
             notifier: ChangeNotifier::new(consumer, scheduler),
+            #[cfg(debug_assertions)]
+            reported_closed: HashSet::new(),
         })
     }
 }
@@ -1751,6 +1853,10 @@ struct CommitProducer {
     drain_start: usize,
     /// Wakes this store's readers when a pull changes what it answers.
     notifier: ChangeNotifier,
+    /// Every key a render has reported in `closed_keys`, for the check that no commit
+    /// writes one afterwards.
+    #[cfg(debug_assertions)]
+    reported_closed: HashSet<Value>,
 }
 
 /// A proposal-stream record field, as its scalar column. The proposal codomain
@@ -1820,9 +1926,16 @@ impl TileProducer for CommitProducer {
         // get_impl`), so a store with a writing endpoint still sheds its
         // superseded history through this branch — the intersection just also
         // waits on that reader's own released prefix.
+        // Through the end of the prefix the meet covers, not its highest point: a tick the
+        // meet skips is still read, and so is everything after it.
         if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard
-            && let Some(through) = pred.max_released_position()
             && let Some(engine) = &mut self.engine
+            && let Some(through) = engine
+                .decided_positions
+                .iter()
+                .take_while(|tick| pred.contains(tick.value()))
+                .last()
+                .cloned()
         {
             engine.gc_released_prefix(&through);
         }
@@ -1848,6 +1961,10 @@ impl CommitProducer {
             }
             if resolved == self.seed_producers.len() {
                 self.engine = Some(CommitEngine::new(seed));
+                // The seed is read once, at the store's opening, so it is released there.
+                for (_, producer) in &mut self.seed_producers {
+                    producer.release(producer.tiling().universal_guard());
+                }
             }
         }
         let Some(engine) = &mut self.engine else {
@@ -1928,13 +2045,33 @@ impl CommitProducer {
                      (the snap field is typed Scalar(UInt) by emit_transact_writer); got \
                      {snapshot}"
                 );
+                let write_set = value_to_map(&writes.index_at(j));
+                #[cfg(debug_assertions)]
+                let written: Vec<Value> = write_set.keys().cloned().collect();
                 let outcome = self.open_engine().attempt(Proposal {
                     snapshot,
                     reads: value_to_map(&reads.index_at(j)),
-                    writes: value_to_map(&writes.index_at(j)),
+                    writes: write_set,
                 });
                 self.consumed[k] = step + 1;
                 if let CommitOutcome::Committed { .. } = outcome {
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert!(
+                            written
+                                .iter()
+                                .all(|w| self.writer_write_keys[k].contains(w)),
+                            "a committed write stays inside its writer's declared footprint: \
+                             writer {k} wrote {written:?}, declaring {:?}",
+                            self.writer_write_keys[k]
+                        );
+                        debug_assert!(
+                            written.iter().all(|w| !self.reported_closed.contains(w)),
+                            "no commit writes a key the store has reported closed: writer {k} \
+                             wrote {written:?}, closed {:?}",
+                            self.reported_closed
+                        );
+                    }
                     // Acknowledge the commit by releasing this step (and any
                     // earlier stale ones) back to the writer — its signal to
                     // advance and to compact its proposal window. A stale
@@ -1987,6 +2124,8 @@ impl CommitProducer {
                     closed.push(k.clone());
                 }
             }
+            #[cfg(debug_assertions)]
+            self.reported_closed.extend(closed.iter().cloned());
             *closed_keys = closed;
         }
         debug_assert!(
@@ -2101,6 +2240,11 @@ fn decode_row_seeds(tile: &Tile, rows_above: usize) -> Vec<(Path, Value)> {
         .into_iter()
         .filter_map(|(path, value)| {
             let (row, _) = path.split_position()?;
+            // A seed holding a collection still arriving is part of a value, not one: the
+            // row opens once it is whole, as it does once a missing seed arrives.
+            if !is_whole_value(&value) {
+                return None;
+            }
             Some((Path::from(row.to_vec()), materialized_row(value)))
         })
         .collect()
@@ -2158,9 +2302,6 @@ pub struct InductionStore {
     /// Keys written, in decision-`writes` order: the accumulator mutable variables, then
     /// any reply-tap (`__to_<defer>`) keys.
     write_keys: Vec<Value>,
-    /// The tick this store's seed sits at, and so the first position it decides.
-    /// `0` for a store that starts with its source; the resume position for one
-    /// replacing a store in a running program.
     /// The last position a predecessor store reached, or `None` for one starting
     /// from the beginning of its source.
     resumed_after: Option<Position>,
@@ -2249,7 +2390,11 @@ impl TileOperator for InductionStore {
         );
         let body_producer = {
             let g = body_op.tiling().universal_guard();
-            body_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
+            body_op.subscribe(
+                g,
+                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                scheduler,
+            )
         };
         // A seed forwards, rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
@@ -2262,7 +2407,11 @@ impl TileOperator for InductionStore {
                 let g = op.tiling().universal_guard();
                 (
                     key,
-                    op.subscribe(g, forwarding_consumer(&consumer), scheduler),
+                    op.subscribe(
+                        g,
+                        forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                        scheduler,
+                    ),
                 )
             })
             .collect();
@@ -2284,6 +2433,8 @@ impl TileOperator for InductionStore {
             tap_fields: self.tap_fields.clone(),
             output_tiling: self.tiling().clone(),
             notifier: ChangeNotifier::new(consumer, scheduler),
+            #[cfg(debug_assertions)]
+            stepped_through: None,
         })
     }
 }
@@ -2346,6 +2497,11 @@ struct InductionStoreProducer {
     /// The full-store output tiling — for a debug-time shape check on the rendered
     /// store tile.
     output_tiling: Tiling,
+    /// The highest path this carrier has stepped, for the check that rows open in
+    /// ascending path order and never reopen. Survives [`Engines::remove_covered`], which
+    /// moves [`decided_path`](Self::decided_path) back when it drops the rows it names.
+    #[cfg(debug_assertions)]
+    stepped_through: Option<Path>,
 }
 
 impl InductionStoreProducer {
@@ -2446,11 +2602,17 @@ impl InductionStoreProducer {
         for (key, producer) in &mut self.seed_producers {
             let tile = producer.get(producer.tiling().universal_guard());
             for (row, value) in decode_row_seeds(&tile, rows_above) {
-                seeds
-                    .entry(row)
-                    .or_default()
-                    .entry(key.clone())
-                    .or_insert(value);
+                let at = seeds.entry(row.clone()).or_default();
+                match at.get(key) {
+                    Some(first) => debug_assert_eq!(
+                        *first, value,
+                        "a row has one seed: every position under row {row:?} carries the \
+                         same seed for {key}"
+                    ),
+                    None => {
+                        at.insert(key.clone(), value);
+                    }
+                }
             }
         }
         seeds.retain(|_, at| at.len() == keys);
@@ -2516,10 +2678,18 @@ impl TileProducer for InductionStoreProducer {
         // accumulator's value before the first position out of this store, and a store
         // that is not open carries none. A nested carrier's rows are named by decisions
         // instead, so none of its seeds lands at the empty path and they wait below.
-        let row_seeds = self.row_seeds();
+        // An open store of its own has read its seed, and nothing more of it is wanted.
+        let row_seeds = match &self.engines {
+            Engines::Store(Some(_)) => HashMap::new(),
+            _ => self.row_seeds(),
+        };
         if let Some(seed) = row_seeds.get(&Path::default()) {
             let seed = seed.clone();
             self.open_at(&Path::default(), &seed);
+            // The seed is read once, at the store's opening, so it is released there.
+            for (_, producer) in &mut self.seed_producers {
+                producer.release(producer.tiling().universal_guard());
+            }
         }
         let body_tile = self
             .body_producer
@@ -2577,6 +2747,19 @@ impl TileProducer for InductionStoreProducer {
                     None => break,
                 },
             };
+            #[cfg(debug_assertions)]
+            {
+                debug_assert!(
+                    self.stepped_through
+                        .as_ref()
+                        .is_none_or(|high| path > *high),
+                    "a carrier steps its decisions in ascending path order and never reopens \
+                     a row: stepping {path:?} at or below {:?}, the highest path already \
+                     stepped",
+                    self.stepped_through
+                );
+                self.stepped_through = Some(path.clone());
+            }
             let write_set = self.write_set(commit, writes, tap_fired);
             let engine = self.open_at(&row, &seed);
             engine.step(inner.clone(), write_set);
@@ -2636,7 +2819,11 @@ impl TileProducer for InductionStoreProducer {
             "induction store: the body's decision stream is terminal but still decides \
              {undecided:?}, past the watermark {through:?}"
         );
-        if body_tile.is_terminal() {
+        // A nested carrier's rows open as they are decided and release their seeds as they
+        // go (`release_seeds_through`); the rest go once the body is done, since a row that
+        // ran no position answers from the enclosing row's default instead. The carrier's
+        // own store released its seed when it opened.
+        if body_tile.is_terminal() && matches!(self.engines, Engines::Rows(_)) {
             for (_, producer) in &mut self.seed_producers {
                 producer.release(producer.tiling().universal_guard());
             }
@@ -2666,13 +2853,18 @@ impl TileProducer for InductionStoreProducer {
             at.clear();
             at.extend_from_slice(rows);
             at.push(Value::Unit);
+            // The reclaimable prefix ends at the first decided position the guard does not
+            // cover: one past it is still read by someone, and so is its carry source, so a
+            // position covered beyond it is not a prefix to reclaim through. The decided
+            // positions ascend, so the walk is in order.
             let mut through: Option<Position> = None;
             for decided in &engine.decided_positions {
                 let last = at.len() - 1;
                 at[last] = decided.value().clone();
-                if obsolete_guard.covers_path(&at) && through.as_ref().is_none_or(|t| decided > t) {
-                    through = Some(decided.clone());
+                if !obsolete_guard.covers_path(&at) {
+                    break;
                 }
+                through = Some(decided.clone());
             }
             if let Some(through) = through {
                 engine.gc_released_prefix(&through);
@@ -2771,9 +2963,11 @@ impl TileOperator for StoreValueStream {
         let consumer = shared_consumer(consumer);
         consumer.borrow_mut().notify();
         let g = self.store_op.tiling().universal_guard();
-        let store_producer = self
-            .store_op
-            .subscribe(g, forwarding_consumer(&consumer), scheduler);
+        let store_producer = self.store_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), self.tiling()),
             store_producer,
@@ -2868,10 +3062,15 @@ impl TileProducer for StoreValueStreamProducer {
         let Tile::Store { decided, .. } = &store else {
             unreachable!("StoreValueStream's constructor requires a store source; got {store:?}")
         };
+        // A reclaim takes the prefix of the clock the readers have released, keeping each
+        // key's carry source, so the ticks start at the clock's start or where the reclaim
+        // stopped, and run one commit apart from there.
         let all_ticks: Vec<Position> = store_decided_positions(decided, 0);
         debug_assert!(
-            all_ticks.first().is_none_or(|t| *t == commit_clock_start()),
-            "the commit clock's first decided tick is its start: {all_ticks:?}"
+            all_ticks
+                .windows(2)
+                .all(|w| next_commit_tick(&w[0]) == w[1]),
+            "the commit clock's decided ticks run one commit apart: {all_ticks:?}"
         );
         let folded = fold_changelog_key_ascending(
             &store,
@@ -2924,15 +3123,16 @@ impl TileProducer for StoreValueStreamProducer {
     }
 }
 
-/// The **terminal read** of a transactional mutable variable: `key`'s value at the
-/// position its own writers finish, or the store's seed if no commit wrote it.
+/// The **terminal read** of a store key: `key`'s value where the store closes it — where
+/// a transactional variable's own writers finish, or where an induction loop ends — or
+/// the store's seed if nothing wrote it.
 ///
 /// A Txn read samples the key's carried value; this one's position is where the key
 /// closes. It takes the same sample [`AsOf`] does, through the same
 /// [`store_current`] — the difference is what fixes the position: a trigger arrival
 /// there, the store's own closure here. So it is neither a reduction nor a
-/// projection of the history, and needs no seed operand, because tick 0 of the
-/// changelog holds the seed.
+/// projection of the history, and needs no seed operand, because the store holds its
+/// seed beside its changelog.
 pub struct StoreFinalRead {
     /// Output tiling `Scalar(V)` — a terminal read is one value, not a stream.
     base: OperatorBase,
@@ -2972,9 +3172,11 @@ impl TileOperator for StoreFinalRead {
         let consumer = shared_consumer(consumer);
         consumer.borrow_mut().notify();
         let g = self.store_op.tiling().universal_guard();
-        let store_producer = self
-            .store_op
-            .subscribe(g, forwarding_consumer(&consumer), scheduler);
+        let store_producer = self.store_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         Box::new(StoreFinalReadProducer {
             base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), self.tiling()),
             store_producer,
@@ -3169,8 +3371,11 @@ impl TileOperator for StoreDenseRead {
         consumer.borrow_mut().notify();
         let store_producer = {
             let g = self.store_op.tiling().universal_guard();
-            self.store_op
-                .subscribe(g, forwarding_consumer(&consumer), scheduler)
+            self.store_op.subscribe(
+                g,
+                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                scheduler,
+            )
         };
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), self.tiling()),
@@ -3615,13 +3820,17 @@ impl TileOperator for AsOf {
         // only propose; later pulls commit and render).
         let consumer = shared_consumer(consumer);
         let tg = self.trigger.tiling().universal_guard();
-        let trigger = self
-            .trigger
-            .subscribe(tg, forwarding_consumer(&consumer), scheduler);
+        let trigger = self.trigger.subscribe(
+            tg,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         let sg = self.source.tiling().universal_guard();
-        let source = self
-            .source
-            .subscribe(sg, forwarding_consumer(&consumer), scheduler);
+        let source = self.source.subscribe(
+            sg,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         let b_extent = match self.tiling() {
             Tiling::DataFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiles as a function"),
@@ -4311,14 +4520,22 @@ fn subscribe_driver_inputs(
     let consumer = shared_consumer(consumer);
     let source_producer = {
         let g = source_op.tiling().universal_guard();
-        source_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
+        source_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        )
     };
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
     let store_producer = {
         let g = store_op.tiling().universal_guard();
-        store_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
+        store_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        )
     };
     DriverInputs {
         consumer,
@@ -4543,7 +4760,11 @@ impl TileOperator for InductionDriver {
         let nested = self.nested.as_mut().map(|n| {
             let mut sub = |op: &mut Box<dyn TileOperator>| {
                 let g = op.tiling().universal_guard();
-                op.subscribe(g, forwarding_consumer(&consumer), scheduler)
+                op.subscribe(
+                    g,
+                    forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                    scheduler,
+                )
             };
             NestedDrive {
                 body: n.body.clone(),
@@ -4581,6 +4802,8 @@ impl TileOperator for InductionDriver {
             source_fully_released: false,
             source_complete: Vec::new(),
             stated: Vec::new(),
+            #[cfg(debug_assertions)]
+            reseeded: None,
         })
     }
 }
@@ -4631,6 +4854,11 @@ struct InductionDriverProducer {
     /// that states more has changed its output, and wakes its consumer as an emission
     /// does.
     stated: Vec<Predicate>,
+    /// The last row this drive reseeded and the snapshot it reseeded it at, until the
+    /// store's frontier enters that row, for the check that the reseed is the store's seed
+    /// there.
+    #[cfg(debug_assertions)]
+    reseeded: Option<(Path, Vec<Value>)>,
 }
 
 impl InductionDriverProducer {
@@ -4747,7 +4975,6 @@ impl TileProducer for InductionDriverProducer {
                         .source_released_through
                         .as_ref()
                         .is_some_and(|r| p <= r)
-                    || self.nested.is_some()
             }),
             "induction source delivered a position at or below the emitted cursor {:?} \
              that was never released: {:?}",
@@ -4774,7 +5001,16 @@ impl TileProducer for InductionDriverProducer {
                     .map(|p| {
                         read(p)
                             .into_iter()
-                            .map(|(path, seed)| (path, materialized_row(seed)))
+                            .map(|(path, seed)| {
+                                // The drive reaches a row only once the store has opened it,
+                                // which it does on the row's whole seed.
+                                debug_assert!(
+                                    is_whole_value(&seed),
+                                    "a reseed is a whole value: the reseed at {path:?} holds \
+                                     a collection still arriving, got {seed:?}"
+                                );
+                                (path, materialized_row(seed))
+                            })
                             .collect()
                     })
                     .collect(),
@@ -4791,6 +5027,32 @@ impl TileProducer for InductionDriverProducer {
         // to.
         let frontier = frontier_path(&store);
         let store = current_row_store(&store);
+        // The store opens a row at its seed stream's value and the drive restarts the row's
+        // accumulator at its reseed stream's, which is one stream behind a `FanOut`. The two
+        // are visible together once the store's frontier is inside the row the drive
+        // reseeded.
+        #[cfg(debug_assertions)]
+        if let Some((row, reseed)) = self.reseeded.take() {
+            match frontier.as_ref().and_then(Path::split_position) {
+                Some((rows, _)) if rows == &row[..] => {
+                    let seeds: Vec<Option<Value>> = self
+                        .read_keys
+                        .iter()
+                        .map(|k| store_seed_value(&store, k))
+                        .collect();
+                    debug_assert!(
+                        seeds
+                            .iter()
+                            .zip(&reseed)
+                            .all(|(s, r)| s.as_ref() == Some(r)),
+                        "a drive's reseed at a row is the store's seed for that row: row \
+                         {row:?} reseeded at {reseed:?}, the store seeded it at {seeds:?}"
+                    );
+                }
+                Some((rows, _)) if Path::from(rows.to_vec()) > row => {}
+                _ => self.reseeded = Some((row, reseed)),
+            }
+        }
 
         // The rows of one level the source will gain no more items beneath — one of the two
         // halves of a row being answerable as a whole, `folded` below being the other. Read
@@ -4845,6 +5107,20 @@ impl TileProducer for InductionDriverProducer {
                 e.split_position().map(|(rows, _)| rows)
                     != pos.split_position().map(|(rows, _)| rows)
             });
+            // Leaving a row is final: the drive never looks back, so a position the row
+            // gains afterwards would be dropped. So the next row starts only once the source
+            // calls this one complete, at its own level or any above it.
+            let left_open = boundary
+                && self
+                    .emitted_through
+                    .as_ref()
+                    .and_then(|e| e.split_position())
+                    .is_some_and(|(rows, _)| {
+                        !(0..rows.len()).any(|level| {
+                            source_complete_at(CurryLevel::new(level))
+                                .contains_path(&rows[..=level])
+                        })
+                    });
             let snapshot: Option<Vec<Value>> = self
                 .read_keys
                 .iter()
@@ -4865,14 +5141,19 @@ impl TileProducer for InductionDriverProducer {
                 None => Some(None),
                 Some(n) => n.pairs.get(&pos).cloned().map(Some),
             };
-            if let (Some(snapshot), Some(item), Some(enclosing)) =
-                (snapshot, by_path.get(&pos), enclosing)
+            if !left_open
+                && let (Some(snapshot), Some(item), Some(enclosing)) =
+                    (snapshot, by_path.get(&pos), enclosing)
             {
                 let (rows, at) = pos
                     .split_position()
                     .unwrap_or_else(|| unreachable!("a delivered path names a position"));
                 let inner = Position::new(at.clone());
                 let row = self.nested.is_some().then(|| Path::from(rows.to_vec()));
+                #[cfg(debug_assertions)]
+                if boundary && let Some(row) = &row {
+                    self.reseeded = Some((row.clone(), snapshot.clone()));
+                }
                 self.window
                     .push(snapshot, item.clone(), enclosing, row, inner.clone(), inner);
                 self.emitted_through = Some(pos);
@@ -5757,9 +6038,11 @@ impl TileOperator for TransactWriter {
         // owns the transaction source, so a request arriving on a live source
         // reaches this writer, and through it the commit cycle, along this edge.
         let dg = self.driver_op.tiling().universal_guard();
-        let driver_producer =
-            self.driver_op
-                .subscribe(dg, forwarding_consumer(&consumer), scheduler);
+        let driver_producer = self.driver_op.subscribe(
+            dg,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         Box::new(TransactWriterProducer {
             base: ProducerBase::new(TransactWriterProducer::alloc_id(), self.tiling()),
             store_producer,
@@ -6911,13 +7194,16 @@ mod tests {
         for row in 0..3u64 {
             engines.store_at(&[Value::UInt(row as usize)], &mut seed);
         }
-        // Rows 0 and 1 whole; row 2 only at its positions, which names no row.
+        // Rows 0 and 1 whole; row 2 only at its first position, which names part of it.
         engines.remove_covered(&TileGuard::Or(vec![
             TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
                 1,
             )))),
             TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
-                FunctionGuard::Domain(Predicate::True),
+                FunctionGuard::Domain(Predicate::qualified(
+                    Predicate::point(Value::UInt(2)),
+                    Predicate::at_or_below(Value::UInt(0)),
+                )),
             )))),
         ]));
         let left: Vec<&Value> = engines.rows().iter().map(|(row, _)| row).collect();
@@ -9073,6 +9359,18 @@ mod tests {
         assert!(!validate_tile(&store(Tile::Scalar(
             ColumnValue::from_ints(vec![1])
         ))));
+        // A position decided above the frontier, and one decided with no frontier at all.
+        let decided_through = |decided: Vec<usize>, frontier: Vec<usize>| Tile::Store {
+            state: Box::new(Tile::Record(HashMap::new())),
+            seed: Box::new(Tile::Record(HashMap::new())),
+            decided: Box::new(one_row_decided(ColumnValue::from_uints(decided))),
+            frontier: Box::new(one_row_decided(ColumnValue::from_uints(frontier))),
+            terminal: false,
+            closed_keys: Vec::new(),
+        };
+        assert!(validate_tile(&decided_through(vec![0, 1], vec![1])));
+        assert!(!validate_tile(&decided_through(vec![0, 2], vec![1])));
+        assert!(!validate_tile(&decided_through(vec![0], vec![])));
     }
     /// Two memo'd readers of one cyclic store both end at the final state, in whichever
     /// order they are pulled.
@@ -9187,5 +9485,438 @@ mod tests {
             vec![1, 3, 6],
             "the memo cached partially-decided folds instead of the accumulator"
         );
+    }
+
+    /// A fixture whose tile the test changes between pulls.
+    struct SharedSource {
+        tiling: Tiling,
+        tile: Rc<RefCell<Tile>>,
+    }
+    struct SharedSourceProducer {
+        base: ProducerBase,
+        tile: Rc<RefCell<Tile>>,
+    }
+    impl TileOperator for SharedSource {
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(SharedSourceProducer {
+                base: ProducerBase::new(SharedSourceProducer::alloc_id(), &self.tiling),
+                tile: self.tile.clone(),
+            })
+        }
+    }
+    impl TileProducer for SharedSourceProducer {
+        fn base(&self) -> &ProducerBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut ProducerBase {
+            &mut self.base
+        }
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            honoring_release(&self.tile.borrow(), self.obsolete_guard())
+        }
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A nested drive stays in a row until the source calls it complete: a position the row
+    /// gains after the drive left it would be below the cursor and never run.
+    #[test]
+    fn a_nested_drive_stays_in_a_row_until_it_is_complete() {
+        let acc = acct("acc");
+        let uint = Extent::Base(BaseType::UInt);
+        let pair_extent = Extent::Record(HashMap::from([
+            (tuple_field(0), uint.clone()),
+            (tuple_field(1), uint.clone()),
+        ]));
+        let pair = |r: usize, p: usize| {
+            Value::Record(HashMap::from([
+                (tuple_field(0), Value::UInt(r)),
+                (tuple_field(1), Value::UInt(p)),
+            ]))
+        };
+        // The curried source: rows 0 and 1, one position each, no row complete yet.
+        let source_of = |row0: Vec<usize>, items0: Vec<i64>| {
+            let n0 = row0.len();
+            let mut positions = row0;
+            positions.push(0);
+            let mut items = items0;
+            items.push(10);
+            Tile::data_function(
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::grouped(
+                    ColumnValue::UInts(vec![0, n0]),
+                    ColumnValue::from_uints(positions),
+                    Box::new(Tile::Scalar(ColumnValue::from_ints(items))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let source_tiling = Tiling::data_function(
+            uint.clone(),
+            Tiling::data_function(uint.clone(), Tiling::Scalar(value_extent())),
+        );
+        let source = Rc::new(RefCell::new(source_of(vec![0], vec![1])));
+        let pairs_tile = |values: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::from_values(vec![pair(0, 0), pair(0, 1), pair(1, 0)], &pair_extent),
+                Box::new(Tile::Scalar(ColumnValue::from_ints(values))),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let pairs_tiling =
+            Tiling::data_function(pair_extent.clone(), Tiling::Scalar(value_extent()));
+        let store_tiling = nested_store_tiling(uint.clone(), uint.clone(), store_values(&["acc"]));
+        let mut engines = Engines::unopened(&store_tiling);
+        let render = |e: &Engines| {
+            render_carrier_tile(e, &store_tiling, &[Predicate::False, Predicate::False])
+        };
+        let store = Rc::new(RefCell::new(render(&engines)));
+        let (nested, inner) = InductionDriver::nested_parts(
+            Box::new(SharedSource {
+                tiling: pairs_tiling.clone(),
+                tile: Rc::new(RefCell::new(pairs_tile(vec![100, 100, 200]))),
+            }),
+            vec![Box::new(SharedSource {
+                tiling: pairs_tiling,
+                tile: Rc::new(RefCell::new(pairs_tile(vec![0, 0, 0]))),
+            })],
+            Vec::new(),
+            value_extent(),
+            &pair_extent,
+        );
+        let mut driver = InductionDriver::new(
+            Box::new(SharedSource {
+                tiling: store_tiling.clone(),
+                tile: store.clone(),
+            }),
+            Box::new(SharedSource {
+                tiling: source_tiling,
+                tile: source.clone(),
+            }),
+            Some(nested),
+            vec![acc.clone()],
+            vec![value_extent()],
+            value_extent(),
+            inner,
+            None,
+        );
+        let g = driver.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = driver.subscribe(g, Box::new(|| {}), &mut sched);
+        let emitted = |t: &Tile| -> Vec<Vec<Value>> {
+            decided_paths(t)
+                .into_iter()
+                .map(|(p, _)| p.to_vec())
+                .collect()
+        };
+        let first = producer.get(producer.tiling().universal_guard());
+        assert_eq!(emitted(&first), vec![vec![Value::UInt(0), Value::UInt(0)]]);
+        // The store decides (0, 0).
+        engines
+            .store_at(&[Value::UInt(0)], &mut || {
+                CommitEngine::seeded_at(None, HashMap::from([(acc.clone(), int(0))]))
+            })
+            .step(pos(0), Some(HashMap::from([(acc.clone(), int(1))])));
+        *store.borrow_mut() = render(&engines);
+        sched.check_for_notifications();
+        let second = producer.get(producer.tiling().universal_guard());
+        let paths = emitted(&second);
+        assert!(
+            !paths.contains(&vec![Value::UInt(1), Value::UInt(0)]),
+            "the drive entered row 1 while the source had not called row 0 complete: {paths:?}"
+        );
+    }
+
+    /// A seed stand-in counting its pulls and recording what it was released.
+    struct CountingSeed {
+        tiling: Tiling,
+        value: Value,
+        gets: Rc<RefCell<usize>>,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+    struct CountingSeedProducer {
+        base: ProducerBase,
+        value: Value,
+        gets: Rc<RefCell<usize>>,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+    impl TileOperator for CountingSeed {
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(CountingSeedProducer {
+                base: ProducerBase::new(CountingSeedProducer::alloc_id(), &self.tiling),
+                value: self.value.clone(),
+                gets: self.gets.clone(),
+                released: self.released.clone(),
+            })
+        }
+    }
+    impl TileProducer for CountingSeedProducer {
+        fn base(&self) -> &ProducerBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut ProducerBase {
+            &mut self.base
+        }
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            *self.gets.borrow_mut() += 1;
+            if self.obsolete_guard().is_universal() {
+                return self.tiling().empty_tile();
+            }
+            Tile::Scalar(ColumnValue::single(self.value.clone()))
+        }
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
+    type Counters = (Rc<RefCell<usize>>, Rc<RefCell<Vec<TileGuard>>>);
+
+    fn counting_seed(init: i64) -> (CountingSeed, Counters) {
+        let gets = Rc::new(RefCell::new(0));
+        let released = Rc::new(RefCell::new(Vec::new()));
+        (
+            CountingSeed {
+                tiling: Tiling::Scalar(value_extent()),
+                value: int(init),
+                gets: gets.clone(),
+                released: released.clone(),
+            },
+            (gets, released),
+        )
+    }
+
+    /// A flat induction store reads its seed once, when it opens, and releases it there.
+    #[test]
+    fn an_open_induction_store_reads_and_releases_its_seed_once() {
+        let items = [1, 2, 3, 4, 5, 6];
+        let acc = acct("acc");
+        let (seed, (gets, released)) = counting_seed(0);
+        let store = InductionStore::new(
+            vec![(acc.clone(), Box::new(seed))],
+            vec![acc.clone()],
+            Vec::new(),
+            full_store_tiling(Extent::uint_range(items.len()), store_values(&["acc"])),
+            None,
+        );
+        let set_body = store.body_input_setter();
+        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let driver = InductionDriver::new(
+            fan.branch(),
+            Box::new(ItemSource::new(&items)),
+            None,
+            vec![acc.clone()],
+            vec![value_extent()],
+            value_extent(),
+            Extent::uint_range(items.len()),
+            None,
+        );
+        set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
+        let mut op = fan.branch();
+        let guard = op.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        // Pull until the store is open and has decided at least one position, but is
+        // not yet terminal.
+        let mut pulls_after_open = 0;
+        let mut gets_at_open = None;
+        for _ in 0..MAX_CYCLE_PULLS {
+            sched.check_for_notifications();
+            let t = producer.get(producer.tiling().universal_guard());
+            if store_frontier(&t).is_some() {
+                gets_at_open.get_or_insert(*gets.borrow());
+                pulls_after_open += 1;
+            }
+            if t.is_terminal() {
+                break;
+            }
+        }
+        let after = *gets.borrow() - gets_at_open.expect("the store opened");
+        assert_eq!(
+            after, 0,
+            "an open store reads its seed again on every pull ({after} extra reads over \
+             {pulls_after_open} pulls)"
+        );
+        assert!(
+            !released.borrow().is_empty(),
+            "an open store never released its seed stream"
+        );
+    }
+
+    /// A commit store releases its seed stream once it has opened on it.
+    #[test]
+    fn an_open_commit_store_releases_its_seed() {
+        let acc = acct("acc");
+        let (seed, (gets, released)) = counting_seed(7);
+        let mut op = CommitOperator::with_seed_ops(
+            vec![(acc.clone(), Box::new(seed))],
+            store_values(&["acc"]),
+            Vec::new(),
+        );
+        let g = op.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(g, Box::new(|| {}), &mut sched);
+        let mut last = None;
+        for _ in 0..4 {
+            sched.check_for_notifications();
+            last = Some(producer.get(producer.tiling().universal_guard()));
+        }
+        let last = last.unwrap();
+        assert!(last.is_terminal(), "a store with no writers is terminal");
+        assert_eq!(store_value_now(&last, &acc), Some(int(7)));
+        assert!(
+            !released.borrow().is_empty(),
+            "a terminal commit store has never released its seed stream (pulled {} times)",
+            gets.borrow()
+        );
+    }
+
+    /// A reclaim takes the prefix of decided positions the meet covers and stops at the
+    /// first it does not: a reader that released positions 0 and 2 still reads 1.
+    #[test]
+    fn a_reclaim_stops_at_the_first_position_still_read() {
+        let (fan, _acc) = induction_cycle(&[1, 2, 3, 4], i64::MIN, 0);
+        let mut reader = fan.branch();
+        let guard = reader.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
+        let tile = pull_to_terminal(&mut sched, &mut producer);
+        let Tile::Store { decided, .. } = &tile else {
+            panic!("a store")
+        };
+        assert_eq!(
+            store_decided_positions(decided, 0),
+            vec![pos(0), pos(1), pos(2), pos(3)]
+        );
+        // The drive has released through the frontier; this reader releases 0 and 2.
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::from_column_value(&ColumnValue::from_uints(vec![0, 2])),
+        )));
+        sched.check_for_notifications();
+        let tile = producer.get(producer.tiling().universal_guard());
+        let Tile::Store { decided, .. } = &tile else {
+            panic!("a store")
+        };
+        let now = store_decided_positions(decided, 0);
+        assert!(
+            now.contains(&pos(1)),
+            "position 1 was never released by this reader but left the domain: {now:?}"
+        );
+    }
+
+    /// A commit store's value stream reads a store whose clock prefix was reclaimed.
+    #[test]
+    fn a_commit_value_stream_reads_a_reclaimed_store() {
+        let acc = acct("acc");
+        let mut engine = CommitEngine::new(HashMap::from([(acc.clone(), int(100))]));
+        for v in [60, 50] {
+            let snap = engine.decided_watermark().unwrap().clone();
+            engine.attempt(Proposal {
+                snapshot: snap,
+                reads: HashMap::new(),
+                writes: HashMap::from([(acc.clone(), int(v))]),
+            });
+        }
+        engine.gc_released_prefix(&pos(1));
+        let store_tiling = store_tiling(&["acc"]);
+        let tile = engine.render_full_store_tile(&store_tiling);
+        let mut stream = StoreValueStream::new(
+            Box::new(FixedSource {
+                tiling: store_tiling,
+                tile,
+            }),
+            acc,
+            Extent::Base(BaseType::Int),
+            true,
+        );
+        let g = stream.tiling().universal_guard();
+        let mut p = stream.subscribe(g, Box::new(|| {}), &mut Scheduler::new());
+        let _ = p.get(p.tiling().universal_guard());
+    }
+
+    /// A record seed is the whole value only once each of its collection fields is complete.
+    #[test]
+    fn a_record_seed_waits_for_its_open_collection_field() {
+        let open = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10]))),
+            Predicate::at_or_below(Value::UInt(0)),
+            BitSet::new(),
+        );
+        let seed = Tile::Record(HashMap::from([
+            (tuple_field(0), open),
+            (
+                tuple_field(1),
+                Tile::Scalar(ColumnValue::from_ints(vec![0])),
+            ),
+        ]));
+        let got = seed_value(&seed);
+        assert!(
+            got.is_err(),
+            "a record seed with an open collection field seeded as {:?}",
+            got.ok()
+        );
+    }
+
+    /// A row's seed holding a collection is ready once the collection is whole, which a
+    /// complete key above says as well as its own level would: row 0's pair key is
+    /// complete, so its seed is whole though its own level states nothing; row 1's is not
+    /// and waits.
+    #[test]
+    fn a_row_seed_holding_a_collection_waits_until_it_is_whole() {
+        let pairs = |rows: Vec<usize>| {
+            let n = rows.len();
+            ColumnValue::Records(HashMap::from([
+                (tuple_field(0), ColumnValue::from_uints(rows)),
+                (tuple_field(1), ColumnValue::from_uints(vec![0; n])),
+            ]))
+        };
+        let seeds = |complete: Predicate| {
+            Tile::data_function(
+                pairs(vec![0, 1]),
+                Box::new(Tile::grouped(
+                    ColumnValue::from_uints(vec![0, 1]),
+                    ColumnValue::from_uints(vec![0, 0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                complete,
+                BitSet::new(),
+            )
+        };
+        let rows = |tile: &Tile| -> Vec<Path> {
+            let mut rows: Vec<Path> = decode_row_seeds(tile, 1)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect();
+            rows.sort();
+            rows
+        };
+        let row = |r: usize| Path::from(vec![Value::UInt(r)]);
+        assert_eq!(rows(&seeds(Predicate::True)), vec![row(0), row(1)]);
+        let first = Predicate::from_column_value(&pairs(vec![0]));
+        assert_eq!(rows(&seeds(first)), vec![row(0)]);
+        assert_eq!(rows(&seeds(Predicate::False)), Vec::<Path>::new());
     }
 }

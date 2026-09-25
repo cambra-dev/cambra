@@ -398,6 +398,59 @@ pub(crate) fn through_shared_levels(guard: TileGuard, levels: usize, input: &Til
     }
 }
 
+/// `guard`, released against a record of fields standing at `level` beneath collection
+/// levels every field shares, restated for the operand that holds field `field`: the shared
+/// levels pass through, and at the record the operand gets its own field's part.
+///
+/// A guard at the record naming it whole names every field whole, and one of another shape
+/// there names no field's part the operand can act on, so it waits. `operand` is the
+/// operand's own tiling.
+pub(crate) fn onto_record_field(
+    guard: TileGuard,
+    level: usize,
+    field: &str,
+    operand: &Tiling,
+) -> TileGuard {
+    fn walk(
+        guard: TileGuard,
+        depth: usize,
+        level: usize,
+        field: &str,
+        operand: &Tiling,
+    ) -> TileGuard {
+        if depth == level {
+            let values = operand.values_at(CurryLevel::new(depth));
+            return match guard {
+                g if g.is_universal() => values.universal_guard(),
+                TileGuard::Record(mut fields) => {
+                    fields.remove(field).unwrap_or_else(|| values.empty_guard())
+                }
+                TileGuard::Or(arms) => TileGuard::flatten_or(
+                    arms.into_iter()
+                        .map(|arm| walk(arm, depth, level, field, operand))
+                        .collect(),
+                ),
+                _ => values.empty_guard(),
+            };
+        }
+        match guard {
+            TileGuard::Or(arms) => TileGuard::flatten_or(
+                arms.into_iter()
+                    .map(|arm| walk(arm, depth, level, field, operand))
+                    .collect(),
+            ),
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+                FunctionGuard::Codomain(Box::new(walk(*inner, depth + 1, level, field, operand))),
+            ),
+            other => other,
+        }
+    }
+    match walk(TileGuard::flatten_or(vec![guard]), 0, level, field, operand) {
+        g if g.is_empty() => operand.empty_guard(),
+        g => g,
+    }
+}
+
 /// Whether two guards name the same place — the same nesting, down to the predicate.
 fn same_place(a: &TileGuard, b: &TileGuard) -> bool {
     match (a, b) {

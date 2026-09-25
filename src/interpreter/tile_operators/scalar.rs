@@ -602,14 +602,9 @@ struct VariantProjectProducer {
     empty_level: Option<Tile>,
 }
 
-impl TileProducer for VariantProjectProducer {
-    impl_producer_base!();
-
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("scrutinee", self.input.inspect(opts))
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+impl VariantProjectProducer {
+    /// The payloads of the scrutinee's rows carrying the tag.
+    fn project(&mut self) -> Tile {
         let tile = self.input.get(self.input.tiling().universal_guard());
         // Under standing levels the projection runs one enclosing row at a time: its keys
         // are the rows it keeps, and which rows those are is a fact about one group.
@@ -624,6 +619,25 @@ impl TileProducer for VariantProjectProducer {
             });
         }
         self.project_level(tile)
+    }
+}
+
+impl TileProducer for VariantProjectProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("scrutinee", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let mut out = self.project();
+        // Part of a payload released names no part of the scrutinee, so the scrutinee keeps
+        // the row and the payload is projected again on the next pull (`release_impl`);
+        // what the consumer let go is taken back out here.
+        if !self.base.obsolete_guard.is_empty() {
+            out.remove_guarded(self.base.obsolete_guard.clone());
+        }
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -642,6 +656,22 @@ impl TileProducer for VariantProjectProducer {
             && matches!(self.input.tiling(), Tiling::DataFunction { .. })
         {
             self.input.release(obsolete_guard);
+            return;
+        }
+        // Beneath standing levels the keys are the scrutinee's too, down to its values; the
+        // payload beneath them is not the scrutinee's variant, so only a release of all of it
+        // reaches the scrutinee's values.
+        if matches!(self.input.tiling(), Tiling::DataFunction { .. })
+            && !obsolete_guard.is_universal()
+            && !obsolete_guard.is_empty()
+        {
+            let input = self.input.tiling();
+            let guard = crate::interpreter::tiling::through_shared_levels(
+                obsolete_guard,
+                input.levels(),
+                input,
+            );
+            self.input.release(guard);
             return;
         }
         // Anything else is all-or-nothing: there is no other sub-region of the scrutinee

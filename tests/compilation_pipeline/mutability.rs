@@ -2362,6 +2362,30 @@ fn a_later_accumulator_seeds_from_a_long_loops_result(#[case] n: i64, #[case] ex
     );
 }
 
+/// A loop that runs no position answers with its seed, however many pulls the seed takes
+/// to settle: the body is done on the first pull, and the store still has to read the seed
+/// it answers with.
+#[rstest]
+#[case::filtered_empty("[z for z in [1, 2] if z > 5]")]
+#[case::literal_empty("[z for z in [1, 2] if z > 5 if z < 0]")]
+fn a_loop_that_runs_no_position_answers_with_a_late_seed(#[case] source: &str) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                a := 0
+                for x in [1, 2, 3]:
+                    a += x
+                b := a
+                for y in {source}:
+                    b += y
+                b
+            "#},
+            source = source,
+        ),
+        cambra::interpreter::Value::Int(6),
+    );
+}
+
 /// Two accumulators in one loop whose seeds settle on different pulls.
 ///
 /// `b` seeds from a loop that takes many pulls to reach its final; `c` seeds from a

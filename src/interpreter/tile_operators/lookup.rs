@@ -189,12 +189,12 @@ impl TileOperator for CheckedLookup {
                 let shared = shared_consumer(consumer);
                 let keys = keys.subscribe(
                     keys.tiling().universal_guard(),
-                    forwarding_consumer(&shared),
+                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                     scheduler,
                 );
                 let collection = collection.subscribe(
                     collection.tiling().universal_guard(),
-                    forwarding_consumer(&shared),
+                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                     scheduler,
                 );
                 ProducerSource::Split { collection, keys }

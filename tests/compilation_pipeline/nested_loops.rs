@@ -1064,3 +1064,272 @@ fn a_guard_every_row_passes_leaves_the_nest_unchanged() {
         Value::Int(39),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Order, branches, and the enclosing body's bindings
+// ---------------------------------------------------------------------------
+
+/// A nest runs its positions in order, row by row: a non-commutative write shows the order,
+/// which a symmetric `+=` over symmetric sources cannot.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::depth_two(
+    indoc! {r#"
+        s := ""
+        for x in ["a", "b"]:
+            for y in ["1", "2"]:
+                s := s + x + y
+        s
+    "#},
+    "a1a2b1b2"
+)]
+#[case::depth_three(
+    indoc! {r#"
+        s := ""
+        for x in ["a", "b"]:
+            for y in ["1", "2"]:
+                for z in ["p", "q"]:
+                    s := s + x + y + z
+        s
+    "#},
+    "a1pa1qa2pa2qb1pb1qb2pb2q"
+)]
+fn a_nest_runs_its_positions_in_order(#[case] program: &str, #[case] expected: &str) {
+    check_scalar(program, Value::String(expected.into()));
+}
+
+/// An inner loop may write a variable the enclosing body introduced without reading it:
+/// each enclosing row's `y` ends at the inner loop's last write, 20.
+#[test]
+fn an_inner_loop_may_write_a_variable_it_never_reads() {
+    check_scalar(
+        indoc! {r"
+            t := 0
+            for i in [1, 2]:
+                y := 0
+                for j in [10, 20]:
+                    y := j
+                t += y
+            t
+        "},
+        Value::Int(40),
+    );
+}
+
+/// An inner loop inside a branch reads what the branch bound, and a feed after it in the
+/// branch reads what it left: only `x = 2` runs the branch.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// (10 + 4) + (20 + 4).
+#[case::a_binding_of_the_branch(
+    indoc! {r"
+        s := 0
+        for x in [1, 2]:
+            if x > 1:
+                z = x * 2
+                for y in [10, 20]:
+                    s += y + z
+        s
+    "},
+    38
+)]
+// `s` is 30 after the inner loop, and the branch feeds it once.
+#[case::a_feed_after_the_inner_loop(
+    indoc! {r"
+        s := 0
+        o = defer()
+        for x in [1, 2]:
+            if x > 1:
+                for y in [10, 20]:
+                    s += y
+                o << s
+        s + sum(o)
+    "},
+    60
+)]
+fn an_inner_loop_inside_a_branch_sees_the_branch(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A seed of the inner loop reads a binding of the enclosing body: the seed runs over the
+/// `(enclosing, position)` pairs, and the binding is lifted onto them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Row 1 seeds 10 and ends at 13; row 2 seeds 20 and ends at 23.
+#[case::an_overwritten_accumulator(
+    indoc! {r"
+        total := 0
+        for x in [1, 2]:
+            a = x * 10
+            total := a
+            for y in [1, 2]:
+                total += y
+        total
+    "},
+    23
+)]
+// 13 + 23.
+#[case::a_variable_introduced_between_the_loops(
+    indoc! {r"
+        total := 0
+        for x in [1, 2]:
+            a = x * 10
+            inner := a
+            for y in [1, 2]:
+                inner += y
+            total += inner
+        total
+    "},
+    36
+)]
+fn an_inner_seed_reads_a_binding_of_the_enclosing_body(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A collection bound in the enclosing body and read inside the inner loop: the binding is
+/// paired with each enclosing row's inner keys at the level the inner loop adds, beneath
+/// which it keeps its own. (2 + 1) + (2 + 2) + (4 + 1) + (4 + 2), with `sum(a)` 3 then 6.
+#[test]
+fn a_collection_bound_in_the_enclosing_body_is_read_inside_the_nest() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for x in [1, 2]:
+                a = [x * k for k in [1, 2]]
+                for y in [1, 2]:
+                    total += sum(a) + y
+            total
+        "},
+        Value::Int(24),
+    );
+}
+
+/// A write between the loops that reads the enclosing binder, rather than a constant.
+#[test]
+fn a_write_between_the_loops_may_read_the_enclosing_binder() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for x in [1, 2]:
+                total += x
+                for y in [10, 20]:
+                    total += y
+            total
+        "},
+        Value::Int(63),
+    );
+}
+
+/// A write between the loops that only some enclosing rows make.
+#[test]
+fn a_conditional_write_between_the_loops_seeds_each_inner_run() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for x in [1, 2, 3]:
+                if x > 1:
+                    total += 10
+                for y in [1, 2]:
+                    total += y
+            total
+        "},
+        Value::Int(29),
+    );
+}
+
+/// The same, writing the binder where the condition holds.
+#[test]
+fn a_conditional_write_between_the_loops_may_read_the_enclosing_binder() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for x in [1, 2, 3]:
+                if x > 1:
+                    total += x
+                for y in [10, 20]:
+                    total += y
+            total
+        "},
+        Value::Int(95),
+    );
+}
+
+/// A seed zipping two computed legs, the carried value and a binding of the enclosing
+/// body: converted at the carrier's level, since the pairs it reads are flattened.
+#[test]
+fn an_inner_seed_combines_the_carried_value_with_an_enclosing_binding() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for x in [1, 2]:
+                a = x * 10
+                total := total * 2 + a
+                for y in [1, 2]:
+                    total += y * x
+            total
+        "},
+        Value::Int(52),
+    );
+}
+
+/// The nested shapes #242's lowering admits, run: a `yield` in the inner loop feeds the
+/// enclosing generator once per inner iteration (10, 30, 50, 90); each branch's own `y`;
+/// a pass-by-reference writer on a body-introduced variable (3 then 4); two sibling inner
+/// loops; and writes on both sides of an inner loop.
+#[rstest]
+#[case::a_yield_in_the_inner_loop(indoc! {r"
+    def g(xs):
+        acc := 0
+        for x in xs:
+            for y in [10, 20]:
+                acc += y * x
+                yield acc
+    sum(g([1, 2]))
+"}, 180)]
+#[case::the_same_name_introduced_in_both_branches(indoc! {r"
+    t := 0
+    for i in [1, 2]:
+        if i > 1:
+            y := 0
+            for k in [10, 20]:
+                y += k
+            t += y
+        else:
+            y := 100
+            for k in [1]:
+                y += k
+            t += y
+    t
+"}, 131)]
+#[case::a_writer_call_on_a_body_introduced_variable(indoc! {r"
+    def bump(c: Mut(Int)):
+        c += 1
+    t := 0
+    for i in [1, 2]:
+        y := i
+        for k in [10, 20]:
+            bump(y)
+        t += y
+    t
+"}, 7)]
+#[case::two_sibling_inner_loops(indoc! {r"
+    s := 0
+    for x in [1, 2]:
+        for y in [10, 20]:
+            s += y
+        for z in [100]:
+            s += z
+    s
+"}, 260)]
+#[case::writes_before_and_after_an_inner_loop(indoc! {r"
+    s := 0
+    for x in [1, 2]:
+        s += x
+        for y in [10, 20]:
+            s += y
+        s += 1000
+    s
+"}, 2063)]
+fn the_shapes_lowering_admits_run(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}

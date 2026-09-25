@@ -2,7 +2,7 @@ use bit_set::BitSet;
 use bit_vec::BitVec;
 use log::trace;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::interpreter::nest_levels;
@@ -383,7 +383,12 @@ impl TileProducer for MapExtractAggregateProducer {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            g @ (TileGuard::Function(_) | TileGuard::Or(_)) => g,
+            // What sits under the innermost level is the extract, not the input's
+            // aggregation, so only a release of all of it reaches the input's values.
+            g @ (TileGuard::Function(_) | TileGuard::Or(_)) => {
+                let input = self.input.tiling();
+                crate::interpreter::tiling::through_shared_levels(g, input.levels(), input)
+            }
             g => unreachable!("MapExtractAggregate's tiling is a collection, released by {g:?}"),
         });
     }
@@ -431,7 +436,8 @@ fn build_levels_from_paths(
     let mut starts: Vec<Vec<usize>> = vec![Vec::new(); depth.saturating_sub(1)];
     let mut last: Vec<Option<Vec<Value>>> = vec![None; depth];
     for path in paths {
-        for level in 0..depth {
+        // A path may stop short of the innermost level: a key standing with nothing beneath.
+        for level in 0..path.len() {
             let prefix = &path[..=level];
             if last[level].as_deref() == Some(prefix) {
                 continue;
@@ -580,6 +586,7 @@ impl TileOperator for MapAggregate {
             input: input_producer,
             kind: self.kind,
             accumulators: HashMap::new(),
+            standing: HashSet::new(),
         })
     }
 }
@@ -593,6 +600,11 @@ struct MapAggregateProducer {
     kind: AggregateKind,
     /// Running per-key accumulators, grown as new keys arrive across `get` calls.
     accumulators: HashMap<Vec<Value>, Tile>,
+    /// Keys above the accumulators whose every accumulator was released without the key
+    /// itself: a key is there only through what it maps to, and a release naming part of
+    /// what lies beneath leaves it standing, holding nothing unreleased
+    /// (`src/interpreter/design-operators.md`, "The completeness contract").
+    standing: HashSet<Vec<Value>>,
 }
 
 impl TileProducer for MapAggregateProducer {
@@ -705,8 +717,27 @@ impl TileProducer for MapAggregateProducer {
             accumulator: Box::new(accumulator),
             terminal: ColumnValue::Bools(terminal),
         };
-        let paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
-        build_levels_from_paths(&paths, &extents, aggregation, domain_predicate)
+        let mut paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
+        paths.extend(
+            self.standing
+                .iter()
+                .filter(|key| !entries.iter().any(|(path, _)| path.starts_with(key)))
+                .map(Vec::as_slice),
+        );
+        paths.sort_by(|a, b| compare_paths(a, b));
+        let mut out = build_levels_from_paths(&paths, &extents, aggregation, domain_predicate);
+        // Each level beneath the outermost holds the input's keys at that level, so it
+        // states what the input's does there: a group settles once some level on its path
+        // is complete, and a level saying nothing would leave it looking open downstream.
+        for (level, stated) in level_predicates.into_iter().enumerate().skip(1) {
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = out.values_at_mut(CurryLevel::new(level))
+            {
+                *domain_predicate = stated;
+            }
+        }
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -719,15 +750,39 @@ impl TileProducer for MapAggregateProducer {
             g if g.is_empty() => {}
             g if g.is_universal() => {
                 self.accumulators.clear();
+                self.standing.clear();
                 self.input.release(self.input.tiling().universal_guard());
             }
             // The guard is a region over the accumulators' own paths, whatever shape it
             // names it at, so it is read at each of them rather than matched arm by arm.
             // Keeping a released path would re-emit it on the next pull, `get_impl`
             // building its output from every accumulator it holds.
+            // The input carries the aggregated level where the output holds each group's
+            // accumulator, so a region of the output's keys passes through and only a
+            // release of a whole accumulator reaches the group beneath its key.
             g => {
+                let released: Vec<Vec<Value>> = self
+                    .accumulators
+                    .keys()
+                    .filter(|path| g.covers_path(path))
+                    .cloned()
+                    .collect();
                 self.accumulators.retain(|path, _| !g.covers_path(path));
-                self.input.release(g);
+                for path in released {
+                    for len in 1..path.len() {
+                        let key = &path[..len];
+                        if !g.covers_path(key) {
+                            self.standing.insert(key.to_vec());
+                        }
+                    }
+                }
+                self.standing.retain(|key| !g.covers_path(key));
+                let levels = self.tiling().levels();
+                let input = self.input.tiling();
+                self.input
+                    .release(crate::interpreter::tiling::through_shared_levels(
+                        g, levels, input,
+                    ));
             }
         }
     }
@@ -849,6 +904,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
+            standing: HashSet::new(),
         };
 
         let first = producer.get(out_tiling.universal_guard());
@@ -932,6 +988,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
+            standing: HashSet::new(),
         };
         producer.get(out_tiling.universal_guard());
         assert!(
@@ -951,6 +1008,76 @@ mod tests {
             released.borrow().contains(&key_two),
             "the per-key release must reach the input, got {:?}",
             released.borrow()
+        );
+    }
+
+    /// A group the input settles at an inner level is stated settled at the same level of
+    /// the output, which holds the input's keys there.
+    #[test]
+    fn map_aggregate_states_a_settled_group_at_its_own_level() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+        );
+        // Outer row 0 is open; the level beneath calls key 0 under row 0 complete, so the
+        // group at (0, 0) is whole.
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::grouped(
+                    ColumnValue::from_uints(vec![0]),
+                    ColumnValue::from_uints(vec![0, 1]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::qualified(Predicate::point(Value::UInt(0)), Predicate::True),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let (spy, _released) = QuietSpy::new(tile, in_tiling);
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::Aggregation {
+                    kind: AggregateKind::Sum,
+                    accumulator: Box::new(Tiling::Scalar(int())),
+                },
+            ),
+        );
+        let mut producer = MapAggregateProducer {
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+            standing: HashSet::new(),
+        };
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::Aggregation { terminal, .. } = out.values_at(CurryLevel::new(2)) else {
+            panic!("the fold sits beneath two levels, got {out:?}")
+        };
+        assert_eq!(
+            terminal,
+            &ColumnValue::Bools(BitVec::from_elem(1, true)),
+            "the any-level rule settles the group: {out:?}"
+        );
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = out.values_at(CurryLevel::new(1))
+        else {
+            panic!("the output's second level is a collection, got {out:?}")
+        };
+        assert!(
+            domain_predicate.contains_path(&[Value::UInt(0), Value::UInt(0)]),
+            "the input settles (0, 0) at this level, and the output says nothing: \
+             {domain_predicate:?}"
         );
     }
 }

@@ -223,23 +223,46 @@ impl Tile {
 
     /// Check whether this tile could have been produced by `tiling`.
     pub fn check_from(&self, tiling: &Tiling) -> bool {
+        self.check_from_over(tiling, &[])
+    }
+
+    /// [`check_from`](Self::check_from) for a tile standing beneath collection levels over
+    /// `levels`, outermost first: what each level's statement names is a path through them.
+    fn check_from_over(&self, tiling: &Tiling, levels: &[Extent]) -> bool {
         match (self, tiling) {
             (Tile::Scalar(cv), Tiling::Scalar(extent)) => cv.is_compatible_with_extent(extent),
+            // A record's fields stand at the record's own level.
             (Tile::Record(tile_fields), Tiling::Record(tiling_fields)) => {
                 tile_fields.len() == tiling_fields.len()
-                    && tile_fields
-                        .iter()
-                        .all(|(k, t)| tiling_fields.get(k).is_some_and(|s| t.check_from(s)))
+                    && tile_fields.iter().all(|(k, t)| {
+                        tiling_fields
+                            .get(k)
+                            .is_some_and(|s| t.check_from_over(s, levels))
+                    })
             }
             (
                 Tile::DataFunction {
                     domain: key_column,
                     codomain: value_tile,
+                    domain_predicate,
                     ..
                 },
                 Tiling::DataFunction { domain, codomain },
-            ) => key_column.is_compatible_with_extent(domain) && value_tile.check_from(codomain),
-            (Tile::Aggregation { .. }, Tiling::Aggregation { .. }) => true,
+            ) => {
+                let levels = [levels, std::slice::from_ref(domain)].concat();
+                key_column.is_compatible_with_extent(domain)
+                    && domain_predicate.is_applicable_over(&levels)
+                    && value_tile.check_from_over(codomain, &levels)
+            }
+            (
+                Tile::Aggregation {
+                    kind, accumulator, ..
+                },
+                Tiling::Aggregation {
+                    kind: tiled,
+                    accumulator: accumulator_tiling,
+                },
+            ) => kind == tiled && accumulator.check_from_over(accumulator_tiling, levels),
             // The state is a changelog per key, which is what the tiling's own
             // `store_state` spells out; checking against that checks each key's change
             // ticks against the commit domain and its values against that key's tiling.
@@ -543,6 +566,12 @@ impl Tile {
                     *s_seed = o_seed;
                 } else if !whole {
                     s_seed.merge_part(*o_seed, false);
+                } else {
+                    debug_assert!(
+                        o_seed.is_empty() || *s_seed == o_seed,
+                        "a store's seed is fixed for its whole life: two arrivals of one \
+                         store carry the same seed, got {s_seed:?} and {o_seed:?}"
+                    );
                 }
                 // A whole store's two halves describe its one row, which has got as far as
                 // the later of them. Rows under a collection follow one another, as the
@@ -1589,6 +1618,34 @@ impl Tile {
         codomain.retain_paths_under(depth - 1, survivors, keep);
     }
 
+    /// A level appended beneath level `at`, in place of the values `at` holds, for groups
+    /// that may still gain keys: `level` builds it from those values, as in
+    /// [`append_level`](Self::append_level), and level `at`'s `domain_predicate` is left as the
+    /// caller stated it. A later tile adding to a group re-states its key, which
+    /// [`Tile::merge`] merges into the group.
+    ///
+    /// Beneath a stated level rather than the innermost one, because the values there may be
+    /// collections of their own: pairing a row whose value is a collection puts the new level
+    /// between the row and that collection.
+    pub fn append_open_level_beneath(
+        mut self,
+        at: CurryLevel,
+        level: impl FnOnce(Tile) -> Tile,
+    ) -> Tile {
+        let slot = self.values_at_mut(CurryLevel::new(at.index() + 1));
+        let built = level(std::mem::replace(slot, Tile::Record(HashMap::new())));
+        assert!(
+            matches!(
+                &built,
+                Tile::DataFunction { domain_predicate: Predicate::False, deleted, .. }
+                    if deleted.is_empty()
+            ),
+            "an appended level names no complete keys and has removed nothing: {built:?}"
+        );
+        *slot = built;
+        self
+    }
+
     /// This collection with `level` appended below its innermost one.
     ///
     /// `level` builds that level out of the values the tile arrives with, which is the data
@@ -1601,16 +1658,13 @@ impl Tile {
     /// the base case and each append gives another — which is what lets correlated
     /// comprehensions nest to any depth.
     ///
-    /// **Every group the level names is whole.** A key's group is one contiguous run of the
-    /// level below, so no later tile can add to it: [`Tile::merge`] runs whole subtrees
-    /// together under new keys and never reaches inside an existing group. A caller holding
-    /// part of a group has nothing to append yet.
-    ///
-    /// The **innermost** level's `domain_predicate` follows from that — the new level sits
-    /// beneath it, so each of its keys present is final together with the group opened
-    /// under it, unioned with the region the arriving tile already called final. The levels
-    /// above keep their own predicates: a row of one of them is complete once the level
-    /// beneath it will gain no more keys, which appending says nothing about.
+    /// **Every group the level names is whole**, so the **innermost** level's
+    /// `domain_predicate` gains each key present: the new level sits beneath it, so each key
+    /// is final together with the group opened under it, unioned with the region the arriving
+    /// tile already called final. A caller whose groups may still gain keys appends with
+    /// [`append_open_level_beneath`](Self::append_open_level_beneath) instead, which states nothing more.
+    /// The levels above keep their own predicates: a row of one of them is complete once the
+    /// level beneath it will gain no more keys, which appending says nothing about.
     pub fn append_level(mut self, level: impl FnOnce(Tile) -> Tile) -> Tile {
         assert!(
             self.is_data_function(),
@@ -1788,15 +1842,14 @@ impl Tile {
             }
         }
         let head = domain.index_at(last);
-        if !codomain.holds_a_level() {
-            return Some(vec![head]);
+        // A prefix of a union domain names the tags ordered before the head's whole, which a
+        // union predicate cannot say (`Predicate::at_or_below`), so there is none to give.
+        if matches!(head, Value::Union { .. }) {
+            return None;
         }
-        let mut group = (**codomain).clone();
-        group.retain_rows(&BitVec::from_fn(domain.len(), |i| i == last));
-        let mut path = vec![head.clone()];
-        // The group is the last row's alone, so that row's path is what its keys extend.
-        // Only that one path, not every key's: building them all costs a `Value` per key,
-        // which for a record-keyed domain is a fresh map per key.
+        // The row holding the last key, whose path its keys extend. Only that one path, not
+        // every key's: building them all costs a `Value` per key, which for a record-keyed
+        // domain is a fresh map per key.
         let owner = (0..row_paths.len())
             .rev()
             .find(|row| {
@@ -1804,6 +1857,32 @@ impl Tile {
                 (from..to).contains(&last)
             })
             .unwrap_or(0);
+        // The prefix names every key below the head, held or not, so each one it has not
+        // been handed has to be one that never arrives: the statement calls it complete. A
+        // held key whose value is a scalar is whole already, so holding it is enough.
+        let before_head = Predicate::qualified(
+            Predicate::exactly(&row_paths[owner]),
+            Predicate::below(head.clone()),
+        );
+        let settled_or_held = match codomain.holds_a_level() {
+            true => domain_predicate.clone(),
+            false => {
+                let (from, to) = self.row_run(owner);
+                domain_predicate.union(&Predicate::qualified(
+                    Predicate::exactly(&row_paths[owner]),
+                    Predicate::from_column_value(&domain.select_indices(from..to, to - from)),
+                ))
+            }
+        };
+        if !settled_or_held.subsumes(&before_head) {
+            return None;
+        }
+        if !codomain.holds_a_level() {
+            return Some(vec![head]);
+        }
+        let mut group = (**codomain).clone();
+        group.retain_rows(&BitVec::from_fn(domain.len(), |i| i == last));
+        let mut path = vec![head.clone()];
         let mut below = row_paths[owner].clone();
         below.push(head.clone());
         path.extend(group.held_prefix(std::slice::from_ref(&below))?);
@@ -1901,12 +1980,6 @@ pub fn nest_levels(
     built
 }
 
-/// Whether `tile` is well formed as a whole value.
-///
-/// Nothing pins the row count at the top level: a tile there carries its own rows, as a
-/// `Scalar(Union)` stream does when its keys are the column's positions. Every depth below
-/// is pinned — a collection's values stand at its key count, and a record's fields at the
-/// rows the record does — and that pairing is what this checks.
 /// A store's frontier over its rows, from each row's watermark: a run holding the one
 /// position that row is decided through, or nothing for a row decided through none.
 pub(crate) fn store_frontier_rows(
@@ -2352,10 +2425,14 @@ fn store_change_positions(state: &Tile) -> Predicate {
 ///
 /// Checks the row counts [`Tile::DataFunction`] states, and nothing else.
 fn valid_over(tile: &Tile, rows: usize) -> bool {
-    valid_over_settled(tile, rows, false)
+    // One row is the root, reached by the empty path; several stand under paths this call
+    // does not know, so a statement naming a path cannot be read there.
+    let paths = (rows == 1).then(|| vec![Vec::new()]);
+    valid_over_settled(tile, rows, paths.as_deref(), &Predicate::False, &[])
 }
 
-/// [`valid_over`], knowing whether the level above has called any of these rows settled.
+/// [`valid_over`], knowing which of these rows the level above has called settled
+/// (`settled`, one flag per row, or none where nothing above is known).
 ///
 /// A column that has not arrived is empty rather than `rows` long — what a producer emits
 /// before it has an answer and a consumer reads as "not ready" — so a record field may be
@@ -2364,15 +2441,26 @@ fn valid_over(tile: &Tile, rows: usize) -> bool {
 /// beneath one is not "not yet" but a value that is never coming, and the two are the same
 /// spelling only if the completion statement is ignored. Caught here rather than at the
 /// merge that trips over it, which sees two tiles and not the producer of either.
-fn valid_over_settled(tile: &Tile, rows: usize, any_settled: bool) -> bool {
+///
+/// `row_paths` is the path reaching each row where it is known, and `above` what the levels
+/// above call complete over whole paths: completeness is downward-closed, so a key beneath a
+/// complete one is settled whatever its own level says.
+fn valid_over_settled(
+    tile: &Tile,
+    rows: usize,
+    row_paths: Option<&[Vec<Value>]>,
+    above: &Predicate,
+    settled: &[bool],
+) -> bool {
     match tile {
+        // A column is there for every row or not yet: it cannot be absent for some rows only.
         Tile::Scalar(cv) => match cv.is_empty() {
-            true => !any_settled || rows == 0,
+            true => !settled.contains(&true) || rows == 0,
             false => cv.len() == rows,
         },
         Tile::Record(fields) => fields
             .values()
-            .all(|t| valid_over_settled(t, rows, any_settled)),
+            .all(|t| valid_over_settled(t, rows, row_paths, above, settled)),
         Tile::DataFunction {
             row_starts,
             domain,
@@ -2403,17 +2491,53 @@ fn valid_over_settled(tile: &Tile, rows: usize, any_settled: bool) -> bool {
             }) {
                 return false;
             }
-            let settled = (0..domain.len())
-                .any(|key| domain_predicate.contains_path(&[domain.index_at(key)]));
-            valid_over_settled(codomain, domain.len(), settled)
+            let key_paths = row_paths.map(|paths| tile.key_paths(paths));
+            // Which keys are settled, each on its own: a row beneath one is a row the level
+            // above calls complete.
+            let (settled, complete): (Vec<bool>, Predicate) = match &key_paths {
+                Some(paths) => {
+                    let complete = Predicate::qualified(above.clone(), Predicate::True)
+                        .union(domain_predicate);
+                    (
+                        paths.iter().map(|p| complete.contains_path(p)).collect(),
+                        complete,
+                    )
+                }
+                // With no paths, only a statement naming no path can be read.
+                None => (
+                    (0..domain.len())
+                        .map(|key| {
+                            !domain_predicate.qualifies()
+                                && domain_predicate.contains(&domain.index_at(key))
+                        })
+                        .collect(),
+                    Predicate::False,
+                ),
+            };
+            valid_over_settled(
+                codomain,
+                domain.len(),
+                key_paths.as_deref(),
+                &complete,
+                &settled,
+            )
         }
         Tile::Aggregation {
             accumulator,
             terminal,
             ..
         } => {
+            // A row beneath a settled key has its whole group, so its fold has finished.
             accumulator.rows() == terminal.len()
-                && (accumulator.is_empty() || accumulator.rows() == rows)
+                && match accumulator.is_empty() {
+                    true => !settled.contains(&true) || rows == 0,
+                    false => {
+                        accumulator.rows() == rows
+                            && settled.iter().enumerate().all(|(r, settled)| {
+                                !settled || terminal.index_at(r) == Value::Bool(true)
+                            })
+                    }
+                }
         }
         // A store is its **domain** — the positions it decided, strictly ascending — and
         // a record of per-key changelogs sparse against it, each a collection over the
@@ -2428,10 +2552,37 @@ fn valid_over_settled(tile: &Tile, rows: usize, any_settled: bool) -> bool {
             state,
             seed,
             decided,
+            frontier,
             ..
         } => {
             let Tile::Record(keys) = &**state else {
                 return false;
+            };
+            // A row is decided through one watermark or none, and every position it has
+            // decided lies at or below it.
+            let within_frontier = |r: usize| {
+                let (from, to) = frontier.row_run(r);
+                let Tile::DataFunction {
+                    domain: watermarks, ..
+                } = &**frontier
+                else {
+                    return false;
+                };
+                let (start, end) = decided.row_run(r);
+                let Tile::DataFunction {
+                    domain: positions, ..
+                } = &**decided
+                else {
+                    return false;
+                };
+                match to - from {
+                    0 => start == end,
+                    1 => {
+                        let watermark = Position::new(watermarks.index_at(from));
+                        (start..end).all(|i| Position::new(positions.index_at(i)) <= watermark)
+                    }
+                    _ => false,
+                }
             };
             // Ascending **within a row**: a store per enclosing row decides its own
             // positions in its own order, and two rows' positions never interleave
@@ -2451,6 +2602,8 @@ fn valid_over_settled(tile: &Tile, rows: usize, any_settled: bool) -> bool {
                 && valid_over(state, rows)
                 && valid_over(seed, rows)
                 && valid_over(decided, rows)
+                && valid_over(frontier, rows)
+                && (0..rows).all(within_frontier)
                 && keys.values().all(ascends_per_row)
         }
     }
@@ -2711,6 +2864,34 @@ mod tests {
             let guard = tile.to_guard();
             assert!(guard.check_from(&tiling), "{guard:?} against {tiling}");
         }
+    }
+
+    /// An empty column beneath a key its level calls settled is invalid, whether the
+    /// statement names the key alone or by the path that reaches it.
+    #[test]
+    fn an_empty_column_under_a_settled_key_is_invalid_by_its_path() {
+        let tile = |inner_statement: Predicate| Tile::DataFunction {
+            row_starts: ColumnValue::from_uints(vec![0]),
+            domain: ColumnValue::from_uints(vec![0]),
+            codomain: Box::new(Tile::DataFunction {
+                row_starts: ColumnValue::from_uints(vec![0]),
+                domain: ColumnValue::from_uints(vec![5]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+                domain_predicate: inner_statement,
+                deleted: BitSet::new(),
+            }),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        };
+        assert!(
+            !valid_over(&tile(Predicate::True), 1),
+            "an unqualified statement settles key 5, so its empty column is invalid"
+        );
+        let qualified = Predicate::qualified(Predicate::point(Value::UInt(0)), Predicate::True);
+        assert!(
+            !valid_over(&tile(qualified), 1),
+            "the same key settled under row 0 by a qualified statement"
+        );
     }
 
     /// Completeness is downward-closed, so a group taken out beneath a key the outermost
@@ -4189,13 +4370,35 @@ mod tests {
         let tile = two_level_uint_int(
             vec![0],
             vec![0],
-            vec![10, 11],
+            vec![0, 1],
             vec![100, 110],
             Predicate::False,
         );
         assert_eq!(
             tile.to_guard(),
-            domain_prefix(vec![Value::UInt(0), Value::UInt(11)])
+            domain_prefix(vec![Value::UInt(0), Value::UInt(1)])
+        );
+    }
+
+    /// Keys below the first one held may still arrive — a group's keys need not come in
+    /// order — so what is held is no prefix, and the guard names the keys held alone.
+    #[test]
+    fn to_guard_names_no_prefix_over_keys_that_have_not_arrived() {
+        let tile = two_level_uint_int(
+            vec![0],
+            vec![0],
+            vec![10, 11],
+            vec![100, 110],
+            Predicate::False,
+        );
+        let guard = tile.to_guard();
+        assert!(
+            guard.covers_path(&[Value::UInt(0), Value::UInt(11)]),
+            "{guard:?}"
+        );
+        assert!(
+            !guard.covers_path(&[Value::UInt(0), Value::UInt(5)]),
+            "{guard:?}"
         );
     }
 
@@ -4205,17 +4408,17 @@ mod tests {
     /// them under the whole group too.
     #[test]
     fn to_guard_two_levels_names_the_path_past_a_whole_group() {
-        // Groups 0 and 1, both keyed 10 and 11; the predicate calls group 0 whole.
+        // Groups 0 and 1, both keyed 0 and 1; the predicate calls group 0 whole.
         let tile = two_level_uint_int(
             vec![0, 1],
             vec![0, 2],
-            vec![10, 11, 10, 11],
+            vec![0, 1, 0, 1],
             vec![100, 110, 200, 210],
             Predicate::at_or_below(Value::UInt(0)),
         );
         assert_eq!(
             tile.to_guard(),
-            domain_prefix(vec![Value::UInt(1), Value::UInt(11)])
+            domain_prefix(vec![Value::UInt(1), Value::UInt(1)])
         );
     }
 
