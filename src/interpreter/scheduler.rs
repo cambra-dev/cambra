@@ -152,24 +152,69 @@ other's subscribers",
         self.wakeups.clone()
     }
 
-    pub fn check_for_notifications(&mut self) {
-        self.source_handles
-            .values_mut()
-            .for_each(|(source, consumers)| {
-                // Prune first, so a source whose every subscriber is gone stops
-                // accumulating dead registrations across program reloads.
-                consumers.retain(|c| c.strong_count() > 0);
-                if source.borrow_mut().check_for_new_data() {
-                    for consumer in consumers.iter().filter_map(Weak::upgrade) {
-                        consumer.borrow_mut().notify();
-                    }
-                }
-            });
+    /// Pull what each source has received into its buffer, and return the
+    /// consumers to wake, without waking them.
+    ///
+    /// No consumer is notified, so no `get` runs and nothing is released. A
+    /// source's retained window read between this and [`deliver`](Self::deliver)
+    /// holds this pass's arrivals. After `deliver`, a sink has pulled them and a
+    /// `Memo` may have released them.
+    pub fn poll_sources(&mut self) -> Delivery {
+        let mut woken = Vec::new();
+        for (source, consumers) in self.source_handles.values_mut() {
+            // Prune first, so a source whose every subscriber is gone stops
+            // accumulating dead registrations across program reloads.
+            consumers.retain(|c| c.strong_count() > 0);
+            if source.borrow_mut().check_for_new_data() {
+                woken.extend(consumers.iter().filter_map(Weak::upgrade));
+            }
+        }
+        Delivery(woken)
+    }
+
+    /// Notify the consumers a [`poll_sources`](Self::poll_sources) found data
+    /// for, then the deferred wakeups. A sink pulls here.
+    pub fn deliver(&mut self, mut delivery: Delivery) {
+        for consumer in std::mem::take(&mut delivery.0) {
+            consumer.borrow_mut().notify();
+        }
         // Deliver deferred wakeups now — outside any `get`, so a notification
         // that fans through the cyclic operator graph does not re-enter an
-        // operator mid-borrow (see [`WakeupQueue`]).
+        // operator mid-borrow (see [`WakeupQueue`]). They follow the source
+        // notifications because a wakeup is a notification too and can pull.
         for consumer in self.wakeups.take() {
             consumer.borrow_mut().notify();
+        }
+    }
+
+    /// [`poll_sources`](Self::poll_sources) then [`deliver`](Self::deliver), for
+    /// a caller with nothing to do between them.
+    pub fn check_for_notifications(&mut self) {
+        let delivery = self.poll_sources();
+        self.deliver(delivery);
+    }
+}
+
+/// The consumers a [`Scheduler::poll_sources`] found new data for, not yet
+/// notified.
+///
+/// Holds them strongly from the poll to the delivery, so a consumer dropped in
+/// between is still notified once. Dropping a `Delivery` without passing it to
+/// [`Scheduler::deliver`] leaves the data buffered with no consumer woken, and a
+/// sink-only program then stalls: `#[must_use]` catches a delivery that is
+/// ignored, and `Drop` catches one that is bound and forgotten.
+#[must_use = "a polled delivery must be passed to `Scheduler::deliver`"]
+pub struct Delivery(Vec<SharedConsumer>);
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        // Skipped while unwinding: a second panic in `Drop` aborts.
+        if !std::thread::panicking() {
+            debug_assert!(
+                self.0.is_empty(),
+                "a Delivery of {} consumer(s) was dropped without `Scheduler::deliver`",
+                self.0.len(),
+            );
         }
     }
 }
@@ -205,6 +250,47 @@ pub fn pull_laps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source with new data, and a consumer that counts its notifications.
+    fn polled_source() -> (Scheduler, Rc<RefCell<u32>>, SharedConsumer) {
+        use crate::{
+            ccl::Type,
+            interpreter::{BaseType, Extent, TestDataSource},
+        };
+        let mut source = TestDataSource::new(
+            "src",
+            Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        );
+        source.set_has_data(true);
+        let count = Rc::new(RefCell::new(0u32));
+        let count_c = count.clone();
+        let consumer: SharedConsumer = Rc::new(RefCell::new(move || *count_c.borrow_mut() += 1));
+        let mut scheduler = Scheduler::new();
+        scheduler.add_source_handle(Rc::new(RefCell::new(source)), Rc::downgrade(&consumer));
+        (scheduler, count, consumer)
+    }
+
+    /// A poll takes the data in and wakes nobody; the delivery wakes the
+    /// consumer. The gap between them is where a source window is sampled,
+    /// with the arrivals present and no sink yet pulled.
+    #[test]
+    fn a_poll_wakes_no_consumer_until_it_is_delivered() {
+        let (mut scheduler, count, _consumer) = polled_source();
+        let delivery = scheduler.poll_sources();
+        assert_eq!(*count.borrow(), 0, "polling notifies nobody");
+        scheduler.deliver(delivery);
+        assert_eq!(*count.borrow(), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "dropped without `Scheduler::deliver`")]
+    fn a_delivery_dropped_undelivered_is_refused() {
+        let (mut scheduler, _count, _consumer) = polled_source();
+        let delivery = scheduler.poll_sources();
+        drop(delivery);
+    }
 
     /// A requested wakeup is not delivered synchronously — only by the next
     /// `check_for_notifications` — and it is delivered exactly once (the queue is

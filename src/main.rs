@@ -269,12 +269,14 @@ fn run_program(
             if let Some(probes) = probe_table.as_ref() {
                 probes.borrow_mut().set_tick(tick);
             }
-            // Sampled before the pull, not after. A `Memo` releases its input
-            // from inside `get_impl`, so the release cascade reaches the source
-            // buffer partway through the pull, and a window read afterwards
-            // reports what the tick consumed rather than what it delivered.
+            // Sampled between the poll and the delivery. The poll takes this
+            // pass's arrivals into the source buffers; the delivery is where a
+            // sink pulls them and a `Memo` releases its input from inside
+            // `get_impl`. A window read before the poll misses the arrivals,
+            // and one read after the delivery reports what the pass consumed.
+            let delivery = ctx.scheduler().poll_sources();
             let sources = sample_sources(ctx.scheduler());
-            ctx.scheduler().check_for_notifications();
+            ctx.scheduler().deliver(delivery);
             if publish_probes(tick, &sources) {
                 tick += 1;
             }
