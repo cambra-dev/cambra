@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::Type;
-use cambra::ccl::context::{GlobalContext, compile_program};
+use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
 use cambra::interpreter::{
     BaseType, Consumer, Extent, Predicate, SinkReadError, TestDataSource, Value,
 };
@@ -511,20 +511,29 @@ fn a_sink_accumulates_across_two_deliveries() {
     );
 }
 
-/// Feeding a collection built from the loop variable, from inside the loop, produces a tree
-/// that fails the compiler's own post-lambda-elim typecheck. Not a sink defect: the same
-/// program through a plain `defer()` and a trailing expression panics identically.
-///
-/// It leaves one feed case unmeasured — whether such a channel takes the loop's keys with a
-/// collection under each, or splices the contributions into one flat domain — so nothing
-/// downstream should assume either.
+/// A list literal's elements are constants (`docs/chl-spec.md`, "3.11 List, tuple, record
+/// literals"), so a list built from the loop variable is refused.
 #[test]
-#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
 fn a_collection_fed_from_inside_a_loop_does_not_compile() {
-    observe_one(indoc! {r#"
+    let source = indoc! {r#"
         out = test_sink()
         for x in [1, 2]:
             out << [x, x * 10]
-    "#})
-    .expect("a value");
+    "#};
+    let mut ctx = GlobalContext::default();
+    ctx.register_test_sink("out");
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let Err(errs) = compile_program(&mut ctx, source, consumer) else {
+        panic!("expected a compile error");
+    };
+    // Both elements vary, and each is refused at its own span.
+    let rendered = render_errors(&errs, "<test>", source);
+    assert_eq!(
+        rendered
+            .matches("a list element must be a constant, but this one varies with `x`")
+            .count(),
+        2,
+        "{rendered}"
+    );
+    assert!(rendered.contains("out << [x, x * 10]"), "{rendered}");
 }

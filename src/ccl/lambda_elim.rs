@@ -59,15 +59,22 @@ use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 /// Errors that can occur during lambda elimination.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LambdaElimError {
-    /// A node kind inside a lambda body is not yet handled by the elimination
-    /// rules.  Currently: `Case`, `Loop`, and `HashJoin` refinements.
+    /// A node kind inside a lambda body is not handled by the elimination rules.
     Unsupported(String),
+    /// A list literal inside a lambda body has an element that reads the lambda's binder.
+    /// A list literal's elements are constants (`docs/chl-spec.md`, "3.11 List, tuple, record
+    /// literals"), and this one varies with the binder.
+    VaryingListElement { binder: Name },
 }
 
 impl std::fmt::Display for LambdaElimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsupported(msg) => write!(f, "lambda elimination: unsupported: {msg}"),
+            Self::VaryingListElement { binder } => write!(
+                f,
+                "a list element must be a constant, but this one varies with `{binder}`"
+            ),
         }
     }
 }
@@ -1129,13 +1136,27 @@ fn elim_lambda_impl(
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
         }
 
-        // List — treat like Tuple: eliminate param element-wise.
+        // List: a list literal's elements are constants (`docs/chl-spec.md`, "3.11 List,
+        // tuple, record literals"), and a body that reaches this arm has one that reads
+        // `param`. Lowering refuses every element that names a varying variable at its span
+        // (`lower::constant_lists`); an element that varies by a route that check does not
+        // follow is refused here, without a span. A list none of whose elements reads `param`
+        // as a value never gets here: the Constant and Pi-const rules above return it whole.
+        //
+        // The Tuple rule would be ill-typed here, not merely unsupported. A list's elements are
+        // rows of a collection rather than slots of a row, and `Zip` is the product fanout,
+        // `zip : ((𝐴 ⇒ 𝐵), (𝐴 ⇒ 𝐶)) ⇒ (𝐴 ⇒ (𝐵, 𝐶))`. Every element would come back a
+        // function, so the node would carry the lambda's type `𝑋 ⇒ ([0, 𝑛-1] ⤇ 𝑉)` where a
+        // list node is typed `[0, 𝑛-1] ⤇ (𝑋 ⇒ 𝑉)`.
         TypedExprNode::List(elts) => {
-            let elim_elts: Result<Vec<_>, _> = elts
-                .into_iter()
-                .map(|e| elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()))
-                .collect();
-            Ok(Expr::list(elim_elts?).with_ty(result_ty))
+            assert!(
+                elts.iter().any(|e| is_free_in_value(param, e)),
+                "a list no element of which reads `{param}` as a value is a constant body, \
+                 which the Constant and Pi-const rules above have already returned"
+            );
+            Err(LambdaElimError::VaryingListElement {
+                binder: param.clone(),
+            })
         }
 
         // Desugar to input ▷ agg(kind), then elim_lambda the result

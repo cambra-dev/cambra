@@ -4761,7 +4761,7 @@ fn each_specialization_of_a_generic_conditional_gets_its_own_witness() {
     let ty = infer_program(
         r"
 def f(a, b):
-    box([b, b]) if a else box([b, b, b])
+    box([b for z in [1, 2]]) if a else box([b for z in [1, 2, 3]])
 c = 3 > 2
 x = f(c, 1)
 y = f(c, True)
