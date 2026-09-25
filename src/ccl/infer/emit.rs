@@ -973,6 +973,19 @@ pub(super) fn emit_apply<C: Typing>(
     // mutable variable is the parameter itself and never nested inside it, so there is no
     // composite to walk.
     let param_ty = parameter_type(function, &fn_ty).cloned();
+    // A node under an annotation that is not a handle reads (`emit_node`), which here would
+    // read the handle this position has to pass. Only lowering annotates an expression (a
+    // source `x: T = e` annotates the binding), and it annotates generator sources, the
+    // kind stamps on `Compose` and lambda nodes, and a `**` exponent, none of which is a
+    // pass-by-reference argument.
+    debug_assert!(
+        param_ty
+            .as_ref()
+            .is_none_or(|param| param.mut_value_type().is_none())
+            || argument.user_annotation.is_none(),
+        "a pass-by-reference argument carries no annotation, got {:?}",
+        argument.user_annotation
+    );
     let arg_ty = match (param_ty, raw_arg_ty.mut_value_type()) {
         // A handle reaching its pass-by-reference parameter: invariance relates the two
         // value types directly, in both directions.

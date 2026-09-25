@@ -9,13 +9,13 @@ use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
 use crate::interpreter::{
-    BinOpKind, Tile, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
+    BinOpKind, Extent, Tile, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
 };
 use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;
 
 use super::{ColumnValue, FuncBinding, bindings_are_list};
-use crate::interpreter::tile_operators::materialize_collections;
+use crate::interpreter::tile_operators::{materialize_collections, open_collections};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunctionDef {
@@ -61,91 +61,88 @@ impl FunctionDef {
 
     /// Apply this function to an argument **tile**, for an argument carrying a collection as
     /// a level — which a column has nowhere to put, so [`Self::apply`] cannot be handed one.
+    /// `argument_extent` is the argument's extent, which types the written values.
     ///
     /// Only [`Self::Insert`] has a level-shaped argument: a keyed write's collection operand
     /// reaches it opened when the store read that produced it was. The rest read columns,
     /// and a level arriving at one is a defect rather than a case to cover.
-    pub fn apply_tile(&self, input: Tile) -> Tile {
+    pub fn apply_tile(&self, input: Tile, argument_extent: &Extent) -> Tile {
         let FunctionDef::Insert = self else {
             panic!("{self} takes a column argument; a level reaching it is a shape error")
         };
         let Tile::Record(mut fields) = input else {
             panic!("insert takes the tupled `(collection, key, value)`, got {input:?}")
         };
+        let Some(Extent::Function {
+            codomain: value_extent,
+            ..
+        }) = argument_extent
+            .record_fields()
+            .and_then(|f| f.get(&tuple_field(0)))
+        else {
+            panic!("insert's argument is `(collection, key, value)`, got {argument_extent}")
+        };
         let collection = fields
             .remove(&tuple_field(0))
             .expect("insert: no collection");
         let Tile::DataFunction {
-            row_starts,
             domain,
             codomain,
             domain_predicate,
             deleted,
-        } = collection
+            ..
+        } = &collection
         else {
             panic!("FunctionDef::apply_tile is for a collection operand that is a level")
         };
         // The key and value are one value per row, which a product spreads over a record of
-        // columns. The collection holds each as one column, so they are read as one.
+        // columns. The key is read as one column, and the value is reopened into the shape
+        // the collection's values take, at whatever depth that is.
         let new_keys =
             materialize_collections(fields.remove(&tuple_field(1)).expect("insert: no key"));
-        let new_values =
-            materialize_collections(fields.remove(&tuple_field(2)).expect("insert: no value"));
-        let Tile::Scalar(old_values) = *codomain else {
-            panic!("insert: a collection operand deeper than one level is unsupported")
-        };
+        let new_values = open_collections(
+            &materialize_collections(fields.remove(&tuple_field(2)).expect("insert: no value")),
+            value_extent,
+        );
+        let rows = collection.rows();
+        assert_eq!(
+            new_keys.len(),
+            rows,
+            "insert writes one key in each row of the collection it is handed"
+        );
         // Rebuild each row's group with its key written: replacing the binding where the row
         // already holds that key, appending it where it does not. A removed key is dropped
-        // rather than carried, since the group a write lands in is the live one.
-        let starts: Vec<usize> = (0..row_starts.len())
-            .map(|r| match row_starts.index_at(r) {
-                Value::UInt(u) => u,
-                other => panic!("a collection's row starts are UInts, got {other:?}"),
-            })
-            .collect();
-        // Columns are built by gathering from the operands rather than from `Value`s, since
-        // a column's kind comes from the column it is taken from and nothing here carries
-        // an extent to rebuild one at.
-        let one = |column: &ColumnValue, i: usize| column.select_indices(std::iter::once(i), 1);
-        let mut out_starts = Vec::with_capacity(starts.len());
-        let mut out_keys = domain.select_indices(std::iter::empty(), 0);
-        let mut out_values = old_values.select_indices(std::iter::empty(), 0);
-        let mut written_rows = 0usize;
-        for r in 0..starts.len() {
-            out_starts.push(out_keys.len());
-            let from = starts[r];
-            let to = starts.get(r + 1).copied().unwrap_or(domain.len());
+        // rather than carried, since the group a write lands in is the live one. Every entry
+        // is gathered from the collection's entries followed by the written ones, so entry
+        // `i < written` is the collection's and `written + r` is row `r`'s write.
+        let written = domain.len();
+        let mut starts = Vec::with_capacity(rows);
+        let mut key_entries = Vec::with_capacity(written + rows);
+        let mut value_entries = Vec::with_capacity(written + rows);
+        for (r, (from, to)) in collection.row_runs().enumerate() {
+            starts.push(key_entries.len());
             let key = new_keys.index_at(r);
-            let mut written = false;
-            for i in from..to {
-                if deleted.contains(i) {
-                    continue;
-                }
-                let hit = domain.index_at(i) == key;
-                written |= hit;
-                out_keys.append(one(&domain, i));
-                out_values.append(if hit {
-                    one(&new_values, r)
-                } else {
-                    one(&old_values, i)
-                });
+            let mut hit = false;
+            for i in (from..to).filter(|i| !deleted.contains(*i)) {
+                let is_key = domain.index_at(i) == key;
+                hit |= is_key;
+                key_entries.push(i);
+                value_entries.push(if is_key { written + r } else { i });
             }
-            if !written {
-                out_keys.append(one(&new_keys, r));
-                out_values.append(one(&new_values, r));
+            if !hit {
+                key_entries.push(written + r);
+                value_entries.push(written + r);
             }
-            written_rows += 1;
         }
-        debug_assert_eq!(
-            written_rows,
-            starts.len(),
-            "insert writes its key in every row of the collection it is handed"
-        );
+        let mut keys = domain.clone();
+        keys.append(new_keys);
+        let mut values = (**codomain).clone();
+        values.merge_rows(new_values);
         Tile::grouped(
-            ColumnValue::from_uints(out_starts),
-            out_keys,
-            Box::new(Tile::Scalar(out_values)),
-            domain_predicate,
+            ColumnValue::UInts(starts),
+            keys.select_indices(key_entries.iter().copied(), key_entries.len()),
+            Box::new(values.select_rows(&value_entries)),
+            domain_predicate.clone(),
             bit_set::BitSet::new(),
         )
     }
@@ -435,6 +432,7 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::BaseType;
     use std::collections::HashMap;
 
     // --- Display tests ---
@@ -531,6 +529,84 @@ mod tests {
 
     // --- insert over a level ---
 
+    /// The extent of `insert`'s `(collection, key, value)` argument over `Map(String, value)`.
+    fn insert_argument(value: Extent) -> Extent {
+        Extent::Record(HashMap::from([
+            (
+                tuple_field(0),
+                Extent::Function {
+                    domain: Box::new(Extent::Base(BaseType::String)),
+                    codomain: Box::new(value.clone()),
+                },
+            ),
+            (tuple_field(1), Extent::Base(BaseType::String)),
+            (tuple_field(2), value),
+        ]))
+    }
+
+    /// A list level of `Int`s: one row per group in `groups`.
+    fn int_lists(groups: &[&[i64]]) -> Tile {
+        let mut starts = Vec::new();
+        let mut positions = Vec::new();
+        let mut elements = Vec::new();
+        for group in groups {
+            starts.push(positions.len());
+            positions.extend(0..group.len());
+            elements.extend(group.iter().copied());
+        }
+        Tile::grouped(
+            ColumnValue::UInts(starts),
+            ColumnValue::UInts(positions),
+            Box::new(Tile::Scalar(ColumnValue::Ints(elements))),
+            crate::interpreter::Predicate::True,
+            bit_set::BitSet::new(),
+        )
+    }
+
+    /// `insert` over a collection whose values are themselves a level, `Map(String,
+    /// List(Int))`: the written list replaces the row's list at a held key and is appended at
+    /// a new one, and the lists below stay a level rather than a column of maps.
+    #[test]
+    fn apply_tile_writes_a_collection_valued_key() {
+        // Row 0 is `{a: [1, 2]}`, row 1 is `{a: [3]}`.
+        let level = Tile::grouped(
+            ColumnValue::from_uints(vec![0, 1]),
+            ColumnValue::Strings(vec!["a".into(), "a".into()]),
+            Box::new(int_lists(&[&[1, 2], &[3]])),
+            crate::interpreter::Predicate::True,
+            bit_set::BitSet::new(),
+        );
+        let argument = Tile::Record(HashMap::from([
+            (tuple_field(0), level),
+            // Row 0 writes `a := [7]`, which it holds; row 1 writes `b := [8, 9]`, which it
+            // does not.
+            (
+                tuple_field(1),
+                Tile::Scalar(ColumnValue::Strings(vec!["a".into(), "b".into()])),
+            ),
+            (tuple_field(2), int_lists(&[&[7], &[8, 9]])),
+        ]));
+        let list = Extent::Function {
+            domain: Box::new(Extent::Base(BaseType::UInt)),
+            codomain: Box::new(Extent::Base(BaseType::Int)),
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            ..
+        } = FunctionDef::Insert.apply_tile(argument, &insert_argument(list))
+        else {
+            panic!("insert over a level yields a level")
+        };
+        assert_eq!(row_starts, ColumnValue::from_uints(vec![0, 1]));
+        assert_eq!(
+            domain,
+            ColumnValue::Strings(vec!["a".into(), "a".into(), "b".into()])
+        );
+        assert_eq!(*codomain, int_lists(&[&[7], &[3], &[8, 9]]));
+    }
+
     /// `insert(m, k, v)` over a collection carried as a **level**: each row's group gets
     /// `k` written, replacing the binding the row already holds and appending it where the
     /// row lacks one. The two rows differ in both, which is what pins the per-row fold.
@@ -560,7 +636,7 @@ mod tests {
             domain,
             codomain,
             ..
-        } = FunctionDef::Insert.apply_tile(argument)
+        } = FunctionDef::Insert.apply_tile(argument, &insert_argument(Extent::Base(BaseType::Int)))
         else {
             panic!("insert over a level yields a level")
         };

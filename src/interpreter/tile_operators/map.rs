@@ -81,11 +81,13 @@ fn gather_applied(values: &Tile, groups: &[Vec<usize>]) -> Tile {
         return values.regroup_rows(groups);
     }
     let rows: Vec<usize> = groups.iter().flatten().copied().collect();
+    // `MapResultProducer::get_impl` withholds every argument outside the function's
+    // `domain_predicate` before applying it. An argument inside the predicate that the
+    // function does not hold lies outside its domain, which the argument's type excludes.
     assert_eq!(
         rows.len(),
         groups.len(),
-        "a function whose values are a record answers each argument with exactly one row, \
-         so an argument it does not name is withheld before reaching here"
+        "a function whose values are a record answers each argument with exactly one row"
     );
     values.select_rows(&rows)
 }
@@ -333,8 +335,19 @@ impl TileProducer for MapResultProducer {
         // `domain_predicate` separates a key the function will never answer from one it has
         // not answered yet. A key whose argument the function has not answered is withheld —
         // dropped from this tile, and subtracted from its predicate — so the consumer pulls
-        // again once the function has it. The nested branch above draws the same distinction
+        // again once the function has it. A whole value is withheld whole, as no rows, which
+        // is a value not known yet. The nested branch above draws the same distinction
         // through `incomplete_domain`.
+        if let Tile::DataFunction {
+            domain_predicate: f_domain_predicate,
+            ..
+        } = &function_tile
+            && let Tile::Scalar(argument) = &input_tile
+            && argument.len() == 1
+            && !f_domain_predicate.contains(&argument.index_at(0))
+        {
+            input_tile = Tile::Scalar(argument.select_indices(std::iter::empty(), 0));
+        }
         if let Tile::DataFunction {
             domain_predicate: f_domain_predicate,
             ..
@@ -423,7 +436,9 @@ impl TileProducer for MapResultProducer {
             && let Tile::Scalar(f) = &function_tile
             && let Some(Value::ComputableFunction(f)) = f.as_single()
         {
-            return map_tile_result(input_tile, move |values| f.apply_tile(values));
+            return map_tile_result(input_tile, move |values| {
+                f.apply_tile(values, f_domain_extent)
+            });
         }
 
         // Standard logic for non-Function outputs

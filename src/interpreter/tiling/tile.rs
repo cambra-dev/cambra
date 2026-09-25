@@ -1027,6 +1027,18 @@ impl Tile {
         };
         level_run(level_offsets(row_starts), row, domain.len())
     }
+
+    /// Every row's half-open run of `domain`, in row order: [`Self::row_run`] for each row.
+    pub fn row_runs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let Tile::DataFunction {
+            row_starts, domain, ..
+        } = self
+        else {
+            panic!("row_runs is a collection's: {self:?}")
+        };
+        let offsets = level_offsets(row_starts);
+        (0..offsets.len()).map(move |row| level_run(offsets, row, domain.len()))
+    }
 }
 
 /// A collection's own `row_starts`, for the validation a constructor does.

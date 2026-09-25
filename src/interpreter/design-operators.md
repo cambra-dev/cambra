@@ -201,8 +201,8 @@ is required, as in a variant's payload and a store write.
 and its static counterpart `Tiling::holds_a_level`, asks whether a tile holds a collection this
 way; an operator putting a value into a column asks it, a column having nowhere to put one.
 `Extent::holds_a_collection` asks whether a type contains a collection at all, which a column of
-maps answers yes too. `open_row_collections` turns a column of maps into this form, and
-`materialize_collections` turns this form back into maps where one value is required.
+maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
+and `materialize_collections` turns this form back into maps where one value is required.
 
 ---
 
@@ -554,9 +554,9 @@ rather than leaving an adapter to open it downstream. Three do:
 - A **list literal** builds the table it denotes, recursing on the element extent: a
   collection element contributes its own keys as the level below, and a record element
   holding a collection contributes one sub-tile per field (`list_levels`).
-- A **store read** opens each position's stored value the same way, so a collection-valued
-  key reads as a collection per position rather than a map per position
-  (`read_tiling` / `read_tile`).
+- A **store read** opens each position's stored value the same way, at every depth, so a
+  collection-valued key reads as a collection per position rather than a map per position
+  (`read_tiling` / `read_tile`, through `open_collections`).
 - A **record field** of either keeps the tiling its own term produced, so a projection out
   of it is a tile operation (`SelectField`) rather than a column one.
 
@@ -567,8 +567,10 @@ the keys: `CheckedLookup` searches the bindings of the row's own value, and `Sol
 A **transaction writer body's parameter record** opens the same way, so a collection-valued
 read reaches the body as a level it can iterate (`commit_operator.rs`'s `body_input_tiling`).
 Its *writes* go the other way: a store write is one value per key, so a keyed write's
-`insert` takes the level and the payload materializes where it becomes the decision's value
-(`FunctionDef::apply_tile`, `materialize_collections`).
+`insert` takes the level, at any depth, and the payload materializes where it becomes the
+decision's value (`FunctionDef::apply_tile`, `materialize_collections`). The written value
+reopens into the shape the collection's values take, so the rebuilt level is one gather over
+the collection's entries followed by the written ones.
 
 **A per-row collection is complete as soon as its row arrives.** A map value carries its own
 keys, so nothing waits on a domain closing to know the group is whole. A producer opening one

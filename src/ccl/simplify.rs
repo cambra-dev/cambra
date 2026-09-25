@@ -293,6 +293,11 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         try_string_add_to_concat,
     );
     changed |= ruled("simplify.partial_lookup", expr, try_partial_lookup);
+    changed |= ruled(
+        "simplify.compose_constant_function",
+        expr,
+        try_compose_constant_function,
+    );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -607,6 +612,69 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
             } else {
                 vec![left]
             }
+        },
+    )
+}
+
+/// Composition with a constant function: `⟨𝑆, 𝑓 ▷ const⟩ ▷ zip ≫ compose  ⟹  𝑆 ≫ map(𝑓)`,
+/// and `⟹  𝑆` where `𝑓` is `id`.
+///
+/// At each input `𝑥` the left side is `𝑆(𝑥) ≫ 𝑓`, which is `𝑆(𝑥)` post-composed with a
+/// function that does not read `𝑥`. `lambda_elim` leaves this shape for a generator over a sum
+/// whose element function reads nothing from the enclosing scope (`compose_sum_generators`).
+/// Both sides keep `𝑆` and `𝑓`, so the rule relocates no iteration source.
+///
+/// Scoped to an `𝑆` whose values are a sum, the shape the generator rewrite produces. Planning's
+/// letrec recognition reads a history through the unrewritten form, so the rule leaves every
+/// other `𝑆` alone.
+fn try_compose_constant_function(expr: &mut Expr) -> bool {
+    fn constant_function(left: &Expr) -> Option<(&Expr, &Expr)> {
+        let TypedExprNode::Apply { argument, function } = &left.node else {
+            return None;
+        };
+        if !is_builtin(function, Builtin::Zip) {
+            return None;
+        }
+        let TypedExprNode::Tuple(parts) = &argument.node else {
+            return None;
+        };
+        let [source, lifted] = parts.as_slice() else {
+            return None;
+        };
+        if !source.ty.codomain().is_some_and(|c| c.sum().is_some()) {
+            return None;
+        }
+        Some((source, as_const(lifted)?))
+    }
+    try_pairwise_in_compose(
+        expr,
+        |left, right| is_builtin(right, Builtin::Compose) && constant_function(left).is_some(),
+        |left, _right, _mint_kind| {
+            let TypedExprNode::Apply { argument, .. } = left.node else {
+                unreachable!("matched as a zip above")
+            };
+            let TypedExprNode::Tuple(mut parts) = argument.node else {
+                unreachable!("matched as a pair above")
+            };
+            let lifted = parts.pop().expect("matched as a pair above");
+            let source = parts.pop().expect("matched as a pair above");
+            let TypedExprNode::Apply { argument: f, .. } = lifted.node else {
+                unreachable!("matched as a constant above")
+            };
+            if is_id(&f) {
+                return vec![source];
+            }
+            let mapped_ty = match source.ty.codomain() {
+                Some(collection) => match (collection.domain(), f.ty.codomain()) {
+                    (Some(domain), Some(codomain)) => Type::fun(
+                        collection.clone(),
+                        Type::fun_like(&collection, domain, codomain),
+                    ),
+                    _ => Type::Hole,
+                },
+                None => Type::Hole,
+            };
+            vec![source, apply_primitive(*f, Builtin::Map, mapped_ty)]
         },
     )
 }

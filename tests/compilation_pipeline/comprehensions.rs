@@ -278,6 +278,49 @@ fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i
     );
 }
 
+/// A transactional map read back after a keyed write in the same block: the comprehension's
+/// source is the `insert` result rather than a store read (`src/ccl/design/optimization.md`,
+/// "A generator over a sum composes with its source"). Each transaction writes `b := 10` and
+/// then sums `{a: 1, b: 10}`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::identity("v", 22)]
+#[case::element_function("v * 2", 44)]
+fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[case] total: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+                n: Mut(Int, Txn) := 0
+                for r in [1, 2]:
+                    with begin():
+                        m["b"] := 10
+                        n := n + sum([{} for v in m])
+                await_final(n)
+            "#},
+            element
+        ),
+        Value::Int(total),
+    );
+}
+
+/// A collection-valued field of a transactional record, iterated inside a transaction.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_value_binder_reads_a_collection_field_of_a_transactional_record() {
+    check_scalar(
+        indoc! {r#"
+            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+            n: Mut(Int, Txn) := 0
+            for r in [1, 2, 3]:
+                with begin():
+                    n := n + sum([v for v in s.b])
+            await_final(n)
+        "#},
+        Value::Int(9),
+    );
+}
+
 /// A nested collection literal is a **level per nesting**, so a chain of aggregates collapses
 /// one level each to reach the integers.
 ///

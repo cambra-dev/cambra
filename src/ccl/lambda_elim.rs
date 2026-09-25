@@ -82,8 +82,9 @@ impl std::fmt::Display for LambdaElimError {
 /// (as produced by [`crate::ccl::infer::infer`]).
 ///
 /// Returns `Ok(point_free_expr)` where the result contains no `Lambda` nodes.
-pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
+pub fn run(mut expr: Expr) -> Result<Expr, LambdaElimError> {
     let mut ctx = ElimContext::new();
+    compose_sum_generators(&mut expr);
     let point_free = elim_lambdas(&mut ctx, expr)?;
     // Per design §6.3, lambda elimination **does not descend into refinement
     // predicates** — they stay as bare boolean expressions (over the implicit
@@ -92,6 +93,7 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     // → simplify (→ planning) sub-pipeline when a refined type is iterated
     // (`planning::compile_refinement_predicates`).
     let mut simplified = simplify(point_free);
+    refuse_escaped_pair_witness(&simplified)?;
     // Elimination and simplification rebuild node types from surrounding term
     // structure; restore each `Cast`'s canonical split (`target` = born
     // refinements, `expr.ty` = value-refinements ∪ born on the rebuilt view) so the
@@ -99,6 +101,99 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     // making the cast's refinements route-dependent.
     crate::ccl::ccl_utils::canonicalize_cast_types(&mut simplified);
     Ok(simplified)
+}
+
+/// Rewrite every generator over a sum, `λ k : σ → (k ▷ 𝑆) ▷ 𝑓` with `k` free in neither `𝑆`
+/// nor `𝑓`, to `𝑆 ≫ 𝑓` (`src/ccl/design/optimization.md`, "A generator over a sum composes
+/// with its source").
+///
+/// Bottom-up, so a generator nested in another's element function is composed first.
+///
+/// A filtered generator is left as it is: it is the lambda under a `Cast` whose refinement
+/// reads the key, and the cast-wrapped arm of elimination is what compiles it.
+fn compose_sum_generators(expr: &mut Expr) {
+    if let TypedExprNode::Cast { value, .. } = &mut expr.node
+        && matches!(value.node, TypedExprNode::Lambda { .. })
+    {
+        value.walk_children_mut(compose_sum_generators);
+        return;
+    }
+    expr.walk_children_mut(compose_sum_generators);
+    let TypedExprNode::Lambda { param, body } = &expr.node else {
+        return;
+    };
+    // The key ranges over a witness only in a lambda that is itself a collection over one.
+    if !matches!(param.ty.peel_refinements(), Type::WitnessRef(_)) {
+        return;
+    }
+    let TypedExprNode::Apply {
+        argument: indexed,
+        function: element,
+    } = &body.node
+    else {
+        return;
+    };
+    let TypedExprNode::Apply {
+        argument: key,
+        function: source,
+    } = &indexed.node
+    else {
+        return;
+    };
+    if !matches!(&key.node, TypedExprNode::Var(k) if *k == param.name)
+        || is_free(&param.name, source)
+        || is_free(&param.name, element)
+    {
+        return;
+    }
+    let _g = provenance::enter(
+        expr.node_id(),
+        "lambda_elim.compose_sum_generator",
+        provenance::Nature::Machinery,
+    );
+    let TypedExprNode::Lambda { body, .. } = std::mem::replace(expr, Expr::lit(Lit::Unit)).node
+    else {
+        unreachable!("matched as a lambda above")
+    };
+    let TypedExprNode::Apply {
+        argument: indexed,
+        function: element,
+    } = body.node
+    else {
+        unreachable!("matched as an application above")
+    };
+    let TypedExprNode::Apply {
+        function: source, ..
+    } = indexed.node
+    else {
+        unreachable!("matched as an application above")
+    };
+    // `typed_compose` takes the chain's kind from its head, so the composite is the
+    // source's own sum with the element function's codomain.
+    *expr = typed_compose(vec![*source, *element]);
+}
+
+/// Refuse a `curry` whose pair still names a sum's witness once simplification has run
+/// (`src/ccl/design/optimization.md`, "A pair naming a sum's witness is refused").
+fn refuse_escaped_pair_witness(expr: &Expr) -> Result<(), LambdaElimError> {
+    if let TypedExprNode::Apply { function, argument } = &expr.node
+        && matches!(function.node, TypedExprNode::Builtin(Builtin::Curry))
+        && !crate::ccl::ty::free_witness_refs(&argument.ty, &[]).is_empty()
+    {
+        return Err(LambdaElimError::Unsupported(format!(
+            "a comprehension over a collection whose domain is a sum's witness reads its \
+             enclosing scope, and pairing the enclosing value with the key needs a type that \
+             binds the witness over the pair, which `{}` does not",
+            argument.ty
+        )));
+    }
+    let mut result = Ok(());
+    expr.walk_children(|child| {
+        if result.is_ok() {
+            result = refuse_escaped_pair_witness(child);
+        }
+    });
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +908,9 @@ fn elim_lambda_impl(
                 .with_ty(param_ty.clone());
                 crate::ccl::subst::Subst::discharge(param.clone(), pre_sub_x).apply_type(&y_ty)
             };
+            // A `y_ty` naming the inner lambda's witness escapes the Σ binding it here.
+            // [`compose_sum_generators`] keeps a generator over a sum from reaching this rule,
+            // and [`refuse_escaped_pair_witness`] refuses any other `curry` that keeps one.
             let pair_ty = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
