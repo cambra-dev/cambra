@@ -14,10 +14,14 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{commit_payload_ty, count_free},
+    ccl_utils::{
+        PredMemo, commit_payload_ty, count_free, is_free, is_free_in_type,
+        walk_refined_predicates_mut,
+    },
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, tvar},
     provenance,
+    subst::Subst,
     symbolic::symbolic,
 };
 
@@ -545,10 +549,20 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         read_map.insert(n.clone(), (field.clone(), stream_ty.clone()));
     }
 
+    // The substitution reaches type slots too: a conditional's test refines the branch
+    // domain, so a transactional read in the test lands in that refinement's predicate. It
+    // leaves every subtree that mentions none of the bindings untouched, so a predicate away
+    // from a read is not rebuilt.
     let hist = Name::fresh("__hist");
-    let mut body = body;
-    rewrite_txn_reads(&mut body, &hist, &hist_ty, &read_map);
-    collapse_snapshot_sources(&mut body, &hist, &hist_ty);
+    let env: HashMap<Name, Expr> = read_map
+        .iter()
+        .map(|(n, (field, field_ty))| {
+            let read = hist_field_read(&hist, &hist_ty, field.clone(), field_ty.clone());
+            (n.clone(), read)
+        })
+        .collect();
+    let mut body = Subst::discharge_env_in_place(body, &env);
+    collapse_snapshot_sources(&mut body, &hist, &hist_ty, &PredMemo::new());
     for n in &binding_names {
         assert_eq!(
             count_free(n, &body),
@@ -561,41 +575,26 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     Expr::let_in(binding(hist, hist_ty), transact, body)
 }
 
-/// Rewrite every history / tap binding reference in the continuation to a
-/// history-record projection `__hist.field`, then drop the letrec (its bindings
-/// are now carried by the `Transact`). Mirrors [`rewrite_hist_reads`].
-fn rewrite_txn_reads(
-    e: &mut Expr,
-    hist: &Name,
-    hist_ty: &Type,
-    read_map: &HashMap<Name, (String, Type)>,
-) {
-    if let TypedExprNode::Var(n) = &e.node
-        && let Some((field, field_ty)) = read_map.get(n)
-    {
-        // The projection replaces *this* reference, so the reference is what the
-        // recording names — finer than the enclosing `planning.recognize`, which
-        // would otherwise make every continuation read descend from the `LetRec`
-        // and lose which read went where.
-        let _g = provenance::enter(
-            e.node_id(),
-            "planning.txn_read",
-            provenance::Nature::Machinery,
-        );
-        *e = hist_field_read(hist, hist_ty, field.clone(), field_ty.clone());
-        return;
-    }
-    e.walk_children_mut(|c| rewrite_txn_reads(c, hist, hist_ty, read_map));
-}
-
 /// Collapse a multi-variable as-of read\'s snapshot source: the pre-elim
 /// as-of-read rewrite emits `as_of((trigger, (f_a: ⟨a-hist⟩, f_b: ⟨b-hist⟩)))`
 /// with a *record literal* of history reads (the history record does not exist
-/// yet). After [`rewrite_txn_reads`] every field is `__hist.f`; replace the
+/// yet). After the continuation's substitution every field is `__hist.f`; replace the
 /// literal with the mutable variable itself, so op-conversion latches ONE
 /// whole-variable snapshot per request (§I-c atomicity) instead of per-field
 /// reads.
-fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
+///
+/// Reaches the snapshots inside refinement predicates too, and rebuilds only a predicate that
+/// mentions `__hist`. Answers whether it changed anything.
+fn collapse_snapshot_sources(
+    e: &mut Expr,
+    hist: &Name,
+    hist_ty: &Type,
+    memo: &PredMemo<()>,
+) -> bool {
+    if !is_free(hist, e) {
+        return false;
+    }
+    let mut changed = false;
     if let TypedExprNode::Apply { argument, function } = &mut e.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOf))
         && let TypedExprNode::Tuple(elts) = &mut argument.node
@@ -629,8 +628,17 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
         {
             tys[1] = source.ty.clone();
         }
+        changed = true;
     }
-    e.walk_children_mut(|c| collapse_snapshot_sources(c, hist, hist_ty));
+    e.walk_type_slots_mut(|ty| {
+        if is_free_in_type(hist, ty) {
+            changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+                collapse_snapshot_sources(pred, hist, hist_ty, memo)
+            });
+        }
+    });
+    e.walk_children_mut(|c| changed |= collapse_snapshot_sources(c, hist, hist_ty, memo));
+    changed
 }
 
 /// Destructure the phase\'s decision-factored induction binding (post-elim)
