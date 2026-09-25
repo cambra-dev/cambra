@@ -33,7 +33,13 @@ CHL source
 | [collections.md](collections.md) | Collections as data functions `𝐷 ⤇ 𝑉`: the five surface types as domain shapes, the referenceable opaque domain (Σ-witness activation) behind maps/sets and runtime-length lists, membership-discharge lookup, keyed feeds, and mutable collections. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Phase` identity primitives, the `ProvenanceTable` model and its fold, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
 | [diffing.md](diffing.md) | Program diffing: α-invariant content addressing of CCL terms and the GumTree correspondence between two compiled programs. |
-| [hot-reload.md](hot-reload.md) | Replacing a running program with a new version: the endpoint set a version inherits, operator reuse keyed by the node a structural diff pairs each of the new version's nodes with, and the weak subscriptions that let one graph be swapped for another. |
+| [program-evolution.md](program-evolution.md) | How a running program becomes a different program: the control-port verbs (`/diff`, `/reload`, `/branch`, `/branches`), the branch table that maps each numbered branch to the operators it holds and shares with the branch it was created from, the reload mechanism that keeps every operator whose computation is unchanged, and the *state takeover* guard. |
+
+Branching in [program-evolution.md](program-evolution.md) is a *model*, not a
+pass — nothing in the pipeline above implements it yet (`docs/design.md` marks
+program branching **[Open]**), though the reload half of that doc is built. It
+sits here because the analysis it turns on, divergence reachability, is a
+property of the CCL dataflow graph.
 
 Provenance is the one cross-cutting concern in the table: every pass above both
 preserves node identity and records what it rewrote, so

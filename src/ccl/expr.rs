@@ -596,8 +596,7 @@ pub enum TypedExprNode {
     /// carries no dependency on `x` going forward. That is what keeps it out of
     /// the transactional read discipline — a loaded value is not a read of a
     /// transactional variable, so it needs no `with begin():` block
-    /// (`src/ccl/design/hot-reload.md`, "Seeding a variable from the value the
-    /// predecessor held").
+    /// (`src/ccl/design/program-evolution.md`, "Which variable a load site addresses").
     ///
     /// The name is the source's own spelling. Which variable it addresses is
     /// decided by where the node sits, exactly as a declaration's address is —

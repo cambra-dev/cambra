@@ -1204,7 +1204,8 @@ in it has a correspondent",
     /// starts is all that is left, and whether the author meant a running total
     /// from here or a view of history is not something the source says. The
     /// intended answer is for the declaration to state which
-    /// (`src/ccl/design/hot-reload.md`, "A variable that begins above its loop's input"),
+    /// (`src/ccl/design/program-evolution.md`, "A variable that begins above
+    /// its loop's input"),
     /// and naming it is what makes the choice visible until then.
     ///
     /// Read off the planned tree before anything is torn down, so `/diff` answers
