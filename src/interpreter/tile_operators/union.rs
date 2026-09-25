@@ -190,15 +190,18 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     let mut pairs: Vec<(Value, Value)> = Vec::new();
     let mut domain_predicate = Predicate::False;
     for (i, tile) in tiles.into_iter().enumerate() {
+        assert!(
+            tile.is_data_function(),
+            "flat_merge: expected a collection arm, got {tile:?}"
+        );
+        let live: Vec<(usize, Value)> = tile.live_keys().collect();
         let Tile::DataFunction {
-            domain,
             codomain,
             domain_predicate: dp,
-            deleted,
             ..
         } = tile
         else {
-            panic!("flat_merge: expected a collection arm, got {tile:?}");
+            unreachable!("checked above");
         };
         assert!(
             !codomain.holds_a_level(),
@@ -219,11 +222,8 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
              boxed-compound codomain, got {codomain:?}"
         );
         let values = scalar_tile_to_column_value(*codomain);
-        for row in 0..domain.len() {
-            if deleted.contains(row) {
-                continue;
-            }
-            pairs.push((domain.index_at(row), values.index_at(row)));
+        for (row, key) in live {
+            pairs.push((key, values.index_at(row)));
         }
     }
     // Disjoint by first-match, so a stable sort by key reassembles the full column

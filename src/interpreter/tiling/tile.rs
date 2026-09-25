@@ -1027,6 +1027,26 @@ impl Tile {
         };
         level_run(level_offsets(row_starts), row, domain.len())
     }
+
+    /// A collection's keys that neither a filter nor a release has removed, as `(column index,
+    /// key)` in column order.
+    ///
+    /// A `Restrict`, a keyed merge and a release ([`Self::remove_guarded`]) mark a row deleted
+    /// rather than dropping it, so the domain column still holds its extent's keys and a reader
+    /// of the collection's values reads these. A raw read of `domain` is for what a deleted key
+    /// is still owed: its release (`to_guard`), and the position a loop driver releases
+    /// through.
+    pub fn live_keys(&self) -> impl Iterator<Item = (usize, Value)> + '_ {
+        let Tile::DataFunction {
+            domain, deleted, ..
+        } = self
+        else {
+            panic!("live_keys is a collection's: {self:?}")
+        };
+        (0..domain.len())
+            .filter(|i| !deleted.contains(*i))
+            .map(|i| (i, domain.index_at(i)))
+    }
 }
 
 /// A collection's own `row_starts`, for the validation a constructor does.

@@ -285,7 +285,7 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
 
 - **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
-- **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own.
+- **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own. It releases the source through each finished item on its ack, and through each filtered row once it reads past it, since no ack comes for a row nothing attempts.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
 
   **The ack is a release intersection.** The driver sits behind a `FanOut` with two branches — the body and the writer — and advances its item cursor on what they *both* release. A body releases a row as soon as it has consumed it, which says nothing about commitment; the writer releases it when the attempt has finished, committed or denied without proposing. Only the intersection means "this item is done", which is why the writer holds a driver branch it barely reads: that branch is the ack channel.
@@ -536,10 +536,10 @@ a source whose extent is not position-indexed rather than letting a product doma
 which drops a non-`UInt` key silently.
 
 Ascending rather than contiguous, because the positions are the *source's*. A restricted loop
-source (`for l in [x for x in xs if p(x)]`) delivers a subset of its extent's positions and
-the recurrence runs over exactly those, so the watermark is a lower bound on the next position
-rather than the position itself, and the ticks a filtered-out position would have occupied are
-never occupied. The alternative — iterating the extent densely and gating the write — was not
+source (`for l in [x for x in xs if p(x)]`) carries its extent's keys, the filtered ones marked
+deleted. The decode reads only the surviving positions and the recurrence runs over exactly
+those, so the watermark is a lower bound on the next position rather than the position itself,
+and the ticks a filtered-out position would have occupied are never occupied. The alternative — iterating the extent densely and gating the write — was not
 taken: the domain the pipeline hands the store is the refined extent, and a store that
 disagreed with it would have to recover the filter the type already carries.
 
@@ -564,13 +564,16 @@ write). What the driver does keep is the **item** cursor `emitted_through`, beca
 restricted source's positions are sparser than its extent's and the frontier therefore does
 not name one; the next position to iterate is the smallest delivered position above it. An
 emitted row is otherwise a pure function of the store tile and the source tile, with nothing
-cached that could drift. It decodes the source
-into `(absolute position, item)` pairs (`decode_source_positioned`), since an async source's
-domain arrives *unordered* and *compacts* as its consumed prefix is released; it reclaims
-that prefix incrementally and releases the whole source (`True`) once the loop is done. It
-also releases the changelog through the frontier — the store's keep-latest GC preserves each
-key's latest write inside a released prefix, so the fold is never stranded, and without it
-the store's `FanOut`-intersected watermark could never advance past the cycle branch.
+cached that could drift. It decodes the source into `(absolute position, item)` pairs
+(`decode_source_positioned`), since an async source's domain arrives *unordered* and
+*compacts* as its consumed prefix is released. The decode skips the rows the source marks
+deleted, because a `Restrict` marks a filtered row deleted rather than dropping it. The driver
+reclaims the consumed prefix incrementally and releases the whole source (`True`) once the loop
+is done. The consumed prefix is every position it has emitted and every filtered position below
+the next one it will emit, so the driver holds no filtered row below that position. It also
+releases the changelog through the frontier — the store's keep-latest GC preserves each key's
+latest write inside a released prefix, so the fold is never stranded, and without it the
+store's `FanOut`-intersected watermark could never advance past the cycle branch.
 
 **One position advances per outer pull**, because the cyclic `FanOut` serves a snapshot
 taken before the traversal began: a position decided *during* a pull is not visible until
