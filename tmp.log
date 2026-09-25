@@ -1,0 +1,1367 @@
+@  nlruptmq scook90 2026-09-25 08:42:51 default@ a3b3b52c fixup(oqloxtmw): a collection's recorded shape is DataFunction
+│ ×  owlkmpkr/0 scook90 2026-09-24 16:45:11 demo/09-demo-feed* 234aeb6e (divergent) (conflict) demo: bridge a Coinbase feed into the dev driver's stdin
+│ ×  sumqxurx/0 scook90 2026-09-24 16:45:11 demo/08-node-tails 851bc0d0 (divergent) (conflict) inspector: what flowed through a node, rather than what it holds
+│ ×  pmwmmlsk/0 dan 2026-09-24 16:45:11 demo/07-inspector-editing f5db9982 (divergent) (conflict) inspector: a source pane that is read, and edited
+│ ×  kwmnvnmk/0 scook90 2026-09-24 16:45:11 demo/06-operator-graph-noise 671a79d0 (divergent) (conflict) inspector: consolidate operator-graph rendering
+│ ×  pxpsvtuu/0 scook90 2026-09-24 16:45:11 skylar/provenance/20-reload-aware restack2@ 2e39dfd2 (divergent) (conflict) inspector: the panes and the values follow a reload
+│ ×  ryvyzxtr/0 scook90 2026-09-24 16:45:11 demo/03-inspector-embed* fec5861e (divergent) (conflict) cambra-inspector(web): a run that has started publishing stops saying it has not
+│ ×  opttokno/0 scook90 2026-09-24 16:45:11 demo/05-wasm-build* 22ab6c52 (divergent) (conflict) wasm: build the module and run the contract against it in Node
+│ ×  yuykmqul/0 scook90 2026-09-24 16:45:11 cc41b4b4 (divergent) (conflict) cambra-inspector(web): a snapshot and a frame stream the embedder supplies
+│ ×  ooplvvul/0 scook90 2026-09-24 16:45:11 9faf9624 (divergent) (conflict) wasm: the crate compiles for wasm32, and the module wraps the host
+│ ×  psqszwqv/0 scook90 2026-09-24 16:45:11 demo/04-embed-host* dd4385ae (divergent) (conflict) embed: a program the host compiles, pushes into and ticks
+│ ×  mvzuqxkz/0 scook90 2026-09-24 16:45:11 12a74c2b (divergent) (conflict) inspector: a source window for every source that has one
+│ ×  qqlvolst/0 scook90 2026-09-24 16:45:11 demo/02-dev-driver* d48a73f2 (divergent) (conflict) cambra: drive a host-channel program from the command line
+│ ×  mtyooqry/0 scook90 2026-09-24 16:45:11 12cf4d3c (divergent) (conflict) interpreter: a stdin source reads stdin when the program reads stdin
+│ ×  ppywmltp/0 scook90 2026-09-24 16:45:11 demo/01-host-channels* 21c792d3 (divergent) (conflict) asset_cart: the demo program in the gallery, wired by a channels file
+│ ×  slnwzzzn/0 scook90 2026-09-24 16:45:11 b66094ff (divergent) (conflict) ccl: channel declarations, from a CHL type to a registered channel
+│ ×  wkpnwrtv/0 scook90 2026-09-24 16:45:11 c1528b89 (divergent) (conflict) interpreter+ccl: a sink the host reads rows out of
+│ ○  lnxyznkl/0 scook90 2026-09-24 16:45:11 ffb84bd0 (divergent) interpreter: a source the host pushes rows into
+│ ○  wultvwqm/0 scook90 2026-09-24 16:45:11 2f9ea997 (divergent) interpreter: a stream buffer holds values, not lines
+│ ○  zskkrurs/0 scook90 2026-09-24 16:45:11 58aca0f9 (divergent) compilation_pipeline: a registered source whose rows are records
+│ ○  tmqtsuso scook90 2026-09-24 16:45:11 skylar/provenance/19-graph-pane* 95b08c28 Draw the operator pane as a graph rather than an indented forest
+├─╯
+○  oqloxtmw scook90 2026-09-24 16:45:11 skylar/provenance/17-values-pane* 0619e4e7 Select from the `Values` pane, and name a group that has produced nothing
+○  lulquknq scook90 2026-09-24 16:45:11 09299109 Add a `Values` pane showing what the operators a reader pinned currently hold
+│ ○  uqskttut scook90 2026-09-24 16:50:56 b27c1e29 fixup(tknpsxon): match IterateExtent's tiling as a DataFunction
+├─╯
+○  tknpsxon scook90 2026-09-24 16:45:11 skylar/provenance/14-live-values* 59bbc722 Stream a run's values over an `/api/live` websocket and delete the legacy dashboard
+│ ○  kyytyoyw scook90 2026-09-24 16:50:56 5069369c fixup(rmsmquvs): port value_recorder to DataFunction
+├─╯
+○  rmsmquvs scook90 2026-09-24 16:45:11 ce59344e Record what every producer returns, attributed to the operator that built it
+│ ○  qxnlpvxy scook90 2026-09-24 19:23:32 skylar/provenance/12a2-output-sink stdout-sink@ 9cac731e Add an `out = stdout()` sink statement, and bind every sink through one helper
+├─╯
+○  wxpuxqnn scook90 2026-09-24 16:45:11 output-sink@ 73a70540 Drop the sink node from the operator graph and mark each output on its operator
+◆  vonyqzoy daniel 2026-09-24 16:42:15 main e7f64da1 Replace the sealed and curried function tiles with one nesting `DataFunction` (#210)
+◆  tnupquuu skylar 2026-09-24 16:40:56 35c2a6d5 Make a source selection a byte range, and paint it apart from the spans it reaches (#216)
+◆  zpsptqsl skylar 2026-09-24 16:01:39 32b16521 Name the payload and the rejected value in wire-validation failures (#194)
+│ ◆  nnrwrpos daniel 2026-09-24 16:13:33 dmills/nested-recurrence@origin d6e1a6bf Take the level each operator pairs, wraps and merges at from the AST around it
+│ ◆  wmyorzrz daniel 2026-09-24 15:59:40 f95c4105 Realize a nested `for` loop's recurrence as one induction store per enclosing row
+│ ◆  lzsvxyql daniel 2026-09-24 15:59:40 dmills/nested-for-compile@origin 99a0d185 Lower mutable variables introduced in a loop body, and nested `for` loops as a parameterized `Transact`
+│ ◆  lxnztkzq daniel 2026-09-24 15:59:40 dmills/tile-levels-paths@origin 2eb46aac Add path-qualified predicates and a `CurryLevel` type for addressing a collection's levels
+│ ◆  rxlrvmpx daniel 2026-09-24 15:59:40 dmills/store-key-changelog@origin 37f4dd12 Hold a transactional store's state as one changelog per key
+│ ◆  mzxrrzns daniel 2026-09-24 15:59:40 dmills/correlated-filter@origin ac7db1a6 Compile a correlated comprehension's filter by re-basing its predicate onto the pair
+│ ◆  nyxlnunu daniel 2026-09-24 15:59:40 dmills/correlated-comprehension@origin 82a04135 Compile a correlated inner comprehension by pairing each outer row with the inner domain
+│ ◆  wnnywomu daniel 2026-09-24 15:59:40 dmills/carried-witness@origin f2267bda Compile a sum whose witness the value carries, rather than erasing or rejecting it
+│ ◆  svwrxpxy daniel 2026-09-24 15:59:40 dmills/txn-collection-read@origin 11181af5 Open a collection-valued store read into a level so a transaction body can iterate it
+│ ◆  wzynspps daniel 2026-09-24 15:59:40 dmills/record-collection-field@origin 3358f622 Compile a product value as a record of tiles, so a component can hold a collection
+│ │ ◆  xpolvlqm daniel 2026-09-24 15:59:40 dmills/constant-decision@origin 0fce7cc5 Answer the review of the constant writer decision
+│ │ ◆  ywplpkus daniel 2026-09-24 15:59:40 fc7e3bf7 Recognize a writer decision that reads neither its accumulator nor the loop item
+│ │ ◆  wvyrwzlz daniel 2026-09-24 15:59:40 dmills/restricted-source@origin 943841ff Answer the review of the restricted source decode
+│ │ ◆  krxzxpql daniel 2026-09-24 15:59:40 0e141435 Read a restricted source's surviving positions, not its extent's
+│ │ ◆  vpkwrzvt daniel 2026-09-24 15:59:40 dmills/list-element-binder@origin 8b59aac1 Answer the review of the list element refusal
+│ │ ◆  nlrlyklr daniel 2026-09-24 15:59:40 75d1449e Refuse a list literal whose elements vary with the enclosing binder
+│ │ ◆  vmmzpsrs daniel 2026-09-24 15:59:40 dmills/txn-predicate-reads@origin 5e766994 Answer the review of the transactional predicate reads
+│ │ ◆  tzwwkmpk daniel 2026-09-24 15:59:40 a4e05f17 Reach refinement predicates when rewriting a letrec's transactional reads
+│ │ ◆  uwsuvrpx daniel 2026-09-24 15:59:40 dmills/generated-pairs@origin a69853f4 Answer the review of the generated-pairs grid
+│ │ ◆  utztlkmt daniel 2026-09-24 15:59:40 7808af5b Enumerate a differential corpus from program skeletons and hole fillers
+│ │ ◆  zpyqyvtt daniel 2026-09-24 15:59:40 dmills/chl-interp@origin 864450bf Answer the review of the reference interpreter
+│ │ ◆  lkomyupu daniel 2026-09-24 15:59:40 d6fb7be9 Add a reference interpreter for CHL and diff the compiler against it
+│ │ ◆  mqplqlzl daniel 2026-09-24 15:59:40 73b96289 Make the CHL parser its own crate, so a consumer can depend on the front end alone
+│ │ ◆  qpotnypz daniel 2026-09-24 15:59:40 dmills/test-sink@origin af01808a Answer the review of the test sink
+│ │ ◆  rsnmzrtr daniel 2026-09-24 15:59:40 d883b9bf Add a test sink, so a program's output can be observed the way a real program's is
+│ │ ◆  kttrvtnl daniel 2026-09-24 15:59:40 dmills/txn-reply-type@origin 8ed4c81d Type an in-block reply over the commit clock it is keyed by
+│ ├─╯
+│ ◆  rvszkwqs daniel 2026-09-24 15:59:40 c4b5dd40 Address review on #210
+│ ◆  rqypxstz daniel 2026-09-24 15:59:33 daf77d94 Retire the vocabulary the collapsed variants left, and check two untested invariants
+│ ◆  kwlpmqpr daniel 2026-09-24 15:59:33 37a850b9 Merge a collection by key, rather than concatenating and repairing
+│ ◆  tkmmkvoq daniel 2026-09-24 15:59:33 7bcd7198 Ask whether a level sits below through a record, and re-collapse after a join
+│ ◆  wtttxnym daniel 2026-09-24 15:59:33 80266920 Compact every level of a tile, not only its top
+│ ◆  utmqupto/0 daniel 2026-09-24 15:59:33 20b826af (divergent) Collapse a run of equal keys when a merge extends a collection
+│ ◆  rzqtzwkr/0 daniel 2026-09-24 15:59:33 578fb0e2 (divergent) Represent a tile as a value vectorized over rows, nesting one node per collection level
+├─╯
+│ ○  olvltory scook90 2026-09-24 15:43:11 312b918e inspector(web): keep a selection's region in one measure, and repair three claims
+│ ○  wsqrnwzt scook90 2026-09-24 15:43:11 f02fd097 inspector(web): blue is what you pointed at, amber is what we resolved
+│ ○  uynvksom scook90 2026-09-24 15:43:11 cdcb0876 inspector(web): a pane does not scroll the row you just clicked
+│ ○  wutsunts scook90 2026-09-24 15:43:11 bc619e99 inspector: make a source selection a byte range, and stop drawing refinement predicates
+│ ○  qkqqmukz scook90 2026-09-24 15:43:11 9850a3ac Correct the span-ordering test's stale claims and share one `el` helper
+│ ○  klwwwzmo scook90 2026-09-24 15:43:11 da388214 inspector: name the program a wire validator rejected
+│ ○  rkspqzpw scook90 2026-09-24 15:43:10 d78aab46 inspector(web): a rejected span reports the span
+│ ○  qlkskspk scook90 2026-09-24 15:43:10 d1f19ee0 inspector: a join reaches the validator that never saw one
+├─╯
+◆  tswlqltp skylar 2026-09-24 15:40:37 d0e8f4d8 Pin the replayed and lost reads a hot reload produces over a kept fan-out (#246)
+│ ○  xotlutyv scook90 2026-09-24 15:42:32 fanout-graphs@ 248c9729 (empty) (no description set)
+├─╯
+◆  otltmymu daniel 2026-09-24 12:53:37 2e81e88f Constant-fold closed scalar computations during planning, through the runtime's operator kernel (#182)
+◆  tltsyyor daniel 2026-09-24 12:53:36 80e7636b Take an empty collection's types from its use site, and add `empty_map()` (#183)
+◆  kvmqxvow daniel 2026-09-24 12:53:36 0ce2653d Add integer `**` with a non-negative exponent refinement (#181)
+◆  mzqyuyyl daniel 2026-09-24 12:53:35 f59c54d9 Parse the pair arrow `k -> v` as the two-tuple `(k, v)` (#180)
+◆  pstrlspw daniel 2026-09-24 12:53:35 22a73bdc Answer `Equatable` on a product componentwise, so a tuple or record can key a collection (#177)
+│ ◆  rxvpkokx dan 2026-09-24 12:29:09 codex/docs-compiler-fundamentals@origin 6b1bb639 Rework CCL design guides around the current compiler pipeline
+├─╯
+│ ◆  zortwytn contact 2026-09-24 11:58:37 enable-refined-mut@origin b552e522 Enable refined writes to mut vars
+├─╯
+◆  kytztmtk skylar 2026-09-24 11:24:39 52d5d245 Drop the data-source node from the operator graph and read each source from its `IterateExtent` (#193)
+│ ◆  otupyrpt contact 2026-09-24 12:15:06 smart-refined-ite@origin 000da749 Work on ite
+│ ◆  rovprnrz contact 2026-09-24 11:34:40 c4ff3cb9 Add conditional refinement checking tests
+│ ◆  mumnutzy contact 2026-09-24 11:17:21 92b21ac0 Fix record-time scope check by adding opaques to telescopes
+│ ◆  wllzqzzs contact 2026-09-24 10:09:24 29343ba8 Enable refined writes to mut vars
+├─╯
+│ ○  tvmowmxr scook90 2026-09-23 20:32:53 main-inspect@ 2a608ad2 (empty) (no description set)
+├─╯
+│ ○  tuwomlpt scook90 2026-09-24 09:24:44 fanout-lag@ a2fcc0e2 EXPERIMENT, not for merge: key fan-out slots by reader and claim the replaced reader's guard (option A)
+│ ○  ounnxzks scook90 2026-09-24 09:18:43 cce2c0ed Pin which reader of a kept fan-out each rebuilt reader corresponds to
+│ ○  puqkonul scook90 2026-09-23 20:42:08 3ec71d16 (no description set)
+│ ○  sontxxqu scook90 2026-09-23 20:27:05 5ead88cc (empty) (no description set)
+├─╯
+│ ○  rxyyynzx scook90 2026-09-24 19:22:43 skylar/branching-prototype branching-prototype@ 6224de2f Run several branches of one program in one process
+│ ○  uqloqyqo scook90 2026-09-24 15:45:58 program-evolution@ ca02e074 Consolidate the hot-reload and branching design docs into `program-evolution.md`
+│ │ ○  wkqzuxuu scook90 2026-09-23 12:27:35 skylar/branching-design* 2af70a43 (no description set)
+│ ├─╯
+│ │ ○  ovslupmp scook90 2026-09-23 12:27:35 skylar/branching-mermaid-lint 340a689e wip: mermaid lint
+│ ├─╯
+│ ○  kqozqlts scook90 2026-09-23 12:27:35 branching@ 86434d94 Branching: state the fragment execution model, and repair what it corrects
+│ ○  oxyrptzl scook90 2026-09-23 12:27:35 ae431220 Design docs: the program-branching model and its operational configurations
+├─╯
+◆  qwwzolxq skylar 2026-09-23 11:55:38 0e11b34e Cover the conditional-induction shapes with a materialized leak gate (#147)
+│ ○  toxnlkml scook90 2026-09-23 12:24:54 pr147@ f6007b6f (empty) (no description set)
+├─╯
+◆  zsmnwruz daniel 2026-09-22 21:34:24 d73beac9 Build every `Type::History` through `Type::feed`, `Type::mutable` and `Type::history` (#191)
+◆  wprqlwwl daniel 2026-09-22 21:11:18 ac332ec7 Make node ids independent of `debug_assertions`, and gate that configuration in CI (#218)
+◆  zkxwvmln daniel 2026-09-22 21:07:12 0c4aae58 Fan a loop's conditional out once per deferred collection it feeds (#170)
+│ ◆  tmkrtymm daniel 2026-09-22 19:00:24 dmills/loadfrom-domain@origin fe15578f Refuse a `@LoadFrom` that seeds a store sequenced in another domain
+├─╯
+◆  slnxxxnp daniel 2026-09-22 13:20:47 357b8615 Add `@LoadFrom` so a reload can seed a new variable from a retired one (#174)
+◆  ykqyplkz daniel 2026-09-22 12:02:51 075f248d Erase channel types from refinement predicates in `channelize` (#196)
+◆  uswvwmmy daniel 2026-09-22 10:34:28 6562e812 Run the reversed refinement-order suite as its own job sharing `test`'s Cargo cache (#215)
+│ ◆  qqtuwmvx daniel 2026-09-18 19:05:22 dmills/feed-contribution-type@origin 75d16ccc Relate every Let/LetRec binder to its references, and fix the three passes that broke it
+├─╯
+│ ◆  qwmrsupq daniel 2026-09-19 18:11:13 dmills/nested-for-fold@origin 1067c26e Fold an inner for that only accumulates into the accumulation it denotes
+│ ◆  znlzrnuv daniel 2026-09-19 17:53:46 00ff2727 Compile a sum whose witness the value carries, rather than erasing or rejecting it
+│ ◆  mpvoqrrp daniel 2026-09-19 17:53:46 9956d72d Compile a correlated comprehension's filter by re-basing its predicate onto the pair
+│ ◆  qnwkuskk daniel 2026-09-19 17:53:46 61376c5c Compile a correlated inner comprehension by pairing each outer row with the inner domain
+│ ◆  rtksswuo daniel 2026-09-19 17:53:46 f84e0def Read a transactional map as a collection by streaming each row's materialized value
+│ ◆  xnlkwkvr daniel 2026-09-19 17:53:46 d9599cb8 Let a record or tuple component hold a collection by keeping its own tiling
+│ ◆  vvqrqnzo daniel 2026-09-19 17:53:46 fe2d4420 Hold a transactional store's state as one changelog per key
+│ ◆  utmqupto/4 daniel 2026-09-19 17:29:44 b92a110e (divergent) Collapse a run of equal keys when a merge extends a collection
+│ ◆  rzqtzwkr/4 daniel 2026-09-17 17:43:38 f2f4d5e2 (divergent) Represent a tile as a value vectorized over rows, nesting one node per collection level
+├─╯
+◆  nsoktopk daniel 2026-09-16 15:28:42 84967b5b Retire git-spice and document the jj and GitHub-native stack workflows (#220)
+│ ◆  ruvolqxy daniel 2026-09-16 13:55:50 dmills/level-append@origin a0f7f4b1 Share one domain-level append between `Product` and `IterateRowCollection`
+│ ◆  vqsxypwo daniel 2026-09-16 13:55:46 9deaf7b4 Let a curried tile hold an empty group, so an empty collection folds to the identity
+│ ◆  mklzzyyk daniel 2026-09-16 13:54:45 f7dd5996 Generalize the curried tiling to any number of domain levels so correlated comprehensions nest
+│ ◆  qqyuvmrw daniel 2026-09-16 13:54:41 f7c9ed14 Compile a correlated filter by re-basing its predicate onto the pair
+│ ◆  mszzsszp daniel 2026-09-16 13:54:25 bbbef576 Compile a correlated inner comprehension by pairing each outer row with the inner positions
+│ ◆  vmrvxoox daniel 2026-09-16 13:54:11 10787049 Read a transactional collection as a collection by dereffing the handle and streaming its map
+├─╯
+◆  lzxvxtvp daniel 2026-09-16 13:08:15 c67951f1 Enforce three debug-gated compiler checks in every build (#186)
+◆  pvoyxzwm daniel 2026-09-16 12:45:46 e7cb8204 Run each CI gate as its own job, and cache the Lean build (#214)
+│ ○  mumqrquq scook90 2026-09-16 12:26:45 durable-exec@ 0c772652 (empty) (no description set)
+├─╯
+◆  nyvuwxvm skylar 2026-09-16 10:54:48 3f6a6daf Require a PR description to quote the output it changes and state what each section replaces (#213)
+◆  zzunmnxz daniel 2026-09-15 17:33:56 b2a82c09 Take a zip's binder from whichever operand names one (#187)
+◆  kpsyrpwm daniel 2026-09-15 17:26:06 68d32722 Admit a feed above a for-loop body's last statement (#169)
+◆  rvkyplyk daniel 2026-09-15 17:26:05 a43e37a2 Compile `pass` by dropping it at every block entry (#168)
+◆  ptpxyvlp daniel 2026-09-15 17:03:57 7a5efd24 Delete the per-operation `deep-typecheck` probe and enforce the closure invariant unconditionally (#161)
+◆  ylpvtovk daniel 2026-09-15 16:02:49 e2032620 Report the sub-comparison when a domain mismatch's two sides render identically (#206)
+◆  rtpuwkkl contact 2026-09-15 15:55:05 ae02907c Fix staleness of trait refinement inputs (#212)
+◆  ksmwnotk daniel 2026-09-15 15:52:47 6602b78a Compare the statement shapes a discharge can capture, and rename the predicate walk for terms (#185)
+◆  uyskzlou daniel 2026-09-15 15:51:37 2974e257 Give an application one read view of its function in the post-inference check (#195)
+◆  nuqpnqrt daniel 2026-09-15 14:44:31 03736b65 Gate a `Memo`'s input pull on a one-bit input-notified flag (#201)
+◆  syntouku daniel 2026-09-15 14:44:12 e3a839a0 Retire `stream` and `arrow` as second names for `Type::Fun`, and spell a feed's read view `⤇` (#200)
+◆  nqnrzxwz skylar 2026-09-15 14:20:52 a9b54883 Warn before an edit amends a jj commit that is already pushed (#209)
+│ ○  lrzvonpy scook90 2026-09-16 09:00:41 jj-hook@ 76cd1ef7 (empty) (no description set)
+├─╯
+◆  mmnsoquv skylar 2026-09-15 12:23:41 ce39c152 Share the repo's Claude Code permission rules through the checked-in settings (#208)
+◆  rvkmzyxw skylar 2026-09-14 18:10:14 e8b29f6b Move the inspector's TypeScript project from `cambra-inspector/` to `web/` (#192)
+◆  qlswrsno daniel 2026-09-14 15:25:17 ff605df4 Pin `txn_multi_read`'s answer by reading `pool` with `await_final` (#179)
+◆  tossrqpq daniel 2026-09-14 15:23:38 d253d047 Defer the unreadable-input correspondence to the first path that reads it (#188)
+◆  mrzmpzlr daniel 2026-09-14 15:13:54 2f172417 Read both sides at an invariant position however the walk reached it (#172)
+│ ○  uqmoonqx scook90 2026-09-14 14:22:29 graphlayout@ 136b021c (empty) (no description set)
+│ ○  ploquyvv/0 scook90 2026-09-14 14:22:29 0eae55f0 (divergent) Draw the operator pane as a graph rather than an indented forest
+│ ○  wzzwysxr/0 scook90 2026-09-14 14:22:29 3d427597 (divergent) Select from the `Values` pane, and name a group that has produced nothing
+│ ○  kvspxutw/0 scook90 2026-09-14 14:22:29 120a8239 (divergent) Add a `Values` pane showing what the operators a reader pinned currently hold
+│ ○  vrsprtll/0 scook90 2026-09-14 14:22:29 e4e22d31 (divergent) Move the inspector's TypeScript project from `cambra-inspector/` to `web/`
+│ ○  prtktwkp/0 scook90 2026-09-14 14:22:17 9a7297df (divergent) Stream a run's values over an `/api/live` websocket and delete the legacy dashboard
+│ ○  pqkoxkxt/0 scook90 2026-09-14 14:22:17 f55b961c (divergent) Record what every producer returns, attributed to the operator that built it
+│ ○  wrzyusnq/0 scook90 2026-09-14 14:22:17 7595cd4a (divergent) cambra-inspector(web): blue is what you pointed at, amber is what we resolved
+│ ○  lykkovor/0 scook90 2026-09-14 14:22:17 cbaefe97 (divergent) cambra-inspector(web): a pane does not scroll the row you just clicked
+│ ○  mvylptmn/0 scook90 2026-09-14 14:22:17 15ba0354 (divergent) cambra-inspector(web): a rejected span reports the span
+│ ○  pwktolkp/0 scook90 2026-09-14 14:22:17 9ad9c8d5 (divergent) cambra-inspector: a join reaches the validator that never saw one
+│ │ ○  ootvnnnm scook90 2026-09-14 14:22:17 f68f12ef (empty) (no description set)
+│ ├─╯
+│ ○  kvmzonxs/0 scook90 2026-09-14 14:22:17 852bda25 (divergent) cambra-inspector: the docs describe the wire and the gestures that exist
+│ ○  xmrsutyv/0 scook90 2026-09-14 14:22:17 28c32f11 (divergent) cambra-inspector(web): a source selection is a range, and predicates leave the tree
+│ ○  znvlslqo/0 scook90 2026-09-14 14:22:17 a9095b38 (divergent) Wire an `IterateExtent` to the source it iterates
+├─╯
+│ ◆  touomxmp contact 2026-09-13 08:42:04 wasm-smt@origin 8d8c5fcf Switch to Oxiz SMT library to support WASM
+│ ◆  vkzyzwts contact 2026-09-12 10:37:07 transaction-body-refinements@origin 63a1a58d Add ^- operator, thread guards into if-then-else arms
+│ ◆  ssmwzypo contact 2026-09-12 09:25:05 e36139da Prevent mutable variables from triggering scope violation
+│ ◆  untvlorm contact 2026-09-12 09:13:43 ce412e83 Transaction tests
+│ ◆  mxmsmntw contact 2026-09-12 08:42:06 40456ee2 Add flattening example
+│ ◆  ksyzvztx contact 2026-09-11 22:09:37 ec0791d0 Add transaction tests
+│ ◆  vunqnnvq contact 2026-09-11 21:28:56 a66f3e37 Elif test
+│ ◆  krqntzzl contact 2026-09-11 21:27:37 f632d5d7 Strengthen if-then-else refinements using conditions
+│ ◆  kwpoqswm contact 2026-09-11 20:29:28 6caf1ad4 Add if-then-else tests
+├─╯
+│ ○  ywvykmtr scook90 2026-09-11 19:49:13 63bb99d5 (empty) scratch: bisect
+├─╯
+│ ○  zsmwnyur scook90 2026-09-15 11:46:52 05c78539 (empty) scratch: bisect
+│ │ ×  vulvqnpr/0 daniel 2026-09-15 11:46:52 5efa3537 (divergent) (conflict) Hold a collection in a product value instead of zipping the components
+│ │ ×  ttvvsuon/0 daniel 2026-09-15 11:46:52 93104a25 (divergent) (conflict) Separate the program's output list from a record value
+│ │ ×  wvomrkqr/0 daniel 2026-09-15 11:46:52 b1339952 (divergent) (conflict) Fold a closed scalar computation to the literal it computes
+│ ├─╯
+│ │ ○  ymwrtmpu scook90 2026-09-14 14:00:31 skylar/conversion-error-span f49a2d3f (no description set)
+│ │ ○  vwuywolo scook90 2026-09-13 18:18:49 skylar/asset-cart-loadfrom-upgrade 35ff43cc inspector: make the source pane an editor you can edit in
+│ │ ○  ryllrqwu scook90 2026-09-13 16:19:26 eb1923a8 inspector: put a program in the pane, and a rejection under the line it names
+│ │ ○  nqssypsr scook90 2026-09-13 15:38:35 396058bb Swap the refinement solver for a pure-Rust one that builds for wasm
+│ │ ○  usorkvos scook90 2026-09-13 14:06:27 8dc3fe41 Add a state-migrating reload target to the single-line asset cart
+│ │ ◆  ksxnrnzw daniel 2026-09-13 01:58:28 dan/demo-map-cart@origin 5935f37f Defer the unreadable-input correspondence to the first path that reads it
+│ │ ◆  wppslwrw daniel 2026-09-13 01:33:34 e3caa19d Add a per-asset-scale reload target for the single-line asset cart
+│ │ ◆  tsyznmtw daniel 2026-09-13 01:07:42 a52043d6 Carry the refined `Balance` into the single-line asset cart
+│ │ ◆  lnukkoyw daniel 2026-09-13 00:47:59 70524888 Drive `v1_single_line.cambra` through its routes instead of only compiling it
+│ │ ◆  vtvtrzsx daniel 2026-09-13 00:47:59 4aa4938c Advance producer state once per delivery round instead of once per pull
+│ │ ◆  stpysnms daniel 2026-09-13 00:47:44 ecd869e9 Bind the repeated lookups in the cart's read sites
+│ │ ◆  rsylknlz contact 2026-09-13 00:46:41 30b621f0 Add flattening example
+│ │ ◆  mpmorvvl daniel 2026-09-13 00:46:41 13842842 Pin that the single-line cart compiles, not that it runs
+│ │ ◆  mwtnuyqx daniel 2026-09-13 00:46:41 2e5361eb Add the map-based cart with one line per account, which runs
+│ │ ◆  wmpmzzzz dan 2026-09-12 23:39:57 db08a49e Reload a running program from the page that embeds it
+│ │ ◆  rqnkyqmk dan 2026-09-12 23:27:31 dan/wip-refinements@origin 39e7ed70 Carry a mutable variable's refinement as the invariant it is
+│ │ ◆  lmomsqmq dan 2026-09-12 23:27:31 507cef9f Let a refined mutable variable be declared, and say what still stops one
+│ │ ◆  xyvtwqsu contact 2026-09-12 22:19:00 a8f32347 Add ^- operator, thread guards into if-then-else arms
+│ │ ◆  ukrwxqvr contact 2026-09-12 22:04:52 47444761 Prevent mutable variables from triggering scope violation
+│ │ ◆  olpzpxpm contact 2026-09-12 22:01:53 14fa63b3 Transaction tests
+│ │ ◆  wnlrwxkk contact 2026-09-12 22:01:53 f28ce521 Add transaction tests
+│ │ ◆  kunqlwlp contact 2026-09-12 22:01:53 d441a023 Elif test
+│ │ ◆  tprzwytt contact 2026-09-12 22:01:53 7726b2a1 Strengthen if-then-else refinements using conditions
+│ │ ◆  unzsupxo contact 2026-09-12 21:57:05 8199c3d2 Add if-then-else tests
+│ │ ◆  prmpnozn dan 2026-09-12 21:55:26 efccf652 Add the refining product `^*`, so a scaled amount keeps its refinement
+│ │ │ ◆  pzktvmwn dan 2026-09-12 23:37:07 dan/wip-reload@origin 46182840 (scratch)
+│ │ │ ◆  zqrqpkqr dan 2026-09-12 22:45:04 f67c43f3 Reload a running program from the page that embeds it
+│ │ ├─╯
+│ │ ◆  vzpmpzwr dan 2026-09-12 21:46:55 f7d76c74 Say what v1 meets now its price feed is built
+│ │ ◆  nwzrtzlx dan 2026-09-12 21:45:09 bb464d9b Bind a host source to the socket that fills it
+│ │ │ ◆  kytuysqv daniel 2026-09-13 00:45:30 dan/single-line-cart@origin c7de6600 Drive `v1_single_line.cambra` through its routes instead of only compiling it
+│ │ │ ◆  xpkzsrsp daniel 2026-09-13 00:45:23 868fa5e0 Advance producer state once per delivery round instead of once per pull
+│ │ │ ◆  uuyzsmpr daniel 2026-09-13 00:45:12 d93e9d44 Delete a duplicate of `Type::field` and an unnecessary qualification
+│ │ │ ◆  vvmxrwon daniel 2026-09-12 22:49:15 dc90b016 Bind the repeated lookups in the cart's read sites
+│ │ │ ◆  nxnroqnv daniel 2026-09-12 22:19:13 c835fe89 Say what the entry-filter pins report after the condition work
+│ │ │ ◆  zlwlxpxw contact 2026-09-12 22:16:06 5b5bfd3e Add ^- operator, thread guards into if-then-else arms
+│ │ │ ◆  pnzrprqm contact 2026-09-12 22:13:43 6aed9de9 Prevent mutable variables from triggering scope violation
+│ │ │ ◆  slynmnqx contact 2026-09-12 22:13:43 d64f99be Transaction tests
+│ │ │ ◆  vztzksvx contact 2026-09-12 22:13:43 37f55fbc Add flattening example
+│ │ │ ◆  krmwqozo contact 2026-09-12 22:13:43 32dcb303 Add transaction tests
+│ │ │ ◆  xtkxvvoo contact 2026-09-12 22:13:43 ab2a91b2 Elif test
+│ │ │ ◆  klnywpor contact 2026-09-12 22:13:43 c9603160 Strengthen if-then-else refinements using conditions
+│ │ │ ◆  pqoxsnnr contact 2026-09-12 22:13:01 b72bea74 Add if-then-else tests
+│ │ │ ◆  lwopswsu daniel 2026-09-12 22:12:51 d0a0e07a Pin that the single-line cart compiles, not that it runs
+│ │ │ ◆  qoynxlky daniel 2026-09-12 22:04:30 404c4622 Add the map-based cart with one line per account, which runs
+│ │ ├─╯
+│ │ ◆  ulxysysu daniel 2026-09-12 21:44:07 73ee9aeb Read a feed handle through to its stream where an argument is checked
+│ │ ◆  kluuzsut daniel 2026-09-12 21:40:23 33596294 Say what the record-equality pins report now that a record is equatable
+│ │ ◆  mosooyup daniel 2026-09-12 21:35:51 64679cfb Fold the terms a refinement predicate embeds, beside the ones it shares with the tree
+│ │ ◆  xvvvpoxt daniel 2026-09-12 21:15:48 de5464e7 Let a refinement's element read defer its collision to the base
+│ │ ◆  wrtnqrsy daniel 2026-09-12 21:15:48 d8ec069f Say which loops put an iteration in scope, and pin the ones that do not
+│ │ ◆  kyptmrpw daniel 2026-09-12 21:15:48 510ba09a Abstract a feed contribution over the channel's position
+│ │ ◆  kutvonnn daniel 2026-09-12 21:15:43 06c1462a Enforce the record-time closure check in every build
+│ │ ◆  vnrqlmzt daniel 2026-09-12 21:15:43 f2e93881 Record what a release build reports behind the scope check
+│ │ ◆  vqwttrqw daniel 2026-09-12 21:15:43 340cb446 Give `Type::History` a position binder
+│ │ ◆  rwnqnkun daniel 2026-09-12 21:15:43 c4a9710e Give `Type::History` a constructor
+│ │ ◆  vkqlrmnk daniel 2026-09-12 21:15:43 3e22973d Pin the two defects behind v1's cart view, and what works beside them
+│ │ ◆  yppkmszz daniel 2026-09-12 21:15:43 3d0170b4 Pin what v1's read sites report, behind the drain
+│ │ ◆  xonkokmn daniel 2026-09-12 21:15:43 b97f1d45 Seed v1's stores with `box(map(…))` and `empty_map()`
+│ │ ◆  worwpltx daniel 2026-09-12 21:15:34 ed775cbf Take an `if` in a `for` header
+│ │ ◆  mmrvytrx daniel 2026-09-12 15:30:38 62a676f0 Filter a collection held per row
+│ │ ◆  mxtrqmmz daniel 2026-09-12 15:22:50 3707a50a Re-base a correlated filter onto the pair it filters
+│ │ ◆  tsvzvvsl daniel 2026-09-12 14:56:00 06c576ca Take a zip's binder from either of its operands
+│ │ ◆  nxvmvtlt daniel 2026-09-12 14:23:36 e5323bd0 Name a correlated comprehension's inner source
+│ │ ◆  tpswrtlw daniel 2026-09-12 13:54:24 8b8653a0 Run a correlated inner comprehension once per outer row
+│ │ ◆  puptsoxx daniel 2026-09-12 12:57:48 fd67c74e Read a transactional collection as a collection
+│ │ ◆  ppqunsuk daniel 2026-09-12 11:51:30 ed69c67f Iterate the entries of a map whose domain is a witness
+│ │ │ ○  qsozuxmt scook90 2026-09-12 14:18:53 7cd5fa41 (no description set)
+│ │ │ ○  xyposplz scook90 2026-09-12 12:34:09 demo/11-blocker3-fixed cc45853b demo: blocker 3 is fixed, and its dangling citation is gone
+│ │ │ ○  kmxqttmz scook90 2026-09-12 11:21:09 demo/10-upgrade-loop c7fd9e43 demo: a two-phase upgrade loop, and what v1 actually waits on
+│ │ ├─╯
+│ │ ◆  tuxklsqv daniel 2026-09-12 11:08:21 78513534 Take a compound key apart at an entry binder
+│ │ ◆  mkkwmwxq dan 2026-09-12 09:19:29 3c97309b demo: the map-based cart, and four steps toward compiling it
+│ │ ◆  xywluqus daniel 2026-09-11 22:30:16 d4a5a9b3 Answer term equality for every shape a program can build
+│ │ ◆  owlkmpkr/146 scook90 2026-09-11 20:19:20 demo/09-demo-feed@origin 09c992ed (divergent) demo: bridge a Coinbase feed into the dev driver's stdin
+│ │ ◆  sumqxurx/145 scook90 2026-09-11 20:19:20 a4a25835 (divergent) inspector: what flowed through a node, rather than what it holds
+│ │ ◆  pmwmmlsk/142 dan 2026-09-11 20:19:20 2a4cc5cd (divergent) inspector: a source pane that is read, and edited
+│ │ ◆  kwmnvnmk/139 scook90 2026-09-11 20:19:20 87dedb1c (divergent) inspector: consolidate operator-graph rendering
+│ │ ◆  pxpsvtuu/135 scook90 2026-09-11 20:19:20 c384be07 (divergent) inspector: the panes and the values follow a reload
+│ │ ◆  ryvyzxtr/131 scook90 2026-09-11 20:18:00 77173b75 (divergent) cambra-inspector(web): a run that has started publishing stops saying it has not
+│ │ ◆  opttokno/128 scook90 2026-09-11 20:18:00 bb7b807f (divergent) wasm: build the module and run the contract against it in Node
+│ │ ◆  yuykmqul/126 scook90 2026-09-11 20:18:00 f279dcb9 (divergent) cambra-inspector(web): a snapshot and a frame stream the embedder supplies
+│ │ ◆  ooplvvul/123 scook90 2026-09-11 20:18:00 3a619bfc (divergent) wasm: the crate compiles for wasm32, and the module wraps the host
+│ │ ◆  psqszwqv/122 scook90 2026-09-11 20:18:00 794198a2 (divergent) embed: a program the host compiles, pushes into and ticks
+│ │ ◆  mvzuqxkz/120 scook90 2026-09-11 20:18:00 e511623b (divergent) inspector: a source window for every source that has one
+│ │ ◆  qqlvolst/120 scook90 2026-09-11 20:18:00 a0eece79 (divergent) cambra: drive a host-channel program from the command line
+│ │ ◆  mtyooqry/119 scook90 2026-09-11 20:18:00 d71ac27d (divergent) interpreter: a stdin source reads stdin when the program reads stdin
+│ │ ◆  ppywmltp/119 scook90 2026-09-11 20:18:00 912239e4 (divergent) asset_cart: the demo program in the gallery, wired by a channels file
+│ │ ◆  slnwzzzn/118 scook90 2026-09-11 20:18:00 cc1abba4 (divergent) ccl: channel declarations, from a CHL type to a registered channel
+│ │ ◆  wkpnwrtv/118 scook90 2026-09-11 20:18:00 5d2a29ba (divergent) interpreter+ccl: a sink the host reads rows out of
+│ │ ◆  lnxyznkl/117 scook90 2026-09-11 20:17:46 e2088c61 (divergent) interpreter: a source the host pushes rows into
+│ │ ◆  wultvwqm/117 scook90 2026-09-11 20:17:46 3fabb6ed (divergent) interpreter: a stream buffer holds values, not lines
+│ │ ◆  zskkrurs/117 scook90 2026-09-11 20:17:46 3f47c7e9 (divergent) compilation_pipeline: a registered source whose rows are records
+│ │ ◆  ploquyvv/10 scook90 2026-09-11 20:17:46 1ff34fbb (divergent) Draw the operator pane as a graph rather than an indented forest
+│ │ ◆  wzzwysxr/10 scook90 2026-09-11 20:17:46 f1f01b3f (divergent) Select from the `Values` pane, and name a group that has produced nothing
+│ │ ◆  kvspxutw/10 scook90 2026-09-11 20:17:46 511a05b0 (divergent) Add a `Values` pane showing what the operators a reader pinned currently hold
+│ │ ◆  vrsprtll/10 scook90 2026-09-11 20:17:46 0a4135ef (divergent) Move the inspector's TypeScript project from `cambra-inspector/` to `web/`
+│ │ ◆  prtktwkp/7 scook90 2026-09-11 20:17:39 990404e7 (divergent) Stream a run's values over an `/api/live` websocket and delete the legacy dashboard
+│ │ ◆  pqkoxkxt/7 scook90 2026-09-11 20:17:39 06f5fe86 (divergent) Record what every producer returns, attributed to the operator that built it
+│ │ ◆  wrzyusnq/5 scook90 2026-09-11 20:17:16 dd02c14a (divergent) cambra-inspector(web): blue is what you pointed at, amber is what we resolved
+│ │ ◆  lykkovor/5 scook90 2026-09-11 20:17:16 e8fff710 (divergent) cambra-inspector(web): a pane does not scroll the row you just clicked
+│ │ ◆  mvylptmn/5 scook90 2026-09-11 20:17:16 d23d53a9 (divergent) cambra-inspector(web): a rejected span reports the span
+│ │ ◆  pwktolkp/5 scook90 2026-09-11 20:17:16 dfda9adb (divergent) cambra-inspector: a join reaches the validator that never saw one
+│ │ ◆  kvmzonxs/5 scook90 2026-09-11 20:17:16 337be0e9 (divergent) cambra-inspector: the docs describe the wire and the gestures that exist
+│ │ ◆  xmrsutyv/5 scook90 2026-09-11 20:17:16 0354bfc5 (divergent) cambra-inspector(web): a source selection is a range, and predicates leave the tree
+│ │ ◆  znvlslqo/5 scook90 2026-09-11 20:17:16 3a58f308 (divergent) Wire an `IterateExtent` to the source it iterates
+│ │ ◆  vulvqnpr/4 daniel 2026-09-11 18:56:14 bf46435f (divergent) Hold a collection in a product value instead of zipping the components
+│ │ ◆  ttvvsuon/4 daniel 2026-09-11 18:54:47 562d217b (divergent) Separate the program's output list from a record value
+│ │ ◆  wvomrkqr/4 daniel 2026-09-11 18:54:47 036ef254 (divergent) Fold a closed scalar computation to the literal it computes
+│ │ ◆  slxtrzuk daniel 2026-09-11 18:54:22 3f073167 Add `empty_map()`, the collection with no entries
+│ │ ◆  wnowsnwv daniel 2026-09-11 18:54:22 980f9405 Infer an empty list literal's element type from its use
+│ │ ◆  kwlwwzlv daniel 2026-09-11 18:54:22 e43e83c8 Add the right-associative `**` exponentiation operator
+│ │ ◆  pvskswpm daniel 2026-09-11 18:51:49 e6b9c1c3 Parse the pair arrow `k -> v` as the two-tuple `(k, v)`
+│ │ ◆  xrxknpul daniel 2026-09-11 18:51:49 24e7530f Key a collection by a record or a tuple, equality being componentwise
+│ │ ◆  zlxzrtwp daniel 2026-09-11 18:51:49 c2f32667 Add the proven lookup `c[k]`, answering the value and faulting on an absent key
+│ │ ◆  wtuztuyq daniel 2026-09-11 18:51:49 eab67034 Add `@LoadFrom` so a reload can seed a new variable from a retired one
+│ ├─╯
+│ ◆  svvplsoo daniel 2026-09-11 18:51:49 fffb751b Spell the refined-key pins as what they are
+│ ◆  mpvxzkzx daniel 2026-09-11 18:51:49 c6992000 Keep the general merge notes under the section they belong to
+│ ◆  oklnvoyk daniel 2026-09-11 18:51:49 b88278a1 Keep the merge under the walk-wide collapse flag
+│ ◆  myszszxp daniel 2026-09-11 18:51:49 1e74422c Bundle the walk's position so its two halves cannot drift
+│ ◆  ympkpyok daniel 2026-09-11 18:51:49 b3bbaea5 Say what the refinement syntax does, and pin the two refined-key reports
+│ ◆  ruvosnyw daniel 2026-09-11 18:51:13 e1e631fa Read both sides at an invariant position however the walk reached it
+├─╯
+◆  szwuqqqn contact 2026-09-11 18:09:24 91011b5b Partially implement SMT-based refinement checks (#178)
+◆  wqyrwrsm daniel 2026-09-11 16:08:12 dbe07921 Meet both sides when reading a negative position (#153)
+◆  kkwrwtvo daniel 2026-09-11 14:52:26 ca406841 Implement type-alias statements by substituting the aliased type at lowering (#175)
+│ ○  xxnpxxkv scook90 2026-09-11 19:49:33 9096edd1 (empty) scratch: bisect
+├─╯
+│ ○  yyzrsptn scook90 2026-09-11 15:26:46 preserved@ ab6219c7 (empty) (no description set)
+├─╯
+◆  upmvwukr daniel 2026-09-10 18:45:43 70ded936 Add a control port that replaces a running program with a new version of its source (#121)
+◆  prppquqs skylar 2026-09-10 15:26:58 e4d9f872 Give every operator a `NodeId` and ship the dataflow graph as the seventh inspector pane (#162)
+│ ○  rtttknkm scook90 2026-09-10 15:17:06 1fa52bd2 interpreter: walk the operators for the graph rather than recording them
+│ ○  yktwrwzt scook90 2026-09-10 15:16:31 83d43a36 ccl+inspector: one derivation per concept, and the counts are pinned again
+│ ○  kyuyusvl/0 scook90 2026-09-10 15:16:31 review-oper-identity@ 4d188882 (divergent) inspector_model: derive the operator pane's walk starts
+│ ○  kuqxmzwp/0 scook90 2026-09-10 15:16:31 01a0989a (divergent) interpreter: the cycle set is the late-wired edges, and a label is its own type
+│ ○  nkrnxwos/0 scook90 2026-09-10 15:16:09 e32c2adf (divergent) ccl+inspector: the docs describe the pane set that exists
+│ ○  vxozntnx/0 scook90 2026-09-10 15:16:09 340e97f7 (divergent) interpreter+inspector: name the dataflow graph's parts after dataflow
+│ ○  rysmnlxn/0 scook90 2026-09-10 15:16:09 25c57998 (divergent) cambra-inspector: the fixtures README describes the corpus that exists
+│ ○  yzquryov/0 scook90 2026-09-10 15:16:09 324dcef3 (divergent) cambra-inspector: an example that reads one source twice
+│ ○  qvzqqszl/0 scook90 2026-09-10 15:16:09 3221956a (divergent) cambra-inspector: pin the operator edge shapes only a store produces
+│ ○  loykxmpq/0 scook90 2026-09-10 15:16:09 64bc80dd (divergent) cambra-inspector(web): render the operator pane
+│ ○  xvqyvwvt/0 scook90 2026-09-10 15:16:09 97f23861 (divergent) inspector_model: the operator pane on the wire
+│ ○  wuprwqxq/0 scook90 2026-09-10 15:16:09 5a815531 (divergent) interpreter: the operator graph has both program boundaries
+│ ○  urtkrkmz/0 scook90 2026-09-10 15:16:09 74033883 (divergent) ccl+interpreter: conversion records what it builds, and the operator graph is a pane
+│ ○  rvnsrpsr/0 scook90 2026-09-10 15:15:41 a038963b (divergent) interpreter: an OperatorBase for every operator
+│ ○  vwlpzuqu/0 scook90 2026-09-10 15:14:36 67f0fcf8 (divergent) ccl(provenance): what stands between the panes and the operators
+├─╯
+◆  mrlxxuvu daniel 2026-09-10 14:41:38 01cc612b Fall back to `HEAD` for the doc-adoption tip outside the `jj` root checkout (#167)
+◆  uskrxvrv daniel 2026-09-10 14:10:20 ed8c251e Compile a `match` in a loop body and a transaction block, and tag a reply tap with its firing (#139)
+◆  ovuvmxqw skylar 2026-09-09 19:42:36 26400d92 Drop the stray bracket a curried tiling renders (#165)
+◆  omulostw skylar 2026-09-09 19:41:51 b151db5a Gate against an item inserted into another item's doc block (#166)
+◆  zypuropu daniel 2026-09-09 18:25:02 077715e8 Add the keyed write `m[k] := v` as a whole-collection `insert` (#159)
+◆  vomxzkqq daniel 2026-09-09 18:25:02 13f4ee3f Add the checked lookup `c[k]?` as its own typing rule and tile operator (#158)
+◆  ywwqlxoo daniel 2026-09-09 18:25:01 23c9af90 Add the `set` and `map` constructors, lowering both as a `groupby` with a collapse aggregate (#157)
+◆  uztvkpvr daniel 2026-09-09 18:25:01 821d15a5 Type a group-by at its present-key domain, and lower the `Map`/`Set`/`FullMap` annotations (#156)
+◆  qklvsoxv daniel 2026-09-09 18:25:01 769e2462 Type conditional collections as dependent sums and compile them to a gated union (#45)
+│ ○  txpwvonz scook90 2026-09-09 19:46:16 opgraph@ b127727d (empty) (no description set)
+├─╯
+◆  nkkrnpyr skylar 2026-09-09 12:40:11 e0dbf707 Record a mutation loop's products against the body statements that produce them (#155)
+│ ○  yrmqkymk scook90 2026-09-08 18:58:45 skylar/fast-web-checks 20e14f4a Run the frontend's typecheck and vitest in `./ci.sh fast`
+├─╯
+│ ◆  vzvtrsns dan 2026-09-11 10:43:28 dan/inspector-editing@origin 4608cc5b inspector: a source pane that is read, and edited
+│ ◆  ryvyzxtr/285 scook90 2026-09-08 17:46:51 demo/03-inspector-embed@origin 7b579eea (divergent) cambra-inspector(web): a run that has started publishing stops saying it has not
+│ ◆  opttokno/275 scook90 2026-09-08 17:46:51 demo/05-wasm-build@origin d53d260a (divergent) wasm: build the module and run the contract against it in Node
+│ ◆  yuykmqul/273 scook90 2026-09-08 17:46:51 83187f76 (divergent) cambra-inspector(web): a snapshot and a frame stream the embedder supplies
+│ ◆  ooplvvul/267 scook90 2026-09-08 17:46:51 3d900a11 (divergent) wasm: the crate compiles for wasm32, and the module wraps the host
+│ ◆  psqszwqv/262 scook90 2026-09-08 17:46:51 demo/04-embed-host@origin bd6b8acd (divergent) embed: a program the host compiles, pushes into and ticks
+│ ◆  mvzuqxkz/258 scook90 2026-09-08 17:46:51 b5235ed1 (divergent) inspector: a source window for every source that has one
+│ ◆  qqlvolst/258 scook90 2026-09-08 17:46:51 demo/02-dev-driver@origin 4d00f3dd (divergent) cambra: drive a host-channel program from the command line
+│ ◆  mtyooqry/256 scook90 2026-09-08 17:46:51 79cab9b8 (divergent) interpreter: a stdin source reads stdin when the program reads stdin
+│ ◆  ppywmltp/256 scook90 2026-09-08 17:46:51 demo/01-host-channels@origin b62ea442 (divergent) asset_cart: the demo program in the gallery, wired by a channels file
+│ ◆  slnwzzzn/252 scook90 2026-09-08 17:46:51 a73eadb2 (divergent) ccl: channel declarations, from a CHL type to a registered channel
+│ ◆  wkpnwrtv/250 scook90 2026-09-08 17:46:51 0a49b08f (divergent) interpreter+ccl: a sink the host reads rows out of
+│ ◆  lnxyznkl/246 scook90 2026-09-08 17:46:51 68b87480 (divergent) interpreter: a source the host pushes rows into
+│ ◆  wultvwqm/244 scook90 2026-09-08 17:46:51 5de6e478 (divergent) interpreter: a stream buffer holds values, not lines
+│ ◆  zskkrurs/241 scook90 2026-09-08 17:46:51 e4cbc1e5 (divergent) compilation_pipeline: a registered source whose rows are records
+│ ◆  ploquyvv/133 scook90 2026-09-08 17:46:51 741530a7 (divergent) Draw the operator pane as a graph rather than an indented forest
+│ ◆  wzzwysxr/125 scook90 2026-09-08 17:46:51 aacbb9bf (divergent) Select from the `Values` pane, and name a group that has produced nothing
+│ ◆  kvspxutw/122 scook90 2026-09-08 17:46:51 4912c30d (divergent) Add a `Values` pane showing what the operators a reader pinned currently hold
+│ ◆  vrsprtll/119 scook90 2026-09-08 17:46:51 a5c62eaf (divergent) Move the inspector's TypeScript project from `cambra-inspector/` to `web/`
+│ ◆  prtktwkp/87 scook90 2026-09-08 17:20:50 14697d95 (divergent) Stream a run's values over an `/api/live` websocket and delete the legacy dashboard
+│ ◆  pqkoxkxt/83 scook90 2026-09-08 17:20:50 69bd0231 (divergent) Record what every producer returns, attributed to the operator that built it
+│ ◆  wrzyusnq/69 scook90 2026-09-08 17:20:50 6640deef (divergent) cambra-inspector(web): blue is what you pointed at, amber is what we resolved
+│ ◆  lykkovor/67 scook90 2026-09-08 17:20:17 cd20b18c (divergent) cambra-inspector(web): a pane does not scroll the row you just clicked
+│ ◆  mvylptmn/65 scook90 2026-09-08 17:20:16 58d0a109 (divergent) cambra-inspector(web): a rejected span reports the span
+│ ◆  pwktolkp/63 scook90 2026-09-08 17:20:15 e17153a9 (divergent) cambra-inspector: a join reaches the validator that never saw one
+│ ◆  kvmzonxs/63 scook90 2026-09-08 17:20:15 432e52ff (divergent) cambra-inspector: the docs describe the wire and the gestures that exist
+│ ◆  xmrsutyv/61 scook90 2026-09-08 17:20:13 c7f7842e (divergent) cambra-inspector(web): a source selection is a range, and predicates leave the tree
+│ ◆  znvlslqo/61 scook90 2026-09-08 17:20:13 c1dc72cd (divergent) Wire an `IterateExtent` to the source it iterates
+│ ◆  kyuyusvl/24 scook90 2026-09-08 17:20:13 7dc57e3e (divergent) inspector_model: derive the operator pane's walk starts
+│ ◆  kuqxmzwp/23 scook90 2026-09-08 17:20:12 0459baf9 (divergent) interpreter: the cycle set is the late-wired edges, and a label is its own type
+│ ◆  nkrnxwos/21 scook90 2026-09-08 17:20:11 10cf7ccc (divergent) ccl+inspector: the docs describe the pane set that exists
+│ ◆  vxozntnx/21 scook90 2026-09-08 17:20:11 74f413c5 (divergent) interpreter+inspector: name the dataflow graph's parts after dataflow
+│ ◆  rysmnlxn/19 scook90 2026-09-08 17:20:09 b23a37f8 (divergent) cambra-inspector: the fixtures README describes the corpus that exists
+│ ◆  yzquryov/19 scook90 2026-09-08 17:20:09 1e384675 (divergent) cambra-inspector: an example that reads one source twice
+│ ◆  qvzqqszl/18 scook90 2026-09-08 17:20:09 0f94986c (divergent) cambra-inspector: pin the operator edge shapes only a store produces
+│ ◆  loykxmpq/17 scook90 2026-09-08 17:20:09 a9610823 (divergent) cambra-inspector(web): render the operator pane
+│ ◆  xvqyvwvt/17 scook90 2026-09-08 17:19:03 57f43ace (divergent) inspector_model: the operator pane on the wire
+│ ◆  wuprwqxq/14 scook90 2026-09-08 17:17:15 7160433a (divergent) interpreter: the operator graph has both program boundaries
+│ ◆  urtkrkmz/14 scook90 2026-09-08 17:17:15 1b8a15fb (divergent) ccl+interpreter: conversion records what it builds, and the operator graph is a pane
+│ ◆  rvnsrpsr/10 scook90 2026-09-08 17:17:15 8bad4c5b (divergent) interpreter: an OperatorBase for every operator
+│ ◆  vwlpzuqu/7 scook90 2026-09-08 17:17:15 7bbf8c33 (divergent) ccl(provenance): what stands between the panes and the operators
+│ │ ○  yrxuwpoy scook90 2026-09-09 12:31:01 review24@ 6ec28a20 (empty) (no description set)
+│ │ ○  lowvxypw scook90 2026-09-09 12:31:01 4a0a4d5b Record an accumulator's slot against every write to it
+│ ├─╯
+│ ◆  uvqpmszu scook90 2026-09-08 17:17:15 248c7d70 Record a cross-domain accumulator's view against the write that produced it
+│ ◆  qqwlyywr scook90 2026-09-08 17:17:15 38f5536b Attribute an accumulator-free loop's map to the feed that produced it
+│ ◆  wkulmswq scook90 2026-09-08 17:17:15 ce07db16 Split a mutation loop's provenance into per-accumulator and per-feed recordings
+├─╯
+◆  sonuxnqu daniel 2026-09-04 15:51:36 1412f476 Set the source view's diagnostics at mount instead of through a debounced linter (#160)
+◆  uyvszttv daniel 2026-09-04 14:38:07 610ec2e0 Iterate a `mut` accumulator over the positions its filtered source delivers (#138)
+◆  rqultmyl daniel 2026-09-04 14:11:28 706b0ca1 Walk `elim_lambda`'s result at the `match`-arm rule (#137)
+◆  vukmympx daniel 2026-09-04 14:11:27 6a8c5e1a Carry a write inside a conditional's branch past the conditional, and indent a block right-hand side's chain one level in (#136)
+│ ◆  smwmpkyl dan 2026-09-03 11:53:58 dan/wasm-playground@origin 7d9afd05 wasm playground: rebuild against the merged inspector work
+├─╯
+◆  qsltoyzn skylar 2026-09-02 20:10:24 b465a7cf Add a pane filter and per-pane copy buttons to the inspector web view (#148)
+│ ○  lmyntqqv scook90 2026-09-02 20:01:13 pr145@ 874bbd28 cambra-inspector(web): toggle panes from a header menu
+│ ○  rsmpowrl scook90 2026-09-02 20:01:13 7065b5b4 cambra-inspector(web): copy a pane's text verbatim
+├─╯
+◆  vtnrsokq skylar 2026-09-02 20:00:22 97f55b83 Serve the inspector frontend from the `cambra` binary and document fixture re-blessing (#146)
+│ ○  xutspvyo scook90 2026-09-03 15:12:49 2bf50e02 cambra-inspector: make the fixture re-bless procedure discoverable
+├─╯
+◆  nkuvmrxs skylar 2026-09-02 17:46:00 8a4102c2 Add the inspector's CodeMirror frontend and a `ci.sh web` gate (#150)
+│ ○  pzssyqpm scook90 2026-09-02 17:36:44 9c961377 cambra-inspector(web): the multi-pane frontend and its wire validator
+├─╯
+◆  vwuwmpvu skylar 2026-09-02 16:32:11 6f19cfb7 Serve the program inspector from the `cambra` binary and pin its wire with golden fixtures (#145)
+│ ◆  xoytzrtp dan 2026-09-01 13:21:38 dan/reference-app-comparison@origin afdc711e docs: the reference-app comparison report
+│ ◆  zyzrqkoq dan 2026-09-01 13:21:38 e5d94954 reference-app: the line counter and its committed classification
+│ ◆  rktnzltx dan 2026-09-01 13:21:38 489423c6 reference-app: the storefront on a conventional stack
+│ ◆  rmkxmnru dan 2026-09-01 12:40:39 6186c8dc Storefront V2: durable execution and the warehouse path, and the four satellites that pin them
+│ ◆  ovuyqxsk dan 2026-09-01 12:32:08 5dfa40aa Record the reference-app comparison brief and its design
+├─╯
+◆  wlspluxs contact 2026-09-01 12:11:07 fd609f22 Add walkthrough on SMT strategies to docs (#149)
+│ ○  puuxkpvt scook90 2026-09-02 16:24:48 7b07ce7a Deduplicate the inspector's gallery programs against the shapes already there
+│ ○  uxpxxzkm scook90 2026-09-02 15:46:06 78eaef5d Serve the inspector from the `cambra` binary and read its programs from the gallery
+│ ○  pzrwqtww scook90 2026-09-01 14:52:33 0a0d34a5 Drop inspector fixture slimming for whole-payload goldens and structural assertions
+│ ○  ysyqmkqx scook90 2026-09-01 13:05:37 82bcd06b cambra-inspector: crate, snapshot server, golden-fixture gates
+├─╯
+◆  wnsxwmxt skylar 2026-09-01 10:45:03 5c080cc1 inspector_model: build the inspector's read-only payload from the retained IR panes (#141)
+│ ○  kurkvxlk scook90 2026-09-01 10:12:02 26900904 inspector_model: cut the child-edge label, and mark what is provisional as provisional
+│ ○  vzvsqoyv scook90 2026-09-01 10:08:47 98e6a3d1 inspector_model: resolve definitions over the IR, not a second scope walk
+│ ○  xzunupyl scook90 2026-08-31 18:31:17 caf22b86 inspector_model: ship only what the consumer reads
+│ ○  ntsvsyrn scook90 2026-08-31 18:31:17 f5a38d3a inspector_model: a diagnostic's stage is a compiler stage, not a pane
+│ ○  xrmxwrxl scook90 2026-08-31 18:31:17 e80035fc inspector_model: give each module one concept
+│ ○  zotuzypw scook90 2026-08-31 18:31:17 a5a4d8af inspector_model: name the read model `InspectedProgram`
+│ ○  tmtlrmzt scook90 2026-08-31 18:31:17 8ad49b3c inspector_model: call a pane a pane, on the wire as well
+│ ○  zmuvnyux scook90 2026-08-31 18:31:17 c8ef9f03 inspector_model: carry a type's discriminant and its predicates beside the rendering
+│ ○  qkyooywk scook90 2026-08-31 18:31:17 78f4c2eb inspector_model: ship a pane's nodes as a table, not a tree
+│ ○  ozkxuown scook90 2026-08-31 18:31:17 4a099f15 inspector_model: own the payload's node type
+│ ○  nlwpkssw scook90 2026-08-31 18:31:17 b0323f3b inspector_model: emit one scope row per region
+│ ○  wqzkxkyq scook90 2026-08-31 18:31:17 475e7797 inspector_model: render a compile error's message, and carry its span
+│ ○  nttrpuoq scook90 2026-08-31 18:31:17 d37c2665 inspector_model: delete the static query layer
+│ ○  wpyllovp scook90 2026-08-31 18:31:17 skylar/provenance/05-inspector-model 455c7016 inspector_model: write the layer's design doc and drop its planned status in provenance.md
+│ ○  nrrutvtw scook90 2026-08-31 18:31:17 af48ff59 inspector_model: the snapshot model, its indices, and the pane projections
+│ ○  xyxvprmu scook90 2026-08-31 18:31:17 09ba6605 ccl: attribute an uncurried projection to the parameter it replaced
+├─╯
+◆  ukswursm skylar 2026-08-31 07:34:01 23fc327b ccl: delete the unused cross-phase TypeError (#140)
+│ ◆  lqouvqzs contact 2026-09-01 09:59:50 smt-test@origin 512f07ef SMT check for simple expressions
+│ ◆  xywwlvqn contact 2026-09-01 09:26:48 5d34d5a6 Create stub for smt check
+│ ◆  mxwrxrpk contact 2026-09-01 09:11:41 ddc6fc3c Add easy-smt dependency
+│ ◆  oskmktou contact 2026-09-01 09:08:16 f92e0581 Fix test
+│ ◆  luoslunn contact 2026-08-28 16:12:53 447ada78 Opus fix to let-binding escape
+│ ◆  rnuwknov contact 2026-08-28 14:54:06 ba675827 More tests
+│ ◆  pnltsssv contact 2026-08-28 14:45:22 73b9298b Add tests
+├─╯
+│ ○  zovroyom scook90 2026-08-31 07:19:25 76e8a358 ccl: delete the unused cross-phase TypeError
+├─╯
+◆  nyylnpsp daniel 2026-08-28 11:51:02 8562961e Model the type system in Lean, and check the solver's subtyping, polar merge, and materialization against it (#109)
+◆  unwzounm skylar 2026-08-28 10:58:29 d543cb83 Gate the last pane pair by recording what planning rewrites (#132)
+│ ○  qtpomqwv scook90 2026-08-28 10:52:07 18413200 (empty) (no description set)
+│ ○  vysnlwqy scook90 2026-08-28 10:52:07 38b76efa ccl: state a phase boundary's post-conditions once
+│ ○  pyspsxzv scook90 2026-08-28 10:52:07 9285b1b4 ccl(planning): blame the predicates the hash join plans from
+│ ○  nzvqmnwv scook90 2026-08-28 10:52:07 85ab79bb ccl(planning): one planning scope, and the Nature line stated at both recognizers
+│ ○  stzyuptr scook90 2026-08-28 10:52:07 68955a0c ccl(planning): recognition, group-by and the hash join record their rewrites
+├─╯
+◆  pkqpvpml contact 2026-08-28 09:58:20 da573a24 Add refinement templates to trait instances, refined ^+ operator (#135)
+◆  lsqxuvko daniel 2026-08-27 12:11:32 86960fe9 Accept an `if`/`match` block as an assignment's value, and add the one-line `match` (#129)
+◆  xsxymvpt daniel 2026-08-27 12:03:42 fe05a76b Declare a curried function's non-`Mut` parameter annotations instead of dropping them (#130)
+◆  ryqukmzp daniel 2026-08-27 11:51:55 e78143dc Fuzz the solver for arrival-order independence, and join a kind variable's pins at the read (#125)
+◆  qkpznuws daniel 2026-08-27 11:44:58 2e0c7f3b Improve source releasing for http and stdin (#122)
+◆  skxxmnwo daniel 2026-08-27 11:39:53 2a895800 Filter a partition's inner collections with a `MapFilter` operator (#127)
+│ ◆  wnnwllsq contact 2026-08-27 09:31:55 refine-binops@origin fd763b16 Fix provenance errors: no parent node
+│ ◆  oqturukq contact 2026-08-27 09:31:55 a49ad360 Update check.rs to handle trait-supplied refinements
+│ ◆  ytsqtnzr contact 2026-08-27 09:31:55 b7497621 Move trait refinements to be per associated type
+│ ◆  uonlkrmx contact 2026-08-27 09:31:55 312679af Fix small trait resolution test error
+│ ◆  vnvnmvwn contact 2026-08-27 09:31:55 94bc6e5b Fix errors around expr node provenance
+│ ◆  lsxwkrtl contact 2026-08-27 09:31:55 73057689 Feature-gate the refinement on Add
+│ ◆  ynrxkwnm contact 2026-08-27 09:31:55 83fe53d3 Fix refinement construction
+│ ◆  xqsmlwwz contact 2026-08-27 09:31:55 8b4436ec Clean up RefinementTemplate definition
+│ ◆  ullqznmv contact 2026-08-27 09:31:55 df2ebd75 Fix up traits tests
+│ ◆  nrtwnkos contact 2026-08-27 09:31:55 50d9e96e Feed expressions into refinements for operator types
+│ ◆  mrpvnrzz contact 2026-08-27 09:31:55 8e01692d Add refinement to Add trait, still needs to be utilized by typing
+├─╯
+◆  zvnzvxlw daniel 2026-08-26 17:28:11 267dcdfb Carry a suffix morphism out of exponential eta as `map` (#123)
+◆  tlwwxtql daniel 2026-08-26 15:51:29 82e2f19c Add program diffing: content addressing modulo α plus a GumTree matcher (#41)
+◆  xvwtyuvr daniel 2026-08-26 13:51:43 8f55c38f Add an end-to-end walkthrough of mutability, from CHL source to operators (#97)
+◆  mmpyumvn daniel 2026-08-26 13:51:43 15c80f0f Retire the `reg` and `Recurse` names, and pin the out-of-block read rule (#106)
+◆  tqxosvmy daniel 2026-08-26 13:51:42 6ea64f7b Close a commit store's keys individually, so an await waits only for its own variable's writers (#102)
+◆  mkpqpwus daniel 2026-08-26 13:51:42 b89c570b Feed both writers' decision bodies through tiles, retiring `WriterBuffer` (#93)
+◆  pouzllwr skylar 2026-08-26 13:45:43 d617e4ed Carry provenance panes down to `post-lambda-elim`, with the topology declared once (#131)
+◆  ssowuzkw daniel 2026-08-26 11:49:55 9d592ca6 Reject a product with no fields instead of answering `Unit` (#118)
+◆  qnkqknss daniel 2026-08-26 11:49:55 1799211d Give a function slot's domain alternatives an order-insensitive set (#117)
+◆  rrtkzqrm daniel 2026-08-26 11:49:55 c0b33fc5 Apply a function slot's domain rule once its kind is resolved, not at each merge (#116)
+│ ◆  ttzpntlu daniel 2026-08-26 11:42:48 dmills/empty-product@origin 43409882 Reject a product with no fields instead of answering `Unit`
+│ ◆  kupqxotx daniel 2026-08-26 11:42:41 c4833156 Give a function slot's domain alternatives an order-insensitive set
+│ ◆  npxoyyur daniel 2026-08-25 23:13:52 f81b5f1e Apply a function slot's domain rule once its kind is resolved, not at each merge
+├─╯
+◆  xxmlwkmp daniel 2026-08-25 23:13:43 f03c000c Give `CompactType`'s refinement slot the `None` sentinel its shape slots carry (#115)
+◆  skxlyvnq daniel 2026-08-25 23:13:43 7088abbc Derive a `Cast`'s refinements from its term instead of overwriting the `target` (#78)
+◆  omnnunrv daniel 2026-08-25 23:13:42 e0be4eae Hold a refined type's refinements in one unordered set instead of nested layers (#77)
+◆  uxuunopt daniel 2026-08-25 23:13:42 c9eff7a8 Scope inference variables with telescopes, and identify binder references by position (#108)
+◆  sqwrxwnx skylar 2026-08-25 14:28:27 b5b866c7 Replace the lineage log with a `NodeId`-keyed provenance table and gate the pane folds (#107)
+◆  lqxkwqms contact 2026-08-24 11:37:32 71194300 Fix missing emit for predicates on Lambda params (#128)
+│ ○  mwzmnnzy scook90 2026-08-25 14:03:24 e6823c0c ccl(provenance): the leak classes name a detection role, not two defects
+│ ○  uzzmzuxm scook90 2026-08-24 13:24:13 247fd949 ccl(provenance): assert node-id uniqueness over predicates, not just the main tree
+│ ○  svsxoouw scook90 2026-08-24 11:24:36 43616ee7 ccl(provenance): one word for the node a recording names
+│ ○  lsruqmww scook90 2026-08-24 11:24:36 4e354fc9 ccl(provenance): one name for the interned rewrite tag
+│ ○  zqnqtxqy scook90 2026-08-24 11:24:36 ab452c6d ccl(provenance): one module, one word for where a node came from
+│ ○  onlzmnom scook90 2026-08-24 11:24:36 ae3dfe9d ccl(lineage): claims the docs make that the code does not
+│ ○  kkzwrltl scook90 2026-08-24 11:24:36 3f9e2959 ccl: rename the desugar pass to channelize
+│ ○  swqmpopp scook90 2026-08-24 11:24:36 62c57660 ccl(lineage): one name per concept in the recording vocabulary
+│ │ ×  vuqsyzun scook90 2026-08-24 11:24:36 88330d9a (conflict) (no description set)
+│ ├─╯
+│ ○  sutvxnnt scook90 2026-08-24 11:24:36 a552dc45 ccl(lineage): plain English for the recording vocabulary, and docs that match the code
+│ ○  xvrkxxnt scook90 2026-08-24 11:24:36 5c8aa7a5 ccl(ccl_utils): a predicate rebuild records or preserves by the caller's reach
+│ ○  yrkovqrw scook90 2026-08-24 11:24:36 9a726827 Replace the lineage log with a `NodeId`-keyed provenance table and gate the pane folds
+├─╯
+◆  yqxzuovu contact 2026-08-21 11:26:10 feb183e5 Parse and lower fun type (=>) annotations (#119)
+◆  ssryrrnt skylar 2026-08-21 07:03:30 7e31f0f2 Collapse the phase-local substitution copies onto one Subst engine (#101)
+│ ○  nolvopxy scook90 2026-08-21 07:12:56 d70a001f (empty) scratch: test list at 09
+├─╯
+│ ×  zrlsnqqo scook90 2026-08-21 07:12:56 adceb8c3 (conflict) (no description set)
+│ │ ×  rzlvxuvs scook90 2026-08-21 07:12:56 140889d6 (conflict) (no description set)
+│ ├─╯
+│ │ ×  pvmmkkqw scook90 2026-08-21 07:12:56 c77c97a5 (conflict) (no description set)
+│ ├─╯
+│ │ ×  rzlxtqln scook90 2026-08-21 07:12:56 757e8d1b (conflict) (no description set)
+│ ├─╯
+│ │ ×  pzulxooy scook90 2026-08-21 07:12:56 48ba732a (conflict) ccl: region claims on the order-free lineage fold
+│ ├─╯
+│ ×  zlwlvsvk scook90 2026-08-21 07:12:56 727f824f (conflict) ccl: the passes adopt the lineage recorder; both pane boundaries assert leak-free
+│ ×  mxowqsrk scook90 2026-08-21 07:12:56 18660e3d (conflict) ccl: region claims — a frame declares what it rewrites; deaths resolve at the drain
+│ ×  vlyluzyt scook90 2026-08-21 07:12:56 50f6bc48 (conflict) ccl: measure the always-on lowering fold on two representative programs
+│ ×  lsuovztm scook90 2026-08-21 07:12:56 a8ddc288 (conflict) ccl: name the dedup falsifier correctly in merge_roots
+│ ×  ukzpvwvp scook90 2026-08-21 07:12:56 18c91f35 (conflict) ccl: the source projection hashes ids directly
+│ │ ×  sltzwwso scook90 2026-08-21 07:12:56 0aca16d4 (conflict) (no description set)
+│ ├─╯
+│ ×  nwzqqyov scook90 2026-08-21 07:12:56 1485d69b (conflict) ccl: the lowering fold hashes ids directly — the one path every build pays for
+│ ×  puuzonvs scook90 2026-08-21 07:12:56 37e48546 (conflict) ccl: the fold's annotations are shared sorted runs, not per-vertex hash sets
+│ ×  pqwpnnyr scook90 2026-08-21 07:12:56 45ac5469 (conflict) ccl: hash NodeIds directly — the lineage maps key on counter-minted ids
+├─╯
+│ ○  oqvrqmzx scook90 2026-08-21 07:12:56 freshclone-base@ a4fc0ac7 (empty) (no description set)
+├─╯
+│ ○  qowxsxqk scook90 2026-08-21 07:12:56 freshclone@ e60c196d (empty) (no description set)
+├─╯
+◆  yzuuoztz skylar 2026-08-20 19:47:30 f12ccd1b Check NodeId uniqueness at every pipeline boundary, and fix what that surfaces (#98)
+◆  vpvrzprn contact 2026-08-20 14:53:03 ec7aeeb0 Implement parse and lower for refinements and function-def output types (#114)
+│ ◆  tyrupmlv contact 2026-08-20 11:55:12 parsing-refs-rebase@origin 11f8548b Parse and lower refinements and function-def output type annotations
+├─╯
+│ ○  oykrklln scook90 2026-08-20 19:42:17 cee02bea ccl: repair two comments the freshening clone rotted
+│ ○  kryponpl scook90 2026-08-20 19:42:17 58938e4f ccl(channelize): the defer lift matches before it consumes
+│ ○  zlvtqxpq scook90 2026-08-20 19:42:17 50493b9d ccl: address review feedback on the id-hygiene pass
+│ ○  pvmrylkv scook90 2026-08-20 19:42:17 d9bab8a6 ccl(transact): a dropped as-of read moves its body rather than freshening it
+│ ○  kwlkwmxk scook90 2026-08-20 19:42:17 222d4bd8 ccl(expr): `Clone` on `TypedExpr` freshens; lowering records its predicates
+│ │ ○  qnoslskr scook90 2026-08-20 11:36:09 661350a0 (empty) (no description set)
+│ ├─╯
+│ ○  slrtqtyu scook90 2026-08-20 11:36:09 b10e60e1 ccl: hygiene follow-ups — the duplication primitive absorbs its hand-rolled copies
+│ ○  vnypuqww scook90 2026-08-20 10:36:40 ac938b5b ccl: close the two id-uniqueness holes the boundary asserts do not see
+│ ○  nzwrlvnk scook90 2026-08-20 10:36:05 12b4c277 ccl: freshen at every duplication site — a pass yields unique NodeIds
+├─╯
+◆  xkvrmtnw daniel 2026-08-19 17:19:19 7a9d1201 Relate the two function kinds by equality instead of ordering `Data` below `Compute` (#113)
+◆  mozutqlr daniel 2026-08-19 12:45:54 8c589003 Build the `await_final` terminal read as a completion-point sample, and give the as-of read its own term (#92)
+◆  snkmnrsu daniel 2026-08-19 12:45:53 daf5bce6 Split transactional commit stores by connected components of transaction blocks (#91)
+◆  srryvsqx daniel 2026-08-18 20:47:25 ef122d3b Add CHL variant support: constructors, `match`, and variant types (#54)
+◆  vmytzosk daniel 2026-08-18 18:01:24 acefe7bd Add specification-prose rules to CLAUDE.md, with a `spec-prose` skill and a reminder hook (#104)
+◆  qzvyoqlw daniel 2026-08-18 17:57:57 f40b3d8a Restrict opposite-polarity fallback to only undetermined positions (#87)
+◆  qomqslpk daniel 2026-08-18 17:42:58 0ac93dd6 Carry the FunKind through compilation instead of reconstructing it (#99)
+◆  vzuozklw dan 2026-08-18 15:58:42 8aba3efe Corpus: redesign the storefront north-star to match the announcement example (#29)
+◆  llwpwqzq daniel 2026-08-18 15:57:34 01c6bc9e Render a singleton type as `Int@7` rather than as the bare literal (#105)
+│ ○  ttnvpvvp scook90 2026-08-19 08:22:44 skylar/shadow-cow shadow-audit@ d8894a47 Return a borrow from `Subst::shadow` rather than a copy that changes nothing
+├─╯
+│ ◆  txpsouny daniel 2026-08-17 23:43:29 dmills/formal-ground-model-restacked@origin 30405ba7 Retire the refuted inside-out-indexing footnote for a citation
+│ ◆  nnmtrtux daniel 2026-08-17 23:43:29 6bd2db50 Retire the partition-collapse modeling; the rule it mirrors is gone
+│ ◆  rrwqspuu daniel 2026-08-17 23:43:29 069384e9 M2 safety: progress, preservation, refinement soundness (sorry-free) — plus a partition-collapse finding
+│ ◆  vkomklkp daniel 2026-08-17 23:43:29 ccccd96b Plan M3b: dependent-fragment transitivity — canonical fragment now, α-aware as a bug hunt
+│ ◆  rkmrnlpu daniel 2026-08-17 23:43:29 83c1f187 M2, part 1: the definitional core — terms, values, small-step, typing
+│ ◆  usnvumkt daniel 2026-08-17 23:43:29 4269811e Merge algebra (M4b), part 2: congruence, guarded associativity, the mixed-kind counterexample, fold invariance
+│ ◆  zqxyzkun daniel 2026-08-17 23:43:29 c388f382 Merge algebra (M4b), part 1: the model, its equivalence, commutativity, idempotence
+│ ◆  wzoqwoxp daniel 2026-08-17 23:43:29 5a0bf009 Record why minting canonical Pi binders does not work
+│ ◆  rpnqxkpo daniel 2026-08-17 23:43:29 934a78f2 differential: keep the bridge near-miss inside `Ty.WF`
+│ ◆  rmpyvzwy daniel 2026-08-17 23:43:29 62d06e8b formal/: the model carries a claim set, and claim order is proved unobservable
+│ ◆  oszrlxly daniel 2026-08-17 23:43:29 4a4b166c formal/: pure transitivity for the canonical fragment — the σ-gap dissolved
+│ ◆  vvtrtxlw daniel 2026-08-17 23:43:29 ecda39b4 Probe: α-variant dependent types split identity sites (SpecKey, bound merge)
+│ ◆  qpvqrkvw daniel 2026-08-17 23:43:29 005f6ad4 formal/: transitivity proved for the non-dependent fragment; the dependent case's obstruction stated
+│ ◆  pxouqxyu daniel 2026-08-17 23:43:29 eb33fba2 Confluence fuzz for the bound graph; finding: refinement layers stack in arrival order
+│ ◆  yolqsorx daniel 2026-08-17 23:43:29 e3923470 formal/: decidability of ground subtyping; transitivity refuted, repaired, machine-checked
+│ ◆  tysmxvxr daniel 2026-08-17 23:43:29 0d3add57 formal/: Lean 4 model of ground subtyping, with a differential oracle against `constrain`
+│ ◆  omzkoksy daniel 2026-08-17 23:43:29 f54190c3 Retire the wholesale cast-target sync: rebuild passes restore the canonical split
+│ ◆  xzpxywvk daniel 2026-08-17 23:43:29 91f6cc02 Canonical discharge: a cast's claims are term-determined, not route-determined
+│ ◆  pmqnnuly daniel 2026-08-17 23:43:29 3f0a369c Refinements are an unordered set, not a stack of layers
+│ ◆  movpvnvp daniel 2026-08-17 23:17:26 2194bc31 State the canonical-Pi-binder invariant, and make the codomain depth un-derivable
+│ ◆  prvtsnyw daniel 2026-08-17 21:50:06 9be50209 Rebase fallout: the bounded-annotation marker is `BoundedHole` now
+│ ◆  llwtlnts daniel 2026-08-17 21:50:06 80b9b8d0 The canonical Pi-binder rule lives in one place
+│ ◆  klwxlynp daniel 2026-08-17 21:50:06 9385b277 Canonical Pi binders at the solver's flattening layer
+├─╯
+◆  xtxxluzm daniel 2026-08-17 21:38:51 3c430356 Read a value's trait requirements together, and write back what they determine (#94)
+◆  vpwrzqvp daniel 2026-08-17 21:17:55 11939b79 Update the value-`Case` fan-out's prose to the `DisjointJoin` it builds (#75)
+◆  vluouwyu daniel 2026-08-17 18:26:26 fc0807e6 Add title rules and cold-draft delegation to the `pr-description` skill (#103)
+◆  komxmnvo daniel 2026-08-17 17:30:23 94a3051f Split CollectionUnion into two distinct node types (#86)
+◆  zqnqsruy daniel 2026-08-17 17:30:23 e15e306d An unobservable `match` arm's payload is pinned on the variable, not in the slot (#57)
+│ ◆  vsuskton daniel 2026-08-17 16:38:09 dmills/copair-disjointjoin@origin 3e1c2150 Combining collections is two operations, so it is two nodes
+│ ◆  twqxrnpo daniel 2026-08-17 16:37:16 b6cc1bca An unobservable `match` arm's payload is pinned on the variable, not in the slot
+├─╯
+◆  zmtrstuo daniel 2026-08-17 11:57:28 90551781 `constrain_go` asserts the uniquely-keyed invariant it rests on (#74)
+◆  muquwyoq daniel 2026-08-17 11:57:28 816ec649 Exact and bounded binder annotations: `x: T` fixes the type, `x <: T` bounds it (#62)
+│ ◆  tkoxusxo contact 2026-08-19 10:31:12 div_zero_concept@origin 982d476f Claude-code-produced fix to refinement scoping tests
+│ ◆  kkzpzlrp contact 2026-08-19 09:43:24 e8fbb824 Add tests on refinement scoping
+│ ◆  srrknttk contact 2026-08-18 16:04:49 2c2da43a Implement parsing of refinements into CHL, and lowering into CCL
+│ ◆  vkqlsmvr contact 2026-08-18 10:24:42 628c7d22 Add div-by-zero tests for refined division proof-of-concept
+├─╯
+◆  tpmsxyoo daniel 2026-08-14 15:41:19 8eb74449 A mutable variable read is an explicit operation, not a subtyping rule (#64)
+◆  pptxqrpz daniel 2026-08-14 15:41:19 2074ed74 Four defects in how `Mut` is typed: message polarity, an unclosable refinement, and `op=` as a rebind (#63)
+◆  nowxtmww daniel 2026-08-14 15:41:18 4f4307ba Annotations stop standing in for binder structure, and stop outliving inference (#60)
+◆  knpqlntl daniel 2026-08-14 15:41:18 ce60fd0b Mutable-variable typing: an honest seed, a fixed history read-through, and a polarity-directed base (#52)
+◆  oyxnvvmm daniel 2026-08-14 15:41:18 280fabda Traits: state what an operator requires of its operands, not that they are the same (#73)
+│ ◆  rnvpxrum daniel 2026-08-14 15:29:39 dmills/explicit-register-reads@origin d33d69a3 Tests: embedded programs read as programs, not as escaped newlines
+│ ◆  rkmutyyl daniel 2026-08-14 15:29:39 30e05209 Rebase fallout: `Lit` is now imported where this test qualified it
+│ ◆  nnxttlpz daniel 2026-08-14 15:29:39 00d9568e Neither direction of `Mut` is a subtyping fact
+│ ◆  nstrplxm daniel 2026-08-14 15:29:39 774616b3 A register read is an explicit operation, not a subtyping rule
+│ ◆  uzyxovur daniel 2026-08-14 15:29:39 f648152a Tests: embedded programs read as programs, not as escaped newlines
+│ ◆  oqzztszr daniel 2026-08-14 15:29:17 6b246267 Four defects in how `Mut` is typed: message polarity, an unclosable refinement, and `op=` as a rebind
+│ ◆  zkquumtt daniel 2026-08-14 15:29:15 04f7788f Tests: embedded programs read as programs, not as escaped newlines
+│ ◆  lpwmuzkz daniel 2026-08-14 15:29:15 e7054de4 Annotations stop standing in for binder structure, and stop outliving inference
+│ ◆  vnswtnvs daniel 2026-08-14 15:29:15 8a2e1e3b A mutable variable is called a mutable variable
+│ ◆  vprxlpyu daniel 2026-08-14 13:36:59 19390c6f Tests: embedded programs read as programs, not as escaped newlines
+│ ◆  mlvspkoo daniel 2026-08-14 13:36:59 540ad636 Rebase fallout: `Lit` is now imported where these tests qualified it
+│ ◆  oppwmuku daniel 2026-08-14 13:36:59 dcbd1f88 Mutable-register typing: an honest seed, a fixed history read-through, and a polarity-directed base
+│ ◆  nwuttwxk daniel 2026-08-14 13:36:38 65853a77 Review: a trait's rows are instances, and finding one is resolution
+│ ◆  opmytwqq daniel 2026-08-14 12:35:30 24edf65a Tests: embedded programs read as programs, not as escaped newlines
+│ ◆  mzsylnmn daniel 2026-08-14 12:35:30 e9cf7798 Docs: state the trait design rather than narrate arriving at it
+│ ◆  sunrnutp daniel 2026-08-14 12:35:30 34b0d63c Rebase fallout: two consequences of meeting #89's never-called typechecking
+│ ◆  ktqlynrt daniel 2026-08-14 12:35:30 364667ac Review: a trait is a relation over types *and functions*, and F = 0 today
+│ ◆  lkmqvpqy daniel 2026-08-14 12:35:30 83441764 Traits: state what an operator requires of its operands, not that they are the same
+├─╯
+│ ○  zpxrqqoo scook90 2026-08-17 16:08:31 05abdab8 (no description set)
+├─╯
+◆  lyklulwo skylar 2026-08-14 10:51:09 6d33f587 claude: add testing analysis to staff review skill (#90)
+◆  ollxpsut daniel 2026-08-13 17:12:45 26da9ce0 Producers reject release guards they cannot honor (#95)
+◆  zpvrwrut daniel 2026-08-13 17:12:45 71e3b17e Producers keep the release contract (#58)
+◆  qulrpnkq daniel 2026-08-12 22:25:40 a4f0319f Typecheck a never-called function before dropping it (#89)
+◆  rwmsvmts daniel 2026-08-12 14:43:25 12d952cf The allocation probe measures a thread, not a wall-clock window (#82)
+◆  omuwrvso daniel 2026-08-12 14:19:38 2d7cda18 Reserve http test ports with a held lock, not a released bind hint (#65)
+◆  quqlltvy daniel 2026-08-12 14:08:00 05f202e5 `SharedHole`: let lowering state that two type positions are the same (#72)
+◆  xomosttq daniel 2026-08-12 14:08:00 bfaf4175 Freshening asks a different question than `type_level`, so it needs its own (#71)
+◆  xwsnrytr daniel 2026-08-11 16:04:24 033ff546 Stop copying the bound graph to read it (#55)
+│ ◆  sxrryvsq daniel 2026-08-11 17:02:46 dmills/flat-merge-keys@origin 5efc9946 A flat merge keys on the domain value, not a position
+│ ◆  vwnzmzls daniel 2026-08-11 16:05:31 c79b2331 Surface variants: constructors, `match`, and variant types
+│ ◆  mpmzqvkl daniel 2026-08-11 15:54:25 8f5b816b An unobservable `match` arm's payload is pinned on the variable, not in the slot
+├─╯
+◆  ptxnvoow daniel 2026-08-11 13:57:00 c2ef9dbf CHL syntax decisions: variants, `where` refinements, destructuring; braces are always a product (#69)
+◆  yvsurumv daniel 2026-08-11 12:26:52 82d2df94 Say "final" for a completed history's last entry, "latest" for most-recent (#68)
+◆  zlksnkwy daniel 2026-08-11 12:26:51 c2642113 Compound (tuple/record) mutable registers (induction + transactions) (#17)
+◆  uvplmmuz daniel 2026-08-11 12:26:51 6879160c mutability-conditionals 7/7: writer decision as a `commit | `abort variant; retire F_COMMIT (#67)
+◆  zqykmwtq daniel 2026-08-11 12:26:50 c3889091 mutability-conditionals 6/7: variant elimination — the point-free sum algebra (#15)
+◆  qyxupmno daniel 2026-08-11 10:42:37 9f139827 CLAUDE.md: move PR-description guidance into a `pr-description` skill (#70)
+│ ◆  prrzvkpm daniel 2026-08-10 19:16:56 backup/pr52-move-20260810/formal-ground-model-amended 43d3b75d M2 safety: progress, preservation, refinement soundness (sorry-free) — plus a partition-collapse finding
+│ ◆  wspszntu daniel 2026-08-10 19:16:56 e8b243a1 Plan M3b: dependent-fragment transitivity — canonical fragment now, α-aware as a bug hunt
+│ ◆  vxnowssy daniel 2026-08-10 19:16:56 fadbe281 M2, part 1: the definitional core — terms, values, small-step, typing
+│ ◆  tmstkkyw daniel 2026-08-10 19:16:56 4ed84834 Merge algebra (M4b), part 2: congruence, guarded associativity, the mixed-kind counterexample, fold invariance
+│ ◆  lpowlrxw daniel 2026-08-10 19:16:56 d514454b Merge algebra (M4b), part 1: the model, its equivalence, commutativity, idempotence
+│ ◆  uvqqkunr daniel 2026-08-10 19:16:56 1889439c Retire the wholesale cast-target sync: rebuild passes restore the canonical split
+│ ◆  ztsvrqzm daniel 2026-08-10 19:16:56 77831d90 Canonical discharge: a cast's claims are term-determined, not route-determined
+│ ◆  ztpuksyq daniel 2026-08-10 19:16:56 d3a06093 Planning's claim-application order is a function of content, not insertion
+│ ◆  urtnsqkn daniel 2026-08-10 19:16:56 e7eaf6ad Record why minting canonical Pi binders does not work
+│ ◆  wuntwyqy daniel 2026-08-10 19:16:56 843f4225 The canonical Pi-binder rule lives in one place
+│ ◆  plttlqvz daniel 2026-08-10 19:16:56 8b9a1133 `constrain_go` asserts the uniquely-keyed invariant it rests on
+│ ◆  tqqpwkxv daniel 2026-08-10 19:16:56 ddae07ef differential: keep the bridge near-miss inside `Ty.WF`
+│ ◆  zovmouqn daniel 2026-08-10 19:16:56 29b34ce1 formal/: the model carries a claim set, and claim order is proved unobservable
+│ ◆  zqpxkspu daniel 2026-08-10 19:16:56 35d29b31 Refinements are an unordered set, not a stack of layers
+│ ◆  oksqonqu daniel 2026-08-10 19:16:56 b4c86886 formal/: pure transitivity for the canonical fragment — the σ-gap dissolved
+│ ◆  zwlnypno daniel 2026-08-10 19:16:48 f1b70bf0 Canonical Pi binders at the solver's flattening layer
+│ ◆  uskttppu daniel 2026-08-10 19:01:48 22372052 Probe: α-variant dependent types split identity sites (SpecKey, bound merge)
+│ ◆  uztwxrtu daniel 2026-08-10 19:01:48 bbe427f4 formal/: transitivity proved for the non-dependent fragment; the dependent case's obstruction stated
+│ ◆  ntsosyqn daniel 2026-08-10 19:01:48 b2ac8c65 Confluence fuzz for the bound graph; finding: refinement layers stack in arrival order
+│ ◆  vxpypkyv daniel 2026-08-10 19:01:48 dbcf095b formal/: decidability of ground subtyping; transitivity refuted, repaired, machine-checked
+│ ◆  pxmxqpom daniel 2026-08-10 19:01:48 a475646b Partition collapse composes: replace the bridge arm with normalize-then-recurse
+│ ◆  xltzozsq daniel 2026-08-10 19:01:48 2ef559fb formal/: Lean 4 model of ground subtyping, with a differential oracle against `constrain`
+│ ◆  mslsonqr daniel 2026-08-10 18:52:34 78583cca Exact and bounded binder annotations: `x: T` fixes the type, `x <: T` bounds it
+│ ◆  somvxkrz daniel 2026-08-10 18:49:15 8eb5ba95 A register read is an explicit operation, not a subtyping rule
+│ ◆  rluwlpmv daniel 2026-08-10 18:45:58 e3a61eac Four defects in how `Mut` is typed: message polarity, an unclosable refinement, and `op=` as a rebind
+│ ◆  kywnvyvs daniel 2026-08-10 18:43:45 28430a25 Annotations stop standing in for binder structure, and stop outliving inference
+│ ◆  uymwwovs daniel 2026-08-10 18:41:05 1dc1982a Mutable-register typing: an honest seed, a fixed history read-through, and a polarity-directed base
+│ ◆  ntyvrqkx daniel 2026-08-10 18:18:29 2c38c0b9 Traits: state what an operator requires of its operands, not that they are the same
+│ ◆  olowqutv daniel 2026-08-10 15:39:21 0627ead3 `SharedHole`: let lowering state that two type positions are the same
+│ ◆  uupwxmvo daniel 2026-08-10 15:39:08 90f496e1 Freshening asks a different question than `type_level`, so it needs its own
+├─╯
+│ ◆  sspllvxp daniel 2026-08-10 11:29:41 backup/pr52-move-20260810/subtype-annotations b984d6b2 Exact and bounded binder annotations: `x: T` fixes the type, `x <: T` bounds it
+│ ◆  vzunvykz daniel 2026-08-10 11:29:05 backup/pr52-move-20260810/explicit-register-reads 70ee570a A register read is an explicit operation, not a subtyping rule
+│ ◆  stwzlsro daniel 2026-08-10 11:29:04 backup/pr52-move-20260810/mut-typing-fixes e955e064 Four defects in how `Mut` is typed: message polarity, an unclosable refinement, and `op=` as a rebind
+│ ◆  osyzllno daniel 2026-08-10 11:29:04 backup/pr52-move-20260810/annotation-fixups 87ea4c00 Annotation clearing and its check both follow type slots
+│ ◆  vxxnolqq daniel 2026-08-10 11:29:04 8f0682f8 Annotations stop standing in for binder structure, and stop outliving inference
+│ ◆  mszkmllp daniel 2026-08-10 11:27:52 backup/pr52-move-20260810/mut-typing 51221178 Mutable-register typing: an honest seed, a fixed history read-through, and a polarity-directed base
+│ ◆  ruwysnto daniel 2026-08-10 11:25:54 dmills/type-operators@origin backup/pr52-move-20260810/type-operators 96f06fba Arithmetic checks its operands' base, not just that they agree
+│ ◆  yktvmozn daniel 2026-08-10 10:34:00 b9daafee Docs: cut §4.7's duplication of `reduce.rs`, and record `SharedHole`
+│ ◆  rytolxzs daniel 2026-08-10 10:34:00 69656d55 State the group-by key relation about the group-by, not about its binder
+│ ◆  nokowqsp daniel 2026-08-10 10:34:00 a891bf3e Pin the typing of a register that reads itself
+│ ◆  kuptyoum daniel 2026-08-10 10:34:00 a2135fe3 The cut at a cycle is an unrolling, not an iteration
+│ ◆  zvnzqyrq daniel 2026-08-10 10:34:00 c99c4f46 A rule declares whether it can answer through a cycle
+│ ◆  quzozyqw daniel 2026-08-10 10:34:00 8a04d289 Law 3 is totality, not coarsening — and drop the retired design from the docs
+│ ◆  rrkpnzrw daniel 2026-08-10 10:34:00 d5903ce4 Docs: reconcile with what the machinery actually is now
+│ ◆  vutqyonr daniel 2026-08-10 10:34:00 81a6c32b An unreduced application contributes nothing to a specialization key
+│ ◆  mvpktmsx daniel 2026-08-10 10:34:00 9defc2bf Delete the resolution memo and the graph-generation counter it needed
+│ ◆  osvuqtry daniel 2026-08-10 10:34:00 57ffd42b The resolution memo caches one answer per variable, not one per reach set
+│ ◆  tktlypmz daniel 2026-08-10 10:34:00 ea23441a Retire `CommonBase`: an operand requirement belongs in the result rule
+│ ◆  rllpxlul daniel 2026-08-10 10:34:00 04e99372 `SharedHole`: let lowering state that two type positions are the same
+│ ◆  wlzutrzr daniel 2026-08-10 10:34:00 940d86ba Freshening asks a different question than `type_level`, so it needs its own
+│ ◆  ovpmvonn daniel 2026-08-10 10:34:00 5e6d6739 Type functions: state a relationship between type variables other than subtyping
+├─╯
+│ ○  kpvkxrqk scook90 2026-08-10 08:03:34 devex@ 8b5a072d (empty) (no description set)
+│ ○  vklkzkoz scook90 2026-08-10 08:02:56 skylar/docs-devex fb14bae8 Move doc-authoring guidance into a `docs-style` skill
+│ ○  mqorroxs scook90 2026-08-10 08:01:58 a22f4f6c CCL IR: document and pin the symbolic rendering vocabulary
+├─╯
+◆  rwwpovqs daniel 2026-08-07 12:43:28 91626232 Positional tuple access `t.0`; `[…]` is lookup, not projection (#48)
+│ ◆  vqzmlrqm daniel 2026-08-09 23:01:41 backup/pr52-move-20260810/formal-ground-model 47bf80a7 M2 safety: progress, preservation, refinement soundness (sorry-free) — plus a partition-collapse finding
+│ ◆  ullmsroq daniel 2026-08-09 21:27:28 1b516771 Plan M3b: dependent-fragment transitivity — canonical fragment now, α-aware as a bug hunt
+│ ◆  slmukkzk daniel 2026-08-09 20:56:12 6c3d36a9 M2, part 1: the definitional core — terms, values, small-step, typing
+│ ◆  rtmtnqtt daniel 2026-08-09 20:13:34 acb3b096 Merge algebra (M4b), part 2: congruence, guarded associativity, the mixed-kind counterexample, fold invariance
+│ ◆  wpnknmmk daniel 2026-08-09 19:47:13 35bfefb7 Merge algebra (M4b), part 1: the model, its equivalence, commutativity, idempotence
+│ ◆  tssxqksz daniel 2026-08-09 17:36:01 4215a7b2 Retire the wholesale cast-target sync: rebuild passes restore the canonical split
+│ ◆  poppwqun daniel 2026-08-09 16:26:18 2cd38ab2 Canonical discharge: a cast's claims are term-determined, not route-determined
+│ ◆  wtoquyss daniel 2026-08-09 16:16:31 40f460bd Planning's claim-application order is a function of content, not insertion
+│ ◆  kzquxrlx daniel 2026-08-09 15:30:31 c963bc12 Record why minting canonical Pi binders does not work
+│ ◆  vrpokzxo daniel 2026-08-09 15:19:14 df1a5e3b The canonical Pi-binder rule lives in one place
+│ ◆  rvkskxqx daniel 2026-08-09 14:49:51 0b8ab75c `constrain_go` asserts the uniquely-keyed invariant it rests on
+│ ◆  pzrkpvwu daniel 2026-08-09 14:48:36 2c1e2dff differential: keep the bridge near-miss inside `Ty.WF`
+│ ◆  vtppwtxo daniel 2026-08-09 14:33:05 5692401c formal/: the model carries a claim set, and claim order is proved unobservable
+│ ◆  xmmsskpp daniel 2026-08-09 14:05:42 03b4f313 Refinements are an unordered set, not a stack of layers
+│ ◆  tvvrpwox daniel 2026-08-09 12:13:59 4192ba44 formal/: pure transitivity for the canonical fragment — the σ-gap dissolved
+│ ◆  qlyyvszt daniel 2026-08-09 11:47:32 7ef0587c Canonical Pi binders at the solver's flattening layer
+│ ◆  kqnmqnxz daniel 2026-08-09 11:34:08 174b4cbb Probe: α-variant dependent types split identity sites (SpecKey, bound merge)
+│ ◆  znkzkwlq daniel 2026-08-09 01:53:05 cc9224c8 formal/: transitivity proved for the non-dependent fragment; the dependent case's obstruction stated
+│ ◆  yovsxppt daniel 2026-08-09 01:15:54 74a6a420 Confluence fuzz for the bound graph; finding: refinement layers stack in arrival order
+│ ◆  nlzlplul daniel 2026-08-09 00:24:40 c41133b7 formal/: decidability of ground subtyping; transitivity refuted, repaired, machine-checked
+│ ◆  lxmvsqqp daniel 2026-08-09 00:24:25 08e37cb1 Partition collapse composes: replace the bridge arm with normalize-then-recurse
+│ ◆  zsyprxol daniel 2026-08-08 22:45:15 922891c3 formal/: Lean 4 model of ground subtyping, with a differential oracle against `constrain`
+│ ◆  ryustook daniel 2026-08-08 15:57:35 6856122b Exact and bounded binder annotations: `x: T` fixes the type, `x <: T` bounds it
+│ ◆  nprotxvs daniel 2026-08-08 15:57:35 59024b0b A register read is an explicit operation, not a subtyping rule
+│ ◆  nuoknvyl daniel 2026-08-08 15:57:35 7c6f9bfb Four defects in how `Mut` is typed: message polarity, an unclosable refinement, and `op=` as a rebind
+│ ◆  kwmxuppn daniel 2026-08-08 15:57:34 1fedc7d4 Annotation clearing and its check both follow type slots
+│ ◆  nkzqltxl daniel 2026-08-08 15:57:34 c9a562af Annotations stop standing in for binder structure, and stop outliving inference
+│ ◆  yrroqllk daniel 2026-08-08 15:57:30 3b843789 Mutable-register typing: an honest seed, a fixed history read-through, and a polarity-directed base
+│ ◆  mmkrpnmr daniel 2026-08-08 15:56:21 efdf88eb State the group-by key relation about the group-by, not about its binder
+│ ◆  yrqsvxvv daniel 2026-08-08 11:58:10 40430efd Pin the typing of a register that reads itself
+│ ◆  yntzrwsr daniel 2026-08-07 23:53:44 df22f76e The cut at a cycle is an unrolling, not an iteration
+│ ◆  kqlxzknl daniel 2026-08-07 23:39:25 f17c3e32 A rule declares whether it can answer through a cycle
+│ ◆  kmwrmqnk daniel 2026-08-07 23:07:00 ba5f9241 Law 3 is totality, not coarsening — and drop the retired design from the docs
+│ ◆  sqmznovp daniel 2026-08-07 22:33:30 ff5ea9b3 Docs: reconcile with what the machinery actually is now
+│ ◆  zqstsvlp daniel 2026-08-07 22:26:59 653f0bfd An unreduced application contributes nothing to a specialization key
+│ ◆  xwwwzrqo daniel 2026-08-07 22:13:33 7c72cc8e Delete the resolution memo and the graph-generation counter it needed
+│ ◆  yskmvsxo daniel 2026-08-07 21:47:28 c5e123b1 The resolution memo caches one answer per variable, not one per reach set
+│ ◆  yvppplqo daniel 2026-08-07 21:37:08 4008b32a Retire `CommonBase`: an operand requirement belongs in the result rule
+│ ◆  nywpsyvs daniel 2026-08-07 19:12:41 4c616caa `SharedHole`: let lowering state that two type positions are the same
+│ ◆  umxutvyw daniel 2026-08-07 19:02:43 fb8dfe4a Freshening asks a different question than `type_level`, so it needs its own
+│ ◆  kpnulrzl daniel 2026-08-07 17:44:33 a47a4172 Type functions: state a relationship between type variables other than subtyping
+├─╯
+◆  qqwnsprx daniel 2026-08-06 18:04:04 240763ec Monomorphization: key specializations on instantiation identity, not a resolved type (#50)
+◆  osznvrzs daniel 2026-08-06 17:55:33 73968b63 mutability-conditionals 5/7: one changelog realization for every loop (retire dense Recurse) (#14)
+◆  klmzsroy daniel 2026-08-06 17:48:03 458e2aa5 mutability-conditionals 4/7: path-based with begin(): conditionals (#13)
+│ ○  lxxqtuqy scook90 2026-08-07 13:29:06 pr51@ bfaa87b1 (empty) (no description set)
+├─╯
+◆  qnmnlxru skylar 2026-08-05 13:10:55 dacbbc21 ci.sh: `ci_doc_refs` swallowed a failing checker unit test (#49)
+◆  mqlqtkrr daniel 2026-08-05 10:48:02 ca982f0d mutability-conditionals 3/7: conditional induction writes (#12)
+◆  utrkunmq daniel 2026-08-05 10:41:55 59545e74 mutability-conditionals 2/7: value-Case compilation via literal union-of-restricts (#11)
+◆  kxqyswwy daniel 2026-08-05 10:11:44 0ba442d0 mutability-conditionals 1/7: data/compute function kinds and kind inference (#10)
+◆  puwysqsr daniel 2026-08-04 15:51:04 46ee3dcd Binder scoping: one exhaustive scoped-children walk, four folds over it (#40)
+│ ◆  ntoyyzuz scook90 2026-08-04 15:18:01 skylar/review/scoped-children-findings@origin 29245546 tests: pin three review findings on the scoped-children walk (failing)
+│ ◆  ttzlntku daniel 2026-08-03 15:31:41 29ae173e Binder scoping: one exhaustive scoped-children walk, four folds over it
+├─╯
+│ ◆  wyryuwkn daniel 2026-08-03 17:09:11 dmills/variant-type-syntax@origin 778f0c5f A variant type is spelled as its arms, so `Option` stops being the only one
+│ ◆  sxsmpmwl daniel 2026-08-03 17:08:27 3ccdddf3 Surface variants: `.tag(payload)` constructors and `match`
+│ ◆  xpnwwnlr daniel 2026-08-03 17:07:47 f7db1803 Variant arms are keyed by tag, not by position
+│ ◆  knpoykzl daniel 2026-08-03 12:52:02 0a252caa mutability-conditionals 6/7: variant elimination — VariantProject/VariantWrap sum algebra
+│ ◆  owzvkrns daniel 2026-08-03 12:51:40 a7c5422e mutability-conditionals 5/7: one changelog realization for every loop (retire dense Recurse)
+│ ◆  rswkztln daniel 2026-08-03 12:50:46 e8d371ad mutability-conditionals 4/7: path-based with begin(): conditionals
+│ ◆  ylmvqyur daniel 2026-08-03 12:49:34 76928ccb mutability-conditionals 3/7: conditional induction writes
+│ ◆  wnlvqwlm daniel 2026-08-03 12:49:34 8ff9b4e5 mutability-conditionals 2/7: value-Case compilation via literal union-of-restricts
+│ ◆  torpnllz daniel 2026-08-03 12:47:51 9b17b9b3 mutability-conditionals 1/7: data/compute function kinds and kind inference
+├─╯
+◆  voxronry daniel 2026-08-03 12:44:04 3b687a11 A renamed occurrence keeps its type, so nothing has to re-stamp predicates later (#56)
+◆  yzvlwtyv skylar 2026-07-30 17:56:50 ab79a529 Claude skill: Update staff-rust-review (#46)
+│ ○  wyqwusxy scook90 2026-08-05 09:48:48 8d14de24 (empty) (no description set)
+│ ○  xyllyswm scook90 2026-08-05 09:48:47 pr44@ 52a19fcd (no description set)
+│ ○  lyyzkknv scook90 2026-07-31 19:59:36 skylar/lineage/01a-infer-locations 090db043 ccl(infer): every inference error carries its node — locate the check family
+├─╯
+◆  omkmqkkw daniel 2026-07-30 14:12:37 303a6e66 Doc refs: check the references line-based scanning was silently skipping (#47)
+◆  ytrytwyk skylar 2026-07-30 13:23:54 ebb018e2 ccl: stable NodeId substrate + lineage core + always-on lowering projection (#19)
+◆  ykpovrwr daniel 2026-07-29 16:25:25 f281d11a Preserve refinement-predicate Rc sharing across inference and planning (#32)
+◆  pzutlxow daniel 2026-07-28 16:47:12 2679bcce Type a literal by which literal it is: the singleton refinement (#36)
+│ ◆  qpvxnvsl scook90 2026-07-27 14:19:33 skylar/review/predicate-sharing-findings@origin c74cdfdf tests: failing guards for five predicate-sharing review findings
+│ ◆  zpmxkryp daniel 2026-07-27 13:43:56 5db0607b Make the predicate-sharing guards observe what they guard, and close the split they were hiding
+│ ◆  wnspszzt daniel 2026-07-27 13:43:56 14a4543e Gate per-operation debug_typecheck behind opt-in `deep-typecheck` feature (#33)
+│ ◆  mwpszlnl daniel 2026-07-27 13:43:56 463e7f1d Preserve refinement-predicate Rc sharing across inference and planning
+├─╯
+│ ◆  qruuzorr scook90 2026-07-28 14:34:04 skylar/case-arm-strip-regression@origin 0d4c2ca1 Pin two review findings on literal singletons: a `Case`-arm regression and the newly-hot inline assert
+│ ◆  skqrttoq daniel 2026-07-27 13:37:59 3ffe038d Type a literal by which literal it is: the singleton refinement
+│ ◆  urmomunl daniel 2026-07-27 13:27:33 5079a39a Two over-strict equality constraints in inference: a list's elements, and a Case guard
+├─╯
+◆  oluswzkn daniel 2026-07-27 13:24:08 e520aae9 Fix false "value-dependent dependent function" panic on nested filters (#35)
+◆  pyukwnyy skylar 2026-07-27 11:15:23 97a33c66 BaseType: single-source keyword spelling via `keyword()`/`from_keyword()` (#37)
+◆  uxmmxyxt skylar 2026-07-27 09:21:57 1ce08d89 build: provision rust-analyzer and rust-src via rust-toolchain.toml (#26)
+◆  zlllswsr skylar 2026-07-27 09:18:29 cff368f4 CLAUDE.md: jj stack-rebase workflow (#25)
+◆  wuypzust skylar 2026-07-27 09:17:54 3f80eb1a CLAUDE.md: author commit descriptions as Markdown (they become PR bodies) (#27)
+◆  zpxkvywz daniel 2026-07-24 12:24:51 8a30ea02 ci.sh: add `fast` inner-loop gate for local iteration (#34)
+◆  oykwpopm daniel 2026-07-24 12:24:18 31fd900a CHL lambdas: replace `lambda x: body` with `\x -> body` (#30)
+◆  uozxvyql daniel 2026-07-24 12:12:47 7930a4b1 CHL records: (name=value) values; braces are type-only; retire dict (#31)
+◆  untxmtsm daniel 2026-07-24 12:02:11 0aad1e8c CHL type annotations: parenthesised application, Caps primitives, record & tuple types (#28)
+│ ◆  xvumvtxk scook90 2026-07-27 11:55:59 skylar/predicate-sharing-gap-tests@origin 413b7154 tests: pin the predicate-`Rc` sharing gaps (failing)
+│ ◆  rmyqwtlk daniel 2026-07-23 19:31:42 23187925 Preserve refinement-predicate Rc sharing across inference and planning
+├─╯
+◆  uwllkmvp daniel 2026-07-23 14:33:02 c86d5c2a Lowering: enforce def/lambda parameter type annotations (were silently dropped) (#18)
+◆  zwszzrlm daniel 2026-07-23 12:57:36 b2369d2f Drop static finiteness assumptions from the transaction as-of path (#24)
+◆  vruuqtpk dan 2026-07-23 09:22:45 d646fe15 CI tripwire against pre-rewrite history; lowercase repository URL (#9)
+◆  qsmupktl dan 2026-07-22 13:30:44 714bc8db Rewrite README as the public front door (cambra-dev/cambra-old#299)
+◆  tvtsuzml daniel 2026-07-22 11:55:06 6a7b8826 docs: move transactional-mutability surface to the CHL spec; add await_final (cambra-dev/cambra-old#312)
+◆  xnwlplyt dan 2026-07-21 12:01:59 f957996d Add storefront north-star example, satellite gap programs, and ↦ map-entry syntax (cambra-dev/cambra-old#295)
+◆  spytqxnv skylar 2026-07-21 10:35:24 09e029bd remove pyast references (cambra-dev/cambra-old#300)
+◆  otrvoqqz daniel 2026-07-21 10:30:57 2fd199e4 Transactional mutability: Mut[V, Txn] registers and with begin() blocks (cambra-dev/cambra-old#288)
+◆  mmrmtxrt daniel 2026-07-21 10:25:10 9806a89e Mutability v2 core: the unified history model, feeds as letrec outputs, rigid channel domains (cambra-dev/cambra-old#287)
+◆  ksonxzsu daniel 2026-07-20 15:02:06 90d0e439 Add doc→source path check to the doc-reference checker (cambra-dev/cambra-old#311)
+◆  wslqvpmz daniel 2026-07-20 14:07:08 03c5fb6f Add doc-reference checker to CI + fix pre-existing broken references (cambra-dev/cambra-old#310)
+◆  wpowtzzx dan 2026-07-17 10:28:08 5fff94f2 Add community and governance scaffolding for OSS release (cambra-dev/cambra-old#298)
+◆  voqrtrkv dan 2026-07-17 10:27:44 5cf7b02b Remove internal docs and blog drafts from the public tree (cambra-dev/cambra-old#297)
+◆  mnkskpxr dan 2026-07-16 16:29:41 3a27a719 Relicense from GPLv3 to Apache 2.0 (cambra-dev/cambra-old#296)
+◆  oqsxzuzy dan 2026-07-14 14:59:01 0cb8f0f4 Remove the dev container setup (cambra-dev/cambra-old#294)
+│ ◆  nkzpsorw daniel 2026-07-17 16:38:43 dmills/conditionals-kind-subtyping@origin a298c197 Kind inference: freshen kind vars per instantiation; propagate links transitively
+│ ◆  xwznyzlu daniel 2026-07-17 16:38:43 b228db05 Kind inference: iterated collections display the data arrow
+│ ◆  rlywyzrv daniel 2026-07-17 16:38:43 75dcdecf Kind inference PR1.5 stage 4: Compute<:Data rejection + ⤇ display
+│ ◆  lsowzttq daniel 2026-07-17 16:38:43 fdbc469b Kind inference PR1.5 stage 3: domain-derived default (maps carry Data)
+│ ◆  xnylowqz daniel 2026-07-17 16:38:43 d1ef0c40 Kind inference PR1.5 stage 2: mint kind vars at emit (inert)
+│ ◆  nnovkymn daniel 2026-07-17 16:38:43 196662c1 Kind inference PR1.5 stage 1: FunKind::Var representation (inert)
+│ ◆  qpnxyoqo daniel 2026-07-17 16:37:30 44b3c249 Σ solver: assert choice groundness + dormant-witness invariants
+│ ◆  xomqqymq daniel 2026-07-17 16:37:30 637cd85c Mutability conditionals PR1: reconcile design docs with landed scope
+│ ◆  kpvkunps daniel 2026-07-17 16:37:30 08bfb766 Mutability conditionals PR1 (4/4): broaden the Data marker to all collection introductions
+│ ◆  qprtnwzm daniel 2026-07-17 16:37:30 b1acac6c Mutability conditionals PR1 (3/4): activate Σ formation for conditional collections
+│ ◆  swrvolrn daniel 2026-07-17 16:37:30 25dcb66e Mutability conditionals PR1 (2/4): Σ types + solver machinery (dormant)
+│ ◆  uywvvmqw daniel 2026-07-17 16:37:30 8621b63e Mutability conditionals PR1 (1/4): FunKind marker on Type::Fun
+│ ◆  ttkzqpkq daniel 2026-07-17 16:37:30 1ce29181 Design: Σ types, data/compute function kinds, Case-arm lattice joins
+│ ◆  xluqzmov daniel 2026-07-17 16:29:44 7dbcb9f3 tests: deny/liveness for the consumer-driven as-of read
+│ ◆  lzxuuwqo daniel 2026-07-17 16:29:35 f3b38148 Commit store: consumer-driven as-of read; retire drive_store_to_fixpoint
+│ ◆  qxqultpo daniel 2026-07-17 11:48:30 84082cc9 G4: test ColumnValue::Union append for interleaved Commit|Abort streams
+│ ◆  ytvkumvr daniel 2026-07-17 11:47:34 e1448d2a G4: drop vestigial commit field from the per-key commit view ({time,write})
+│ ◆  touxyruy daniel 2026-07-17 11:43:38 d7169c64 G4: VariantCtor op-conversion + union-value tile (net-new construct)
+│ ◆  oukzxmno daniel 2026-07-17 08:49:45 e2868f65 Docs: sweep residual old-name prose (rename consistency)
+│ ◆  rrmprrxx daniel 2026-07-17 08:46:19 844acce1 restack onto renamed 287: apply mut_elim/HistoryKind/plan_loops/WriterSite renames
+│ ◆  xvnzwuqt daniel 2026-07-17 08:46:19 7ba5cc50 Tests: pin defer and Mut/loop-annotation rejections
+│ ◆  vxswmtpr daniel 2026-07-17 08:46:19 1afe94c3 Transactional mutability: registers, with begin() blocks, and unified txn+induction loops
+│ ◆  uqqvtqvo daniel 2026-07-17 08:46:01 dad6b671 Docs: sweep residual old-name prose in adjacent design docs
+│ ◆  tyuvtpsv daniel 2026-07-16 22:26:41 3a38ce05 Address PR 287 review: F14 keystone renames + G1 ordering account
+│ ◆  qxspqzwv daniel 2026-07-16 21:00:25 519f6e64 Address PR 287 review: doc-consistency fixes
+│ ◆  qvlmkvkr daniel 2026-07-13 18:11:53 6b558362 Mutability v2 core: the unified history model
+├─╯
+◆  ksuoysmn daniel 2026-07-13 17:28:41 7b739e6d Fix CLI hang on mutation-loop accumulators via a deferred-wakeup queue (cambra-dev/cambra-old#291)
+◆  uvmqlmun dan 2026-07-09 16:09:42 80ff3377 Bump toolchain to 1.97.0; adopt newer clippy lints (cambra-dev/cambra-old#289)
+◆  mnqtuqnu dan 2026-07-09 13:59:14 f80b3caf Correct technical claims in adjacent design docs (cambra-dev/cambra-old#286)
+◆  qoqvlzkw dan 2026-07-09 13:58:57 2c070f53 Pin the Rust toolchain to 1.95.0 (unbreak clippy CI) (cambra-dev/cambra-old#285)
+│ ◆  yowwrqxy daniel 2026-07-08 21:29:19 dmills/txn-mutability@origin 54a6b474 Transactional mutability: Mut[V, Txn] + with begin()
+│ ◆  uoznxlut daniel 2026-07-08 21:29:18 8c011512 Retire desugar_defers + retype: feed channelization in the unified phase
+│ ◆  mvwlprns daniel 2026-07-08 21:29:02 e012c067 Conditional feeds: N-arm if/elif fan-out via refined sources
+│ ◆  qyqnsopz daniel 2026-07-08 21:29:02 bee49782 Induction mutability + the unified history model
+├─╯
+◆  sunqnnkt daniel 2026-07-07 17:22:53 90c39bd2 Add a spec for CHL (cambra-dev/cambra-old#210)
+◆  rtyytnwl dan 2026-07-07 11:21:35 e027a660 Add north-star CHL example programs + syntax-convergence design doc (cambra-dev/cambra-old#277)
+│ ○  wntvpuro daniel 2026-07-07 11:18:16 a514ecff Transactional mutability: Mut[V, Txn] + with begin()
+│ ○  tkqtuktu daniel 2026-07-07 11:11:59 20aa373c Induction mutability with `:=`, registry-free lowering
+├─╯
+◆  vswkoyru dan 2026-07-07 10:40:49 4b271b6a Consolidate CCL design docs into src/ccl/design/ (cambra-dev/cambra-old#279)
+◆  xsqurnnk dan 2026-07-07 09:50:59 d6a7fa48 Rename CCL inference to infer/ + infer/solver/; relocate FieldKey (cambra-dev/cambra-old#278)
+◆  qmwzwvox dan 2026-07-01 16:10:01 4a67b298 Consolidate duplicated helpers (behavior-preserving) (cambra-dev/cambra-old#273)
+◆  tpvryylu dan 2026-07-01 16:08:53 f6cac488 Fix naming inconsistencies (behavior-preserving) (cambra-dev/cambra-old#274)
+◆  ntxwvtry dan 2026-07-01 16:03:56 09ea7fb6 Fix stale-pointer collisions in Rc-identity predicate memos (cambra-dev/cambra-old#272)
+◆  ylrxzpms dan 2026-07-01 15:40:13 fb5e2091 Split interpreter/types.rs into a directory module (pure move) (cambra-dev/cambra-old#259)
+◆  mrlquktx dan 2026-07-01 15:33:30 90e56a23 Split chl_parser error types into parser/error.rs (pure move) (cambra-dev/cambra-old#261)
+◆  sznxuzww dan 2026-07-01 14:08:10 b31a75a3 Documentation restructuring: brainstorm index/banners, supersede pi-types draft, glyph tidy (cambra-dev/cambra-old#269)
+◆  tmzqtrzp dan 2026-07-01 14:07:11 3346de91 Document the full CI gate so release clippy isn't skipped before PRs (cambra-dev/cambra-old#271)
+◆  rzmvsqoy dan 2026-07-01 14:05:56 cc915e7e Remove dead code in interpreter (behavior-preserving) (cambra-dev/cambra-old#270)
+◆  vwwmvsro dan 2026-07-01 14:05:31 b3d9c45c Split tests/compilation_pipeline.rs into themed files (one test binary) (cambra-dev/cambra-old#268)
+◆  pwmwpwxr dan 2026-07-01 14:04:03 6465af43 Split ccl/mod.rs core types into submodules (pure move) (cambra-dev/cambra-old#267)
+◆  kkupkzmn dan 2026-07-01 14:02:57 923665b8 Split interpreter/tile_operators.rs into a directory module (pure move) (cambra-dev/cambra-old#266)
+◆  vtmwlyuu dan 2026-07-01 14:01:44 b31d2c19 Split ccl/infer_simple_sub.rs into a directory module (pure move) (cambra-dev/cambra-old#265)
+◆  krolqmlw dan 2026-07-01 14:00:56 665e6c8c Split ccl/simple_sub.rs into a directory module (pure move) (cambra-dev/cambra-old#264)
+◆  qvoqtmpt dan 2026-07-01 14:00:26 a303b261 Split ccl/lower.rs into a directory module (pure move) (cambra-dev/cambra-old#263)
+◆  sknvorkm dan 2026-07-01 09:44:05 8bd67c1f Split ccl/planning.rs into a directory module (pure move) (cambra-dev/cambra-old#262)
+◆  lrwtzttm dan 2026-07-01 09:38:32 d64a8d81 Split interpreter/tiling.rs into a directory module (pure move) (cambra-dev/cambra-old#260)
+◆  xqqmykpm dan 2026-06-30 09:52:57 48886e22 Documentation consistency pass (cambra-dev/cambra-old#256)
+◆  zqtvuuot dan 2026-06-22 10:18:05 c7d612c7 Bump flaky test timeouts (slow CI VMs, not contention) (cambra-dev/cambra-old#246)
+◆  zrxmnroy dan 2026-06-19 10:30:34 6240aec9 Generalize the AI-attribution prohibition in CLAUDE.md (cambra-dev/cambra-old#245)
+◆  lonxyvtm dan 2026-06-17 15:11:50 2590fed7 Immutable predicate terms (stage 3): Rc<RefCell<TypedExpr>> → Rc<TypedExpr> (cambra-dev/cambra-old#243)
+◆  nznqvwno dan 2026-06-16 13:19:48 c154b0e2 One uniform substitution over terms and types (immutable-predicates stage 2) (cambra-dev/cambra-old#242)
+◆  ounvptxz dan 2026-06-15 17:07:21 dce42853 Integrate monomorphization into the coalesce walk; delete rederive_dependent_types (cambra-dev/cambra-old#240)
+◆  nsutkvxt dan 2026-06-15 16:41:34 5f134933 Structured binder names + α-uniquification at lowering (immutable-predicates stage 1) (cambra-dev/cambra-old#241)
+◆  wkousyyt dan 2026-06-12 17:18:47 f72cbd3c Store constraint edges two-sided; never invert a discharge (cambra-dev/cambra-old#236)
+◆  mstvnzzm daniel 2026-06-12 17:07:51 cdb3c7fa Remove refinement field on lambda (cambra-dev/cambra-old#234)
+◆  yontuntq daniel 2026-06-12 16:54:48 6d05945f Support pi types (cambra-dev/cambra-old#233)
+◆  vppslvvo daniel 2026-06-12 14:44:28 ab7acfc0 More type system cleanups (cambra-dev/cambra-old#235)
+◆  wwtmtwxo daniel 2026-06-10 16:13:49 b6a675f6 Type system cleanups (cambra-dev/cambra-old#230)
+◆  roovzrlw daniel 2026-06-10 16:10:54 9c083456 Fix infer mem leak (cambra-dev/cambra-old#229)
+◆  zyysztsw daniel 2026-06-10 16:08:51 b48c4906 Support polymorphic functions (cambra-dev/cambra-old#227)
+◆  syuutnlp daniel 2026-06-10 16:06:19 9eacb1b5 Improve type checking (cambra-dev/cambra-old#226)
+◆  tqwurxvn daniel 2026-06-10 16:03:55 ab681e9a Add cast operator (cambra-dev/cambra-old#218)
+◆  nlyzsupk daniel 2026-06-08 14:18:02 179644e5 Move iteration to join planning (cambra-dev/cambra-old#217)
+◆  puvvsrxz daniel 2026-06-05 15:22:09 fbadfec6 Handle refinements in simplesub (cambra-dev/cambra-old#223)
+◆  mxwnllmp daniel 2026-06-04 22:31:52 0cd2e732 Unify simple sub and ccl types (cambra-dev/cambra-old#222)
+◆  ousyqlqo daniel 2026-06-04 22:28:39 499c29d8 Delete PartialTuple and PartialRecord (cambra-dev/cambra-old#221)
+◆  utvxzsyt skylar 2026-06-04 17:45:05 5b6fdbd7 Add Stage 2 tagged variant machinery to simple-sub lattice (cambra-dev/cambra-old#213)
+◆  wulmolmk dan 2026-06-02 16:13:19 38d8ff99 Add tripwire test for Max over non-orderable codomain (cambra-dev/cambra-old#220)
+◆  omxyovtr dan 2026-06-02 15:33:33 d5c3e871 Add design proposal: dependent refinements via Pi types (cambra-dev/cambra-old#215)
+◆  kyttkoqv dan 2026-06-02 15:12:41 46fdd380 Unify aggregate operator schemes into their full-function types (cambra-dev/cambra-old#219)
+◆  kruyuyqo skylar 2026-06-02 13:10:59 e26730bd Replace HM unification with Simple-sub algebraic subtyping (Stage 1.5 complete) (cambra-dev/cambra-old#211)
+◆  zmrmuxsn skylar 2026-06-02 10:40:41 2afd86b2 add cargo doc lint to CI (cambra-dev/cambra-old#216)
+◆  xvmuszlt daniel 2026-05-21 17:13:30 88075580 Rename @ to ++ and eagerly flatten nested unions (cambra-dev/cambra-old#212)
+◆  qylmsyno dan 2026-05-21 16:58:10 5224503d Add notation conventions for design docs (cambra-dev/cambra-old#214)
+◆  zxlwkunp daniel 2026-05-20 17:14:32 e23c1d25 Remove defers before inference (cambra-dev/cambra-old#202)
+◆  oktltvmp daniel 2026-05-20 14:34:13 0909b0c8 Improve errors up through lowering (cambra-dev/cambra-old#203)
+◆  wwrotxpu dan 2026-05-19 17:54:40 c90a892d Add codebase-thinking guidance to CLAUDE.md (cambra-dev/cambra-old#208)
+◆  vvwlykrr daniel 2026-05-19 14:35:28 683d9ad4 More recursion helpers (cambra-dev/cambra-old#209)
+◆  qmzzvxvy daniel 2026-05-19 14:00:31 567b7ab1 Fix iteration for union types (cambra-dev/cambra-old#205)
+◆  tqkqutmy dan 2026-05-18 15:50:57 cdcb1358 Drop `Refined(...)` wrapper from symbolic refinement rendering (cambra-dev/cambra-old#207)
+◆  yolmmnzl daniel 2026-05-18 13:15:49 3ba772d5 Remove dead code: pretty for exprs (cambra-dev/cambra-old#195)
+◆  wmmurpzm daniel 2026-05-18 13:01:33 fdc61ee2 Add expr walking helpers (cambra-dev/cambra-old#204)
+◆  uwmmwrsy daniel 2026-05-18 12:41:23 2f9677a2 First pass of mutability (cambra-dev/cambra-old#193)
+◆  zmnxpvqv dan 2026-05-18 11:43:19 25f872dc Delete unverified examples/ directory (cambra-dev/cambra-old#200)
+◆  ruxppnnn dan 2026-05-18 11:35:34 fa7f8001 Add demo program gallery under tests/programs/ (cambra-dev/cambra-old#199)
+◆  ovztkykl daniel 2026-05-15 14:05:57 28501758 Switch lowering to new parser (cambra-dev/cambra-old#198)
+◆  uwsuztov daniel 2026-05-15 14:04:01 c84951f3 Add a CHL parser (cambra-dev/cambra-old#197)
+◆  ltsuruzs daniel 2026-05-11 16:44:52 bb6f8fd3 Lower for-loops directly to Compose+Lambda, retire generator chain walker (cambra-dev/cambra-old#190)
+◆  uwvqwvpk daniel 2026-05-11 16:42:51 e1218e25 Add a simple webserver source/sink (cambra-dev/cambra-old#188)
+◆  vvvpywsn daniel 2026-05-07 11:58:18 bfc00457 Feed bugfixes (cambra-dev/cambra-old#185)
+◆  srsprxko daniel 2026-05-06 13:08:43 9b55ad4d Support multiple feed calls (cambra-dev/cambra-old#183)
+◆  pmlkvtkx daniel 2026-05-05 14:21:45 6440fcdb Remove some dead code (cambra-dev/cambra-old#189)
+◆  qmuwrwlx daniel 2026-05-04 17:45:24 27d3c6c7 Record support in CHL (cambra-dev/cambra-old#187)
+◆  xsrktxko daniel 2026-05-01 14:11:49 ec223301 Add claude instructions for editing PR descriptions (cambra-dev/cambra-old#186)
+◆  supzmowx daniel 2026-04-30 12:38:59 4583932f Add union types, operator, etc (cambra-dev/cambra-old#182)
+◆  kklqlrup daniel 2026-04-30 12:14:06 c8cd4273 Prototype deferred collection operators (cambra-dev/cambra-old#180)
+◆  nmqxonwv skylar 2026-04-29 13:35:03 680f2a7b add gh review skill (cambra-dev/cambra-old#110)
+◆  ytsmzwst dan 2026-04-29 11:58:11 50df54b8 Support user-defined function calls (cambra-dev/cambra-old#173)
+◆  vuxlqqno dan 2026-04-27 22:09:48 4670fafc Replace magic-string built-ins with a typed Builtin enum (cambra-dev/cambra-old#181)
+◆  ortzukou dan 2026-04-27 10:02:07 13abfd63 Lower generator functions (for/yield) and function definitions (cambra-dev/cambra-old#161)
+◆  puxmzlpw daniel 2026-04-24 16:04:40 ce26debf Support predicate pushdown in join planning (cambra-dev/cambra-old#175)
+◆  mrrrssmp daniel 2026-04-24 15:54:43 54fe02ee Support n-way hash joins (cambra-dev/cambra-old#174)
+◆  stzztvkl dan 2026-04-22 16:55:20 2a4b8fec Rename Split/Zip tile operators to FanOut/FanIn (cambra-dev/cambra-old#177)
+◆  zsnuksnq dan 2026-04-22 16:18:40 77dd90d9 devcontainer: install git-spice and wire host GitHub/SSH auth (cambra-dev/cambra-old#176)
+◆  wpykloqk dan 2026-04-22 15:14:41 ec705194 Support calling user-defined functions (cambra-dev/cambra-old#172)
+◆  wqqtvqnp daniel 2026-04-22 12:12:48 5b6a49f9 Shorten review reminder threshold (cambra-dev/cambra-old#169)
+◆  kwrlstol dan 2026-04-21 15:28:29 7173a1d3 Guard product-eta rewrite on 2-tuple codomain (cambra-dev/cambra-old#171)
+◆  lypouyul dan 2026-04-20 14:59:10 41792217 Add VS Code dev container (cambra-dev/cambra-old#170)
+◆  wwspywqw daniel 2026-04-20 12:16:03 228f1f6f Support logical deletes with bitsets (cambra-dev/cambra-old#167)
+◆  xmslpxsu daniel 2026-04-20 12:08:45 5c1e5c06 Improve source releasing (cambra-dev/cambra-old#163)
+◆  qrmyxovm daniel 2026-04-20 12:02:12 c03e48dc Support interval guards in stdinreader (cambra-dev/cambra-old#166)
+◆  lkpzklyx daniel 2026-04-20 12:01:46 14a8f5d3 Fix inspector colors (cambra-dev/cambra-old#168)
+◆  vzonuomq dan 2026-04-17 13:52:01 1e63c5d0 Fix is_free_in_type to use any instead of all for Tuple/Record (cambra-dev/cambra-old#165)
+◆  mutrzvvs daniel 2026-04-16 23:43:14 0e4becb1 Release + domain predicate improvements (cambra-dev/cambra-old#162)
+◆  pkrusyou daniel 2026-04-16 21:13:03 ac05bc79 Fix clippy error (cambra-dev/cambra-old#164)
+◆  wxrwuyrw daniel 2026-04-15 15:18:14 2db55b57 Add mode to MapResultToConst to zip instead of replace (cambra-dev/cambra-old#157)
+◆  npouqspv dan 2026-04-15 15:09:07 6b339565 Augmented assignment lowering (cambra-dev/cambra-old#160)
+◆  kspprkpt dan 2026-04-15 12:19:53 c205b3fa mutability brainstorm (cambra-dev/cambra-old#152)
+◆  zzyywptx daniel 2026-04-14 12:49:25 2336b93e Delete temporary compiler (cambra-dev/cambra-old#155)
+◆  voptxoro daniel 2026-04-14 12:46:22 ba30c3f1 Add test timeouts (cambra-dev/cambra-old#159)
+◆  nkrxqvwn daniel 2026-04-14 12:43:15 6aa1fa15 Revert "remove HashJoin and RefinementKind (cambra-dev/cambra-old#149)" (cambra-dev/cambra-old#158)
+◆  owwqonrn skylar 2026-04-13 17:18:15 e20c3882 remove HashJoin and RefinementKind (cambra-dev/cambra-old#149)
+◆  kllzmuox daniel 2026-04-13 11:12:38 c6e4f401 Update the web inspector with fancy colors (cambra-dev/cambra-old#156)
+◆  zsmsplnr daniel 2026-04-10 11:57:50 3384a574 Switch tests to new path (cambra-dev/cambra-old#153)
+◆  rsvxmzlu skylar 2026-04-09 17:08:45 3d065d68 fix lambda binding type inference (cambra-dev/cambra-old#154)
+◆  swuvpuxy skylar 2026-04-09 16:47:13 0ada6f8c defer early lambda typecheck (cambra-dev/cambra-old#148)
+◆  kpxtvlmv daniel 2026-04-09 15:37:44 1f0259c9 Support more complicated 2-way joins (cambra-dev/cambra-old#151)
+◆  vwmswqvp daniel 2026-04-09 15:17:58 0b4282dc First pass of hash joins v2 (cambra-dev/cambra-old#150)
+◆  zmlzrwyn daniel 2026-04-07 16:09:01 19c98cc6 Keyed aggregates (cambra-dev/cambra-old#143)
+◆  pquxyxrt daniel 2026-04-03 17:45:19 4d01197a Add a typecheck helper (cambra-dev/cambra-old#146)
+◆  nlnvkpkk daniel 2026-04-03 17:23:26 73690cc6 Support global aggregates (cambra-dev/cambra-old#140)
+◆  vpmymvvy daniel 2026-04-03 17:20:59 ac30fadd Support sources in new compile path (cambra-dev/cambra-old#139)
+◆  mtulrpqs daniel 2026-04-03 17:16:40 847fa09e Convert λ-free CCL to operators (cambra-dev/cambra-old#138)
+◆  rkxmymrt skylar 2026-04-03 15:24:52 b8d84035 Replace pre-scan param inference with unification-table approach                                                       (cambra-dev/cambra-old#145)
+◆  lrunsxnq skylar 2026-04-01 12:00:31 07a9bb22 Merge PartialTuple/PartialRecord in set(); accumulate TupleField constraints (cambra-dev/cambra-old#142)
+◆  ypomkyvu skylar 2026-04-01 11:51:31 a17398f9 Add PartialTuple/PartialRecord type variants for Proj inference (cambra-dev/cambra-old#141)
+◆  quuvpvzy daniel 2026-03-31 15:16:03 ff8802b0 Add a fully-typed check (cambra-dev/cambra-old#137)
+◆  xnrvusmo daniel 2026-03-31 15:14:38 3034a2c1 Flatten out compose (cambra-dev/cambra-old#134)
+◆  skrwmryn skylar 2026-03-31 12:55:31 da5ce894 clarify TODOs around if/else statements vs ternary (cambra-dev/cambra-old#131)
+◆  quzumnuw daniel 2026-03-30 18:18:48 af508a3c Add support for unification of structured types (cambra-dev/cambra-old#133)
+◆  stsuousl daniel 2026-03-27 13:29:14 6b8b1102 Consolidate e2e tests (cambra-dev/cambra-old#132)
+◆  nvmqkqvo dan 2026-03-27 10:17:52 0c351a13 Lambda elimination (cambra-dev/cambra-old#124)
+◆  ytymzrtr dan 2026-03-26 14:59:49 c5334c2d Replace TupleIndex with Proj first-class projection morphism (cambra-dev/cambra-old#123)
+◆  mztpxllo daniel 2026-03-25 16:39:40 8aa8436e Speed up function application and converse (cambra-dev/cambra-old#130)
+◆  tumsrkvk daniel 2026-03-25 16:37:57 1997bed8 Improve filtering code (cambra-dev/cambra-old#128)
+◆  kpvlwqvr daniel 2026-03-25 15:46:35 e443b7f9 Refactor Map* to MapN* (cambra-dev/cambra-old#126)
+◆  vkorsnuv skylar 2026-03-25 11:39:57 54c42d17 ccl: redesign `Case` as guard-based branching and implement type inference (cambra-dev/cambra-old#125)
+◆  nrorqzru daniel 2026-03-25 10:43:04 09fe2ee0 Optimize strings and sources (cambra-dev/cambra-old#122)
+◆  xyvttztu daniel 2026-03-25 10:37:33 530db52e Make stdinreader async (cambra-dev/cambra-old#119)
+◆  zqwkqswz daniel 2026-03-25 10:29:18 d9b1c08a Operator/Producer cleanups (cambra-dev/cambra-old#118)
+◆  tqyutttm daniel 2026-03-24 17:13:01 24beaaca Implement Memo (cambra-dev/cambra-old#117)
+◆  myyrmsps skylar 2026-03-24 10:55:47 540be005 Complete Record type inference: infer field types instead of fresh Infer var (cambra-dev/cambra-old#121)
+◆  ympzqlsm skylar 2026-03-24 10:55:00 43201191 Move BaseType definition to ccl, re-export from interpreter (cambra-dev/cambra-old#120)
+◆  zquouyqo skylar 2026-03-23 13:39:39 b7081361 Add CCL type-check integration tests and lower improvements (cambra-dev/cambra-old#116)
+◆  tzslwyrx daniel 2026-03-20 17:45:02 52b7ec17 Couple of perf improvements (cambra-dev/cambra-old#115)
+◆  sqpwyzox daniel 2026-03-20 17:31:35 d1ba3679 Graphical producer rendering (cambra-dev/cambra-old#114)
+◆  vtuztnkl daniel 2026-03-20 15:04:57 aff0f628 Implement release for aggregation (cambra-dev/cambra-old#113)
+◆  uwsozyur skylar 2026-03-20 12:16:44 8de1408a UnaryOp end-to-end: lowering, inference, and compilation (cambra-dev/cambra-old#112)
+◆  tvvwzrxq skylar 2026-03-20 12:01:56 71b06e35 BinOp inference rules with constrain_equal; defer Concat rewrite to compile time (cambra-dev/cambra-old#111)
+◆  spnzzunn daniel 2026-03-18 21:32:24 3454116b Improve layout of LookupFunction and rename to CurriedFunction (cambra-dev/cambra-old#109)
+◆  zrzktqwn daniel 2026-03-18 11:05:20 4e957a69 Delete old interpreter (cambra-dev/cambra-old#108)
+◆  mzmutlwx daniel 2026-03-18 10:55:32 24ef936d Switch over to new tile operators (cambra-dev/cambra-old#107)
+◆  lnorqszp skylar 2026-03-18 09:49:10 08a4f69c Replace Type::Unknown with Infer/Error; add UnificationTable (cambra-dev/cambra-old#105)
+◆  oquxpkyo daniel 2026-03-17 14:02:19 63420b75 More typechecking and bugfixes for tile operators (cambra-dev/cambra-old#106)
+◆  mpkxlqwq skylar 2026-03-17 11:02:32 eb43be76 Wrap CCL expressions in TypedExpr single-tree representation (cambra-dev/cambra-old#104)
+◆  ppxuuuzk daniel 2026-03-16 17:54:41 93a6ea20 Tile prototyping (cambra-dev/cambra-old#89)
+◆  rpvopvms daniel 2026-03-16 14:07:14 df372507 Add sources to lower and inference (cambra-dev/cambra-old#102)
+◆  ysyywumr daniel 2026-03-13 15:25:25 78781ec9 Initial impl of Tilings and Tiles (cambra-dev/cambra-old#100)
+◆  kpxolwol skylar 2026-03-13 15:00:32 625915f4 prevent ci running on PR desc edits (cambra-dev/cambra-old#103)
+◆  puskkpor skylar 2026-03-13 14:53:22 70082fbb Introduce TypedBinding for lambda and join params (cambra-dev/cambra-old#101)
+◆  ytnyvvxr daniel 2026-03-13 11:10:05 dc427ba4 Add Display for Values and Extents (cambra-dev/cambra-old#98)
+◆  nslsuzno daniel 2026-03-12 17:22:30 7eb40d49 Add groupby and lambdas to lower and infer (cambra-dev/cambra-old#97)
+◆  yyknuxyl skylar 2026-03-11 19:31:15 e77964a5 update claude review skill: no whitespace nits (cambra-dev/cambra-old#92)
+◆  wllszynn daniel 2026-03-11 16:27:50 fc051f53 Add aggregates to lower and infer (cambra-dev/cambra-old#91)
+◆  yvyrstlo dan 2026-03-11 16:21:51 eed7adbb Add example for operational semantics (cambra-dev/cambra-old#86)
+◆  wzqpyvpk daniel 2026-03-10 15:25:59 35fd5d68 Add more boolean support (cambra-dev/cambra-old#90)
+◆  wuvllmpu daniel 2026-03-10 12:25:11 4d5ef5f2 Support for joins in CCL (cambra-dev/cambra-old#83)
+◆  xqlvrnzx skylar 2026-03-09 12:13:54 65eaec21 prefer RAII for ScopeStacks via scopeguard (cambra-dev/cambra-old#87)
+◆  lzzlnytr skylar 2026-03-05 16:59:54 6b5f4c56 add basic tuple support to CCL pipeline (cambra-dev/cambra-old#82)
+◆  vzlkummz skylar 2026-03-05 16:08:42 e54aaccc compile Let bindings to a dedicated Let operator  (cambra-dev/cambra-old#79)
+◆  puurnywl skylar 2026-03-05 13:29:59 97c78f52 Consolidate E2E compilation tests (cambra-dev/cambra-old#78)
+◆  konwsrqt skylar 2026-03-05 13:18:45 d67cb67e ccl LowerError -> LoweringError (cambra-dev/cambra-old#77)
+◆  twnsyolq skylar 2026-03-05 13:15:37 e47aeabe CCL → operator compile pass (cambra-dev/cambra-old#60)
+◆  pswkryrs dan 2026-03-05 10:19:41 df639bd9 Refactor operational semantics doc into focused files (cambra-dev/cambra-old#76)
+◆  ppuxyolt daniel 2026-03-04 18:46:21 4f355498 First pass of hash joins (cambra-dev/cambra-old#81)
+◆  wnwtymkx skylar 2026-03-03 14:33:40 996cccc7 review reminders: no drafts, update usermap (cambra-dev/cambra-old#75)
+◆  qpmsyrxt skylar 2026-03-03 14:32:22 408f1210 Enable unused_qualifications lint and fix violations (cambra-dev/cambra-old#70)
+◆  ttvstoxs daniel 2026-03-03 12:41:18 b526327e Remove guards from notify (cambra-dev/cambra-old#66)
+◆  zwxqxzly dan 2026-03-02 18:01:55 3c407918 Operational semantics: tilings, guards, operators, and compaction (cambra-dev/cambra-old#54)
+◆  rnyywkzs skylar 2026-03-02 17:34:44 61ab35b0 have klod respect git spice branch prefixes (cambra-dev/cambra-old#69)
+◆  qxlkqkut daniel 2026-03-02 17:27:48 71ebbaae Record cleanups (cambra-dev/cambra-old#74)
+◆  lrypktsl daniel 2026-03-02 17:09:59 c371d4e9 Improve inspection for restrictions (cambra-dev/cambra-old#65)
+◆  kkxznlqu daniel 2026-03-02 17:05:47 fe917458 Clean up old join code (cambra-dev/cambra-old#63)
+◆  nxmnkowq daniel 2026-03-02 16:54:57 8b7a364c Implement loop joins and restricted Extents (cambra-dev/cambra-old#59)
+◆  wlunmyus skylar 2026-03-02 14:17:39 35c3b7e4 less verbose CI & LLM review skills (cambra-dev/cambra-old#72)
+◆  utvmoqlw daniel 2026-02-27 14:19:27 658b21b7 Basic implementation of tuples (as records) (cambra-dev/cambra-old#53)
+◆  koqsrxqz skylar 2026-02-27 12:56:27 853ccdd8 actions checkout needs contents permissions (cambra-dev/cambra-old#67)
+◆  ruuvrkvp skylar 2026-02-26 21:10:20 9eec1c82 Document git-spice workflow options in CLAUDE.md (cambra-dev/cambra-old#62)
+◆  tmxxpmws skylar 2026-02-26 16:06:24 0334bda5 have klod update docs when planning (cambra-dev/cambra-old#58)
+◆  nntsyzrk skylar 2026-02-26 11:26:57 201f34fb add symbolic representation for CCL (cambra-dev/cambra-old#57)
+◆  prylxwzs skylar 2026-02-26 10:24:59 3cc5fe27 first pass of CCL lowering & pretty nodes (cambra-dev/cambra-old#56)
+◆  sllwwllo skylar 2026-02-26 10:23:26 88598208 First pass of CCL nodes (cambra-dev/cambra-old#55)
+◆  ormkrroq daniel 2026-02-25 18:05:28 c8a98b28 Support more binops and optimize vectorization (cambra-dev/cambra-old#51)
+◆  quzwnwol dan 2026-02-21 23:08:44 87a851f0 Docs refactor: reorganize design docs, add op-sem foundation (cambra-dev/cambra-old#47)
+◆  ltylsqym skylar 2026-02-20 17:16:04 b81c37a0 add operator graph viz (cambra-dev/cambra-old#40)
+◆  wvxltyry dan 2026-02-20 17:10:23 077e1a0b Add bash-approval hook and git-spice workflow docs (cambra-dev/cambra-old#48)
+◆  wqrqumwp skylar 2026-02-20 14:47:59 84110d7e extract closures from lambdaproducer (cambra-dev/cambra-old#49)
+◆  nwmmxvru skylar 2026-02-19 18:51:26 0e68b0de fix permissions on PR reminder workflow (cambra-dev/cambra-old#50)
+◆  qvnzowor daniel 2026-02-19 17:01:33 49396f2e Fix type+scope handling in lowering (cambra-dev/cambra-old#45)
+◆  qpptrqom daniel 2026-02-19 16:59:55 c3fb92b4 Refactor ColumnValue for better columnarization (cambra-dev/cambra-old#44)
+◆  xqzvnplw daniel 2026-02-19 16:52:37 432456dd Add a test source (cambra-dev/cambra-old#42)
+◆  xyvomwoq dan 2026-02-19 15:19:30 e0eae2f5 Rename VarSource variants: Bound->Argument, Scanning->Iteration (cambra-dev/cambra-old#37)
+◆  syvyrnkz daniel 2026-02-19 13:09:48 2c36f739 Add a simple webserver for inspecting the state of the program (cambra-dev/cambra-old#36)
+◆  ouyvnryv dan 2026-02-18 22:51:42 675e8344 Update Claude settings and dev docs (cambra-dev/cambra-old#39)
+◆  romnwlux daniel 2026-02-18 22:33:05 0c081bbe Add stdin support (cambra-dev/cambra-old#33)
+◆  uyooltzp daniel 2026-02-18 11:02:31 41c492cc Add support for scalars and binops inside list comps (cambra-dev/cambra-old#31)
+◆  yzruvlum daniel 2026-02-17 15:42:45 a984d11d First pass of list comprehension support (cambra-dev/cambra-old#30)
+◆  qqksqzxu skylar 2026-02-17 12:57:10 a39eb298 update claude comments and git settings (cambra-dev/cambra-old#38)
+◆  ouxskpmr dan 2026-02-16 18:47:34 db90900a fix CI: clean rustpython-parser to avoid stale cache (cambra-dev/cambra-old#34)
+◆  wuosmvqr dan 2026-02-16 18:47:13 9728ff1f Remove Co-Authored-By from commit messages (cambra-dev/cambra-old#11)
+◆  lxkspsnn skylar 2026-02-16 18:20:19 3c4d3b42 refactor consumer/producer notification protocol (cambra-dev/cambra-old#32)
+◆  tsowqzzy skylar 2026-02-11 17:25:08 2a069b38 expand listcmp in pretty ast (cambra-dev/cambra-old#28)
+◆  vmynvlvs skylar 2026-02-10 21:53:20 bc27f2dd split interpreter into module files (cambra-dev/cambra-old#27)
+◆  qrwxswxp skylar 2026-02-10 20:33:21 3f0ad952 implement binop lowering (cambra-dev/cambra-old#20)
+◆  ytpznrqq skylar 2026-02-10 20:26:00 a46baaca wip add pretty AST printing (cambra-dev/cambra-old#23)
+◆  xwqwppmx skylar 2026-02-10 15:20:26 8acec753 add --fix flag to autoformat ci (cambra-dev/cambra-old#25)
+◆  tlkrtnyx skylar 2026-02-10 12:56:01 555a0a4c Rc VarScope and remove Clone Trait (cambra-dev/cambra-old#24)
+◆  mywoqxul daniel 2026-02-09 22:27:36 860ab8e9 Prototype support for variable assignment in lowering (cambra-dev/cambra-old#22)
+◆  zvkkxkrm skylar 2026-02-09 19:24:31 56e97903 add shellcheck to ci (cambra-dev/cambra-old#21)
+◆  vmpstmul daniel 2026-02-09 15:50:38 50e9e6f3 Pass strings by slice (cambra-dev/cambra-old#19)
+◆  xunpvmoz daniel 2026-02-09 15:24:08 e8aa2d10 Add more Debug types (cambra-dev/cambra-old#18)
+◆  monpzpxw skylar 2026-02-09 15:18:33 c7bc625f Add literal lowering and scaffolding (cambra-dev/cambra-old#17)
+◆  pwvmpykn daniel 2026-02-09 13:39:50 34065b82 Fix some .md lists (cambra-dev/cambra-old#16)
+◆  ywpylpsm skylar 2026-02-09 13:21:01 c22e9b35 send CI failure notifications to #code (cambra-dev/cambra-old#13)
+◆  mwoxmnoz skylar 2026-02-09 13:09:08 3dbcfb23 add code review reminders workflows (cambra-dev/cambra-old#12)
+◆  oqvsnyny skylar 2026-02-06 21:19:54 11937afc add git-spice branch prefix (cambra-dev/cambra-old#15)
+◆  ntkntnvy skylar 2026-02-06 15:30:25 744c2906 add pyast claude skill for reference (cambra-dev/cambra-old#14)
+◆  oxvslrpq skylar 2026-02-05 15:20:31 fa6d4555 add codeowners for auto-assignment (cambra-dev/cambra-old#10)
+◆  nkyrwlku skylar 2026-02-05 14:46:33 1692f010 Add github actions with cargo and clippy (cambra-dev/cambra-old#9)
+◆  kllzmlvl skylar 2026-02-05 14:26:30 78be2bf7 fix clippy errors (cambra-dev/cambra-old#8)
+◆  swvpqxqm skylar 2026-02-05 11:55:54 e94d33f0 skylar/fix_VarRef_borrow (cambra-dev/cambra-old#7)
+◆  mmtxkwyt skylar 2026-02-05 09:50:38 6871aad9 add git-spice cheatsheat (cambra-dev/cambra-old#5)
+◆  xzsuxpll skylar 2026-02-03 14:56:27 6fbf1de1 Name change: pototo -> cambra (cambra-dev/cambra-old#2)
+◆  oryyszvv skylar 2026-02-03 14:53:45 5f7ae766 mirror from potatoes (cambra-dev/cambra-old#1)
+◆  ovrzpmqs skylar 2026-02-03 13:31:35 1a3fcbc9 (empty) Initial commit
+│ ○  znxulllp scook90 2026-08-09 08:14:33 313cd478 (empty) (no description set)
+├─╯
+│ ○  vqxnklkt skylar 2026-07-10 11:42:59 defdd635 docs(ccl,inspector): comment concision — present-tense invariants, no history
+│ ○  rxrmnqru skylar 2026-07-10 11:24:13 dbce200a ccl: remove vestigial wrapper-blame records + redundant sweep bookkeeping
+│ ○  tpzxqsqm skylar 2026-07-10 10:57:36 a9ea4195 inspector(web): rewire frontend to the schema-2 3-stage wire + fixture drift gate
+│ ○  zttvlmxv skylar 2026-07-10 10:41:18 ff996496 inspector: golden corpus + cross-process determinism check (drift gate plumbing)
+│ ○  lxrxyvln skylar 2026-07-10 10:26:30 5c82e584 inspector(wire): schema 2 — retire top-level ir/spanIndex, honest stage kinds
+│ ○  xqttuykp skylar 2026-07-10 10:13:12 e45845b1 inspector: key retained remaps by pass; stage pairing owns the association
+│ ○  opkvukuu skylar 2026-07-10 10:00:17 b9059fc5 ccl(inspector): drop the byte-identical post_desugar_provenance clone
+│ ○  vpwtqrko skylar 2026-07-10 09:55:46 75b1d209 ccl(desugar): preserve node id on try_lift_defer's lifted prefix heads
+│ ○  tqyxunkt skylar 2026-07-10 09:50:08 e17eca7b ccl: restore node-id uniqueness through transact/letrec + boundary tripwire
+│ ○  qsvzsqpp skylar 2026-07-10 09:14:50 d0b77966 ccl(provenance): apply inline recorder entries + retain its stage remap
+│ ○  kuwornul skylar 2026-07-10 08:52:45 349b96ba ccl(provenance): apply records in dataflow order + ordering-violation guardrail
+│ ○  wllqsovm skylar 2026-07-10 07:54:27 5dbe4152 docs(provenance): update design-provenance.md for the 4-pane model + inline adoption
+│ ○  mzourslo skylar 2026-07-09 15:02:55 bfbfdc51 inspector: pre-inference snapshot + 4-pane model, re-enable stage tests
+│ ○  lsnyomrz skylar 2026-07-09 14:38:54 a91a0deb ccl(desugar): preserve node id on float_defer_in_lambda outer lambda
+│ ○  zypxqxlk skylar 2026-07-09 14:38:54 c0f93ea5 ccl(inline): adopt NodeRecorder — id-preserving + construction records
+│ ○  zktzvlqp skylar 2026-07-09 11:55:10 a81dc3b4 ccl(node-recorder): add Replicated (1→N) construction verb
+│ │ ○  tyypkzyq skylar 2026-07-09 11:55:10 dd4de28f ccl(desugar): adopt NodeRecorder additively (run_with_recorder)
+│ │ ○  llqokusq skylar 2026-07-09 11:55:10 b3e12bae ccl(inline): adopt NodeRecorder — id-preserving + construction records
+│ ├─╯
+│ ○  mwosxsux skylar 2026-07-09 11:55:10 52831738 ccl(node-recorder): redesign as per-pass construction-edge primitive
+│ ○  lvpvyrwp skylar 2026-07-09 11:55:10 4f4f9610 docs(provenance): post-rebase provenance/inspector design notes (design-provenance.md)
+│ ○  snsmvmzk scook90 2026-07-08 08:44:38 d54b403a ccl: add standalone NodeRecorder module (keep/merge/synth + reconcile)
+│ ○  knrvvtzl scook90 2026-07-08 08:44:38 f94540ab ci: run inspector crate + web frontend gates in ci.sh and CI workflow
+│ ○  puqwwwtv scook90 2026-07-08 08:44:38 2502b5bb cambra-inspector web: vitest suites + snapshot fixtures + DOM tests
+│ ○  xpxyqmqs scook90 2026-07-08 08:44:38 8da6b338 cambra-inspector web: CodeMirror multi-pane frontend (scaffold, interactivity, N-stage, cross-linking)
+│ ○  mypzrvyl scook90 2026-07-08 08:44:38 15ca7a9f preserve list node ids and let ids
+│ ○  zowkxmuo scook90 2026-07-08 08:44:38 7f50b6fc cambra-inspector: vendor built web bundle (dist/index.html) for include_str!
+│ ○  lyqozuoy scook90 2026-07-08 08:44:38 aafd9c97 cambra-inspector: CCL examples, span-dump scripts, crate README
+│ ○  nmwpvkow scook90 2026-07-08 08:44:38 60c29fad cambra-inspector: tiny_http server + binary
+│ ○  orqotokt scook90 2026-07-08 08:44:38 628796a3 cambra-inspector: Cargo workspace + serde wire types + /api/snapshot payload
+│ ○  kulvxqwx scook90 2026-07-08 08:44:38 18cbd76d inspector_model: snapshot model — indices, query handlers, stage projection, serde wire
+│ ○  yrwwmwtx scook90 2026-07-08 08:44:38 74e1a973 ccl: snapshot retention, inspector wire support, and provenance-coverage fixes
+│ ○  kvtqltwq scook90 2026-07-08 08:44:38 e3d68914 ccl: provenance substrate — stable NodeIds + side table through every pass
+│ ○  oxtykvxo daniel 2026-07-07 11:18:16 96bdafc1 Transactional mutability: Mut[V, Txn] + with begin()
+│ ○  nyrlwtoo daniel 2026-07-07 11:11:59 460e0967 Induction mutability with `:=`, registry-free lowering
+│ ○  ssxourmx dan 2026-07-07 10:40:49 4724e14d Consolidate CCL design docs into src/ccl/design/ (#279)
+│ ○  oovmkmnl dan 2026-07-07 09:50:59 710e3e0d Rename CCL inference to infer/ + infer/solver/; relocate FieldKey (#278)
+│ ○  nswyksvq dan 2026-07-01 17:10:44 1f9d71df Retire CLEANUP.md (cleanup round complete) (#276)
+│ ○  lslrkroo dan 2026-07-01 16:10:01 7f010501 Consolidate duplicated helpers (behavior-preserving) (#273)
+│ ○  utwtokpy dan 2026-07-01 16:08:53 2e39368f Fix naming inconsistencies (behavior-preserving) (#274)
+│ ○  mzkyzyrx dan 2026-07-01 16:03:56 95c811a2 Fix stale-pointer collisions in Rc-identity predicate memos (#272)
+│ ○  nqkvlspk dan 2026-07-01 15:40:13 db45bda3 Split interpreter/types.rs into a directory module (pure move) (#259)
+│ ○  wnnvllmk dan 2026-07-01 15:33:30 ea879b3b Split chl_parser error types into parser/error.rs (pure move) (#261)
+│ ○  ompksmpy dan 2026-07-01 14:08:10 9d9da43b Documentation restructuring: brainstorm index/banners, supersede pi-types draft, glyph tidy (#269)
+│ ○  tkvvprwp dan 2026-07-01 14:07:11 e860f825 Document the full CI gate so release clippy isn't skipped before PRs (#271)
+│ ○  txpomzuk dan 2026-07-01 14:05:56 cdae3b02 Remove dead code in interpreter (behavior-preserving) (#270)
+│ ○  tuwuyozz dan 2026-07-01 14:05:31 aa543131 Split tests/compilation_pipeline.rs into themed files (one test binary) (#268)
+│ ○  vpunzory dan 2026-07-01 14:04:03 2d17fbc2 Split ccl/mod.rs core types into submodules (pure move) (#267)
+│ ○  rmwokwzs dan 2026-07-01 14:02:57 215afec8 Split interpreter/tile_operators.rs into a directory module (pure move) (#266)
+│ ○  qxmqqwtq dan 2026-07-01 14:01:44 fac707af Split ccl/infer_simple_sub.rs into a directory module (pure move) (#265)
+│ ○  ytsmztpy dan 2026-07-01 14:00:56 277bd8ff Split ccl/simple_sub.rs into a directory module (pure move) (#264)
+│ ○  skxzutuy dan 2026-07-01 14:00:26 7d82da39 Split ccl/lower.rs into a directory module (pure move) (#263)
+│ ○  tvoxyoql dan 2026-07-01 09:44:05 8860f50a Split ccl/planning.rs into a directory module (pure move) (#262)
+│ ○  kmxlksrt dan 2026-07-01 09:38:32 97995cf1 Split interpreter/tiling.rs into a directory module (pure move) (#260)
+│ ○  zowzrusm dan 2026-06-30 14:38:58 030e2cfa Add cleanup catalog (CLEANUP.md) (#257)
+│ ○  wxykrovp dan 2026-06-30 09:52:57 c77e421f Documentation consistency pass (#256)
+│ ○  ukwnpmvv dan 2026-06-22 10:18:05 worktree-agent-a70ad175675403e07 worktree-agent-ab09e6a2e1d1a5033 f79ba2e6 Bump flaky test timeouts (slow CI VMs, not contention) (#246)
+│ ○  pqwuuyrt dan 2026-06-19 10:30:34 f9c2c1ab Generalize the AI-attribution prohibition in CLAUDE.md (#245)
+│ ○  xvntnsky dan 2026-06-17 15:11:50 b42a4f1b Immutable predicate terms (stage 3): Rc<RefCell<TypedExpr>> → Rc<TypedExpr> (#243)
+│ ○  rrxuoxnx dan 2026-06-16 13:19:48 0c192564 One uniform substitution over terms and types (immutable-predicates stage 2) (#242)
+│ ○  qopklqxm dan 2026-06-15 17:07:21 3b8235e6 Integrate monomorphization into the coalesce walk; delete rederive_dependent_types (#240)
+│ ○  ptmvvvlw dan 2026-06-15 16:41:34 3ec5a988 Structured binder names + α-uniquification at lowering (immutable-predicates stage 1) (#241)
+│ ○  plzprynl dan 2026-06-12 17:18:47 67a6b2bd Store constraint edges two-sided; never invert a discharge (#236)
+│ ○  pkpsktpu daniel 2026-06-12 17:07:51 d5e24c96 Remove refinement field on lambda (#234)
+│ ○  yzukmrql daniel 2026-06-12 16:54:48 bc89154e Support pi types (#233)
+│ ○  xqmxvvsq daniel 2026-06-12 14:44:28 9c9d3fd0 More type system cleanups (#235)
+│ ○  ltlzxqmv daniel 2026-06-10 16:13:49 4b3a8d29 Type system cleanups (#230)
+│ ○  ryysyymw daniel 2026-06-10 16:10:54 cc6cfcf6 Fix infer mem leak (#229)
+│ ○  kpszkuwk daniel 2026-06-10 16:08:51 a3491d77 Support polymorphic functions (#227)
+│ ○  zpqxxqrp daniel 2026-06-10 16:06:19 9d3b32d3 Improve type checking (#226)
+│ ○  umnzpspv daniel 2026-06-10 16:03:55 46d97442 Add cast operator (#218)
+│ ○  muwlxunm daniel 2026-06-08 14:18:02 7dcf9cc2 Move iteration to join planning (#217)
+│ ○  pwwxymwl dan 2026-06-08 10:28:04 0cbf98da Dependent refinements: design proposal + substitution prototype (brainstorm) (#228)
+│ ○  uopktwvo daniel 2026-06-05 15:22:09 fee1a101 Handle refinements in simplesub (#223)
+│ ○  plsqvpsz daniel 2026-06-04 22:31:52 e3b087e1 Unify simple sub and ccl types (#222)
+│ ○  nvxuquuo daniel 2026-06-04 22:28:39 0053bb7a Delete PartialTuple and PartialRecord (#221)
+│ ○  nnymonxp skylar 2026-06-04 17:45:05 99a2f46b Add Stage 2 tagged variant machinery to simple-sub lattice (#213)
+│ ○  wmtnrvtl dan 2026-06-02 16:13:19 36b92c93 Add tripwire test for Max over non-orderable codomain (#220)
+│ ○  wmkmkxtx dan 2026-06-02 15:33:33 0b840529 Add design proposal: dependent refinements via Pi types (#215)
+│ ○  lopxsxvn dan 2026-06-02 15:12:41 921f0217 Unify aggregate operator schemes into their full-function types (#219)
+│ ○  ykwtvwzp skylar 2026-06-02 13:10:59 ff4c4e3e Replace HM unification with Simple-sub algebraic subtyping (Stage 1.5 complete) (#211)
+│ ○  llyruoxp skylar 2026-06-02 10:40:41 8b3603b3 add cargo doc lint to CI (#216)
+│ ○  wouopvzz daniel 2026-05-21 17:13:30 b8e7929e Rename @ to ++ and eagerly flatten nested unions (#212)
+│ ○  ssssxkxw dan 2026-05-21 16:58:10 21b25158 Add notation conventions for design docs (#214)
+│ ○  puksxtop daniel 2026-05-20 17:14:32 7203c88e Remove defers before inference (#202)
+│ ○  nwupspru daniel 2026-05-20 14:34:13 d1e6cbed Improve errors up through lowering (#203)
+│ ○  uzzxkotn dan 2026-05-19 17:54:40 992e86c2 Add codebase-thinking guidance to CLAUDE.md (#208)
+│ ○  klklkrwk daniel 2026-05-19 14:35:28 523f43b4 More recursion helpers (#209)
+│ ○  yqlzlnny daniel 2026-05-19 14:00:31 4cfa659a Fix iteration for union types (#205)
+│ ○  mvozstso dan 2026-05-18 15:50:57 87a89c47 Drop `Refined(...)` wrapper from symbolic refinement rendering (#207)
+│ ○  rznlptzk daniel 2026-05-18 13:15:49 b8ed41d6 Remove dead code: pretty for exprs (#195)
+│ ○  twxrpxyy daniel 2026-05-18 13:01:33 f80769a3 Add expr walking helpers (#204)
+│ ○  yxutrurm daniel 2026-05-18 12:41:23 c1ed89f7 First pass of mutability (#193)
+│ ○  rxtookzr dan 2026-05-18 11:43:19 e04ac7e4 Delete unverified examples/ directory (#200)
+│ ○  xumtksow dan 2026-05-18 11:35:34 3eb81774 Add demo program gallery under tests/programs/ (#199)
+│ ○  lsmovrrx daniel 2026-05-15 14:05:57 284963a1 Switch lowering to new parser (#198)
+│ ○  rnuqrzxm daniel 2026-05-15 14:04:01 742991e5 Add a CHL parser (#197)
+│ ○  owusrlnm daniel 2026-05-11 16:44:52 1e3fe503 Lower for-loops directly to Compose+Lambda, retire generator chain walker (#190)
+│ ○  qyymyynr daniel 2026-05-11 16:42:51 175c509b Add a simple webserver source/sink (#188)
+│ ○  puvrkyoo daniel 2026-05-07 11:58:18 f19c56d8 Feed bugfixes (#185)
+│ ○  plmoknkp daniel 2026-05-06 13:08:43 ab41944c Support multiple feed calls (#183)
+│ ○  xtnmrnnm daniel 2026-05-05 14:21:45 ac15e96c Remove some dead code (#189)
+│ ○  kzpmxwlt daniel 2026-05-04 17:45:24 4e778d09 Record support in CHL (#187)
+│ ○  xtusurus daniel 2026-05-01 14:11:49 d7d3a95f Add claude instructions for editing PR descriptions (#186)
+│ ○  qsxxtsln daniel 2026-04-30 12:38:59 27dbb412 Add union types, operator, etc (#182)
+│ ○  lmwumuqx daniel 2026-04-30 12:14:06 2627202f Prototype deferred collection operators (#180)
+│ ○  loxuyruk skylar 2026-04-29 13:54:03 74c47aba add program diffing brainstorm (#179)
+│ ○  mpkqostl skylar 2026-04-29 13:35:03 86ed04ef add gh review skill (#110)
+│ ○  zvpwrptw dan 2026-04-29 11:58:11 6a3e5e22 Support user-defined function calls (#173)
+│ ○  zvvpsomn dan 2026-04-27 22:09:48 f48e0983 Replace magic-string built-ins with a typed Builtin enum (#181)
+│ ○  pkvkxrwt daniel 2026-04-27 14:53:11 34735ef4 Bind brainstorm (#178)
+│ ○  zopuqmyu dan 2026-04-27 10:02:07 52f8200e Lower generator functions (for/yield) and function definitions (#161)
+│ ○  lnqwprmx daniel 2026-04-24 16:04:40 0f2b3587 Support predicate pushdown in join planning (#175)
+│ ○  ovxkvxsn daniel 2026-04-24 15:54:43 9f02a779 Support n-way hash joins (#174)
+│ ○  zrkktxqy dan 2026-04-22 16:55:20 0f8ced0e Rename Split/Zip tile operators to FanOut/FanIn (#177)
+│ ○  wwwzxmtw dan 2026-04-22 16:18:40 436e6656 devcontainer: install git-spice and wire host GitHub/SSH auth (#176)
+│ ○  tnqzrlsu dan 2026-04-22 15:14:41 ebe74256 Support calling user-defined functions (#172)
+│ ○  ztppnkwo daniel 2026-04-22 12:12:48 8dc9c3c0 Shorten review reminder threshold (#169)
+│ ○  szppmlvv dan 2026-04-21 15:28:29 da6488b9 Guard product-eta rewrite on 2-tuple codomain (#171)
+│ ○  wvktumzl dan 2026-04-20 14:59:10 b75ae46d Add VS Code dev container (#170)
+│ ○  sktmzptn daniel 2026-04-20 12:16:03 b903595a Support logical deletes with bitsets (#167)
+│ ○  rrtoswkw daniel 2026-04-20 12:08:45 2f6c9b8f Improve source releasing (#163)
+│ ○  tkmmwsqz daniel 2026-04-20 12:02:12 a3e08388 Support interval guards in stdinreader (#166)
+│ ○  lvzxozsr daniel 2026-04-20 12:01:46 4484b51b Fix inspector colors (#168)
+│ ○  lkkupytt dan 2026-04-17 13:52:01 3ce0eccc Fix is_free_in_type to use any instead of all for Tuple/Record (#165)
+│ ○  prnsvqpm daniel 2026-04-16 23:43:14 ae3a0fa6 Release + domain predicate improvements (#162)
+│ ○  wwvxotpm daniel 2026-04-16 21:13:03 2f0b831a Fix clippy error (#164)
+│ ○  yuylzmtk daniel 2026-04-15 15:18:14 0a278be0 Add mode to MapResultToConst to zip instead of replace (#157)
+│ ○  sptroomp dan 2026-04-15 15:09:07 67d971e0 Augmented assignment lowering (#160)
+│ ○  yyunkmpl dan 2026-04-15 12:19:53 187cac49 mutability brainstorm (#152)
+│ ○  kqqrnuyt daniel 2026-04-14 12:49:25 0f4d0a05 Delete temporary compiler (#155)
+│ ○  tmszkzsy daniel 2026-04-14 12:46:22 a5440ced Add test timeouts (#159)
+│ ○  xmyuqkwl daniel 2026-04-14 12:43:15 b6b2e253 Revert "remove HashJoin and RefinementKind (#149)" (#158)
+│ ○  tqzxsstv skylar 2026-04-13 17:18:15 a2cc94bf remove HashJoin and RefinementKind (#149)
+│ ○  nnxtoyvo daniel 2026-04-13 11:12:38 bff87cb6 Update the web inspector with fancy colors (#156)
+│ ○  nuklnlum daniel 2026-04-10 11:57:50 07c5c521 Switch tests to new path (#153)
+│ ○  rpypxttp skylar 2026-04-09 17:08:45 c1797770 fix lambda binding type inference (#154)
+│ ○  nnkukrks skylar 2026-04-09 16:47:13 4fdd5815 defer early lambda typecheck (#148)
+│ ○  nxrtsqmn daniel 2026-04-09 15:37:44 49faabbf Support more complicated 2-way joins (#151)
+│ ○  qywxqwql daniel 2026-04-09 15:17:58 69007bf4 First pass of hash joins v2 (#150)
+│ ○  nzxkrrxr dan 2026-04-07 16:40:32 c200f1ef OSS strategy proposal (#147)
+│ ○  tzroxntt daniel 2026-04-07 16:09:01 28567c0b Keyed aggregates (#143)
+│ ○  lxumzxkr daniel 2026-04-03 17:45:19 9242bcef Add a typecheck helper (#146)
+│ ○  kqmpsoov daniel 2026-04-03 17:23:26 db37f59c Support global aggregates (#140)
+│ ○  okztvrvw daniel 2026-04-03 17:20:59 c9de7f1b Support sources in new compile path (#139)
+│ ○  rsxyyryt daniel 2026-04-03 17:16:40 0661338b Convert λ-free CCL to operators (#138)
+│ ○  ynkouuku skylar 2026-04-03 15:24:52 13f2a4ce Replace pre-scan param inference with unification-table approach                                                       (#145)
+│ ○  rrkyprvo skylar 2026-04-03 13:50:26 44c56957 clarify refinement semantics in ccl brainstorm (#144)
+│ ○  ozzozqws skylar 2026-04-01 12:00:31 af3835b7 Merge PartialTuple/PartialRecord in set(); accumulate TupleField constraints (#142)
+│ ○  yrzrsvyx skylar 2026-04-01 11:51:31 090f191c Add PartialTuple/PartialRecord type variants for Proj inference (#141)
+│ ○  lkvyqmmp daniel 2026-03-31 15:16:03 1ff23091 Add a fully-typed check (#137)
+│ ○  tnlolnkl daniel 2026-03-31 15:14:38 a667a776 Flatten out compose (#134)
+│ ○  mtpwstmt skylar 2026-03-31 13:00:31 c51221ea Add typechecking/compiler brainstorm doc (#129)
+│ ○  xxszlyrq skylar 2026-03-31 12:55:31 069d11f3 clarify TODOs around if/else statements vs ternary (#131)
+│ ○  vopmnwxz daniel 2026-03-30 18:18:48 22176f5f Add support for unification of structured types (#133)
+│ ○  kxpovqpk daniel 2026-03-27 13:29:14 7305c88f Consolidate e2e tests (#132)
+│ ○  zmpwsylr dan 2026-03-27 10:17:52 28788214 Lambda elimination (#124)
+│ ○  noxvtwys dan 2026-03-26 14:59:49 90b45c00 Replace TupleIndex with Proj first-class projection morphism (#123)
+│ ○  mkkntnyr daniel 2026-03-25 16:39:40 622df698 Speed up function application and converse (#130)
+│ ○  rowomnst daniel 2026-03-25 16:37:57 8650a122 Improve filtering code (#128)
+│ ○  ytlwslmo daniel 2026-03-25 15:46:35 70938680 Refactor Map* to MapN* (#126)
+│ ○  ruttxolv skylar 2026-03-25 11:39:57 a4733d2d ccl: redesign `Case` as guard-based branching and implement type inference (#125)
+│ ○  lxltqtqw daniel 2026-03-25 10:43:04 db1a504a Optimize strings and sources (#122)
+│ ○  wymqoumx daniel 2026-03-25 10:37:33 ecaf853c Make stdinreader async (#119)
+│ ○  lopltnrz daniel 2026-03-25 10:29:18 c57af4e5 Operator/Producer cleanups (#118)
+│ ○  uyqnnuul daniel 2026-03-24 17:13:01 1b84ce67 Implement Memo (#117)
+│ ○  wksowyxx skylar 2026-03-24 10:55:47 9b49d579 Complete Record type inference: infer field types instead of fresh Infer var (#121)
+│ ○  pmpswyzu skylar 2026-03-24 10:55:00 61957f16 Move BaseType definition to ccl, re-export from interpreter (#120)
+│ ○  txymnpnk skylar 2026-03-23 13:39:39 36059552 Add CCL type-check integration tests and lower improvements (#116)
+│ ○  zynzxpmu daniel 2026-03-20 17:45:02 5af11349 Couple of perf improvements (#115)
+│ ○  ynvyuyur daniel 2026-03-20 17:31:35 cd762ac3 Graphical producer rendering (#114)
+│ ○  vpwmvokx daniel 2026-03-20 15:04:57 6d0f8bb7 Implement release for aggregation (#113)
+│ ○  qyopywwm skylar 2026-03-20 12:16:44 b1336f6a UnaryOp end-to-end: lowering, inference, and compilation (#112)
+│ ○  znpvkvow skylar 2026-03-20 12:01:56 a35aebed BinOp inference rules with constrain_equal; defer Concat rewrite to compile time (#111)
+│ ○  zpysswsv daniel 2026-03-18 21:32:24 95918a69 Improve layout of LookupFunction and rename to CurriedFunction (#109)
+│ ○  pumwpxol daniel 2026-03-18 11:05:20 7c7d7cbf Delete old interpreter (#108)
+│ ○  snuvvxyz daniel 2026-03-18 10:55:32 785b8d53 Switch over to new tile operators (#107)
+│ ○  roytwzxt skylar 2026-03-18 09:49:10 1eff0fde Replace Type::Unknown with Infer/Error; add UnificationTable (#105)
+│ ○  lpwukvvn daniel 2026-03-17 14:02:19 d5c3a225 More typechecking and bugfixes for tile operators (#106)
+│ ○  ozsnkwqp skylar 2026-03-17 11:02:32 cadb3937 Wrap CCL expressions in TypedExpr single-tree representation (#104)
+│ ○  wpowqxxt daniel 2026-03-16 17:54:41 6b166011 Tile prototyping (#89)
+│ ○  xxusxumo daniel 2026-03-16 14:07:14 43928d11 Add sources to lower and inference (#102)
+│ ○  yznqkooq daniel 2026-03-13 15:25:25 abe940b9 Initial impl of Tilings and Tiles (#100)
+│ ○  osuokrnw skylar 2026-03-13 15:00:32 a01ae6e8 prevent ci running on PR desc edits (#103)
+│ ○  szkwyqmo skylar 2026-03-13 14:53:22 12a0308c Introduce TypedBinding for lambda and join params (#101)
+│ ○  ykopxyoq daniel 2026-03-13 11:10:05 c4706180 Add Display for Values and Extents (#98)
+│ ○  xyzzxkvy daniel 2026-03-12 17:22:30 0756f09f Add groupby and lambdas to lower and infer (#97)
+│ ○  nknkrtrm skylar 2026-03-11 19:31:15 6ff61e1d update claude review skill: no whitespace nits (#92)
+│ ○  rzyvksqn daniel 2026-03-11 16:27:50 f690b692 Add aggregates to lower and infer (#91)
+│ ○  kkqnlzvl dan 2026-03-11 16:21:51 5c737ac8 Add example for operational semantics (#86)
+│ ○  mnyumouv daniel 2026-03-10 15:25:59 fb98a12a Add more boolean support (#90)
+│ ○  lwvrmqmo daniel 2026-03-10 12:25:11 6b17302e Support for joins in CCL (#83)
+│ ○  oqlqkmmu skylar 2026-03-09 12:13:54 efd5e0f9 prefer RAII for ScopeStacks via scopeguard (#87)
+│ ○  wluknrzq skylar 2026-03-05 16:59:54 68a73282 add basic tuple support to CCL pipeline (#82)
+│ ○  nrynyssx skylar 2026-03-05 16:08:42 4c794b23 compile Let bindings to a dedicated Let operator  (#79)
+│ ○  pkmtypzw skylar 2026-03-05 13:29:59 e70f9661 Consolidate E2E compilation tests (#78)
+│ ○  lwutkqts skylar 2026-03-05 13:18:45 e211033f ccl LowerError -> LoweringError (#77)
+│ ○  nxyuvsxu skylar 2026-03-05 13:15:37 de1ba57a CCL → operator compile pass (#60)
+│ ○  nwyovypv dan 2026-03-05 10:19:41 f762755b Refactor operational semantics doc into focused files (#76)
+│ ○  zspxprty daniel 2026-03-04 18:46:21 c420547d First pass of hash joins (#81)
+│ ○  qzkoxpkz skylar 2026-03-03 14:33:40 0a2d7f5b review reminders: no drafts, update usermap (#75)
+│ ○  ppyymlso skylar 2026-03-03 14:32:22 10270d06 Enable unused_qualifications lint and fix violations (#70)
+│ ○  xxnqvkwz daniel 2026-03-03 12:41:18 d0a93005 Remove guards from notify (#66)
+│ ○  nznwoqyr dan 2026-03-02 18:01:55 9fdfa799 Operational semantics: tilings, guards, operators, and compaction (#54)
+│ ○  mstlqkut skylar 2026-03-02 17:34:44 1eeac8ac have klod respect git spice branch prefixes (#69)
+│ ○  zqoqrlos daniel 2026-03-02 17:27:48 8835f28c Record cleanups (#74)
+│ ○  nloqnpqw daniel 2026-03-02 17:09:59 999f1b4c Improve inspection for restrictions (#65)
+│ ○  vomypqou daniel 2026-03-02 17:05:47 9b3e751f Clean up old join code (#63)
+│ ○  yoplkwrk daniel 2026-03-02 16:54:57 40743104 Implement loop joins and restricted Extents (#59)
+│ ○  plpptklx skylar 2026-03-02 14:47:38 300f0c5f move ssh key setup to dev onboarding (#68)
+│ ○  qslmqzqp skylar 2026-03-02 14:17:39 52c8925b less verbose CI & LLM review skills (#72)
+│ ○  sysotvvy daniel 2026-02-27 14:19:27 4b940537 Basic implementation of tuples (as records) (#53)
+│ ○  rmlzxlzo skylar 2026-02-27 12:56:27 30d060a5 actions checkout needs contents permissions (#67)
+│ ○  svrpxpqt skylar 2026-02-26 21:10:20 b464e62c Document git-spice workflow options in CLAUDE.md (#62)
+│ ○  kpmypwlq skylar 2026-02-26 16:06:24 8d996c3d have klod update docs when planning (#58)
+│ ○  zsmxmlyr skylar 2026-02-26 11:26:57 95f58783 add symbolic representation for CCL (#57)
+│ ○  nxnrzxnl skylar 2026-02-26 10:24:59 edb8183b first pass of CCL lowering & pretty nodes (#56)
+│ ○  txqvvryx skylar 2026-02-26 10:23:26 e42f00aa First pass of CCL nodes (#55)
+│ ○  syxmkpry daniel 2026-02-25 18:05:28 fe534123 Support more binops and optimize vectorization (#51)
+│ ○  omvovvkp skylar 2026-02-25 12:41:26 a4204f73 add function operators to latex (#52)
+│ ○  slzxxpvz dan 2026-02-21 23:08:44 88ad5d7d Docs refactor: reorganize design docs, add op-sem foundation (#47)
+│ ○  urvnqwns skylar 2026-02-20 17:16:04 3cee3efc add operator graph viz (#40)
+│ ○  pvzkowkv dan 2026-02-20 17:10:23 63da79dd Add bash-approval hook and git-spice workflow docs (#48)
+│ ○  ozzmtlul skylar 2026-02-20 14:47:59 daa8e0ec extract closures from lambdaproducer (#49)
+│ ○  szqpyoun skylar 2026-02-19 18:51:26 6746a4f2 fix permissions on PR reminder workflow (#50)
+│ ○  yvoprqlu daniel 2026-02-19 17:01:33 59d494ea Fix type+scope handling in lowering (#45)
+│ ○  ommuwmss daniel 2026-02-19 16:59:55 356168cb Refactor ColumnValue for better columnarization (#44)
+│ ○  vqqlrszt daniel 2026-02-19 16:52:37 ce5f5e2e Add a test source (#42)
+│ ○  lxmlqyzt skylar 2026-02-19 16:02:40 d7929aad Add lowering loops brainstorm chickenscratch (#41)
+│ ○  qqwqrtrw dan 2026-02-19 15:19:30 3dcfaca4 Rename VarSource variants: Bound->Argument, Scanning->Iteration (#37)
+│ ○  skuuuowm daniel 2026-02-19 13:09:48 057604da Add a simple webserver for inspecting the state of the program (#36)
+│ ○  knkkvrwy daniel 2026-02-19 12:41:45 c030f02b ColumnValue refactor brainstorm (#43)
+│ ○  olooslvs dan 2026-02-18 22:51:42 9bf6d59f Update Claude settings and dev docs (#39)
+│ ○  unrotlwl daniel 2026-02-18 22:33:05 901eb5e3 Add stdin support (#33)
+│ ○  zuqlmktx daniel 2026-02-18 11:02:31 3955e2a8 Add support for scalars and binops inside list comps (#31)
+│ ○  ynuqwqwp daniel 2026-02-17 15:42:45 801ee984 First pass of list comprehension support (#30)
+│ ○  rypsxylq skylar 2026-02-17 12:57:10 6cc1c3c5 update claude comments and git settings (#38)
+│ ○  qlulqtln dan 2026-02-16 18:47:34 7157447d fix CI: clean rustpython-parser to avoid stale cache (#34)
+│ ○  vwuqvvkp dan 2026-02-16 18:47:13 85007d87 Remove Co-Authored-By from commit messages (#11)
+│ ○  kyxqrnyn skylar 2026-02-16 18:20:19 bbb8fe45 refactor consumer/producer notification protocol (#32)
+│ ○  uqxkyzno skylar 2026-02-13 15:11:59 c2218907 add new dev setup checklist (#29)
+│ ○  kxvzkzlw skylar 2026-02-11 17:25:08 a2b835e9 expand listcmp in pretty ast (#28)
+│ ○  kuwpnmso skylar 2026-02-10 21:53:20 979ce66f split interpreter into module files (#27)
+│ ○  yoqypumq skylar 2026-02-10 20:33:21 c0cd645e implement binop lowering (#20)
+│ ○  omtrwtyv skylar 2026-02-10 20:26:00 6bf9af18 wip add pretty AST printing (#23)
+│ ○  pooryury skylar 2026-02-10 15:20:26 ac88f388 add --fix flag to autoformat ci (#25)
+│ ○  pvosnnrz skylar 2026-02-10 12:56:01 9c8e4e70 Rc VarScope and remove Clone Trait (#24)
+│ ○  lpmkvqtw daniel 2026-02-09 22:27:36 5c4ff8a0 Prototype support for variable assignment in lowering (#22)
+│ ○  lvvlrwpt skylar 2026-02-09 19:24:31 79e08f30 add shellcheck to ci (#21)
+│ ○  roqvrtkq daniel 2026-02-09 15:50:38 c4e6fca0 Pass strings by slice (#19)
+│ ○  mutksmpu daniel 2026-02-09 15:24:08 e6ab0482 Add more Debug types (#18)
+│ ○  vpxvuroq skylar 2026-02-09 15:18:33 51be2332 Add literal lowering and scaffolding (#17)
+│ ○  pzqntwst daniel 2026-02-09 13:39:50 1db7a501 Fix some .md lists (#16)
+│ ○  oxuommwq skylar 2026-02-09 13:21:01 203ed147 send CI failure notifications to #code (#13)
+│ ○  srkrwupo skylar 2026-02-09 13:09:08 16b113ae add code review reminders workflows (#12)
+│ ○  nkumrqus skylar 2026-02-06 21:19:54 2b470442 add git-spice branch prefix (#15)
+│ ○  ksotsmmt skylar 2026-02-06 15:30:25 089df5ea add pyast claude skill for reference (#14)
+│ ○  nzszzyty skylar 2026-02-05 15:20:31 33b088c1 add codeowners for auto-assignment (#10)
+│ ○  ktnmyprz skylar 2026-02-05 14:46:33 ba74ce87 Add github actions with cargo and clippy (#9)
+│ ○  xspnysws skylar 2026-02-05 14:26:30 ed78e730 fix clippy errors (#8)
+│ ○  rwszrlmv skylar 2026-02-05 11:56:17 a407cb90 add `log -a` option to gts cheatsheet (#6)
+│ ○  rxltpokv skylar 2026-02-05 11:55:54 dff23637 skylar/fix_VarRef_borrow (#7)
+│ ○  kmtqylpq skylar 2026-02-05 09:50:38 dfd575c6 add git-spice cheatsheat (#5)
+│ ○  xpqpnvlo skylar 2026-02-03 15:00:41 3aa1e28b add new repo checklist (#3)
+│ ○  sszpzyum scook90 2026-02-03 14:56:27 e8c4bbf3 Name change: pototo -> cambra (#2)
+│ ○  zlwzzumq scook90 2026-02-03 14:53:45 9e85d485 mirror from potatoes (#1)
+│ ○  rorrvusz scook90 2026-02-03 13:31:35 9314b221 (empty) Initial commit
+├─╯
+◆  zzzzzzzz root() 00000000
