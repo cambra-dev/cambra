@@ -2,8 +2,8 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, FunKind, Lit, Name, ProjKey, TagMap,
-        TransactKey, Type, TypedExprNode, V_COMMIT, WriterSite,
+        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
+        Type, TypedExprNode, V_COMMIT, WriterSite,
         ccl_utils::strip_refinements,
         ccl_utils::{free_names, is_trivially_true_predicate},
         content_hash::{ContentHash, content_hash},
@@ -2160,15 +2160,14 @@ fn convert_impl_inner(
         }
 
         TypedExprNode::Apply { argument, function } => {
-            // An `Apply` that *denotes* a collection is a value, not a combinator, so
-            // an input reaching it is a domain to look the collection up at rather
-            // than a stage to thread through it. That is the rule a free
-            // [`TypedExprNode::Var`] already follows below, and a projection out of a
-            // product is the other term that denotes one: a filter plans as
-            // `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠`, naming its source twice, and the
-            // second occurrence is the composition stage this answers for.
+            // An `Apply` whose type is a collection sits in function position as a free
+            // [`TypedExprNode::Var`] does below, whatever its function: an input reaching it
+            // is a domain to look the collection up at, `λ 𝑥 → (arg ▷ f)(𝑥)`. A filter over a
+            // product's component plans as `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠` with `𝑠` such an
+            // `Apply`, and its second `𝑠` reaches here. An input reaching any other `Apply`
+            // is an iteration planning left out.
             if let Some(input) = input {
-                if !is_function(&expr.ty) {
+                if !expr.ty.is_collection() {
                     return Err(ConversionError::Unsupported(format!(
                         "Only higher-order combinators (map, const, zip) can take an input \
                          operator; found input for non-combinator {}",
@@ -2447,24 +2446,21 @@ fn convert_impl_inner(
         // `Tuple` appears as the argument of a non-Zip Apply (e.g.
         // `Apply(Tuple([acc, i]), Builtin(BinOp(Add)))` after lambda-elim of
         // `acc + i`). Each component compiles as the term it is, and
-        // [`build_product`] reads off the node's type whether they are a value's
-        // components or a morphism's.
+        // [`build_product`] assembles them by the node's extent.
         TypedExprNode::Tuple(elts) => {
             expect_no_input(input, "tuple literal")?;
             let ops: Result<Vec<_>, _> = elts
                 .iter()
                 .map(|elt| convert_impl(elt, None, ctx))
                 .collect();
-            let product = build_product(
+            build_product(
                 ops?.into_iter()
                     .enumerate()
                     .map(|(i, op)| (tuple_field(i), op))
                     .collect(),
                 expr,
                 ctx,
-            )?;
-            debug_assert_product_shape(&*product, expr, ctx);
-            Ok(product)
+            )
         }
 
         TypedExprNode::Record(fields) => {
@@ -2473,9 +2469,7 @@ fn convert_impl_inner(
                 .iter()
                 .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
                 .collect();
-            let product = build_product(ops?, expr, ctx)?;
-            debug_assert_product_shape(&*product, expr, ctx);
-            Ok(product)
+            build_product(ops?, expr, ctx)
         }
 
         // Literal constant: produce a scalar.
@@ -2648,28 +2642,6 @@ fn zip_ambient<'a>(input_levels: usize, arms: impl Iterator<Item = &'a Tiling>) 
     arms.map(level_count).fold(input_levels, usize::min)
 }
 
-/// Check that the operator built for a value-position product has that
-/// product's own shape.
-///
-/// The two disagree when a product of collections is assembled by the
-/// combinator that zips them: `(D ⤇ A, D ⤇ B)` comes out as `D ⤇ (A, B)`, a
-/// collection of products where the node's type is a product of collections.
-/// Nothing else relates an operator to the type of the node it was built for, so
-/// the swap is otherwise silent until the components' domains differ and the
-/// zip's shared-domain assertion fires somewhere else entirely.
-fn debug_assert_product_shape(op: &dyn TileOperator, expr: &Expr, ctx: &OpConversionContext) {
-    let Ok(want) = ctx.extent_of(&expr.ty) else {
-        return;
-    };
-    let got = op.tiling().extent();
-    debug_assert!(
-        extent_shapes_agree(&got, &want),
-        "a product value compiles to its own shape, but {} came out at {got} where its \
-         type is {want}",
-        symbolic(expr),
-    );
-}
-
 /// Whether two extents have the same constructor skeleton.
 ///
 /// Coarser than equality in the two ways an operator's extent legitimately
@@ -2707,47 +2679,37 @@ fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
     }
 }
 
-/// Is `ty` a collection — something the runtime sweeps — rather than a capability?
+/// Assemble a product from its compiled components, by the node's own extent.
 ///
-/// [`FunKind`] is the whole test: both tile at an [`Extent::Function`], and a `Data`
-/// domain is the one that is swept. A refinement is a fact about the value rather
-/// than a different shape, so it peels first — a filtered collection is a collection.
-fn is_function(ty: &Type) -> bool {
-    matches!(
-        ty.peel_refinements(),
-        Type::Fun {
-            fun_kind: FunKind::Data(..),
-            ..
-        }
-    )
-}
-
-/// Assemble a product from its compiled components.
+/// A record extent is built by [`MakeRecord`] (`src/interpreter/design-operators.md`, "A
+/// product value is a record of tiles"). A function extent `𝐷 ⤇ {…}` is a collection of
+/// records, such as `Tuple([acc, i])` under a binop, which [`zip_arms_named_at`] pairs over
+/// the ambient iteration. Both arrive as the same node with the same operands, so the
+/// extent is the only thing that separates them.
 ///
-/// Two different things wear the `Tuple`/`Record` node. A product **value** is a
-/// record of tiles, which [`MakeRecord`] builds. A product **morphism** —
-/// `Tuple([acc, i])` under a binop — is a pointwise pairing over the ambient
-/// iteration, which [`zip_arms`] builds.
-///
-/// The node's own type tells them apart, and nothing else can: both arrive as the
-/// same node with the same number of operands, and a value whose components happen
-/// to share a domain is still a value. A value's extent is a record; a morphism's is
-/// a function, and [`debug_assert_product_shape`] checks the choice against it.
-/// Reasoning: `src/interpreter/design-operators.md`, "A product value is a record of
-/// tiles".
+/// The built operator's extent is checked against the node's, and a disagreement is a
+/// [`ConversionError::TypeError`]. Function-tiled components under a record extent would
+/// otherwise build a record of collections where the consumer reads a collection of records.
 fn build_product(
     components: Vec<(String, Box<dyn TileOperator>)>,
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    if matches!(ctx.extent_of(&expr.ty)?, Extent::Record(_)) {
-        return Ok(Box::new(MakeRecord::new_named(components)));
+    let want = ctx.extent_of(&expr.ty)?;
+    let product: Box<dyn TileOperator> = if matches!(want, Extent::Record(_)) {
+        Box::new(MakeRecord::new_named(components))
+    } else {
+        let ambient = leaf_ambient(components.iter().map(|(_, op)| op.tiling()));
+        zip_arms_named_at(components, ambient)
+    };
+    let got = product.tiling().extent();
+    if !extent_shapes_agree(&got, &want) {
+        return Err(ConversionError::TypeError(format!(
+            "the product {} compiled to {got}, but its type's extent is {want}",
+            symbolic(expr),
+        )));
     }
-    // A morphism's components each carry the iteration they were compiled over, and there
-    // is no input here to read it off, so it is theirs, and they must agree on it. A component that *is* a collection takes the value branch above, so what
-    // reaches here nests alike.
-    let ambient = leaf_ambient(components.iter().map(|(_, op)| op.tiling()));
-    Ok(zip_arms_named_at(components, ambient))
+    Ok(product)
 }
 
 /// The ambient iteration a product's **leaf** components stand over.
@@ -4368,28 +4330,19 @@ fn convert_store_read(
     }
 }
 
-/// Whether projecting `name` out of `input` is a **tile** operation.
+/// Whether projecting `name` out of `input` is a [`SelectField`] rather than the
+/// `RecordField` application.
 ///
-/// A bare product is a record of tiles, so every field of it is one. Under a collection the
-/// record's fields share their levels, so a release naming one cannot be expressed at the
-/// input — which is why only the field the other projection *cannot* carry goes this way: a
-/// collection-valued field, which a column has nowhere to put but a boxed cell.
+/// Every field of a bare product is a tile. Under a collection the record's fields share its
+/// levels, and a release naming keys of one cannot reach the input ([`SelectField`]), so the
+/// application keeps every record it can box into a column. A record holding a level is one
+/// it cannot, and then every field of it goes this way.
 fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
-    fn holds_a_collection(tiling: &Tiling) -> bool {
-        match tiling {
-            Tiling::DataFunction { .. } => true,
-            Tiling::Record(fields) => fields.values().any(holds_a_collection),
-            _ => false,
-        }
-    }
     match tiling {
-        Tiling::Record(_) => true,
-        // Every field of such a record, not just the collection-valued one: boxing the
-        // record back into a column is what the other projection does, and a column has
-        // nowhere to put a level.
+        Tiling::Record(fields) => fields.contains_key(name),
         _ => matches!(
             tiling.deepest_values(),
-            Tiling::Record(fields) if fields.contains_key(name) && fields.values().any(holds_a_collection)
+            Tiling::Record(fields) if fields.contains_key(name) && fields.values().any(Tiling::holds_a_level)
         ),
     }
 }
@@ -4402,7 +4355,6 @@ fn proj_field(
     n: usize,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let field_name = tuple_field(n);
-    // A tuple value is a product value; see [`proj_named_field`].
     if selects_a_tile(input.tiling(), &field_name) {
         return Ok(Box::new(SelectField::new(input, field_name)));
     }
@@ -4471,11 +4423,6 @@ fn proj_named_field(
     input: Box<dyn TileOperator>,
     name: &str,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    // A product **value** tiles as a record of tiles, so its field is one of those tiles
-    // and selecting it is a tile operation — at whatever depth the record sits, because a
-    // collection of products is one product per key. The application below is the *other*
-    // projection: it reads a record one row at a time, which a record holding a collection
-    // cannot supply, since a column holds one value per row.
     if selects_a_tile(input.tiling(), name) {
         return Ok(Box::new(SelectField::new(input, name)));
     }

@@ -165,7 +165,7 @@ pub(crate) fn make_int_list(v: &[i64]) -> Tile {
 }
 
 /// A **materialized** collection value: the whole `key ↦ value` table in one
-/// cell, which is how a product value holds a collection-valued component.
+/// cell.
 pub(crate) fn make_collection(bindings: &[(Value, Value)]) -> Value {
     Value::Function(
         bindings
@@ -194,7 +194,7 @@ pub(crate) fn make_int_collection(v: &[i64]) -> Value {
 ///
 /// [`Value::Function`] compares its binding list positionally while a
 /// collection's iteration order is unspecified ([`docs/chl-spec.md`](../../docs/chl-spec.md),
-/// "3. Expressions"), so a comparison of two tables normalizes first. Keys that
+/// "3. Expression semantics"), so a comparison of two tables normalizes first. Keys that
 /// no total order covers keep their delivery order.
 pub(crate) fn sort_collection_bindings(value: Value) -> Value {
     match value {

@@ -298,8 +298,7 @@ fn test_conditional_arms_at_different_record_widths(#[case] code: &str, #[case] 
 // Products holding a collection
 // ---------------------------------------------------------------------------
 
-/// A product value holds each component as the tile its own term produced, so a
-/// collection component stays a sealed function and `SelectField` hands it back.
+/// A collection component is handed back by `SelectField` as the collection it is.
 ///
 /// The components' domains are unrelated, which is what separates a product of
 /// collections from a collection of products: assembling one as the other needs
@@ -333,10 +332,8 @@ fn test_scalar_component_beside_a_collection(#[case] code: &str, #[case] expecte
     check_scalar(code, expected);
 }
 
-/// The whole product value: a record of tiles, each component keeping the tiling
-/// its own term produced. The two collections keep their own domains — `a` holds
-/// two elements where `b` holds three — which is what a product of collections is
-/// and a collection of products cannot be.
+/// The whole product value. `a` holds two elements where `b` holds three, which a
+/// product of collections can and a collection of products cannot.
 #[test]
 fn test_product_of_collections_is_a_record_of_tables() {
     check_collection_tile(
@@ -405,9 +402,7 @@ fn test_computed_collection_component(#[case] code: &str, #[case] expected: Valu
 }
 
 /// A partition is a component like any other. Every key of one holds a further
-/// collection, so it tiles as a curried function rather than a sealed one — and a
-/// component keeps the tiling its own term produced, so there is nothing here to
-/// flatten and nothing to reject.
+/// collection, so it tiles as two levels, and the component keeps both.
 ///
 /// Held rather than read back: reading a partition's entries takes
 /// `for k -> v in g`, which this version does not lower. What is pinned is that
@@ -422,7 +417,7 @@ fn a_partition_is_a_product_component_like_any_other(#[case] code: &str, #[case]
 
 /// A `let`-bound partition held as a component reaches a `subst` defect.
 ///
-/// The inline case above compiles, so a product can hold a curried function. What
+/// The inline case above compiles, so a product can hold a two-level collection. What
 /// this one trips is the key binder `groupby` mints, which `subst` reports as
 /// escaping its scope when the `let` is substituted through — a defect in
 /// substitution rather than in how a product holds a component.
@@ -442,8 +437,7 @@ fn a_let_bound_partition_component_reaches_a_subst_defect() {
 /// filtered from: index `2` survives `y > 2` and indices `0` and `1` do not, so the
 /// field's tile is keyed by `2` alone.
 ///
-/// The component's tiling is its own, so a sparse domain travels as a sparse
-/// domain. Boxed into a cell it would have to be read back out against something,
+/// Boxed into a cell, the collection would have to be read back out against something,
 /// and the extent is the only thing available to read it against — which would ask
 /// for keys this collection does not bind.
 #[test]
@@ -475,9 +469,8 @@ fn test_a_filtered_component_keeps_the_domain_it_binds() {
 /// A filter plans as `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠`, naming its source twice:
 /// once inside the predicate and once as the composition stage that reads the
 /// surviving domain. That second occurrence puts the projection in function
-/// position with an input, where a map leaves it at the head with none. A
-/// projection denotes a collection rather than transforming one, so it answers an
-/// input the way a free `Var` does — by looking the collection up at each position.
+/// position with an input, where a map leaves it at the head with none, and
+/// op-conversion's `Apply` arm answers the input by looking the collection up.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::record(
@@ -512,4 +505,27 @@ fn test_a_filtered_component_keeps_the_domain_it_binds() {
 )]
 fn test_filter_over_a_projected_component(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// A record built per element with a collection component does not compile yet.
+///
+/// A product value holds a collection, but a record inside a comprehension's body is a
+/// component per element. A constant list component there reaches op-conversion with no
+/// iteration planned for it.
+///
+/// Pinned rather than ignored, so the error it reaches is a ledger entry: whoever fixes
+/// it sees this case turn from a pinned panic into a passing one.
+#[test]
+#[should_panic(expected = "list literal reached op-conversion without an input")]
+fn a_per_element_record_holding_a_list_literal_is_not_yet_planned() {
+    run_pipeline("xs = [1, 2]; ys = [(a=l, b=[1, 2]) for l in xs]; ys");
+}
+
+/// A record built per element whose collection component reads the element fails the
+/// type check after `lambda_elim`, on the lowered component `[id, id]`. Pinned for the
+/// reason [`a_per_element_record_holding_a_list_literal_is_not_yet_planned`] gives.
+#[test]
+#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
+fn a_per_element_record_holding_a_computed_list_fails_the_post_lambda_elim_check() {
+    run_pipeline("xs = [1, 2]; ys = [(a=x, b=[x, x]) for x in xs]; ys");
 }

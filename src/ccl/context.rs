@@ -1904,9 +1904,9 @@ fn run_passes(
     // reachable.
     expr = recorded(capture_provenance, Phase::Transact, || {
         let mut expr = expr;
-        // A mutable variable's seed enters the value type its binder declares — a concrete
-        // collection reaches an abstract one only through an introduction.
-        mut_elim::view_seeds_at_value_type(&mut expr);
+        // A mutable variable's seed and writes enter the value type its binder declares — a
+        // concrete collection reaches an abstract one only through an introduction.
+        mut_elim::view_values_at_value_type(&mut expr);
         // `m[k] := v` becomes the whole-value write it denotes, `m := insert(m, k, v)`, so
         // every phase below sees one kind of `MutWrite` and none of them needs a key.
         mut_elim::desugar_keyed_writes(&mut expr);

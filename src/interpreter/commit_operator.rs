@@ -58,7 +58,8 @@ use crate::pretty_tree::InspectNode;
 
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
 use crate::interpreter::tile_operators::{
-    OperatorBase, impl_operator_base, impl_producer_base, open_row_collections,
+    OperatorBase, impl_operator_base, impl_producer_base, materialize_collections,
+    open_row_collections,
 };
 
 /// A commit timestamp — a position on the runtime's monotonic commit clock.
@@ -347,7 +348,6 @@ fn read_initial_scalar(
     producer: &mut dyn TileProducer,
     scheduler: &mut Scheduler,
 ) -> Result<Value, InitDrainFailure> {
-    use crate::interpreter::tile_operators::try_scalar_tile_to_column_value;
     let guard = producer.tiling().universal_guard();
     let mut saw_empty_scalar = false;
     for pull in 0..MAX_INIT_PULLS {
@@ -359,11 +359,9 @@ fn read_initial_scalar(
         // like any scalar. A plain scalar init passes straight through.
         let cv = match producer.get(guard.clone()) {
             Tile::Scalar(cv) => cv,
-            // A field that is not itself scalar — a collection held in the record — is a
-            // seed shape no store takes. Reported as a failure to settle rather than
-            // panicked on: this runs after `tear_down()`, so an abort here leaves no
-            // running program to keep serving.
-            tile @ Tile::Record(_) => match try_scalar_tile_to_column_value(tile) {
+            // A field holding a collection as a level materializes into the record value
+            // once the level is decided ([`decided_seed_column`]).
+            tile @ Tile::Record(_) => match decided_seed_column(tile) {
                 Some(cv) => cv,
                 None => continue,
             },
@@ -390,15 +388,10 @@ fn read_initial_scalar(
                 // or struct-of-arrays as a `Tile::Record`. Which one depends on what
                 // computed the seed — a value carried whole keeps the boxed form it was
                 // stored in, and a comprehension over that value builds each field
-                // separately. `try_scalar_tile_to_column_value` normalizes both, as it does for
-                // the non-keyed init above.
-                let values = match *codomain {
-                    Tile::Scalar(values) => values,
-                    tile @ Tile::Record(_) => match try_scalar_tile_to_column_value(tile) {
-                        Some(values) => values,
-                        None => continue,
-                    },
-                    _ => continue,
+                // separately. [`decided_seed_column`] normalizes both, as it does for the
+                // non-keyed init above, and materializes values that hold a level.
+                let Some(values) = decided_seed_column(*codomain) else {
+                    continue;
                 };
                 let map: HashMap<Value, Value> = (0..domain.len())
                     .map(|i| (domain.index_at(i), values.index_at(i)))
@@ -419,6 +412,25 @@ fn read_initial_scalar(
     } else {
         InitDrainFailure::Diverged
     })
+}
+
+/// A seed tile's values as one column: a scalar, a record of scalars, or a tile holding a
+/// collection as a level, materialized ([`materialize_collections`]) once each collection is
+/// decided. Completeness is downward-closed, so a collection decided at its outermost level
+/// is decided beneath. `None` while one is undecided, since materializing it then would
+/// present the keys that have arrived as the whole collection.
+fn decided_seed_column(tile: Tile) -> Option<ColumnValue> {
+    fn decided(tile: &Tile) -> bool {
+        match tile {
+            Tile::Scalar(_) => true,
+            Tile::Record(fields) => fields.values().all(decided),
+            Tile::DataFunction {
+                domain_predicate, ..
+            } => matches!(domain_predicate, Predicate::True),
+            Tile::Aggregation { .. } | Tile::Store { .. } => false,
+        }
+    }
+    decided(&tile).then(|| materialize_collections(tile))
 }
 
 /// Pull bound for [`read_initial_scalar`]: an acyclic scalar init resolves on the
@@ -2242,7 +2254,7 @@ pub struct AsOfField {
     pub value_extent: Extent,
 }
 
-/// One snapshot field's tile, matching the [`Tiling::with_levels`] its tiling is: a
+/// One snapshot field's tile, in the form [`Tiling::from_extent`] gives its extent: a
 /// collection-valued field opens each row's map into that row's group.
 fn field_tile(value_extent: &Extent, values: Vec<Value>) -> Tile {
     match value_extent {
@@ -2280,14 +2292,12 @@ impl AsOfOutput {
     fn codomain_tiling(&self) -> Tiling {
         match self {
             AsOfOutput::Scalar { value_extent, .. } => Tiling::Scalar(value_extent.clone()),
-            // A collection-valued field is a **level**, not a cell. A record field is a
-            // column only where its value is one; a component that carries a collection
-            // keeps its own tiling, which is what lets a consumer fold its elements
-            // without anything opening the cell first.
+            // A collection-valued field stays a tile (`src/interpreter/design-operators.md`,
+            // "A collection inside a value stays a tile").
             AsOfOutput::Record { fields } => Tiling::Record(
                 fields
                     .iter()
-                    .map(|f| (f.field.clone(), Tiling::with_levels(&f.value_extent)))
+                    .map(|f| (f.field.clone(), Tiling::from_extent(&f.value_extent)))
                     .collect(),
             ),
         }

@@ -50,13 +50,12 @@ impl MapResult {
         };
 
         let input_tiling = input.tiling();
-        // A function applied to an argument carrying a **level** yields its codomain with
-        // that codomain's own collections as levels too: the argument could not have been
-        // boxed into a column, and neither can the result, so the two are read the same way
-        // ([`Tiling::with_levels`]). A function's type says only its codomain extent, which
-        // cannot draw that distinction on its own.
-        let fn_result = if input_tiling.deepest_values().has_a_level() {
-            Tiling::with_levels(&fn_result.extent())
+        // A function applied to an argument holding a collection as a tile yields its
+        // codomain's collections as tiles too ([`Tiling::from_extent`]): the argument could
+        // not have been boxed into a column, and neither can the result. A function's type
+        // says only its codomain extent, which cannot draw that distinction on its own.
+        let fn_result = if input_tiling.deepest_values().holds_a_level() {
+            Tiling::from_extent(&fn_result.extent())
         } else {
             fn_result
         };
@@ -587,8 +586,8 @@ impl TileProducer for MapResultToConstProducer {
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
-            c_tiling.is_scalar(),
-            "MapResultToConst expected scalar tiling, Got {c_tiling:?}"
+            !matches!(c_tiling, Tiling::Aggregation { .. } | Tiling::Store { .. }),
+            "MapResultToConst broadcasts a value, got {c_tiling:?}"
         );
         let i_tiling = self.input.tiling().clone();
         let input_guard = match projection_guard {

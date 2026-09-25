@@ -14,12 +14,11 @@ use crate::interpreter::{
     ColumnValue, Extent, FuncBinding, Value, bindings_are_list, transform_hashmap_values,
 };
 
-/// A column of **materialized** collection values, opened into a level over the rows that
-/// hold them.
+/// A column of map values, one per row, as the tile those collections form
+/// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
 ///
-/// A store holds one value per key per tick, so a collection-valued variable is a map in a
-/// cell. Handing its keys out as a level is what lets a consumer fold the elements directly,
-/// rather than reading a column of maps that something downstream has to open first.
+/// A store holds one value per key per tick, so a collection-valued variable is read out of
+/// it as a column of maps.
 ///
 /// Keys are sorted within each row, which is the invariant
 /// [`Tile::DataFunction`](crate::interpreter::Tile::DataFunction) states of its `keys`.
@@ -57,11 +56,12 @@ pub(crate) fn open_row_collections(
     )
 }
 
-/// Repeat a scalar or record-of-scalars tile `len` times along the domain axis.
+/// Repeat a whole value's tile `len` times along the domain axis.
 ///
 /// Used by [`MapResultToConstProducer`] to broadcast a constant value across all
 /// domain elements: `Tile::Scalar(cv)` → `Tile::Scalar(cv.repeat(len))`;
-/// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`.
+/// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`; a collection, one row
+/// holding its keys, → one group per element, each a copy of that row's.
 pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
     match tile {
         Tile::Scalar(cv) => Tile::Scalar(cv.repeat(len)),
@@ -70,6 +70,14 @@ pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
                 .map(|(k, t)| (k, repeat_tile(t, len)))
                 .collect(),
         ),
+        collection @ Tile::DataFunction { .. } => {
+            assert_eq!(
+                collection.rows(),
+                1,
+                "a broadcast collection is one whole value, its one row's group"
+            );
+            collection.select_rows(&vec![0; len])
+        }
         other => panic!("repeat_tile: unsupported tile shape {other:?}"),
     }
 }
@@ -154,14 +162,13 @@ pub(crate) fn apply_function_tile(
         tile => panic!("apply_function_tile: not a function tile: {tile:?}"),
     }
 }
-/// A tile as a column, turning each collection it holds into one map value per row.
+/// A tile as a column, turning each collection it holds into one map value per row, for the
+/// places one value is required: a variant's payload rides its arm as one, and a store write
+/// is one value per key. The inverse of [`open_row_collections`].
 ///
-/// The inverse of the opening a producer does when it hands a collection out as a level, for
-/// the places a **value** is what is wanted rather than something to iterate: a variant's
-/// payload rides its arm as one, and a store write is one value per key. Distinct from
-/// [`scalar_tile_to_column_value`], which refuses a level — boxing one is a defect wherever
-/// the tile path was the point, so the two are separate functions rather than one that
-/// always obliges.
+/// Distinct from [`scalar_tile_to_column_value`], which refuses a collection held as a tile:
+/// boxing one is a defect wherever the tile was the point, so the two are separate functions
+/// rather than one that always obliges.
 pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
     match tile {
         Tile::Scalar(cv) => cv,

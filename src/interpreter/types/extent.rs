@@ -86,11 +86,8 @@ pub struct NotifyOrSubscribeResult {
 }
 
 impl Extent {
-    /// Whether a collection sits anywhere inside this extent.
-    ///
-    /// The question a producer asks before putting a value of this extent in a column: a
-    /// column holds one value per row, so a collection inside one is materialized into a
-    /// cell rather than carried as a level.
+    /// Whether a collection sits anywhere inside this extent, however a tile holds it
+    /// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
     pub fn holds_a_collection(&self) -> bool {
         match self {
             Extent::Function { .. } => true,

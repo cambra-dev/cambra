@@ -771,11 +771,8 @@ fn test_incremental_aggregates() {
 /// A collection component of a product value, read from a **data source** rather
 /// than written out as a literal.
 ///
-/// The component keeps its own tiling, so what the product holds is the source's
-/// own sealed function and a projection reads what the source delivered. Covered
-/// here rather than beside the literal cases in `records.rs` because a literal's
-/// table is built at compile time, so those never exercise a component whose rows
-/// arrive over time.
+/// A literal's table is built at compile time, so the cases in `records.rs` never
+/// exercise a component whose rows arrive over time.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::projected_and_summed("r = (n=1, xs=source1()); sum(r.xs)", 30)]
@@ -816,13 +813,9 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
 }
 
 /// A collection component **grows**: rows reach it as the source delivers them,
-/// and the field settles when the source does.
-///
-/// This is what holding the component as a tile buys. A `Tile::DataFunction`
-/// merges by appending its domain and unioning its domain predicate, which is a
-/// collection arriving in pieces; boxed into one cell it would merge the way every
-/// `Tile::Scalar` does, by appending the column, so the deliveries below would land
-/// as three cells rather than one growing table.
+/// and the field settles when the source does (`src/interpreter/design-operators.md`,
+/// "A product value is a record of tiles"). Boxed into a cell, the deliveries below
+/// would land as three cells rather than one growing table.
 ///
 /// The bare source is pulled alongside as the control: a component answers what
 /// the collection answers, at every pull rather than only at the last.
@@ -894,11 +887,8 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
 /// released does not come back.
 ///
 /// A release travels to the product through the [`FanOut`] a `let` binding wraps
-/// it in, which accumulates each subscriber's guard by union. Two releases of one
-/// field are two record guards, and their union is the record guard naming that
-/// field's two regions — a shape the product can forward to the operand that owns
-/// the field. An `Or` of the two would name the field twice and reach nobody, and
-/// the product would reject it.
+/// it in, which accumulates each subscriber's guard by union, so two releases of one
+/// field reach the product as one record guard (`TileGuard::union`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::component("r = (n=1, xs=source1()); r.xs")]

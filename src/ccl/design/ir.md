@@ -178,11 +178,20 @@ Op-conversion accordingly compiles a fed union as a flat merge — a disjoint jo
 
 ### The program's outputs are a trailing `Record`
 
-A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at the tail of the root `Let*` chain so each output is in scope of the bindings above it. The node is an ordinary `Record`, the same one a program whose trailing expression is a record literal ends in.
+A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at
+the tail of the root `Let*` chain so each output is in scope of the bindings above it. The node is
+an ordinary `Record`, the same one a program whose trailing expression is a record literal ends
+in.
 
-Lowering appends it as the body of an `ExprStmt` whose effect is the program's own trailing expression, and `channelize` collapses that `ExprStmt` to its body (`drop_expr_stmts`). A sink program's trailing expression is therefore dropped, and the `Record` is what sits at the tail. Which conversion entry point runs is read off the sink registry, the same fact lowering read when it decided to append a `Record` at all.
+Lowering appends it as the body of an `ExprStmt` whose effect is the program's own trailing
+expression, and `channelize` collapses that `ExprStmt` to its body (`drop_expr_stmts`). A sink
+program's trailing expression is therefore dropped, and the `Record` is what sits at the tail.
+Which conversion entry point runs is read off the sink registry, the same fact lowering read when
+it decided to append a `Record` at all.
 
-An output is an iteration site exactly when it holds a collection, the rule a product value's components already follow (`planning::iterate`'s `mark_component_source`): an output is compiled with no input, and so is a component, and a collection needs the iteration a collection needs. A pure program has one output and no `Record` — its trailing expression is that output.
+An output is an iteration site by the rule a product's components follow
+(`planning::iterate`'s `mark_component_source`). A pure program has one output and no `Record`:
+its trailing expression is that output.
 
 ### `Transact` — the domain-parameterized recurrence carrier
 

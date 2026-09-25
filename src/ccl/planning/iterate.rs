@@ -105,15 +105,13 @@ pub(super) fn insert_iterate_recurse(
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
     // A list literal's elements are **values**: op-conversion evaluates each with
-    // `expr_to_value` and compiles none of them, so nothing inside one is an
-    // iteration site. A collection-valued element is the case that shows it — the
-    // element is a table written down, and a table written down is what a constant
-    // already is. Marking it would leave `iterate ≫ […]` where a value belongs, and
-    // constant evaluation would report a computation it cannot reduce.
+    // `expr_to_value` and compiles none of them, so nothing inside one is an iteration
+    // site. Marking a collection-valued element would leave `iterate ≫ […]` where a value
+    // belongs, and constant evaluation would report a computation it cannot reduce.
     if matches!(&expr.node, TypedExprNode::List(_)) {
         return;
     }
-    // A zipped product is a product *morphism*, not a product value: op-conversion's
+    // A zipped product pairs its components over the ambient iteration: op-conversion's
     // `Zip` arm fans the outer input out to each component, so each is compiled with
     // `input=Some(fan_out_branch)`. The value-position arms below would mark a
     // collection-valued component as an iteration site ([`mark_component_source`]),
@@ -261,21 +259,16 @@ pub(super) fn insert_iterate_recurse(
     }
 }
 
-/// Mark a product's `component` as an iteration site when it holds a collection.
+/// Mark a product's `component` as an iteration site when it holds a collection
+/// ([`Type::is_collection`]).
 ///
-/// A collection component compiles exactly as a collection compiles anywhere: the
-/// product holds the tile it produces, keeping its own domain
-/// ([`SelectField`](crate::interpreter::tile_operators::SelectField) is what reads one
-/// back out), and a program output is compiled with `input=None` by
+/// A collection component compiles as a collection compiles anywhere, and the product holds
+/// the tile it produces (`src/interpreter/design-operators.md`, "A product value is a record
+/// of tiles"). A program output is such a component: its outputs are a trailing `Record`
+/// compiled with `input=None` by
 /// [`convert_outputs_to_operators`](crate::interpreter::operator_conversion::convert_outputs_to_operators).
-/// Both need the iteration every collection needs.
-///
-/// **Being a collection is the whole test**, and the two halves of it each rule out a
-/// shape that looks like the other. A refinement is a fact about the value rather than
-/// a different shape, so it peels first: a filtered collection is a collection, and
-/// iterating it is what makes its rows reach anything. A compute function tiles at a
-/// function extent too and is not swept, so `FunKind` is what separates them; handing
-/// one an iteration source gives it an input it rejects.
+/// A compute function is not a collection, and handing one an iteration source gives it an
+/// input it rejects.
 ///
 /// A tuple, a record and the program's trailing `Record` differ only in whether a
 /// component carries a name, so the rule is one rule.
@@ -283,14 +276,7 @@ fn mark_component_source(
     component: &mut Expr,
     discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
-    let holds_a_collection = matches!(
-        component.ty.peel_refinements(),
-        Type::Fun {
-            fun_kind: crate::ccl::ty::FunKind::Data(..),
-            ..
-        }
-    );
-    if holds_a_collection {
+    if component.ty.is_collection() {
         wrap_with_iterate(component, discharged, "product-component-source");
     }
 }
@@ -1318,11 +1304,10 @@ mod tests {
         );
     }
 
-    /// End-to-end coverage of the same rule is in `tests/compilation_pipeline/records.rs`:
-    /// `test_filter_over_a_projected_component` for a filtered component, and
-    /// `a_conditionally_fed_output_compiles` for the same shape as a program output. The
-    /// cases here reach one node for both meanings, since a program's outputs are a
-    /// `Record` like any other.
+    /// End-to-end coverage: `test_filter_over_a_projected_component` in
+    /// `tests/compilation_pipeline/records.rs` for a filtered component, and
+    /// `a_conditionally_fed_output_answers_the_requests_its_guard_admits` in
+    /// `tests/http_server.rs` for the same shape as a program output.
     #[rstest]
     #[case::collection(data_fun_ty(Type::UIntRange(3), int_ty()), true)]
     #[case::compute_function(fun_ty(Type::UIntRange(3), int_ty()), false)]
@@ -1348,9 +1333,7 @@ mod tests {
         );
     }
 
-    /// A record's collection-valued field is an iteration site, and its scalar
-    /// field is not. The product holds the tile each component produces, so a
-    /// component compiles as the collection it is.
+    /// A record's collection-valued field is an iteration site, and its scalar field is not.
     #[test]
     fn test_insert_iterate_recurse_wraps_a_collection_record_field() {
         let int = int_ty();
@@ -1364,13 +1347,19 @@ mod tests {
         ]));
         insert_iterate_recurse(&mut expr, &Default::default());
         let TypedExprNode::Record(fields) = &expr.node else {
-            panic!("still a record");
+            panic!("expected Record, got: {}", symbolic(&expr));
         };
+        let xs = &fields.iter().find(|(n, _)| n == "xs").unwrap().1;
         assert!(
-            symbolic(&fields[0].1).contains("iterate"),
-            "the collection field is a site: {}",
-            symbolic(&fields[0].1),
+            is_iterate_apply(chain_head(xs)),
+            "the collection field `xs` is a site: {}",
+            symbolic(xs)
         );
-        assert_eq!(symbolic(&fields[1].1), "0", "the scalar field is untouched",);
+        let n = &fields.iter().find(|(n, _)| n == "n").unwrap().1;
+        assert!(
+            matches!(n.node, TypedExprNode::Lit(_)),
+            "the scalar field `n` is untouched: {}",
+            symbolic(n)
+        );
     }
 }

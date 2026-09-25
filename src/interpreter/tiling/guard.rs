@@ -385,9 +385,7 @@ mod tests {
         codomain_guard(upto(bound))
     }
 
-    /// A record guard names a region per field, so two of them union field by
-    /// field and the result is a record guard again. That is what a record-tiled
-    /// producer can act on: each field's operand is handed its own field's union.
+    /// Two record guards union field by field, to a record guard.
     #[test]
     fn guard_union_record_is_field_wise() {
         let g1 = record_guard(&[

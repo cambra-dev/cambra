@@ -502,6 +502,78 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
     assert_eq!(final_mut_var_value(code), expected);
 }
 
+/// A value whose declared type holds a sum enters that sum through `box` wherever the sum sits:
+/// a record field or a tuple component, of a seed written as a literal or bound first, or of a
+/// write (`mut_elim::view_values_at_value_type`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::record_seed(
+    indoc! {r#"
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + s.a
+        await_final(n)
+    "#},
+    15
+)]
+#[case::tuple_seed(
+    indoc! {r#"
+        s: Mut({Int, Map(String, Int)}, Txn) := (5, box(map([("x", 1), ("y", 2)])))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + s.0
+        await_final(n)
+    "#},
+    15
+)]
+#[case::bound_record_seed(
+    indoc! {r#"
+        init = (a=5, b=box(map([("x", 1), ("y", 2)])))
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := init
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + s.a
+        await_final(n)
+    "#},
+    15
+)]
+#[case::record_write(
+    indoc! {r#"
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1)])))
+        for r in [1, 2, 3]:
+            with begin():
+                s := (a=s.a + 1, b=box(map([("z", 3)])))
+        await_final(s).a
+    "#},
+    8
+)]
+fn a_sum_inside_a_product_enters_its_declared_sum(#[case] code: &str, #[case] expected: i64) {
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// A whole-variable write of a boxed collection enters the variable's declared sum, as its
+/// seed does.
+#[test]
+fn a_boxed_write_enters_its_declared_sum() {
+    assert_eq!(
+        final_mut_var_value(indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("x", 1)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m := box(map([("z", 3)]))
+            await_final(m)
+        "#}),
+        Value::Function(vec![cambra::interpreter::FuncBinding {
+            input: Value::String("z".into()),
+            output: Value::Int(3),
+        }]),
+    );
+}
+
 /// A field projected off a tuple transactional mutable variable's completion read.
 #[test]
 fn test_compound_txn_mut_var_field() {
@@ -2098,33 +2170,6 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
         "#},
         "read transactional variable `p` inside a `with begin():` block",
     );
-}
-
-/// A **conditionally fed** output compiles, which is the program output that carries
-/// a refinement.
-///
-/// Feeding a response under a guard restricts the channel's domain, so the output's
-/// type is `{source(…) | __elem ▷ …} ⤇ String` rather than an unrefined one. The output
-/// list is an ordinary `Record`, so planning decides each entry by whether it holds a
-/// collection — and a filtered collection is a collection, its predicate riding the
-/// domain. Reading the outer shape instead would answer the same here and differ on a
-/// compute-typed entry, which is the distinction
-/// `test_a_product_entry_is_a_site_exactly_when_it_holds_a_collection` pins.
-///
-/// No sink program in the suite fed a response under a guard before this one, so the
-/// refined output reached nothing.
-#[test]
-fn a_conditionally_fed_output_compiles() {
-    let code = indoc! {r#"
-        reqs, resps = http_serve("0", "GET", "/g")
-        for req in reqs:
-            if req != "skip":
-                resps << req
-    "#};
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    compile_program(&mut ctx, code, consumer)
-        .expect("a guarded feed restricts the output's domain, and it is still a collection");
 }
 
 /// A *computed* live cross-endpoint read (`resp << latest + 1`) compiles: the

@@ -316,13 +316,11 @@ impl TileProducer for ZipProducer {
     }
 }
 
-/// Build a record **value** from N components: a `Tile::Record` whose fields are
-/// `_0`, `_1`, … for a tuple, or the source's own names for a record.
+/// Build a product value from N components: a `Tile::Record` whose fields are `_0`, `_1`,
+/// … for a tuple, or the source's own names for a record.
 ///
-/// Each field keeps the tiling its own operand produced, and [`SelectField`] is
-/// the eliminator. Nothing here shares a domain — that is [`Zip`], the other thing
-/// a `Tuple`/`Record` node can mean. Reasoning:
-/// `src/interpreter/design-operators.md`, "A product value is a record of tiles".
+/// [`SelectField`] is the eliminator. See `src/interpreter/design-operators.md`, "A product
+/// value is a record of tiles".
 pub struct MakeRecord {
     base: OperatorBase,
     /// Field names in input order, used when producing `Tile::Record` tiles.
@@ -331,11 +329,9 @@ pub struct MakeRecord {
 }
 
 impl MakeRecord {
-    /// Construct a `MakeRecord` from N scalar input operators.
+    /// Construct a `MakeRecord` whose fields are `inputs`, named `_0`, `_1`, … in order.
     ///
-    /// All inputs must have scalar tilings. The output `extent` and `tiling`
-    /// are derived: each input's scalar extent becomes a field (`_0`, `_1`, …)
-    /// in the output `Extent::Record`.
+    /// Each field keeps its input's tiling, whatever that is.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
         assert!(!inputs.is_empty(), "MakeRecord requires at least one input");
         let names = (0..inputs.len()).map(tuple_field).collect();
@@ -402,8 +398,8 @@ impl TileOperator for MakeRecord {
     }
 }
 
-/// Producer for [`MakeRecord`]: pulls each scalar input and combines them into
-/// a `Tile::Scalar(ColumnValue::Records)`.
+/// Producer for [`MakeRecord`]: pulls every operand and builds a `Tile::Record` of their
+/// tiles.
 struct MakeRecordProducer {
     base: ProducerBase,
     names: Vec<String>,
@@ -421,13 +417,9 @@ impl TileProducer for MakeRecordProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Every operand is pulled whole, for the reason
-        // [`SelectFieldProducer::get_impl`] gives: a narrowed pull is unsound
-        // through a cumulative cache, because [`Memo`] would record a partial
-        // answer as the whole one. Withholding what a consumer has finished with
-        // is the operand's own job, and [`Self::release_impl`] is what tells it.
-        // A record whose fields settle at different moments therefore does not
-        // re-deliver the ones that settled first.
+        // Every operand is pulled whole ([`SelectFieldProducer`] says why a narrowed pull
+        // is unsound). An operand withholds what [`Self::release_impl`] told it a consumer
+        // finished with, so a field that settled early is not re-delivered.
         let fields: HashMap<String, Tile> = self
             .names
             .iter()
@@ -441,13 +433,8 @@ impl TileProducer for MakeRecordProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // A record guard names one guard per field, and a field's guard belongs to
-        // that field's operand. Forwarding it is the whole of the release: the
-        // operand then withholds what it handed over, whether that is the field
-        // entire or the rows of it a consumer has finished with.
-        //
-        // A pull re-reads every operand, which does not make forwarding unsafe: an
-        // operand that has been told keeps the promise itself.
+        // A record guard names one guard per field, and each goes to that field's operand.
+        // A later pull re-reads every operand, and each withholds what it was told.
         match &obsolete_guard {
             g if g.is_empty() => {}
             TileGuard::Record(fields) => {
@@ -470,14 +457,12 @@ impl TileProducer for MakeRecordProducer {
     }
 }
 
-/// Pick one field out of a **product value**.
+/// Pick one field out of a **product value**: the eliminator for [`MakeRecord`], handing
+/// back that field's tile.
 ///
-/// The eliminator for what [`MakeRecord`] introduces: hand back that field's
-/// sub-tile. This is a *tile* operation, unlike the value-level `RecordField`
-/// application [`crate::interpreter::operator_conversion`] uses elsewhere, which
-/// reads a record one row at a time and so needs every field to be a value in a
-/// column. Reasoning: `src/interpreter/design-operators.md`, "A product value is
-/// a record of tiles".
+/// The `RecordField` application is the other projection, and it reads a record one row
+/// at a time, so every field must fit in a column. See
+/// `src/interpreter/design-operators.md`, "A product value is a record of tiles".
 pub struct SelectField {
     base: OperatorBase,
     /// The product whose field this selects.
@@ -486,14 +471,17 @@ pub struct SelectField {
     name: String,
 }
 
-/// `guard` placed at the field it names, under one `Codomain` wrapper per level the record
-/// sits beneath — the shape the input reads a release in.
+/// What a selector of field `name` releases of the product `tiling`, given its consumer's
+/// release `guard` of that field: `guard` placed at the field, under one `Codomain` wrapper
+/// per level the record sits beneath, and nothing on the other fields.
 ///
-/// **Only what names the field's own contents travels.** A guard naming a level names keys
-/// the product shares with its other fields, and one field's consumer finishing with a key
-/// says nothing about its siblings, so that half releases nothing here. Releasing less than
-/// it might is always sound; the levels are released by whatever coordinates the product's
-/// readers.
+/// TODO(exact-field-release): this release is lossy, which the guard algebra forbids
+/// (`src/interpreter/design-operators.md`, "Guard operations are exact"). Do not copy it. It
+/// drops a guard naming keys of a level above the record, and releases nothing of the other
+/// fields, so a `FanOut` meeting two selectors releases nothing at all. The exact release is
+/// `guard` on this field and every other field whole, and the `FanOut` meet of two of those
+/// beneath a level names one field's cells under some of the rows. That region needs a scalar
+/// guard qualified by the rows above it, which the guard algebra cannot spell yet.
 fn guard_at_field(tiling: &Tiling, name: &str, guard: TileGuard) -> TileGuard {
     match tiling {
         Tiling::DataFunction { codomain, .. } => match guard {
@@ -553,15 +541,6 @@ impl SelectField {
             name,
         }
     }
-
-    /// `guard` on this field, and nothing on the product's others.
-    ///
-    /// Every guard travelling to the input names one field, which is what makes a
-    /// consumer reading one field release only that one
-    /// ([`MakeRecordProducer::release_impl`]).
-    fn at_field(&self, input_tiling: &Tiling, guard: TileGuard) -> TileGuard {
-        guard_at_field(input_tiling, &self.name, guard)
-    }
 }
 
 impl TileOperator for SelectField {
@@ -573,13 +552,16 @@ impl TileOperator for SelectField {
 
     fn subscribe(
         &mut self,
-        intent_guard: TileGuard,
+        _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // An intent may only widen on its way upstream, so the input is asked for all of
+        // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
-        let intent = self.at_field(&input_tiling, intent_guard);
-        let input_producer = self.input.subscribe(intent, consumer, scheduler);
+        let input_producer =
+            self.input
+                .subscribe(input_tiling.universal_guard(), consumer, scheduler);
         Box::new(SelectFieldProducer {
             base: ProducerBase::new(SelectFieldProducer::alloc_id(), self.tiling()),
             input: input_producer,
@@ -587,9 +569,23 @@ impl TileOperator for SelectField {
             input_tiling,
         })
     }
+
+    /// The input's correlation, one step further into the record: what the `RecordField`
+    /// application reports for the same projection.
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        let mut correlation = self.input.result_correlation()?;
+        correlation.push(TilePathStep::Record(self.name.clone()));
+        Some(correlation)
+    }
 }
 
 /// Producer for [`SelectField`].
+///
+/// **A pull reads the whole product.** A narrowed pull is unsound through a cumulative
+/// cache: [`Memo`] merges what a pull returned and answers later pulls from it without going
+/// below, so a pull naming one field would record a partial answer as the whole one, and a
+/// sibling selector would read a field never fetched. A release names only this field's
+/// part ([`guard_at_field`], whose TODO says why that is lossy).
 struct SelectFieldProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
@@ -612,14 +608,6 @@ impl TileProducer for SelectFieldProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // The whole product is pulled, not this field alone, because a narrowed
-        // pull is unsound through a cumulative cache: [`Memo`] merges what a pull
-        // returned and then answers later pulls from that cache without going
-        // below, so a pull naming one field would record a partial answer as the
-        // whole one and a sibling selector would read a field that was never
-        // fetched. Releasing is the opposite case and does name one field
-        // ([`Self::release_impl`]): what a consumer is finished with is its own
-        // business, and says nothing about a sibling's.
         let mut tile = self.input.get(self.input.tiling().universal_guard());
         // The record stands at the chain's deepest values, so the field takes its place and
         // every level above it is left where it was.
@@ -633,19 +621,14 @@ impl TileProducer for SelectFieldProducer {
                 self.name
             )
         });
-        // The release this producer passed upstream was narrowed to its own field, so the
-        // input still holds what this consumer released — a sibling selector is why. Dropping
-        // it here is what keeps the narrowing from re-emitting released data; a producer that
-        // forwards its release whole gets this from its input instead.
+        // The input is released only where every reader of it has released, and less than
+        // that ([`guard_at_field`]), so it can still hold what this consumer released.
         tile.remove_guarded(self.obsolete_guard().clone());
         tile.compact();
         tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Only this field is released. The product's other fields belong to
-        // whatever else selects them, and a consumer of one says nothing about
-        // the rest.
         let released = self.at_field(obsolete_guard);
         self.input.release(released);
     }
@@ -655,15 +638,13 @@ impl TileProducer for SelectFieldProducer {
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
-    use crate::interpreter::{BaseType, ColumnValue, Extent};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
 
-    /// A `MakeRecord` re-reads every operand on every pull, so it can only pass a
-    /// release on once there will be no next pull — which is exactly what a
-    /// universal release from its consumer says. Swallowing it strands every
-    /// producer beneath a binop operand or record field, and because [`FanOut`]
-    /// forwards the *intersection* of its branches' guards, one branch that never
-    /// releases blocks reclamation for all of them.
+    /// A universal guard names every field, so every operand is released. Swallowing it
+    /// strands every producer beneath a record field, and because [`FanOut`] forwards the
+    /// intersection of its branches' guards, one branch that never releases blocks
+    /// reclamation for all of them.
     #[test]
     fn make_record_forwards_a_universal_release_to_every_component() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
@@ -692,8 +673,7 @@ mod tests {
         }
     }
 
-    /// Nothing narrower travels: a scalar has no sub-region, so a partial guard
-    /// names no operand positions to free — and the operands are still being read.
+    /// An empty guard names no field, so it reaches no operand.
     #[test]
     fn make_record_does_not_forward_an_empty_release() {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
@@ -764,6 +744,97 @@ mod tests {
         );
     }
 
+    /// `UInt ⤇ {a: Int, xs: UInt ⤇ Int}`: a record holding a collection, under a level.
+    fn record_under_a_level() -> Tiling {
+        Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Record(HashMap::from([
+                ("a".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                (
+                    "xs".to_string(),
+                    Tiling::data_function(
+                        Extent::Base(BaseType::UInt),
+                        Tiling::Scalar(Extent::Base(BaseType::Int)),
+                    ),
+                ),
+            ])),
+        )
+    }
+
+    /// An operator that states a correlation and is never subscribed.
+    struct Correlated {
+        tiling: Tiling,
+        correlation: Vec<TilePathStep>,
+    }
+
+    impl TileOperator for Correlated {
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            unreachable!("only the correlation is read")
+        }
+
+        fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+            Some(self.correlation.clone())
+        }
+    }
+
+    /// A selection is one record step further in than its input, as the `RecordField`
+    /// application it stands in for reports; `MapResultWithSource` needs the path.
+    #[test]
+    fn select_field_extends_its_input_correlation_by_the_field() {
+        let select = SelectField::new(
+            Box::new(Correlated {
+                tiling: record_under_a_level(),
+                correlation: vec![TilePathStep::Codomain],
+            }),
+            "a",
+        );
+        assert_eq!(
+            select.result_correlation(),
+            Some(vec![
+                TilePathStep::Codomain,
+                TilePathStep::Record("a".to_string())
+            ]),
+        );
+    }
+
+    /// A release naming rows of the level above the record reaches nothing upstream today
+    /// (TODO(exact-field-release) on [`guard_at_field`]). This pins the gap: the exact release
+    /// names those rows, and this assertion flips when the guard algebra can spell it.
+    #[test]
+    fn select_field_drops_a_release_naming_rows_above_the_record() {
+        let input_tiling = record_under_a_level();
+        let (spy, log) = ReleaseSpy::new(
+            Tile::Scalar(ColumnValue::Ints(vec![])),
+            input_tiling.clone(),
+        );
+        let output_tiling = select_field_tiling(&input_tiling, "a");
+        let mut producer = SelectFieldProducer {
+            base: ProducerBase::new(SelectFieldProducer::alloc_id(), &output_tiling),
+            input: Box::new(spy),
+            name: "a".to_string(),
+            input_tiling,
+        };
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(0)),
+        )));
+        assert!(
+            log.borrow().iter().all(TileGuard::is_empty),
+            "the rows reach upstream now, so the TODO is done: {:?}",
+            log.borrow(),
+        );
+    }
+
     // ── ZipProducer: asymmetric per-branch presence ────────────────────────
     //
     // Regression for the per-branch presence-intersection added to
@@ -816,7 +887,7 @@ mod tests {
                 ),
             ])),
         );
-        let mut zip_arms = ZipProducer {
+        let mut zip = ZipProducer {
             depth: 1,
             base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
@@ -826,7 +897,7 @@ mod tests {
             ],
         };
 
-        let result = zip_arms.get(zip_arms.tiling().universal_guard());
+        let result = zip.get(zip.tiling().universal_guard());
         let Tile::DataFunction {
             domain, codomain, ..
         } = result

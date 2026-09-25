@@ -340,8 +340,8 @@ There are two compilation passes that translate CCL into tile-dataflow operators
 | CCL form | Operator |
 |---|---|
 | `Compose([f, g, …])` | sequential pipeline: output of each feeds next |
-| `zip(f, g)` | `Zip` over a shared `FanOut`-wrapped domain (via the `zip_arms` factory) |
-| `zip({k: f, …})` | `zip_arms_named` — record-of-morphisms fused via `Zip::new_named` or `MakeRecord::new_named` |
+| `zip(f, g)` | `Zip` over a shared `FanOut`-wrapped domain (via the `zip_arms_at` factory) |
+| `zip({k: f, …})` | `zip_arms_named_at` — record-of-morphisms fused via `Zip::new_at` or `MakeRecord::new_named` |
 | `id` | identity (pass-through) |
 | `const(c)` | `MapResultToConst` |
 | `map(g)` | pass-through: compiles `g` with the upstream threaded in as input (emits no operator of its own) |

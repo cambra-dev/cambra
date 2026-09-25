@@ -199,9 +199,8 @@ fn run_program(
 
 /// What the driver has taken delivery of in `tile`, to release back.
 ///
-/// A record value's fields are tiled independently — a scalar field alongside a
-/// materialized collection field — so the guard is built per field rather than
-/// from the record as a whole.
+/// A product value's fields are tiled independently, so the guard is built per field
+/// rather than from the record as a whole.
 fn release_guard_for(tile: &Tile) -> TileGuard {
     match tile {
         Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),

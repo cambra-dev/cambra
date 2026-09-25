@@ -95,10 +95,7 @@ the previous version of the interpreter.
 
 `TileGuard::intersect()` computes the overlap between two guards, and `TileGuard::union()` their
 union; `is_universal()` and `is_empty()` test the extremes. Both run field by field over a
-`Record` guard, which names a region per field rather than a product over them — unlike
-`Predicate::Record`, which admits a value only when every field does and so needs an `Or` of
-its own to union two. A record guard's union is a record guard, which is what lets a product
-forward a consumer's accumulated release to the operand holding the field it names.
+`Record` guard, which names a region per field (`TileGuard::union`).
 
 TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
 as a `split(guard: &TileGuard)` method on `Tile` in the future.
@@ -166,35 +163,46 @@ The tile layer chooses **how the runtime materialises that pointwise function**.
 
 Both compiled forms satisfy the same CCL type; which one a specific call site gets is determined at op-conversion by the upstream `input`'s tiling, which flows in from whatever sits above the operator in the dataflow graph. This is what makes UDFs like `lambda x: x + 1` compile cleanly whether they're called once on a literal or mapped over a source — no duplication at the CCL level, the tile layer specialises automatically.
 
-In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; a zip is handled by [`zip_arms`](./tile_operators/fan.rs), which builds [`Zip`] from function-tiled arms and [`MakeRecord`] from arms that all came out scalar, where there is no domain to share. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
+In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; a zip is handled by [`zip_arms_at`](./tile_operators/fan.rs), which builds [`Zip`] from function-tiled arms and [`MakeRecord`] from arms that all came out scalar, where there is no domain to share. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
 
 ### A product value is a record of tiles
 
-A record or tuple **value** compiles to a `Tiling::Record`, each field keeping the tiling its own
-term produced: a scalar field stays a scalar, a collection field stays the collection it
-already was, with the domain it binds. `MakeRecord` assembles it and [`SelectField`] reads one
-field back out.
+A `Tuple` or `Record` node whose extent is a record compiles to a `Tiling::Record`, each field
+keeping the tiling its own term produced: a scalar field stays a scalar, and a collection field
+stays the collection it was, with the domain it binds. `MakeRecord` assembles it and
+[`SelectField`] reads one field back out. `build_product` in `operator_conversion.rs` chooses it
+by the node's extent.
 
 Keeping a field a tile is what lets it grow. A `Tile::DataFunction` merges by appending its
 domain and unioning its domain predicate, which is a collection arriving in pieces. A collection
-boxed into one cell would merge the way every `Tile::Scalar` does, by appending the column, so two
-deliveries would land as two cells — two tables where the program has one collection. The fields
-also settle at their own moments, so a guard names one at a time: a settled scalar beside an
-unsettled collection releases the first alone.
+boxed into one cell merges as every `Tile::Scalar` does, by appending the column, so two
+deliveries land as two cells: two tables where the program has one collection. The fields settle
+at their own moments, so a release names one field at a time, and a settled scalar beside an
+unsettled collection is released alone.
 
-The other product is a **morphism**: `Tuple([acc, i])` under a binop is a pointwise pairing over the
-ambient iteration, and that is the zip [`Zip`] assembles. A value's extent is a record and a
-morphism's is a function, so the node's own type is what separates them. Assembling a value as a zip
-yields `𝐷 ⤇ (𝐴, 𝐵)`, a collection of products, where the type says a product of collections.
+A `Tuple` or `Record` node whose extent is a function, `𝐷 ⤇ {…}`, is a collection of records.
+`Tuple([acc, i])` under a binop is one: it pairs its components over the ambient iteration, which
+is what [`Zip`] assembles. Assembling a record extent as a zip instead yields `𝐷 ⤇ (𝐴, 𝐵)`, a
+collection of products, where the type says a product of collections.
 
-A collection component is an iteration site like any other collection (`planning::iterate`'s
-`mark_component_source`), because it compiles as the collection it is. A list literal's elements are
-the exception: op-conversion evaluates each to a `Value` and compiles none of them, so nothing
-inside one is a site.
+`SelectField` is a tile operation. The `RecordField` application is the other projection, and it
+reads a record in a function's codomain one row at a time, so every field must be a value in a
+column. A record holding a collection cannot supply one.
 
-Selecting a field is a tile operation, distinct from the value-level `RecordField` application that
-reads a record sitting in a function's codomain one row at a time. That application needs every
-field to be a value in a column, which a record holding a collection cannot supply.
+### A collection inside a value stays a tile
+
+A collection inside a value is kept as a `Tile::DataFunction`: its keys in a column beneath the
+rows that hold them, and its values in the tile below. A merge appends keys to it, and a guard
+names them. Operators do not box it into a `Tile::Scalar` column of `Value::Function` maps, which
+would arrive whole and be read only by opening each map. A map value is used only where one value
+is required, as in a variant's payload and a store write.
+
+`Tiling::from_extent` is the tiling a value of an extent takes in this form. `Tile::holds_a_level`,
+and its static counterpart `Tiling::holds_a_level`, asks whether a tile holds a collection this
+way; an operator putting a value into a column asks it, a column having nowhere to put one.
+`Extent::holds_a_collection` asks whether a type contains a collection at all, which a column of
+maps answers yes too. `open_row_collections` turns a column of maps into this form, and
+`materialize_collections` turns this form back into maps where one value is required.
 
 ---
 
@@ -207,6 +215,25 @@ Every operator must obey it in both directions, because a violation yields **wro
 `TileProducer::get` checks the producer's half in debug builds: the returned tile must carry no live data inside the accumulated `obsolete_guard`. What an operator can forward depends on how it reads its input, so it is specified per operator below.
 
 An operator must therefore **reject a guard it cannot honor rather than ignore it**. The guard accumulates in `obsolete_guard` whether or not `release_impl` acts on it, so dropping one silently leaves the operator free to re-emit that region — from its own state, or by re-reading an input it never passed the release to. Every `release_impl` is exhaustive; an operator with no sub-region to reclaim piecewise checks the guard with `TileGuard::expect_universal_or_empty`. Rejecting fires where the guard arrives, which does not depend on anything pulling afterwards — the `get` post-condition only fires if something does.
+
+### Guard operations are exact
+
+`TileGuard::intersect`, `TileGuard::union`, `TileGuard::flatten_or`, and every function that
+restates a guard for another operator's tiling name exactly the region they denote. A region the
+representation cannot spell is a gap in the guard algebra. The fix is a spelling for it, and until
+then the operation fails loudly (`todo!`, `unimplemented!`). It never answers a smaller region,
+and never a larger one.
+
+A consumer may release less than it has finished with, since what it releases is its own promise.
+An operator computing a guard from the guards it received has no such choice:
+
+- An understated guard fails to forward a release the operator could make, which strands upstream
+  state. A `FanOut` forwards the meet of its branches, so one understated meet blocks
+  reclamation for every branch.
+- An overstated guard releases data a reader still needs, which yields wrong results.
+- Either one is a different region from then on. `TileProducer::release` compares the spelling of
+  the accumulated guard to decide whether a release added anything, and every later union and
+  meet is computed from that spelling.
 
 ## Tile Operators
 
@@ -278,11 +305,11 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
 | `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
-| `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a record **value**: each field keeps the tiling its operand produced. Nothing shares a domain here — that is `Zip`, and `build_product` chooses between the two by the node's own type. Pulls every operand whole; forwards a release naming one field to that field's operand alone. |
+| `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
-| `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → Scalar)` | Replaces every codomain value of a function input with the same constant (or zips it in, per its mode), preserving the domain. The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
+| `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces every codomain value of a function input with the same constant (or zips it in, per its mode), preserving the domain. A collection constant is one row, and each element gets a copy of its group (`repeat_tile`). The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `DataFunction(Unit → Scalar)` | `Scalar` | Unwraps a `DataFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
-| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's sub-tile — the eliminator for the product value `MakeRecord` builds. Pulls the product whole, since a narrowed pull through `Memo` would cache a partial record as a complete one; releases name the one field, so reading one field frees only it. |
+| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product whole, and releases what its consumer released of the field it selects, which is lossy (`guard_at_field`, TODO(exact-field-release)). |
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
@@ -477,11 +504,11 @@ Three arms share an input across multiple downstream consumers:
 
 - **`Apply(_, Zip)` with `Tuple` / `Record` arguments** fans the input out to
   each tuple / record element; the elements get `Some(fan_out_branch)` and
-  combine via [`zip_arms`] (function-tiled arms) or [`MakeRecord`] (scalar arms).
+  combine via [`zip_arms_at`] (function-tiled arms) or [`MakeRecord`] (scalar arms).
   The 2-arm Zip-with-const fast path skips the fan-out and emits a single
   `MapResultToConst` instead. A **store-read arm** (`__hist.k`) is a *leaf*
   source over its own domain, so it is converted with **no** input (rather than
-  the fanned branch, which it would reject); `zip_arms` co-aligns it with the
+  the fanned branch, which it would reject); `zip_arms_at` co-aligns it with the
   input-driven arms by domain position. This is the cross-domain co-iteration a
   commit writer's source uses — `zip((reqs, __cnt.acc))` pairs the request stream
   with a request-indexed induction accumulator read so a commit decision can read
@@ -625,7 +652,7 @@ restricted-source multi-leg realization's cyclic-convergence desync from arising
 **`StoreDenseRead` — the dense changelog read.** A `__hist.k` read folds the changelog at
 *every* position of the loop extent → `Fun(D, V)`: an `IterateExtent(D)` trigger supplies
 the domain positions (a live enumeration — over a `DataSource` it re-reads the arrived keys
-each pull, so it spans live arrivals — and it aligns via `zip_arms` with any co-iterated
+each pull, so it spans live arrivals — and it aligns via `zip_arms_at` with any co-iterated
 source over the same `D`), and each position `p` reads tick `p + 1` via `store_value_at`
 (which scans changes ≤ that tick — **independent of the store frontier**, so a carry
 position inherits the latest earlier write and a leading carry folds to the tick-0 seed).
@@ -634,7 +661,7 @@ arbitrary order, but the output domain must be position-ordered so that the **sc
 read — `ExtractFinal` over this dense stream, i.e. the *final column* — is the highest loop
 position (the final accumulator), not an arbitrary mid-loop value. (A **co-iterated** read —
 an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with begin(): store
-:= store + cnt` — aligns by domain *value* via `zip_arms`, so ordering is immaterial there;
+:= store + cnt` — aligns by domain *value* via `zip_arms_at`, so ordering is immaterial there;
 sorting is correct for both.) One reader serves both shapes, and a downstream release of loop
 positions is forwarded to the trigger so the source is reclaimed. Reading by fold rather
 than by indexed projection is what unifies induction reads with transactional-variable reads.

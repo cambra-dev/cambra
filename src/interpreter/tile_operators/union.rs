@@ -227,15 +227,11 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         // already the shape its tiling names, and boxing it is what has no column to go in.
         let codomain = if codomain.holds_a_level() {
             *codomain
-        } else if codomain_tiling.has_a_level() {
-            // An arm that contributed no row emits an empty column whatever its tiling
-            // says; restate it at the declared shape so the concatenation is like-for-like.
-            assert!(
-                codomain.is_empty(),
-                "flat_merge: an arm of a level-valued codomain carries levels unless it is \
-                 empty, got {codomain:?}"
-            );
-            codomain_tiling.empty_at_no_rows()
+        } else if codomain_tiling.holds_a_level() {
+            unreachable!(
+                "flat_merge: an arm with live rows under a codomain tiling that holds a level \
+                 carries the level itself, got {codomain:?}"
+            )
         } else {
             column_value_to_tile(scalar_tile_to_column_value(*codomain), codomain_tiling)
         };

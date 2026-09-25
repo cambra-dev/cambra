@@ -52,40 +52,21 @@ pub enum Tiling {
 }
 
 impl Tiling {
-    /// Whether a level sits here, or inside a record here — the test an operator makes
-    /// before boxing a value into a column, which has nowhere to put one.
+    /// The tiling a value of `extent` takes: a collection as a `DataFunction`, a record
+    /// holding one as a record of its fields' tilings, and anything else as a `Scalar` column,
+    /// which is what a consumer reading one row at a time reads. The inverse of
+    /// [`Self::extent`] for these shapes.
     ///
-    /// [`Extent::holds_a_collection`] asks the other question, whether the value type
-    /// contains a collection at all, which a materialized cell answers yes and this one no.
-    pub fn has_a_level(&self) -> bool {
-        match self {
-            Tiling::DataFunction { .. } => true,
-            Tiling::Record(fields) => fields.values().any(Tiling::has_a_level),
-            _ => false,
-        }
-    }
-
-    /// The tiling a value of `extent` has when it carries its collections as **levels**
-    /// rather than materializing them into cells.
-    ///
-    /// The inverse of [`Self::extent`] for the shapes that have one: a function extent
-    /// becomes a level, and a record holding a collection becomes a record of tilings so the
-    /// collection-valued field keeps its own. Every other extent stays a `Scalar`, because a
-    /// column holds it perfectly well and a consumer reading one row at a time wants it
-    /// there.
-    ///
-    /// Two producers hand values out this way — a store read, and a computable function
-    /// applied to a level — and both mean the same thing by it, so they share this rather
-    /// than each deciding where to stop.
-    pub fn with_levels(extent: &Extent) -> Tiling {
+    /// See `src/interpreter/design-operators.md`, "A collection inside a value stays a tile".
+    pub fn from_extent(extent: &Extent) -> Tiling {
         match extent {
             Extent::Function { domain, codomain } => {
-                Tiling::data_function((**domain).clone(), Tiling::with_levels(codomain))
+                Tiling::data_function((**domain).clone(), Tiling::from_extent(codomain))
             }
             Extent::Record(fields) if extent.holds_a_collection() => Tiling::Record(
                 fields
                     .iter()
-                    .map(|(name, e)| (name.clone(), Tiling::with_levels(e)))
+                    .map(|(name, e)| (name.clone(), Tiling::from_extent(e)))
                     .collect(),
             ),
             _ => Tiling::Scalar(extent.clone()),
@@ -238,6 +219,9 @@ impl Tiling {
 
     /// Whether a level sits here, or inside a record here — the static counterpart of
     /// [`Tile::holds_a_level`](crate::interpreter::Tile::holds_a_level), which carries the rule.
+    ///
+    /// [`Extent::holds_a_collection`] asks whether the value type contains a collection at
+    /// all, which a column of maps answers yes and this no.
     pub fn holds_a_level(&self) -> bool {
         match self {
             Tiling::DataFunction { .. } => true,

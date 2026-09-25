@@ -65,6 +65,8 @@ Specific decision points where this matters:
 
 - **Defensive checks at internal boundaries.** Add `debug_assert!`, `unreachable!`, and explicit invariant checks at pass boundaries and between modules where load-bearing assumptions live. Don't go overboard — assertions that just restate what the type system already enforces are noise. Add them where the invariant is real but not type-enforced: pass output shapes, module-boundary preconditions, post-conditions on internal helpers. Name what the invariant *is* in the assertion message.
 
+- **Guard algebra is exact.** A guard operation or restatement names exactly its region; where the representation has no spelling for one, fail loudly and flag the gap rather than answering a smaller guard ("releasing less is sound" is false). See `src/interpreter/design-operators.md`, "Guard operations are exact".
+
 ### Prose style: specifications, not blog posts
 
 Design docs, code and doc comments, PR descriptions, commit messages, and answers in chat are
