@@ -984,7 +984,7 @@ mod tests {
         assert_eq!(fan.shared.borrow().subscribers.len(), 2);
 
         // Distinguish the survivor's guard from the empty one the dead slot holds.
-        let mine = TileGuard::Scalar(true);
+        let mine = TileGuard::Scalar(Predicate::True);
         second.release(mine.clone());
         drop(first);
 
@@ -1024,7 +1024,7 @@ mod tests {
             !fan.released_in_full(),
             "nothing has released, so the fan-out still has its value to give"
         );
-        first.release(TileGuard::Scalar(true));
+        first.release(TileGuard::Scalar(Predicate::True));
         drop(first);
         fan.reopen();
 
@@ -1037,7 +1037,7 @@ mod tests {
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
         assert_eq!(
             fan.shared.borrow().release_guards[0],
-            TileGuard::Scalar(true),
+            TileGuard::Scalar(Predicate::True),
             "the late subscriber inherits the release rather than starting at nothing"
         );
         drop(late);

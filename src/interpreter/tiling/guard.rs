@@ -3,16 +3,21 @@
 
 use std::collections::HashMap;
 
-use crate::interpreter::{Extent, Predicate, Tiling, Value};
+use crate::interpreter::{CurryLevel, Extent, Predicate, Tiling, Value};
 
 /// Specifies a sub-region of interest within a [`Tile`](crate::interpreter::Tile), used for
 /// demand-driven computation and incremental release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileGuard {
-    Scalar(bool),
+    /// A value with no keys of its own, named under the paths that reach it. The predicate
+    /// is `True` (under every path), `False` (under none), or `Qualified { enclosing, here:
+    /// True }`: under the enclosing paths `enclosing` admits, the value being the one cell
+    /// its path ends in ([leaf rows](TileGuard::leaf_rows)).
+    Scalar(Predicate),
     Record(HashMap<String, TileGuard>),
     Function(FunctionGuard),
-    Aggregation(bool),
+    /// An aggregate's result, named under the paths that reach it as [`Self::Scalar`] is.
+    Aggregation(Predicate),
     /// The union of multiple guards — matches anything admitted by any arm.
     ///
     /// Built where no single variant holds the union. A collection of collections is
@@ -28,6 +33,32 @@ pub enum TileGuard {
 }
 
 impl TileGuard {
+    /// A keyless leaf named under every path, or under none.
+    pub fn leaf(whole: bool) -> Predicate {
+        match whole {
+            true => Predicate::True,
+            false => Predicate::False,
+        }
+    }
+
+    /// The enclosing paths a keyless leaf's predicate names it under: `True` for every
+    /// path, `False` for none, and `enclosing` for `Qualified { enclosing, here: True }`.
+    ///
+    /// A leaf has no key of its own, so the only thing its predicate can say is which paths
+    /// above it reach a released cell, and only `Qualified` says that.
+    pub(crate) fn leaf_rows(pred: &Predicate) -> &Predicate {
+        match pred.split_qualification() {
+            (_, here) if here.is_false() => &Predicate::False,
+            (enclosing, here) => {
+                debug_assert!(
+                    here.is_true(),
+                    "a keyless leaf's predicate names its one cell whole or not at all: {pred:?}"
+                );
+                enclosing
+            }
+        }
+    }
+
     /// Whether this guard names `path`, one component per level from the outermost.
     ///
     /// A guard is a region of paths, and this is the region read at one of them — what a
@@ -51,9 +82,39 @@ impl TileGuard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 level < path.len() && pred.contains_path(&path[..=level])
             }
-            TileGuard::Function(FunctionGuard::Codomain(inner)) => inner.covers_at(path, level + 1),
-            TileGuard::Record(fields) => fields.values().any(|g| g.covers_at(path, level)),
-            TileGuard::Scalar(taken) | TileGuard::Aggregation(taken) => *taken,
+            // A key is there only through what it maps to, so a guard naming everything
+            // beneath a key names the key.
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => match path.len() > level + 1 {
+                true => inner.covers_at(path, level + 1),
+                false => inner.is_universal(),
+            },
+            // The fields stand over the same rows, so a row is released only where every
+            // field's part of it is. A path does not say which field it runs into, so a
+            // deeper one asks every field too.
+            TileGuard::Record(fields) => fields.values().all(|g| g.covers_at(path, level)),
+            // A keyless leaf at `level` stands under the path of the `level` keys above it.
+            TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => {
+                let rows = TileGuard::leaf_rows(pred);
+                rows.is_true() || (path.len() >= level && rows.contains_path(&path[..level]))
+            }
+        }
+    }
+
+    /// The keys of the outermost level this guard names whole: its `Domain` arm, in
+    /// canonical form ([`TileGuard::flatten_or`]), where every region naming a key's whole
+    /// value is spelled as that key.
+    ///
+    /// What a producer whose state is held by key acts on. The rest of the guard names parts
+    /// of values under keys it keeps, which it withholds from its output instead.
+    pub fn whole_keys(&self) -> Predicate {
+        match TileGuard::flatten_or(vec![self.clone()]) {
+            TileGuard::Function(FunctionGuard::Domain(pred)) => pred,
+            TileGuard::Or(arms) => arms.iter().fold(Predicate::False, |acc, arm| match arm {
+                TileGuard::Function(FunctionGuard::Domain(pred)) => acc.union(pred),
+                _ => acc,
+            }),
+            g if g.is_universal() => Predicate::True,
+            _ => Predicate::False,
         }
     }
 
@@ -65,11 +126,232 @@ impl TileGuard {
     pub fn names_a_path(&self) -> bool {
         match self {
             TileGuard::Function(FunctionGuard::Domain(pred)) => pred.qualifies(),
+            TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => pred.qualifies(),
             TileGuard::Function(FunctionGuard::Codomain(inner)) => inner.names_a_path(),
             TileGuard::Record(fields) => fields.values().any(TileGuard::names_a_path),
             TileGuard::Or(arms) => arms.iter().any(TileGuard::names_a_path),
-            _ => false,
         }
+    }
+}
+
+/// A chain of codomain steps restated at the highest level it names: an arm naming
+/// everything beneath some keys names those keys, since a key is there only through what it
+/// maps to.
+///
+/// `Codomain(Domain(Qualified(𝐸, True)))` is `Domain(𝐸)`, and a codomain step over a guard
+/// that names everything is `Domain(True)`. A lifted arm is lifted again, so a region whole
+/// at every depth beneath it rises to the level of its outermost keys. What an arm names
+/// only part of stays where it is. This is what gives a region one spelling, so
+/// [`Tile::remove_guarded`](crate::interpreter::Tile::remove_guarded) drops a key only
+/// where a domain guard names it, and [`TileGuard::covers_path`] reads the same region.
+fn lift(chain: TileGuard) -> Vec<TileGuard> {
+    fn wrap(depth: usize, guard: TileGuard) -> TileGuard {
+        (0..depth).fold(guard, |g, _| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
+        })
+    }
+    let mut depth: usize = 0;
+    let mut leaf = &chain;
+    while let TileGuard::Function(FunctionGuard::Codomain(inner)) = leaf {
+        depth += 1;
+        leaf = inner;
+    }
+    let Some(above) = depth.checked_sub(1) else {
+        return vec![chain];
+    };
+    if leaf.is_universal() {
+        return lift(wrap(
+            above,
+            TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
+        ));
+    }
+    let pred = match leaf {
+        TileGuard::Function(FunctionGuard::Domain(pred)) => pred,
+        // A keyless leaf names its cell under the paths above it, which are the keys of the
+        // level above, so the cell under a key is that key.
+        TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => {
+            let rows = TileGuard::leaf_rows(pred);
+            if rows.is_false() {
+                return vec![chain];
+            }
+            return lift(wrap(
+                above,
+                TileGuard::Function(FunctionGuard::Domain(rows.clone())),
+            ));
+        }
+        TileGuard::Record(fields) => return lift_record(fields, depth),
+        _ => return vec![chain],
+    };
+    let arms = match pred {
+        Predicate::Or(arms) => arms.clone(),
+        other => vec![other.clone()],
+    };
+    let (whole, part): (Vec<Predicate>, Vec<Predicate>) = arms
+        .into_iter()
+        .partition(|arm| matches!(arm, Predicate::Qualified { here, .. } if here.is_true()));
+    if whole.is_empty() {
+        return vec![chain];
+    }
+    let mut lifted: Vec<TileGuard> = whole
+        .into_iter()
+        .flat_map(|arm| {
+            let Predicate::Qualified { enclosing, .. } = arm else {
+                unreachable!("partitioned on the qualified arms")
+            };
+            lift(wrap(
+                above,
+                TileGuard::Function(FunctionGuard::Domain(*enclosing)),
+            ))
+        })
+        .collect();
+    if !part.is_empty() {
+        lifted.push(wrap(
+            depth,
+            TileGuard::Function(FunctionGuard::Domain(Predicate::flatten_or(part))),
+        ));
+    }
+    lifted
+}
+
+/// A record at `depth` codomain steps, restated with the keys above it that every field
+/// names whole as those keys: a key is released once every field under it is.
+///
+/// What the fields name beyond those keys stays as a record arm, less the keys the lifted
+/// arm names, so the two arms do not both name one region.
+fn lift_record(fields: &HashMap<String, TileGuard>, depth: usize) -> Vec<TileGuard> {
+    let record = || {
+        (0..depth).fold(TileGuard::Record(fields.clone()), |g, _| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
+        })
+    };
+    let whole = fields.values().fold(Predicate::True, |acc, field| {
+        acc.intersect(&whole_rows(field))
+    });
+    if whole.is_false() {
+        return vec![record()];
+    }
+    let mut covered = vec![Predicate::False; depth];
+    covered[depth - 1] = whole.clone();
+    let mut lifted = lift(
+        (0..depth - 1).fold(TileGuard::Function(FunctionGuard::Domain(whole)), |g, _| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
+        }),
+    );
+    let rest = TileGuard::Record(
+        fields
+            .iter()
+            .map(|(name, field)| (name.clone(), without_covered_keys(field.clone(), &covered)))
+            .collect(),
+    );
+    if !rest.is_empty() {
+        lifted.push((0..depth).fold(rest, |g, _| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
+        }));
+    }
+    lifted
+}
+
+/// The paths reaching `guard` under which it names everything: for a guard standing under
+/// a level, the keys of that level whose whole value it names.
+fn whole_rows(guard: &TileGuard) -> Predicate {
+    match guard {
+        g if g.is_universal() => Predicate::True,
+        g if g.is_empty() => Predicate::False,
+        TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => {
+            TileGuard::leaf_rows(pred).clone()
+        }
+        TileGuard::Function(FunctionGuard::Domain(pred)) => whole_under(pred),
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => whole_under(&whole_rows(inner)),
+        TileGuard::Record(fields) => fields.values().fold(Predicate::True, |acc, field| {
+            acc.intersect(&whole_rows(field))
+        }),
+        TileGuard::Or(arms) => arms
+            .iter()
+            .fold(Predicate::False, |acc, arm| acc.union(&whole_rows(arm))),
+    }
+}
+
+/// The enclosing paths under which `pred` admits every key: `True` for `True`, `enclosing`
+/// for an arm `Qualified { enclosing, here: True }`, and nothing for an arm admitting only
+/// some keys, since the keys still to come are not among them.
+fn whole_under(pred: &Predicate) -> Predicate {
+    match pred {
+        Predicate::Or(arms) => arms
+            .iter()
+            .fold(Predicate::False, |acc, arm| acc.union(&whole_under(arm))),
+        p if p.is_true() => Predicate::True,
+        Predicate::Qualified { enclosing, here } if here.is_true() => (**enclosing).clone(),
+        _ => Predicate::False,
+    }
+}
+
+/// `guard` without what the levels above it name whole, `covered[d]` being the keys of
+/// level `d` named whole ([`Predicate::without_covered`]).
+fn without_covered_keys(guard: TileGuard, covered: &[Predicate]) -> TileGuard {
+    let keep = |pred: Predicate| pred.without_covered(covered).unwrap_or(pred);
+    match guard {
+        TileGuard::Scalar(pred) => TileGuard::Scalar(keep(pred)),
+        TileGuard::Aggregation(pred) => TileGuard::Aggregation(keep(pred)),
+        TileGuard::Function(FunctionGuard::Domain(pred)) => {
+            TileGuard::Function(FunctionGuard::Domain(keep(pred)))
+        }
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+            let mut deeper = covered.to_vec();
+            deeper.push(Predicate::False);
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(without_covered_keys(
+                *inner, &deeper,
+            ))))
+        }
+        TileGuard::Record(fields) => TileGuard::Record(
+            fields
+                .into_iter()
+                .map(|(name, field)| (name, without_covered_keys(field, covered)))
+                .collect(),
+        ),
+        TileGuard::Or(arms) => TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| without_covered_keys(arm, covered))
+                .collect(),
+        ),
+    }
+}
+
+/// `guard`, released against an operator's output, restated for an input that shares the
+/// output's collection levels down to `levels` and holds different values beneath them.
+///
+/// `Domain` and `Codomain` steps through those levels name the same keys on both sides, so
+/// they pass through. Beneath them the two sides hold different things, so only a guard
+/// naming everything there translates, as `input_values`' universal guard: part of an
+/// output value names no part of the input value it came from. In canonical form
+/// ([`TileGuard::flatten_or`]) a region naming everything beneath a key is that key, so a
+/// guard reaching the values here names part of them, and the input's release waits for
+/// the key.
+pub(crate) fn through_shared_levels(guard: TileGuard, levels: usize, input: &Tiling) -> TileGuard {
+    fn walk(guard: TileGuard, depth: usize, levels: usize, input: &Tiling) -> TileGuard {
+        let values = || input.values_at(CurryLevel::new(depth));
+        if depth == levels {
+            return match guard.is_universal() {
+                true => values().universal_guard(),
+                false => values().empty_guard(),
+            };
+        }
+        match guard {
+            TileGuard::Or(arms) => TileGuard::flatten_or(
+                arms.into_iter()
+                    .map(|arm| walk(arm, depth, levels, input))
+                    .collect(),
+            ),
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+                FunctionGuard::Codomain(Box::new(walk(*inner, depth + 1, levels, input))),
+            ),
+            other => other,
+        }
+    }
+    match walk(TileGuard::flatten_or(vec![guard]), 0, levels, input) {
+        // The input's own empty guard, which for a collection is `Domain(False)`, however the
+        // walk came to name nothing.
+        g if g.is_empty() => input.empty_guard(),
+        g => g,
     }
 }
 
@@ -87,6 +369,8 @@ fn same_place(a: &TileGuard, b: &TileGuard) -> bool {
         // A record's fields are cells of their own, so two record guards union field by
         // field ([`TileGuard::union`]) whatever each field names.
         (TileGuard::Record(_), TileGuard::Record(_)) => true,
+        (TileGuard::Scalar(_), TileGuard::Scalar(_))
+        | (TileGuard::Aggregation(_), TileGuard::Aggregation(_)) => true,
         _ => false,
     }
 }
@@ -102,7 +386,9 @@ fn union_in_place(a: &TileGuard, b: &TileGuard) -> TileGuard {
             TileGuard::Function(FunctionGuard::Codomain(x)),
             TileGuard::Function(FunctionGuard::Codomain(y)),
         ) => TileGuard::Function(FunctionGuard::Codomain(Box::new(union_in_place(x, y)))),
-        (TileGuard::Record(_), TileGuard::Record(_)) => a.union(b),
+        (TileGuard::Record(_), TileGuard::Record(_))
+        | (TileGuard::Scalar(_), TileGuard::Scalar(_))
+        | (TileGuard::Aggregation(_), TileGuard::Aggregation(_)) => a.union(b),
         _ => unreachable!("only two guards naming one place are unioned this way"),
     }
 }
@@ -206,7 +492,7 @@ impl TileGuard {
                 other => vec![other],
             }
         }
-        let mut flat: Vec<TileGuard> = arms.into_iter().flat_map(chains).collect();
+        let mut flat: Vec<TileGuard> = arms.into_iter().flat_map(chains).flat_map(lift).collect();
         if let Some(everything) = flat.iter().find(|arm| arm.is_universal()) {
             return everything.clone();
         }
@@ -251,9 +537,9 @@ impl TileGuard {
     /// that is. `covers_at` and `check_from_under` thread it for the same reason.
     fn intersect_at(&self, other: &TileGuard, level: usize) -> TileGuard {
         match (self, other) {
-            (TileGuard::Scalar(u1), TileGuard::Scalar(u2)) => TileGuard::Scalar(*u1 && *u2),
-            (TileGuard::Aggregation(u1), TileGuard::Aggregation(u2)) => {
-                TileGuard::Aggregation(*u1 && *u2)
+            (TileGuard::Scalar(p), TileGuard::Scalar(q)) => TileGuard::Scalar(p.intersect(q)),
+            (TileGuard::Aggregation(p), TileGuard::Aggregation(q)) => {
+                TileGuard::Aggregation(p.intersect(q))
             }
             (TileGuard::Function(f1), TileGuard::Function(f2)) => {
                 TileGuard::Function(f1.intersect_at(f2, level))
@@ -281,15 +567,17 @@ impl TileGuard {
     /// throw an error.
     pub fn union(&self, other: &TileGuard) -> TileGuard {
         match (self, other) {
-            (TileGuard::Scalar(u1), TileGuard::Scalar(u2)) => TileGuard::Scalar(*u1 || *u2),
-            (TileGuard::Aggregation(u1), TileGuard::Aggregation(u2)) => {
-                TileGuard::Aggregation(*u1 || *u2)
+            (TileGuard::Scalar(p), TileGuard::Scalar(q)) => TileGuard::Scalar(p.union(q)),
+            (TileGuard::Aggregation(p), TileGuard::Aggregation(q)) => {
+                TileGuard::Aggregation(p.union(q))
             }
             // Two function guards whose shapes have no common arm stay side by side: an
             // `Or` names the union exactly, where an arm invented to hold the pair would
             // have to over- or under-approximate it.
+            // A merged arm can come to name everything beneath some keys, which is naming
+            // the keys, so it goes through the canonical form.
             (TileGuard::Function(f1), TileGuard::Function(f2)) => match f1.union(f2) {
-                Some(merged) => TileGuard::Function(merged),
+                Some(merged) => TileGuard::flatten_or(vec![TileGuard::Function(merged)]),
                 None => TileGuard::flatten_or(vec![self.clone(), other.clone()]),
             },
             // A record guard covers the cells of each field its map names, so two of
@@ -318,7 +606,7 @@ impl TileGuard {
 
     pub fn is_universal(&self) -> bool {
         match self {
-            TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => *universal,
+            TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => pred.as_bool() == Some(true),
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
             TileGuard::Function(g) => g.is_universal(),
             // Or is universal if any arm covers everything.
@@ -328,7 +616,7 @@ impl TileGuard {
 
     pub fn is_empty(&self) -> bool {
         match self {
-            TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => !*universal,
+            TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => pred.as_bool() == Some(false),
             // Record: empty only when every field guard is empty — i.e., there
             // is nothing to release from any field.  (Fields are managed
             // independently, so a guard with one empty field is still meaningful
@@ -374,8 +662,12 @@ impl TileGuard {
     /// reads it as unqualified and refuses it.
     fn check_from_under(&self, tiling: &Tiling, above: &[Extent]) -> bool {
         match (self, tiling) {
-            (TileGuard::Scalar(_), Tiling::Scalar(_)) => true,
-            (TileGuard::Aggregation(_), Tiling::Aggregation { .. }) => true,
+            // A keyless leaf names the paths above it and nothing of its own.
+            (TileGuard::Scalar(pred), Tiling::Scalar(_))
+            | (TileGuard::Aggregation(pred), Tiling::Aggregation { .. }) => {
+                let rows = TileGuard::leaf_rows(pred);
+                rows.as_bool().is_some() || rows.is_applicable_over(above)
+            }
 
             // DataFunction tilings can have domain guards which are always allowed, or
             // codomain guards which match their codomain tiling. A Store shares the
@@ -500,11 +792,10 @@ fn require_at(guard: TileGuard, p: &Predicate, at: usize, level: usize) -> TileG
                 .map(|(name, field)| (name, require_at(field, p, at, level)))
                 .collect(),
         ),
-        // A whole value under every key cannot be narrowed to the keys `p` admits: a scalar
-        // guard names no keys. Naming none of it releases less than the meet, which the
-        // consumer answers by delivering again rather than by losing data.
-        TileGuard::Scalar(_) => TileGuard::Scalar(false),
-        TileGuard::Aggregation(_) => TileGuard::Aggregation(false),
+        // A keyless leaf at `level` is named under the paths above it, so the requirement is
+        // conjoined where its chain reaches `at`, as for a key of that level.
+        TileGuard::Scalar(pred) => TileGuard::Scalar(require_level(&pred, p, at, level)),
+        TileGuard::Aggregation(pred) => TileGuard::Aggregation(require_level(&pred, p, at, level)),
     }
 }
 
@@ -600,6 +891,119 @@ mod tests {
     use crate::ccl::AggregateKind;
     use crate::interpreter::tiling::tests::*;
 
+    /// `domain_prefix` names every row before its head whole and the head's row up to its
+    /// tail, and a later prefix absorbs the earlier one's arm beneath a row now whole.
+    #[test]
+    fn a_domain_prefix_names_everything_up_to_its_path() {
+        let g = domain_prefix(vec![Value::UInt(1), Value::UInt(2)]);
+        let covers = |a: usize, b: usize| g.covers_path(&[Value::UInt(a), Value::UInt(b)]);
+        assert!(
+            covers(0, 0) && covers(0, 99),
+            "rows before the head, whole: {g:?}"
+        );
+        assert!(
+            covers(1, 0) && covers(1, 2),
+            "the head's row up to the tail: {g:?}"
+        );
+        assert!(!covers(1, 3), "past the tail: {g:?}");
+        assert!(!covers(2, 0), "rows after the head: {g:?}");
+        // A later prefix absorbs the earlier one's arm beneath a now-whole row.
+        let later = g.union(&domain_prefix(vec![Value::UInt(2), Value::UInt(0)]));
+        assert_eq!(
+            later,
+            TileGuard::Or(vec![
+                domain(Predicate::below(Value::UInt(2))),
+                codomain(domain(at(2, Predicate::at_or_below(Value::UInt(0))))),
+            ])
+        );
+    }
+
+    // ── TileGuard::covers_path: a key is there only through its values ───────
+
+    /// A guard naming everything beneath a key names the key; one naming part of what lies
+    /// beneath names only that part.
+    #[test]
+    fn a_codomain_guard_covers_a_key_only_when_it_names_everything_beneath() {
+        let k = [Value::UInt(2)];
+        let beneath = |j| [Value::UInt(2), Value::UInt(j)];
+        let everything = codomain(domain(Predicate::True));
+        assert!(everything.is_universal());
+        assert!(everything.covers_path(&k));
+        let part = codomain(domain(Predicate::at_or_below(Value::UInt(5))));
+        assert!(!part.covers_path(&k));
+        assert!(part.covers_path(&beneath(3)));
+        assert!(!part.covers_path(&beneath(9)));
+    }
+
+    /// A record's fields stand over the same rows, so a row is released only where every
+    /// field's part of it is.
+    #[test]
+    fn a_record_guard_covers_a_row_only_where_every_field_does() {
+        let k = [Value::UInt(0)];
+        let record = |xs: TileGuard| {
+            codomain(TileGuard::Record(HashMap::from([
+                ("n".to_string(), TileGuard::Scalar(Predicate::True)),
+                ("xs".to_string(), xs),
+            ])))
+        };
+        assert!(!record(domain(Predicate::False)).covers_path(&k));
+        assert!(record(domain(Predicate::True)).covers_path(&k));
+    }
+
+    // ── Canonical form: an arm naming everything beneath keys names the keys ──
+
+    /// A codomain arm naming everything beneath some keys is those keys, at every depth,
+    /// and an arm naming part of what lies beneath stays where it is.
+    #[test]
+    fn a_region_whole_beneath_keys_lifts_to_the_keys() {
+        let lifted = |g: TileGuard| TileGuard::flatten_or(vec![g]);
+        assert_eq!(
+            lifted(codomain(domain(Predicate::True))),
+            domain(Predicate::True)
+        );
+        assert_eq!(
+            lifted(codomain(domain(at(2, Predicate::True)))),
+            domain(Predicate::point(Value::UInt(2)))
+        );
+        let part = at(3, Predicate::at_or_below(Value::UInt(1)));
+        assert_eq!(
+            lifted(codomain(domain(Predicate::flatten_or(vec![
+                at(2, Predicate::True),
+                part.clone()
+            ])))),
+            TileGuard::Or(vec![
+                domain(Predicate::point(Value::UInt(2))),
+                codomain(domain(part.clone())),
+            ])
+        );
+        assert_eq!(
+            lifted(codomain(domain(part.clone()))),
+            codomain(domain(part))
+        );
+        // Whole beneath key 5 of row 0, two levels in, is key 5 of row 0 one level in.
+        let row0_key5 = at(0, Predicate::point(Value::UInt(5)));
+        assert_eq!(
+            lifted(codomain(codomain(domain(Predicate::qualified(
+                row0_key5.clone(),
+                Predicate::True
+            ))))),
+            codomain(domain(row0_key5))
+        );
+    }
+
+    /// Two releases that together name everything beneath a key name the key.
+    #[test]
+    fn releases_that_together_name_a_whole_group_name_its_key() {
+        let low = codomain(domain(at(0, Predicate::at_or_below(Value::UInt(1)))));
+        let high = codomain(domain(at(
+            0,
+            Predicate::True.minus(&Predicate::at_or_below(Value::UInt(1))),
+        )));
+        let both = low.union(&high);
+        assert_eq!(both, domain(Predicate::point(Value::UInt(0))));
+        assert!(both.covers_path(&[Value::UInt(0)]));
+    }
+
     // ── TileGuard::union: absorbing what a shallower arm names whole ─────────
 
     fn at(row: usize, positions: Predicate) -> Predicate {
@@ -681,19 +1085,20 @@ mod tests {
 
     #[test]
     fn guard_intersect_scalar_universal_universal() {
-        let g = TileGuard::Scalar(true).intersect(&TileGuard::Scalar(true));
+        let g = TileGuard::Scalar(Predicate::True).intersect(&TileGuard::Scalar(Predicate::True));
         assert!(g.is_universal());
     }
 
     #[test]
     fn guard_intersect_scalar_universal_empty() {
-        let g = TileGuard::Scalar(true).intersect(&TileGuard::Scalar(false));
+        let g = TileGuard::Scalar(Predicate::True).intersect(&TileGuard::Scalar(Predicate::False));
         assert!(g.is_empty());
     }
 
     #[test]
     fn guard_intersect_aggregation() {
-        let g = TileGuard::Aggregation(true).intersect(&TileGuard::Aggregation(true));
+        let g = TileGuard::Aggregation(Predicate::True)
+            .intersect(&TileGuard::Aggregation(Predicate::True));
         assert!(g.is_universal());
     }
 
@@ -831,18 +1236,18 @@ mod tests {
     #[test]
     fn guard_union_record_is_field_wise() {
         let g1 = record_guard(&[
-            ("a", TileGuard::Scalar(true)),
-            ("b", TileGuard::Scalar(false)),
+            ("a", TileGuard::Scalar(Predicate::True)),
+            ("b", TileGuard::Scalar(Predicate::False)),
         ]);
         let g2 = record_guard(&[
-            ("a", TileGuard::Scalar(false)),
-            ("b", TileGuard::Scalar(true)),
+            ("a", TileGuard::Scalar(Predicate::False)),
+            ("b", TileGuard::Scalar(Predicate::True)),
         ]);
         assert_eq!(
             g1.union(&g2),
             record_guard(&[
-                ("a", TileGuard::Scalar(true)),
-                ("b", TileGuard::Scalar(true)),
+                ("a", TileGuard::Scalar(Predicate::True)),
+                ("b", TileGuard::Scalar(Predicate::True)),
             ]),
         );
     }
@@ -852,19 +1257,19 @@ mod tests {
     /// what a consumer reading one field of a growing product does every pull.
     #[test]
     fn guard_union_record_accumulates_a_function_field() {
-        let first = record_guard(&[("n", TileGuard::Scalar(false)), ("xs", upto(0))]);
-        let second = record_guard(&[("n", TileGuard::Scalar(false)), ("xs", upto(2))]);
+        let first = record_guard(&[("n", TileGuard::Scalar(Predicate::False)), ("xs", upto(0))]);
+        let second = record_guard(&[("n", TileGuard::Scalar(Predicate::False)), ("xs", upto(2))]);
         assert_eq!(
             first.union(&second),
-            record_guard(&[("n", TileGuard::Scalar(false)), ("xs", upto(2))]),
+            record_guard(&[("n", TileGuard::Scalar(Predicate::False)), ("xs", upto(2))]),
         );
     }
 
     #[test]
     fn guard_union_record_identical_is_that_record() {
         let g = record_guard(&[
-            ("x", TileGuard::Scalar(true)),
-            ("y", TileGuard::Scalar(true)),
+            ("x", TileGuard::Scalar(Predicate::True)),
+            ("y", TileGuard::Scalar(Predicate::True)),
         ]);
         assert_eq!(g.union(&g), g);
     }
@@ -872,12 +1277,12 @@ mod tests {
     #[test]
     fn guard_union_record_is_universal_when_every_field_is() {
         let universal = record_guard(&[
-            ("a", TileGuard::Scalar(true)),
-            ("b", TileGuard::Scalar(true)),
+            ("a", TileGuard::Scalar(Predicate::True)),
+            ("b", TileGuard::Scalar(Predicate::True)),
         ]);
         let empty = record_guard(&[
-            ("a", TileGuard::Scalar(false)),
-            ("b", TileGuard::Scalar(false)),
+            ("a", TileGuard::Scalar(Predicate::False)),
+            ("b", TileGuard::Scalar(Predicate::False)),
         ]);
         assert!(empty.union(&universal).is_universal());
     }
@@ -885,8 +1290,8 @@ mod tests {
     #[test]
     fn guard_union_record_is_empty_when_every_field_is() {
         let empty = record_guard(&[
-            ("a", TileGuard::Scalar(false)),
-            ("b", TileGuard::Scalar(false)),
+            ("a", TileGuard::Scalar(Predicate::False)),
+            ("b", TileGuard::Scalar(Predicate::False)),
         ]);
         assert!(empty.union(&empty).is_empty());
     }
@@ -963,11 +1368,13 @@ mod tests {
 
     #[test]
     fn function_guard_intersect_codomain_codomain() {
-        let result = FunctionGuard::Codomain(Box::new(TileGuard::Scalar(true)))
-            .intersect(&FunctionGuard::Codomain(Box::new(TileGuard::Scalar(false))));
+        let result = FunctionGuard::Codomain(Box::new(TileGuard::Scalar(Predicate::True)))
+            .intersect(&FunctionGuard::Codomain(Box::new(TileGuard::Scalar(
+                Predicate::False,
+            ))));
         assert_eq!(
             result,
-            FunctionGuard::Codomain(Box::new(TileGuard::Scalar(false)))
+            FunctionGuard::Codomain(Box::new(TileGuard::Scalar(Predicate::False)))
         );
     }
 
@@ -990,26 +1397,31 @@ mod tests {
 
     #[test]
     fn check_from_scalar_matches_scalar_tiling() {
-        assert!(TileGuard::Scalar(true).check_from(&Tiling::Scalar(int())));
-        assert!(TileGuard::Scalar(false).check_from(&Tiling::Scalar(int())));
+        assert!(TileGuard::Scalar(Predicate::True).check_from(&Tiling::Scalar(int())));
+        assert!(TileGuard::Scalar(Predicate::False).check_from(&Tiling::Scalar(int())));
     }
 
     #[test]
     fn check_from_scalar_rejects_non_scalar_tiling() {
-        assert!(!TileGuard::Scalar(true).check_from(&scalar_function(int(), bool_ext())));
-        assert!(!TileGuard::Scalar(true).check_from(&agg_tiling()));
+        assert!(
+            !TileGuard::Scalar(Predicate::True).check_from(&scalar_function(int(), bool_ext()))
+        );
+        assert!(!TileGuard::Scalar(Predicate::True).check_from(&agg_tiling()));
     }
 
     #[test]
     fn check_from_aggregation_matches_aggregation_tiling() {
-        assert!(TileGuard::Aggregation(true).check_from(&agg_tiling()));
-        assert!(TileGuard::Aggregation(false).check_from(&agg_tiling()));
+        assert!(TileGuard::Aggregation(Predicate::True).check_from(&agg_tiling()));
+        assert!(TileGuard::Aggregation(Predicate::False).check_from(&agg_tiling()));
     }
 
     #[test]
     fn check_from_aggregation_rejects_non_aggregation_tiling() {
-        assert!(!TileGuard::Aggregation(true).check_from(&Tiling::Scalar(int())));
-        assert!(!TileGuard::Aggregation(true).check_from(&scalar_function(int(), bool_ext())));
+        assert!(!TileGuard::Aggregation(Predicate::True).check_from(&Tiling::Scalar(int())));
+        assert!(
+            !TileGuard::Aggregation(Predicate::True)
+                .check_from(&scalar_function(int(), bool_ext()))
+        );
     }
 
     #[test]
@@ -1031,14 +1443,14 @@ mod tests {
     #[test]
     fn check_from_function_codomain_scalar_against_a_one_level_tiling() {
         // Codomain(Scalar) is valid when the function's codomain is a scalar.
-        let g = codomain_guard(TileGuard::Scalar(true));
+        let g = codomain_guard(TileGuard::Scalar(Predicate::True));
         assert!(g.check_from(&scalar_function(int(), bool_ext())));
     }
 
     #[test]
     fn check_from_function_codomain_wrong_shape_against_a_one_level_tiling() {
         // Codomain(Aggregation) against a function with scalar codomain must fail.
-        let g = codomain_guard(TileGuard::Aggregation(true));
+        let g = codomain_guard(TileGuard::Aggregation(Predicate::True));
         assert!(!g.check_from(&scalar_function(int(), bool_ext())));
     }
 
@@ -1058,7 +1470,7 @@ mod tests {
     #[test]
     fn check_from_function_codomain_scalar_rejects_a_two_level_tiling() {
         // Codomain(Scalar) is not a valid guard shape for a Function.
-        let g = codomain_guard(TileGuard::Scalar(true));
+        let g = codomain_guard(TileGuard::Scalar(Predicate::True));
         assert!(!g.check_from(&two_level(range(4), int(), int())));
     }
 
@@ -1073,8 +1485,8 @@ mod tests {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int())), ("y", agg_tiling())]);
         let guard = TileGuard::Record(
             [
-                ("x".to_string(), TileGuard::Scalar(true)),
-                ("y".to_string(), TileGuard::Aggregation(false)),
+                ("x".to_string(), TileGuard::Scalar(Predicate::True)),
+                ("y".to_string(), TileGuard::Aggregation(Predicate::False)),
             ]
             .into(),
         );
@@ -1085,7 +1497,8 @@ mod tests {
     fn check_from_record_rejects_missing_key() {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int())), ("y", Tiling::Scalar(int()))]);
         // Guard only has "x", not "y".
-        let guard = TileGuard::Record([("x".to_string(), TileGuard::Scalar(true))].into());
+        let guard =
+            TileGuard::Record([("x".to_string(), TileGuard::Scalar(Predicate::True))].into());
         assert!(!guard.check_from(&tiling));
     }
 
@@ -1093,7 +1506,8 @@ mod tests {
     fn check_from_record_rejects_wrong_field_shape() {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int()))]);
         // "x" field guard is Aggregation but tiling says Scalar.
-        let guard = TileGuard::Record([("x".to_string(), TileGuard::Aggregation(true))].into());
+        let guard =
+            TileGuard::Record([("x".to_string(), TileGuard::Aggregation(Predicate::True))].into());
         assert!(!guard.check_from(&tiling));
     }
 
@@ -1102,8 +1516,8 @@ mod tests {
         let tiling = record_tiling(&[("x", Tiling::Scalar(int()))]);
         let guard = TileGuard::Record(
             [
-                ("x".to_string(), TileGuard::Scalar(true)),
-                ("y".to_string(), TileGuard::Scalar(true)),
+                ("x".to_string(), TileGuard::Scalar(Predicate::True)),
+                ("y".to_string(), TileGuard::Scalar(Predicate::True)),
             ]
             .into(),
         );
@@ -1113,7 +1527,10 @@ mod tests {
     #[test]
     fn check_from_or_all_arms_compatible() {
         let tiling = Tiling::Scalar(int());
-        let guard = TileGuard::Or(vec![TileGuard::Scalar(true), TileGuard::Scalar(false)]);
+        let guard = TileGuard::Or(vec![
+            TileGuard::Scalar(Predicate::True),
+            TileGuard::Scalar(Predicate::False),
+        ]);
         assert!(guard.check_from(&tiling));
     }
 
@@ -1121,7 +1538,52 @@ mod tests {
     fn check_from_or_rejects_when_any_arm_incompatible() {
         let tiling = Tiling::Scalar(int());
         // Second arm is an Aggregation guard, which does not match a Scalar tiling.
-        let guard = TileGuard::Or(vec![TileGuard::Scalar(true), TileGuard::Aggregation(true)]);
+        let guard = TileGuard::Or(vec![
+            TileGuard::Scalar(Predicate::True),
+            TileGuard::Aggregation(Predicate::True),
+        ]);
         assert!(!guard.check_from(&tiling));
+    }
+
+    /// Two selectors' releases of one product beneath a level meet exactly: `a`'s cell under
+    /// row 0, named by the row above it, and the `xs` keys released under row 0.
+    #[test]
+    fn a_keyless_field_meets_under_the_rows_above_it() {
+        let row0 = Predicate::at_or_below(Value::UInt(0));
+        let xs_keys = at(0, Predicate::at_or_below(Value::String("b".into())));
+        let a_reader = TileGuard::flatten_or(vec![
+            domain(row0.clone()),
+            codomain(record_guard(&[
+                ("a", TileGuard::Scalar(Predicate::False)),
+                ("xs", domain(Predicate::True)),
+            ])),
+        ]);
+        let xs_reader = codomain(record_guard(&[
+            ("a", TileGuard::Scalar(Predicate::True)),
+            ("xs", domain(xs_keys.clone())),
+        ]));
+        assert_eq!(
+            a_reader.intersect(&xs_reader),
+            codomain(record_guard(&[
+                (
+                    "a",
+                    TileGuard::Scalar(Predicate::qualified(row0, Predicate::True))
+                ),
+                ("xs", domain(xs_keys)),
+            ])),
+        );
+    }
+
+    /// A record whose every field is whole under a row names that row: a key is released
+    /// once every field under it is.
+    #[test]
+    fn a_record_whole_under_a_row_is_that_row() {
+        let row0 = Predicate::at_or_below(Value::UInt(0));
+        let whole_under_row0 = Predicate::qualified(row0.clone(), Predicate::True);
+        let g = codomain(record_guard(&[
+            ("a", TileGuard::Scalar(whole_under_row0.clone())),
+            ("xs", domain(whole_under_row0)),
+        ]));
+        assert_eq!(TileGuard::flatten_or(vec![g]), domain(row0));
     }
 }

@@ -152,7 +152,9 @@ fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
         // its own tag; the arms stay keyed by tag so a downstream consumer can
         // split per-variant releases back to their source sub-extents by name
         // rather than relying on two arm vectors staying in the same order.
-        Extent::Union(arms) => Predicate::Union(arms.map(|_, e| get_iterate_extent_predicate(e))),
+        Extent::Union(arms) => {
+            Predicate::over_every_tag(arms.map(|_, e| get_iterate_extent_predicate(e)))
+        }
         _ => Predicate::True,
     }
 }
@@ -251,13 +253,13 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
             // arm releases its own sub-extent. Pairing positionally would release
             // the wrong sub-extent whenever the predicate covers a different tag
             // set than the extent — which width subtyping makes legal.
-            Predicate::Union(pred_arms) => {
+            Predicate::Union { .. } => {
                 for (tag, e) in ext_arms.iter_mut() {
-                    // A tag the predicate does not mention is unconstrained, so
-                    // nothing of it is released.
-                    if let Some(arm) = pred_arms.get(tag) {
-                        release_extent(e, arm, releaser);
-                    }
+                    // A tag the predicate does not name releases what its `rest` says.
+                    let arm = pred
+                        .under_tag(tag)
+                        .unwrap_or_else(|| unreachable!("matched as a union predicate"));
+                    release_extent(e, &arm, releaser);
                 }
             }
             _ => todo!("Got {pred:?} for Union extent"),
