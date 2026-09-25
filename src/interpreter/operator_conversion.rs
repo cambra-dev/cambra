@@ -2040,6 +2040,20 @@ fn convert_impl_inner(
             ))
         }
 
+        // `by_commit_time` heads a reply tap binding, which letrec pattern recognition
+        // consumes whole (a read of the tap becomes a read of the store's field). Reaching
+        // this arm means a transactional `LetRec` group escaped recognition.
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::ByCommitTime) =>
+        {
+            Err(ConversionError::Unsupported(
+                "by_commit_time (a reply tap's re-keying by commit time) reached operator \
+                 conversion — letrec pattern recognition (the unified phase, \
+                 src/ccl/design/mutability.md) must consume it before this pass"
+                    .into(),
+            ))
+        }
+
         // `as_of_read` is a fed-out mutable variable read still missing its position, and
         // `rewrite_as_of_reads` pairs every one with its reading loop to build the `AsOf`
         // join. Reaching this arm means one was never paired and the check at the end of

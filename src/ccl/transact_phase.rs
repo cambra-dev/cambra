@@ -2719,13 +2719,13 @@ fn record_field_ty(ty: &Type, field: &str) -> Type {
     }
 }
 
-/// A hoisted in-block feed: the target defer and the tap binding (`Fun(𝐼, V)`
-/// over its site's commit-record stream) whose per-commit values feed it.
+/// A hoisted in-block feed: the target defer and the tap binding (``Txn ⤇ {`fired{𝑉} |
+/// `idle}``, its site's commit records keyed by commit time) whose per-commit values feed it.
 /// `recognize` maps a read of `tap` to the history record's tap field.
 struct HoistedFeed {
     defer: Name,
     tap: Name,
-    /// The raw tap stream's type — `` 𝐼 ⇒ {`fired{𝑉} | `idle} ``, as the decision
+    /// The raw tap stream's type — `` Txn ⤇ {`fired{𝑉} | `idle} ``, as the decision
     /// carries it.
     tap_ty: Type,
     /// The fed value type `𝑉`, which the channel carries after `` `fired `` is
@@ -2745,7 +2745,8 @@ struct HoistedFeed {
 ///   (verbatim) applied to the mutable variable snapshot `(hist_rk(begin(r)) …,
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
-/// - one **tap** binding per in-block feed — `commits_j ≫ .decision ≫ .field`.
+/// - one **tap** binding per in-block feed — ``(commits_j ▷ by_commit_time) ≫ .decision ≫
+///   variant_project(`commit) ≫ .field``, keyed by commit time.
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
 /// `final_or_default(hist_x, init)` read over its history and hoists each
@@ -2890,20 +2891,31 @@ fn plan_store(
         ));
 
         // One tap binding per in-block feed:
-        // `commits_j ≫ .decision ≫ variant_project(`commit) ≫ .field`, the
-        // per-commit tap stream — the tap rides the (dense) `commit` payload, so
-        // eliminate the `` {`commit{𝑃} | `abort} `` decision before the field read.
-        // recognition maps its ref to the history record's `field` tap. Emitted in
-        // feed (source) order across sites.
+        // `(commits_j ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .field`,
+        // the per-commit tap stream. `by_commit_time` keys the site's commit records by
+        // the commit time each carries, which is the key the store serves a reply under.
+        // The tap rides the (dense) `commit` payload, so the `` {`commit{𝑃} | `abort} ``
+        // decision is eliminated before the field read. Recognition maps a read of the
+        // tap to the history record's `field` tap. Emitted in feed (source) order across
+        // sites.
         let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(&decision_ty);
         let commits_ty = Type::data_fun(dom.clone(), rec_ty.clone());
+        let by_time_ty = Type::data_fun(Type::Txn, rec_ty.clone());
         for f in feeds {
             let tap_name = Name::fresh(f.field.clone());
             // The tap is the commit log read through the field, so it is a collection at
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
             let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value_ty.clone());
-            let tap_ty = Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone());
+            let tap_ty = Type::fun_like(&by_time_ty, Type::Txn, tap_value_ty.clone());
+            let by_time = apply_ty(
+                tvar(&commits[j], commits_ty.clone()),
+                builtin_ty(
+                    Builtin::ByCommitTime,
+                    Type::fun(commits_ty.clone(), by_time_ty.clone()),
+                ),
+                by_time_ty.clone(),
+            );
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
             let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
@@ -2914,12 +2926,7 @@ fn plan_store(
             // hoist below, where the channel wants the fed value.
             let mut field_proj = Expr::proj_field(f.field.clone());
             field_proj.ty = Type::fun(payload_ty.clone(), tap_value_ty.clone());
-            let mut tap_expr = Expr::compose(vec![
-                tvar(&commits[j], commits_ty.clone()),
-                dec_proj,
-                vp,
-                field_proj,
-            ]);
+            let mut tap_expr = Expr::compose(vec![by_time, dec_proj, vp, field_proj]);
             tap_expr.ty = tap_ty.clone();
             tap_bindings.push((binding(tap_name.clone(), tap_ty.clone()), tap_expr));
             hoisted.push(HoistedFeed {

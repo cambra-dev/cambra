@@ -545,9 +545,14 @@ fn progress_feed_inside_tx() {
 /// the engine appends nothing for a `commit: false` decision. 70 commits (pool →
 /// 30, reply 30); 50 fails `30 >= 50` → deny, no tick. So `out` is [30] at tick
 /// 1 alone.
+///
+/// The reply is keyed by its commit time, so its key has type `Txn` and not the loop's
+/// position type.
 #[test]
 fn progress_feed_grant_deny() {
-    check_tile(
+    let mut ctx = GlobalContext::default();
+    let (ast, tile) = run_pipeline_with_ctx(
+        &mut ctx,
         indoc! {r#"
             out = defer()
             pool: Mut(Int, Txn) := 100
@@ -558,8 +563,9 @@ fn progress_feed_grant_deny() {
                         out << pool
             out
         "#},
-        commit_stream(&[1], &[30]),
     );
+    assert_eq!(ast.ty.to_string(), "(Txn ⤇ Int)");
+    assert_eq!(tile, commit_stream(&[1], &[30]));
 }
 
 // ---------------------------------------------------------------------------
@@ -669,7 +675,7 @@ fn reply_feed_under_one_route_does_not_overfire() {
 /// and replies on `out`. Both taps ride the same commit but must fire only on
 /// their own route — each carries its own `__fire` gate. x=1 → else (a += 100,
 /// out << 0); x=2 → if (a += 2, out << 2); x=3 → if (a += 3, out << 3). Every
-/// position commits (both arms write), so `out` is [0, 2, 3] over domain [0,1,2].
+/// position commits (both arms write), so `out` is [0, 2, 3] keyed by commit time.
 #[test]
 fn both_arms_feed_in_committing_block() {
     check_tile(
