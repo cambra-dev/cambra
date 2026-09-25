@@ -604,10 +604,10 @@ pub trait TileProducer {
         // producer's inputs, whose own `get` borrows the same probe table, and a
         // borrow held across that call overlaps the inner one.
         if let Some(probes) = self.base().probes.clone() {
-            let (node_id, producer_id, name) = (self.base().node_id, self.base().id, self.name());
+            let (node_id, producer_id) = (self.base().node_id, self.base().id);
             probes
                 .borrow_mut()
-                .observe(node_id, producer_id, &name, &result);
+                .observe_named(node_id, producer_id, || self.name(), &result);
         }
         result
     }

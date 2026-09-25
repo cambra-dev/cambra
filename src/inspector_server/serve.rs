@@ -199,6 +199,12 @@ pub fn serve_compiled(
     Ok(channel)
 }
 
+/// The path a request URL routes on: the URL without its query string, so a
+/// cache-busting `?t=…` reaches the same route.
+fn route(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(path, _)| path)
+}
+
 /// Answer requests against pre-rendered bodies until the process is killed.
 fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io::Result<()> {
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
@@ -210,7 +216,7 @@ fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io:
     for request in server.incoming_requests() {
         // The live route takes the socket rather than answering on it, so it is
         // matched before the bodies below, which respond and drop.
-        if request.url() == LIVE_PATH {
+        if route(request.url()) == LIVE_PATH {
             if let Err(e) = live.accept(request) {
                 eprintln!("cambra: live upgrade failed: {e}");
             }
@@ -219,7 +225,7 @@ fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io:
         // `bodies` and `INDEX_HTML` both outlive the loop, so a response
         // borrows: the snapshot is megabytes on a large program and the bundle
         // is a quarter of one, and every request would otherwise copy it.
-        let (body, status, header) = match request.url() {
+        let (body, status, header) = match route(request.url()) {
             "/api/snapshot" => (bodies.snapshot.as_bytes(), 200, json_header()),
             "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
             "/" | "/index.html" => (INDEX_HTML.as_bytes(), 200, html_header()),
@@ -331,5 +337,12 @@ mod tests {
             bad_diag["diagnostics"], bad_snap["diagnostics"],
             "the degraded snapshot's diagnostics equal the diagnostics endpoint's"
         );
+    }
+
+    #[test]
+    fn a_query_string_does_not_change_the_route() {
+        assert_eq!(route("/api/live?t=1"), LIVE_PATH);
+        assert_eq!(route("/api/snapshot"), "/api/snapshot");
+        assert_eq!(route("/?"), "/");
     }
 }
