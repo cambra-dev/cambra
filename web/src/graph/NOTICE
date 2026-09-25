@@ -1,0 +1,17 @@
+This directory vendors no source, but `elk.ts` imports elkjs, which is licensed
+under the Eclipse Public License 2.0 with a secondary licence under the GNU
+General Public License 3.0 or later. The rest of this repository is Apache-2.0.
+
+    elkjs — https://github.com/kieler/elkjs
+    Copyright (c) 2017 Kiel University and others
+    EPL-2.0 OR GPL-3.0-or-later
+
+The distribution obligation is the repository's `NOTICE`, which `vite.config.ts`
+copies into `dist/index.html`: that bundle is committed and embedded in the
+binary, so it ships elkjs in object form.
+
+The dependency is confined to this directory. `layout.ts` states the contract
+with no reference to elkjs, and `operatorView.ts` takes a `GraphLayout` rather
+than constructing one, so `elk.ts` is imported once outside this directory —
+where `main.ts` mounts the pane. Replacing the engine replaces `elk.ts` and that
+one import.
