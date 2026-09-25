@@ -16,7 +16,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     thread,
 };
@@ -46,29 +46,33 @@ pub const LIVE_PATH: &str = "/api/live";
 struct Latest {
     /// The newest frame and the count it was published as, as one value.
     ///
-    /// Held together because a reader taking them separately could pair a frame
+    /// Held together because a writer taking them separately could pair a frame
     /// with a later count: `send` bumps the count, renders, and only then
-    /// stores, so a broadcaster waking in between would mark a connection as
-    /// holding a frame it was never sent — and the real one is then skipped as
+    /// stores, so a writer waking in between would mark its connection as
+    /// holding a frame it was never sent. The real one would then be skipped as
     /// already delivered, leaving that reader a frame behind for the rest of
     /// the run.
     frame: Mutex<Option<(String, u64)>>,
     published: AtomicU64,
 }
 
+/// The wake handle of every connection's writer thread.
+///
+/// Each channel has capacity one and is only ever `try_send`-ed, so a publish
+/// never blocks on a connection. A full channel means a wake is already
+/// pending, and the writer reads the newest frame when it takes it.
+type Connections = Arc<Mutex<Vec<SyncSender<()>>>>;
+
 /// A handle the driver publishes through.
 #[derive(Clone)]
 pub struct LiveChannel {
     latest: Arc<Latest>,
-    wake: Sender<()>,
+    connections: Connections,
 }
 
 impl LiveChannel {
-    /// Render the probe table's current state and hand it to the broadcaster.
-    ///
-    /// Called from the driver's per-tick hook, which sits between the pull and
-    /// the release, so a source's retained window is sampled before anything is
-    /// dropped from it.
+    /// Render the probe table's current state and wake every connection's
+    /// writer.
     pub fn publish_probes(&self, probes: &SharedProbeTable, sources: &[SourceWindow], tick: u64) {
         self.send(probes, sources, tick, false);
     }
@@ -77,8 +81,8 @@ impl LiveChannel {
     ///
     /// Without it a converged run is indistinguishable from one that is merely
     /// idle: the process parks after the run so the socket stays open and
-    /// simply goes quiet. A reader cannot infer "nothing more will ever arrive"
-    /// from silence, so the run says so.
+    /// goes quiet. A reader cannot infer "nothing more will ever arrive" from
+    /// silence, so the run says so.
     pub fn publish_final_probes(
         &self,
         probes: &SharedProbeTable,
@@ -104,10 +108,7 @@ impl LiveChannel {
             final_frame,
         );
         *self.latest.frame.lock().expect("live frame lock") = Some((frame, published));
-        // A full channel or a dead broadcaster must not stall the driver, so a
-        // failed wake is dropped: the next publish wakes the same reader with
-        // newer state anyway.
-        let _ = self.wake.send(());
+        wake_all(&self.connections);
     }
 
     /// Frames published so far, for tests and for a client asking whether it is
@@ -117,49 +118,32 @@ impl LiveChannel {
     }
 }
 
-/// The connections a broadcast writes to.
-/// A connection, and the `published` count of the last frame written to it.
-///
-/// The count is what makes delivery at-most-once per frame. `accept` wakes the
-/// broadcaster so a newcomer is served without `accept` writing anything
-/// itself, and that wake can be handled after a publish has already stored its
-/// frame — so without a per-connection mark the same frame reaches an
-/// established reader twice, and a reader that takes one frame per publish
-/// falls a frame behind for the rest of the run.
-struct Connection {
-    socket: WebSocket<Box<dyn ReadWrite + Send>>,
-    sent: u64,
+/// Wake every connection's writer, and forget the ones whose writer has
+/// exited. Never blocks: the lock is held only across `try_send`s.
+fn wake_all(connections: &Connections) {
+    connections
+        .lock()
+        .expect("live connections lock")
+        .retain(|wake| match wake.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => true,
+            Err(TrySendError::Disconnected(())) => false,
+        });
 }
 
-type Connections = Arc<Mutex<Vec<Connection>>>;
-
-/// The live channel and the registry its broadcaster writes to.
+/// The live channel and the connections it wakes.
 pub struct LiveServer {
     channel: LiveChannel,
-    connections: Connections,
 }
 
 impl LiveServer {
-    /// Start the broadcaster and return the server.
-    ///
-    /// The broadcaster blocks on its wakeup channel, so it costs nothing while
-    /// the program is idle — unlike the driver, which spins.
+    /// Create the server. It spawns nothing until a client connects.
     pub fn start() -> Self {
-        let (wake, woken) = channel();
-        let latest = Arc::new(Latest::default());
-        let connections: Connections = Arc::new(Mutex::new(Vec::new()));
-        let server = Self {
+        Self {
             channel: LiveChannel {
-                latest: Arc::clone(&latest),
-                wake,
+                latest: Arc::new(Latest::default()),
+                connections: Arc::new(Mutex::new(Vec::new())),
             },
-            connections: Arc::clone(&connections),
-        };
-        thread::Builder::new()
-            .name("cambra-live-broadcast".to_string())
-            .spawn(move || broadcast_loop(&woken, &latest, &connections))
-            .expect("spawning the live broadcaster");
-        server
+        }
     }
 
     /// The handle to publish through.
@@ -167,7 +151,8 @@ impl LiveServer {
         self.channel.clone()
     }
 
-    /// Answer a request on [`LIVE_PATH`] by taking its socket into the registry.
+    /// Answer a request on [`LIVE_PATH`] by upgrading it and starting a writer
+    /// thread for the socket.
     ///
     /// A request carrying no `Sec-WebSocket-Key` is not an upgrade, and gets a
     /// 400 rather than being left hanging — a plain `GET /api/live` from a
@@ -188,28 +173,23 @@ impl LiveServer {
         let socket = request.upgrade("websocket", response);
         let websocket =
             WebSocket::from_raw_socket(socket, Role::Server, Some(WebSocketConfig::default()));
-        // Register first, then ask the broadcaster for the current state, which
-        // a newcomer needs because the next tick never comes on a converged
-        // program. Writing it here instead cost two things. The frame lock would
-        // be held across the write: `if let` holds the guard for the whole
-        // let-chain, `send` is a blocking write-then-flush with no timeout, and
-        // the lock a stalled client pins is the one `LiveChannel::send` takes on
-        // the driver thread — so one client that never reads halts the
-        // interpreter. And a publish landing between that write and this push
-        // reached a socket the registry did not hold yet; latest-wins means it
-        // was never resent, so a client could miss the `final` frame and sit on
-        // a run that says more is coming.
-        //
-        // The wake costs every other connection a repeat of the frame it
-        // already holds, which is a frame-shaped no-op: a frame is whole state.
-        self.connections
+        let (wake, woken) = sync_channel(1);
+        let latest = Arc::clone(&self.channel.latest);
+        thread::Builder::new()
+            .name("cambra-live-writer".to_string())
+            .spawn(move || write_loop(websocket, &woken, &latest))?;
+        // Register, then wake the writer once itself. A newcomer needs the
+        // current frame because the next publish never comes on a converged
+        // program. Registering before that wake means a publish landing now
+        // wakes the writer too, so the newest frame, including a `final` one,
+        // always reaches it.
+        let mut connections = self
+            .channel
+            .connections
             .lock()
-            .expect("live connections lock")
-            .push(Connection {
-                socket: websocket,
-                sent: 0,
-            });
-        let _ = self.channel.wake.send(());
+            .expect("live connections lock");
+        let _ = wake.try_send(());
+        connections.push(wake);
         Ok(())
     }
 
@@ -218,44 +198,44 @@ impl LiveServer {
         self.channel.published()
     }
 
-    /// Connections currently held.
+    /// Connections whose writer has not been seen to exit.
     pub fn connection_count(&self) -> usize {
-        self.connections
+        self.channel
+            .connections
             .lock()
             .expect("live connections lock")
             .len()
     }
 }
 
-/// Write each published frame to every connection, dropping the ones that fail.
-fn broadcast_loop(woken: &Receiver<()>, latest: &Arc<Latest>, connections: &Connections) {
+/// Write the newest frame to one socket each time it is woken, until a write
+/// fails or the server goes away.
+///
+/// One thread per connection, so a client that stops reading blocks only its
+/// own writer. `sent` is the `published` count of the last frame written, which
+/// makes delivery at-most-once per frame: a wake that finds no newer frame
+/// writes nothing, so a reader taking one frame per publish never reads a
+/// repeat and falls a frame behind.
+fn write_loop(
+    mut socket: WebSocket<Box<dyn ReadWrite + Send>>,
+    woken: &Receiver<()>,
+    latest: &Latest,
+) {
+    let mut sent = 0;
     while woken.recv().is_ok() {
-        // Read the count under the same lock as the frame it belongs to, so a
-        // connection's mark names the frame it actually received.
+        // The count is read under the same lock as the frame it belongs to, so
+        // `sent` names the frame actually written.
         let Some((frame, published)) = latest.frame.lock().expect("live frame lock").clone() else {
             continue;
         };
-        // Collect under the lock and write after releasing it, so one slow
-        // client cannot hold the lock the driver's next publish needs. The same
-        // discipline `HttpServerSharedState` uses at its own I/O boundary.
-        let mut held = std::mem::take(&mut *connections.lock().expect("live connections lock"));
-        held.retain_mut(|conn| {
-            if conn.sent >= published {
-                return true;
-            }
-            match conn.socket.send(Message::Text(frame.clone().into())) {
-                Ok(()) => {
-                    conn.sent = published;
-                    true
-                }
-                Err(e) => {
-                    log::debug!("live: dropping a connection: {e}");
-                    false
-                }
-            }
-        });
-        let mut registry = connections.lock().expect("live connections lock");
-        registry.append(&mut held);
+        if published <= sent {
+            continue;
+        }
+        if let Err(e) = socket.send(Message::Text(frame.into())) {
+            log::debug!("live: dropping a connection: {e}");
+            return;
+        }
+        sent = published;
     }
 }
 
@@ -517,11 +497,10 @@ mod tests {
     /// A newcomer's arrival does not re-deliver a frame an established reader
     /// already has.
     ///
-    /// `accept` wakes the broadcaster rather than writing the held frame
-    /// itself, and that wake is indistinguishable from a publish's. Without a
-    /// per-connection mark the wake re-sends the current frame to everyone, so
-    /// a reader taking one frame per publish reads a repeat and is a frame
-    /// behind for the rest of the run.
+    /// A writer woken with no newer frame writes nothing. Without that check,
+    /// a wake that finds the frame the reader already holds re-sends it, and a
+    /// reader taking one frame per publish reads a repeat and is a frame behind
+    /// for the rest of the run.
     #[test]
     fn a_second_connection_does_not_re_deliver_the_frame_the_first_holds() {
         let live = Arc::new(LiveServer::start());
@@ -544,7 +523,7 @@ mod tests {
         .expect("the publishing thread");
         assert_eq!(read_frame(&mut first)["tick"], 1);
 
-        // The second arrival wakes the broadcaster; the first reader is current.
+        // The second arrival is served its own frame; the first reader is current.
         let _second = connect(port);
         for _ in 0..100 {
             if live.connection_count() == 2 {
@@ -565,15 +544,10 @@ mod tests {
         assert_eq!(read_frame(&mut first)["tick"], 2);
     }
 
-    /// A connection is in the registry before anything is written to it.
-    ///
-    /// `accept` used to send the held frame first and register afterwards, which
-    /// cost two things. A publish landing in that window wrote to a registry the
-    /// socket was not in yet, and latest-wins meant it was never resent — so a
-    /// client could miss the `final` frame and sit forever on a run that says
-    /// more is coming. And the send held the frame lock, which is the lock
-    /// `LiveChannel::send` takes on the driver thread, so a client that never
-    /// read could stall the interpreter.
+    /// A connection is registered before anything is written to it, so a
+    /// publish that lands while it connects still wakes its writer. Latest-wins
+    /// never resends a frame, so a connection registered after a publish could
+    /// miss the `final` frame and sit on a run that says more is coming.
     #[test]
     fn a_connection_is_registered_before_any_frame_is_written_to_it() {
         let live = Arc::new(LiveServer::start());
@@ -637,6 +611,49 @@ mod tests {
             !frame["nodes"].as_array().expect("nodes").is_empty(),
             "operators still ship in the same frame"
         );
+    }
+
+    /// A client that stops reading blocks only its own writer. Each frame here
+    /// is several megabytes, so the stalled socket's buffers fill within the
+    /// first few, and a single writer serving every connection would stop
+    /// there for all of them.
+    #[test]
+    fn a_client_that_stops_reading_does_not_stall_another() {
+        const FRAMES: u64 = 6;
+        let live = Arc::new(LiveServer::start());
+        let port = serve_live(Arc::clone(&live));
+        let _stalled = connect(port);
+        let mut reader = connect(port);
+        for _ in 0..100 {
+            if live.connection_count() == 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let channel = live.channel();
+        thread::spawn(move || {
+            let probes = Rc::new(RefCell::new(ProbeTable::with_defaults()));
+            let (node, big) = (NodeId::fresh(), "x".repeat(4 << 20));
+            for tick in 1..=FRAMES {
+                // One probe, re-read each tick, so every frame is one big row.
+                probes.borrow_mut().observe(
+                    Some(node),
+                    1,
+                    "P#1",
+                    &Tile::Scalar(ColumnValue::Strings(vec![big.clone().into()])),
+                );
+                channel.publish_probes(&probes, &[], tick);
+            }
+        })
+        .join()
+        .expect("the publishing thread");
+
+        let mut last = 0;
+        while last < FRAMES {
+            last = read_frame(&mut reader)["tick"].as_u64().expect("a tick");
+        }
+        assert_eq!(last, FRAMES, "the reading client reaches the last frame");
     }
 
     #[test]

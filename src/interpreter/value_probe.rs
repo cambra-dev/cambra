@@ -81,8 +81,9 @@ pub struct Reading {
     pub node_id: Option<NodeId>,
     /// The producer instance, since one operator can build several.
     pub producer_id: usize,
-    /// The producer's display name, e.g. `"MapResultWithSource#1"`.
-    pub producer: String,
+    /// The producer's display name, e.g. `"MapResultWithSource#1"`, shared by
+    /// every reading of one probe.
+    pub producer: Rc<str>,
     /// The tile's variant name.
     pub shape: &'static str,
     /// The tile's `domain_predicate` in its `Debug` form, which is the progress
@@ -137,12 +138,16 @@ pub struct ProbeTable {
 ///
 /// `last_flow` is one reading under the same row cap as any other, so the
 /// footprint stays `probes × (readings + 1) × rows`.
-#[derive(Default)]
+///
+/// A reading is held behind an `Rc`, so `last_flow` and the ring share one
+/// allocation rather than each holding a copy.
 struct Probe {
+    /// The producer's display name, computed once when the probe is attached.
+    name: Rc<str>,
     /// Recent readings, empty or not, oldest first.
-    recent: VecDeque<Reading>,
+    recent: VecDeque<Rc<Reading>>,
     /// The newest reading that carried rows, which `recent` may have evicted.
-    last_flow: Option<Reading>,
+    last_flow: Option<Rc<Reading>>,
 }
 
 impl ProbeTable {
@@ -196,31 +201,47 @@ impl ProbeTable {
         producer: &str,
         tile: &Tile,
     ) {
+        self.observe_named(node_id, producer_id, || producer.to_string(), tile);
+    }
+
+    /// [`observe`](Self::observe), computing the producer's display name only
+    /// when its probe is first attached. `TileProducer::get` calls this on every
+    /// pull, and a name is a fresh `String` each time it is asked for.
+    pub(crate) fn observe_named(
+        &mut self,
+        node_id: Option<NodeId>,
+        producer_id: usize,
+        name: impl FnOnce() -> String,
+        tile: &Tile,
+    ) {
         let rendered = render(tile, self.rows_per_reading);
-        let reading = Reading {
+        let probe = self
+            .probes
+            .entry((node_id, producer_id))
+            .or_insert_with(|| Probe {
+                name: name().into(),
+                recent: VecDeque::new(),
+                last_flow: None,
+            });
+        let reading = Rc::new(Reading {
             tick: self.tick,
             seq: self.next_seq,
             node_id,
             producer_id,
-            producer: producer.to_string(),
+            producer: Rc::clone(&probe.name),
             shape: rendered.shape,
             watermark: rendered.watermark,
             note: rendered.note,
             rows: rendered.rows,
             total: rendered.total,
-        };
+        });
         self.next_seq += 1;
         let carried_rows = !reading.is_empty();
         if carried_rows {
             self.next_flow += 1;
+            probe.last_flow = Some(Rc::clone(&reading));
         }
-
-        let cap = self.readings_per_probe;
-        let probe = self.probes.entry((node_id, producer_id)).or_default();
-        if carried_rows {
-            probe.last_flow = Some(reading.clone());
-        }
-        if probe.recent.len() == cap {
+        if probe.recent.len() == self.readings_per_probe {
             probe.recent.pop_front();
         }
         probe.recent.push_back(reading);
@@ -253,7 +274,7 @@ impl ProbeTable {
         self.probes
             .get(&(node_id, producer_id))
             .into_iter()
-            .flat_map(|probe| probe.recent.iter())
+            .flat_map(|probe| probe.recent.iter().map(|reading| &**reading))
     }
 
     /// The key of every attached probe.
@@ -280,7 +301,7 @@ impl ProbeTable {
         producer_id: usize,
     ) -> Option<(&Reading, bool)> {
         let probe = self.probes.get(&(node_id, producer_id))?;
-        let found = probe.last_flow.as_ref()?;
+        let found: &Reading = probe.last_flow.as_ref()?;
         let stale = probe
             .recent
             .back()

@@ -279,6 +279,25 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 ---
 
+### Producer attribution and probes
+
+`TileOperator::subscribe` is a provided method that no operator overrides. It opens a scope naming
+the operator's `NodeId` and calls the operator's required `subscribe_impl`. `ProducerBase::new`
+reads the innermost open scope, so every producer records the operator that built it
+(`ProducerBase::node_id`) without its constructor taking a parameter. A scope restores the id it
+replaced when it closes, because a `subscribe_impl` may subscribe its inputs before or after it
+builds its own producer. A scope that names an operator builds at most one `ProducerBase`, and a
+second fails a `debug_assert!`. An input's producer is built under the input's own scope.
+
+A probe observes one producer's results. While a probe session is live
+(`value_probe::attach_probes`, held across `LiveProgram::start` and `reload` under `--inspect`),
+every `ProducerBase` built takes a handle to the session's `ProbeTable`. `TileProducer::get`
+records a rendered, row-capped reading of each tile it returns, after `get_impl` returns, into the
+probe keyed `(node_id, producer_id)`. Dropping a producer detaches its probe. A producer built with
+no session live has no probe, and its `get` records nothing. The probe frame
+`src/inspector_model/frame.rs` renders from the table is described in
+[design.md](../inspector_model/design.md#the-live-model-is-a-separate-path).
+
 ## The commit operator (`interpreter/commit_operator.rs`)
 
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
