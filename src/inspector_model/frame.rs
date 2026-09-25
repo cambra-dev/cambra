@@ -1,39 +1,40 @@
-//! Rendering a live frame: the JSON a publish sends.
+//! Rendering a probe frame: the JSON probe publishing sends.
 //!
-//! A pure function of the recorder and the sources' windows, so it is wire and
-//! only its delivery is transport. Leaving it behind the websocket route would
+//! A pure function of the probe table and the sources' windows, so it is wire
+//! and only its delivery is transport. Leaving it behind the websocket route would
 //! have put a socket between a host with no sockets and the bytes it needs.
 
 use std::collections::HashMap;
 
 use crate::ccl::provenance::NodeId;
-use crate::interpreter::value_recorder::{RecordedRow, Recording, SharedRecorder, SourceWindow};
+use crate::interpreter::value_probe::{Reading, ReadingRow, SharedProbeTable, SourceWindow};
 
-/// The JSON a publish sends: one entry per producer that produced this tick.
+/// The JSON probe publishing sends: one entry per node, holding each of its
+/// probes' last row-carrying reading.
 ///
-/// Collapsed here rather than at recording time. A producer pulled twice in one
-/// tick answers the second call empty, and another answers with the same tile
-/// twice, so the newest recording is the wrong one to send and merging the two
-/// double-counts — see
-/// [`ValueRecorder::latest_non_empty`](crate::interpreter::value_recorder::ValueRecorder::latest_non_empty).
-pub fn render_frame(
-    recorder: &SharedRecorder,
+/// Collapsed here rather than when a reading is taken. A producer pulled twice
+/// in one tick answers the second call empty, and another answers with the
+/// same tile twice, so the newest reading is the wrong one to send and merging
+/// the two double-counts. See
+/// [`ProbeTable::last_flow`](crate::interpreter::value_probe::ProbeTable::last_flow)..
+pub fn render_probe_frame(
+    probes: &SharedProbeTable,
     sources: &[SourceWindow],
     tick: u64,
     published: u64,
     final_frame: bool,
 ) -> String {
-    let recorder = recorder.borrow();
+    let probes = probes.borrow();
     let mut by_node: HashMap<u64, Vec<serde_json::Value>> = HashMap::new();
-    for (node_id, producer_id) in recorder.producers() {
+    for (node_id, producer_id) in probes.probe_keys() {
         let Some(node) = node_id else { continue };
-        let Some((recording, stale)) = recorder.latest_non_empty(node_id, producer_id) else {
+        let Some((reading, stale)) = probes.last_flow(node_id, producer_id) else {
             continue;
         };
         by_node
             .entry(node_key(node))
             .or_default()
-            .push(producer_json(recording, stale));
+            .push(probe_json(reading, stale));
     }
     let mut by_node: Vec<(u64, Vec<serde_json::Value>)> = by_node.into_iter().collect();
     // Ascending `NodeId`, which is both stable and meaningful: an operator's id
@@ -43,22 +44,22 @@ pub fn render_frame(
     by_node.sort_by_key(|(node, _)| *node);
     let nodes: Vec<serde_json::Value> = by_node
         .into_iter()
-        .map(|(node, mut producers)| {
-            // A node's producers are keyed by an allocation counter, so ordering
-            // by it is stable across ticks; a `HashMap` iteration is not.
-            producers.sort_by_key(|p| p["producerId"].as_u64().unwrap_or(0));
-            serde_json::json!({ "nodeId": node, "producers": producers })
+        .map(|(node, mut node_probes)| {
+            // A node's probes are keyed by the producer's allocation counter, so
+            // ordering by it is stable across ticks; a `HashMap` iteration is not.
+            node_probes.sort_by_key(|p| p["producerId"].as_u64().unwrap_or(0));
+            serde_json::json!({ "nodeId": node, "probes": node_probes })
         })
         .collect();
     // `published` counts frames rather than ticks, so a client that reconnects
     // or misses a wake can tell it is behind. A producer's own `seq` is the
-    // finer signal, for a gap within one node's recordings.
+    // finer signal, for a gap within one probe's readings.
     // `final` says the run is over and this frame is the last. A reader that
     // never sees one and then loses the socket has been disconnected; a reader
     // holding one knows the quiet is the end rather than a pause.
     // A source ships beside the operators rather than among them: it has no
     // producer and takes no `get`, so it carries a window rather than a
-    // recording. A source is not a graph node, so the window names the
+    // probe reading. A source is not a graph node, so the window names the
     // `IterateExtent`s over its domain, which is where a click resolves.
     let sources: Vec<serde_json::Value> = sources
         .iter()
@@ -91,7 +92,7 @@ fn node_key(node: NodeId) -> u64 {
 }
 
 /// One rendered row.
-fn row_json(row: &RecordedRow) -> serde_json::Value {
+fn row_json(row: &ReadingRow) -> serde_json::Value {
     serde_json::json!({
         "key": row.key,
         "value": row.value,
@@ -99,20 +100,20 @@ fn row_json(row: &RecordedRow) -> serde_json::Value {
     })
 }
 
-/// One producer's rows.
-fn producer_json(recording: &Recording, stale: bool) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = recording.rows.iter().map(row_json).collect();
+/// One probe's last row-carrying reading.
+fn probe_json(reading: &Reading, stale: bool) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = reading.rows.iter().map(row_json).collect();
     serde_json::json!({
-        "producerId": recording.producer_id,
-        "producer": recording.producer,
-        "shape": recording.shape,
-        "watermark": recording.watermark,
-        "note": recording.note,
-        "tick": recording.tick,
-        "seq": recording.seq,
+        "producerId": reading.producer_id,
+        "producer": reading.producer,
+        "shape": reading.shape,
+        "watermark": reading.watermark,
+        "note": reading.note,
+        "tick": reading.tick,
+        "seq": reading.seq,
         "stale": stale,
-        "total": recording.total,
-        "dropped": recording.dropped(),
+        "total": reading.total,
+        "dropped": reading.dropped(),
         "rows": rows,
     })
 }

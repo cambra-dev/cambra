@@ -50,19 +50,37 @@ The live path is `frame.rs` over `/api/live`, and it names its nodes with the id
 conversion records — see
 [provenance.md](../ccl/design/provenance.md#operator-conversion).
 
-A frame carries two records, which answer different questions.
+A probe frame carries two records, which answer different questions.
 
-**What flowed through a node** is its tail: its newest answer that carried rows, taken inside
-`TileProducer::get` and held for the life of the run. A ring of recent calls cannot stand in for it,
-because a producer under a settling scheduler answers empty hundreds of times per row, so the ring
-holds nothing but empties by the time a frame renders.
+**What flowed through a node** is its probes' last flow. A probe is attached to each producer built
+while a probe session is live, and takes a reading of every result `TileProducer::get` returns. Its
+last flow is the newest reading that carried rows, held for the producer's lifetime. A ring of
+recent readings cannot stand in for it, because a producer under a settling scheduler answers empty
+hundreds of times per row, so the ring holds nothing but empty readings by the time a frame renders.
 
 **What a source still holds** is its window: the keys no reader has released. A consumer releases a
-row from inside the pull that reads it, so a stream every consumer keeps up with has a full tail and
-an empty window.
+row from inside the pull that reads it, so a stream every consumer keeps up with has a full last
+flow and an empty window.
 
 It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.
+
+### A reload is not followed
+
+Under `--inspect --control`, the panes and the source anchors describe the version the run started
+with, and a `/reload` does not replace them. `serve_compiled` renders `/api/snapshot` once, from the
+first compile, and the driver computes each source's anchors (`source_nodes`) once, before its first
+pull.
+
+A reload keeps some operators and rebuilds the rest. A kept operator keeps its `NodeId`, so its
+probe frame entries still resolve in the panes. A rebuilt operator mints a fresh `NodeId` that the
+served snapshot does not contain. Its entries arrive in every probe frame, but no pane node matches
+them. A source window's `nodeIds` keep naming the first version's `IterateExtent`s. For a rebuilt
+iteration, those ids name a node whose probe detached at teardown. A source first read by the new
+version ships with empty `nodeIds`.
+
+Following a reload means republishing the snapshot and the anchors with the version, and telling a
+reader which version a frame belongs to. Neither is implemented.
 
 ## The data model
 

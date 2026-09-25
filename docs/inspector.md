@@ -90,8 +90,13 @@ and `GET /api/live` (a websocket carrying a run's recorded values).
 
 `--inspect-only` compiles the program and does not run it, so `/api/live`
 completes its handshake and carries nothing. `--inspect` runs the program and
-publishes to that route each tick. The two are exclusive, and both serve the
-same panes.
+publishes a probe frame to that route after each pull that carried rows. The two
+are exclusive, and both serve the same panes.
+
+With `--control` as well, the panes keep showing the version the run started
+with after a `/reload`. Probe frames for operators the reload rebuilt name nodes
+no pane contains. See
+[design.md](../src/inspector_model/design.md#a-reload-is-not-followed).
 
 ### One-shot snapshot dump
 

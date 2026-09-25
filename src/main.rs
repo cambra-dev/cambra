@@ -8,8 +8,8 @@ use cambra::{
         Consumer, Scheduler,
         operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard},
-        value_recorder::{
-            self, DEFAULT_ROWS_PER_RECORDING, SharedRecorder, SourceWindow, ValueRecorder,
+        value_probe::{
+            self, ProbeTable, ROWS_PER_READING, SharedProbeTable, SourceWindow,
             render_source_window,
         },
     },
@@ -28,7 +28,7 @@ fn poll_control(
     live: &mut LiveProgram,
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
     new_data: &Rc<RefCell<bool>>,
-    recorder: Option<&SharedRecorder>,
+    probe_table: Option<&SharedProbeTable>,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
@@ -43,12 +43,12 @@ fn poll_control(
         },
         ControlRequest::Reload { code } => {
             // A reload rebuilds the operators it could not keep, and a producer
-            // takes its recorder handle when it is built — so the replacement
-            // records only under a session, exactly as the first compile does.
+            // attaches its probe when it is built, so the replacement is probed
+            // only under a session, exactly as the first compile is.
             // `diff_against` is left out: it compiles a version to compare and
             // throws it away.
             let reloaded = {
-                let _recording = recorder.cloned().map(value_recorder::install);
+                let _probing = probe_table.cloned().map(value_probe::attach_probes);
                 live.reload(ctx, code, main_consumer)
             };
             match reloaded {
@@ -92,14 +92,14 @@ fn run_program(
         })
     };
 
-    // Recording is installed for the whole subscribe, which happens inside
-    // `compile_program`: a producer takes its handle when its `ProducerBase` is
-    // built, and there is no traversal of the live graph to hand one out later.
-    let recorder = inspect_port.map(|_| Rc::new(RefCell::new(ValueRecorder::with_defaults())));
+    // The probe session spans the whole subscribe, which happens inside
+    // `compile_program`: a producer attaches its probe when its `ProducerBase` is
+    // built, and there is no traversal of the live graph to attach one later.
+    let probe_table = inspect_port.map(|_| Rc::new(RefCell::new(ProbeTable::with_defaults())));
 
     let mut ctx = GlobalContext::default();
     let mut live = {
-        let _recording = recorder.clone().map(value_recorder::install);
+        let _probing = probe_table.clone().map(value_probe::attach_probes);
         match LiveProgram::start(&mut ctx, code, &main_consumer) {
             Ok(p) => p,
             Err(errs) => {
@@ -110,10 +110,10 @@ fn run_program(
     };
 
     // Serve the panes from the same compile that is about to be driven, so a
-    // click in a pane names a node the running graph actually built.
-    //
-    // Named `frames` rather than `live`: `live` is the running program here.
-    let frames = match inspect_port {
+    // click in a pane names a node the running graph actually built. A reload
+    // replaces neither the panes nor `source_node_ids` below: see
+    // `src/inspector_model/design.md`, "A reload is not followed".
+    let probe_channel = match inspect_port {
         Some(port) => match serve_compiled(live.program(), src_name, port) {
             Ok(channel) => Some(channel),
             Err(e) => {
@@ -132,36 +132,33 @@ fn run_program(
         }
     };
 
-    // Publishing sits between the pull and the release, so a source's retained
-    // window is sampled before anything is dropped from it.
-    //
-    // Only when a producer answered with rows. The sink loop below polls on a
-    // 10ms timer, and a poll that delivers nothing still records an empty answer
-    // from every producer it pulls — so gating on recordings rather than on
-    // production would broadcast an unchanged frame a hundred times a second,
-    // make `tick` count timer ticks rather than data, and pair each of those
-    // frames with a window sampled on a tick that carried nothing. Returns
+    // Probe publishing happens only when some probe took a reading that carried
+    // rows. The sink loop below polls on a 10ms timer, and a poll that delivers
+    // nothing still takes an empty reading from every producer it pulls. Gating
+    // on every reading would broadcast an unchanged frame a hundred times a
+    // second, make `tick` count timer ticks rather than data, and pair each of
+    // those frames with a window sampled on a tick that carried nothing. Returns
     // whether it published, so the caller advances `tick` only over a tick that
     // carried something.
-    let published_through = std::cell::Cell::new(0u64);
-    let publish = |tick: u64, sources: &[SourceWindow]| -> bool {
-        let (Some(frames), Some(recorder)) = (frames.as_ref(), recorder.as_ref()) else {
+    let probes_published_through = std::cell::Cell::new(0u64);
+    let publish_probes = |tick: u64, sources: &[SourceWindow]| -> bool {
+        let (Some(channel), Some(probes)) = (probe_channel.as_ref(), probe_table.as_ref()) else {
             return false;
         };
-        let produced = recorder.borrow().produced();
-        if produced == published_through.get() {
+        let flows = probes.borrow().flows();
+        if flows == probes_published_through.get() {
             return false;
         }
-        published_through.set(produced);
-        frames.publish(recorder, sources, tick);
+        probes_published_through.set(flows);
+        channel.publish_probes(probes, sources, tick);
         true
     };
 
-    // The last frame, marked `final`, so a reader can tell a finished run from
-    // an idle one. The process parks afterwards, so the socket stays open.
-    let finish = |tick: u64, sources: &[SourceWindow]| {
-        if let (Some(frames), Some(recorder)) = (frames.as_ref(), recorder.as_ref()) {
-            frames.finish(recorder, sources, tick);
+    // The last probe frame, marked `final`, so a reader can tell a finished run
+    // from an idle one. The process parks afterwards, so the socket stays open.
+    let publish_final_probes = |tick: u64, sources: &[SourceWindow]| {
+        if let (Some(channel), Some(probes)) = (probe_channel.as_ref(), probe_table.as_ref()) {
+            channel.publish_final_probes(probes, sources, tick);
         }
     };
 
@@ -177,7 +174,7 @@ fn run_program(
     // source that is not part of the program.
     let source_node_ids = source_nodes(&live.program().operator_graph);
     let sample_sources = |scheduler: &Scheduler| -> Vec<SourceWindow> {
-        if frames.is_none() {
+        if probe_channel.is_none() {
             return Vec::new();
         }
         scheduler
@@ -191,7 +188,7 @@ fn run_program(
                     name,
                     &keys,
                     &values,
-                    DEFAULT_ROWS_PER_RECORDING,
+                    ROWS_PER_READING,
                 ))
             })
             .collect()
@@ -212,7 +209,7 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
-                recorder.as_ref(),
+                probe_table.as_ref(),
             );
             if *new_data.borrow() {
                 break;
@@ -226,8 +223,8 @@ fn run_program(
             break;
         };
         debug!("Main calling get");
-        if let Some(recorder) = recorder.as_ref() {
-            recorder.borrow_mut().set_tick(tick);
+        if let Some(probes) = probe_table.as_ref() {
+            probes.borrow_mut().set_tick(tick);
         }
         // Sampled before the pull, not after. A `Memo` releases its input from
         // inside `get_impl`, so the release cascade reaches the source buffer
@@ -236,7 +233,7 @@ fn run_program(
         // present and nothing has taken delivery.
         let sources = sample_sources(ctx.scheduler());
         let tile = producer.get(producer.tiling().universal_guard());
-        if publish(tick, &sources) {
+        if publish_probes(tick, &sources) {
             tick += 1;
         }
 
@@ -269,8 +266,8 @@ fn run_program(
     // loop runs until the process exits.
     if live.program().sinks().next().is_some() {
         loop {
-            if let Some(recorder) = recorder.as_ref() {
-                recorder.borrow_mut().set_tick(tick);
+            if let Some(probes) = probe_table.as_ref() {
+                probes.borrow_mut().set_tick(tick);
             }
             // Sampled before the pull, not after. A `Memo` releases its input
             // from inside `get_impl`, so the release cascade reaches the source
@@ -278,7 +275,7 @@ fn run_program(
             // reports what the tick consumed rather than what it delivered.
             let sources = sample_sources(ctx.scheduler());
             ctx.scheduler().check_for_notifications();
-            if publish(tick, &sources) {
+            if publish_probes(tick, &sources) {
                 tick += 1;
             }
             poll_control(
@@ -287,7 +284,7 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
-                recorder.as_ref(),
+                probe_table.as_ref(),
             );
             if live.done().try_recv().is_ok() {
                 break;
@@ -298,7 +295,7 @@ fn run_program(
         }
     }
 
-    finish(tick, &sample_sources(ctx.scheduler()));
+    publish_final_probes(tick, &sample_sources(ctx.scheduler()));
     Ok(())
 }
 

@@ -599,7 +599,7 @@ impl TileOperator for FanOutBranch {
 
         Box::new(FanOutProducer {
             // The fan-out's own id rather than a fresh one, so every branch's
-            // producer reads as the same `FanOut#n`. `ValueRecorder` keys on
+            // producer reads as the same `FanOut#n`. `ProbeTable` keys on
             // `(node_id, producer_id)`, and that stays unique here because each
             // branch is its own operator with its own `NodeId` — the first
             // component separates them, not the second. Subscribing one branch

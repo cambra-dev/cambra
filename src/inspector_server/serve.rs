@@ -169,6 +169,10 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
 /// name different nodes than the graph being driven, and a click in a pane
 /// would resolve to a producer that does not exist.
 ///
+/// The payload is rendered once, so it describes `compiled` and not a version
+/// a later reload installs. See `src/inspector_model/design.md`,
+/// "A reload is not followed".
+///
 /// The server thread is detached, and outlives this call by design — a run
 /// finishes long before a reader is done looking at it, which is why the binary
 /// parks afterwards.
