@@ -33,7 +33,7 @@ CHL source
 | [collections.md](collections.md) | Collections as data functions `𝐷 ⤇ 𝑉`: the five surface types as domain shapes, the referenceable opaque domain (Σ-witness activation) behind maps/sets and runtime-length lists, membership-discharge lookup, keyed feeds, and mutable collections. |
 | [provenance.md](provenance.md) | How a node keeps its link to the source the user wrote across the whole pipeline: the `NodeId`/`Phase` identity primitives, the `ProvenanceTable` model and its fold, the recorder, the always-on lowering projection release diagnostics read, and what the inspector consumes. |
 | [diffing.md](diffing.md) | Program diffing: α-invariant content addressing of CCL terms and the GumTree correspondence between two compiled programs. |
-| [program-evolution.md](program-evolution.md) | How a running program becomes a different program: the control-port verbs (`/diff`, `/reload`, `/branch`, `/branches`), the branch table that maps each branch to the operators it holds and shares with its origin, the reload mechanism that keeps every operator whose computation is unchanged, and the *state takeover* guard. |
+| [program-evolution.md](program-evolution.md) | How a running program becomes a different program: the control-port verbs (`/diff`, `/reload`, `/branch`, `/branches`), the branch table that maps each numbered branch to the operators it holds and shares with the branch it was created from, the reload mechanism that keeps every operator whose computation is unchanged, and the *state takeover* guard. |
 
 Branching in [program-evolution.md](program-evolution.md) is a *model*, not a
 pass — nothing in the pipeline above implements it yet (`docs/design.md` marks

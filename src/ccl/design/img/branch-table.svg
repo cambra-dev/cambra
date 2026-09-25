@@ -2,11 +2,11 @@
      font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
   <title>A branch table and the operator graph it holds</title>
   <desc>An operator graph beside the branch table that holds it. Ocean nodes r1, r2 and r3 are the
-  production branch's chain. r2 also feeds two ember nodes, o1 for branch v3 and g1 for branch v1,
+  main branch's chain. r2 also feeds two ember nodes, o1 for branch v3 and g1 for branch v1,
   so r2's fan-out has a slot for each of r3, o1 and g1. r1 also feeds an ember chain b1 to b2 for
-  branch v2. The table lists each branch with the operators it holds: production r1, r2, r3; v1
+  branch v2. The table lists each branch with the operators it holds: main r1, r2, r3; v1
   r1, r2, g1; v2 r1, b1, b2; v3 r1, r2, o1. r1 appears in every row and r2 in three, because a
-  branch holds the operators it shares with its origin rather than copies of them.</desc>
+  branch holds the operators it shares with the branch it was created from rather than copies of them.</desc>
 
   <defs>
     <marker id="ah-ocean" viewBox="0 0 10 10" refX="9.6" refY="5"
@@ -35,7 +35,7 @@
   <text x="170" y="154" font-size="11" fill="#1C88A7" text-anchor="middle">r2</text>
   <circle cx="170" cy="240" r="18" stroke="#1C88A7" stroke-width="2" fill="none"/>
   <text x="170" y="244" font-size="11" fill="#1C88A7" text-anchor="middle">r3</text>
-  <text x="170" y="276" font-size="12.5" fill="#1C88A7" text-anchor="middle">production</text>
+  <text x="170" y="276" font-size="12.5" fill="#1C88A7" text-anchor="middle">main</text>
 
   <circle cx="90" cy="240" r="18" stroke="#D75A2E" stroke-width="2" fill="none"/>
   <text x="90" y="244" font-size="11" fill="#D75A2E" text-anchor="middle">o1</text>
@@ -58,7 +58,7 @@
   <!-- ── branch table ───────────────────────────────────────────────────── -->
   <text x="432" y="24" font-size="13" fill="#6B7A8A">branch table</text>
 
-  <text x="432" y="80" font-size="12.5" fill="#1C88A7">production</text>
+  <text x="432" y="80" font-size="12.5" fill="#1C88A7">main</text>
   <text x="548" y="80" font-size="12.5" fill="#6B7A8A">r1, r2, r3</text>
   <text x="432" y="118" font-size="12.5" fill="#D75A2E">v1</text>
   <text x="548" y="118" font-size="12.5" fill="#6B7A8A">r1, r2, g1</text>

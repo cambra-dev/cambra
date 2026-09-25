@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 404" width="700" role="img"
      font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
-  <title>Moving the production tag across a reload</title>
+  <title>The main branch across a reload</title>
   <desc>Two readings of one operator graph, before and after a reload. A source node feeds two
-  chains of three ocean nodes each: n1 to n3, the program prod_v0, and n4 to n6, the program
-  prod_v1. Node n1 also feeds one ember node b1, the program branch_1. A box marked prod sits
-  under whichever chain is the canonical production branch. In the first reading prod_v0 is
-  solid and carries the prod box while prod_v1 is dashed, not yet built. In the second the
-  prod box has moved to prod_v1, which is now solid; n2 and n3 are dashed, retired by the
+  chains of three ocean nodes each: n1 to n3, the program main@1, and n4 to n6, the program
+  main@2. Node n1 also feeds one ember node b1, the program branch_1. A box marked main sits
+  under whichever chain is the main branch's current version. In the first reading main@1 is
+  solid and carries the main box while main@2 is dashed, not yet built. In the second the
+  main box has moved to main@2, which is now solid; n2 and n3 are dashed, retired by the
   reload; n1 stays solid because branch_1 still reads it, and b1 is unchanged.</desc>
 
   <defs>
@@ -20,8 +20,8 @@
     </marker>
   </defs>
 
-  <!-- ── before · production on v0 ──────────────────────────────────────── -->
-  <text x="12" y="24" font-size="13" fill="#6B7A8A">before · prod_v0 serving</text>
+  <!-- ── before · main at version 1 ──────────────────────────────────────── -->
+  <text x="12" y="24" font-size="13" fill="#6B7A8A">before · main@1 serving</text>
 
   <circle cx="120" cy="76" r="18" stroke="#6B7A8A" stroke-width="2" fill="none"/>
   <text x="120" y="80" font-size="11" fill="#6B7A8A" text-anchor="middle">src</text>
@@ -41,7 +41,7 @@
   <text x="60" y="228" font-size="11" fill="#1C88A7" text-anchor="middle">n5</text>
   <circle cx="60" cy="298" r="18" stroke="#1C88A7" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
   <text x="60" y="302" font-size="11" fill="#1C88A7" text-anchor="middle">n6</text>
-  <text x="60" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">prod_v1</text>
+  <text x="60" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">main@2</text>
 
   <path d="M180 168 V206" stroke="#1C88A7" stroke-width="3" fill="none" marker-end="url(#ah-ocean)"/>
   <path d="M180 242 V280" stroke="#1C88A7" stroke-width="3" fill="none" marker-end="url(#ah-ocean)"/>
@@ -53,21 +53,21 @@
   <text x="180" y="228" font-size="11" fill="#1C88A7" text-anchor="middle">n2</text>
   <circle cx="180" cy="298" r="18" stroke="#1C88A7" stroke-width="2" fill="none"/>
   <text x="180" y="302" font-size="11" fill="#1C88A7" text-anchor="middle">n3</text>
-  <text x="180" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">prod_v0</text>
+  <text x="180" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">main@1</text>
 
   <rect x="152" y="346" width="56" height="22" rx="6" stroke="#6B7A8A" stroke-width="2" fill="none"/>
-  <text x="180" y="361" font-size="12" fill="#6B7A8A" text-anchor="middle">prod</text>
+  <text x="180" y="361" font-size="12" fill="#6B7A8A" text-anchor="middle">main</text>
 
   <circle cx="300" cy="224" r="18" stroke="#D75A2E" stroke-width="2" fill="none"/>
   <text x="300" y="228" font-size="11" fill="#D75A2E" text-anchor="middle">b1</text>
   <text x="300" y="262" font-size="12.5" fill="#D75A2E" text-anchor="middle">branch_1</text>
 
-  <text x="12" y="388" font-size="11.5" fill="#6B7A8A">prod_v1 is not built yet</text>
+  <text x="12" y="388" font-size="11.5" fill="#6B7A8A">main@2 is not built yet</text>
 
   <path d="M360 44 V372" stroke="#6B7A8A" stroke-width="1" fill="none" opacity="0.35"/>
 
-  <!-- ── after · production reloaded to v1 ──────────────────────────────── -->
-  <text x="392" y="24" font-size="13" fill="#6B7A8A">after · prod_v1 serving</text>
+  <!-- ── after · main reloaded to version 2 ──────────────────────────────── -->
+  <text x="392" y="24" font-size="13" fill="#6B7A8A">after · main@2 serving</text>
 
   <circle cx="460" cy="76" r="18" stroke="#6B7A8A" stroke-width="2" fill="none"/>
   <text x="460" y="80" font-size="11" fill="#6B7A8A" text-anchor="middle">src</text>
@@ -84,10 +84,10 @@
   <text x="400" y="228" font-size="11" fill="#1C88A7" text-anchor="middle">n5</text>
   <circle cx="400" cy="298" r="18" stroke="#1C88A7" stroke-width="2" fill="none"/>
   <text x="400" y="302" font-size="11" fill="#1C88A7" text-anchor="middle">n6</text>
-  <text x="400" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">prod_v1</text>
+  <text x="400" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">main@2</text>
 
   <rect x="372" y="346" width="56" height="22" rx="6" stroke="#6B7A8A" stroke-width="2" fill="none"/>
-  <text x="400" y="361" font-size="12" fill="#6B7A8A" text-anchor="middle">prod</text>
+  <text x="400" y="361" font-size="12" fill="#6B7A8A" text-anchor="middle">main</text>
 
   <path d="M520 168 V206" stroke="#1C88A7" stroke-width="3" fill="none"
         stroke-dasharray="6 5" marker-end="url(#ah-ocean)"/>
@@ -101,11 +101,11 @@
   <text x="520" y="228" font-size="11" fill="#1C88A7" text-anchor="middle">n2</text>
   <circle cx="520" cy="298" r="18" stroke="#1C88A7" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
   <text x="520" y="302" font-size="11" fill="#1C88A7" text-anchor="middle">n3</text>
-  <text x="520" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">prod_v0</text>
+  <text x="520" y="334" font-size="12.5" fill="#1C88A7" text-anchor="middle">main@1</text>
 
   <circle cx="640" cy="224" r="18" stroke="#D75A2E" stroke-width="2" fill="none"/>
   <text x="640" y="228" font-size="11" fill="#D75A2E" text-anchor="middle">b1</text>
   <text x="640" y="262" font-size="12.5" fill="#D75A2E" text-anchor="middle">branch_1</text>
 
-  <text x="392" y="388" font-size="11.5" fill="#6B7A8A">prod_v0 retired · n1 kept for branch_1</text>
+  <text x="392" y="388" font-size="11.5" fill="#6B7A8A">main@1 retired · n1 kept for branch_1</text>
 </svg>
