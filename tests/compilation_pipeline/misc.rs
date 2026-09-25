@@ -32,9 +32,9 @@ fn test_no_fan_outs(#[case] code: &str) {
 // ---------------------------------------------------------------------------
 // User-defined functions (scalar UDFs via lambda)
 //
-// These tests validate the inline pass: scalar-typed `Let` bindings introduced
-// by lambda elimination are substituted at their call sites before operator
-// conversion, avoiding the "Attempted to iterate on infinite Extent" panic.
+// These tests validate pre-lambda-elimination inlining of compute-function
+// bindings at their call sites. Leaving a scalar-domain function as a value
+// would require iteration over a non-enumerable extent during compilation.
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -92,9 +92,9 @@ fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
 // a tupled argument. This keeps `curry` out of the tree for the common case.
 // The n-arm zip arm in operator_conversion dispatches between `ScalarFanIn`
 // (scalar upstream) and `FanIn` (function upstream), so bodies with nested
-// BinOps also compile cleanly under scalar call sites. Explicit currying
-// (`\\x -> \\y -> ...` or explicit `curry(f)`) is still tracked as
-// follow-up work.
+// BinOps also compile cleanly under scalar call sites. Nested lambdas that
+// leave an internal `curry` in the tree remain unsupported; see
+// src/ccl/design/optimization.md "Limitations".
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("add = \\x, y -> x + y\nadd(3, 4)", Value::Int(7))]

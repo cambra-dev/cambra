@@ -1,369 +1,354 @@
 # Optimization & compilation passes
 
-The passes that turn a fully type-inferred CCL tree into tile-dataflow operators. In pipeline order they run **inline → lambda_elim → planning → simplify → operator_conversion**; this doc is organized by pass. Inlining and lambda elimination remove `Lambda` nodes and UDF indirection; planning recognizes iteration sites (hash joins, keyed aggregates) and marks them; `operator_conversion` does the final λ-free CCL → `TileOperator` translation. For the AST these passes operate on, see [ir.md](ir.md); for the CCC theory behind lambda elimination, see [`docs/operational-semantics/lowering.md`](/docs/operational-semantics/lowering.md).
+After inference, the compiler rewrites typed CCL into an operator graph. `context.rs` runs
+`inline`, transaction rewriting, `mut_elim`, `channelize`, the as-of-read rewrite,
+`lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda elimination
+runs `simplify` internally; planning also runs it before and after iteration-site marking.
+`interpreter/operator_conversion.rs` then converts the planned CCL to `TileOperator`s. The
+transaction and mutation phases are described in [mutability.md](mutability.md); the AST is
+described in [ir.md](ir.md).
 
 ---
 
 ## Inlining Pass (`ccl/inline.rs`)
 
-`inline_non_iterable_lambdas` runs **after `infer`** and **before `lambda_elim`**. It performs two structural rewrites on `Let` bindings, in order:
-
-1. **Alias inlining** — eliminate `let y = x` pure α-renamings.
-2. **UDF inlining** — substitute call sites for functions over non-iterable domains.
-
-### Motivation
-
-**Scalar UDFs** (e.g. `Fun(Int, Int)`): operator conversion compiles `Let`-bound expressions independently with `input = None`. For a function whose domain is scalar, this causes the operator graph to insert an `IterateExtent` for the domain — which panics at runtime ("Attempted to iterate on infinite Extent") because base types have no finite enumerable extent.
-
-**List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`): these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda shape reaches `lambda_elim` intact, the rule emits a `curry` combinator over a *lambda body*, which `operator_conversion.rs` has no arm for, so compilation fails. Its one compiled shape is `curry` of a **tupled builtin** — a partial application, closing over nothing — which is how a lookup at a fixed collection reaches the operator graph.
-
-Inlining at the CCL level threads the call-site argument as `input`, and beta-reducing the outer lambda strips the user-parameter layer, leaving a single `__iter_record`-wrapping lambda that matches the list-comprehension shape `lambda_elim` already handles.
+`inline_capability_lambdas` runs on the typed CCL tree after inference and before transaction
+rewriting, channelization, and lambda elimination. It visits `Let` bindings and performs two
+related rewrites: it removes safe variable aliases, then expands eligible function bindings at
+their uses. Expanding a call while its source lambda is still present lets the pass substitute
+the actual argument into the function body. This is required for supported calls to scalar and
+collection-producing UDFs, not merely a performance optimization. A surviving scalar-domain
+function binding would need iteration over a non-enumerable extent. A surviving nested lambda
+can instead produce `curry` over a lambda body, for which operator conversion has no general arm.
+Beta-reducing the user-argument lambda avoids those forms before lambda elimination. A function
+passed around without a call is still substituted as a value; substitution alone does not
+beta-reduce it.
 
 ### Alias inlining
 
-When the right-hand side of a `Let` is a plain `Var(x)`, the binding is pure α-renaming. It is eliminated unconditionally by substituting `x` for the bound name throughout the body — *unless* `x` is rebound by an inner `let x = …` node inside that body, which would cause variable capture.
+For `let y = x in body`, the pass can replace free uses of `y` with `x` and remove the `Let`,
+regardless of whether `x` denotes a scalar, function, or collection. The replacement is
+conditional. The pass skips the alias shortcut if its whole-body check finds a rebinding of `x`
+by a `Let`, lambda parameter, `LetRec` binder, or loop target. It also skips the alias shortcut if
+the body contains a mutable write to `x`. Substitution across such a write could turn a read of
+the value captured at `y`'s binding site into a read of the later value. These checks are
+conservative: a matching rebind or write can block alias removal even if no particular use would
+be affected. The binding remains eligible for the function-inlining check that follows. Removing
+an alias here also keeps lambda elimination from lifting that alias into a `const(x)` wrapper.
 
-Performing this before `lambda_elim` prevents the let-in-lambda rule from hoisting such bindings into `const(x)` wrappers that would need to be recognised and stripped by downstream passes.
+### Function binding eligibility
 
-### What is inlined (UDF step)
+The second rewrite checks the type of the bound expression. It expands a `Type::Fun` binding
+unless its `FunKind` is `Data`; a non-function binding remains in place. The function's domain is
+not the criterion. A function accepting a collection, a scalar-domain UDF, a tuple-argument UDF,
+and a curried function can all qualify. A `Data` function represents a collection, including one
+over a finite index domain, and remains bound. Alias removal has precedence, so a plain `Var`
+binding can disappear even when its type is `Data`.
 
-A `Let { binding, bound_expr, body }` is inlined when `bound_expr.ty` is a **capability** — a `Fun` whose [`FunKind`](type-inference.md#46-data-vs-compute-functions) is not `Data`. That is the whole rule.
+### Collection sharing
 
-A capability has no data behind it, so there is nothing to share and inlining is how it reaches its call sites to be specialized there: scalar UDFs, list-producing UDFs, curried functions. A **collection** is the opposite — the binding *is* the data, so op-conversion compiles it once behind a `Memo` and hands each use a `FanOut` branch. Inlining one rebuilds the whole collection per use.
-
-#### Inlining a collection is loop fusion
-
-Substituting a collection at its use sites is **loop fusion**: the use site's pipeline runs
-straight through the source's chain rather than pulling from a materialized `Memo`, exactly as an
-inlined capability's body fuses into its caller's. So "never inline a collection" is a *policy*,
-not a structural bar — it trades one materialization for N recomputations of the source, which pays
-when the source is cheap or singly-used and loses when it is expensive with many uses. Nothing here
-has the cost model to decide per binding (use count is a walk away, source cost is not), so the
-rule takes the bounded-worst-case side and fusion waits behind that model. The same decision waits
-on the type side, where generalizing a collection is
-[filter pushdown](type-inference.md#generalizing-a-collection-is-filter-pushdown).
+Keeping a collection binding preserves a sharing point. Operator conversion compiles a surviving
+`Let` bound expression into an operator behind `Memo` and gives uses branches from `FanOut`.
+Substituting the collection at every use would instead give downstream compilation separate
+copies of its expression, which may duplicate its work. Conversely, an expanded function body
+appears at each use, trading that possible duplication for call-site specialization. The pass
+has no use-count or cost test; its type-kind rule makes this decision uniformly. A collection
+substitution could sometimes enable fusion with its consumer, but this pass does not make that
+tradeoff. The corresponding type-level decision is described in
+[Generalizing a collection is filter pushdown](type-inference.md#generalizing-a-collection-is-filter-pushdown).
 
 ### Substitution and beta-reduction
 
-At each call site, substitution is paired with beta-reduction of the outer user-parameter lambda. Apply chains terminating in `Var(name)` participate in beta-reduction; unrelated `Apply(arg, Lambda)` patterns elsewhere in the tree are left intact so list-comprehension bodies and scalar BinOp desugaring keep the structure `lambda_elim` + `simplify` expect.
+For an eligible binding, the pass substitutes the bound expression at free occurrences of its
+name and removes the `Let`. At a call whose function position is that name, including a chain of
+applications for a curried call, it reduces an application when the substituted function is a
+lambda: the argument replaces the lambda parameter in its body. If the substituted function is
+not a lambda, the application remains. Applications of unrelated anonymous lambdas are left for
+later passes. Substitution respects binders that shadow the function name and also visits
+refinement predicates stored in type slots, where a use may otherwise be missed by the ordinary
+expression walk.
 
-Multi-arg call-site bodies contain `Apply(Tuple(…), Proj(Index(i)))` (from the uncurried `__arg_pair.i` references). Those literal-tuple projections are folded later by `simplify::try_literal_tuple_projection`; this pass leaves them in place.
-
-After beta-reducing a UDF call, `inline_impl` is re-applied to the result so that any newly-created `Let` bindings (e.g. from a defer-returning argument) are also processed by the alias-inlining and lift steps.
+Beta-reduction has a further condition for a refined outer parameter: the argument's type must
+entail the parameter's refinements. The pass asserts when it cannot establish that condition,
+since dropping the parameter without preserving its precondition would be unsound. For
+multi-argument UDFs lowered with a tuple parameter, substitution can leave
+`Apply(Tuple(...), Proj(Index(i)))`; `simplify::try_literal_tuple_projection` folds that shape
+later. Finally, the pass revisits the reduced result, so newly exposed `Let` bindings can undergo
+the same inlining checks.
 
 ### Limitations
 
-- **A curried function that is never fully applied** (`add: (Int => (Int => Int)) = \x -> \y -> x + y` then `add`): `should_inline` inlines `add` because its type is a capability, but with no call site to beta-reduce against, the outer lambda survives, lambda-elim emits `add ▷ curry`, and operator conversion rejects it (`found input for non-combinator curry`). The residue carries no eta redex, so `try_exponential_eta` does not reach it. The annotation is load-bearing — unannotated, the program is ambiguous and inference rejects it first. The `curry` is not the whole story: `add(1)` reaches operator conversion without one and still fails, panicking on the first `get` with "Attempted to iterate on infinite Extent: Int" — the scalar-UDF case above, at the program's result. A tile carries values, not closures, and a compute function has no data behind it to materialize, so neither spelling has a tile to produce. Binding each application (`x = add(1)` then `x(2)`) collapses both layers and works; the chained spelling `add(1)(2)` is a separate lowering restriction, since `lower_call` takes only a named callee. A curried *data* function is unaffected: planning builds `groupby`'s partition from `converse`, and it materialises as a `DataFunction` tile.
-- **Collection UDFs** (domain `UIntRange` or `DataSource`): not inlined; they compile correctly via `Memo + FanOut` and benefit from sharing.
-- **Body duplication**: a UDF called N times has its body duplicated N times in the operator graph. Acceptable for now; only collection-typed UDFs warrant caching.
+- **Unapplied or partially applied compute functions:** An unapplied nested lambda can leave a
+  `curry` over a lambda body, which operator conversion cannot compile. A partial application such
+  as `add(1)` can eliminate that combinator but still leave a compute-function result: debug
+  planning rejects it at the data-site assertion, while a build without that assertion attempts
+  to iterate its non-enumerable `Int` domain. Binding each application and ultimately consuming the
+  result, `x = add(1)` followed by `x(2)`, lets inlining eliminate both parameter layers. The
+  spelling `add(1)(2)` is separately rejected because CHL call lowering requires a named target.
+  Curried data functions are different: grouping constructs them through `converse`, and the
+  runtime represents them with nested `DataFunction` tilings.
+- **Collection bindings:** A `Type::Fun` with `FunKind::Data` is not expanded by the function
+  rewrite, regardless of its domain. A safe plain-variable alias can still be removed by the
+  earlier alias rewrite. A surviving `Let` compiles through `Memo` and `FanOut`.
+- **Body duplication:** An eligible function body is copied at each use in the CCL tree. The pass
+  has no use-count or cost test.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
 
 ---
 
 ## Lambda Elimination (`ccl/lambda_elim.rs`)
 
-`lambda_elim::run` converts a fully type-inferred CCL expression containing `Lambda` nodes into a point-free expression of primitive combinators, following the Cartesian Closed Category (CCC) structure described in [`docs/operational-semantics/lowering.md`](/docs/operational-semantics/lowering.md).
+`lambda_elim::run` removes term-level `Lambda` nodes from the channelized, typed tree. It
+eliminates outer lambdas before their nested lambdas, then simplifies the result to a fixed
+point. A nested lambda can capture its outer parameter, so eliminating the inner one first
+would mistake that parameter for a constant. The rules use the Cartesian closed category
+structure described in [operational lowering](/docs/operational-semantics/lowering.md).
+Refinement predicates in type slots remain pointful until planning compiles them.
 
 ### Output nodes introduced
 
-| Source form | CCL AST after `lambda_elim` |
+The pass represents composition with `TypedExprNode::Compose`, and projections with
+`TypedExprNode::Proj`. It rewrites non-composition binary operations to an application of
+`Builtin::BinOp(op)` to a tuple, and unary operations to an application of `Builtin::Neg` or
+`Builtin::NotFn`. These rewrites apply both inside and outside lambdas.
+
+| Source expression | Point-free CCL shape |
 |---|---|
-| `f ≫ g` | `BinOp { left: f, op: Compose, right: g }` |
-| `.n` (projection) | `Proj(ProjKey::Index(n))` |
-| `.field` | `Proj(ProjKey::Field("field"))` |
-| `a + b` (and other non-compose BinOps) | `Apply { argument: Tuple([a, b]), function: Builtin(BinOp(op)) }` |
-| `-x` (UnaryOp) | `Apply { argument: x, function: Builtin(Neg) }` |
-| `not x` (UnaryOp) | `Apply { argument: x, function: Builtin(NotFn) }` |
+| `f ≫ g` | `Compose([f, g])` |
+| `.0`, `.field` | `Proj(Index(0))`, `Proj(Field("field"))` |
+| `a + b` | `(a, b) ▷ add` (`Apply(Tuple([a, b]), Builtin(BinOp(Add)))`) |
+| `-a`, `not a` | `a ▷ neg`, `a ▷ not_fn` |
+| `λ x → x` | `id` |
+| `λ x → c`, where `x` is not free in `c` | `c ▷ const` |
+| `λ x → e ▷ f` | `⟨λx→e, λx→f⟩ ≫ apply` |
+| `λ x → λ y → e` | `curry(λ (x, y) → e)` |
 
-Non-compose `BinOp` and `UnaryOp` nodes are desugared uniformly to function application form so that operator conversion can treat all operations as combinators. This applies at all levels: inside lambda bodies (via `elim_lambda`) and at the top level of a program (via `elim_lambdas`).
+The eliminated function retains its inferred `FunKind`. If its result type refers to the
+eliminated parameter, the point-free function type retains the binder as a dependent function.
+`Builtin::Zip` pairs point-free functions: `⟨f, g⟩` is
+`Apply(Tuple([f, g]), Builtin(Zip))`. Records of functions use the corresponding record-shaped
+`Zip` application. There is no separate `Zip` AST node. `Builtin::Compose` is a first-class
+composition function; it differs from the `TypedExprNode::Compose` chain.
 
-### Built-in combinators
+The other combinators introduced here include `Curry`, `Const`, `Apply`, `Map`, aggregation
+builtins, and the point-free `Copair` form. `Builtin::Copair` appears as
+`Apply(Tuple(arms), Builtin(Copair))` when a copair is lifted out of a lambda. A value-position
+`TypedExprNode::Copair` remains a value-form node. Planning later introduces `Iterate`,
+`Restrict`, `MapFilter`, `Converse`, `Uncurry`, and the domain transformations used by join plans.
+Lambda elimination does not introduce iteration sources.
 
-The output references built-in primitives via the `Builtin` enum carried by `TypedExprNode::Builtin`. Each variant has a stable display name (matched by the symbolic printer):
+### Conditional expressions and filters
 
-| Variant | Name | Meaning |
-|---|---|---|
-| `Builtin::Id` | `id` | identity morphism |
-| `Builtin::Apply` | `apply` | function application as a morphism |
-| `Builtin::Curry` | `curry` | currying |
-| `Builtin::Uncurry` | `uncurry` | uncurrying |
-| `Builtin::Const` | `const` | constant lift: `const(c) = λ _ → c` |
-| `Builtin::Zip` | `zip` | product/fanout: `zip(f, g) = λ x → (f(x), g(x))`, written `⟨f, g⟩` |
-| `Builtin::Map` | `map` | post-composition: `map(g)` applied to a curried function |
-| `Builtin::MapDomain` | `map_domain` | domain-to-domain identity stream |
-| `Builtin::Compose` | `compose` | composition as a first-class morphism |
-| `Builtin::Restrict` | `restrict` | planning-introduced mid-chain filter; a codomain-parametric function transformer: `restrict(p) : (𝐷 ⤇ Bool) ⇒ (𝐷 ⤇ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⤇ 𝑇)`. The predicate is a collection — one `Bool` per element of `𝐷` — and so is the upstream: every restrict chain is led by an iteration source, which `make_iterate` declares `Data`, and the kind rides through from there. It narrows the **domain** of an upstream `𝐷 ⤇ 𝑇` to the subset satisfying `𝑝`, preserving the value `𝑇` on the codomain (*not* the unsound `𝐷 ⤇ {𝑑: 𝐷 \| 𝑝(𝑑)}`). Because its domain is a function type it is **applied to** its upstream (`upstream ▷ (𝑝 ▷ restrict)`), never composed as a CCC morphism. (Where planning emits it, and how op-conversion compiles the application, is covered under Planning below.) Chain-head iteration is the separate `Iterate` variant. |
-| `Builtin::Iterate` | `iterate` | planning-introduced chain-head iteration source: `iterate(p) : {𝑑: 𝐷 \| 𝑝(𝑑)} ⤇ {𝑑: 𝐷 \| 𝑝(𝑑)}` (or `𝐷 ⤇ 𝐷` when `p` is the trivially-true `true ▷ const`). `planning` emits one at the head of every iteration site (aggregate arguments, the stream side of `FinalOrDefault`, top-level function-valued results, sink-bound record fields, mutation-loop sources, …). Op-conversion's Iterate arm requires `input=None`; it compiles `Apply(p, Iterate)` to an `IterateExtent` tile (plus a `Restrict` filter when `p` is non-trivial). Mid-chain filtering is the separate `Restrict` variant. |
-| `Builtin::Converse` | `converse` | grouping by key |
-| `Builtin::PermuteDomain`, `Builtin::FlattenDomain` | `permute_domain`, `flatten_domain` | hash-join domain massaging |
-| `Builtin::BinOp(op)` for any `op: BinOpKind` | `add`, `sub`, `eq`, `lt`, `and`, `or`, `concat`, … | every arithmetic / compare / boolean-logic / string-concat binary op (one variant, parameterised by the existing `BinOpKind` so the operator enum has a single source of truth) |
-| `Builtin::{Neg,NotFn}` | `neg`, `not_fn` | unary operations |
-| `Builtin::{Sum,Max}` | `sum`, `max` | aggregations (fold/reduce) |
-| `Builtin::Copair` | `copair` | point-free function form of the N-ary copairing, emitted only by lambda elimination when an inside-a-lambda `TypedExprNode::Copair` needs to be lifted out: `Apply(Tuple([a, b]), Builtin(Copair))`. The value-form node (top-level `TypedExprNode::Copair`) is the canonical shape; both compile to a `UnionOperator` tile. Surface `a ++ b ++ c` lowers directly to a flat N-ary value-form node — see [ir.md](ir.md) and [type-inference.md](type-inference.md#union-flattening-construction-time) for the construction-time invariant. |
+A value-selecting `Case` inside a lambda becomes a `DisjointJoin` of arms. Each arm first
+applies `filter_values` to the fed input using its first-match condition, then computes the
+arm value. This keeps a partial operation in an arm from running at positions rejected by
+that arm's guard. A scalar `Case` in value position uses a one-element iteration domain:
+each arm lifts its value over that domain, restricts it by its first-match condition, and
+the arms are unioned. `final_or_default` extracts the selected value. Its fallback is the
+exhaustive final arm. A collection-valued `Case` remains for conditional-collection planning.
+For a scalar pattern match, the branch condition comes from the scrutinee's tag.
 
-Downstream passes (`simplify`, `planning`, `operator_conversion`) match directly on the `Builtin` variant.
+For a source followed by `λ x → Case { guard → action; true → unit }`, the `Compose` rule
+attaches the guard as a refinement of the source domain and composes the eliminated action
+after it. This recognition requires the two-branch `Case` at the lambda body's root. Planning
+later materializes the refinement at an iteration site. A leading `Let` around the `Case`
+does not match this filter rule and takes the general lambda-elimination path.
 
-### `zip` encoding
+### `Let` inside a lambda
 
-`⟨f, g⟩` (pointwise function pairing) is encoded as:
-```
-Apply { argument: Tuple([f, g]), function: Builtin(Zip) }
-```
-There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple` + `Builtin` nodes.
-
-### For-loop filter pattern in lambda elimination
-
-For-loops lower directly to `Compose([src, Lambda(x, body)])`. Lambda elimination handles them through the existing `Lambda` and `Compose` arms, with one special case for the filter pattern.
-
-**Filter pattern** (`elim_lambdas`, detected at the `Compose` level): a `Compose` whose last element is a `Lambda(x, Case { [guard → action, true → unit] })` (a two-branch filter case) is rewritten as a filtered composition:
-```text
-Compose([src, Lambda(x, { guard(x) → action(x); true → unit })])
-  ⟹  src_refined ≫ elim_lambda(x, action)
-```
-where `src_refined` is `src_elim` with its domain wrapped in `Type::Refinement` carrying `guard` as a `Predicate`. `planning`'s `insert_iterate_markers` pass then reifies that domain refinement into an explicit `Apply(guard, Iterate)` at the iteration site, which op-conversion compiles to an `IterateExtent` + `Restrict` filter pair (equivalent to the refinement-lambda path used by list comprehensions).
-
-The filter check happens at the `Compose` level (rather than inside the `Lambda` arm) because the refinement must be attached to the source, which is only visible alongside the lambda at the compose level.
-
-### `Let` nodes after rule 7
-
-When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bound variable changes type from `T` to `ParamTy ⇒ T`. The rewritten `Let` node has `bound_ty: None` because the old annotation is stale and would be incorrect.
+For `λ x → let v = def in body`, elimination keeps a `Let`: its bound expression becomes
+`λx→def`, and free uses of `v` in the body become `x ▷ v` before that body is eliminated.
+The bound function therefore varies with the surrounding input. Operator conversion fans
+that input to both the bound expression and the body. A `Let`'s type is reclosed over its
+new definition if a refinement in the result refers to the binder. The current `Let` node
+contains `binding`, `bound_expr`, and `body`; it has no `bound_ty` field.
 
 ---
 
 ## Planning (`ccl/planning/`)
 
-`planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.
-The pass does general iteration-site planning — hash-join planning is just one *specialised*
-strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  Its CCL-to-CCL
-rewrites, in the order `run` performs them:
+Planning turns point-free CCL into explicit iteration and filter chains. `context.rs` first
+calls `planning::plan_loops` to recognize causal `LetRec` groups as `Transact` nodes. Both
+induction loops and transaction groups use this carrier; its domain selects the runtime
+engine during operator conversion. `planning::run` then performs these rewrites in order:
 
-1. **Conditional-collection realization** (`conditionals::realize_conditional_collections`) — a
-   `Case` over collections becomes the gated union every later step then treats as an ordinary
-   collection.
-2. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises
-   the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒
-   V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the
-   partition dispatch through `converse`.
-3. **Constant folding** (`const_fold::fold_constants`) — a closed scalar computation becomes the
-   literal it computes, which is what makes a collection literal's elements the compile-time values
-   op conversion reads.  The value comes from the kernel in `src/scalar_ops.rs`, called on a
-   one-element column, so the folded answer and the operator's are one implementation; what the
-   pass decides is the exclusion list, which `src/ccl/planning/const_fold.rs` states.
-4. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every
-   position where op-conversion would compile with `input=None`.  At each site the pass picks the
-   best implementation strategy:
-   - **Hash join** (`try_hash_join_rewrite` → `convert_loop_join` → `plan_loop_join` → `join_plan_to_expr`) when the site's domain is a refined tuple whose predicate decomposes into equality join conditions.  The emitted chain is itself iteration-bearing at its leaves (each `JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`), so no further marker is added.
-   - **Iterate-then-restricts chain** (`wrap_with_iterate`'s fallback) — build the iteration source by *applying* one `restrict(p)` per refinement, in `ccl::application_order`, to a chain-head `Apply(true ▷ const, Iterate)`, then compose the value-producing body onto it, when the hash-join recogniser doesn't match.  `restrict` is a function transformer `(𝐷 ⤇ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⤇ 𝑇)` — applied, not composed — so each stage narrows the domain while preserving the value `𝑇`, and the chain stays well-typed (its honest second-order type would make a morphism-`Compose` ill-typed; `typecheck` rejects that).
-5. **Refinement-predicate compilation** (`compile_refinement_predicates`) — every remaining bare
-   predicate is normalized tree-wide to point-free form, reaching the consumer contracts that sit
-   outside any iteration site.
-6. **Per-group filter insertion** (`insert_map_filters`) — a refinement riding an inner collection's
-   domain becomes a `map_filter`.
+1. Realize collection-valued conditionals and erase determined sum witnesses.
+2. Recognize pointful keyed-aggregate sources and rewrite them using `converse`.
+3. Simplify point-free expressions before inserting iteration sources.
+4. Fold closed scalar computations with `const_fold::fold_constants`.
+5. Mark iteration sites, choosing a hash join where its predicate matches.
+6. Compile remaining refinement predicates throughout the tree.
+7. Insert `map_filter` for supported refinements on inner, per-group collections.
+8. Simplify the planned expression again.
 
-Hash-join planning is the *specialised* strategy at an iteration site; the uniform iterate-then-restricts chain is the default.
+Constant folding evaluates supported operations through the runtime's `src/scalar_ops.rs` kernel
+on one-element columns. `src/ccl/planning/const_fold.rs` defines which expressions are excluded;
+the pass leaves their runtime evaluation unchanged.
 
-The full pipeline inside `run`:
+The second simplification removes identities and nested composition introduced by join
+planning. Structural rules that could discard an iteration source guard themselves against
+subtrees containing `iterate`. A planned `restrict` is protected because its upstream contains
+`iterate`; the guard does not independently recognize `restrict`. Predicate compilation follows
+the group-by and join recognizers because they inspect inference's pointful predicates.
 
-```
-let discharged = realize_conditional_collections(&mut expr);
-recognize_groupby_sites(&mut expr);
-let mut expr = simplify(expr);
-fold_constants(&mut expr);
-insert_iterate_markers(&mut expr, &discharged);
-compile_refinement_predicates(&mut expr, &PredMemo::new());
-insert_map_filters(&mut expr);
-simplify(expr)
-```
+### Conditional collections
 
-`simplify` brackets the marker pass on both sides — the same marker-aware pass, not two modes:
+A collection-valued guard `Case` carries a sum over its possible domains. For a witness with
+finitely many named candidates, conditional planning restricts each arm by its first-match
+condition and unions the arms. Exactly one arm contributes data. The resulting tagged union
+is an executable representation of the selected collection; it is introduced after type
+inference because its type differs from the source sum. A determined witness with one
+candidate is erased from the term and its types. A sum whose domain cannot be determined
+from named candidates remains unresolved and may be rejected by operator conversion if it
+needs a concrete iteration extent. See
+[collections.md](collections.md#compiling-a-conditional-collection).
 
-- The **pre-marker `simplify`** runs on an iterate-free AST, canonicalising the value-level combinators before marker insertion; with no markers present, every rule fires.  (The join/group-by recognizers match the *pointful* predicate carried in the type, which `simplify` does not touch — see the dependent-refinements section of [type-inference.md](type-inference.md#45-dependent-refinements-via-pi-types).)
-- The **post-marker `simplify`** absorbs the `id` leaves and nested `Compose` boilerplate that `replace_tuple_project_with_id` produces while planning a hash join.  Its structural-discard rules (`try_const_reduce`, `try_product_beta_fst`/`_snd`, `try_literal_tuple_projection`, `try_ccc_universal`, `try_exponential_eta`, …) **self-guard on an iteration-freeness check**, so safety is a property of the *nodes*, not of pass timing.  The guard is computed bottom-up: `simplify_once` OR-s `is_iteration` over each node and its children, marking any sub-tree that contains an `iterate` source, and the discard rules refuse to fire on such a sub-tree — an `Apply(_, Iterate)` at a chain head *is* the iteration source for everything downstream, so dropping it would strand the chain.  Only `iterate` needs the guard: a `restrict` filter always sits on an iterate-bearing upstream, so it is never separable from its source and the same guard protects it transitively.  Fully iteration-free sub-trees are pure CCC morphisms and reduce soundly, so no separate iterate-safe mode is needed.
+### Loop recognition
+
+`plan_loops` recognizes the point-free causal form emitted by mutation and transaction
+rewriting. It turns each supported `LetRec` group into a `let __hist = Transact { keys, writers,
+domain } in body`, then rewrites history reads to that binding. Each writer has an iteration
+source, a decision body, and read and write key sets. Operator conversion compiles a concrete
+iteration domain to the induction store and `Txn` to the commit engine. The transaction
+recognizer also retains feed taps alongside writes in the history record. Guard-free, acyclic
+channel groups emitted by `channelize` instead flatten to dependency-ordered `Let` bindings.
+An unrecognized causal group panics at compile time; there is no fallback recognition strategy.
 
 ### Hash Joins
 
-Loop join patterns — where a predicate filters a cartesian product of two or more collections — are converted to hash-join strategies via `try_hash_join_rewrite`, called from `wrap_with_iterate` at every iteration site whose domain has a `Type::Refinement`.
+At an iteration site with a refined tuple domain, `try_hash_join_rewrite` delegates to
+`convert_loop_join` and `plan_loop_join`. The same planning path handles every arity of at least
+two. `split_join_conditions` splits the pointful predicate's top-level `and` tree into equalities
+and residual predicates; it does not extract join conditions from inside other Boolean forms.
+Each equality side must depend on exactly one distinct tuple arm. `replace_tuple_project_with_id`
+removes that arm's tuple projection to obtain its key function.
 
-#### Recognised pattern
+`spanning_tree_children` builds a breadth-first tree rooted at arm 0. A disconnected equality
+graph makes the entire site fall back to loop iteration; it does not produce a partial hash join.
+`build_join_plan` combines each child subtree with the accumulated probe side, choosing build and
+probe order from that tree without a cost model. Every `JoinPlan::Loop` leaf represents one arm.
+Each `JoinPlan::Hash` groups the build side by its key with `converse`, probes that group, and uses
+`uncurry` and `map_domain` to restore the pair domain.
 
-The recognizer matches the **pointful** predicate form ([type-inference.md §4.5](type-inference.md#45-dependent-refinements-via-pi-types)) — the lambda the refinement carries, not a compiled combinator chain. The predicate has the shape `λ rec → rec.0 ▷ l0 ▷ (λ v0 → … rec.k ▷ lk ▷ (λ vk → <bool>))`, where each `rec.i ▷ li` binds the element `vi` of arm `i` and the innermost boolean is a conjunction of:
-- equalities `vi == vj` (the join conditions), and
-- residual predicates over the element binders.
+Additional equalities crossing a join become residual predicates. `collect_arms_used` identifies
+the arms required by each other predicate, and `reindex_for_domain` adapts it to the selected
+node's flat domain. Predicates run at the first node containing all their required arms;
+single-arm predicates can be pushed to a leaf. A residual with no referenced arm currently hits
+the `TODO support constant predicates in joins` assertion.
 
-`split_join_conditions` builds the `vi ↦ rec.i ▷ li` environment, decomposes the boolean (`and` / `==` / residual), and for each side substitutes the environment and runs lambda-elim to recover the combinator morphism over `rec`. Each equality side must then depend on a *single* arm, identified by `is_function_of_single_tuple_arm`.
+The domain must have exactly one refinement for this recognition path. With multiple refinements,
+the attempted conversion retains the others around the base, which then fails `convert_loop_join`'s
+bare-tuple match and leaves ordinary iteration and filtering.
 
-#### 2-way join
-
-For two arms the transformation is straightforward:
-1. **Build side**: group by the build key using `converse` — yielding `key → (build_type →
-   build_type)`
-2. **Probe side**: compose the probe key with the build side lookup — yielding `probe_type →
-   (build_type → build_type)`
-3. **Materialise**: `▷ uncurry ▷ map_domain` flattens the curried result back to `(probe_type,
-   build_type) → (probe_type, build_type)`, which is the same as what would have come out of the
-   loop join.
-
-#### N-way join planning
-
-For `n ≥ 3` arms `plan_loop_join` constructs a left-deep binary hash-join tree using a five-step algorithm:
-
-1. **Split conditions** (`split_join_conditions`): decompose the pointful predicate (above) into
-   equality join conditions — each side compiled to a combinator morphism over the tuple domain,
-   where each key depends on exactly one arm — and *other predicates* that aren't equalities.  For
-   each equality condition, `replace_tuple_project_with_id` strips the tuple projection, leaving a
-   function of just the arm's own type.  Each non-equality predicate is paired with the set of arm
-   indices it references (`collect_arms_used`), so it can be pushed to the right level later.
-
-2. **Build spanning tree** (`spanning_tree_children`): treat each equality condition as an
-   undirected edge `(arm_a, arm_b)` and run BFS from arm 0 over this graph.  Returns `children:
-   Vec<Vec<usize>>` — the BFS spanning tree as an adjacency list — or `None` if the graph is
-   disconnected (some arm has no join path to arm 0).
-
-3. **Build left-deep plan with predicate pushdown** (`build_join_plan`): walk the BFS children
-   recursively, starting from arm 0.  For each child subtree, find a condition that *straddles* the
-   accumulated probe side and the child's subtree, orient it probe/build, and fold it into a
-   `JoinPlan::Hash`.  Any remaining straddling equality conditions become residual predicates at
-   that node.  Non-equality predicates are pushed down greedily: predicates whose required arms are
-   entirely within a child subtree are forwarded into that child's recursive call; predicates whose
-   required arms span the current probe side are applied at the first join node where all required
-   arms are present, after reindexing (`reindex_for_domain`) to match the flat output domain of the
-   current node.  Single-arm predicates that depend only on a leaf arm are pushed all the way into
-   the `JoinPlan::Loop` node's `predicate` field.  Returns `(JoinPlan, arm_order)` where
-   `arm_order[i]` is the canonical arm index at output position `i`.
-
-4. **Emit CCL** (`join_plan_to_expr`): convert the `JoinPlan` tree to a CCL expression bottom-up.
-   - `Loop { arms }` → `id` on the tuple type of those arms (or the single arm type)
-   - `Hash { probe, build, … }` → the probe/build `converse`/`uncurry`/`map_domain` chain described above.  Additionally, for nested hash joins, we need to convert from the nested 2-tuple structure generated by the join tree back to a flat n-tuple structure, so a new `flatten_domain` combinator is inserted before the `map_domain` as needed.  `flatten_domain` allows for flattening up specific positions of a tuple of tuples.
-
-5. **Restore canonical order**: because BFS visit order depends on the order equality conditions
-   appear in the AND expression, `arm_order` may not be `[0, 1, …, n-1]`.  When it differs,
-   `convert_loop_join` appends `▷ ([perm] ▷ permute_domain) ▷ map_domain`, where `perm[j]` = the
-   position of canonical arm `j` in `arm_order`.  This rewrites the domain from the BFS-induced
-   tuple order back to the original `(T_0, T_1, …, T_{n-1})` order that the rest of the expression
-   expects.
-
-For example, a three way join might end up looking like
-```
-(arm1 ≫ ((arm3 ≫ arm2 ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ arm3) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ join_body
-```
-
-#### `JoinPlan` structure
-
-A `JoinPlan` is either a `Loop` (a leaf that iterates a set of `arms` with an optional residual `predicate`) or a `Hash` join of a `probe` sub-plan against a `build` sub-plan on key expressions, with an optional residual `predicate`.
-
-`probe_key_idx` / `build_key_idx` are indices *into the output type of that side's sub-plan*, not into the original tuple.  They are `None` when the respective side is a single-arm `Loop` (no projection needed).  When `Some(i)`, a `Proj(i)` step is inserted before the key expression.
-
-The `predicate` fields correspond to extra predicates that aren't expressable as hash join conditions; planning emits these as a downstream `iterate(predicate)` step on the joined output (op-conversion compiles that to a `Restrict` filter tile).
-
-Future work:
-1. Support loop joins inside hash joins (today the Loop nodes are always single-arm)
-2. Support hash joins inside loop joins.  This will require a new CartesianProduct operator, as currently the only thing that can do a cartesian product is iterating a type, and this needs to be downstream of nontrivial operators.
-3. Bloom filters to optimize joins.  Instead of doing traditional join ordering, we'll do runtime bloom-filter passing as described in https://dl.acm.org/doi/pdf/10.1145/3725283
+`join_plan_to_expr` emits the tree as CCL. A leaf starts with `iterate`; a hash node uses
+`converse`, `uncurry`, and `map_domain`. Nested joins may need `flatten_domain` to make
+their tuple domain flat. `convert_loop_join` applies `permute_domain` when breadth-first
+arm order differs from the source tuple order. A residual predicate applies `restrict`
+to its leaf or joined stream. The join output thus has the same tuple order and filters
+as the loop it replaces.
 
 ### Keyed Aggregates
 
-Keyed aggregates are patterns like `sum(x) for x in groupby(xs, key_fn)` where:
-- A collection is grouped by a key function
-- An aggregation operation is applied to each group
-- The pattern iterates first over the key, then over elements within that key's group
-
-The pass identifies constructs where a `curry` operator is applied to a function whose **domain** carries a predicate refinement (`{(key, value) | …} ⇒ A` — the placement `lambda_elim` uses for the correlated partition predicate; see [type-inference.md §4.5](type-inference.md#45-dependent-refinements-via-pi-types)). The refinement expresses equality with a key: elements are partitioned when the key function applied to them equals a particular value. This pattern is rewritten to:
-
-1. Swap the iteration order: instead of iterating both the collection and key together, iterate the collection and compute the key for each element
-2. Use the `"converse"` combinator to group elements by their key values
-3. Apply the aggregation operator to each group
-
-This transformation reduces the domain iteration complexity and allows the runtime to optimize group-by-key operations using dedicated grouping operators instead of generic iteration.
+`recognize_groupby_sites` matches the dependent-refinement source produced for a keyed
+aggregate such as `sum(x) for x in groupby(xs, key_fn)`. The source describes a group
+through a key equality on its element domain. The rewrite computes keys over the source,
+groups them with `converse`, and maps the value function over each group. The group keeps
+the key-dependent refined domain, so a later aggregate sees only its members. If the
+pointful shape does not match, the site retains ordinary iteration and restriction.
 
 ### Iteration-Site Marking (`insert_iterate_markers`)
 
-`insert_iterate_markers` is the final step of planning.  It walks the CCL and inserts an explicit `Apply(predicate, Builtin::Iterate)` term at every position where operator conversion would compile with `input=None` and the expression is function-typed.  Refinement layers beyond the innermost are reified as a chain of `Apply(predicate, Builtin::Restrict)` mid-chain filters.  After the pass, op-conversion is a context-free dispatch on AST shape: it never inspects refinement structure to decide whether to start an iteration, and every iteration source it ever emits comes from exactly one CCL primitive.
+`insert_iterate_markers` visits positions that operator conversion compiles with no
+upstream input. These include the program's collection-valued result, collection-valued
+`Let` definitions, aggregate and grouping inputs, `Transact` writer sources, collection
+merge operands, and function-typed fields in a value-position `Record`. `Zip` instead
+fans an existing input to its tuple or record operands. For `final_or_default`, only its
+stream operand needs iteration; the default is a scalar. A top-level `Let` is traversed
+through its definition and body rather than prefixed with an iteration source. Its
+definition is compiled even when the body never uses it.
 
-For the full description of the input-policy split that this pass mirrors, see the [Operator Conversion section in `interpreter/design-operators.md`](/src/interpreter/design-operators.md#operator-conversion-interpreteroperator_conversionrs).  The short version:
+`wrap_with_iterate` first checks whether a site already has an iteration source or an
+operator that internalizes iteration. It then attempts the hash-join rewrite. Its default
+source is `(true ▷ const) ▷ iterate` over the unrefined domain, followed by one applied
+`p ▷ restrict` for each refinement in `application_order`, then the value-producing
+body. An unrefined site has only the initial `iterate`. The type of `restrict` is a
+function transformer: it narrows the upstream collection's domain and preserves its
+values. Accordingly, `upstream ▷ (p ▷ restrict)` applies the transformer to the
+upstream function; composing it as a morphism would have the wrong input type.
 
-- **Input-internalising arms** in op-conversion (`Sum`, `Max`, `Converse`, `MapDomain`, `Uncurry`, `FlattenDomain`, `PermuteDomain`, `Copair` / `DisjointJoin`, `FinalOrDefault` stream side, `Loop` source, value-position `Record` fields, the catch-all `Apply`) compile their argument with `input=None`.  Each such argument is an iteration site and gets a chain-head `Apply(true ▷ const, Iterate)` as its source, with one `restrict(p)` *applied* per refinement.
-- **Input-threading arms** (`Const`, `Zip`, `Map`, `Restrict` itself, and the `Var` / `Let` / `Compose` infrastructure) accept `input=Some(upstream)` and pass it through, so their children inherit the surrounding iteration and are not iteration sites.
-- **The program root** and each function-typed field of a trailing sink-bound `Record` are iteration sites by *subscription*: the user-supplied consumer (or `SinkConsumer`) subscribes to the result, expecting an iterated stream.
-- **Each function-typed bound expression in the top-level `Let` chain** is wrapped because op-conversion's `Let` arm compiles `bound_expr` *unconditionally* (`operator_conversion.rs`, `let bound_op = convert_impl(bound_expr, …)?`), whether or not `body` references the binding — a non-iteration-bearing function-typed bound expr would otherwise reach an `input=None` arm and error (e.g. the `List` arm's "list literal reached op-conversion without an input").  This is a mechanical requirement of eager compilation, not subscription.  One consequence: a dead iterable binding (`let x = [1, 2, 3] in 42`) is eagerly compiled and iterate-wrapped rather than eliminated — making iteration use-driven so the wrap becomes unnecessary is tracked by [#232](https://github.com/cambra-dev/Cambra/issues/232).
+`Builtin::Iterate` requires no upstream input and compiles to `IterateExtent`. A
+nontrivial predicate on that builtin adds a `Restrict` operator; the planner's default
+source uses the trivial predicate, so each later refinement is represented by its own
+applied `restrict`. `Builtin::Restrict` consumes its upstream input. Already marked
+chains, collection-typed bound variables, and combinators that create iteration from
+their arguments are not prefixed again. A bare sum witness has no iteration extent;
+conditional planning must realize it or the unresolved case reaches a compile error.
 
-At each iteration site, `wrap_with_iterate` first tries the specialised hash-join rewrite (`try_hash_join_rewrite`); the iterate-then-restricts chain is the default when hash join doesn't match.  See [Hash Joins](#hash-joins) above for the recognised shapes and the join-plan tree.
+The complete `is_iteration_bearing` skip cases are:
 
-When the hash-join rewrite doesn't fire, the chain that `wrap_with_iterate` emits is:
-- A single chain-head `Apply(true ▷ const, Iterate)` over the unrefined base domain — op-conversion compiles this to a bare `IterateExtent` (no filter tile, since the predicate is trivially true).
-- One `restrict(p)` *applied* per refinement, in `ccl::application_order`.  Each `restrict` is a function transformer applied to the source it narrows — not a morphism composed with it — so `make_restrict` keeps the term well-typed (its honest second-order type makes a morphism-`Compose` ill-typed; `typecheck` rejects that).  Op-conversion compiles each applied `restrict` to a `Restrict` tile fed the previous step's tile as `input=Some(_)`.
-- The value-producing body is then composed onto that source (`source ≫ body`) as a genuine CCC morphism.
+- Value-position `Tuple`, `Record`, `Copair`, and `DisjointJoin` nodes.
+- A `Var` whose function kind is `Data`.
+- An `Apply` headed by `Iterate`, `Restrict`, `AsOf`, or `FilterValues`, or by a builtin whose
+  `iterates_arg` property is true, including the domain-transforming combinators.
+- An `Apply` whose function position is not a builtin, such as a projection, variable, or curried
+  application; its conversion path rejects an additional upstream input.
 
-For an unrefined site, the source is just the chain-head iterate.  For a refined site `{D | p}`, it's `iterate ▷ (p ▷ restrict)`.  For nested `{{D | p_inner} | p_outer}`, it's `iterate ▷ (p_inner ▷ restrict) ▷ (p_outer ▷ restrict)` — matching the goldens in `tests/compilation_pipeline/`.
+Recognizing a `restrict`-led chain is necessary for repeated planning walks: its upstream already
+has an iteration source, and another wrapper would stack a second one.
 
-`Apply(p, Iterate)` is rendered as `p ▷ iterate` in symbolic form, or as just `iterate` when `p` is the trivially-true predicate (a shortcut in `symbolic.rs` to keep program dumps readable; the underlying AST always carries the predicate).  `Apply(p, Restrict)` renders as `p ▷ restrict`.
+### Per-group value filters
 
-#### Skip cases (`is_iteration_bearing`)
-
-A chain head is left alone when wrapping it with iterate would either be redundant or break op-conversion:
-
-- **Already iterate-led** — `Apply(_, Iterate)` at head.
-- **Restrict-led** — `Apply(_, Apply(_, Restrict))` at head, i.e. the outer `restrict` filter of a refined site.  A `restrict` application always sits on an iteration source by construction (`make_restrict` only ever wraps an iteration-bearing upstream), so a refined site is iteration-bearing just as its unrefined `iterate`-led counterpart is.  Recognising it keeps the pass idempotent on refined sites — without it, a second marker walk would re-enter `wrap_with_iterate` on the still-refined domain and stack a second iteration source.
-- **Provides its own iteration** — `Apply(_, MapDomain | Uncurry | Converse | Copair)` and the nested `PermuteDomain` / `FlattenDomain` applies.  These arms construct iteration internally from their argument, so prepending iterate would feed them an unwanted upstream stream.
-- **Rejects `input=Some`** — value-position `Tuple` / `Record` literals (op-conversion's `Tuple` / `Record` arms assert `input.is_none()`) and the catch-all `Apply` with a non-builtin function (`Proj`, `Var`, curried `Apply`).
-- **Collection-typed `Var`** — the bound op was already iterate-wrapped at its let-bind site, so returning the `FanOut` branch directly is correct; an outer iterate would create a redundant `MapResult` lookup.  The test is the `FunKind::Data`, not mere `Fun`-ness: a capability-typed `Var` has no such wrapping behind it, and the kind is exactly the distinction (see [type-inference.md](type-inference.md#46-data-vs-compute-functions)).
-
-#### Special cases beyond the uniform "wrap argument" pattern
-
-Three op-conversion arms have child-input policies that don't fit the single-argument shape:
-
-- **`Apply(Tuple | Record, Zip)`** — Zip fans the upstream input out to each tuple/record element.  Those elements receive `Some(fan_out_branch)`, so they are not iteration sites.  The pass walks into the elements (to reach deeper iteration sites) without triggering the value-position `Record` / `Tuple` wrap.
-- **`Apply(Tuple([stream, default]), FinalOrDefault)`** — the tuple's first element (`stream`) is iterated; the second (`default`) is a scalar fallback for empty iteration and needs no marker.
-- **`Copair` / `DisjointJoin`** — for `Copair`, both the value-form node (`Copair(operands)`) and the function-form `Apply(Tuple(ops), Copair)` need each operand wrapped independently; op-conversion compiles each with `input=None`. `DisjointJoin` is the sibling operation (see [ir.md](ir.md), "`Copair` and `DisjointJoin` — two collection-combining operations, not one") and behaves the same way here: its operands are compiled with `input=None` when nothing is fed, so each is its own iteration site.
-
-#### `Let` recursion
-
-A top-level `Let { bound_expr, body }` is compiled by op-conversion's `Let` arm with `input=None`, which then fans `None` into both children.  The marker pass therefore recurses into both — wrapping function-typed bound expressions and walking the body — without prepending iterate to the `Let` itself (which would mis-thread input through to `bound_expr` and `body`).  The bound-expression wrap is unconditional because the `Let` arm compiles `bound_expr` eagerly regardless of whether `body` uses it (see the iteration-site list above); [#232](https://github.com/cambra-dev/Cambra/issues/232) tracks making iteration use-driven so an unused binding can be dropped instead of materialised.
-
-#### Joins emit an `iterate` source with `restrict` filters applied
-
-`JoinPlan::Loop` and `JoinPlan::Hash` emissions in `join_plan_to_expr` use `Builtin::Iterate` as the iteration source and `Builtin::Restrict` for the residual filters, the latter built with `make_restrict` (a `restrict` *applied* to its upstream):
-
-- A leaf `JoinPlan::Loop` without a predicate emits `Apply(true ▷ const, Iterate)` over the arm's type.
-- A `JoinPlan::Loop` with a predicate emits `make_restrict(predicate, base_iter)` = `Apply(base_iter, Apply(predicate, Restrict))`, i.e. `base_iter ▷ (predicate ▷ restrict)` — the iterate provides the source and the applied restrict filters it.
-- A `JoinPlan::Hash` with a residual predicate emits `make_restrict(predicate, map_domain)` = `map_domain ▷ (predicate ▷ restrict)` — same shape, but the restrict filters the joined output.
-
-This is *application*, not composition: the `restrict` transformer's domain is a function type, so it cannot sit as a morphism in a `Compose` chain (`typecheck` rejects that).  Op-conversion compiles the outer `Apply`'s argument (`base_iter` / `map_domain`) with `input=None` via the catch-all arm — the `MapDomain` / `IterateExtent` arm sees no upstream input as required — and the `Restrict` arm then consumes that tile as `input=Some(_)` and applies the filter.
+`insert_map_filters` handles a refinement on the domain of a collection returned by a
+function, where that refinement depends on the function's input collection. The ordinary
+iteration walk sees the function's own domain and cannot materialize this inner one.
+When each added predicate reads that input collection, planning converts the added
+conditions into a value predicate and inserts one `map_filter` before the function.
+The operator filters each group's elements independently. A shape that does not meet
+this condition remains for the post-planning type check to reject.
 
 ---
 
 ## Compilation
 
-There are two compilation passes that translate CCL into tile-dataflow operators.
+`interpreter/operator_conversion.rs` converts planned CCL to tile-dataflow operators.
+`Compose` passes each operator's output to the next. The conversion arms distinguish
+expressions that consume an upstream stream from expressions that compile their own
+input. Planning supplies `iterate` at the latter sites, so conversion does not infer
+iteration from a refinement type. A surviving `Lambda` or `LetRec` violates the pass
+boundary and is rejected.
 
-`interpreter/operator_conversion.rs` converts the λ-free CCL produced by `lambda_elim` + `simplify` into `TileOperator`s.  This process is mostly a 1:1 correspondence, with each type of object lifted up to apply within a chain of composed terms.
-
-| CCL form | Operator |
+| Planned CCL | Operator behavior |
 |---|---|
-| `Compose([f, g, …])` | sequential pipeline: output of each feeds next |
-| `zip(f, g)` | `FanIn` over a shared `FanOut`-wrapped domain (via the `fan_in` factory) |
-| `zip({k: f, …})` | `fan_in_named` — record-of-morphisms fused via `FanIn::new_named` or `ScalarFanIn::new_named` |
-| `id` | identity (pass-through) |
-| `const(c)` | `MapResultToConst` |
-| `map(g)` | pass-through: compiles `g` with the upstream threaded in as input (emits no operator of its own) |
-| `Proj(Index(n))` | `tuple_field(n)` projection |
-| `add`, `sub`, … | `apply_binop` |
-| `neg`, `not_fn` | `apply_unaryop` |
-| `iterate(p)` | chain-head iteration source: `IterateExtent` (when `p` is `true ▷ const`) or `IterateExtent ≫ Restrict` (otherwise) |
-| `restrict(p)` | mid-chain filter: `Restrict` over the upstream input |
-| `Lit` | `Constant` scalar |
-| `Tuple([…])` | `ScalarFanIn` |
-| `List([…])` | `MapResult` over index stream |
-| `Source(name)` | data-source operator |
-| `Let { binding, … }` | `Memo`-wrapped `FanOut` bound in scope |
+| `f ≫ g` | Compile `f`, then feed its result to `g` |
+| `id`, `map(g)` | Pass the input through; `map` compiles `g` with that input |
+| `const(c)` | `MapResultToConst` on the input |
+| `zip(f, g)` | Share input through `FanOut` and combine results with `FanIn` |
+| `zip((a: f, b: g))` | Named fan-in of record fields |
+| `.n`, `.field` | Project a tuple or record field |
+| `add`, `neg`, and other scalar builtins | Apply the corresponding scalar operator |
+| `(true ▷ const) ▷ iterate` | `IterateExtent` over the declared domain |
+| `p ▷ iterate`, nontrivial `p` | `IterateExtent` followed by `Restrict` |
+| `upstream ▷ (p ▷ restrict)` | Filter the upstream with `Restrict` |
+| `filter_values(p)`, `map_filter(p)` | Filter fed values or inner collections |
+| `copair`, `disjoint_join` | Combine collection arms through union operators |
+| `List` | `MapResult` over an index stream |
+| `Lit`, value-position `Tuple` or `Record` | Scalar constant or fan-in |
+| `Source(name)` | `MapResultWithSource` reads the registered source using the supplied upstream input |
 
-End-to-end pipeline tests live in `tests/compilation_pipeline/`.
+The exact operator choice for a tuple or record depends on its element tilings; `fan_in`
+selects scalar or function fan-in. `Transact` is intercepted at its enclosing `Let` and
+compiled as a shared history store. End-to-end cases are in
+`tests/compilation_pipeline/`.
+See [Operator Conversion](../../interpreter/design-operators.md#operator-conversion-interpreteroperator_conversionrs)
+for the operator-level contracts.
 
 ### `Let` nodes compile to a shared binding, not `Apply(Lambda)`
 
-A `Let` node is compiled directly rather than desugared to `Apply(Lambda, value)`.
-
-The desugaring identity `let x = e1 in e2 ≡ (λx. e2)(e1)` is operationally correct, but compiling through it would lose binding provenance in the graph and introduce unnecessary indirection through an intermediate application.
-
-Instead, the bound expression is converted to an operator, wrapped in a `Memo` (so its value is computed at most once) inside a `FanOut` (so every use in the body shares that one computation), and bound in scope. Each `Var` reference in the body resolves to the shared `FanOut` handle, so a value bound once and used many times is computed once and fanned out to all its uses.
-
-**Prerequisite**: `binding.ty` on the `Let` node's `TypedBinding` must be resolved to a concrete type before compilation — the type inference pass fills it from the inferred type of `bound_expr`.
+Operator conversion compiles the bound expression, places `Memo` behind a `FanOut`, and
+binds that handle in a scope. Each `Var` use takes a branch. A binding aligned with the
+surrounding iteration reads its branch directly; a free binding used under an input is
+applied pointwise through `MapResult`. The `Let` arm can fan a surrounding input to both
+the definition and body, as required by `Let` expressions produced inside lambda
+elimination. The bound expression is compiled even if unused, so planning marks a
+collection-valued definition as an iteration site. The binding's type must be resolved
+before conversion.

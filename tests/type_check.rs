@@ -4458,9 +4458,9 @@ fn the_alpha_variant_join_is_arrival_order_independent() {
 /// reported by `check_scope_valid` (`tests/compilation_pipeline/transactions.rs`,
 /// `TODO(refined-txn-body)`).
 ///
-/// This also blocks binding a multi-argument function's parameters rather than
-/// substituting them away — see `src/ccl/design/ir.md`, "A substituted
-/// parameter's site rides its projection". The two are one fix.
+/// Tuple-parameter substitution has a separate constraint: lambda elimination
+/// would lift inner parameter bindings into unsupported morphism shapes. See
+/// `src/ccl/design/ir.md`, "Source locations on substituted parameter projections".
 #[test]
 fn let_binder_does_not_escape_into_result_refinement() {
     let ty = infer_program(indoc! {r#"

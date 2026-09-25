@@ -969,10 +969,10 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 ///
 /// [`crate::ccl::lambda_elim`]'s cast-wrapped-lambda arm calls this on a
 /// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
-/// reconstructed `groupby` lambda.  (Inference does not need it: it types the
-/// cast as the upcast `value_ty <: target` and lets the solver carry the
-/// refinement.) The returned refinements share their predicates' `Rc<Expr>`s with
-/// `target`.
+/// reconstructed `groupby` lambda. Inference's `emit_cast` instead decomposes the
+/// value's function type and rebuilds it with the target's domain refinements;
+/// it does not emit a `value_ty <: target` edge. The returned refinements share
+/// their predicates' `Rc<Expr>`s with `target`.
 ///
 /// The whole [`RefinementSet`] is returned rather than a single refinement: a target
 /// is *built* carrying one predicate ([`refined_data_fun`]), but the domain it

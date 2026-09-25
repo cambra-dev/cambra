@@ -147,7 +147,8 @@ impl TypedBinding {
 /// This is the central type of the CCL AST node hierarchy. Every program is a [`TypedExpr`]
 /// whose `node` field holds one of these variants.
 ///
-/// Application is curried: `f(x, y)` is `Apply(Apply(f, x), y)`. Compound
+/// Each application has one argument. Ordinary multi-argument CHL calls pack a
+/// tuple; calls to functions with `Mut` parameters use chained applications. Compound
 /// expressions may appear inline as arguments — [`TypedExprNode::Let`] bindings are
 /// optional (unlike strict ANF).
 ///
@@ -606,7 +607,7 @@ pub enum TypedExprNode {
 
     /// N-ary point-free function composition: `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁`.
     ///
-    /// Introduced by [`crate::ccl::lambda_elim`]; always contains at least
+    /// Built by lowering and [`crate::ccl::lambda_elim`]; always contains at least
     /// two morphisms. [`crate::ccl::simplify`] flattens nested two-element
     /// `Compose` nodes into longer chains.
     ///

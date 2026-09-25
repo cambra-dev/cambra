@@ -233,21 +233,16 @@ A key domain is spelled as the image of a named morphism term:
 `present_key_domain` in `src/ccl/lower/exprs.rs` builds every one, so a domain of this shape
 came from a re-keying producer.
 
-**Naming the morphism is what makes membership provable.** A domain that said only "the keys
-of this collection" would have no introduction rule: nothing could produce a value at it
-except a term already stamped there, so `𝑚[𝑘] : 𝑉` would be unprovable by construction
-rather than for want of a rule — and refinements relate by structural predicate equality
-rather than implication, so there is no entailment step for a proof to land in instead.
-Naming it supplies the rule: a key produced by `𝑚` is a key of the collection `𝑚` keys.
+Naming the producer makes membership available through the existing structural refinement rule:
+a key produced by `𝑚` belongs to the collection that `𝑚` keys. An opaque key-set name would
+instead need a membership introduction rule or axiom relating that set to its producer.
 
-**That is the current answer, and implication is what retires it.** Reasoning about refinements
-by implication rather than by structural equality is planned and unbuilt
-([type-inference.md, Roadmap and Current Prototype
-Status](type-inference.md#roadmap-and-current-prototype-status)). With it, an opaque named key
-set — "the keys of this collection", carrying no producer — is dischargeable from an axiom, and
-it wins on every count that decides between the two: it is smaller, it is independent of how the
-producer is spelled, and it keeps a producer out of a type. So the transparent form is what the
-absence of an entailment step forces, and the opaque form is its successor.
+Inference already has an SMT entailment fallback, but its supported integer/Boolean fragment
+does not encode collection membership axioms; see
+[Semantic entailment as a fallback](type-inference.md#semantic-entailment-as-a-fallback).
+That fallback therefore does not replace the producer-bearing membership predicate. An opaque
+key-set representation remains a possible extension, requiring both its membership rules and a
+way for the solver to use them.
 
 **A product keys a collection like any other type.** A key domain is the morphism's image
 whatever the morphism produces, and the group predicate compares two keys — so what a key
@@ -649,7 +644,8 @@ The gap is not particular to conditionals.
 `sum([x + y for x in ([1, 2] ++ [3, 4]) for y in [10, 20]])` reaches the same rejection, and
 the `let`-bound spelling of it reaches runtime instead and fails in
 `ColumnValue::transform_by_map`, which has no union-key case — the
-`a_union_generator_beside_a_second_generator` test in
+`an_inline_union_generator_beside_a_second_generator` and
+`a_let_bound_union_generator_beside_a_second_generator` tests in
 `tests/compilation_pipeline/scalars_collections.rs`. Compiling a site's witnesses together
 is what keeps every generator's domain a plain range, so no union is ever read at an index.
 A tagged fed copairing, demultiplexing the input by tag and re-tagging each arm's output, is
