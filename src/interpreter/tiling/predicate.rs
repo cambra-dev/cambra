@@ -12,7 +12,7 @@ use intervalsets::{
 };
 
 use crate::{
-    ccl::{BaseType, TagMap},
+    ccl::{BaseType, FieldKey, TagMap},
     interpreter::{ColumnValue, Extent, Tile, UnionArm, Value, transform_hashmap_values},
 };
 
@@ -170,27 +170,32 @@ pub enum Predicate {
     Record(HashMap<String, Predicate>),
     /// The union of multiple predicates — admits any value accepted by any arm.
     ///
-    /// The shape a union of boxes takes where no single box is it
-    /// ([`BoxShape`]). Invariant: arms never directly nest another `Or` (always flattened
-    /// by [`Predicate::flatten_or`]).
+    /// A union of boxes as [`Predicate::flatten_or`] leaves it: no two arms join into one box
+    /// ([`BoxShape`]). Three or more arms can still cover one box that no two of them make,
+    /// so an `Or` is not proof the region is no single box. Invariant: arms never directly
+    /// nest another `Or`.
     Or(Vec<Predicate>),
-    /// Predicate over a discriminated-union domain: one predicate per **arm**,
-    /// keyed by the arm's tag.
+    /// Predicate over a discriminated-union domain: one predicate per **named tag**, and
+    /// `rest` for every tag it does not name.
     ///
-    /// Admits a value `Union { tag, inner }` iff this map's `tag` arm exists and
-    /// admits `inner`. Semantically equivalent to an `Or` of per-arm predicates,
-    /// but preserving the tag structure for efficient dispatch.
+    /// Admits a value `Union { tag, inner }` iff the predicate for `tag` — its own, or
+    /// `rest` — admits `inner`.
     ///
-    /// A tag the map does not carry admits nothing, which is what makes a predicate
-    /// built for a width-narrower domain usable: an arm that cannot occur simply has
-    /// no entry (see [`TagMap`], "Why keyed rather than positional").
+    /// A predicate need not name every tag of its domain, and cannot always: a column
+    /// carries only the tags it holds, which width subtyping makes fewer than its extent's
+    /// (see [`TagMap`], "Why keyed rather than positional"), and a point names one. `rest`
+    /// is what makes that exact. A point or a column's keys leave `rest` false, and a
+    /// complement flips it, so `True ∖ 𝑝` needs no list of the tags `𝑝` leaves out.
     ///
-    /// Invariant: the arm set matches the domain's. Pointwise combinations
-    /// ([`intersect`](Predicate::intersect), [`minus`](Predicate::minus),
-    /// [`union`](Predicate::union)) therefore require both sides to carry the same
-    /// tags and panic otherwise. [`subsumes`](Predicate::subsumes) reads a missing tag as
-    /// the empty arm it stands for.
-    Union(TagMap<Predicate>),
+    /// Canonical form, kept by [`Predicate::tagged`]: no named tag's predicate is `rest`'s
+    /// value, and a union naming no tag is `True` or `False`. Universality is therefore
+    /// spelled `True`: a union naming every tag of its domain `True` over a `false` rest is
+    /// not recognized as everything, so a constructor that knows the whole tag set spells it
+    /// through [`Predicate::over_every_tag`].
+    Union {
+        tags: TagMap<Predicate>,
+        rest: bool,
+    },
     /// A key of an inner level **qualified by the enclosing path that reaches it**:
     /// admits `(k₀ … k_d)` when `(k₀ … k_{d-1})` satisfies `enclosing` and `k_d`
     /// satisfies `here`.
@@ -238,10 +243,12 @@ impl Predicate {
                 .max(),
             // A union's arms are tag-keyed, so they are walked by value rather
             // than sharing the `Or` arm's positional vector.
-            Predicate::Union(arms) => arms
+            Predicate::Union { tags, rest: false } => tags
                 .values()
                 .filter_map(Predicate::max_released_position)
                 .max(),
+            // Every tag it does not name is whole, so there is no watermark to read.
+            Predicate::Union { rest: true, .. } => None,
             // A qualified predicate names a position under one enclosing path, and the
             // caller wants a watermark over a flat domain, so there is nothing to answer.
             Predicate::Qualified { .. } => None,
@@ -325,6 +332,83 @@ impl Predicate {
         }
     }
 
+    /// A union predicate in canonical form: `tags` for the tags named, `rest` for every other.
+    /// A tag stating what `rest` does is dropped, and one naming nothing collapses to `rest`.
+    pub fn tagged(tags: TagMap<Predicate>, rest: bool) -> Predicate {
+        let kept: Vec<(FieldKey, Predicate)> = tags
+            .iter()
+            .filter(|(_, p)| p.as_bool() != Some(rest))
+            .map(|(tag, p)| (tag.clone(), p.clone()))
+            .collect();
+        match (kept.is_empty(), rest) {
+            (true, true) => Predicate::True,
+            (true, false) => Predicate::False,
+            (false, _) => Predicate::Union {
+                tags: TagMap::from_arms(kept),
+                rest,
+            },
+        }
+    }
+
+    /// A union predicate over `tags`, which name every tag of the domain: `rest` is vacuous,
+    /// so every tag `True` is `True` and every tag `False` is `False`.
+    pub fn over_every_tag(tags: TagMap<Predicate>) -> Predicate {
+        let rest = tags.values().all(Predicate::is_true);
+        Predicate::tagged(tags, rest)
+    }
+
+    /// `True` or `False`.
+    fn of_bool(b: bool) -> Predicate {
+        match b {
+            true => Predicate::True,
+            false => Predicate::False,
+        }
+    }
+
+    /// What this predicate over a union domain admits under `tag`, over that tag's payload.
+    /// `None` for a predicate of another shape.
+    pub(crate) fn under_tag(&self, tag: &FieldKey) -> Option<Predicate> {
+        match self {
+            Predicate::True | Predicate::False => Some(self.clone()),
+            Predicate::Union { tags, rest } => Some(Predicate::at_tag(tags, *rest, tag)),
+            _ => None,
+        }
+    }
+
+    /// What a union predicate admits under `tag`: its own predicate, or `rest`.
+    fn at_tag(tags: &TagMap<Predicate>, rest: bool, tag: &FieldKey) -> Predicate {
+        match tags.get(tag) {
+            Some(p) => p.clone(),
+            None => Predicate::of_bool(rest),
+        }
+    }
+
+    /// Two union predicates combined tag by tag, over every tag either names, with `rest`
+    /// combined the same way.
+    fn zip_tags(
+        (ps, pr): (&TagMap<Predicate>, bool),
+        (qs, qr): (&TagMap<Predicate>, bool),
+        f: impl Fn(&Predicate, &Predicate) -> Predicate,
+    ) -> Predicate {
+        let mut named: Vec<&FieldKey> = ps.keys().chain(qs.keys()).collect();
+        named.sort();
+        named.dedup();
+        let tags = named
+            .into_iter()
+            .map(|tag| {
+                let combined = f(
+                    &Predicate::at_tag(ps, pr, tag),
+                    &Predicate::at_tag(qs, qr, tag),
+                );
+                (tag.clone(), combined)
+            })
+            .collect();
+        let rest = f(&Predicate::of_bool(pr), &Predicate::of_bool(qr))
+            .as_bool()
+            .unwrap_or_else(|| unreachable!("True and False combine to True or False"));
+        Predicate::tagged(TagMap::from_arms(tags), rest)
+    }
+
     /// Whether this predicate names an enclosing path anywhere in it.
     ///
     /// What [`contains`](Self::contains) checks before reading a bare key: a qualified
@@ -384,14 +468,12 @@ impl Predicate {
                     None
                 }
             }
-            // Union is true if every variant is true; false if every variant is false.
-            Predicate::Union(ps) => {
-                if ps.values().all(|p| p.as_bool() == Some(true)) {
-                    Some(true)
-                } else if ps.values().all(|p| p.as_bool() == Some(false)) {
-                    Some(false)
-                } else {
-                    None
+            // True or false where every named tag says what `rest` does, which the canonical
+            // form collapses; a union naming a tag that differs from `rest` is neither.
+            Predicate::Union { tags, rest } => {
+                match tags.values().all(|p| p.as_bool() == Some(*rest)) {
+                    true => Some(*rest),
+                    false => None,
                 }
             }
             // A box, so one empty side empties it, as for a record.
@@ -458,8 +540,8 @@ impl Predicate {
             }
             // Union: intersect per arm. Pointwise over one arm set — see
             // `TagMap::zip_same_tags`.
-            (Predicate::Union(ps), Predicate::Union(qs)) => {
-                Predicate::Union(ps.zip_same_tags(qs, "Predicate::intersect", Predicate::intersect))
+            (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
+                Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::intersect)
             }
             (a, b) => match BoxShape::of(a, b) {
                 Some((shape, first, second)) => shape.meet(&first, &second),
@@ -497,15 +579,15 @@ impl Predicate {
             }
             // Union: subtract per arm. Pointwise over one arm set — see
             // `TagMap::zip_same_tags`.
-            (Predicate::Union(ps), Predicate::Union(qs)) => {
-                Predicate::Union(ps.zip_same_tags(qs, "Predicate::minus", Predicate::minus))
+            (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
+                Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::minus)
             }
             // `True` has no arms or fields of its own to subtract from, so it takes those of
             // the predicate it loses, each admitting everything. Only the bare `True`: a
             // record or union that admits everything already has its own, and expanding it
             // again would expand forever.
-            (Predicate::True, Predicate::Union(qs)) => {
-                Predicate::Union(qs.map(|_, q| Predicate::True.minus(q)))
+            (Predicate::True, Predicate::Union { tags, rest }) => {
+                Predicate::tagged(tags.map(|_, q| Predicate::True.minus(q)), !rest)
             }
             (Predicate::True, Predicate::Record(m)) => {
                 let whole = m.keys().map(|k| (k.clone(), Predicate::True)).collect();
@@ -539,8 +621,8 @@ impl Predicate {
             }
             // Union: union per arm. Pointwise over one arm set — see
             // `TagMap::zip_same_tags`.
-            (Predicate::Union(ps), Predicate::Union(qs)) => {
-                Predicate::Union(ps.zip_same_tags(qs, "Predicate::union", Predicate::union))
+            (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
+                Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::union)
             }
             // Two boxes join into one where they agree on every component but one;
             // otherwise the join is the two of them, which is what `Or` is for.
@@ -596,8 +678,11 @@ impl Predicate {
             // Or: value is admitted if any arm admits it.
             Predicate::Or(arms) => arms.iter().any(|a| a.contains(value)),
             // Union: value is admitted if the per-variant predicate for its tag admits its inner value.
-            Predicate::Union(ps) => match value {
-                Value::Union { tag, inner } => ps.get(tag).is_some_and(|p| p.contains(inner)),
+            Predicate::Union { tags, rest } => match value {
+                Value::Union { tag, inner } => match tags.get(tag) {
+                    Some(p) => p.contains(inner),
+                    None => *rest,
+                },
                 _ => false,
             },
             // Refused rather than approximated: the caller holds a key where the
@@ -630,11 +715,13 @@ impl Predicate {
             (Predicate::Or(arms), _) => {
                 arms.iter().any(|a| a.subsumes(other)) || other.minus(self).is_false()
             }
-            // A tag `other` carries is either empty there or needs `self` to cover it; a
-            // tag `other` lacks admits nothing and needs nothing.
-            (Predicate::Union(ps), Predicate::Union(qs)) => qs
-                .iter()
-                .all(|(tag, q)| q.is_false() || ps.get(tag).is_some_and(|p| p.subsumes(q))),
+            // Tag by tag over every tag either names, and over the tags neither names.
+            (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
+                (*pr || !*qr)
+                    && ps.keys().chain(qs.keys()).all(|tag| {
+                        Predicate::at_tag(ps, *pr, tag).subsumes(&Predicate::at_tag(qs, *qr, tag))
+                    })
+            }
             (a, b) => match BoxShape::of(a, b) {
                 // `other` is nonempty, having passed the first arm.
                 Some((_, first, second)) => BoxShape::contains(&first, &second),
@@ -643,9 +730,17 @@ impl Predicate {
         }
     }
 
-    /// Exactly `v`, and nothing else. A record is the box of its fields' points.
+    /// Exactly `v`, and nothing else. A record is the box of its fields' points, and `Unit`,
+    /// the one value of its type, is everything, as [`from_column_value`](Self::from_column_value)
+    /// spells a column of it.
     pub(crate) fn point(v: Value) -> Predicate {
         match v {
+            Value::Unit => Predicate::True,
+            // One tag, with nothing under the others.
+            Value::Union { tag, inner } => Predicate::tagged(
+                TagMap::from_arms(vec![(tag, Predicate::point(*inner))]),
+                false,
+            ),
             Value::Record(fields) => Predicate::Record(
                 fields
                     .into_iter()
@@ -841,6 +936,19 @@ impl Predicate {
     }
 
     fn up_to(v: Value, inclusive: bool) -> Predicate {
+        // A prefix of a union domain is the tags ordered before the bound's whole, part of its
+        // own, and none after, which one `rest` for every unnamed tag cannot spell.
+        assert!(
+            !matches!(v, Value::Union { .. }),
+            "a union key has no prefix spelling without its domain's tags: {v:?}"
+        );
+        // `Unit` is the one value of its type: `≤ ()` is everything and `< ()` nothing.
+        if v == Value::Unit {
+            return match inclusive {
+                true => Predicate::True,
+                false => Predicate::False,
+            };
+        }
         let Value::Record(fields) = v else {
             let bound = match inclusive {
                 true => Interval::unbound_closed(v),
@@ -940,7 +1048,11 @@ impl Predicate {
                 if arms.values().all(UnionArm::is_empty) {
                     return Predicate::False;
                 }
-                Predicate::Union(arms.map(|_, arm| Predicate::from_column_value(arm.values())))
+                // A column names only the tags it holds; the rest admit nothing.
+                Predicate::tagged(
+                    arms.map(|_, arm| Predicate::from_column_value(arm.values())),
+                    false,
+                )
             }
         }
     }
@@ -1029,11 +1141,11 @@ impl Predicate {
                 unreachable!("a path-shaped predicate is checked over its levels")
             }
             // Union: each per-variant predicate must be applicable to its variant extent.
-            Predicate::Union(ps) => match &extent {
-                // Width subtyping: the predicate may cover fewer arms than the
-                // extent declares (the missing ones cannot occur), but every arm it
-                // does cover must match that arm's extent.
-                Extent::Union(ext_arms) => ps
+            Predicate::Union { tags, .. } => match &extent {
+                // Width subtyping: the predicate may name fewer tags than the extent
+                // declares, and `rest` covers the others, but every tag it does name must
+                // match that tag's extent.
+                Extent::Union(ext_arms) => tags
                     .iter()
                     .all(|(k, p)| ext_arms.get(k).is_some_and(|e| p.is_applicable_to(e))),
                 _ => false,
@@ -1441,6 +1553,67 @@ mod tests {
             }
         }
         out
+    }
+
+    /// `beneath` and `within` are inverse, at the group's own level and deeper.
+    #[test]
+    fn beneath_and_within_are_inverse() {
+        let row = [u(3)];
+        let flat = Predicate::at_or_below(u(1));
+        let placed = flat.beneath(&row, 0);
+        assert!(placed.contains_path(&under(3, 1)) && !placed.contains_path(&under(2, 1)));
+        assert_eq!(placed.within(&row, 0), flat);
+        assert_eq!(flat.beneath(&[u(2)], 0).within(&row, 0), Predicate::False);
+
+        let deep = Predicate::qualified(only(0), Predicate::at_or_below(u(4)));
+        let placed = deep.beneath(&row, 1);
+        assert!(placed.contains_path(&[u(3), u(0), u(4)]));
+        assert!(!placed.contains_path(&[u(2), u(0), u(4)]));
+        assert!(!placed.contains_path(&[u(3), u(1), u(4)]));
+        assert_eq!(placed.within(&row, 1), deep);
+    }
+
+    /// `qualified_by` states a column's groups beneath its rows and nowhere else.
+    #[test]
+    fn qualified_by_states_a_column_only_under_its_rows() {
+        let rows = uint_intervals(&[0, 1]);
+        let q = Predicate::True.qualified_by(&rows, 0);
+        assert!(q.contains_path(&under(1, 7)));
+        assert!(!q.contains_path(&under(2, 7)));
+        let deeper = Predicate::at_or_below(u(0)).qualified_by(&rows, 1);
+        assert!(deeper.contains_path(&[u(1), u(9), u(0)]));
+        assert!(!deeper.contains_path(&[u(2), u(9), u(0)]));
+        assert!(!deeper.contains_path(&[u(1), u(9), u(1)]));
+    }
+
+    /// `as_at_or_below` reads back the watermark `at_or_below` was built from, and nothing
+    /// else is one.
+    #[test]
+    fn as_at_or_below_reads_back_its_watermark() {
+        for w in [0usize, 3, 100] {
+            assert_eq!(Predicate::at_or_below(u(w)).as_at_or_below(), Some(u(w)));
+        }
+        assert_eq!(uint_intervals(&[0, 1, 2]).as_at_or_below(), Some(u(2)));
+        assert_eq!(uint_intervals(&[1, 2]).as_at_or_below(), None);
+        assert_eq!(Predicate::True.as_at_or_below(), None);
+    }
+
+    /// `Unit` has one value, so its point and `≤ ()` are everything and `< ()` is nothing,
+    /// as `from_column_value` spells a column of units: taking a unit key out of a statement
+    /// leaves one that still applies to a `Unit` domain.
+    #[test]
+    fn a_unit_key_is_the_whole_unit_domain() {
+        let unit = Extent::Base(BaseType::Unit);
+        assert_eq!(Predicate::point(Value::Unit), Predicate::True);
+        assert_eq!(Predicate::at_or_below(Value::Unit), Predicate::True);
+        assert_eq!(Predicate::below(Value::Unit), Predicate::False);
+        assert_eq!(
+            Predicate::point(Value::Unit),
+            Predicate::from_column_value(&ColumnValue::Units(1))
+        );
+        let rest = Predicate::True.minus(&Predicate::exactly(&[Value::Unit]));
+        assert_eq!(rest, Predicate::False);
+        assert!(rest.is_applicable_to(&unit));
     }
 
     #[test]
@@ -2911,7 +3084,7 @@ mod tests {
     }
 
     fn union_pred(p0: Predicate, p1: Predicate) -> Predicate {
-        Predicate::Union(TagMap::from_positional(vec![p0, p1]))
+        Predicate::over_every_tag(TagMap::from_positional(vec![p0, p1]))
     }
 
     fn union_val(tag: usize, inner: Value) -> Value {
@@ -2919,6 +3092,62 @@ mod tests {
             tag: FieldKey::Index(tag),
             inner: Box::new(inner),
         }
+    }
+
+    /// A union predicate names some tags and says with `rest` what every other admits, so a
+    /// point, its complement and their combination are exact without the domain's tag list.
+    #[test]
+    fn a_union_predicate_is_exact_over_tags_it_does_not_name() {
+        let one = Predicate::point(union_val(0, Value::Int(1)));
+        assert!(one.contains(&union_val(0, Value::Int(1))));
+        assert!(!one.contains(&union_val(0, Value::Int(2))));
+        assert!(!one.contains(&union_val(1, Value::Int(1))));
+        let rest = Predicate::True.minus(&one);
+        assert!(!rest.contains(&union_val(0, Value::Int(1))));
+        assert!(rest.contains(&union_val(0, Value::Int(2))));
+        assert!(rest.contains(&union_val(1, Value::Int(1))));
+        assert!(
+            rest.contains(&union_val(7, Value::Int(1))),
+            "a tag neither names: {rest:?}"
+        );
+        assert_eq!(rest.union(&one), Predicate::True);
+        assert_eq!(rest.intersect(&one), Predicate::False);
+        assert!(rest.is_applicable_to(&union_ext()));
+        // A column naming one tag and a statement over both combine without a tag-set match.
+        let column = Predicate::from_column_value(&ColumnValue::positional_union(
+            &[0],
+            vec![ColumnValue::Ints(vec![1])],
+        ));
+        let statement = union_pred(int_intervals(&[1, 2]), Predicate::True);
+        assert!(statement.subsumes(&column));
+        assert!(!column.subsumes(&statement));
+        assert_eq!(
+            statement.minus(&column),
+            union_pred(int_intervals(&[2]), Predicate::True)
+        );
+    }
+
+    /// A path through a union-typed level is spelled the way that level's own statements
+    /// are, so it applies to the level and meets its statements.
+    #[test]
+    fn a_union_key_path_is_spelled_as_its_levels_statements() {
+        let row = Predicate::exactly(&[union_val(0, Value::Int(1))]);
+        assert!(row.is_applicable_to(&union_ext()), "{row:?}");
+        let stated = union_pred(Predicate::True, Predicate::False);
+        assert!(row.minus(&stated).is_false(), "{:?}", row.minus(&stated));
+    }
+
+    /// A predicate built over every tag of its domain is `True` when every tag is.
+    #[test]
+    fn a_union_over_every_tag_all_true_is_true() {
+        assert_eq!(
+            union_pred(Predicate::True, Predicate::True),
+            Predicate::True
+        );
+        assert_eq!(
+            union_pred(Predicate::False, Predicate::False),
+            Predicate::False
+        );
     }
 
     #[test]
@@ -2937,7 +3166,7 @@ mod tests {
             vec![ColumnValue::Ints(vec![1, 3]), ColumnValue::Ints(vec![7])],
         );
         let pred = Predicate::from_column_value(&cv);
-        assert!(matches!(pred, Predicate::Union(ref ps) if ps.len() == 2));
+        assert!(matches!(pred, Predicate::Union { ref tags, .. } if tags.len() == 2));
         // Tag-0 predicate admits 1 and 3 but not 7.
         assert!(pred.contains(&union_val(0, Value::Int(1))));
         assert!(pred.contains(&union_val(0, Value::Int(3))));
@@ -3001,7 +3230,7 @@ mod tests {
 
     #[test]
     fn union_contains_rejects_non_union_value() {
-        let pred = union_pred(Predicate::True, Predicate::True);
+        let pred = union_pred(int_intervals(&[0]), Predicate::True);
         assert!(!pred.contains(&Value::Int(0)));
     }
 
@@ -3112,7 +3341,7 @@ mod tests {
 
     #[test]
     fn applicable_union_predicate_rejects_scalar_extent() {
-        let pred = union_pred(Predicate::True, Predicate::True);
+        let pred = union_pred(int_intervals(&[1]), Predicate::True);
         assert!(!pred.is_applicable_to(&int()));
     }
 
@@ -3132,10 +3361,10 @@ mod tests {
     /// against.
     #[test]
     fn applicable_union_predicate_rejects_a_tag_the_extent_lacks() {
-        let pred = Predicate::Union(TagMap::from_arms(vec![(
-            FieldKey::Name("nope".into()),
-            Predicate::True,
-        )]));
+        let pred = Predicate::tagged(
+            TagMap::from_arms(vec![(FieldKey::Name("nope".into()), Predicate::True)]),
+            false,
+        );
         let ext = Extent::Union(TagMap::from_positional(vec![int(), bool_ext()]));
         assert!(!pred.is_applicable_to(&ext));
     }

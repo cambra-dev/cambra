@@ -101,8 +101,8 @@ the previous version of the interpreter.
 
 | Variant | Meaning |
 |---------|---------|
-| `Scalar(bool)` | `true` = interested, `false` = not interested. |
-| `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
+| `Scalar(Predicate)` | A value with no keys of its own, named under the paths reaching it: `True` under every path, `False` under none, or `Qualified { enclosing, here: True }` under the paths `enclosing` admits. |
+| `Aggregation(Predicate)` | An aggregate's result, named under the paths reaching it as `Scalar` is. |
 | `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
 | `Function(FunctionGuard)` | Structured interest in a function tile (see below). |
 | `Or(arms)` | Union of two guards no single variant holds: a two-level tile is covered partly by its inner keys and partly by its outer, and `FunctionGuard` has no `Domain`-with-`Codomain` arm. Each arm is a chain of `Codomain` steps ending in one guard (`TileGuard::flatten_or`), so arms naming the same place merge, and an arm beneath a key a shallower arm names whole is dropped. |
@@ -137,6 +137,12 @@ keys the record does, so a collection in one of them is a level under those keys
 is released once every field under it is complete, so a scalar field beside a still-growing
 collection holds the key.
 
+A keyless field beneath a level is named by the rows above it: `Scalar(Qualified { enclosing:
+𝑅, here: True })` is that field's cell under the rows 𝑅. This is the only way a guard names
+part of a record without naming whole keys, and it is how the meet of two readers of one
+record, each done with a different field, stays exact. `TileGuard::flatten_or` states a record
+whose every field is whole under 𝑅 as `Domain(𝑅)`.
+
 A record ends the collection chain, and a collection in one of its fields still grows under the
 record's key. `Tile::holds_a_level` states the two questions that differ there, and which of them
 guards, the merge, and the chain walks each ask.
@@ -154,9 +160,9 @@ signal in tiles and as a region specifier in guards.
 | `False` | No values. Empty predicate; annihilator under `intersect`. |
 | `Intervals(IntervalSet<Value>)` | A scalar key's admitted values, clamped to the type's range. `Predicate::at_or_below(v)` builds the prefix `≤ v`, the upper-bound streaming signal, and `Predicate::below(v)` the strict one. Never built over records. |
 | `Record(fields)` | A box over a record key: one predicate per field, with AND semantics. |
-| `Or(arms)` | A union of boxes where no single box is it. Arms are always flat (no nested `Or`). |
+| `Or(arms)` | A union of boxes no two of which join into one box, as `flatten_or` leaves it; three or more arms can still cover one box. Arms are always flat (no nested `Or`). |
 | `Qualified { enclosing, here }` | A key of an inner level **under the enclosing path that reaches it**: admits `(k₀ … k_d)` when `(k₀ … k_{d-1})` satisfies `enclosing` and `k_d` satisfies `here`. Built through `Predicate::qualified`, which drops the arm where `enclosing` admits everything. |
-| `Union(variants)` | Per-variant predicates for union-typed extents (`Extent::Union`). A value `Union { tag, inner }` satisfies `Union(variants)` iff `variants[tag].contains(inner)`. The length of `variants` must equal the number of union variants. Used as the domain predicate on tiles emitted by `UnionProducer`, and split by `UnionProducer::release_impl` to forward each per-variant predicate to the correct upstream input. |
+| `Union { tags, rest }` | A predicate over a union-typed extent (`Extent::Union`): one predicate per named tag, and `rest` (`True` or `False`) for every tag it does not name. A value `Union { tag, inner }` satisfies it iff the predicate for `tag`, its own or `rest`, admits `inner`. A predicate need not name every tag of its domain: a column names only the tags it holds, which width subtyping makes fewer than its extent's, and a point names one. Built through `Predicate::tagged`, whose canonical form names no tag that says what `rest` does; `Predicate::over_every_tag` builds one from the whole tag set, which is `True` when every tag is. Used as the domain predicate on tiles emitted by `UnionProducer`, and split by `UnionProducer::release_impl` to forward each tag's predicate to the upstream input for that tag. |
 
 `Predicate::intersect()`, `union()`, `minus()`, and `subsumes()` are defined between any two
 predicates over one domain, and refuse two predicates over different domains.
@@ -164,9 +170,12 @@ predicates over one domain, and refuse two predicates over different domains.
 `True` or `False`: a record whose fields are *all* `True`, a record with *any* `False` field
 (the fields are an AND, so one empty field admits nothing whatever the others admit), and an
 `Or` whose arms are all `False`.
-For `Union` predicates, `as_bool()` returns `Some(true)` when every variant predicate is `True`,
-and `Some(false)` when every variant predicate is `False`; otherwise `None`. All set operations
-(`intersect`, `minus`, `union`) are applied element-wise across the variant predicates.
+A `Union` predicate in canonical form names only tags that differ from `rest`, so `as_bool()`
+answers `None` for it; universality over a union domain is spelled `True`. The set operations
+(`intersect`, `minus`, `union`, `subsumes`) apply tag by tag over every tag either side names,
+reading an unnamed tag as its side's `rest`, and combine the two `rest`s the same way. A prefix
+of a union domain (`at_or_below` of a union value) has no spelling: it would need the tags
+ordered before the bound whole and those after it empty, which one `rest` cannot say.
 
 ### Qualified predicates
 
@@ -320,6 +329,12 @@ Every operator must obey it in both directions, because a violation yields **wro
 
 An operator must therefore **reject a guard it cannot honor rather than ignore it**. The guard accumulates in `obsolete_guard` whether or not `release_impl` acts on it, so dropping one silently leaves the operator free to re-emit that region — from its own state, or by re-reading an input it never passed the release to. Every `release_impl` is exhaustive; an operator with no sub-region to reclaim piecewise checks the guard with `TileGuard::expect_universal_or_empty`. Rejecting fires where the guard arrives, which does not depend on anything pulling afterwards — the `get` post-condition only fires if something does.
 
+A keyless field's cell beneath a level goes with its key. A record tile's fields stand over
+the same rows, so a tile cannot hold a row without its cell. A release naming the cell under an
+open key is recorded, and the producer returns the cell until the key is released
+(`Tile::remove_guarded`). No consumer can have dropped the cell while it holds the row, so
+the value it receives again is one it already has, matched by key.
+
 ### Guard operations are exact
 
 `TileGuard::intersect`, `TileGuard::union`, `TileGuard::flatten_or`, and every function that
@@ -461,7 +476,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
 | `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces every codomain value of a function input with the same constant (or zips it in, per its mode), preserving the domain. A collection constant is one row, and each element gets a copy of its group (`repeat_tile`). The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `DataFunction(Unit → Scalar)` | `Scalar` | Unwraps a `DataFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
-| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product whole, and releases what its consumer released of the field it selects, which is lossy (`guard_at_field`, TODO(exact-field-release)). |
+| `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product whole, and releases what its consumer released of the field it selects and every other field whole (`guard_at_field`). |
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |

@@ -174,8 +174,8 @@ impl UnionOperator {
 /// tag fan-out), so the arms' keys are disjoint and reassemble the full column —
 /// which then co-iterates with the decision record's sibling `commit` field. The
 /// codomain is a scalar decision-field value, or a boxed-compound `Tile::Record`
-/// for a tuple/record accumulator; the shared fed predicate is taken from the
-/// first arm (all arms carry it).
+/// for a tuple/record accumulator. A key is complete once every arm calls it complete,
+/// and beneath a key each level states what the arm holding it says.
 ///
 /// **The key is the domain value, not a position.** Reassembling needs only a
 /// total order (to restore the fed order) and equality (to catch two arms
@@ -217,7 +217,7 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         if live.is_empty() {
             continue;
         }
-        for row in live {
+        for &row in &live {
             pairs.push((domain.index_at(row), offset + row));
         }
         offset += domain.len();
@@ -226,7 +226,17 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         // shape before being concatenated. An arm carrying a level passes through: it is
         // already the shape its tiling names, and boxing it is what has no column to go in.
         let codomain = if codomain.holds_a_level() {
-            *codomain
+            // What an arm states beneath a key is the arm's to say only for the keys it holds
+            // live: a key it deleted or never held is a sibling's, whose own statement is the
+            // one that counts there.
+            let mut codomain = *codomain;
+            let held = Predicate::from_column_value(
+                &domain.select_indices(live.iter().copied(), live.len()),
+            );
+            codomain.map_level_predicates(&mut |depth, stated| {
+                stated.intersect(&Predicate::True.qualified_by(&held, depth))
+            });
+            codomain
         } else if codomain_tiling.holds_a_level() {
             unreachable!(
                 "flat_merge: an arm with live rows under a codomain tiling that holds a level \
@@ -411,7 +421,9 @@ impl TileProducer for UnionProducer {
             }
         }
 
-        let domain_predicate = Predicate::Union(TagMap::from_positional(domain_predicates));
+        // One predicate per arm, and the arms are every tag of the union's domain.
+        let domain_predicate =
+            Predicate::over_every_tag(TagMap::from_positional(domain_predicates));
 
         // Build the discriminated-union domain column. Each arm occupies a
         // contiguous run of rows, in arm order.
@@ -464,13 +476,11 @@ impl TileProducer for UnionProducer {
             }
             // Split the per-variant predicates and forward each to the input that
             // produced that variant's data.
-            TileGuard::Function(FunctionGuard::Domain(Predicate::Union(ps))) => {
-                assert_eq!(
-                    ps.len(),
-                    self.inputs.len(),
-                    "UnionProducer::release_impl: variant count mismatch"
-                );
-                for (input, (_, pred)) in self.inputs.iter_mut().zip(ps) {
+            TileGuard::Function(FunctionGuard::Domain(pred @ Predicate::Union { .. })) => {
+                for (arm, input) in self.inputs.iter_mut().enumerate() {
+                    let pred = pred
+                        .under_tag(&crate::ccl::FieldKey::Index(arm))
+                        .unwrap_or_else(|| unreachable!("matched as a union predicate"));
                     input.release(TileGuard::Function(FunctionGuard::Domain(pred)));
                 }
             }
@@ -811,7 +821,7 @@ mod tests {
 
         // Release arm 0 in full, leaving arm 1 live.
         producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::Union(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::False,
             ])),
@@ -937,8 +947,9 @@ mod tests {
 
         let pred0 = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2]));
         let pred1 = Predicate::from_column_value(&ColumnValue::Ints(vec![3, 4]));
-        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::Union(
+        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::tagged(
             TagMap::from_positional(vec![pred0.clone(), pred1.clone()]),
+            false,
         )));
 
         producer.release(guard);
@@ -956,6 +967,48 @@ mod tests {
             l1[0],
             TileGuard::Function(FunctionGuard::Domain(pred1)),
             "input 1 should receive pred1"
+        );
+    }
+
+    /// Beneath each key, a flat merge states what the arm holding that key says, not what
+    /// a sibling arm says of keys it does not hold.
+    #[test]
+    fn flat_merge_states_beneath_each_key_what_its_own_arm_does() {
+        use bit_set::BitSet;
+        let uint = || Extent::Base(BaseType::UInt);
+        let arm = |key: usize, inner: usize, inner_pred: Predicate, outer: Predicate| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![key]),
+                Box::new(Tile::grouped(
+                    ColumnValue::UInts(vec![0]),
+                    ColumnValue::UInts(vec![inner]),
+                    Box::new(Tile::Scalar(ColumnValue::UInts(vec![inner]))),
+                    inner_pred,
+                    BitSet::new(),
+                )),
+                outer,
+                BitSet::new(),
+            )
+        };
+        let a = arm(0, 7, Predicate::True, Predicate::True);
+        let b = arm(1, 8, Predicate::False, Predicate::False);
+        let merged = flat_merge(
+            vec![a, b],
+            &uint(),
+            &Tiling::data_function(uint(), Tiling::Scalar(uint())),
+        );
+        let Tile::DataFunction { codomain, .. } = &merged else {
+            panic!("expected a collection")
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &**codomain
+        else {
+            panic!("expected a nested collection")
+        };
+        assert!(
+            !domain_predicate.contains_path(&[Value::UInt(1), Value::UInt(8)]),
+            "arm B's row 1 is open, yet the merged inner level calls [1, 8] complete: {merged:?}"
         );
     }
 }

@@ -152,7 +152,7 @@ impl TileProducer for ConverseProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        match input_tile {
+        let mut out = match input_tile {
             Tile::DataFunction {
                 row_starts,
                 domain,
@@ -270,7 +270,14 @@ impl TileProducer for ConverseProducer {
                 }
             }
             _ => panic!("Can only converse functions"),
+        };
+        // A group can be released while the input still grows, since `release_impl` frees
+        // only the rows held; a row arriving later with a released value would otherwise
+        // put the group back into a region the consumer has let go.
+        if !self.base.obsolete_guard.is_empty() {
+            out.remove_guarded(self.base.obsolete_guard.clone());
         }
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1723,6 +1730,46 @@ mod tests {
             Extent::Base(BaseType::Int),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )
+    }
+
+    /// A released group stays released: a row the input delivers later with that group's
+    /// value does not put the group back.
+    #[test]
+    fn a_released_group_is_not_redelivered_when_a_row_joins_it() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let input_at = |keys: Vec<i64>, values: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::Ints(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let output_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::Base(BaseType::Int),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![10]), one_level_tiling());
+        let mut producer = ConverseProducer {
+            base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
+            input: Box::new(input),
+            held: Vec::new(),
+        };
+        let _ = producer.get(producer.tiling().universal_guard());
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(10)),
+        )));
+        // Row 0 was released upstream; row 1 joins group 10 and row 2 starts group 20.
+        *next.borrow_mut() = input_at(vec![1, 2], vec![10, 20]);
+        let mut out = producer.get(producer.tiling().universal_guard());
+        out.compact();
+        let Tile::DataFunction { domain, .. } = &out else {
+            panic!("converse yields a collection: {out:?}")
+        };
+        assert_eq!(domain, &ColumnValue::Ints(vec![20]), "{out:?}");
     }
 
     /// Basic converse: `{0→10, 1→20, 2→10}` groups by codomain value.

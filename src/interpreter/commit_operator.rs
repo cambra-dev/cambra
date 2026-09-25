@@ -3507,7 +3507,12 @@ impl TileProducer for TransactDriverProducer {
         if next_item.is_some() {
             self.wakeups.request(self.consumer.clone());
         }
-        self.window.render(done)
+        // A release naming part of a row rather than the row leaves the row in the window
+        // (`release_impl`), so what it names is withheld here.
+        let mut tile = self.window.render(done);
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.compact();
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -3519,9 +3524,10 @@ impl TileProducer for TransactDriverProducer {
         // intersection of the two is the finish, and that is what advances the
         // item cursor. Superseded retries for the same item ride the same prefix
         // and give the same answer, so the rule is idempotent under any order.
-        let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard else {
-            return;
-        };
+        //
+        // The window holds rows, so it acts on the rows the release names whole. What the
+        // release names of a row's values is withheld from the output (`get_impl`).
+        let pred = &obsolete_guard.whole_keys();
         // Only the **newest** live row's release is the item's finish. An older one
         // is a superseded retry, which the writer releases as soon as a newer
         // attempt replaces it — reclaiming that row must not advance the cursor past
@@ -4250,15 +4256,21 @@ impl TileProducer for TransactWriterProducer {
             }
         }
         self.debug_assert_position_invariant();
-        self.render()
+        // A release naming part of a proposal rather than the proposal leaves it in the
+        // window (`release_impl`), so what it names is withheld here.
+        let mut tile = self.render();
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.compact();
+        tile
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // commit-ack: advance past the item each released proposal was for, then
         // compact the released prefix out of the live window. Idempotent.
         self.debug_assert_position_invariant();
-        let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard else {
-            return;
-        };
+        //
+        // The window holds rows, so it acts on the rows the release names whole. What the
+        // release names of a row's values is withheld from the output (`get_impl`).
+        let pred = &obsolete_guard.whole_keys();
         // The entry at vector index `i` is absolute position `committed_base + i`
         // (positions are stable; the consumer releases by that absolute value).
         // A committed proposal finishes its item, so ack the driver row it was

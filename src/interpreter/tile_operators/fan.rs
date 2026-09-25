@@ -496,19 +496,21 @@ pub struct SelectField {
 }
 
 /// What a selector of field `name` releases of the product `tiling`, given its consumer's
-/// release `guard` of that field: `guard` placed at the field, under one `Codomain` wrapper
-/// per level the record sits beneath, and nothing on the other fields.
+/// release `guard` of that field: `guard` on the field, and every other field whole.
 ///
-/// TODO(exact-field-release): this release is lossy, which the guard algebra forbids
-/// (`src/interpreter/design-operators.md`, "Guard operations are exact"). Do not copy it. It
-/// drops a guard naming keys of a level above the record, and releases nothing of the other
-/// fields, so a `FanOut` meeting two selectors releases nothing at all. The exact release is
-/// `guard` on this field and every other field whole, and the `FanOut` meet of two of those
-/// beneath a level names one field's cells under some of the rows. That region needs a scalar
-/// guard qualified by the rows above it, which the guard algebra cannot spell yet.
+/// **A selector's subscription reads one field**, so nothing beneath it needs the others.
+/// A sibling selector reads the product through the [`FanOut`] a shared product sits
+/// behind, which forwards only the meet of its readers' releases, so a field reaches the
+/// product released only where every reader has released it. The meet of two such releases
+/// beneath a level names one field's cells under some rows, which a keyless field's guard
+/// states by the rows above it ([`TileGuard::Scalar`]).
+///
+/// A guard naming keys of a level above the record names every field at those keys, and it
+/// passes through as those keys.
 fn guard_at_field(tiling: &Tiling, name: &str, guard: TileGuard) -> TileGuard {
     match tiling {
         Tiling::DataFunction { codomain, .. } => match guard {
+            g if g.is_universal() => tiling.universal_guard(),
             TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
                 FunctionGuard::Codomain(Box::new(guard_at_field(codomain, name, *inner))),
             ),
@@ -517,15 +519,26 @@ fn guard_at_field(tiling: &Tiling, name: &str, guard: TileGuard) -> TileGuard {
                     .map(|arm| guard_at_field(tiling, name, arm))
                     .collect(),
             ),
-            _ => tiling.empty_guard(),
+            keys @ TileGuard::Function(FunctionGuard::Domain(_)) => {
+                let field = select_field_tiling(codomain, name).empty_guard();
+                TileGuard::flatten_or(vec![
+                    keys,
+                    TileGuard::Function(FunctionGuard::Codomain(Box::new(guard_at_field(
+                        codomain, name, field,
+                    )))),
+                ])
+            }
+            other => unreachable!("a collection's guard is a function guard, got {other:?}"),
         },
-        Tiling::Record(_) => {
-            let TileGuard::Record(mut fields) = tiling.empty_guard() else {
-                unreachable!("a record tiling answers a record guard")
-            };
-            fields.insert(name.to_string(), guard);
-            TileGuard::Record(fields)
-        }
+        Tiling::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(field, t)| match field == name {
+                    true => (field.clone(), guard.clone()),
+                    false => (field.clone(), t.universal_guard()),
+                })
+                .collect(),
+        ),
         other => unreachable!("SelectField's input holds a record, got {other}"),
     }
 }
@@ -608,8 +621,8 @@ impl TileOperator for SelectField {
 /// **A pull reads the whole product.** A narrowed pull is unsound through a cumulative
 /// cache: [`Memo`] merges what a pull returned and answers later pulls from it without going
 /// below, so a pull naming one field would record a partial answer as the whole one, and a
-/// sibling selector would read a field never fetched. A release names only this field's
-/// part ([`guard_at_field`], whose TODO says why that is lossy).
+/// sibling selector would read a field never fetched. A release names this field's part and
+/// every other field whole ([`guard_at_field`]).
 struct SelectFieldProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
@@ -645,8 +658,8 @@ impl TileProducer for SelectFieldProducer {
                 self.name
             )
         });
-        // The input is released only where every reader of it has released, and less than
-        // that ([`guard_at_field`]), so it can still hold what this consumer released.
+        // The input is released only where every reader of it has released
+        // ([`guard_at_field`]), so it can still hold what this consumer released.
         tile.remove_guarded(self.obsolete_guard().clone());
         tile.compact();
         tile
@@ -748,8 +761,8 @@ mod tests {
         // Field `_0` released, `_1` still live — neither empty nor universal.
         let partial = TileGuard::Record(
             [
-                (names[0].clone(), TileGuard::Scalar(true)),
-                (names[1].clone(), TileGuard::Scalar(false)),
+                (names[0].clone(), TileGuard::Scalar(Predicate::True)),
+                (names[1].clone(), TileGuard::Scalar(Predicate::False)),
             ]
             .into_iter()
             .collect(),
@@ -758,7 +771,7 @@ mod tests {
 
         assert_eq!(
             *logs[0].borrow(),
-            vec![TileGuard::Scalar(true)],
+            vec![TileGuard::Scalar(Predicate::True)],
             "the named field's operand is released",
         );
         assert!(
@@ -832,11 +845,10 @@ mod tests {
         );
     }
 
-    /// A release naming rows of the level above the record reaches nothing upstream today
-    /// (TODO(exact-field-release) on [`guard_at_field`]). This pins the gap: the exact release
-    /// names those rows, and this assertion flips when the guard algebra can spell it.
+    /// A consumer finishing rows of one field releases those rows whole, and every other
+    /// field everywhere: nothing beneath the selector reads the others ([`guard_at_field`]).
     #[test]
-    fn select_field_drops_a_release_naming_rows_above_the_record() {
+    fn select_field_releases_finished_rows_and_every_other_field() {
         let input_tiling = record_under_a_level();
         let (spy, log) = ReleaseSpy::new(
             Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -847,15 +859,46 @@ mod tests {
             base: ProducerBase::new(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
             name: "a".to_string(),
-            input_tiling,
+            input_tiling: input_tiling.clone(),
         };
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::at_or_below(Value::UInt(0)),
+        let rows = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+            0,
+        ))));
+        producer.release(rows.clone());
+
+        let Tiling::DataFunction { codomain, .. } = &input_tiling else {
+            unreachable!("built as a collection")
+        };
+        let Tiling::Record(fields) = &**codomain else {
+            unreachable!("built over a record")
+        };
+        let other_fields = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Record(HashMap::from([
+                ("a".to_string(), TileGuard::Scalar(Predicate::False)),
+                ("xs".to_string(), fields["xs"].universal_guard()),
+            ])),
         )));
-        assert!(
-            log.borrow().iter().all(TileGuard::is_empty),
-            "the rows reach upstream now, so the TODO is done: {:?}",
-            log.borrow(),
+        assert_eq!(
+            *log.borrow(),
+            vec![TileGuard::flatten_or(vec![rows, other_fields])],
+        );
+    }
+
+    /// Over a bare product the other fields are released whole and the selected one as its
+    /// consumer released it.
+    #[test]
+    fn select_field_over_a_bare_product_releases_every_other_field() {
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let product = Tiling::Record(HashMap::from([
+            ("a".to_string(), int.clone()),
+            ("b".to_string(), int.clone()),
+        ]));
+        assert_eq!(
+            guard_at_field(&product, "a", TileGuard::Scalar(Predicate::False)),
+            TileGuard::Record(HashMap::from([
+                ("a".to_string(), TileGuard::Scalar(Predicate::False)),
+                ("b".to_string(), TileGuard::Scalar(Predicate::True)),
+            ])),
         );
     }
 

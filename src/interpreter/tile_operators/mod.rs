@@ -528,9 +528,12 @@ pub(crate) fn assert_complete_region_unchanged(
         if last_entries.contains_key(&(label.clone(), path.clone())) || path.is_empty() {
             continue;
         }
+        // The collection an entry sits in: a key's own label, or for a value in a record's
+        // field, the label that record's collection was reached by.
         let level = path.len() - 1;
-        let was_complete = last_nodes
-            .get(&(label.clone(), level))
+        let was_complete = (0..=label.len())
+            .rev()
+            .find_map(|n| last_nodes.get(&(label[..n].to_vec(), level)))
             .is_some_and(|n| n.complete.contains_path(path));
         assert!(
             !was_complete,
@@ -695,7 +698,8 @@ pub trait TileProducer {
                 .is_err()
             {
                 panic!(
-                    "the violation above, in the producer tree:\n{}",
+                    "the panic above, raised checking the completeness contract, in the \
+                     producer tree:\n{}",
                     crate::pretty_tree::render_with_max_depth(
                         &self.inspect(&VizOptions::default()),
                         Some(6)
@@ -728,6 +732,9 @@ pub trait TileProducer {
             "{obsolete_guard:?} vs {:?}",
             self.tiling()
         );
+        // Released in canonical form (`TileGuard::flatten_or`), so a region naming everything
+        // beneath some keys reaches `release_impl` as those keys.
+        let obsolete_guard = TileGuard::flatten_or(vec![obsolete_guard]);
         let new_guard = self.base().obsolete_guard.union(&obsolete_guard);
         if new_guard != self.base().obsolete_guard {
             self.base_mut().obsolete_guard = new_guard;
@@ -814,6 +821,85 @@ pub(crate) mod test_helpers {
                 tile,
             }
         }
+    }
+
+    /// A [`TileProducer`] that answers each pull with whatever tile its shared cell holds,
+    /// so a test can change its input between pulls. What a producer states on one pull
+    /// constrains what it may answer on the next (`src/interpreter/design-operators.md`,
+    /// "The completeness contract"), which a fixed tile cannot exercise.
+    pub(crate) struct ScriptedProducer {
+        pub(crate) base: ProducerBase,
+        pub(crate) tile: std::rc::Rc<std::cell::RefCell<Tile>>,
+    }
+
+    impl ScriptedProducer {
+        /// The producer, and the cell a test writes the next pull's answer into.
+        pub(crate) fn new(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            let producer = Self {
+                base: ProducerBase::new(Self::alloc_id(), &tiling),
+                tile: cell.clone(),
+            };
+            (producer, cell)
+        }
+    }
+
+    impl TileProducer for ScriptedProducer {
+        impl_producer_base!();
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.borrow().clone()
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A value in a record's field filled in beneath a key already called complete is an
+    /// addition beneath a complete path, which the completeness contract forbids.
+    #[test]
+    #[should_panic(expected = "beneath a path it had called complete")]
+    fn a_record_field_filled_beneath_a_complete_key_is_reported() {
+        use crate::interpreter::{ColumnValue, Predicate};
+        use bit_set::BitSet;
+        use std::collections::HashMap;
+        let with_n = |n: ColumnValue| {
+            // Built directly rather than through `Tile::data_function`, which a tile holding
+            // a complete key with an empty field need not pass: this is the check's input.
+            Tile::DataFunction {
+                row_starts: ColumnValue::UInts(vec![0]),
+                domain: ColumnValue::UInts(vec![0]),
+                codomain: Box::new(Tile::Record(HashMap::from([
+                    ("n".to_string(), Tile::Scalar(n)),
+                    (
+                        "xs".to_string(),
+                        Tile::grouped(
+                            ColumnValue::UInts(vec![0]),
+                            ColumnValue::UInts(vec![]),
+                            Box::new(Tile::Scalar(ColumnValue::UInts(vec![]))),
+                            Predicate::False,
+                            BitSet::new(),
+                        ),
+                    ),
+                ]))),
+                domain_predicate: Predicate::True,
+                deleted: BitSet::new(),
+            }
+        };
+        let last = with_n(ColumnValue::Ints(vec![]));
+        let result = with_n(ColumnValue::Ints(vec![5]));
+        super::assert_complete_region_unchanged(
+            "a_record_field",
+            &last,
+            &result,
+            &TileGuard::Function(super::FunctionGuard::Domain(Predicate::False)),
+        );
     }
 
     /// A [`TileProducer`] that answers with a fixed tile and records every release

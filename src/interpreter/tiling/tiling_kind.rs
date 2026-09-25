@@ -101,27 +101,27 @@ impl Tiling {
 
     pub fn universal_guard(&self) -> TileGuard {
         match self {
-            Tiling::Scalar(..) => TileGuard::Scalar(true),
+            Tiling::Scalar(..) => TileGuard::Scalar(Predicate::True),
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.universal_guard()))
             }
             Tiling::DataFunction { .. } | Tiling::Store { .. } => {
                 TileGuard::Function(FunctionGuard::Domain(Predicate::True))
             }
-            Tiling::Aggregation { .. } => TileGuard::Aggregation(true),
+            Tiling::Aggregation { .. } => TileGuard::Aggregation(Predicate::True),
         }
     }
 
     pub fn empty_guard(&self) -> TileGuard {
         match self {
-            Tiling::Scalar(..) => TileGuard::Scalar(false),
+            Tiling::Scalar(..) => TileGuard::Scalar(Predicate::False),
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
             Tiling::DataFunction { .. } | Tiling::Store { .. } => {
                 TileGuard::Function(FunctionGuard::Domain(Predicate::False))
             }
-            Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
+            Tiling::Aggregation { .. } => TileGuard::Aggregation(Predicate::False),
         }
     }
 
