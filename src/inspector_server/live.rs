@@ -1,13 +1,13 @@
-//! The websocket that carries a running program's recorded values to the pane.
+//! The websocket that carries a running program's probe readings to the pane.
 //!
 //! The static payload stays on `GET /api/snapshot`: a static lookup is
 //! `span → node` and a live read is `(node, tick) → value`, so the two share no
 //! index and keeping them on separate routes leaves the pinned snapshot
 //! untouched (`src/inspector_model/design.md`).
 //!
-//! What crosses the socket is rendered rows, never a
+//! What crosses the socket is rendered probe readings, never a
 //! [`Tile`](crate::interpreter::tiling::Tile). The
-//! [`ValueRecorder`](crate::interpreter::value_recorder::ValueRecorder) renders
+//! [`ProbeTable`](crate::interpreter::value_probe::ProbeTable) renders
 //! on the driver thread, which is what bounds its memory, so the only thing this
 //! module moves between threads is a `String`.
 
@@ -28,7 +28,7 @@ use tungstenite::{
 
 #[cfg(test)]
 use crate::ccl::provenance::NodeId;
-use crate::interpreter::value_recorder::{SharedRecorder, SourceWindow};
+use crate::interpreter::value_probe::{SharedProbeTable, SourceWindow};
 #[cfg(test)]
 use crate::interpreter::{ColumnValue, tiling::Tile};
 #[cfg(test)]
@@ -64,35 +64,40 @@ pub struct LiveChannel {
 }
 
 impl LiveChannel {
-    /// Render the recorder's current state and hand it to the broadcaster.
+    /// Render the probe table's current state and hand it to the broadcaster.
     ///
     /// Called from the driver's per-tick hook, which sits between the pull and
     /// the release, so a source's retained window is sampled before anything is
     /// dropped from it.
-    pub fn publish(&self, recorder: &SharedRecorder, sources: &[SourceWindow], tick: u64) {
-        self.send(recorder, sources, tick, false);
+    pub fn publish_probes(&self, probes: &SharedProbeTable, sources: &[SourceWindow], tick: u64) {
+        self.send(probes, sources, tick, false);
     }
 
-    /// Publish a last frame, marked `final`, and stop.
+    /// Publish a last probe frame, marked `final`, and stop.
     ///
     /// Without it a converged run is indistinguishable from one that is merely
     /// idle: the process parks after the run so the socket stays open and
     /// simply goes quiet. A reader cannot infer "nothing more will ever arrive"
     /// from silence, so the run says so.
-    pub fn finish(&self, recorder: &SharedRecorder, sources: &[SourceWindow], tick: u64) {
-        self.send(recorder, sources, tick, true);
+    pub fn publish_final_probes(
+        &self,
+        probes: &SharedProbeTable,
+        sources: &[SourceWindow],
+        tick: u64,
+    ) {
+        self.send(probes, sources, tick, true);
     }
 
     fn send(
         &self,
-        recorder: &SharedRecorder,
+        probes: &SharedProbeTable,
         sources: &[SourceWindow],
         tick: u64,
         final_frame: bool,
     ) {
         let published = self.latest.published.fetch_add(1, Ordering::Release) + 1;
-        let frame = crate::inspector_model::frame::render_frame(
-            recorder,
+        let frame = crate::inspector_model::frame::render_probe_frame(
+            probes,
             sources,
             tick,
             published,
@@ -283,7 +288,7 @@ fn not_an_upgrade(request: Request) -> io::Result<()> {
 mod tests {
     use std::{net::TcpStream, time::Duration};
 
-    use crate::interpreter::value_recorder::{ValueRecorder, render_source_window};
+    use crate::interpreter::value_probe::{ProbeTable, render_source_window};
 
     use super::*;
 
@@ -313,16 +318,16 @@ mod tests {
         socket
     }
 
-    fn recorder_with_one_row() -> SharedRecorder {
-        let recorder = Rc::new(RefCell::new(ValueRecorder::with_defaults()));
-        recorder.borrow_mut().set_tick(3);
-        recorder.borrow_mut().record(
+    fn probes_with_one_row() -> SharedProbeTable {
+        let probes = Rc::new(RefCell::new(ProbeTable::with_defaults()));
+        probes.borrow_mut().set_tick(3);
+        probes.borrow_mut().observe(
             Some(NodeId::fresh()),
             1,
             "MapResultWithSource#1",
             &Tile::Scalar(ColumnValue::Strings(vec!["hello".into()])),
         );
-        recorder
+        probes
     }
 
     fn read_frame(socket: &mut WebSocket<TcpStream>) -> serde_json::Value {
@@ -369,12 +374,12 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
-        // The recorder is `!Send`, so it is built and published from a thread
+        // The probe table is `!Send`, so it is built and published from a thread
         // that owns it — the driver's arrangement, in miniature.
         let channel = live.channel();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[], 3);
+            let probes = probes_with_one_row();
+            channel.publish_probes(&probes, &[], 3);
         })
         .join()
         .expect("the publishing thread");
@@ -382,10 +387,10 @@ mod tests {
         let frame = read_frame(&mut socket);
         assert_eq!(frame["tick"], 3);
         assert_eq!(frame["published"], 1);
-        let rows = &frame["nodes"][0]["producers"][0]["rows"];
+        let rows = &frame["nodes"][0]["probes"][0]["rows"];
         assert_eq!(rows[0]["value"], "\"hello\"");
         assert_eq!(
-            frame["nodes"][0]["producers"][0]["producer"],
+            frame["nodes"][0]["probes"][0]["producer"],
             "MapResultWithSource#1"
         );
     }
@@ -398,8 +403,8 @@ mod tests {
         let live = Arc::new(LiveServer::start());
         let channel = live.channel();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[], 3);
+            let probes = probes_with_one_row();
+            channel.publish_probes(&probes, &[], 3);
         })
         .join()
         .expect("the publishing thread");
@@ -420,19 +425,19 @@ mod tests {
 
         let channel = live.channel();
         thread::spawn(move || {
-            let recorder = Rc::new(RefCell::new(ValueRecorder::with_defaults()));
-            // Recorded in an order that is not the id order, so a frame that
+            let probes = Rc::new(RefCell::new(ProbeTable::with_defaults()));
+            // Observed in an order that is not the id order, so a frame that
             // merely preserved insertion order would fail too.
             let ids: Vec<NodeId> = (0..6).map(|_| NodeId::fresh()).collect();
             for i in [3usize, 0, 5, 1, 4, 2] {
-                recorder.borrow_mut().record(
+                probes.borrow_mut().observe(
                     Some(ids[i]),
                     i,
                     "P#1",
                     &Tile::Scalar(ColumnValue::Strings(vec!["v".into()])),
                 );
             }
-            channel.publish(&recorder, &[], 1);
+            channel.publish_probes(&probes, &[], 1);
         })
         .join()
         .expect("the publishing thread");
@@ -468,8 +473,8 @@ mod tests {
         let channel = live.channel();
         let publishing = channel.clone();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            publishing.publish(&recorder, &[], 3);
+            let probes = probes_with_one_row();
+            publishing.publish_probes(&probes, &[], 3);
         })
         .join()
         .expect("the publishing thread");
@@ -477,8 +482,8 @@ mod tests {
         assert_eq!(running["final"], false, "a mid-run frame is not the last");
 
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.finish(&recorder, &[], 4);
+            let probes = probes_with_one_row();
+            channel.publish_final_probes(&probes, &[], 4);
         })
         .join()
         .expect("the finishing thread");
@@ -494,8 +499,8 @@ mod tests {
         let live = Arc::new(LiveServer::start());
         let channel = live.channel();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.finish(&recorder, &[], 9);
+            let probes = probes_with_one_row();
+            channel.publish_final_probes(&probes, &[], 9);
         })
         .join()
         .expect("the publishing thread");
@@ -530,8 +535,8 @@ mod tests {
         let channel = live.channel();
         let publishing = channel.clone();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            publishing.publish(&recorder, &[], 1);
+            let probes = probes_with_one_row();
+            publishing.publish_probes(&probes, &[], 1);
         })
         .join()
         .expect("the publishing thread");
@@ -547,8 +552,8 @@ mod tests {
         }
 
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[], 2);
+            let probes = probes_with_one_row();
+            channel.publish_probes(&probes, &[], 2);
         })
         .join()
         .expect("the second publishing thread");
@@ -584,8 +589,8 @@ mod tests {
         // The first frame it ever sees is the one published after it registered.
         let channel = live.channel();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.finish(&recorder, &[], 4);
+            let probes = probes_with_one_row();
+            channel.publish_final_probes(&probes, &[], 4);
         })
         .join()
         .expect("the publishing thread");
@@ -596,7 +601,7 @@ mod tests {
     }
 
     /// A source ships beside the operators, carrying a window rather than a
-    /// recording: it has no producer and takes no `get`.
+    /// probe reading: it has no producer and takes no `get`.
     #[test]
     fn a_frame_carries_a_source_window_beside_its_nodes() {
         let live = Arc::new(LiveServer::start());
@@ -613,8 +618,8 @@ mod tests {
         );
         let channel = live.channel();
         thread::spawn(move || {
-            let recorder = recorder_with_one_row();
-            channel.publish(&recorder, &[window], 5);
+            let probes = probes_with_one_row();
+            channel.publish_probes(&probes, &[window], 5);
         })
         .join()
         .expect("the publishing thread");
