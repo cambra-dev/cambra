@@ -2517,17 +2517,11 @@ pub(super) fn emit_transact<C: Typing>(
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, ctx)?;
         // A `__to_<defer>` field on the writer's decision record becomes a
-        // virtual mutable variable key the consumer reads as `__hist.__to_…`. Its stream
-        // is **site-domained** — one tap value per iteration of *this
-        // writer's* source (the channel unions channelize assembled reference
-        // it at that type) — unlike the key histories, which live over the
-        // mutable variable's sequencing domain.
-        let site_dom = w.source.ty.domain().unwrap_or_else(|| domain.clone());
+        // virtual mutable variable key the consumer reads as `__hist.__to_…`. The store
+        // holds one tap value per commit, keyed by its commit time, so the field
+        // lives over the store's sequencing domain like a key history does.
         for (field, value_ty) in writer_tap_fields(&w.body.ty) {
-            fields.push((
-                field,
-                crate::ccl::ccl_utils::history_ty(&site_dom, &value_ty),
-            ));
+            fields.push((field, crate::ccl::ccl_utils::history_ty(domain, &value_ty)));
         }
     }
     Ok(Type::Record(fields))
