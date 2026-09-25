@@ -467,10 +467,10 @@ fn lower_for_body_stmts_scoped(
                      is not yet supported",
                 ));
             }
-            // `x := e` and `x: T := e` introduce a mutable variable inside the body,
-            // the same construct the `Mut(V)`-annotated `=` above rejects, so they earn
-            // the same rejection — the annotation says nothing about which construct it
-            // is ([`in_loop_mut_var_error`]). A subscript target is a keyed write to a
+            // `x := e` and `x: T := e` introduce a mutable variable inside the body. This
+            // loop writes no mutable variable declared before it, so it has no recurrence
+            // for the introduction to nest in, and the introduction is rejected
+            // ([`in_loop_mut_var_error`]). A subscript target is a keyed write to a
             // collection rather than an introduction, and falls through below.
             ChlStmt::MutAssign { target, .. } if name_target_as_name(target).is_some() => {
                 let name = extract_name_target(target, "mutable assignment")?;
@@ -797,13 +797,10 @@ pub(super) fn find_mutation_loop_vars(
     vars
 }
 
-/// Recurse the accumulator scan into `if`/`elif`/`else` branches: a `+=` / `:=`
-/// under a conditional is still a loop-carried accumulator (the conditional
-/// induction write becomes one recurrence leg per path). We descend into `if`
-/// branches only — **not** inner `for` loops (nested-loop mutation is still
-/// unsupported, and a write buried in an inner `for` must stay invisible here so
-/// the caller's `find_nested_mutation_var` reject still fires) nor `with begin()`
-/// blocks (those carry their own transactional keys).
+/// Recurse the accumulator scan into `if`/`elif`/`else` branches, `match` arms and inner
+/// `for` loops: a `+=` / `:=` under a conditional is still a loop-carried accumulator (one
+/// recurrence leg per path), and one inside an inner loop is a write the nested recurrence
+/// carries. `with begin()` blocks are not entered: they carry their own transactional keys.
 fn collect_mutation_loop_vars(
     body: &[Spanned<ChlStmt>],
     scope: &HashSet<String>,
@@ -967,6 +964,25 @@ fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
     })
 }
 
+/// Whether `body` holds a bare effect statement — a call that may hide a pass-by-reference
+/// write ([`for_body_terminal_is_bare_effect`]) — anywhere a write in it would reach the
+/// enclosing loops: in a branch, an arm or a deeper loop.
+fn body_has_bare_call(body: &[Spanned<ChlStmt>]) -> bool {
+    body.iter().any(|stmt| match &stmt.node {
+        ChlStmt::Expr(value) => !matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }),
+        ChlStmt::If {
+            branches,
+            else_body,
+        } => {
+            branches.iter().any(|b| body_has_bare_call(&b.body))
+                || else_body.as_deref().is_some_and(body_has_bare_call)
+        }
+        ChlStmt::Match { arms, .. } => arms.iter().any(|a| body_has_bare_call(&a.body)),
+        ChlStmt::For { body, .. } => body_has_bare_call(body),
+        _ => false,
+    })
+}
+
 /// Lower an inner `for` in a loop body to the direct-mirror `For` node a top-level
 /// mutation loop produces.
 ///
@@ -976,14 +992,18 @@ fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
 /// enclosing loop's binder — a dependent inner source — and the body carries the
 /// enclosing loop's accumulators, a write to one being a write the nest sequences.
 fn lower_nested_loop(
-    target: &Spanned<AssignTarget>,
-    iter: &Spanned<ChlExpr>,
-    body_stmts: &[Spanned<ChlStmt>],
-    acc_names: &[String],
-    outer_bindings: &HashSet<String>,
-    for_span: Span,
+    site: &ForSite<'_>,
+    yield_defer: Option<&str>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    let &ForSite {
+        target,
+        iter,
+        body_stmts,
+        acc_names,
+        outer_bindings,
+        for_span,
+    } = site;
     // A commit site is keyed on the loop that encloses it, and a nested carrier does
     // not yet carry one: `transact_phase` strips each `Begin` against a single
     // enclosing loop, and the accumulator scan does not enter a `with` block, so an
@@ -998,13 +1018,37 @@ fn lower_nested_loop(
              body.",
         ));
     }
+    // A nested loop is folded as a recurrence over what it writes of the loops around it,
+    // so one that writes none of their mutable variables has nothing to fold: its body only
+    // binds, feeds, or writes variables of its own. That shape is not realized yet. A bare
+    // call may be a pass-by-reference write (`bump(y)`), which lowering runs too early to
+    // see, so a body holding one and no feed is left for `mut_elim` to classify, as a flat
+    // loop's is: it drops one whose calls turn out to write nothing.
+    let mut writes = Vec::new();
+    collect_mutation_loop_vars(
+        body_stmts,
+        &acc_names.iter().cloned().collect(),
+        &mut writes,
+        &mut HashSet::new(),
+    );
+    let feeds = for_body_has_feed(body_stmts) || for_body_has_yield(body_stmts);
+    if writes.is_empty() && (!body_has_bare_call(body_stmts) || feeds) {
+        return Err(LoweringError::unsupported(
+            for_span,
+            "a `for` loop nested in a loop that writes a mutable variable must itself \
+             write a mutable variable declared outside it: one whose body only binds \
+             values, feeds, calls, or writes variables of its own is not supported yet.",
+        ));
+    }
     let iter_var = extract_name_target(target, "for-loop target")?;
     let source = lower_expr(iter, ctx)?;
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
+        // A `yield` in the inner body feeds the generator the enclosing loop is in, one
+        // value per inner iteration.
         lower_loop_body_chain(
             body_stmts,
             acc_names,
-            None,
+            yield_defer,
             false,
             outer_bindings,
             for_span,
@@ -1174,18 +1218,34 @@ fn lower_loop_body_chain_scoped(
     // `tag_image`; the `ExprStmt` that sequences one statement before the rest is
     // manufactured plumbing (`src/ccl/design/provenance.md`, "The seam").
     // A mutable variable this body introduces accumulates over the rest of it exactly as
-    // one declared before the loop accumulates over the loop, so it joins the set the
-    // body's writes are read against — including the inner loops and conditionals this
-    // chain recurses into, which is where the write usually sits.
+    // one declared before the loop accumulates over the loop, so from its introducing
+    // statement on it joins the set the body's writes are read against — including the
+    // inner loops and conditionals this chain recurses into, which is where the write
+    // usually sits. A statement before the introduction does not see it: a branch there
+    // that writes the same name introduces its own.
     let introduced = body_introduced_mut_vars(body_stmts, acc_names);
-    let acc_names: Vec<String> = acc_names
-        .iter()
-        .cloned()
-        .chain(introduced.keys().cloned())
-        .collect();
-    let acc_names = acc_names.as_slice();
+    // A body with no mutable variable declared before it carried by this loop — one whose
+    // only writes sit in `with begin():` blocks — has no recurrence for an introduction to
+    // nest in, so the introduction is refused as a generator body's is.
+    if acc_names.is_empty()
+        && let Some((name, &at)) = introduced.iter().min_by_key(|&(_, &at)| at)
+    {
+        return Err(in_loop_mut_var_error(body_stmts[at].span, name));
+    }
+    let declared_before = acc_names;
     let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), for_span, "lower.loop_unit");
     for (i, stmt) in contributing_stmts(body_stmts).rev() {
+        let in_scope: Vec<String> = declared_before
+            .iter()
+            .cloned()
+            .chain(
+                introduced
+                    .iter()
+                    .filter(|&(_, &at)| at <= i)
+                    .map(|(name, _)| name.clone()),
+            )
+            .collect();
+        let acc_names = in_scope.as_slice();
         chain = match &stmt.node {
             // `x = value` — a plain immutable binding. Inside a loop body it
             // is a per-iteration shadowing `let`, *never* a mutable write: `=`
@@ -1421,15 +1481,15 @@ fn lower_loop_body_chain_scoped(
                 iter,
                 body: inner_body,
             } => {
-                let inner = lower_nested_loop(
+                let site = ForSite {
                     target,
                     iter,
-                    inner_body,
+                    body_stmts: inner_body,
                     acc_names,
                     outer_bindings,
-                    stmt.span,
-                    ctx,
-                )?;
+                    for_span: stmt.span,
+                };
+                let inner = lower_nested_loop(&site, yield_defer, ctx)?;
                 ctx.tag_machinery(Expr::expr_stmt(inner, chain), stmt.span, "lower.stmt_seq")
             }
             _ => {

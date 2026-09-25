@@ -371,10 +371,20 @@ fn a_whole_collection_fold_keeps_its_element_materialized(
 // A correlated **filter** beside a correlated body, the filter riding the pair it filters
 // (`src/ccl/planning/correlated.rs`): 1*(2+3) + 2*3.
 #[case::correlated_filter("sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])", 11)]
-// A filter reading only the element, beside a body that reads the outer binder. It lifts to
-// the pair like a correlated one, because neither inner-source builder narrows the inner
-// domain itself — leaving it on the component answers 18 rather than 15. 1*(2+3) + 2*(2+3).
+// A filter reading only the element, beside a body that reads the outer binder. It rides
+// the pair like a correlated one, since neither inner-source builder narrows the inner
+// domain itself, and stays on the component too, which states what the element is.
+// 1*(2+3) + 2*(2+3).
 #[case::uncorrelated_filter("sum([sum([v * r for v in [1, 2, 3] if v > 1]) for r in [1, 2]])", 15)]
+// The same over a **collection** source: the source is matched at the component's
+// membership, not at the filter the component also carries. 1*2 + 2*2.
+#[case::uncorrelated_filter_over_a_collection(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([sum([v * r for v in c if v > 1]) for r in [1, 2]])
+    "#},
+    6
+)]
 // Both together. The element-only bound is the one that bites at `r = 1`, so dropping
 // either filter changes the answer — unlike `v > 1` beside `v > r`, where `v > r` implies
 // it at every `r` and the case would pass with the first filter gone. 1*3 + 2*3.

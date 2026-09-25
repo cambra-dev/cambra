@@ -735,6 +735,35 @@ fn a_mutable_variable_introduced_inside_a_loop_accumulates_over_the_iteration(#[
     "#},
     102
 )]
+// One name, introduced in each branch.
+#[case::one_name_in_both_branches(
+    indoc! {r#"
+        t := 0
+        for i in [1, 2]:
+            if i > 1:
+                y := i
+                t += y
+            else:
+                y := i * 100
+                t += y
+        t
+    "#},
+    102
+)]
+// A branch introducing a name the body introduces again after it: the branch's is its own.
+#[case::a_branch_before_the_bodys_introduction(
+    indoc! {r#"
+        t := 0
+        for i in [1, 2]:
+            if i > 1:
+                y := 100
+                t += y
+            y := i
+            t += y
+        t
+    "#},
+    103
+)]
 fn a_mutable_variable_introduced_inside_a_branch_is_scoped_to_it(
     #[case] code: &str,
     #[case] total: i64,
@@ -774,6 +803,60 @@ fn a_transactional_mutable_variable_introduced_inside_a_loop_is_rejected() {
             t
         "#},
         "introduced inside a for-loop body",
+    );
+}
+
+/// A mutable variable introduced in a loop whose only writes are transactional is rejected:
+/// the loop carries no variable of its own, so the introduction has no recurrence to nest in.
+#[test]
+fn an_introduction_in_a_loop_carrying_only_transactional_writes_is_rejected() {
+    expect_compile_error(
+        indoc! {r#"
+            bal: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                amt := r
+                amt += 10
+                with begin():
+                    bal += amt
+            await_final(bal)
+        "#},
+        "`amt` is a mutable variable introduced inside a for-loop body",
+    );
+}
+
+/// A `for` nested in a mutation loop that writes no mutable variable declared outside it
+/// has no recurrence to fold, whatever else its body does, and is refused at lowering.
+#[rstest]
+#[case::binds_only(indoc! {r#"
+    t := 0
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            k = j
+    t
+"#})]
+#[case::writes_its_own(indoc! {r#"
+    t := 0
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            z := j
+            z += 1
+    t
+"#})]
+#[case::feeds_only(indoc! {r#"
+    t := 0
+    o = defer()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            o << j
+    t + sum(o)
+"#})]
+fn a_nested_loop_writing_nothing_outside_it_is_rejected(#[case] code: &str) {
+    expect_compile_error(
+        code,
+        "must itself write a mutable variable declared outside it",
     );
 }
 
@@ -1618,19 +1701,36 @@ acc",
 
 /// A nested `for` that writes a mutable variable compiles to a carrier per enclosing row,
 /// which op-conversion does not realize: it builds one engine per carrier. Pinned by the
-/// error it reaches rather than ignored, so a change in how it fails is caught.
-#[test]
-fn nested_for_loops_stay_rejected() {
-    expect_compile_error(
-        indoc! {r#"
-            s := 0
-            for x in [1, 2]:
-                for y in [10, 20]:
-                    s += y
-            s
-        "#},
-        "only a top-level carrier is realized",
-    );
+/// error it reaches rather than ignored, so a change in how it fails is caught — every
+/// shape here compiles through every pass before it.
+#[rstest]
+#[case::inner_writes_an_outer_accumulator(indoc! {r#"
+    s := 0
+    for x in [1, 2]:
+        for y in [10, 20]:
+            s += y
+    s
+"#})]
+// The inner loop writes a variable the body introduced, and never reads it.
+#[case::inner_writes_without_reading(indoc! {r#"
+    t := 0
+    for i in [1, 2]:
+        y := 0
+        for j in [10, 20]:
+            y := j
+        t += y
+    t
+"#})]
+#[case::depth_three(indoc! {r#"
+    s := 0
+    for x in [1, 2]:
+        for y in [10, 20]:
+            for z in [100, 200]:
+                s += x + y + z
+    s
+"#})]
+fn nested_for_loops_stay_rejected(#[case] code: &str) {
+    expect_compile_error(code, "only a top-level carrier is realized");
 }
 
 /// A `mut` loop over a **product** domain is rejected at op-conversion, at every
@@ -2190,5 +2290,87 @@ fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
     assert!(
         rendered.contains("WitnessRef("),
         "and the divergence it quotes is the binder identity, got:\n{rendered}",
+    );
+}
+
+/// The nested shapes lowering and planning accept, pinned where op-conversion stops them
+/// until nested carriers are realized: each compiles through every pass before it.
+#[rstest]
+// A `yield` in the inner loop feeds the generator the enclosing loop is in.
+#[case::a_yield_in_the_inner_loop(indoc! {r#"
+    def g(xs):
+        acc := 0
+        for x in xs:
+            for y in [10, 20]:
+                acc += y * x
+                yield acc
+    sum(g([1, 2]))
+"#})]
+// Each branch introduces its own `y`, and each branch's inner loop accumulates it.
+#[case::the_same_name_introduced_in_both_branches(indoc! {r#"
+    t := 0
+    for i in [1, 2]:
+        if i > 1:
+            y := 0
+            for k in [10, 20]:
+                y += k
+            t += y
+        else:
+            y := 100
+            for k in [1]:
+                y += k
+            t += y
+    t
+"#})]
+// A pass-by-reference writer on a variable the body introduced.
+#[case::a_writer_call_on_a_body_introduced_variable(indoc! {r#"
+    def bump(c: Mut(Int)):
+        c += 1
+    t := 0
+    for i in [1, 2]:
+        y := i
+        for k in [10, 20]:
+            bump(y)
+        t += y
+    t
+"#})]
+#[case::two_sibling_inner_loops(indoc! {r#"
+    s := 0
+    for x in [1, 2]:
+        for y in [10, 20]:
+            s += y
+        for z in [100]:
+            s += z
+    s
+"#})]
+#[case::writes_before_and_after_an_inner_loop(indoc! {r#"
+    s := 0
+    for x in [1, 2]:
+        s += x
+        for y in [10, 20]:
+            s += y
+        s += 1000
+    s
+"#})]
+fn nested_shapes_reach_realization(#[case] code: &str) {
+    expect_compile_error(code, "only a top-level carrier is realized");
+}
+
+/// An inner loop whose only statement is a call that writes nothing is dropped, as a flat
+/// one is, leaving the enclosing loop on its own.
+#[test]
+fn an_inner_loop_calling_a_pure_function_is_dropped() {
+    check_scalar(
+        indoc! {r#"
+            def f(k):
+                k + 1
+            t := 0
+            for i in [1, 2]:
+                t += i
+                for k in [10, 20]:
+                    f(k)
+            t
+        "#},
+        Value::Int(3),
     );
 }

@@ -161,15 +161,24 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
             // position — and everything after is a group-free pointwise step. Two
             // elements naming the group would read one at a position derived from the
             // other's output, which is outside the accessor.
-            let mut naming = elts.iter().filter(|e| {
+            //
+            // A selector is a projection, which picks a component and reads no position.
+            // Any other group-free morphism there could compute the position the accessor
+            // consults — a shift `𝑓: D ⇒ D` ahead of the history reads it at `𝑓(𝑝)` — so
+            // it is not admitted.
+            let names_the_group = |e: &TypedExpr| {
                 let mut r = BTreeSet::new();
                 collect_noncausal_refs(e, live, &mut r);
                 !r.is_empty()
-            });
-            match (naming.next(), naming.next()) {
-                (Some(root), None) => is_causal_history_slot(root, live),
-                _ => false,
-            }
+            };
+            let Some(at) = elts.iter().position(names_the_group) else {
+                return false;
+            };
+            elts[..at]
+                .iter()
+                .all(|e| matches!(&e.node, TypedExprNode::Proj(_)))
+                && !elts[at + 1..].iter().any(names_the_group)
+                && is_causal_history_slot(&elts[at], live)
         }
         TypedExprNode::Copair(ops) => {
             !ops.is_empty() && ops.iter().all(|o| is_causal_history_slot(o, live))

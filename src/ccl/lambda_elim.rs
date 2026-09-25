@@ -1343,9 +1343,11 @@ fn elim_lambda_impl(
         // applied — including the references inside the definitions, the group being
         // recursive, which is the one way this differs from `Let`.
         //
-        // The self-reference's type is the eliminated definition's, which only
-        // elimination knows, so the definition is eliminated once to learn it and
-        // again with it in hand.
+        // Each reference, inside the definitions and in the body, is typed
+        // `𝑃 ⇒ 𝑇` from the binding's own type `𝑇`, before elimination. That is the
+        // eliminated definition's type wherever the history's type does not depend on the
+        // enclosing parameter; a history whose type does would be a dependent function,
+        // which these references would not say.
         TypedExprNode::LetRec { bindings, body } => {
             let eliminate_defs = |ctx: &mut ElimContext, hist_tys: &[Type]| {
                 let calls: Vec<(Name, Expr)> = bindings

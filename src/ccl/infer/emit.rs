@@ -2590,7 +2590,17 @@ pub(super) fn emit_transact<C: Typing>(
             ));
         }
     }
-    Ok(Type::Record(fields))
+    // A nested carrier is one history record per enclosing row, so it is a function of the
+    // enclosing half of its `(enclosing, position)` parameter.
+    Ok(match parameter {
+        None => Type::Record(fields),
+        Some(p) => {
+            let Type::Tuple(parts) = p.peel_refinements() else {
+                panic!("a nested carrier's parameter is the (enclosing, position) pair: {p}")
+            };
+            fun(parts[0].clone(), Type::Record(fields))
+        }
+    })
 }
 
 #[cfg(test)]

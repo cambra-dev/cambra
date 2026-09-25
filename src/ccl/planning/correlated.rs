@@ -103,9 +103,14 @@ fn name_inner_source(expr: &Expr) -> Option<Expr> {
     let Some(Type::Tuple(pair)) = g.ty.domain().map(|d| d.peel_refinements().clone()) else {
         return None;
     };
-    let [_, inner_domain] = pair.as_slice() else {
+    let [_, component] = pair.as_slice() else {
         return None;
     };
+    // The component states what the element is, which includes a filter reading only the
+    // element; the source's domain is its keys before any filter. The filter rides the pair
+    // as well, which is the copy planning applies, so the source is matched — and its keys
+    // re-viewed — at the component's membership alone.
+    let inner_domain = &collection_domain(component);
     let source = inner_source(g, inner_domain)?;
     let source_ty = Type::data_fun(inner_domain.clone(), inner_domain.clone());
     // A **recorded copy**: the source stays where it is inside `𝑔`, which applies it at each
@@ -119,6 +124,26 @@ fn name_inner_source(expr: &Expr) -> Option<Expr> {
     let pair = Expr::tuple(vec![keys, g.as_ref().clone_preserving_ids()])
         .with_ty(Type::Tuple(vec![source_ty, g.ty.clone()]));
     Some(apply_primitive(pair, Builtin::CurryOver, expr.ty.clone()))
+}
+
+/// `component` with only its collection-membership refinements: the domain of the collection
+/// it ranges over, without the filters a comprehension applies to the elements.
+fn collection_domain(component: &Type) -> Type {
+    let membership: Vec<_> = component
+        .refinements()
+        .iter()
+        .filter(|r| r.is_collection_membership())
+        .cloned()
+        .collect();
+    let base = component.peel_refinements().clone();
+    match membership.is_empty() {
+        true => base,
+        false => {
+            let mut set = crate::ccl::ty::RefinementSet::new();
+            set.extend(membership);
+            Type::refined(base, set)
+        }
+    }
 }
 
 /// The collection `g` applies at the pair's second component, whose domain is the one the

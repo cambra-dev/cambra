@@ -1814,9 +1814,11 @@ total                     # 23
 An `if` branch is a block of its own, so a `:=` there introduces a variable that
 branch alone writes and reads.
 
-A **transactional** introduction is the exception: `y: Mut(Int, Txn) := 0`
-inside a loop body is a lowering error, commit time being a sequencing domain
-the loop around it does not supply.
+Two introductions are lowering errors. A **transactional** one, `y: Mut(Int,
+Txn) := 0` inside a loop body, names commit time, a sequencing domain the loop
+around it does not supply. One inside a loop that writes no mutable variable
+declared before it (a generator, or a loop that only feeds) has no recurrence of
+that loop to live in.
 
 > `Y is a mutable variable introduced inside a for-loop body, which is not
 > supported: declare it before the loop (`Y := …`) so its updates carry
@@ -3432,9 +3434,11 @@ with parser-level support that lowering rejects:
 - **`while` loops** — currently a parse error (the `while` keyword is
   not yet recognised). Tracked as future work under mutability
   ("while loop lowering").
-- **Nested `for` loops with mutable variables** — a single-level
-  for-loop accumulator works (§4.6), but mutation inside a nested loop
-  is not yet lowered.
+- **Nested `for` loops with mutable variables** — a nested loop that
+  writes a mutable variable of the loop around it lowers and plans to a
+  carrier per enclosing row, which operator conversion does not realize
+  yet. A nested loop that writes no mutable variable declared outside it
+  is rejected at lowering.
 - **A mutable variable introduced inside a transaction block** — a `with
   begin():` block may write mutable variables declared outside it but not
   introduce its own, which would need a sequencing domain nested inside commit
