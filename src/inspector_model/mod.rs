@@ -57,6 +57,7 @@
 //! `src/inspector_model/design.md`, "The usage model".
 
 mod definitions;
+pub mod frame;
 mod program;
 mod walk;
 mod wire;

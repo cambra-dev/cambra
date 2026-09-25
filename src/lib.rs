@@ -11,4 +11,3 @@ pub mod pretty_graph;
 pub mod pretty_tree;
 pub mod scalar_ops;
 pub mod util;
-pub mod web_inspector;

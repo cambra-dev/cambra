@@ -168,6 +168,53 @@ In practice this means tile operators need to be **tile-polymorphic in their inp
 
 ---
 
+## The producer protocol
+
+Four calls cross each subscription edge. `TileOperator::subscribe`, `TileProducer::get` and
+`TileProducer::release` are each a provided method that runs what every operator shares and then
+calls a required `_impl`, so no operator restates the checks below.
+
+- **`subscribe(intent, consumer, scheduler)`** builds a `TileProducer` answering for `intent`, the
+  region of the operator's tiling the consumer asks for. The producer keeps `consumer` to notify. A
+  producer has exactly one consumer: sharing goes through a `FanOut`, whose branches are separate
+  producers.
+- **`Consumer::notify()`** says the producer has new data. It carries no payload, and the consumer
+  answers it by calling `get`. A producer does not notify from inside a `get`, because the
+  notification graph is cyclic through a feedback `FanOut` and a synchronous notify re-enters an
+  operator that is mid-`get` holding a `RefCell` borrow. A producer with more to compute and no
+  external trigger pending queues its consumer on the scheduler's `WakeupQueue`, and
+  `Scheduler::deliver` notifies it between pulls.
+- **`get(projection)`** returns the producer's current tile restricted to `projection`, and is the
+  only way data crosses an edge. The wrapper asserts that the tile conforms to the producer's
+  tiling, and in debug builds that it is a valid tile holding no data inside `obsolete_guard`.
+- **`release(obsolete)`** adds `obsolete` to the producer's `obsolete_guard`, and calls
+  `release_impl` only when the guard grew. What a release promises is
+  [The release contract](#the-release-contract).
+
+A source is not a producer. The scheduler polls each source (`Scheduler::poll_sources`) and
+notifies the consumers registered on it (`Scheduler::deliver`); `check_for_notifications` runs the
+two in turn.
+
+### Producer attribution and probes
+
+`TileOperator::subscribe` is a provided method that no operator overrides. It opens a scope naming
+the operator's `NodeId` and calls the operator's required `subscribe_impl`. `ProducerBase::new`
+reads the innermost open scope, so every producer records the operator that built it
+(`ProducerBase::node_id`) without its constructor taking a parameter. A scope restores the id it
+replaced when it closes, because a `subscribe_impl` may subscribe its inputs before or after it
+builds its own producer. A scope that names an operator builds at most one `ProducerBase`, and a
+second fails a `debug_assert!`. An input's producer is built under the input's own scope.
+
+A probe observes one producer's `get`. While a probe session is live
+(`value_probe::attach_probes`, held across `LiveProgram::start` and `reload` under `--inspect`),
+every `ProducerBase` built takes a handle to the session's `ProbeTable`. The `get` wrapper records
+a rendered, row-capped reading of the tile into the probe keyed `(node_id, producer_id)`, after
+`get_impl` returns and after the checks above, and returns the tile unchanged. A probe therefore
+sees only tiles the protocol accepted, and changes nothing a consumer receives. Dropping a producer
+detaches its probe. A producer built with no session live has no probe, and its `get` records
+nothing. The probe frame `src/inspector_model/frame.rs` renders from the table is described in
+[design.md](../inspector_model/design.md#the-live-model-is-a-separate-path).
+
 ## The release contract
 
 `release(𝑅)` says the data in 𝑅 is **never requested again, and never returned again** — the same promise from each end of the wire. It holds at every granularity: a consumed prefix, one arm of a union, a record field, or the whole tiling (the *universal* release, after which the only conforming tile is the empty one). This is what makes bounded execution possible — a producer may reclaim 𝑅, and every tile it emits afterwards lies outside its accumulated obsolete guard.

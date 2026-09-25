@@ -7,11 +7,6 @@
 //! request, so there is no per-request recompilation, no mutation endpoint, and
 //! no live ticks.
 //!
-//! This is a sibling of [`crate::web_inspector`]'s internal dev dashboard, not
-//! an extension of it: that one serves live runtime state on a background
-//! thread; this one serves the read-only payload, one pane per pipeline stage.
-//! They share only the `tiny_http` idiom.
-//!
 //! # Routes
 //!
 //! - `GET /api/snapshot` — the [`snapshot_json`](super::snapshot_json) body on a
@@ -40,10 +35,11 @@
 //! type-checks — the frontend never has to branch its initial fetch on compile
 //! success.
 
-use std::io;
+use std::{io, thread};
 
-use crate::ccl::context::{GlobalContext, compile_program};
+use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
+use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
 use crate::interpreter::Consumer;
 
 use super::{snapshot_json, snapshot_json_pretty};
@@ -159,19 +155,77 @@ fn text_header() -> tiny_http::Header {
 /// compiler IR for it, and this is a local development tool. Reaching it from
 /// another host is a port-forward.
 pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
-    let bodies = build_bodies(code, name);
+    // Started even without a program running: the route completes its handshake
+    // and sends nothing, because nothing publishes until a run does.
+    let live = LiveServer::start();
+    serve_bodies(build_bodies(code, name), name, port, &live)
+}
+
+/// Serve an already-compiled program on a background thread, and return the
+/// channel a driver publishes through.
+///
+/// One compile feeds both the payload and the run: `NodeId`s come from a
+/// process-global counter, so compiling a second time for the payload would
+/// name different nodes than the graph being driven, and a click in a pane
+/// would resolve to a producer that does not exist.
+///
+/// The payload is rendered once, so it describes `compiled` and not a version
+/// a later reload installs. See `src/inspector_model/design.md`,
+/// "A reload is not followed".
+///
+/// The server thread is detached, and outlives this call by design — a run
+/// finishes long before a reader is done looking at it, which is why the binary
+/// parks afterwards.
+pub fn serve_compiled(
+    compiled: &CompiledProgram,
+    name: &str,
+    port: u16,
+) -> io::Result<LiveChannel> {
+    let live = LiveServer::start();
+    let channel = live.channel();
+    let bodies = Bodies {
+        snapshot: snapshot_json(compiled, name),
+        diagnostics: diagnostics_body(&[]),
+    };
+    let owned_name = name.to_string();
+    thread::Builder::new()
+        .name("cambra-inspector".to_string())
+        .spawn(move || {
+            if let Err(e) = serve_bodies(bodies, &owned_name, port, &live) {
+                eprintln!("cambra: the inspector server stopped: {e}");
+            }
+        })
+        .map_err(io::Error::other)?;
+    Ok(channel)
+}
+
+/// The path a request URL routes on: the URL without its query string, so a
+/// cache-busting `?t=…` reaches the same route.
+fn route(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(path, _)| path)
+}
+
+/// Answer requests against pre-rendered bodies until the process is killed.
+fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io::Result<()> {
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
-    // Names the scheme and says the server holds the terminal: this call never
-    // returns, and `https://` to a plain-HTTP port fails the handshake and
-    // renders as a blank page with nothing logged here.
+    // Names the scheme and says where to look: `https://` to a plain-HTTP port
+    // fails the handshake and renders as a blank page with nothing logged here.
     eprintln!("cambra: inspecting {name} at http://localhost:{port} — Ctrl+C to stop");
 
     for request in server.incoming_requests() {
+        // The live route takes the socket rather than answering on it, so it is
+        // matched before the bodies below, which respond and drop.
+        if route(request.url()) == LIVE_PATH {
+            if let Err(e) = live.accept(request) {
+                eprintln!("cambra: live upgrade failed: {e}");
+            }
+            continue;
+        }
         // `bodies` and `INDEX_HTML` both outlive the loop, so a response
         // borrows: the snapshot is megabytes on a large program and the bundle
         // is a quarter of one, and every request would otherwise copy it.
-        let (body, status, header) = match request.url() {
+        let (body, status, header) = match route(request.url()) {
             "/api/snapshot" => (bodies.snapshot.as_bytes(), 200, json_header()),
             "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
             "/" | "/index.html" => (INDEX_HTML.as_bytes(), 200, html_header()),
@@ -283,5 +337,12 @@ mod tests {
             bad_diag["diagnostics"], bad_snap["diagnostics"],
             "the degraded snapshot's diagnostics equal the diagnostics endpoint's"
         );
+    }
+
+    #[test]
+    fn a_query_string_does_not_change_the_route() {
+        assert_eq!(route("/api/live?t=1"), LIVE_PATH);
+        assert_eq!(route("/api/snapshot"), "/api/snapshot");
+        assert_eq!(route("/?"), "/");
     }
 }

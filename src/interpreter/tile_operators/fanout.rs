@@ -515,7 +515,7 @@ impl TileOperator for FanOutBranch {
         }
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -598,6 +598,13 @@ impl TileOperator for FanOutBranch {
         }
 
         Box::new(FanOutProducer {
+            // The fan-out's own id rather than a fresh one, so every branch's
+            // producer reads as the same `FanOut#n`. `ProbeTable` keys on
+            // `(node_id, producer_id)`, and that stays unique here because each
+            // branch is its own operator with its own `NodeId` — the first
+            // component separates them, not the second. Subscribing one branch
+            // twice would land both producers in one slot; nothing does, and
+            // `FanOut::branch` mints a fresh branch per call.
             base: ProducerBase::new(shared_rc.borrow().id, self.tiling()),
             // The producer a subscription hands out holds the fan-out the same
             // way this branch does: a recurrence's producer must not own it
@@ -808,7 +815,7 @@ impl TileOperator for Memo {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1068,7 +1075,7 @@ mod tests {
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,

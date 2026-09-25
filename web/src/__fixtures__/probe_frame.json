@@ -1,0 +1,328 @@
+{
+  "final": false,
+  "nodes": [
+    {
+      "nodeId": 1,
+      "probes": [
+        {
+          "dropped": 0,
+          "note": null,
+          "producer": "IterateExtent#1",
+          "producerId": 1,
+          "rows": [
+            {
+              "deleted": false,
+              "key": "u0",
+              "value": "\"a\""
+            },
+            {
+              "deleted": false,
+              "key": "u1",
+              "value": "\"b\""
+            }
+          ],
+          "seq": 0,
+          "shape": "DataFunction",
+          "stale": true,
+          "tick": 3,
+          "total": 2,
+          "watermark": "True"
+        }
+      ]
+    },
+    {
+      "nodeId": 2,
+      "probes": [
+        {
+          "dropped": 0,
+          "note": null,
+          "producer": "Restrict#1",
+          "producerId": 1,
+          "rows": [
+            {
+              "deleted": false,
+              "key": "u0",
+              "value": "\"a\""
+            },
+            {
+              "deleted": true,
+              "key": "u1",
+              "value": "\"skip\""
+            }
+          ],
+          "seq": 2,
+          "shape": "DataFunction",
+          "stale": false,
+          "tick": 3,
+          "total": 2,
+          "watermark": "True"
+        },
+        {
+          "dropped": 0,
+          "note": null,
+          "producer": "Restrict#2",
+          "producerId": 2,
+          "rows": [
+            {
+              "deleted": false,
+              "key": "u0",
+              "value": "\"b\""
+            }
+          ],
+          "seq": 3,
+          "shape": "DataFunction",
+          "stale": false,
+          "tick": 3,
+          "total": 1,
+          "watermark": "True"
+        }
+      ]
+    },
+    {
+      "nodeId": 3,
+      "probes": [
+        {
+          "dropped": 0,
+          "note": null,
+          "producer": "FanIn#1",
+          "producerId": 1,
+          "rows": [
+            {
+              "deleted": false,
+              "key": "u0",
+              "value": "(tagged: \"> a\", text: \"a\")"
+            }
+          ],
+          "seq": 4,
+          "shape": "DataFunction",
+          "stale": false,
+          "tick": 3,
+          "total": 1,
+          "watermark": "True"
+        }
+      ]
+    },
+    {
+      "nodeId": 4,
+      "probes": [
+        {
+          "dropped": 0,
+          "note": null,
+          "producer": "Commit#1",
+          "producerId": 1,
+          "rows": [
+            {
+              "deleted": false,
+              "key": "u0",
+              "value": "()"
+            },
+            {
+              "deleted": false,
+              "key": "u1",
+              "value": "()"
+            }
+          ],
+          "seq": 5,
+          "shape": "Store",
+          "stale": false,
+          "tick": 4,
+          "total": 2,
+          "watermark": "True"
+        },
+        {
+          "dropped": 2,
+          "note": null,
+          "producer": "MapResult#1",
+          "producerId": 2,
+          "rows": [
+            {
+              "deleted": false,
+              "key": "u2",
+              "value": "\"v2\""
+            },
+            {
+              "deleted": false,
+              "key": "u3",
+              "value": "\"v3\""
+            },
+            {
+              "deleted": false,
+              "key": "u4",
+              "value": "\"v4\""
+            },
+            {
+              "deleted": false,
+              "key": "u5",
+              "value": "\"v5\""
+            },
+            {
+              "deleted": false,
+              "key": "u6",
+              "value": "\"v6\""
+            },
+            {
+              "deleted": false,
+              "key": "u7",
+              "value": "\"v7\""
+            },
+            {
+              "deleted": false,
+              "key": "u8",
+              "value": "\"v8\""
+            },
+            {
+              "deleted": false,
+              "key": "u9",
+              "value": "\"v9\""
+            },
+            {
+              "deleted": false,
+              "key": "u10",
+              "value": "\"v10\""
+            },
+            {
+              "deleted": false,
+              "key": "u11",
+              "value": "\"v11\""
+            },
+            {
+              "deleted": false,
+              "key": "u12",
+              "value": "\"v12\""
+            },
+            {
+              "deleted": false,
+              "key": "u13",
+              "value": "\"v13\""
+            },
+            {
+              "deleted": false,
+              "key": "u14",
+              "value": "\"v14\""
+            },
+            {
+              "deleted": false,
+              "key": "u15",
+              "value": "\"v15\""
+            },
+            {
+              "deleted": false,
+              "key": "u16",
+              "value": "\"v16\""
+            },
+            {
+              "deleted": false,
+              "key": "u17",
+              "value": "\"v17\""
+            },
+            {
+              "deleted": false,
+              "key": "u18",
+              "value": "\"v18\""
+            },
+            {
+              "deleted": false,
+              "key": "u19",
+              "value": "\"v19\""
+            },
+            {
+              "deleted": false,
+              "key": "u20",
+              "value": "\"v20\""
+            },
+            {
+              "deleted": false,
+              "key": "u21",
+              "value": "\"v21\""
+            },
+            {
+              "deleted": false,
+              "key": "u22",
+              "value": "\"v22\""
+            },
+            {
+              "deleted": false,
+              "key": "u23",
+              "value": "\"v23\""
+            },
+            {
+              "deleted": false,
+              "key": "u24",
+              "value": "\"v24\""
+            },
+            {
+              "deleted": false,
+              "key": "u25",
+              "value": "\"v25\""
+            },
+            {
+              "deleted": false,
+              "key": "u26",
+              "value": "\"v26\""
+            },
+            {
+              "deleted": false,
+              "key": "u27",
+              "value": "\"v27\""
+            },
+            {
+              "deleted": false,
+              "key": "u28",
+              "value": "\"v28\""
+            },
+            {
+              "deleted": false,
+              "key": "u29",
+              "value": "\"v29\""
+            },
+            {
+              "deleted": false,
+              "key": "u30",
+              "value": "\"v30\""
+            },
+            {
+              "deleted": false,
+              "key": "u31",
+              "value": "\"v31\""
+            },
+            {
+              "deleted": false,
+              "key": "u32",
+              "value": "\"v32\""
+            },
+            {
+              "deleted": false,
+              "key": "u33",
+              "value": "\"v33\""
+            }
+          ],
+          "seq": 6,
+          "shape": "DataFunction",
+          "stale": false,
+          "tick": 4,
+          "total": 34,
+          "watermark": "True"
+        }
+      ]
+    }
+  ],
+  "published": 2,
+  "sources": [
+    {
+      "dropped": 0,
+      "name": "stdin",
+      "nodeIds": [
+        1
+      ],
+      "rows": [
+        {
+          "deleted": false,
+          "key": "u1",
+          "value": "\"b\""
+        }
+      ],
+      "total": 1
+    }
+  ],
+  "tick": 4
+}

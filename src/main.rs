@@ -1,37 +1,21 @@
 use std::{cell::RefCell, rc::Rc, thread, time::Duration};
 
 use cambra::{
-    ccl::{
-        context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
-        symbolic::symbolic,
-    },
+    ccl::context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
     control_port::{ControlPort, ControlReply, ControlRequest},
+    inspector_server::serve_compiled,
     interpreter::{
-        Consumer,
+        Consumer, Scheduler,
+        operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard},
+        value_probe::{
+            self, ProbeTable, ROWS_PER_READING, SharedProbeTable, SourceWindow,
+            render_source_window,
+        },
     },
     live_program::{LiveProgram, render_unreadable},
-    pretty_graph::pretty_tile_operator,
-    web_inspector::WebInspector,
 };
 use log::debug;
-
-/// Render the running program's producers into the inspector's snapshot.
-fn snapshot(live: &LiveProgram, inspector: Option<&WebInspector>, tick: u64) {
-    let Some(inspector) = inspector else { return };
-    inspector.update_snapshot(tick, |add| {
-        // The `main` producer is held out of the compiled outputs for the
-        // driver, so it is read off the program rather than found among them.
-        if let Some(p) = live.main_producer() {
-            add(p);
-        }
-        for output in live.program().sinks() {
-            if let Some(c) = &output.sink_consumer {
-                c.borrow().with_producer(|p| add(p));
-            }
-        }
-    });
-}
 
 /// Service at most one pending control request.
 ///
@@ -44,6 +28,7 @@ fn poll_control(
     live: &mut LiveProgram,
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
     new_data: &Rc<RefCell<bool>>,
+    probe_table: Option<&SharedProbeTable>,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
@@ -56,20 +41,31 @@ fn poll_control(
             )),
             Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
         },
-        ControlRequest::Reload { code } => match live.reload(ctx, code, main_consumer) {
-            Ok(report) => {
-                // The new graph has subscribed but nothing has pulled it, so arm
-                // the driver for one pass.
-                *new_data.borrow_mut() = true;
-                let ReuseTally { kept, bound } = report.reuse;
-                ControlReply::ok(format!(
-                    "reloaded: {kept}/{bound} operators kept\n\n{}{}",
-                    report.diff,
-                    render_unreadable(&report.unreadable),
-                ))
+        ControlRequest::Reload { code } => {
+            // A reload rebuilds the operators it could not keep, and a producer
+            // attaches its probe when it is built, so the replacement is probed
+            // only under a session, exactly as the first compile is.
+            // `diff_against` is left out: it compiles a version to compare and
+            // throws it away.
+            let reloaded = {
+                let _probing = probe_table.cloned().map(value_probe::attach_probes);
+                live.reload(ctx, code, main_consumer)
+            };
+            match reloaded {
+                Ok(report) => {
+                    // The new graph has subscribed but nothing has pulled it, so arm
+                    // the driver for one pass.
+                    *new_data.borrow_mut() = true;
+                    let ReuseTally { kept, bound } = report.reuse;
+                    ControlReply::ok(format!(
+                        "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+                        report.diff,
+                        render_unreadable(&report.unreadable),
+                    ))
+                }
+                Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
             }
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
-        },
+        }
     };
     message.answer(reply);
 }
@@ -96,32 +92,106 @@ fn run_program(
         })
     };
 
+    // The probe session spans the whole subscribe, which happens inside
+    // `compile_program`: a producer attaches its probe when its `ProducerBase` is
+    // built, and there is no traversal of the live graph to attach one later.
+    let probe_table = inspect_port.map(|_| Rc::new(RefCell::new(ProbeTable::with_defaults())));
+
     let mut ctx = GlobalContext::default();
-    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
-        Ok(p) => p,
-        Err(errs) => {
-            eprint_errors(&errs, src_name, code);
-            return Err(());
+    let mut live = {
+        let _probing = probe_table.clone().map(value_probe::attach_probes);
+        match LiveProgram::start(&mut ctx, code, &main_consumer) {
+            Ok(p) => p,
+            Err(errs) => {
+                eprint_errors(&errs, src_name, code);
+                return Err(());
+            }
         }
     };
 
-    let inspector = inspect_port.map(|port| {
-        // Render every output's operator tree.  The AST shown is the full
-        // join-planned program (shared across all outputs).
-        let op_parts: Vec<String> = live
-            .program()
-            .outputs
-            .iter()
-            .map(|o| pretty_tile_operator(o.op.as_ref()))
-            .collect();
-        WebInspector::new(port, symbolic(&live.program().ast), op_parts.join("\n\n"))
-    });
+    // Serve the panes from the same compile that is about to be driven, so a
+    // click in a pane names a node the running graph actually built. A reload
+    // replaces neither the panes nor `source_node_ids` below: see
+    // `src/inspector_model/design.md`, "A reload is not followed".
+    let probe_channel = match inspect_port {
+        Some(port) => match serve_compiled(live.program(), src_name, port) {
+            Ok(channel) => Some(channel),
+            Err(e) => {
+                eprintln!("error: serving the inspector: {e}");
+                return Err(());
+            }
+        },
+        None => None,
+    };
+
     let control = match control_port.map(ControlPort::new).transpose() {
         Ok(control) => control,
         Err(e) => {
             eprintln!("error: could not start the control port: {e}");
             return Err(());
         }
+    };
+
+    // Probe publishing happens only when some probe took a reading that carried
+    // rows. The sink loop below polls on a 10ms timer, and a poll that delivers
+    // nothing still takes an empty reading from every producer it pulls. Gating
+    // on every reading would broadcast an unchanged frame a hundred times a
+    // second, make `tick` count timer ticks rather than data, and pair each of
+    // those frames with a window sampled on a tick that carried nothing. Returns
+    // whether it published, so the caller advances `tick` only over a tick that
+    // carried something.
+    let probes_published_through = std::cell::Cell::new(0u64);
+    let publish_probes = |tick: u64, sources: &[SourceWindow]| -> bool {
+        let (Some(channel), Some(probes)) = (probe_channel.as_ref(), probe_table.as_ref()) else {
+            return false;
+        };
+        let flows = probes.borrow().flows();
+        if flows == probes_published_through.get() {
+            return false;
+        }
+        probes_published_through.set(flows);
+        channel.publish_probes(probes, sources, tick);
+        true
+    };
+
+    // The last probe frame, marked `final`, so a reader can tell a finished run
+    // from an idle one. The process parks afterwards, so the socket stays open.
+    let publish_final_probes = |tick: u64, sources: &[SourceWindow]| {
+        if let (Some(channel), Some(probes)) = (probe_channel.as_ref(), probe_table.as_ref()) {
+            channel.publish_final_probes(probes, sources, tick);
+        }
+    };
+
+    // A source's retained window, read on the thread that owns the graph: the
+    // handles are `Rc`, and `retained_keys`/`get` are `&self`, so sampling
+    // releases nothing. Sampled before the release below, so a window still
+    // shows what the tick delivered.
+    //
+    // The scheduler's handles are the sources the program *reads*: a handle is
+    // registered when an `IterateExtent` over the source is subscribed. Every
+    // context registers `stdin` whether or not the program mentions it, so
+    // iterating the context's sources instead would report a window for a
+    // source that is not part of the program.
+    let source_node_ids = source_nodes(&live.program().operator_graph);
+    let sample_sources = |scheduler: &Scheduler| -> Vec<SourceWindow> {
+        if probe_channel.is_none() {
+            return Vec::new();
+        }
+        scheduler
+            .sources()
+            .filter_map(|(name, handle)| {
+                let source = handle.borrow();
+                let keys = source.retained_keys()?;
+                let values = source.get(keys.clone());
+                Some(render_source_window(
+                    source_node_ids.get(name).cloned().unwrap_or_default(),
+                    name,
+                    &keys,
+                    &values,
+                    ROWS_PER_READING,
+                ))
+            })
+            .collect()
     };
 
     let mut tick = 0u64;
@@ -139,6 +209,7 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
+                probe_table.as_ref(),
             );
             if *new_data.borrow() {
                 break;
@@ -152,7 +223,19 @@ fn run_program(
             break;
         };
         debug!("Main calling get");
+        if let Some(probes) = probe_table.as_ref() {
+            probes.borrow_mut().set_tick(tick);
+        }
+        // Sampled before the pull, not after. A `Memo` releases its input from
+        // inside `get_impl`, so the release cascade reaches the source buffer
+        // partway through the driver's own `get` — sampling afterwards reads a
+        // buffer the pull already drained. Before it, the tick's arrivals are
+        // present and nothing has taken delivery.
+        let sources = sample_sources(ctx.scheduler());
         let tile = producer.get(producer.tiling().universal_guard());
+        if publish_probes(tick, &sources) {
+            tick += 1;
+        }
 
         let release_guard = match &tile {
             Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
@@ -164,8 +247,6 @@ fn run_program(
         debug!("Main releasing with {release_guard:?}");
         let done = release_guard.is_universal();
         producer.release(release_guard);
-        snapshot(&live, inspector.as_ref(), tick);
-        tick += 1;
         // Producers can return empty tiles, but still have more data.
         let is_empty = match &tile {
             Tile::Scalar(cv) => cv.is_empty(),
@@ -185,15 +266,27 @@ fn run_program(
     // loop runs until the process exits.
     if live.program().sinks().next().is_some() {
         loop {
-            ctx.scheduler().check_for_notifications();
-            snapshot(&live, inspector.as_ref(), tick);
-            tick += 1;
+            if let Some(probes) = probe_table.as_ref() {
+                probes.borrow_mut().set_tick(tick);
+            }
+            // Sampled between the poll and the delivery. The poll takes this
+            // pass's arrivals into the source buffers; the delivery is where a
+            // sink pulls them and a `Memo` releases its input from inside
+            // `get_impl`. A window read before the poll misses the arrivals,
+            // and one read after the delivery reports what the pass consumed.
+            let delivery = ctx.scheduler().poll_sources();
+            let sources = sample_sources(ctx.scheduler());
+            ctx.scheduler().deliver(delivery);
+            if publish_probes(tick, &sources) {
+                tick += 1;
+            }
             poll_control(
                 control.as_ref(),
                 &mut ctx,
                 &mut live,
                 &main_consumer,
                 &new_data,
+                probe_table.as_ref(),
             );
             if live.done().try_recv().is_ok() {
                 break;
@@ -204,6 +297,7 @@ fn run_program(
         }
     }
 
+    publish_final_probes(tick, &sample_sources(ctx.scheduler()));
     Ok(())
 }
 
@@ -221,9 +315,9 @@ const DEFAULT_CONTROL_PORT: u16 = 8081;
 /// two flags that each mean something: a program is either run or it is not, and
 /// `--inspect-only` is the not.
 enum Mode {
-    /// Run the program. With an inspect port, attach [`WebInspector`]'s live
-    /// runtime dashboard to the run; with a control port, accept `/diff` and
-    /// `/reload` against the running program.
+    /// Run the program. With an inspect port, serve its panes and stream the
+    /// values flowing through its operators; with a control port, accept
+    /// `/diff` and `/reload` against the running program.
     Run {
         inspect_port: Option<u16>,
         control_port: Option<u16>,
