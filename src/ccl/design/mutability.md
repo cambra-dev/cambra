@@ -91,8 +91,10 @@ The scope is the block that writes it, so an `if` branch introduces one of its o
 `let`: spliced after it instead, the whole introduction sits in effect position, where the walk
 dispatches on the effect and meets a `MutDecl` it has no arm for.
 
-Two introductions have no such carrier. A **transactional** one inside a `for` body would need a
-`Txn` order per iteration, so it is rejected at lowering. A `:=` inside a `with begin():` block
+Three introductions have no such carrier. A **transactional** one inside a `for` body would need a
+`Txn` order per iteration, so it is rejected at lowering. One inside a loop that writes no mutable
+variable declared before it, a generator or a loop that only feeds, has no recurrence of that loop to
+nest in, and is rejected at lowering too. A `:=` inside a `with begin():` block
 would need one per transaction, and has no gate of its own: lowering emits it as a *write*, so the
 program is rejected at inference as `Unbound variable`, naming neither the construct nor the
 alternative. The rejection is right; the message is about the wrong thing. What both rejections
