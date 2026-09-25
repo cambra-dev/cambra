@@ -617,9 +617,8 @@ pub trait TileProducer {
 
     /// Release interest in a region.
     /// The `obsolete_guard` specifies a sub-region of the subscription that
-    /// is no longer needed. Returns an expanded obsolete guard that may be
-    /// larger if the producer has additional obsolescence information (e.g.,
-    /// from variables with their own obsolete guards).
+    /// is no longer needed. It is added to [`obsolete_guard`](Self::obsolete_guard),
+    /// and [`release_impl`](Self::release_impl) runs only when that grew.
     fn release(&mut self, obsolete_guard: TileGuard) {
         trace!("{} release: {obsolete_guard:?}", self.name());
         assert!(

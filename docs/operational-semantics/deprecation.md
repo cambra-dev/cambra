@@ -85,26 +85,6 @@ consumers could use this "sealed by" guard to project out progress information w
 
 ## New Protocol
 
-The producer/consumer protocol, stated in terms of tiles and guards:
-
-```
-// Operator creates the dataflow link
-Operator::subscribe(intent: Guard, consumer: Consumer, scheduler: Scheduler) -> Producer
-
-// Producer pushes notifications to consumer
-Consumer::notify()
-    // New tile available — consumer should call get()
-
-// Consumer pulls data and manages lifecycle
-Producer::get(projection: Guard) -> Tile
-    // Returns the producer's current tile, projected by the consumer's projection guard.
-    // (The obsolete region the consumer has released is tracked internally by the
-    //  producer and read back via obsolete_guard().)
-Producer::release(obsolete: Guard)
-    // Consumer retracts interest; producer may compact and reclaim resources
-```
-
-**Invariants**:
-- `get()` returns the producer's current decomposed state, projected by the consumer's
-  projection guards. Progress monotonicity is structural: `compact_obsolete` accumulates via `⊕`, and
-  `relevant` reflects all non-released tiles received so far.
+The producer/consumer protocol that replaced yield guards (`subscribe`, `Consumer::notify`,
+`TileProducer::get`, `TileProducer::release`) is specified in
+[design-operators.md](../../src/interpreter/design-operators.md#the-producer-protocol).
