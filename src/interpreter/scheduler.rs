@@ -4,7 +4,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
+use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, value_probe::ProbeSlot};
 
 /// A handle to the scheduler's **deferred-wakeup queue**.
 ///
@@ -110,6 +110,7 @@ impl WakeupQueue {
 pub struct Scheduler {
     source_handles: HashMap<String, SourceHandle>,
     wakeups: WakeupQueue,
+    probes: ProbeSlot,
 }
 
 type SourceHandle = (
@@ -132,6 +133,15 @@ impl Scheduler {
         self.source_handles
             .iter()
             .map(|(name, (handle, _))| (name.as_str(), handle))
+    }
+
+    /// The probe slot every producer subscribed under this scheduler holds.
+    ///
+    /// The scheduler carries it because every `subscribe_impl` already receives
+    /// the scheduler, so a producer takes the slot at construction with no
+    /// ambient state.
+    pub fn probes(&self) -> &ProbeSlot {
+        &self.probes
     }
 
     /// Register `consumer` to be notified when `handle` has new data.
@@ -366,7 +376,7 @@ mod tests {
         }
         let mut scheduler = Scheduler::new();
         let mut producer = WakesOnSecondPull {
-            base: ProducerBase::new(0, &Tiling::Scalar(Extent::Base(BaseType::Int))),
+            base: ProducerBase::unowned(0, &Tiling::Scalar(Extent::Base(BaseType::Int))),
             pulls: 0,
             woken: Rc::new(RefCell::new(false)),
             queue: scheduler.wakeup_queue(),

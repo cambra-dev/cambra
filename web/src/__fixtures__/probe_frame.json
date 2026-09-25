@@ -5,8 +5,10 @@
       "nodeId": 1,
       "probes": [
         {
+          "completeness": "True",
           "dropped": 0,
           "note": null,
+          "obsolete": null,
           "producer": "IterateExtent#1",
           "producerId": 1,
           "rows": [
@@ -24,9 +26,7 @@
           "seq": 0,
           "shape": "DataFunction",
           "stale": true,
-          "tick": 3,
-          "total": 2,
-          "watermark": "True"
+          "total": 2
         }
       ]
     },
@@ -34,8 +34,10 @@
       "nodeId": 2,
       "probes": [
         {
+          "completeness": "True",
           "dropped": 0,
           "note": null,
+          "obsolete": null,
           "producer": "Restrict#1",
           "producerId": 1,
           "rows": [
@@ -53,13 +55,13 @@
           "seq": 2,
           "shape": "DataFunction",
           "stale": false,
-          "tick": 3,
-          "total": 2,
-          "watermark": "True"
+          "total": 2
         },
         {
+          "completeness": "True",
           "dropped": 0,
           "note": null,
+          "obsolete": "Function(Domain(Intervals(IntervalSet { intervals: [Interval(Finite(FullyBounded(Bound(Closed, u0), Bound(Closed, u0))))] })))",
           "producer": "Restrict#2",
           "producerId": 2,
           "rows": [
@@ -72,9 +74,7 @@
           "seq": 3,
           "shape": "DataFunction",
           "stale": false,
-          "tick": 3,
-          "total": 1,
-          "watermark": "True"
+          "total": 1
         }
       ]
     },
@@ -82,8 +82,10 @@
       "nodeId": 3,
       "probes": [
         {
+          "completeness": "True",
           "dropped": 0,
           "note": null,
+          "obsolete": null,
           "producer": "FanIn#1",
           "producerId": 1,
           "rows": [
@@ -96,9 +98,7 @@
           "seq": 4,
           "shape": "DataFunction",
           "stale": false,
-          "tick": 3,
-          "total": 1,
-          "watermark": "True"
+          "total": 1
         }
       ]
     },
@@ -106,32 +106,29 @@
       "nodeId": 4,
       "probes": [
         {
+          "completeness": "True",
           "dropped": 0,
           "note": null,
+          "obsolete": null,
           "producer": "Commit#1",
           "producerId": 1,
           "rows": [
             {
               "deleted": false,
-              "key": "u0",
-              "value": "()"
-            },
-            {
-              "deleted": false,
-              "key": "u1",
-              "value": "()"
+              "key": "acc",
+              "value": "[u0 ↦ (), u1 ↦ ()]"
             }
           ],
           "seq": 5,
           "shape": "Store",
           "stale": false,
-          "tick": 4,
-          "total": 2,
-          "watermark": "True"
+          "total": 1
         },
         {
+          "completeness": "True",
           "dropped": 2,
           "note": null,
+          "obsolete": null,
           "producer": "MapResult#1",
           "producerId": 2,
           "rows": [
@@ -299,9 +296,7 @@
           "seq": 6,
           "shape": "DataFunction",
           "stale": false,
-          "tick": 4,
-          "total": 34,
-          "watermark": "True"
+          "total": 34
         }
       ]
     }
@@ -323,6 +318,5 @@
       ],
       "total": 1
     }
-  ],
-  "tick": 4
+  ]
 }

@@ -1,8 +1,9 @@
 //! Probes: what each producer returned, rendered and bounded, for the live
 //! value pane.
 //!
-//! A probe is attached to every producer built while a [`ProbeSession`] is
-//! live, and takes a [`Reading`] of each result
+//! Every producer holds the [`ProbeSlot`] of the scheduler it was built under.
+//! While the slot holds a table, each producer's probe takes a [`Reading`] of
+//! each result
 //! [`TileProducer::get`](crate::interpreter::tile_operators::TileProducer::get)
 //! returns. Every operator-to-operator handoff passes through `get`, so a probe
 //! observes a call the program already makes. Calling `get` from an observer is
@@ -15,9 +16,12 @@
 //!
 //! A reading is rendered and truncated when it is taken. The count of readings
 //! per probe does not bound their size, since one `DataFunction` off a join
-//! carries as many rows as the join produced. The row cap is what bounds the
-//! footprint to `probes × (readings + 1) × rows`. Rendering happens on the
-//! driver thread, and no tile is cloned.
+//! carries as many rows as the join produced. The row cap bounds the rows held to
+//! `probes × (readings + 1) × rows`, and [`CHARS_PER_CELL`] bounds each rendered
+//! key, value, completeness and obsolete guard, however deeply the value nests.
+//! Rendering stops at the budget, so its cost is bounded by it too rather than
+//! by the value's length. Rendering happens on the driver thread, and no tile
+//! is cloned.
 //!
 //! A pane asks what flowed through a node, which a ring of recent readings
 //! cannot answer: empty readings outnumber row-carrying ones by orders of
@@ -26,30 +30,107 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
+    fmt::{self, Write as _},
     rc::Rc,
 };
 
 use crate::{
     ccl::provenance::NodeId,
-    interpreter::{tiling::Tile, types::ColumnValue},
+    interpreter::{
+        tiling::{Tile, TileGuard, running_frontier},
+        types::ColumnValue,
+    },
 };
 
 /// Rows kept per reading.
 pub const ROWS_PER_READING: usize = 32;
 
+/// Characters kept per rendered key or value, however deeply the value nests.
+pub const CHARS_PER_CELL: usize = 256;
+
 /// Readings kept in each probe's ring.
 pub const READINGS_PER_PROBE: usize = 16;
 
-/// A shared handle to the probe table, held by every producer built while a
-/// [`ProbeSession`] is live.
-// shared-state-ok: the observation boundary. A producer writes what it has
-// already returned to its consumer, rendered; nothing reads it back into the
-// graph, and no operator reaches another operator's rows. Shared because the
-// driver reads one table and every producer writes it, and the producer graph
-// has no `&self` traversal that would let the driver collect per-producer
-// buffers instead.
-pub type SharedProbeTable = Rc<RefCell<ProbeTable>>;
+/// The probe table of one program's producers, or nothing while no one is
+/// watching.
+///
+/// Every producer holds a clone, taken from its [`Scheduler`] when it is built,
+/// so one [`enable`](Self::enable) or [`disable`](Self::disable) switches
+/// probing for all of them at once. While the slot is empty a
+/// `TileProducer::get` costs one `None` check.
+///
+/// [`Scheduler`]: crate::interpreter::Scheduler
+#[derive(Clone, Default)]
+pub struct ProbeSlot(
+    // shared-state-ok: the observation boundary. A producer writes what it has
+    // already returned to its consumer, rendered; nothing reads it back into
+    // the graph, and no operator reaches another operator's rows. Shared
+    // because the driver reads one table and every producer writes it, and the
+    // producer graph has no `&self` traversal that would let the driver collect
+    // per-producer buffers instead.
+    Rc<RefCell<Option<ProbeTable>>>,
+);
+
+impl ProbeSlot {
+    /// Start probing with an empty [`ProbeTable`], if not already probing.
+    pub fn enable(&self) {
+        self.0
+            .borrow_mut()
+            .get_or_insert_with(ProbeTable::with_defaults);
+    }
+
+    /// Stop probing and drop every reading taken so far.
+    pub fn disable(&self) {
+        *self.0.borrow_mut() = None;
+    }
+
+    /// Whether producers are taking readings.
+    pub fn is_enabled(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    /// Read the table, or `None` while probing is off.
+    pub fn with_table<R>(&self, read: impl FnOnce(&ProbeTable) -> R) -> Option<R> {
+        self.0.borrow().as_ref().map(read)
+    }
+
+    /// Take a reading of `tile` for one producer. A no-op while probing is off.
+    pub(crate) fn observe_named(
+        &self,
+        node_id: Option<NodeId>,
+        producer_id: usize,
+        name: impl FnOnce() -> String,
+        tile: &Tile,
+        obsolete: &TileGuard,
+    ) {
+        if let Some(table) = self.0.borrow_mut().as_mut() {
+            table.observe_named(node_id, producer_id, name, tile, obsolete);
+        }
+    }
+
+    /// Detach one producer's probe, when that producer is dropped.
+    ///
+    /// Nothing drops a producer while the table is borrowed: `observe_named`
+    /// holds a mutable borrow only for the call, and a frame render holds a
+    /// shared one while it iterates, building no producers and dropping none. A
+    /// failed borrow is that invariant breaking. It panics in debug builds only,
+    /// since this runs in `Drop` and a panic there during an unwind aborts.
+    pub(crate) fn detach(&self, node_id: Option<NodeId>, producer_id: usize) {
+        match self.0.try_borrow_mut() {
+            Ok(mut slot) => {
+                if let Some(table) = slot.as_mut() {
+                    table.detach(node_id, producer_id);
+                }
+            }
+            Err(_) => debug_assert!(
+                false,
+                "a producer was dropped while the probe table was borrowed, so its \
+                 probe outlives it",
+            ),
+        }
+    }
+}
 
 /// One row of a probed tile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +152,6 @@ pub struct ReadingRow {
 /// What one `get` returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
-    /// The driver tick the call happened in.
-    pub tick: u64,
     /// Position in the probe table's total order, so a consumer can tell
     /// "nothing arrived" from "readings were evicted".
     pub seq: u64,
@@ -86,10 +165,20 @@ pub struct Reading {
     pub producer: Rc<str>,
     /// The tile's variant name.
     pub shape: &'static str,
-    /// The tile's `domain_predicate` in its `Debug` form, which is the progress
-    /// signal: `False`, then `LessThanEq(uN)`, then `True`. `None` for a shape
-    /// carrying no such region.
-    pub watermark: Option<String>,
+    /// The region of the domain the output is complete for: a collection's
+    /// `domain_predicate` or a store's `frontier`, in its `Debug` form, which
+    /// advances `False`, then `LessThanEq(uN)`, then `True`. An aggregation
+    /// reports whether it is terminal. `None` for a shape carrying no such
+    /// region.
+    pub completeness: Option<String>,
+    /// The producer's obsolete guard when the call returned, in its `Debug`
+    /// form: the region its consumer has released, which the producer never
+    /// returns again. `completeness` says how much of the output is final; this
+    /// says how much of it the consumer is done with.
+    ///
+    /// `None` when the guard is empty: the consumer has released nothing, which
+    /// is the common case and not worth a rendering.
+    pub obsolete: Option<String>,
     /// Why this reading carries no rows, when the shape is one that is not
     /// rendered.
     pub note: Option<&'static str>,
@@ -105,7 +194,7 @@ impl Reading {
         self.total.saturating_sub(self.rows.len())
     }
 
-    /// Whether the call returned nothing. A producer pulled twice in one tick
+    /// Whether the call returned nothing. A producer pulled twice in one pass
     /// answers the second call empty.
     pub fn is_empty(&self) -> bool {
         self.total == 0
@@ -118,7 +207,6 @@ impl Reading {
 /// several producers. Which of them a reader is shown is a rendering choice,
 /// and keeping both keys leaves it open.
 pub struct ProbeTable {
-    tick: u64,
     next_seq: u64,
     next_flow: u64,
     rows_per_reading: usize,
@@ -130,14 +218,14 @@ pub struct ProbeTable {
 /// carried rows.
 ///
 /// The two answer different questions. `recent` answers what the producer has
-/// been doing, empty readings included, and is where a watermark's progress is
+/// been doing, empty readings included, and is where progress toward completeness is
 /// read. `last_flow` answers what flowed through it. It sits outside the ring
 /// because an operator under a settling scheduler answers empty hundreds of
 /// times per row, so a ring deep enough to hold the row would have to be deeper
 /// than the busiest pass.
 ///
-/// `last_flow` is one reading under the same row cap as any other, so the
-/// footprint stays `probes × (readings + 1) × rows`.
+/// `last_flow` is one reading under the same caps as any other, so the rows
+/// held stay `probes × (readings + 1) × rows`.
 ///
 /// A reading is held behind an `Rc`, so `last_flow` and the ring share one
 /// allocation rather than each holding a copy.
@@ -154,7 +242,6 @@ impl ProbeTable {
     /// A probe table with the given caps.
     pub fn new(rows_per_reading: usize, readings_per_probe: usize) -> Self {
         Self {
-            tick: 0,
             next_seq: 0,
             next_flow: 0,
             rows_per_reading,
@@ -168,20 +255,6 @@ impl ProbeTable {
         Self::new(ROWS_PER_READING, READINGS_PER_PROBE)
     }
 
-    /// Name the tick that subsequent readings belong to.
-    ///
-    /// The driver advances this once per pull, so every reading taken during
-    /// one `get` of the root producer carries the same tick, including the
-    /// several a shared subtree produces when it is pulled once per consumer.
-    pub fn set_tick(&mut self, tick: u64) {
-        self.tick = tick;
-    }
-
-    /// The tick readings are currently attributed to.
-    pub fn tick(&self) -> u64 {
-        self.tick
-    }
-
     /// Readings that carried rows, since this table was built. Monotone.
     ///
     /// Probe publishing compares this against the count it last published at.
@@ -192,16 +265,24 @@ impl ProbeTable {
         self.next_flow
     }
 
-    /// Render `tile` as a reading of this producer's probe, evicting the
-    /// probe's oldest reading once the ring is full.
+    /// Render `tile`, and the `obsolete` guard the producer held when it
+    /// returned it, as a reading of this producer's probe, evicting the probe's
+    /// oldest reading once the ring is full.
     pub fn observe(
         &mut self,
         node_id: Option<NodeId>,
         producer_id: usize,
         producer: &str,
         tile: &Tile,
+        obsolete: &TileGuard,
     ) {
-        self.observe_named(node_id, producer_id, || producer.to_string(), tile);
+        self.observe_named(
+            node_id,
+            producer_id,
+            || producer.to_string(),
+            tile,
+            obsolete,
+        );
     }
 
     /// [`observe`](Self::observe), computing the producer's display name only
@@ -213,24 +294,36 @@ impl ProbeTable {
         producer_id: usize,
         name: impl FnOnce() -> String,
         tile: &Tile,
+        obsolete: &TileGuard,
     ) {
         let rendered = render(tile, self.rows_per_reading);
-        let probe = self
-            .probes
-            .entry((node_id, producer_id))
-            .or_insert_with(|| Probe {
+        let probe = match self.probes.entry((node_id, producer_id)) {
+            Entry::Occupied(entry) => {
+                // `alloc_id` counts per producer type, so two types built for
+                // one operator could share this key and interleave readings.
+                // An operator builds one producer per subscribe; a second name
+                // under one key is that rule breaking.
+                debug_assert_eq!(
+                    &*entry.get().name,
+                    name(),
+                    "two producers share the probe key ({node_id:?}, {producer_id})",
+                );
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => entry.insert(Probe {
                 name: name().into(),
                 recent: VecDeque::new(),
                 last_flow: None,
-            });
+            }),
+        };
         let reading = Rc::new(Reading {
-            tick: self.tick,
             seq: self.next_seq,
             node_id,
             producer_id,
             producer: Rc::clone(&probe.name),
             shape: rendered.shape,
-            watermark: rendered.watermark,
+            completeness: rendered.completeness,
+            obsolete: (!obsolete.is_empty()).then(|| bounded(|out| write!(out, "{obsolete:?}"))),
             note: rendered.note,
             rows: rendered.rows,
             total: rendered.total,
@@ -290,7 +383,7 @@ impl ProbeTable {
     /// still reports the rows.
     ///
     /// The winning reading is chosen, not merged: a producer pulled twice in
-    /// one tick answers the second call empty, and another answers with the
+    /// one pass answers the second call empty, and another answers with the
     /// same tile twice, so neither last-write-wins nor `Tile::merge` is
     /// correct. Two consumers pulling with different projection guards could
     /// return disjoint partial answers, which this drops; the ring shows that
@@ -345,23 +438,36 @@ impl SourceWindow {
     }
 }
 
-/// Render the last `limit` of a source's retained window.
+/// The last `limit` indices of a source's retained `window`: the keys a
+/// sample fetches, so its cost is bounded by `limit` rather than by how much
+/// the source retains.
+pub fn window_tail(window: std::ops::Range<usize>, limit: usize) -> std::ops::Range<usize> {
+    window.end.saturating_sub(limit).max(window.start)..window.end
+}
+
+/// Render the tail of a source's retained window.
 ///
-/// `keys` and `values` come from the source's own `retained_keys` and `get`,
-/// both `&self`. Truncation follows the same rule a reading uses: a source
+/// `keys` and `values` are the part of the window the caller fetched, through
+/// the source's own `retained_window` and `get`, both `&self`. The caller
+/// fetches the window's last keys, following the rule a reading uses: a source
 /// domain is index-ordered, so the last keys are the most recent arrivals.
+/// `total` is the whole window's length, of which `keys` is the end.
 pub fn render_source_window(
     node_ids: Vec<NodeId>,
     name: &str,
+    total: usize,
     keys: &ColumnValue,
     values: &ColumnValue,
-    limit: usize,
 ) -> SourceWindow {
-    let total = keys.len();
+    debug_assert!(
+        keys.len() <= total,
+        "a window's fetched tail is longer than the window: {} of {total}",
+        keys.len(),
+    );
     SourceWindow {
         node_ids,
         name: name.to_string(),
-        rows: tail(total, limit)
+        rows: (0..keys.len())
             .map(|i| ReadingRow {
                 key: Some(cell(keys, i)),
                 value: cell(values, i),
@@ -372,10 +478,10 @@ pub fn render_source_window(
     }
 }
 
-/// A rendered tile, before it is stamped with tick and sequence.
+/// A rendered tile, before it is stamped with its sequence number.
 struct Rendered {
     shape: &'static str,
-    watermark: Option<String>,
+    completeness: Option<String>,
     note: Option<&'static str>,
     rows: Vec<ReadingRow>,
     total: usize,
@@ -388,7 +494,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             let total = column.len();
             Rendered {
                 shape: "Scalar",
-                watermark: None,
+                completeness: None,
                 note: None,
                 rows: tail(total, limit)
                     .map(|i| ReadingRow {
@@ -400,7 +506,7 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
                 total,
             }
         }
-        Tile::Record(fields) => {
+        Tile::Record { fields, .. } => {
             let mut names: Vec<&String> = fields.keys().collect();
             // `Tile::Record` is a `HashMap`, whose iteration order varies
             // between runs of one program. Sorting is what makes a rendering
@@ -409,14 +515,14 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             let total = names.len();
             Rendered {
                 shape: "Record",
-                watermark: None,
+                completeness: None,
                 note: None,
                 rows: names
                     .into_iter()
                     .skip(total.saturating_sub(limit))
                     .map(|name| ReadingRow {
                         key: Some(name.clone()),
-                        value: one_level(&fields[name], 0),
+                        value: bounded(|out| write_field(tile, name, 0, out)),
                         deleted: false,
                     })
                     .collect(),
@@ -433,12 +539,12 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             let total = domain.len();
             Rendered {
                 shape: "DataFunction",
-                watermark: Some(format!("{domain_predicate:?}")),
+                completeness: Some(bounded(|out| write!(out, "{domain_predicate:?}"))),
                 note: None,
                 rows: tail(total, limit)
                     .map(|i| ReadingRow {
                         key: Some(cell(domain, i)),
-                        value: one_level(codomain, i),
+                        value: position(codomain, i),
                         deleted: deleted.contains(i),
                     })
                     .collect(),
@@ -451,35 +557,40 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
             terminal,
         } => Rendered {
             shape: "Aggregation",
-            watermark: Some(format!("terminal: {}", cell(terminal, 0))),
+            completeness: Some(format!("terminal: {}", cell(terminal, 0))),
             note: None,
             rows: vec![ReadingRow {
                 key: Some(format!("{kind:?}")),
-                value: one_level(accumulator, 0),
+                value: position(accumulator, 0),
                 deleted: false,
             }],
             total: 1,
         },
         Tile::Store {
-            changes,
-            deltas,
-            frontier,
-            ..
+            frontier, terminal, ..
         } => {
-            // The change events themselves, rather than the step function they
-            // decide. A store is right-continuous over its whole decided prefix,
-            // so reading it *at a tick* means folding every earlier change; but
-            // what a reader asks of a slot is what was written to it and when,
-            // and that is the changelog unfolded.
-            let total = changes.len();
+            // One row per key, holding the change events themselves rather than
+            // the step function they decide: what a reader asks of a slot is what
+            // was written to it and when, and that is the changelog unfolded.
+            let names = sorted_store_keys(tile);
+            let total = names.len();
+            // A terminal store is decided everywhere; a live one through its
+            // running row's watermark.
+            let completeness = if *terminal {
+                "True".to_string()
+            } else {
+                bounded(|out| write!(out, "{:?}", running_frontier(frontier)))
+            };
             Rendered {
                 shape: "Store",
-                watermark: Some(format!("{frontier:?}")),
+                completeness: Some(completeness),
                 note: None,
-                rows: tail(total, limit)
-                    .map(|i| ReadingRow {
-                        key: Some(cell(changes, i)),
-                        value: cell(deltas, i),
+                rows: names
+                    .into_iter()
+                    .skip(total.saturating_sub(limit))
+                    .map(|name| ReadingRow {
+                        key: Some(name.clone()),
+                        value: bounded(|out| write_changelog(tile, name, out)),
                         deleted: false,
                     })
                     .collect(),
@@ -497,86 +608,233 @@ fn tail(total: usize, limit: usize) -> std::ops::Range<usize> {
     total.saturating_sub(limit)..total
 }
 
-/// One position of a column, or a marker when the column is shorter than the
-/// domain beside it.
+/// One position of a column, rendered within [`CHARS_PER_CELL`].
 fn cell(column: &ColumnValue, i: usize) -> String {
-    if i < column.len() {
-        column.index_at(i).to_string()
-    } else {
-        "<absent>".to_string()
+    bounded(|out| write_cell(column, i, out))
+}
+
+/// One codomain position, rendered within [`CHARS_PER_CELL`] however deep it
+/// nests.
+fn position(tile: &Tile, i: usize) -> String {
+    bounded(|out| write_position(tile, i, out))
+}
+
+/// What `write` renders, cut at [`CHARS_PER_CELL`] characters.
+///
+/// A cut ends in `…`, followed by how many entries it passed over in the
+/// outermost collection that has any left.
+fn bounded(write: impl FnOnce(&mut Bounded) -> fmt::Result) -> String {
+    let mut out = Bounded {
+        text: String::new(),
+        remaining: CHARS_PER_CELL,
+        passed_over: None,
+    };
+    if write(&mut out).is_err() {
+        out.text.push('…');
+        if let Some(entries) = out.passed_over {
+            out.text.push_str(&format!("<+{entries} entries>"));
+        }
+    }
+    out.text
+}
+
+/// A `fmt::Write` sink that stops at a character budget.
+///
+/// It fails the write that crosses the budget, which aborts the formatting
+/// that called it. A value is therefore rendered in time proportional to the
+/// budget rather than to its length: `Value`'s `Display` writes a string's
+/// content in one `write_str`, of which this copies a prefix.
+struct Bounded {
+    text: String,
+    remaining: usize,
+    /// Entries left unrendered in the outermost collection a cut fell inside.
+    passed_over: Option<usize>,
+}
+
+impl fmt::Write for Bounded {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // `nth` stops at the budget, so a long `s` is not scanned to its end.
+        match s.char_indices().nth(self.remaining) {
+            None => {
+                self.text.push_str(s);
+                // At most `remaining` characters, or `nth` would have found one.
+                self.remaining -= s.chars().count();
+                Ok(())
+            }
+            Some((cut, _)) => {
+                self.text.push_str(&s[..cut]);
+                self.remaining = 0;
+                Err(fmt::Error)
+            }
+        }
     }
 }
 
-/// A codomain position, one level deep.
+fn write_cell(column: &ColumnValue, i: usize, out: &mut Bounded) -> fmt::Result {
+    if i < column.len() {
+        write!(out, "{}", column.index_at(i))
+    } else {
+        // The column is shorter than the domain beside it.
+        out.write_str("<absent>")
+    }
+}
+
+/// A codomain position, descending into every level it holds.
 ///
-/// A nested collection renders as its row's key count rather than recursing: a
-/// summary that walks a whole subtree is not bounded by the row cap.
-fn one_level(tile: &Tile, i: usize) -> String {
+/// A nested collection renders its entries as `[key ↦ value, …]`, and a nested
+/// store its changelog the same way, drawing on the one budget the enclosing
+/// cell was given. The budget is what bounds the rendering, not the depth.
+fn write_position(tile: &Tile, i: usize, out: &mut Bounded) -> fmt::Result {
     match tile {
-        Tile::Scalar(column) => cell(column, i),
-        Tile::Record(fields) => {
+        Tile::Scalar(column) => write_cell(column, i, out),
+        Tile::Record { fields, .. } => {
             let mut names: Vec<&String> = fields.keys().collect();
             names.sort();
-            let rendered: Vec<String> = names
-                .into_iter()
-                .map(|name| format!("{name}: {}", one_level(&fields[name], i)))
-                .collect();
-            format!("({})", rendered.join(", "))
+            write_fields(names, out, |name, out| write_field(tile, name, i, out))
         }
-        Tile::DataFunction { .. } if i < tile.rows() => {
+        Tile::DataFunction {
+            domain,
+            codomain,
+            deleted,
+            ..
+        } if i < tile.rows() => {
             let (start, end) = tile.row_run(i);
-            format!("<{} entries>", end - start)
+            write_entries(start..end, out, |j, out| {
+                write_cell(domain, j, out)?;
+                out.write_str(" ↦ ")?;
+                write_position(codomain, j, out)?;
+                if deleted.contains(j) {
+                    out.write_str(" (deleted)")?;
+                }
+                Ok(())
+            })
         }
-        Tile::DataFunction { .. } => "<absent>".to_string(),
-        Tile::Aggregation { accumulator, .. } => one_level(accumulator, i),
-        Tile::Store { .. } => "<Store>".to_string(),
+        Tile::DataFunction { .. } => out.write_str("<absent>"),
+        Tile::Aggregation { accumulator, .. } => write_position(accumulator, i, out),
+        // A store is a whole value, so it stands at one row.
+        Tile::Store { .. } if i < tile.rows() => {
+            write_fields(sorted_store_keys(tile), out, |name, out| {
+                write_changelog(tile, name, out)
+            })
+        }
+        Tile::Store { .. } => out.write_str("<absent>"),
     }
 }
 
-// The probe table every producer built during a session attaches its probe to.
-//
-// `ProducerBase::new` is called from inside producer constructors, which take no
-// context parameter. The same argument `OperatorBase::new` makes for
-// `ACTIVE_GRAPH`, and the session is live only while the graph is being
-// subscribed: at runtime each producer uses the handle it was built with.
-// shared-state-ok: a probe table attached for the duration of a subscribe. What
-// crosses it is a handle, never a value passed between operators.
-thread_local! {
-    // shared-state-ok: the session's handle itself, for the reason on the macro
-    // above. The declaration matches the checker's ambient-state shape twice —
-    // once at the macro, once at the `static` — and its upward scan stops at
-    // `thread_local! {`, which is neither a comment nor an attribute, so the
-    // note above does not reach this line.
-    static SESSION: RefCell<Option<SharedProbeTable>> = const { RefCell::new(None) };
+/// `(name: …, …)` over `names`, each value written by `write_value`.
+fn write_fields(
+    names: Vec<&String>,
+    out: &mut Bounded,
+    mut write_value: impl FnMut(&str, &mut Bounded) -> fmt::Result,
+) -> fmt::Result {
+    out.write_str("(")?;
+    for (n, name) in names.into_iter().enumerate() {
+        if n > 0 {
+            out.write_str(", ")?;
+        }
+        write!(out, "{name}: ")?;
+        write_value(name, out)?;
+    }
+    out.write_str(")")
 }
 
-/// Attach a probe writing to `probes` to every producer built until the
-/// returned session drops.
-///
-/// Held across `LiveProgram::start` and `LiveProgram::reload`, which is where
-/// subscribing happens.
-pub fn attach_probes(probes: SharedProbeTable) -> ProbeSession {
-    SESSION.with(|slot| {
-        let previous = slot.borrow_mut().replace(probes);
-        debug_assert!(
-            previous.is_none(),
-            "a probe session is already live; sessions are per-compile and do not nest",
-        );
-        ProbeSession
+/// Field `name` of `record` at row `i`. A field absent at some rows holds the
+/// other rows' cells in order, so row `i` sits at `i` less the absent rows
+/// below it.
+fn write_field(record: &Tile, name: &str, i: usize, out: &mut Bounded) -> fmt::Result {
+    let Tile::Record { fields, absent } = record else {
+        unreachable!("a field is read off a record, got {record:?}")
+    };
+    let absent = absent.get(name);
+    if absent.is_some_and(|rows| rows.contains(i)) {
+        return out.write_str("<absent>");
+    }
+    let below = absent.map_or(0, |rows| rows.iter().take_while(|&row| row < i).count());
+    write_position(&fields[name], i - below, out)
+}
+
+/// A store's keys, sorted: its state is a `HashMap`, whose iteration order
+/// varies between runs.
+fn sorted_store_keys(store: &Tile) -> Vec<&String> {
+    let mut names: Vec<&String> = store.store_keys().collect();
+    names.sort();
+    names
+}
+
+/// Store key `name`'s changelog as `[position ↦ value, …]`.
+fn write_changelog(store: &Tile, name: &str, out: &mut Bounded) -> fmt::Result {
+    let (positions, values) = store
+        .store_changelog(name)
+        .unwrap_or_else(|| unreachable!("{name} is one of the store's own keys"));
+    write_entries(0..positions.len(), out, |j, out| {
+        write_cell(positions, j, out)?;
+        out.write_str(" ↦ ")?;
+        write_position(values, j, out)
     })
 }
 
-/// The probe table a producer built now attaches to, if a session is live.
-pub(crate) fn session_probes() -> Option<SharedProbeTable> {
-    SESSION.with(|slot| slot.borrow().clone())
+/// `[e₀, e₁, …]` over `entries`, recording how many a cut passes over.
+///
+/// Each enclosing collection with entries left overwrites the count as the cut
+/// unwinds through it, so the count left is the outermost nonzero one.
+fn write_entries(
+    entries: std::ops::Range<usize>,
+    out: &mut Bounded,
+    mut write_entry: impl FnMut(usize, &mut Bounded) -> fmt::Result,
+) -> fmt::Result {
+    let end = entries.end;
+    out.write_str("[")?;
+    for (n, j) in entries.enumerate() {
+        let written =
+            if n > 0 { out.write_str(", ") } else { Ok(()) }.and_then(|()| write_entry(j, out));
+        if written.is_err() {
+            let passed_over = end - j - 1;
+            if passed_over > 0 {
+                out.passed_over = Some(passed_over);
+            }
+            return written;
+        }
+    }
+    out.write_str("]")
 }
 
-/// Ends probe attachment on drop.
-pub struct ProbeSession;
+/// A one-row store holding one key, `key`, written `values` at `positions` and
+/// decided through `watermark`, for fixtures that render one.
+#[cfg(test)]
+pub(crate) fn one_key_store(
+    key: &str,
+    positions: Vec<usize>,
+    values: ColumnValue,
+    watermark: Option<usize>,
+    terminal: bool,
+) -> Tile {
+    use std::collections::HashMap;
 
-impl Drop for ProbeSession {
-    fn drop(&mut self) {
-        SESSION.with(|slot| *slot.borrow_mut() = None);
+    use bit_set::BitSet;
+
+    use crate::interpreter::tiling::{Predicate, one_row_decided};
+
+    let decided = positions.clone();
+    Tile::Store {
+        state: Box::new(Tile::record(HashMap::from([(
+            key.to_string(),
+            Tile::data_function(
+                ColumnValue::UInts(positions),
+                Box::new(Tile::Scalar(values)),
+                Predicate::False,
+                BitSet::new(),
+            ),
+        )]))),
+        seed: Box::new(Tile::record(HashMap::from([(
+            key.to_string(),
+            Tile::Scalar(ColumnValue::Units(0)),
+        )]))),
+        decided: Box::new(one_row_decided(ColumnValue::UInts(decided))),
+        frontier: Box::new(one_row_decided(ColumnValue::UInts(
+            watermark.into_iter().collect(),
+        ))),
+        terminal,
+        closed_keys: Vec::new(),
     }
 }
 
@@ -585,7 +843,10 @@ mod tests {
     use bit_set::BitSet;
 
     use super::*;
-    use crate::interpreter::{tiling::Predicate, types::Value};
+    use crate::interpreter::{
+        tiling::{FunctionGuard, Predicate},
+        types::Value,
+    };
 
     fn strings(values: &[&str]) -> ColumnValue {
         ColumnValue::Strings(values.iter().map(|s| (*s).into()).collect())
@@ -608,19 +869,25 @@ mod tests {
         reading.rows.iter().map(|r| r.value.clone()).collect()
     }
 
+    /// The obsolete guard of a producer whose consumer has released nothing.
+    fn unreleased() -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::False))
+    }
+
     #[test]
-    fn a_reading_of_a_collection_keeps_its_keys_values_and_watermark() {
+    fn a_reading_of_a_collection_keeps_its_keys_values_and_completeness() {
         let mut probes = ProbeTable::with_defaults();
         probes.observe(
             None,
             1,
             "MapResultWithSource#1",
             &collection(&[0, 1], &["a", "b"], &[]),
+            &unreleased(),
         );
 
         let reading = probes.readings(None, 1).next().expect("observed");
         assert_eq!(reading.shape, "DataFunction");
-        assert_eq!(reading.watermark.as_deref(), Some("True"));
+        assert_eq!(reading.completeness.as_deref(), Some("True"));
         assert_eq!(
             reading.rows,
             vec![
@@ -651,6 +918,7 @@ mod tests {
             1,
             "Restrict#1",
             &collection(&[0, 1, 2], &["a", "skip", "c"], &[1]),
+            &unreleased(),
         );
 
         let reading = probes.readings(None, 1).next().expect("observed");
@@ -667,9 +935,21 @@ mod tests {
     #[test]
     fn rows_survive_more_empty_readings_than_the_probe_ring_can_hold() {
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(None, 1, "Restrict#1", &collection(&[0], &["a"], &[]));
+        probes.observe(
+            None,
+            1,
+            "Restrict#1",
+            &collection(&[0], &["a"], &[]),
+            &unreleased(),
+        );
         for _ in 0..READINGS_PER_PROBE * 4 {
-            probes.observe(None, 1, "Restrict#1", &collection(&[], &[], &[]));
+            probes.observe(
+                None,
+                1,
+                "Restrict#1",
+                &collection(&[], &[], &[]),
+                &unreleased(),
+            );
         }
 
         let (reading, stale) = probes.last_flow(None, 1).expect("the rows are kept");
@@ -687,10 +967,22 @@ mod tests {
     #[test]
     fn only_a_reading_carrying_rows_counts_as_a_flow() {
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(None, 1, "Restrict#1", &collection(&[], &[], &[]));
+        probes.observe(
+            None,
+            1,
+            "Restrict#1",
+            &collection(&[], &[], &[]),
+            &unreleased(),
+        );
         assert_eq!(probes.flows(), 0);
 
-        probes.observe(None, 1, "Restrict#1", &collection(&[0], &["a"], &[]));
+        probes.observe(
+            None,
+            1,
+            "Restrict#1",
+            &collection(&[0], &["a"], &[]),
+            &unreleased(),
+        );
         assert_eq!(probes.flows(), 1);
     }
 
@@ -702,6 +994,7 @@ mod tests {
             1,
             "P#1",
             &collection(&[0, 1, 2, 3], &["a", "b", "c", "d"], &[]),
+            &unreleased(),
         );
 
         let reading = probes.readings(None, 1).next().expect("observed");
@@ -717,13 +1010,18 @@ mod tests {
     #[test]
     fn a_probe_keeps_only_its_last_readings() {
         let mut probes = ProbeTable::new(8, 2);
-        for i in 0..5 {
-            probes.set_tick(i);
-            probes.observe(None, 1, "P#1", &Tile::Scalar(strings(&["v"])));
+        for _ in 0..5 {
+            probes.observe(
+                None,
+                1,
+                "P#1",
+                &Tile::Scalar(strings(&["v"])),
+                &unreleased(),
+            );
         }
 
-        let ticks: Vec<u64> = probes.readings(None, 1).map(|r| r.tick).collect();
-        assert_eq!(ticks, vec![3, 4], "the cap evicts from the front");
+        let seqs: Vec<u64> = probes.readings(None, 1).map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![3, 4], "the cap evicts from the front");
         assert_eq!(probes.len(), 2);
     }
 
@@ -733,9 +1031,20 @@ mod tests {
     #[test]
     fn a_producer_answering_empty_on_a_second_pull_still_reads_as_its_data() {
         let mut probes = ProbeTable::with_defaults();
-        probes.set_tick(7);
-        probes.observe(None, 1, "IterateExtent#1", &collection(&[0], &["a"], &[]));
-        probes.observe(None, 1, "IterateExtent#1", &collection(&[], &[], &[]));
+        probes.observe(
+            None,
+            1,
+            "IterateExtent#1",
+            &collection(&[0], &["a"], &[]),
+            &unreleased(),
+        );
+        probes.observe(
+            None,
+            1,
+            "IterateExtent#1",
+            &collection(&[], &[], &[]),
+            &unreleased(),
+        );
 
         let (reading, stale) = probes.last_flow(None, 1).expect("observed");
         assert_eq!(values(reading), vec!["\"a\""]);
@@ -747,9 +1056,20 @@ mod tests {
     #[test]
     fn a_producer_answering_twice_alike_is_not_doubled() {
         let mut probes = ProbeTable::with_defaults();
-        probes.set_tick(7);
-        probes.observe(None, 1, "Memo#2", &collection(&[0], &["a"], &[]));
-        probes.observe(None, 1, "Memo#2", &collection(&[0], &["a"], &[]));
+        probes.observe(
+            None,
+            1,
+            "Memo#2",
+            &collection(&[0], &["a"], &[]),
+            &unreleased(),
+        );
+        probes.observe(
+            None,
+            1,
+            "Memo#2",
+            &collection(&[0], &["a"], &[]),
+            &unreleased(),
+        );
 
         let (reading, stale) = probes.last_flow(None, 1).expect("observed");
         assert_eq!(values(reading), vec!["\"a\""]);
@@ -760,8 +1080,20 @@ mod tests {
     fn one_operator_with_two_producers_keeps_them_apart() {
         let node = Some(NodeId::fresh());
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(node, 1, "FanOut#1", &Tile::Scalar(strings(&["left"])));
-        probes.observe(node, 2, "FanOut#1", &Tile::Scalar(strings(&["right"])));
+        probes.observe(
+            node,
+            1,
+            "FanOut#1",
+            &Tile::Scalar(strings(&["left"])),
+            &unreleased(),
+        );
+        probes.observe(
+            node,
+            2,
+            "FanOut#1",
+            &Tile::Scalar(strings(&["right"])),
+            &unreleased(),
+        );
 
         assert_eq!(probes.probe_keys().count(), 2);
         assert_eq!(
@@ -783,21 +1115,21 @@ mod tests {
         fields.insert("tagged".to_string(), Tile::Scalar(strings(&["> a"])));
         let tile = Tile::data_function(
             uints(&[0]),
-            Box::new(Tile::Record(fields)),
+            Box::new(Tile::record(fields)),
             Predicate::True,
             BitSet::new(),
         );
 
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(None, 1, "FanIn#1", &tile);
+        probes.observe(None, 1, "FanIn#1", &tile, &unreleased());
         let reading = probes.readings(None, 1).next().expect("observed");
         assert_eq!(values(reading), vec!["(tagged: \"> a\", text: \"a\")"]);
     }
 
-    /// A nested collection renders as the size of the row's group, which bounds
-    /// the cost of a cell by the row cap however deep the value is.
+    /// A nested collection renders its entries, so a reading below the top
+    /// level shows the values and not only how many there are.
     #[test]
-    fn a_nested_collection_renders_its_group_size() {
+    fn a_nested_collection_renders_its_entries() {
         let inner = Tile::grouped(
             uints(&[0, 2]),
             uints(&[0, 1, 0]),
@@ -813,51 +1145,125 @@ mod tests {
         );
 
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(None, 1, "GroupBy#1", &tile);
+        probes.observe(None, 1, "GroupBy#1", &tile, &unreleased());
         let reading = probes.readings(None, 1).next().expect("observed");
         assert_eq!(reading.shape, "DataFunction");
-        assert_eq!(values(reading), vec!["<2 entries>", "<1 entries>"]);
+        assert_eq!(
+            values(reading),
+            vec!["[u0 ↦ \"a\", u1 ↦ \"b\"]", "[u0 ↦ \"c\"]"]
+        );
     }
 
+    /// One long string is cut at the budget rather than held at full size in
+    /// every reading that carries it.
     #[test]
-    fn a_reading_of_a_store_keeps_its_changes_and_the_frontier_it_decided() {
+    fn a_long_value_is_cut_at_the_cell_budget() {
+        let long = "x".repeat(CHARS_PER_CELL * 4);
         let mut probes = ProbeTable::with_defaults();
         probes.observe(
             None,
             1,
-            "Commit#1",
-            &Tile::Store {
-                changes: uints(&[0, 1]),
-                deltas: ColumnValue::Variants(vec![Value::Unit, Value::Unit]),
-                frontier: Predicate::True,
-                terminal: true,
-                closed_keys: Vec::new(),
-            },
+            "Memo#1",
+            &collection(&[0], &[&long], &[]),
+            &unreleased(),
         );
+        let reading = probes.readings(None, 1).next().expect("observed");
+        let value = &reading.rows[0].value;
+        assert_eq!(value.chars().count(), CHARS_PER_CELL + 1, "{value}");
+        assert!(value.starts_with("\"xxx"));
+        assert!(value.ends_with('…'));
+    }
+
+    /// Nesting spends one budget, and a cut inside a collection says how many
+    /// of its entries it passed over.
+    #[test]
+    fn a_cut_inside_a_nested_collection_counts_what_it_passed_over() {
+        let entries = CHARS_PER_CELL;
+        let inner = Tile::grouped(
+            uints(&[0]),
+            uints(&(0..entries).collect::<Vec<_>>()),
+            Box::new(Tile::Scalar(strings(&vec!["v"; entries]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tile =
+            Tile::data_function(uints(&[0]), Box::new(inner), Predicate::True, BitSet::new());
+
+        let mut probes = ProbeTable::with_defaults();
+        probes.observe(None, 1, "GroupBy#1", &tile, &unreleased());
+        let reading = probes.readings(None, 1).next().expect("observed");
+        let value = &reading.rows[0].value;
+        let (shown, marker) = value.split_once('…').expect("the value was cut");
+        assert_eq!(shown.chars().count(), CHARS_PER_CELL);
+        // The cut falls inside the entry after the last whole one, so that
+        // entry is started and not counted as passed over.
+        let whole_entries = shown.matches('↦').count();
+        assert_eq!(
+            marker,
+            format!("<+{} entries>", entries - whole_entries - 1),
+            "{value}",
+        );
+    }
+
+    /// A store nested in a codomain renders its changelog as entries, the way a
+    /// nested collection does.
+    #[test]
+    fn a_nested_store_renders_its_changelog() {
+        let store = one_key_store("acc", vec![0, 2], strings(&["a", "b"]), Some(2), false);
+        let tile =
+            Tile::data_function(uints(&[0]), Box::new(store), Predicate::True, BitSet::new());
+
+        let mut probes = ProbeTable::with_defaults();
+        probes.observe(None, 1, "AsOf#1", &tile, &unreleased());
+        let reading = probes.readings(None, 1).next().expect("observed");
+        assert_eq!(values(reading), vec!["(acc: [u0 ↦ \"a\", u2 ↦ \"b\"])"]);
+    }
+
+    #[test]
+    fn a_reading_of_a_store_keeps_each_keys_changelog_and_the_frontier_it_decided() {
+        let mut probes = ProbeTable::with_defaults();
+        let live = one_key_store("acc", vec![0, 1], strings(&["a", "b"]), Some(1), false);
+        probes.observe(None, 1, "Commit#1", &live, &unreleased());
 
         let reading = probes.readings(None, 1).next().expect("observed");
         assert_eq!(reading.shape, "Store");
-        assert_eq!(reading.total, 2);
+        assert_eq!(reading.total, 1, "a store's rows are its keys");
+        assert_eq!(reading.rows[0].key.as_deref(), Some("acc"));
+        assert_eq!(reading.rows[0].value, "[u0 ↦ \"a\", u1 ↦ \"b\"]");
         assert_eq!(
-            reading
-                .rows
-                .iter()
-                .map(|r| r.key.clone())
-                .collect::<Vec<_>>(),
-            vec![Some("u0".into()), Some("u1".into())],
-            "a store's rows are its change ticks",
+            reading.completeness,
+            Some(format!("{:?}", Predicate::at_or_below(Value::UInt(1)))),
+            "a live store is decided through its watermark",
         );
-        assert_eq!(reading.watermark.as_deref(), Some("True"));
+
+        let done = one_key_store("acc", vec![0, 1], strings(&["a", "b"]), Some(1), true);
+        probes.observe(None, 1, "Commit#1", &done, &unreleased());
+        let reading = probes.readings(None, 1).last().expect("observed");
+        assert_eq!(reading.completeness.as_deref(), Some("True"));
     }
 
-    /// A source window renders keys against values and truncates to the tail,
-    /// the same rule a reading uses: a source domain is index-ordered, so the
-    /// last keys are the most recent arrivals.
+    /// A sample fetches the window's last keys, the same rule a reading uses:
+    /// a source domain is index-ordered, so the last keys are the most recent
+    /// arrivals.
     #[test]
-    fn a_source_window_renders_the_last_keys_and_counts_the_rest() {
-        let keys = uints(&[2, 3, 4]);
-        let values = strings(&["c", "d", "e"]);
-        let window = render_source_window(Vec::new(), "stdin", &keys, &values, 2);
+    fn a_window_tail_is_the_last_keys_and_never_reaches_before_the_window() {
+        assert_eq!(window_tail(2..5, 2), 3..5);
+        assert_eq!(
+            window_tail(2..5, 8),
+            2..5,
+            "a short window is fetched whole"
+        );
+        assert_eq!(window_tail(0..0, 8), 0..0);
+        assert_eq!(window_tail(10_000..1_000_000, 32), 999_968..1_000_000);
+    }
+
+    /// A source window renders the tail it was handed against the whole
+    /// window's length.
+    #[test]
+    fn a_source_window_renders_its_tail_and_counts_the_rest() {
+        let keys = uints(&[3, 4]);
+        let values = strings(&["d", "e"]);
+        let window = render_source_window(Vec::new(), "stdin", 3, &keys, &values);
 
         assert_eq!(window.name, "stdin");
         assert_eq!(window.total, 3);
@@ -885,9 +1291,9 @@ mod tests {
         let window = render_source_window(
             Vec::new(),
             "stdin",
+            0,
             &ColumnValue::from_uints(Vec::new()),
             &strings(&[]),
-            8,
         );
         assert_eq!(window.total, 0);
         assert_eq!(window.dropped(), 0);
@@ -897,11 +1303,87 @@ mod tests {
     #[test]
     fn a_sequence_number_orders_every_reading() {
         let mut probes = ProbeTable::with_defaults();
-        probes.observe(None, 1, "A#1", &Tile::Scalar(strings(&["x"])));
-        probes.observe(None, 2, "B#1", &Tile::Scalar(strings(&["y"])));
-        probes.observe(None, 1, "A#1", &Tile::Scalar(strings(&["z"])));
+        probes.observe(
+            None,
+            1,
+            "A#1",
+            &Tile::Scalar(strings(&["x"])),
+            &unreleased(),
+        );
+        probes.observe(
+            None,
+            2,
+            "B#1",
+            &Tile::Scalar(strings(&["y"])),
+            &unreleased(),
+        );
+        probes.observe(
+            None,
+            1,
+            "A#1",
+            &Tile::Scalar(strings(&["z"])),
+            &unreleased(),
+        );
 
         let seqs: Vec<u64> = probes.readings(None, 1).map(|r| r.seq).collect();
         assert_eq!(seqs, vec![0, 2], "the gap is B's reading");
+    }
+
+    /// The guard ships only once the consumer has released something, so a
+    /// reader is not shown an empty region on every probe.
+    #[test]
+    fn an_obsolete_guard_is_reported_only_once_something_is_released() {
+        let mut probes = ProbeTable::with_defaults();
+        let tile = collection(&[0], &["a"], &[]);
+        probes.observe(None, 1, "Memo#1", &tile, &unreleased());
+        let released = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(0),
+        )));
+        probes.observe(None, 1, "Memo#1", &tile, &released);
+
+        let obsolete: Vec<Option<String>> = probes
+            .readings(None, 1)
+            .map(|reading| reading.obsolete.clone())
+            .collect();
+        assert_eq!(obsolete, vec![None, Some(format!("{released:?}"))]);
+    }
+
+    #[test]
+    fn a_slot_takes_readings_only_while_enabled() {
+        let slot = ProbeSlot::default();
+        let tile = collection(&[0], &["a"], &[]);
+        slot.observe_named(None, 1, || "P#1".into(), &tile, &unreleased());
+        assert!(slot.with_table(ProbeTable::len).is_none(), "off: no table");
+
+        slot.enable();
+        slot.observe_named(None, 1, || "P#1".into(), &tile, &unreleased());
+        assert_eq!(slot.with_table(ProbeTable::len), Some(1));
+
+        slot.disable();
+        slot.enable();
+        assert_eq!(
+            slot.with_table(ProbeTable::len),
+            Some(0),
+            "switching off drops the readings, and switching on starts empty",
+        );
+    }
+
+    /// Every producer holds a clone of one slot, so one switch reaches all.
+    #[test]
+    fn enabling_one_clone_enables_every_clone() {
+        let slot = ProbeSlot::default();
+        let held_by_a_producer = slot.clone();
+        slot.enable();
+        assert!(held_by_a_producer.is_enabled());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "two producers share the probe key")]
+    fn two_names_under_one_probe_key_are_refused() {
+        let mut probes = ProbeTable::with_defaults();
+        let tile = collection(&[0], &["a"], &[]);
+        probes.observe(None, 1, "Memo#1", &tile, &unreleased());
+        probes.observe(None, 1, "Restrict#1", &tile, &unreleased());
     }
 }

@@ -70,7 +70,12 @@ impl TileOperator for PermuteRecordDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(PermuteRecordDomainProducer {
-            base: ProducerBase::new(PermuteRecordDomainProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                PermuteRecordDomainProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             permutation: self.permutation.clone(),
         })
@@ -422,7 +427,12 @@ impl TileOperator for FlattenTupleDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(FlattenTupleDomainProducer {
-            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                FlattenTupleDomainProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -763,7 +773,7 @@ mod tests {
         );
         let flat_tiling = flat_three_int_tiling();
         let mut producer = FlattenTupleDomainProducer {
-            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &flat_tiling),
+            base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &flat_tiling),
             input: Box::new(TestTileProducer::new(input_tile, nested_outer_tiling())),
             field_map,
         };
@@ -831,7 +841,7 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let mut producer = FlattenTupleDomainProducer {
-            base: ProducerBase::new(FlattenTupleDomainProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input_tile, pass_through_tiling)),
             field_map,
         };
@@ -879,7 +889,7 @@ mod tests {
         let (input_tile, input_tiling) = make_three_field_records_tile_and_tiling();
         let permutation = vec![2usize, 0, 1];
         let mut producer = PermuteRecordDomainProducer {
-            base: ProducerBase::new(
+            base: ProducerBase::unowned(
                 PermuteRecordDomainProducer::alloc_id(),
                 &flat_three_int_tiling(),
             ),
@@ -904,7 +914,7 @@ mod tests {
         let (input_tile, input_tiling) = make_three_field_records_tile_and_tiling();
         let permutation = vec![0usize, 1, 2];
         let mut producer = PermuteRecordDomainProducer {
-            base: ProducerBase::new(
+            base: ProducerBase::unowned(
                 PermuteRecordDomainProducer::alloc_id(),
                 &flat_three_int_tiling(),
             ),
@@ -944,7 +954,7 @@ mod tests {
         }
         let permutation = vec![2usize, 0, 1];
         let mut producer = PermuteRecordDomainProducer {
-            base: ProducerBase::new(
+            base: ProducerBase::unowned(
                 PermuteRecordDomainProducer::alloc_id(),
                 &flat_three_int_tiling(),
             ),
@@ -995,13 +1005,13 @@ mod tests {
 
         let (input_tile, input_tiling) = make_three_field_records_tile_and_tiling();
         let sender = SenderProducer {
-            base: ProducerBase::new(SenderProducer::alloc_id(), &input_tiling),
+            base: ProducerBase::unowned(SenderProducer::alloc_id(), &input_tiling),
             tile: input_tile,
             tx,
         };
         let out_tiling = flat_three_int_tiling();
         let mut producer = PermuteRecordDomainProducer {
-            base: ProducerBase::new(PermuteRecordDomainProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(PermuteRecordDomainProducer::alloc_id(), &out_tiling),
             input: Box::new(sender),
             permutation: vec![2usize, 0, 1],
         };
@@ -1185,7 +1195,7 @@ mod tests {
             *domain_predicate = stated.clone();
         }
         let mut producer = PermuteRecordDomainProducer {
-            base: ProducerBase::new(
+            base: ProducerBase::unowned(
                 PermuteRecordDomainProducer::alloc_id(),
                 &flat_three_int_tiling(),
             ),

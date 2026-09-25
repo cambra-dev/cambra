@@ -72,8 +72,8 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         "stdin"
     }
 
-    fn retained_keys(&self) -> Option<ColumnValue> {
-        Some(self.buf.retained_keys())
+    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+        Some(self.buf.retained_window())
     }
 
     /// Drains any lines that the background reader thread has buffered.

@@ -1,8 +1,14 @@
-//! Structural validators for the `/api/snapshot` wire shape — the Rust mirror
-//! of the frontend's `validateSnapshot` (`web/src/wireValidate.ts`).
-//! Asserting the wire contract in one place lets the transport, the server and
-//! `tests/inspector_goldens.rs` check one contract (the cross-language twin of
-//! the TS validator, since the two cannot literally share code).
+//! Structural validators for the inspector's two wire shapes.
+//!
+//! The `/api/snapshot` half mirrors the frontend's `validateSnapshot`
+//! (`web/src/wireValidate.ts`), so the transport, the server and
+//! `tests/inspector_goldens.rs` check the contract the frontend reads. The two
+//! cannot share code, so each language carries its own validator.
+//!
+//! The `/api/live` half, [`assert_probe_frame_shape`], has no TypeScript twin.
+//! It pins the probe frame's keys and orderings, and runs on the frame
+//! `inspector_model::frame`'s golden test compares against the committed
+//! fixture `web/src/__fixtures__/probe_frame.json`.
 //!
 //! **Public, not `#[cfg(test)]`.** `tests/inspector_goldens.rs` is a separate
 //! crate linking the library as a consumer does, so a `#[cfg(test)]` item is
@@ -664,15 +670,15 @@ fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
 /// the reason [`PANE_IDS`] is: a list read off the producer agrees with the
 /// producer by construction. A field added, renamed or removed is meant to fail
 /// here, and the failure is the notice that the wire changed.
-const PROBE_FRAME_KEYS: [&str; 5] = ["tick", "published", "final", "nodes", "sources"];
+const PROBE_FRAME_KEYS: [&str; 4] = ["published", "final", "nodes", "sources"];
 const PROBED_NODE_KEYS: [&str; 2] = ["nodeId", "probes"];
 const PROBE_KEYS: [&str; 11] = [
     "producerId",
     "producer",
     "shape",
-    "watermark",
+    "completeness",
+    "obsolete",
     "note",
-    "tick",
     "seq",
     "stale",
     "total",
@@ -688,9 +694,7 @@ const SOURCE_WINDOW_KEYS: [&str; 5] = ["nodeIds", "name", "total", "dropped", "r
 /// otherwise.
 pub fn assert_probe_frame_shape(v: &Value) {
     assert_exact_keys(v, &PROBE_FRAME_KEYS, "frame");
-    for key in ["tick", "published"] {
-        assert!(v[key].is_u64(), "frame.{key} is a number");
-    }
+    assert!(v["published"].is_u64(), "frame.published is a number");
     assert!(v["final"].is_boolean(), "frame.final is a boolean");
 
     let nodes = array_at(v, "nodes", "frame");
@@ -710,15 +714,13 @@ pub fn assert_probe_frame_shape(v: &Value) {
             for key in ["producer", "shape"] {
                 assert!(probe[key].is_string(), "{at}.{key} is a string");
             }
-            for key in ["watermark", "note"] {
+            for key in ["completeness", "obsolete", "note"] {
                 assert!(
                     probe[key].is_string() || probe[key].is_null(),
                     "{at}.{key} is a string or null"
                 );
             }
-            for key in ["tick", "seq"] {
-                assert!(probe[key].is_u64(), "{at}.{key} is a number");
-            }
+            assert!(probe["seq"].is_u64(), "{at}.seq is a number");
             assert!(probe["stale"].is_boolean(), "{at}.stale is a boolean");
             assert_rows_and_counts(probe, &at);
         }

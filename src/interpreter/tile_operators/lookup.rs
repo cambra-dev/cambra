@@ -208,7 +208,12 @@ impl TileOperator for CheckedLookup {
             )),
         };
         Box::new(CheckedLookupProducer {
-            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(
+                CheckedLookupProducer::alloc_id(),
+                &self.base.tiling,
+                &self.base,
+                scheduler,
+            ),
             source,
             released: false,
         })
@@ -657,7 +662,7 @@ mod tests {
     fn lookup_over(keys: (Tile, Tiling), coll: (Tile, Tiling)) -> CheckedLookupProducer {
         let tiling = answer_tiling(&keys.1, option_of_int());
         CheckedLookupProducer {
-            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &tiling),
+            base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
             source: ProducerSource::Split {
                 collection: Box::new(TestTileProducer::new(coll.0, coll.1)),
                 keys: Box::new(TestTileProducer::new(keys.0, keys.1)),
@@ -748,7 +753,7 @@ mod tests {
         let (coll, coll_tiling) = collection(false);
         let tiling = answer_tiling(&keys_tiling, option_of_int());
         let mut lookup = CheckedLookupProducer {
-            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &tiling),
+            base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
             source: ProducerSource::Split {
                 collection: Box::new(TestTileProducer::new(coll, coll_tiling)),
                 keys: Box::new(spy),

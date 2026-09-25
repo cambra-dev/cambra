@@ -1,11 +1,11 @@
-//! The inspector's data endpoints: a read-only `tiny_http` server that answers
-//! with JSON and never with a page. What a user looks at is the frontend, which
-//! fetches these two routes.
+//! The inspector's endpoints: a read-only `tiny_http` server for the frontend,
+//! the static JSON bodies it fetches, and the websocket carrying a run's probe
+//! frames.
 //!
-//! One **statically compiled** program is served. `code` is compiled once at
-//! startup and the response bodies are rendered then and reused for every
-//! request, so there is no per-request recompilation, no mutation endpoint, and
-//! no live ticks.
+//! One program is served, and its response bodies are rendered once and reused
+//! for every request. [`serve`] compiles `code` itself; [`serve_compiled`] takes
+//! the compile a driver is about to run. There is no per-request recompilation
+//! and no mutation endpoint.
 //!
 //! # Routes
 //!
@@ -15,6 +15,10 @@
 //! - `GET /api/diagnostics` — [`diagnostics_body`]
 //!   (`{"diagnostics":[]}` on success, structured diagnostics on failure).
 //!   `application/json`.
+//! - `GET /api/live` — a websocket upgrade handled by
+//!   [`LiveServer::accept`]; it carries the probe frames a driver publishes
+//!   through the [`LiveChannel`], and nothing under [`serve`], which runs no
+//!   program.
 //! - `GET /` and `GET /index.html` — the CodeMirror frontend: the built,
 //!   self-contained `web/dist/index.html` bundle, which
 //!   fetches `/api/snapshot` and renders the source + IR tree. `text/html`.

@@ -5881,7 +5881,7 @@ mod variant_ctor_tests {
         ) -> Box<dyn TileProducer> {
             consumer.notify();
             Box::new(FixedStreamProducer {
-                base: ProducerBase::new(FixedStreamProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
                 released: false,
             })

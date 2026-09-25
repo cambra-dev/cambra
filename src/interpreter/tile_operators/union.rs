@@ -376,7 +376,12 @@ impl TileOperator for UnionOperator {
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                UnionProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             inputs: input_producers,
             flat: self.flat,
             level: self.level,
@@ -980,7 +985,7 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let mut producer = UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &union_tiling),
             inputs,
             // Tagged, not flat-merged: the assertions below read per-arm
             // variants off a `ColumnValue::Union` domain.
@@ -1057,15 +1062,15 @@ mod tests {
 
         let producer = UnionProducer {
             level: CurryLevel::OUTERMOST,
-            base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &union_tiling),
             inputs: vec![
                 Box::new(SpyProducer {
-                    base: ProducerBase::new(0, &int_function_tiling()),
+                    base: ProducerBase::unowned(0, &int_function_tiling()),
                     tile: int_function_tile(),
                     log: log0.clone(),
                 }),
                 Box::new(SpyProducer {
-                    base: ProducerBase::new(1, &int_function_tiling()),
+                    base: ProducerBase::unowned(1, &int_function_tiling()),
                     tile: int_function_tile(),
                     log: log1.clone(),
                 }),
@@ -1208,7 +1213,7 @@ mod tests {
         // Arm 1 has reached no row yet and calls nothing complete.
         let arm1 = tiling.empty_tile();
         let mut producer = UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), &tiling),
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &tiling),
             level: CurryLevel::new(1),
             inputs: vec![
                 Box::new(TestTileProducer::new(arm0, tiling.clone())),

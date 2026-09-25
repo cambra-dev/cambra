@@ -145,7 +145,12 @@ impl TileOperator for Zip {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(ZipProducer {
-            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ZipProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             names: self.names.clone(),
             level: self.level,
             inputs: self
@@ -613,7 +618,12 @@ impl TileOperator for MakeRecord {
     ) -> Box<dyn TileProducer> {
         let shared = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
-            base: ProducerBase::new(MakeRecordProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MakeRecordProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -808,7 +818,12 @@ impl TileOperator for SelectField {
             self.input
                 .subscribe(input_tiling.universal_guard(), consumer, scheduler);
         Box::new(SelectFieldProducer {
-            base: ProducerBase::new(SelectFieldProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                SelectFieldProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             name: self.name.clone(),
             input_tiling,
@@ -928,7 +943,7 @@ mod tests {
         }
         let out_tiling = Tiling::Record((0..2).map(|i| (tuple_field(i), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
-            base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: (0..2).map(tuple_field).collect(),
             inputs,
         };
@@ -950,7 +965,7 @@ mod tests {
         let (spy, log) = ReleaseSpy::new(Tile::Scalar(ColumnValue::Ints(vec![1])), tiling.clone());
         let out_tiling = Tiling::Record([(tuple_field(0), tiling.clone())].into_iter().collect());
         let mut producer = MakeRecordProducer {
-            base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0)],
             inputs: vec![Box::new(spy)],
         };
@@ -986,7 +1001,7 @@ mod tests {
         let out_tiling =
             Tiling::Record(names.iter().map(|n| (n.clone(), tiling.clone())).collect());
         let mut producer = MakeRecordProducer {
-            base: ProducerBase::new(MakeRecordProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out_tiling),
             names: names.clone(),
             inputs,
         };
@@ -1089,7 +1104,7 @@ mod tests {
         );
         let output_tiling = select_field_tiling(&input_tiling, "a");
         let mut producer = SelectFieldProducer {
-            base: ProducerBase::new(SelectFieldProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
             name: "a".to_string(),
             input_tiling: input_tiling.clone(),
@@ -1167,7 +1182,7 @@ mod tests {
             input_tiling.clone(),
         );
         let mut producer = SelectFieldProducer {
-            base: ProducerBase::new(SelectFieldProducer::alloc_id(), &field_tiling),
+            base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(spy),
             name: "xs".to_string(),
             input_tiling,
@@ -1221,7 +1236,7 @@ mod tests {
             BitSet::new(),
         );
         let mut producer = SelectFieldProducer {
-            base: ProducerBase::new(SelectFieldProducer::alloc_id(), &field_tiling),
+            base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &field_tiling),
             input: Box::new(TestTileProducer::new(input, input_tiling.clone())),
             name: "a".to_string(),
             input_tiling,
@@ -1256,7 +1271,7 @@ mod tests {
         let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
         let mut zip = ZipProducer {
             level: CurryLevel::new(1),
-            base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],
         };
@@ -1324,7 +1339,7 @@ mod tests {
         );
         let mut zip = ZipProducer {
             level: CurryLevel::new(1),
-            base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
             inputs: vec![
                 Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
@@ -1409,7 +1424,7 @@ mod tests {
         let (spy0, released0) = QuietSpy::new(arm0, arm0_tiling.clone());
         let (spy1, released1) = QuietSpy::new(arm1, arm1_tiling.clone());
         let mut zip = ZipProducer {
-            base: ProducerBase::new(ZipProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
             inputs: vec![Box::new(spy0), Box::new(spy1)],
             level: CurryLevel::new(1),

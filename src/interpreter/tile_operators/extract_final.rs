@@ -127,7 +127,12 @@ impl TileOperator for ExtractFinal {
             .as_mut()
             .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), scheduler));
         Box::new(ExtractFinalProducer {
-            base: ProducerBase::new(ExtractFinalProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ExtractFinalProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             source: source_producer,
             default: default_producer,
             final_tile: None,
@@ -369,7 +374,7 @@ mod tests {
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
             Box::new(PartialSourceProducer {
-                base: ProducerBase::new(PartialSourceProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(PartialSourceProducer::alloc_id(), &self.tiling),
                 releases: self.releases.clone(),
             })
         }
@@ -421,7 +426,7 @@ mod tests {
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
             Box::new(TerminalSourceProducer {
-                base: ProducerBase::new(TerminalSourceProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(TerminalSourceProducer::alloc_id(), &self.tiling),
                 domain: self.domain.clone(),
                 codomain_tile: self.codomain_tile.clone(),
             })

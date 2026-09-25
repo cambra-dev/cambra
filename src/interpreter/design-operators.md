@@ -419,23 +419,21 @@ two in turn.
 
 ### Producer attribution and probes
 
-`TileOperator::subscribe` is a provided method that no operator overrides. It opens a scope naming
-the operator's `NodeId` and calls the operator's required `subscribe_impl`. `ProducerBase::new`
-reads the innermost open scope, so every producer records the operator that built it
-(`ProducerBase::node_id`) without its constructor taking a parameter. A scope restores the id it
-replaced when it closes, because a `subscribe_impl` may subscribe its inputs before or after it
-builds its own producer. A scope that names an operator builds at most one `ProducerBase`, and a
-second fails a `debug_assert!`. An input's producer is built under the input's own scope.
+A `subscribe_impl` builds exactly one producer. `ProducerBase::new` takes the building operator's
+`OperatorBase` and the `Scheduler` the subscribe received, so every producer records the operator
+that built it (`ProducerBase::node_id`) and holds the scheduler's `ProbeSlot`. An input's producer
+is built by the input's own `subscribe_impl`. Two producers of different types built for one
+operator could share a probe key, since `alloc_id` counts per type; `ProbeTable` fails a
+`debug_assert!` when a second name arrives under one key.
 
-A probe observes one producer's `get`. While a probe session is live
-(`value_probe::attach_probes`, held across `LiveProgram::start` and `reload` under `--inspect`),
-every `ProducerBase` built takes a handle to the session's `ProbeTable`. The `get` wrapper records
-a rendered, row-capped reading of the tile into the probe keyed `(node_id, producer_id)`, after
-`get_impl` returns and after the checks above, and returns the tile unchanged. A probe therefore
-sees only tiles the protocol accepted, and changes nothing a consumer receives. Dropping a producer
-detaches its probe. A producer built with no session live has no probe, and its `get` records
-nothing. The probe frame `src/inspector_model/frame.rs` renders from the table is described in
-[design.md](../inspector_model/design.md#the-live-model-is-a-separate-path).
+A probe observes one producer's `get`. The `get` wrapper records a rendered, row-capped reading of
+the tile into the probe keyed `(node_id, producer_id)`, after `get_impl` returns and after the
+checks above, and returns the tile unchanged. A probe therefore sees only tiles the protocol
+accepted, and changes nothing a consumer receives. The wrapper records nothing while the slot is
+empty, which is every run without a connected `/api/live` client (see
+[design.md](../inspector_model/design.md#probing-follows-the-live-route)). Dropping a producer
+detaches its probe. The probe frame `src/inspector_model/frame.rs` renders from the table is
+described in [design.md](../inspector_model/design.md#the-live-model-is-a-separate-path).
 
 ## The release contract
 
