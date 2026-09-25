@@ -334,7 +334,9 @@ mod tests {
         loop {
             match socket.read().expect("reading a frame") {
                 Message::Text(text) => {
-                    return serde_json::from_str(&text).expect("a frame is JSON");
+                    let frame = serde_json::from_str(&text).expect("a frame is JSON");
+                    crate::inspector_server::wire_check::assert_probe_frame_shape(&frame);
+                    return frame;
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
                 other => panic!("expected text, got {other:?}"),
