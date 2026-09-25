@@ -27,7 +27,7 @@ pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, 
 use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
-    interpreter::value_recorder::{self, SharedRecorder},
+    interpreter::value_probe::{self, SharedProbeTable},
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -201,16 +201,16 @@ static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLo
 // context parameter — threading one through would change all 79 of its call
 // sites, which is the cost this scope exists to avoid. The same argument
 // `OperatorBase::new` makes for `ACTIVE_GRAPH`.
-// shared-state-ok: a recorder, mirroring `operator_graph::ACTIVE_GRAPH`. What
-// crosses it is an operator's identity travelling down to its own producer,
-// never a value passed between operators.
+// shared-state-ok: an attribution scope, mirroring `operator_graph::ACTIVE_GRAPH`.
+// What crosses it is an operator's identity travelling down to its own
+// producer, never a value passed between operators.
 thread_local! {
-    // shared-state-ok: the recorder cell itself, for the reason on the macro
+    // shared-state-ok: the scope cell itself, for the reason on the macro
     // above. The declaration matches the checker's ambient-state shape twice —
     // once at the macro, once at the `static` — and its upward scan stops at
     // `thread_local! {`, which is neither a comment nor an attribute, so the
     // note above does not reach this line.
-    static SUBSCRIBING: Cell<Option<NodeId>> = const { Cell::new(None) };
+    static SUBSCRIBING: Cell<Scope> = const { Cell::new(Scope { id: None, built: 0 }) };
 }
 
 /// Names the operator being subscribed for as long as it is alive, restoring
@@ -224,12 +224,47 @@ thread_local! {
 ///
 /// Panic-safe: an unwind through a subscribe still restores, so the cell is
 /// never left naming a dead scope.
-struct SubscribeScope(Option<NodeId>);
+struct SubscribeScope(Scope);
+
+/// The innermost live subscribe: the operator it names, and how many
+/// [`ProducerBase`]s have been built under it.
+#[derive(Clone, Copy)]
+struct Scope {
+    id: Option<NodeId>,
+    built: u8,
+}
 
 impl SubscribeScope {
     fn enter(id: Option<NodeId>) -> Self {
-        Self(SUBSCRIBING.with(|cell| cell.replace(id)))
+        Self(SUBSCRIBING.with(|cell| cell.replace(Scope { id, built: 0 })))
     }
+}
+
+/// The operator a producer being built now belongs to.
+///
+/// A scope that names an operator builds at most one [`ProducerBase`]. A second
+/// one would take the same operator's id without being that operator's
+/// producer, and since [`TileProducer::alloc_id`] counts per producer type,
+/// two types built under one scope can share `(node_id, producer_id)`, which
+/// is the key a [`ProbeTable`](crate::interpreter::value_probe::ProbeTable)
+/// files a probe under. An input's producer is built under its own scope,
+/// through [`TileOperator::subscribe`], so it does not count here. A scope
+/// naming no operator is a test double's and is not counted.
+fn attribute_producer() -> Option<NodeId> {
+    SUBSCRIBING.with(|cell| {
+        let mut scope = cell.get();
+        if scope.id.is_some() {
+            scope.built = scope.built.saturating_add(1);
+            debug_assert!(
+                scope.built <= 1,
+                "subscribe scope for {:?} built a second ProducerBase; a subscribe \
+                 builds one producer and reaches its inputs through `subscribe`",
+                scope.id,
+            );
+            cell.set(scope);
+        }
+        scope.id
+    })
 }
 
 impl Drop for SubscribeScope {
@@ -383,11 +418,13 @@ pub struct ProducerBase {
     /// outside any [`TileOperator::subscribe`] — a test double constructing a
     /// producer directly, or an operator carrying no [`OperatorBase`].
     pub node_id: Option<NodeId>,
-    /// Where [`TileProducer::get`] records what it returned, or `None` when the
-    /// producer was built with no recorder installed.
+    /// The table this producer's probe writes to on every [`TileProducer::get`],
+    /// or `None` when the producer was built with no [`ProbeSession`] attached.
+    ///
+    /// [`ProbeSession`]: crate::interpreter::value_probe::ProbeSession
     // shared-state-ok: the observation boundary. A producer writes what it has
     // already returned to its consumer; nothing reads it back into the graph.
-    pub(crate) recorder: Option<SharedRecorder>,
+    pub(crate) probes: Option<SharedProbeTable>,
     /// Output tiling for this producer.
     pub tiling: Tiling,
     /// Obsolete region of the tiling
@@ -407,8 +444,8 @@ impl ProducerBase {
     pub(crate) fn listening(id: usize, tiling: &Tiling, notified: Notified) -> Self {
         Self {
             id,
-            node_id: SUBSCRIBING.with(Cell::get),
-            recorder: value_recorder::installed(),
+            node_id: attribute_producer(),
+            probes: value_probe::session_probes(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
             notified,
@@ -416,29 +453,28 @@ impl ProducerBase {
     }
 }
 
-/// Retire this producer's recordings when it goes.
+/// Detach this producer's probe when it goes.
 ///
-/// A replaced version's producers are dropped by `LiveProgram::reload`'s
-/// teardown, so this is what makes its recordings go with them — precisely, and
-/// without asking the recorder to guess which entries are still live. An
-/// operator the reload kept is not rebuilt, so its producer is not dropped and
-/// its recorded series continues across the swap.
+/// `LiveProgram::reload`'s teardown drops a replaced version's producers, so
+/// their probes go with them, and the probe table never has to decide which
+/// entries are still live. An operator the reload kept is not rebuilt, so its
+/// producer is not dropped and its probe's readings continue across the swap.
 impl Drop for ProducerBase {
     fn drop(&mut self) {
-        let Some(recorder) = &self.recorder else {
+        let Some(probes) = &self.probes else {
             return;
         };
-        // Nothing drops a producer while the recorder is borrowed: `record`
-        // holds a mutable borrow only for the call, and `render_frame` holds a
-        // shared one while it iterates, building no producers and dropping none.
-        // A failure here is that invariant breaking rather than a case to
-        // handle, and a panicking `Drop` would abort the process.
-        match recorder.try_borrow_mut() {
-            Ok(mut recorder) => recorder.retire(self.node_id, self.id),
+        // Nothing drops a producer while the probe table is borrowed: `observe`
+        // holds a mutable borrow only for the call, and `render_probe_frame`
+        // holds a shared one while it iterates, building no producers and
+        // dropping none. A failed borrow is that invariant breaking. It panics
+        // in debug builds only, since a panic in `Drop` during an unwind aborts.
+        match probes.try_borrow_mut() {
+            Ok(mut probes) => probes.detach(self.node_id, self.id),
             Err(_) => debug_assert!(
                 false,
-                "a producer was dropped while the recorder was borrowed, so its \
-                 recordings outlive it",
+                "a producer was dropped while the probe table was borrowed, so its \
+                 probe outlives it",
             ),
         }
     }
@@ -565,13 +601,13 @@ pub trait TileProducer {
             self.tiling()
         );
         // After `get_impl` rather than around it: `get_impl` pulls this
-        // producer's inputs, whose own `get` borrows the same recorder, and a
+        // producer's inputs, whose own `get` borrows the same probe table, and a
         // borrow held across that call overlaps the inner one.
-        if let Some(recorder) = self.base().recorder.clone() {
+        if let Some(probes) = self.base().probes.clone() {
             let (node_id, producer_id, name) = (self.base().node_id, self.base().id, self.name());
-            recorder
+            probes
                 .borrow_mut()
-                .record(node_id, producer_id, &name, &result);
+                .observe(node_id, producer_id, &name, &result);
         }
         result
     }
@@ -997,6 +1033,45 @@ mod tests {
             unique.len(),
             3,
             "three operators, three distinct ids: {ids:?}"
+        );
+    }
+
+    /// Builds two bases under its own scope, which the scope refuses: the second
+    /// would take this operator's id without being its producer.
+    #[cfg(debug_assertions)]
+    struct TwoBases {
+        base: OperatorBase,
+    }
+
+    #[cfg(debug_assertions)]
+    impl TileOperator for TwoBases {
+        impl_operator_base!();
+
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+        fn subscribe_impl(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let _first = ProducerBase::new(Reporter::alloc_id(), &self.base.tiling);
+            let base = ProducerBase::new(Reporter::alloc_id(), &self.base.tiling);
+            Box::new(Reporter { base })
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "built a second ProducerBase")]
+    fn a_scope_that_builds_a_second_producer_base_is_refused() {
+        let mut op = TwoBases {
+            base: OperatorBase::new(int_tiling()),
+        };
+        op.subscribe(
+            int_tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut Scheduler::new(),
         );
     }
 
