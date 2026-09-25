@@ -293,8 +293,7 @@ impl<T> IntoIterator for TagMap<T> {
 ///
 /// A record needs no such distinction, because record width subtyping already gives
 /// it: a producer with *extra* fields is a *subtype*, so demanding
-/// `producer <: Record({core})` pins the core and lets the extras through
-/// (`design/lowering.md` calls this the open-record pattern). For a sum the
+/// `producer <: Record({core})` pins the core and lets the extras through. For a sum the
 /// subtyping runs the other way — fewer tags is the subtype — so a producer with
 /// extra tags is a **supertype**, and no closed judgment can both allow those extras
 /// and still say anything about the arms it *does* share.

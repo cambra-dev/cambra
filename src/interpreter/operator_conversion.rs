@@ -4407,7 +4407,7 @@ fn union_operand_ops(
         // that. Programs reach here — a union-domained collection read at a projected
         // index, which is what a `++` generator beside a second generator lowers to
         // (`tests/compilation_pipeline/scalars_collections.rs`,
-        // `a_union_generator_beside_a_second_generator`). So this names the missing
+        // `an_inline_union_generator_beside_a_second_generator`). So this names the missing
         // capability rather than compiling the operation as the one it is not. The
         // `Apply(Tuple, Copair)` form is the one nothing builds: it requires a `++`
         // inside a lambda over the parameter, which fails upstream at the post-elim

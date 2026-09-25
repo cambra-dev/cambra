@@ -13,7 +13,7 @@ records subtype constraints as bounds on inference variables, then materializes 
 polarity. Cambra's implementation supports structural records and variants, refinements, and
 use-site specialization.
 The paper's principal-type result does not establish that every accepted Cambra expression has a
-representable principal `ccl::Type`; incompatible untagged alternatives are rejected here.[^1]
+representable principal `ccl::Type`.[^1] Incompatible untagged alternatives are rejected here.
 
 Constraint emission traverses the CCL AST, writes a `ccl::Type` on each node, and relates produced
 types to expected types. The notation `constrain(lhs, rhs)` means `lhs <: rhs`; the code calls
@@ -103,6 +103,11 @@ or intersection constructor. Compaction merges compatible shapes at each positio
 - At a negative occurrence, it reads upper bounds. Compatible record requirements combine their
   fields; variant requirements retain only tags acceptable to both consumers.
 
+These are the polarity-selected contributions, not the complete materialization rule. At an entered
+negative position, compaction also reads lower bounds, even when upper bounds already supply a
+shape. The resulting type accounts for both supplied values and consumer requirements. See
+[Coalescing](#coalescing-from-bounds-to-types) for the distinction from shape recovery.
+
 The solver stores bounds instead of constructing union or intersection nodes. `compact_type` merges
 their structural contributions, and `coalesce_compact` reports an `IncompatibleBounds` error if a
 position contains incompatible concrete shapes such as `Int` and `String` (see
@@ -113,9 +118,10 @@ position contains incompatible concrete shapes such as `Int` and `String` (see
 Levels distinguish variables local to a generalized function from variables captured from its
 surrounding scope. A `PolyScheme` freshens the former at each use and preserves the latter.
 
-Larger level numbers denote deeper generalization scopes. Emission enters a deeper level for the
-right-hand side of a generalized `let`; ordinary nesting does not by itself increment the level
-(`infer/context.rs`).
+Larger level numbers denote deeper inference scopes. Emission enters one level deeper for every
+`let` right-hand side and every `MutDecl` initializer, then restores the surrounding level before
+checking the body. The decision to generalize a `let` follows emission of its right-hand side;
+it does not control that level increment (`in_let_rhs` in `infer/context.rs`, `infer/emit.rs`).
 
 - Every inference variable records the level at which it was minted. A `PolyScheme` stores the
   binding's cutoff level. Instantiation freshens variables above that cutoff and preserves
@@ -132,15 +138,22 @@ for the binding and specialization rules.
 ### Coalescing: From Bounds to Types
 
 **Coalescing** resolves the bound graph into `ccl::Type` using
-`compact_type` → `simplify_type` → `coalesce_compact` (`infer/solve.rs`). For each variable,
-compaction first traverses bounds on the side selected by polarity:
+`compact_type` → `simplify_type` → `coalesce_compact`. These functions are defined in
+`infer/solver/`; `infer/solve.rs` sequences them. For each variable, compaction first traverses
+bounds on the side selected by polarity:
 
 - Positive occurrences read lower bounds.
 - Negative occurrences read upper bounds.
 
-If that side supplies no concrete shape, compaction may read the opposite side at the position being
-materialized. This resolves a function domain from the argument type that flowed into it, for
-example. An unresolved position can remain `Type::Infer`; a structural collision is an error.
+The opposite side has two roles. Shape recovery can supply a shape when the polarity-selected
+bounds leave the entered position undetermined. Separately, a negative position merges lower-bound
+information with its upper-bound requirements whether or not shape recovery is needed. Within an
+invariant position, that merge also applies when the walk reaches the variable through a bound
+chain. `compact_type_polarity_only` disables both opposite-side reads. See
+[The collapse happens at the position](#the-collapse-happens-at-the-position) and
+[Invariant positions](#an-invariant-position-reads-both-sides-however-the-walk-reached-it).
+
+An unresolved position can remain `Type::Infer`; a structural collision is an error.
 Generalized definitions are materialized through their use-site specialization clones, which lets
 the output tree carry monomorphic types. See
 [Pass 2: Coalesce and Write-back](#pass-2-coalesce-and-write-back).
@@ -180,9 +193,8 @@ Suppose `capitalize` requires `String` and `math_add` requires `Int`. The field 
 requirements on the parameter variable `β`: schematically,
 `β.upper = [{name: String}, {age: Int}]`. The parameter is negative in the function type, so
 compaction combines these compatible upper bounds into a record with both fields. The schematic
-result is `{name: String, age: Int} ⇒ String`. The concrete inference path also depends on whether
-the record's width is closed; an open record that remains unresolved is reported as
-`UnresolvedPartial` (`infer/solver/coalesce.rs`).
+result is `{name: String, age: Int} ⇒ String`. Name-keyed fields materialize as `Type::Record`
+(`infer/solver/coalesce.rs`).
 
 #### A generalized identity function
 
@@ -228,13 +240,16 @@ application discharges that binder; group-by lookup uses this mechanism (see
 [Dependent refinements via Pi types](#45-dependent-refinements-via-pi-types)).
 
 Trait obligations for operators are implemented. Operator signatures state requirements such as
-`Addable` and `Comparable`, and the inference solver narrows their candidate instances before
-materialization (`infer/schemes.rs`, `infer/solver/traits.rs`). This is separate from a general
-nominal-type system.
+`Addable` and `Comparable`. The inference solver narrows base-type candidate instances before
+materialization; `Equatable` additionally handles tuple and record equality componentwise (see
+[A product is answered off the table](#a-product-is-answered-off-the-table)). This is separate from
+a general nominal-type system (`infer/schemes.rs`, `infer/solver/traits.rs`).
 
 `ccl::Type` has no first-class explicit `∀` type. The SMT fallback handles linear integer
-arithmetic over supported `Int`/`Bool` predicate forms. A predicate it cannot encode falls back to
-the structural mismatch, and point-free predicates after `lambda_elim` do not reach that fallback
+arithmetic over supported `Int`/`Bool` predicate forms. Both inference and `inline` use `smt_sub`;
+inlining uses it to check a refined parameter's precondition before beta-reduction. A predicate
+it cannot encode falls back to the structural mismatch, and point-free predicates after
+`lambda_elim` do not reach that fallback
 (`infer/solver/smt.rs`, `infer/solver/constrain.rs`). These are limits of the implemented paths,
 not additional inference passes.
 
@@ -330,7 +345,8 @@ The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/
    * *Polar-only elimination:* a variable whose every occurrence is at a single polarity carries no information (nothing constrains it from the other side), so it is dropped. A purely-negative variable means the function accepts anything there; a purely-positive one means the caller imposes nothing on it.
    * *Co-occurrence merging:* if variable `v` and variable `w` always occur together at a given polarity (and symmetrically), they carry identical information, so `w` is merged into `v`.
    * *Atomic absorption:* if a concrete atom `A` co-occurs with variable `v` at *both* polarities, `v` is sandwiched between two identical `A` constraints and is redundant, so it is dropped.
-   * The pass is currently cosmetic (everything is monomorphic) and becomes load-bearing once let-polymorphism introduces genuine polar asymmetry.
+   * The pass runs on both ordinary monomorphic types and the instantiated types of generalized
+     definitions. Let-polymorphism is implemented; it does not defer these simplification rules.
    * All three rules read the variable sets `compact_type` deposits, and a negative position's
      set holds both sides' variables — the merge unions identities as it unions fields. The
      occurrences the analysis sees there are not the ones the coalesced type materializes.
@@ -729,9 +745,10 @@ on an iterated domain is *compiled* — `planning::iterate` emits one `restrict(
 filter per refinement, in `application_order` — so a refinement is code, and two
 clones pinned to different refinements are genuinely different code. Since every literal carries its
 own singleton ([A literal is refined by its own value](#a-literal-is-refined-by-its-own-value)),
-the practical rule is one specialization per distinct argument tuple. `inline`
-beta-reduces scalar UDFs, so the cost lands on collection-producing ones, which it
-leaves cached.
+the practical rule is one specialization per distinct argument tuple. `inline` expands non-`Data`
+function bindings, including collection-producing UDFs. It preserves bindings whose value is a
+`Data` function, rather than caching every function that returns a collection; see
+[Collection sharing](optimization.md#collection-sharing).
 
 **Known imprecision.** The key summarizes the pin's *input*, so two uses differing
 only in a position the clone never reads still key apart (`λ a, b → a` at `(1, 2)`
@@ -750,7 +767,13 @@ hit wants a non-recording subsumption test, which the solver does not have.
 
 **Refinement predicates under monomorphization.** A `Refinement` has no synthetic identity: it carries an *immutable* predicate term (`Rc<TypedExpr>`), and its identity is the **type-blind structural equality** of that term (`eq_term_modulo_ty_slots`) — the predicate's embedded `Type` slots are inference metadata and never participate. A predicate occurs at many sites — its syntactic origin (a `Cast` target, a `user_annotation`) and every position `constrain`/`freshen_above` propagates the refinement onto — but those are independent occurrences, not aliases of one mutable cell. Two facts make this work without the cell-retirement machinery the mutable design needed. First, a free use of a generalized binding may live *only* inside a predicate (a list-comprehension filter calling a UDF lowers to a cast-target predicate); the coalesce walk reaches such uses because `coalesce_type_predicates` runs `coalesce_node` over every predicate it encounters with the walk's specialization scope live, and the post-inference `inline` pass substitutes inside predicates likewise. Second, because predicates are immutable, **a use-site coalesce *rebuilds* a predicate rather than mutating one shared with the definition** — so there is nothing to privatize, retire, or re-point: a specialization clone freshens its predicate as a proper substitution instance (`freshen_above`'s `Refinement` arm freshens the predicate's type slots through the same cache, and its `Infer` arm freshens the discharge-payload terms riding copied bound edges), and `compact_type` simply `force_refinement`s each refinement it materializes (a vacuous force shares the `Rc`, a substituting one rebuilds). The residual case the mutable design's whole-tree fix-up swept up — a refinement materialized from the definition's bound *before* its first specialization carries the definition's quantified vars — is harmless here: equality is type-blind, so a predicate carrying the definition's quantified vars compares equal to its specialized instance. Passes that need *occurrence* identity rather than equality (visited sets that dedup a predicate term shared by `Rc` across positions — the term graph is a DAG, since immutable `Rc<TypedExpr>` cannot form a cycle) key on the predicate `Rc`'s address (`PredicateId`).
 
-Generalization is narrow only in *what* it generalizes: function definitions with a quantifiable variable. Non-function (value) bindings are *not* generalized — they are bound monomorphically and shared, since specializing a value would duplicate it, which the feed/define and join-planning machinery does not tolerate. There is deliberately **no** use-count or generator carve-out: a single-use function generalizes to one specialization (later inlined like any monomorphic def), and a generator/collection-producing UDF generalizes to one specialization *per distinct element type* — which `inline` leaves *cached* (its domain is iterable) rather than duplicating. Levels are genuinely incremented at every generalized let, so extrude is live.
+Generalization applies to function definitions with a quantifiable variable. Non-function value
+bindings remain monomorphic and shared; specializing them would duplicate values that feed/define
+and join planning expect to share. There is no use-count or generator exception. A generalized
+collection-producing UDF uses the same specialization-key rule as other functions, not a separate
+key based only on element type. After specialization, `inline` expands non-`Data` function bindings;
+it preserves `Data` bindings. Every `let` RHS is emitted at a deeper level, whether or not the
+binding is subsequently generalized.
 
 **Refinement predicate representation.** A `Refinement` holds a single field,
 a **bare**, *immutable* boolean predicate (`Rc<TypedExpr>`), in which one
@@ -930,7 +953,12 @@ e.g. `make_restrict`).
 
 ### 3.2 The `InferArena`: who owns inference variables
 
-Recording `α <: β` pushes `Type::Infer(β)` into `α`'s bounds and `Type::Infer(α)` into `β`'s bounds (the shared-`Rc` linkage from §1). Mutual constraints — and self-recursive ones — therefore make each `InferVar` hold a *strong* `Rc` to the others through its `RefCell<InferBounds>`. After Pass 2 overwrites every `expr.ty` with a concrete, variable-free type, these cells become unreachable from the final AST yet keep one another alive: reference counting alone never reclaims the cycle, so the entire variable graph would leak after each `infer()` run.
+For same-level variables, recording `α <: β` adds `Type::Infer(β)` to `α`'s upper bounds;
+it does not immediately record a reciprocal bound on `β`. Other constraints and recursive bounds
+can nevertheless form cycles of strong `Rc` references between inference variables. Once the AST
+no longer references those variables, their bound cells can keep one another alive. Reference
+counting alone cannot reclaim such a cycle; see
+[Bounds and constraint propagation](#bounds-and-constraint-propagation).
 
 **`InferArena` (`ccl/infer/`) is the single owner that breaks the cycle.** It retains one strong handle to *every* variable at the moment it is minted (captured through a thread-local mint sink wired into `InferVar::fresh`), and on `Drop` clears each variable's lower/upper bound lists — severing all bound edges so every refcount can reach zero. A flat `Vec` suffices: variables are never looked up by id (the `Type` carries the `Rc` directly), so the arena only enumerates them once, at teardown. Clearing bounds before the `Vec` drops handles self-cycles and N-way cycles uniformly. This is an end-of-inference lifetime invariant implemented as RAII: the arena is created at the top of `infer()` and drops on the `Ok` and error paths alike.
 
@@ -1165,7 +1193,18 @@ A feed handle is `Type::History { value: 𝑇, domain: 𝐷, history_kind: Histo
 
 Below, **`Feed(ρ)`** abbreviates a `kind: Feed` history whose reconstructed channel is `ρ = 𝐷 ⤇ 𝑇`; the `value`/`domain` children are the two halves of `ρ`. An `Overwrite` history reaches the relation as a handle — a read has already dereffed at the rule that emitted it — so the four invariance rules below are specifically the `Feed`-kind behavior.
 
-The typing rules (`infer_simple_sub::emit_defer` / `emit_feed` / `emit_define`): `Defer` emits `Feed(fresh ρ)`; `Feed{name, value}` and `Define{name, value}` type as `Unit`, resolve `name` from the scope like a `Var` use, and constrain their contribution into the target's payload (`Fun(fresh δ, value_ty)` for a feed — the channel *domain* is a channelize artifact, so `δ` stays unconstrained and coalesces to `Infer`; the bare `value_ty` for a define). A target that isn't structurally a feed handle (a lambda parameter — ParamAsTarget) is demanded to be one via the upper bound `target <: Feed(ρf)`; the call-site argument edge meets it there and invariance carries the contribution back to the caller's channel. A bare `Defer` RHS is never generalized (`should_generalize` wants a lambda RHS), so feeds and reads of one defer share one `ρ`; a defer minted inside a generalized function instantiates fresh per call site.
+The typing rules are `emit_defer`, `emit_feed`, and `emit_define` in `infer/emit.rs`.
+`emit_defer` initially creates a history with fresh domain and value variables. For
+`let d = Defer`, `emit_let` immediately replaces the domain with rigid `ChanDom(d)`.
+A feed contributes `δ ⤇ value_ty` to the handle's channel; its fresh domain variable is
+constrained to that rigid name, not left as an unconstrained `Infer`. A define contributes
+its entire value type. Both statements have type `Unit`.
+
+A structurally opaque target, such as a lambda parameter, receives a feed-handle upper bound.
+The call-site argument meets that bound, and history invariance propagates contributions back
+to the caller's channel. A bare `Defer` RHS is not generalized, so feeds and reads share its
+history. A defer inside a generalized function freshens with the function's instantiation.
+`channelize` later substitutes the assembled channel domain for each `ChanDom`.
 
 `History` is the lattice's only **invariant** constructor. Feeding is a contravariant capability (a feed contributes an element *into* the channel) while reading is covariant, so a feed handle flowing through a function parameter must propagate feed contributions *backwards* to the caller's channel — a one-way `arg <: param` edge would strand the callee's contribution on the parameter variable. Four constraint rules (`constrain_go`), where `Feed(a)`/`Feed(b)` are same-`kind` (`Feed`) histories:
 
@@ -2968,16 +3007,16 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | :--- | :--- | :--- |
 | **`Type::Infer` / `InferVar`** | Algebraic subtyping | An inference unknown. `Type::Infer(Rc<InferVar>)`; the shared `InferVar` carries a stable `uid`, a `level`, and a `RefCell` of lower/upper bounds. The solver works directly on `ccl::Type`, so this *is* the constraint-graph node — there is no separate "SimpleType". |
 | **Position** | Algebraic subtyping | A location within a type expression where another type sits (a function domain/codomain, a record field value). Each position has a polarity determined by its path from the outermost type. |
-| **Polarity** | Algebraic subtyping | Positive or negative. The outermost type is positive; codomains and field values preserve polarity, domains flip it. Variables at positive positions materialize as a union of lower bounds; at negative positions, as an intersection of upper bounds. |
-| **Lower Bound** | Algebraic subtyping | A type `L` recorded on variable `α` such that `L <: α` must hold (a type that "flows into" `α`). At a positive occurrence of `α`, the lower bounds are unioned to form the type at that position. |
-| **Upper Bound** | Algebraic subtyping | A type `U` recorded on variable `α` such that `α <: U` must hold (a type `α` "must flow into"). At a negative occurrence of `α`, the upper bounds are intersected to form the type at that position. |
-| **Level** | Algebraic subtyping | An integer scope depth; larger = more deeply nested. The outer scope is 0; each nested `let` body adds 1. Used to handle let-polymorphism safely. |
+| **Polarity** | Algebraic subtyping | Positive or negative. The outermost type is positive; codomains and field values preserve polarity, domains flip it. Polarity selects the primary bounds for compaction; [Coalescing](#coalescing-from-bounds-to-types) describes the additional opposite-side reads. |
+| **Lower Bound** | Algebraic subtyping | A type `L` recorded on variable `α` such that `L <: α` must hold (a type that "flows into" `α`). Lower bounds supply the primary contributions at positive occurrences. |
+| **Upper Bound** | Algebraic subtyping | A type `U` recorded on variable `α` such that `α <: U` must hold (a type `α` "must flow into"). Upper bounds supply the primary contributions at negative occurrences. |
+| **Level** | Algebraic subtyping | Inference scope depth, starting at 0. Every `let` RHS and `MutDecl` initializer is emitted one level deeper; the surrounding level is restored for the body. Generalization is decided after RHS emission. |
 | **Level mismatch** | Algebraic subtyping | During `constrain` involving a variable `v`, the condition that the other side contains a variable whose level is numerically higher than `v`'s. Triggers extrude. |
 | **Extrude** | Algebraic subtyping | On a level mismatch, the process of copying a type down to a target level by replacing each too-high variable with a fresh proxy at that level (linked back via the polarity-appropriate bound), so the constraint can be recorded without leaking inner-scope variables. |
 | **Scheme (PolyScheme)** | Algebraic subtyping | A generalized type with a cutoff level. Variables whose level is numerically greater than the cutoff are quantified; using the scheme *instantiates* (freshens) them at the current level. |
 | **CompactType** | Algebraic subtyping | A flat, per-position bag of contributions (variables, atoms, an optional record shape, an optional variant shape, an optional function shape, and a refinement set) produced for simplification and co-occurrence analysis. |
 | **`CompactGraph`** | Algebraic subtyping | A top-level `CompactType` plus a side-table of recursive-variable definitions; the intermediate produced by `compact_type` and consumed by `simplify_type` / `coalesce_compact`. |
-| **Coalesce** | Algebraic subtyping | Materializing a `CompactGraph` back into an immutable `ccl::Type`: positive occurrences become a union of lower bounds, negative occurrences an intersection of upper bounds. |
+| **Coalesce** | Algebraic subtyping | Materializing a `CompactGraph` back into a `ccl::Type`. Compaction selects bounds by polarity, with opposite-side shape recovery and negative-position merging as described in [Coalescing](#coalescing-from-bounds-to-types). |
 | **`FieldKey`** | Algebraic subtyping | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
 | **`Variant` (tagged sum)** | Both | The single sum representation: `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `` `tag(…) ``; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). |
 | **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Hole` is normalized to a fresh var, while `Refinement` is kept and rides the lattice as a refinement. |

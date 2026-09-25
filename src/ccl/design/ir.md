@@ -49,7 +49,15 @@ Structural comparison of copied, already-minted terms preserves binder identity.
 lowered α-equivalent terms can have different `uid`s and need not compare equal. Lowering therefore
 uniquifies a comprehension source before copying it into a loop-join predicate. The whole-program
 pass does not mint again at that copied binding site; several copied sites may carry one `uid`.
-The checked invariant is that every binding site is minted, with copies retaining identity.
+No pass may mint fresh uids on an equality-mediated path: copying must preserve the identities
+that refinement deduplication and other structural comparisons use. Within this mint-once,
+copy-preserving representation, structural comparison implements the α-equivalence checks without
+another scope analysis. It does not identify independently minted α-equivalent trees.
+
+At the post-`uniquify` checkpoint, every binding site must be `Name::Unique`, not merely a minted
+name. A surviving `Synthetic` binder there indicates that a pass minted it too early. The check
+does not require globally distinct uids, since copied binding sites retain their original identity
+(`assert_all_binders_minted` in `uniquify.rs`).
 
 `Name::base()` is for display. Scope and identity checks use the variant and its fields, such as
 `is_elem()` for the reserved refinement binder. Dependent function types close references to a
@@ -108,12 +116,14 @@ parameter declaration span from the substitution template. A definition lookup c
 distinguish the use site from the declaration. The test
 `a_substituted_parameter_carries_occurrence_and_declaration_spans` checks both spans.
 
-Replacing each parameter with an inner `let p = __arg_tuple_0.0` would put `p`'s binder inside the
-lambda body. A refinement inferred for the lambda's codomain can refer to a parameter expression,
-but the inner `Let` binder is out of scope in the lambda's own type. Substituting the tuple
-projection keeps that refinement in the tuple binder's scope. This limitation is specific to the
-ordinary tupled form: a multi-parameter function with a `Mut` parameter remains a chain of named
-lambdas, because a mutable write needs a named target (`lower/functions.rs`).
+Replacing each parameter with an inner `let p = __arg_tuple_0.0` would introduce `Let` nodes
+that lambda elimination lifts to function-valued bindings. The resulting `zip(.0, .1)`-shaped
+morphisms need reductions that simplification does not implement. Direct projection substitution
+avoids that unsupported form, as specified by `substitute_params` in `lower/functions.rs`.
+Scope exit is a separate mechanism: inference discharges an ordinary `let` definition into result
+refinements when they leave its scope (see
+[`let` binders and scope exit](type-inference.md#let-binders-and-scope-exit)). A function with a
+`Mut` parameter still uses named curried binders because a mutable write needs a named target.
 
 ### Application shape
 
@@ -135,9 +145,9 @@ comprehension such as `[f(x) for x in xs]` builds an outer lambda over an iterat
 `λ __iter_record → __iter_record ▷ xs ▷ (λ x → f(x))`. The first application reads the
 source at that position; the second maps its element through the body. Multiple generators nest
 those application and lambda pairs, with a product of source domains for the outer parameter. A
-statement loop without the comprehension's index plumbing uses
+feed-only or yield-only statement loop without loop-carried mutation uses
 `xs ≫ (λ x → body)` (`Expr::for_loop`, `lower/loops.rs`). Both forms use existing function
-nodes; neither introduces a dedicated collection-iteration node. `lambda_elim` removes the
+nodes; mutation and transaction loops instead retain a structured `For`. `lambda_elim` removes the
 lambdas and produces point-free combinators; operator conversion builds the dataflow operators. See
 [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) and the
 [operational lowering model](/docs/operational-semantics/lowering.md).
@@ -168,9 +178,12 @@ treating a call annotation as a hidden operand.
 refinements and function kind. The result restricts where the function is used; it does not
 establish that an arbitrary scalar satisfies a new predicate. An `Int` to `{𝑥: Int | 𝑝(𝑥)}`
 conversion is a value-level narrowing and is outside this rule. The current implementation
-honors function-domain refinements, not a general conversion to every supertype. Nested domain
-refinements compose in the rebuilt domain. Planning uses the refinement for `Restrict`, while
-operator conversion discards the `Cast` wrapper after the restriction is planned. See
+honors function-domain refinements, not a general conversion to every supertype. It constructs
+the refined-domain function instead of demanding `value <: target`: the refinement relation does
+not admit `unrefined <: refined`, and a data-function domain is invariant, so function variance
+does not supply that edge either. Nested domain refinements compose in the rebuilt domain.
+Planning uses the refinement for `Restrict`, while operator conversion discards the `Cast` wrapper
+after the restriction is planned. See
 [dependent refinements](type-inference.md#45-dependent-refinements-via-pi-types) and
 [optimization](optimization.md).
 
@@ -208,7 +221,7 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Tuple`, `Record`, `List` | Positional product, named product, and source list construction. Elements may be expressions. |
 | `VariantCtor` | Tag and payload construction, dual to a `Case` pattern. |
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
-| `Compose` | Point-free function composition in application order, introduced by lambda elimination. |
+| `Compose` | Function composition in application order, built by lowering and lambda elimination. |
 | `ExprStmt` | Statement expression followed by its continuation. |
 | `For`, `MutWrite`, `Begin` | Pre-phase loop, mutable write, and transaction-block structure; mutability phases consume them. |
 | `Feed`, `Define`, `Defer` | Deferred-output write, definition, and placeholder; `channelize` resolves them. |
@@ -233,7 +246,8 @@ anonymous `FieldKey::Index` tag in a `Type::Variant` domain and joins their codo
 `xs ++ xs` retains both copies of every row. `TypedExpr::copair` flattens nested value-form
 copairings at construction; a let-bound operand can still contain its own tagged domain. The
 point-free `Builtin::Copair` form may arise when lambda elimination lifts an inside-lambda
-value-form copairing.
+value-form copairing. A `++` over a lambda parameter currently fails at the post-elimination type
+check, so this point-free fed form does not reach operator conversion through that route.
 
 `DisjointJoin` joins partial collections over one domain without adding tags. `lambda_elim`
 introduces it for `Case` fan-outs whose first-match arms partition the fed input. Inference
@@ -245,10 +259,12 @@ rather than inferring it from whether conversion received a fed input.
 
 Without a fed input, operator conversion builds a tagged union for `Copair` and a flat union for
 `DisjointJoin`. With a fed input, it supports the disjoint join and rejects `Copair`: tagged
-demultiplexing and re-tagging of a fed copairing is not implemented. A union-domained generator
-beside another generator can reach this rejection
-(`a_union_generator_beside_a_second_generator` in
-`tests/compilation_pipeline/scalars_collections.rs`).
+demultiplexing and re-tagging of a fed copairing is not implemented. An inline union-domained
+generator beside another generator reaches this rejection. The let-bound spelling reaches runtime
+and fails in union-key lookup instead. The respective tests are
+`an_inline_union_generator_beside_a_second_generator` and
+`a_let_bound_union_generator_beside_a_second_generator` in
+`tests/compilation_pipeline/scalars_collections.rs`.
 
 ### `Transact` — the domain-parameterized recurrence carrier
 
@@ -272,7 +288,8 @@ and [loop planning](mutability.md#loop-planning-plan_loops-letrec-patterns--the-
 ### `LetRec` — causal mutually recursive definition groups
 
 `LetRec { bindings, body }` scopes every binder over every group definition and over `body`.
-`mut_elim` and `transact_phase` turn mutable state into such groups. A history definition reads
+`mut_elim` and `transact_phase` turn mutable state into such groups; `channelize` also constructs
+`Feed`-kind groups for assembled channels. A mutable history definition reads
 strictly earlier positions through `get_prev_seq` or `get_prev_txn`; trailing reads use
 `final_or_default`. Feed outputs can be carried through the group's decision record before
 channelization gathers them. The symbolic form is
@@ -321,10 +338,11 @@ durable forms are:
 
 A data function can carry witness binders in its `FunKind`: for example,
 `Σ (𝐷 : [𝐷₀, 𝐷₁]). 𝐷 ⤇ 𝑉` ranges over two possible collection domains. The witness reference
-is durable through inference and planning; it is not an inference placeholder. Its binder range
-is a `TypeKind`, separate from the `Type::Variant` used for tagged values. The positional
-`Variant` used by `Copair` is thus a data domain, while the Σ records a choice of domain for one
-collection. See [type inference](type-inference.md) for witness subtyping and consumption.
+survives inference and is resolved by planning's realization step; it is not an inference
+placeholder. Its binder range is a `TypeKind`, separate from the `Type::Variant` used for tagged
+values. The positional `Variant` used by `Copair` is thus a data domain, while the Σ records a
+choice of domain for one collection. See [type inference](type-inference.md) for witness subtyping
+and consumption.
 
 ### Transient types and inference slots
 

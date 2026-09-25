@@ -32,13 +32,16 @@ body. Its refinement predicate can therefore refer to function parameters.
 A function with a `Mut(…)` parameter uses named, curried lambdas instead. A mutable write must keep
 the parameter name as its target; a tuple projection cannot be a `MutWrite` target. Calls to these
 functions use successive applications, so inlining can substitute the caller's mutable variable at
-each named binder before lambda elimination. `Mut(…)` and `Feed(…)` parameter annotations stamp
-history types with inferred domains; a transactional `Mut(…, Txn)` parameter fixes its domain to
-`Txn`. Other parameters in the curried chain retain their annotations.
+each named binder before lambda elimination. `Mut(…)` parameter annotations stamp history types
+with inferred domains; a transactional `Mut(…, Txn)` parameter fixes its domain to `Txn`.
+`Feed(…)` parameter annotations are recognized only within this multi-parameter, `Mut`-curried
+chain. Ordinary parameter/type-annotation lowering rejects `Feed(…)` as an unknown type
+application (`tests/programs/fanout/mod.rs`). Other parameters retain their annotations.
 
 The ordinary tuple shape prevents syntactic multi-argument functions from producing a nested
-lambda chain that `lambda_elim` would turn into `curry`. Explicitly nested lambdas and explicit
-`curry` remain separate constructs and are not generally compilable through operator conversion.
+lambda chain that `lambda_elim` would turn into `curry`. Explicitly nested lambdas can still
+produce that internal combinator and are not generally compilable through operator conversion.
+CHL has no built-in surface `curry` function.
 Function and lambda parameters must be nonempty. The parser rejects variadic, keyword-only, and
 default parameters.
 
@@ -82,23 +85,25 @@ A loop that writes an outer mutable variable with `:=` or `+=` retains a structu
 `Feed`, ordinary local bindings become `Let`, and bare effect expressions become `ExprStmt`.
 Lowering does not construct a recurrence or decide whether each `MutWrite` has a mutable type.
 
-`mut_elim` consumes `For` and `MutWrite`. It builds a guarded `LetRec` history for each accumulator,
-supplies read-your-writes behavior, and hoists in-loop feeds into ordinary feeds of the loop
-history. `planning::plan_loops` subsequently turns the recurrence into `Transact`; operator
-conversion realizes an induction-domain transaction with `InductionStore`. See
+`mut_elim` consumes `For` and `MutWrite`. It builds one guarded `LetRec` history per loop, whose
+decision contains a `writes` record keyed by accumulator. It supplies read-your-writes behavior
+and hoists in-loop feeds into ordinary feeds of that history. `planning::plan_loops` subsequently
+turns the recurrence into `Transact`; operator conversion realizes an induction-domain transaction
+with `InductionStore`. See
 [The model: histories and causal recursion](mutability.md#the-model-histories-and-causal-recursion)
 and [mut_elim: eliminating overwrite mutability](mutability.md#mut_elim-eliminating-overwrite-mutability).
 
 A generator with loop-carried mutation uses this `For` path and a synthesized result defer. Each
 `yield` feeds that defer. A conditional in a mutation loop becomes a statement-position `Case`
 whose branches contain statement chains. The merge of a write branch and its carry is constructed
-by `mut_elim`. Nested `for` and `with begin():` blocks inside such a conditional remain unsupported.
+by `mut_elim`. A nested `for` is rejected anywhere in a mutation-loop body. A `with begin():`
+block nested inside such a conditional is also unsupported.
 
 ## Deferred collection operators — `defer` / `<<` / `<<=`
 
 Deferred collection syntax initially produces `Defer`, `Feed`, and `Define` nodes. A defer binding
-accepts any number of feeds or exactly one define; mixing the forms is an error. Feed and define
-expressions have type `Unit`.
+requires at least one feed or exactly one define; no contribution reports `NoFeedOrDefine`, and
+mixing the forms is an error. Feed and define expressions have type `Unit`.
 
 | CHL | Lowered role |
 |---|---|
@@ -184,15 +189,28 @@ combines restrictions on the same domain with
 `DisjointJoin`, as distinguished from `Copair` in
 [ir.md](ir.md#copair-and-disjointjoin--two-collection-combining-operations-not-one).
 
+Pruning against the scrutinee read alone can remove tags still present in the enclosing lambda's
+domain: specialization may narrow the read without narrowing that parameter. The resulting body
+would handle fewer tags than its declared domain. The arm is therefore retained and its payload
+resolved from its uses; see
+[An unobservable arm payload is pinned to what its uses require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require).
+
 ### Scalar match encoding
 
 A scalar `match` in value position compiles to a one-shot driver. Each tagged arm restricts that
-driver through `variant_project(tag)`, evaluates its body on the surviving payload, and joins the
-disjoint outputs. `final_or_default` extracts the resulting scalar. The scrutinee enters each arm
-through `const(𝑠)`; it is not the input to the `iterate` driver, which accepts no input. The
-corresponding scalar guarded `if` uses guard restrictions and first-match complements instead of
+driver through `variant_project(tag)`, evaluates its body on the surviving payload, and combines
+the arms with `Copair`. `final_or_default` extracts the resulting scalar. The scrutinee enters
+each arm through `const(𝑠)`; it is not the input to the `iterate` driver, which accepts no input.
+The corresponding scalar guarded `if` uses guard restrictions and first-match complements instead of
 tag projections. A single tagged arm needs no union. `variant_project` takes its payload extent
 from its own type, which is available even when the scrutinee cannot carry that tag.
+
+This one-shot scalar encoding is called the C-form in `lambda_elim.rs`. Replacing it with
+`𝑠 ▷ (λ __scrut → match __scrut { … })` would require feeding the scrutinee into the planned
+`iterate`, which accepts no upstream input. A single tagged arm avoids `Copair`, but its stream
+is still an iteration site. Without a default, `final_or_default` takes the bare stream and
+reports an invariant violation if that stream is empty; it does not invent a result. With a
+default, it takes `(stream, default)` and returns the default when no tagged arm contributes.
 
 ### The default arm
 
@@ -245,5 +263,10 @@ transactional `Mut(Cents, Txn)` declaration resolve `Cents` before transaction r
 statement is selected. A value block containing only `pass` is rejected. A feed-only `for` body
 with no other statement yields `unit`; a structured loop body or transaction block retains its
 manufactured `unit` terminal. A transaction with no resulting footprint is rejected by its own
-block rule. A trailing `pass` therefore leaves the shape of an otherwise contributing block
-unchanged.
+block rule.
+
+One pre-filter classification is an exception: `for_body_terminal_is_bare_effect` examines the
+loop body's last statement before `pass` removal. In a final-position loop whose body ends in
+`bump(c)` followed by `pass`, that check misses the effect-call path and lowering rejects the
+loop. Removing the trailing `pass` selects the supported path. This is a lowering limitation,
+not intended `pass` semantics.
