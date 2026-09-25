@@ -78,3 +78,12 @@ by design (and `wireValidate.ts` enforces the shape).
 A re-bless pins more than the shape, and every diff in one has to be classified
 before it is committed: see
 [The golden fixtures](../../CLAUDE.md#the-golden-fixtures).
+
+## The probe frame
+
+`probe_frame.json` is one `/api/live` probe frame, built by
+`a_probe_frame_matches_its_golden` in `src/inspector_model/frame.rs` from a
+hand-built probe table rather than dumped from a program. Its `NodeId`s are
+renumbered from 1 in the order the test minted them, and its keys are sorted, so
+it is the same bytes in every process. Re-bless it with
+`CAMBRA_BLESS=1 cargo test a_probe_frame_matches_its_golden`.
