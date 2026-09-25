@@ -109,7 +109,7 @@ x"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::scalar_and_loop_feeds(
 r#"x = defer()
 x << 1
@@ -119,7 +119,7 @@ x"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 // Three feed sites: locks down N-ary union construction beyond N=2.
 #[case::three_feeds(
 r#"x = defer()
@@ -131,7 +131,7 @@ x"#,
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 // Identical feed values still produce distinct variant tags.
 #[case::identical_feeds(
 r#"x = defer()
@@ -141,7 +141,7 @@ x"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::feed_via_alias(
 r#"
 x = defer()
@@ -194,7 +194,7 @@ for i in [1,2,3]:
 y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::multiple_func_feeds(
 r#"
 def f(n):
@@ -211,7 +211,7 @@ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 #[case::union_of_complex_defers(
 r#"
 def f(n):
@@ -235,13 +235,13 @@ y ++ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 
                         ColumnValue::Units(1),
                         ColumnValue::UInts(vec![0, 1, 2]),
                     ]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3]))), Predicate::Union(TagMap::from_positional(vec![
-            Predicate::Union(TagMap::from_positional(vec![
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
                 Predicate::True,
             ])),
-            Predicate::Union(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
                 Predicate::True,
@@ -262,7 +262,7 @@ o"#,
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
 )]
 // Pass-by-reference writer that *feeds before it writes*: `o << c` precedes
 // `c += 1` in the writer body, inlined per iteration. The Feed-headed spliced
@@ -334,7 +334,7 @@ d"#;
                 vec![ColumnValue::UInts(vec![0]), ColumnValue::UInts(vec![1])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 40]))),
-            Predicate::Union(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
             ])),
@@ -370,7 +370,7 @@ o"#;
                 ],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 100, 100]))),
-            Predicate::Union(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
             ])),
