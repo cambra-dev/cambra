@@ -57,6 +57,10 @@ pub struct ProbeWire {
     pub tick: u64,
     pub seq: u64,
     /// Whether newer readings of this probe carried nothing.
+    ///
+    /// A producer under a settling scheduler answers empty many times per row,
+    /// so most probes are stale in most frames. How recent the rows are is this
+    /// probe's `tick` against the frame's.
     pub stale: bool,
     pub total: usize,
     /// `total - rows.len()`.
@@ -169,7 +173,7 @@ fn row_wire(row: &ReadingRow) -> RowWire {
 fn probe_wire(reading: &Reading, stale: bool) -> ProbeWire {
     ProbeWire {
         producer_id: reading.producer_id,
-        producer: reading.producer.clone(),
+        producer: reading.producer.to_string(),
         shape: reading.shape,
         watermark: reading.watermark.clone(),
         note: reading.note,
