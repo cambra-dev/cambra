@@ -255,6 +255,8 @@ fn lower_tx_block_scoped(
             // A type alias binds nothing, so the chain passes through unchanged.
             ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => chain,
             ChlStmt::Assign { target, value } => {
+                #[cfg(any(test, feature = "test-helpers"))]
+                refuse_nested_test_sink(target, value, stmt.span)?;
                 let name = extract_name_target(target, "assignment")?;
                 if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {
                     return Err(LoweringError::unsupported(

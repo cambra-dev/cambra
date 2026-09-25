@@ -118,7 +118,14 @@ let responses = Defer in
 <user body>
 ```
 
-The `DataSink` for responses (`HttpServerSharedState`) is registered in `LoweringContext::sink_bindings` keyed by the `responses` binding name.  After the full pipeline runs, `compile_program` drains the registry via `ctx.lowering_ctx().take_sink_bindings()`, compiles each sink field's expression independently, and subscribes a `SinkConsumer` to it (the registration side is `register_sink_binding`).  The main program output is replaced by a Unit placeholder; sink programs do not produce a primary output value.
+The `DataSink` for responses (`HttpServerSharedState`) is registered in
+`LoweringContext::sink_bindings` keyed by the `responses` binding name. After the full pipeline
+runs, `compile_program` drains the registry via `ctx.lowering_ctx().take_sink_bindings()`, compiles
+each sink field's expression independently, and subscribes a `SinkConsumer` to it (the
+registration side is `register_sink_binding`). `out = test_sink()`, built only for tests,
+registers its binding the same way, with the `TestSink` a test supplied through
+`GlobalContext::register_test_sink`. The main program output is replaced by a Unit placeholder;
+sink programs do not produce a primary output value.
 
 `x << expr` in expression or statement position lowers to `Feed { name: "x", value: expr }`, wrapped in an `ExprStmt` when it appears as a non-final statement. `x <<= expr` lowers to `Define { name: "x", value: expr }`, also wrapped in an `ExprStmt`. The `ExprStmt { expr, body }` node chains a side-effecting statement before the rest of the block:
 ```
