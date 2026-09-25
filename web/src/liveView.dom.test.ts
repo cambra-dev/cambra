@@ -26,7 +26,7 @@ function frame(overrides: Partial<LiveFrame> = {}): LiveFrame {
     nodes: [
       {
         nodeId: 202,
-        producers: [
+        probes: [
           {
             producerId: 1,
             producer: "MapResultWithSource#1",
@@ -103,9 +103,9 @@ describe("the values pane", () => {
         nodes: [
           {
             nodeId: 202,
-            producers: [
+            probes: [
               {
-                ...frame().nodes[0]!.producers[0]!,
+                ...frame().nodes[0]!.probes[0]!,
                 tick: 4,
                 total: 2,
                 dropped: 0,

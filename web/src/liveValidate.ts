@@ -12,7 +12,7 @@
 // not reproducible. This validator plus the Rust side's own frame tests are
 // what hold the contract, and they are extended together.
 
-import type { LiveFrame, LiveNode, LiveProducer, LiveRow, LiveSource } from "./types";
+import type { LiveFrame, LiveNode, LiveProbe, LiveRow, LiveSource } from "./types";
 
 class LiveWireError extends Error {
   constructor(path: string, expected: string, got: unknown) {
@@ -92,7 +92,7 @@ function validateRows(v: unknown, path: string, total: number, dropped: number):
   return rows;
 }
 
-function validateProducer(v: unknown, path: string): LiveProducer {
+function validateProbe(v: unknown, path: string): LiveProbe {
   const o = obj(v, path);
   const total = num(o["total"], `${path}.total`);
   const dropped = num(o["dropped"], `${path}.dropped`);
@@ -113,16 +113,16 @@ function validateProducer(v: unknown, path: string): LiveProducer {
 
 function validateNode(v: unknown, path: string): LiveNode {
   const o = obj(v, path);
-  const producers = arr(o["producers"], `${path}.producers`).map((p, i) =>
-    validateProducer(p, `${path}.producers[${i}]`),
+  const probes = arr(o["probes"], `${path}.probes`).map((p, i) =>
+    validateProbe(p, `${path}.probes[${i}]`),
   );
   // One operator can build several producers, and the pane keys on the pair, so
   // a repeated id would silently collapse two of them into one row.
-  const ids = new Set(producers.map((p) => p.producerId));
-  if (ids.size !== producers.length) {
-    throw new LiveWireError(`${path}.producers`, "distinct producerIds", producers.length);
+  const ids = new Set(probes.map((p) => p.producerId));
+  if (ids.size !== probes.length) {
+    throw new LiveWireError(`${path}.probes`, "distinct producerIds", probes.length);
   }
-  return { nodeId: num(o["nodeId"], `${path}.nodeId`), producers };
+  return { nodeId: num(o["nodeId"], `${path}.nodeId`), probes };
 }
 
 function validateSource(v: unknown, path: string): LiveSource {
