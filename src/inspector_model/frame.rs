@@ -12,14 +12,16 @@
 use std::collections::BTreeMap;
 
 use crate::ccl::provenance::NodeId;
-use crate::interpreter::value_probe::{Reading, ReadingRow, SharedProbeTable, SourceWindow};
+use crate::interpreter::value_probe::{ProbeTable, Reading, ReadingRow, SourceWindow};
 
 /// What `/api/live` sends: the whole probe state, published after a pull that
 /// carried rows.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct ProbeFrame {
-    /// The driver tick the frame was published on.
-    pub tick: u64,
+///
+/// Borrows from the [`ProbeTable`] and the source windows it renders: a frame
+/// is built to be serialized at once, so copying every rendered string out of
+/// the table first would buy nothing.
+#[derive(Debug, serde::Serialize)]
+pub struct ProbeFrame<'a> {
     /// Frames published before and including this one, so a client that
     /// reconnects or misses a wake can tell it is behind. A reading's own `seq`
     /// is the finer signal, for a gap within one probe's readings.
@@ -30,85 +32,85 @@ pub struct ProbeFrame {
     #[serde(rename = "final")]
     pub final_frame: bool,
     /// Every node with a probe that has carried rows, in ascending `NodeId`.
-    pub nodes: Vec<ProbedNode>,
+    pub nodes: Vec<ProbedNode<'a>>,
     /// Every source with a window. A source ships beside the operators rather
     /// than among them: it has no producer and takes no `get`.
-    pub sources: Vec<SourceWindowWire>,
+    pub sources: Vec<SourceWindowWire<'a>>,
 }
 
 /// One operator's probes.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProbedNode {
+pub struct ProbedNode<'a> {
     pub node_id: NodeId,
     /// In ascending `producer_id`.
-    pub probes: Vec<ProbeWire>,
+    pub probes: Vec<ProbeWire<'a>>,
 }
 
 /// One probe's last row-carrying reading.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProbeWire {
+pub struct ProbeWire<'a> {
     pub producer_id: usize,
-    pub producer: String,
+    pub producer: &'a str,
     pub shape: &'static str,
-    pub watermark: Option<String>,
+    pub completeness: Option<&'a str>,
+    pub obsolete: Option<&'a str>,
     pub note: Option<&'static str>,
-    pub tick: u64,
+    /// The reading's position in the probe table's total order. A client that
+    /// sees the same `seq` in two frames is looking at the same rows, which is
+    /// how it measures how long a probe has gone without new ones.
     pub seq: u64,
     /// Whether newer readings of this probe carried nothing.
     ///
     /// A producer under a settling scheduler answers empty many times per row,
-    /// so most probes are stale in most frames. How recent the rows are is this
-    /// probe's `tick` against the frame's.
+    /// so most probes are stale in most frames.
     pub stale: bool,
     pub total: usize,
     /// `total - rows.len()`.
     pub dropped: usize,
-    pub rows: Vec<RowWire>,
+    pub rows: Vec<RowWire<'a>>,
 }
 
 /// One rendered row.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct RowWire {
-    pub key: Option<String>,
-    pub value: String,
+#[derive(Debug, serde::Serialize)]
+pub struct RowWire<'a> {
+    pub key: Option<&'a str>,
+    pub value: &'a str,
     pub deleted: bool,
 }
 
 /// A source's retained window.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SourceWindowWire {
+pub struct SourceWindowWire<'a> {
     /// The `IterateExtent`s over the source's domain. A source is not a graph
     /// node, so these are where a click on its window resolves.
-    pub node_ids: Vec<NodeId>,
-    pub name: String,
+    pub node_ids: &'a [NodeId],
+    pub name: &'a str,
     pub total: usize,
     /// `total - rows.len()`.
     pub dropped: usize,
-    pub rows: Vec<RowWire>,
+    pub rows: Vec<RowWire<'a>>,
 }
 
 /// Build the probe frame for the probe table's current state.
 ///
 /// Each probe contributes its last flow rather than its newest reading. A
-/// producer pulled twice in one tick answers the second call empty, and
+/// producer pulled twice in one pass answers the second call empty, and
 /// another answers with the same tile twice, so the newest reading is the
 /// wrong one to send and merging the two double-counts. See
 /// [`ProbeTable::last_flow`](crate::interpreter::value_probe::ProbeTable::last_flow).
-pub fn probe_frame(
-    probes: &SharedProbeTable,
-    sources: &[SourceWindow],
-    tick: u64,
+pub fn probe_frame<'a>(
+    probes: &'a ProbeTable,
+    sources: &'a [SourceWindow],
     published: u64,
     final_frame: bool,
-) -> ProbeFrame {
-    let probes = probes.borrow();
+) -> ProbeFrame<'a> {
     // Ordered by `NodeId`, which is both stable and meaningful: an operator's id
     // is minted when it is constructed, and construction is bottom-up, so a
     // smaller id sits further upstream.
-    let mut by_node: BTreeMap<NodeId, Vec<ProbeWire>> = BTreeMap::new();
+    let mut by_node: BTreeMap<NodeId, Vec<ProbeWire<'a>>> = BTreeMap::new();
     for (node_id, producer_id) in probes.probe_keys() {
         let Some(node) = node_id else { continue };
         let Some((reading, stale)) = probes.last_flow(node_id, producer_id) else {
@@ -123,7 +125,7 @@ pub fn probe_frame(
         .into_iter()
         .map(|(node_id, mut node_probes)| {
             // A node's probes are keyed by the producer's allocation counter, so
-            // ordering by it is stable across ticks; a `HashMap` iteration is not.
+            // ordering by it is stable across frames; a `HashMap` iteration is not.
             node_probes.sort_by_key(|probe| probe.producer_id);
             ProbedNode {
                 node_id,
@@ -134,15 +136,14 @@ pub fn probe_frame(
     let sources = sources
         .iter()
         .map(|window| SourceWindowWire {
-            node_ids: window.node_ids.clone(),
-            name: window.name.clone(),
+            node_ids: &window.node_ids,
+            name: &window.name,
             total: window.total,
             dropped: window.dropped(),
             rows: window.rows.iter().map(row_wire).collect(),
         })
         .collect();
     ProbeFrame {
-        tick,
         published,
         final_frame,
         nodes,
@@ -152,32 +153,31 @@ pub fn probe_frame(
 
 /// [`probe_frame`], serialized: the text a publish sends.
 pub fn render_probe_frame(
-    probes: &SharedProbeTable,
+    probes: &ProbeTable,
     sources: &[SourceWindow],
-    tick: u64,
     published: u64,
     final_frame: bool,
 ) -> String {
-    serde_json::to_string(&probe_frame(probes, sources, tick, published, final_frame))
+    serde_json::to_string(&probe_frame(probes, sources, published, final_frame))
         .expect("a probe frame holds only strings, numbers and booleans")
 }
 
-fn row_wire(row: &ReadingRow) -> RowWire {
+fn row_wire(row: &ReadingRow) -> RowWire<'_> {
     RowWire {
-        key: row.key.clone(),
-        value: row.value.clone(),
+        key: row.key.as_deref(),
+        value: &row.value,
         deleted: row.deleted,
     }
 }
 
-fn probe_wire(reading: &Reading, stale: bool) -> ProbeWire {
+fn probe_wire(reading: &Reading, stale: bool) -> ProbeWire<'_> {
     ProbeWire {
         producer_id: reading.producer_id,
-        producer: reading.producer.to_string(),
+        producer: &reading.producer,
         shape: reading.shape,
-        watermark: reading.watermark.clone(),
+        completeness: reading.completeness.as_deref(),
+        obsolete: reading.obsolete.as_deref(),
         note: reading.note,
-        tick: reading.tick,
         seq: reading.seq,
         stale,
         total: reading.total,
@@ -188,7 +188,7 @@ fn probe_wire(reading: &Reading, stale: bool) -> ProbeWire {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::HashMap, rc::Rc};
+    use std::collections::HashMap;
 
     use bit_set::BitSet;
     use serde_json::Value;
@@ -197,9 +197,18 @@ mod tests {
     use crate::inspector_server::wire_check::assert_probe_frame_shape;
     use crate::interpreter::{
         ColumnValue, Value as CellValue,
-        tiling::{Predicate, Tile},
+        tiling::{FunctionGuard, Predicate, Tile, TileGuard},
         value_probe::{ProbeTable, ROWS_PER_READING, render_source_window},
     };
+
+    /// The obsolete guard of a collection producer whose consumer has released
+    /// the keys up to `through`, or nothing.
+    fn released(through: Option<usize>) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(match through {
+            Some(key) => Predicate::LessThanEq(CellValue::UInt(key)),
+            None => Predicate::False,
+        }))
+    }
 
     /// The committed frame, shared with the frontend's tests once a reader of
     /// `/api/live` exists there.
@@ -245,24 +254,36 @@ mod tests {
     #[test]
     fn a_probe_frame_matches_its_golden() {
         let ids: Vec<NodeId> = (0..4).map(|_| NodeId::fresh()).collect();
-        let probes = Rc::new(RefCell::new(ProbeTable::with_defaults()));
+        let mut table = ProbeTable::with_defaults();
         {
-            let mut table = probes.borrow_mut();
-            table.set_tick(3);
             table.observe(
                 Some(ids[0]),
                 1,
                 "IterateExtent#1",
                 &collection(&["a", "b"], &[]),
+                &released(None),
             );
-            table.observe(Some(ids[0]), 1, "IterateExtent#1", &collection(&[], &[]));
+            table.observe(
+                Some(ids[0]),
+                1,
+                "IterateExtent#1",
+                &collection(&[], &[]),
+                &released(Some(1)),
+            );
             table.observe(
                 Some(ids[1]),
                 1,
                 "Restrict#1",
                 &collection(&["a", "skip"], &[1]),
+                &released(None),
             );
-            table.observe(Some(ids[1]), 2, "Restrict#2", &collection(&["b"], &[]));
+            table.observe(
+                Some(ids[1]),
+                2,
+                "Restrict#2",
+                &collection(&["b"], &[]),
+                &released(Some(0)),
+            );
             let mut fields = HashMap::new();
             fields.insert("text".to_string(), Tile::Scalar(strings(&["a"])));
             fields.insert("tagged".to_string(), Tile::Scalar(strings(&["> a"])));
@@ -276,8 +297,8 @@ mod tests {
                     Predicate::True,
                     BitSet::new(),
                 ),
+                &released(None),
             );
-            table.set_tick(4);
             table.observe(
                 Some(ids[3]),
                 1,
@@ -289,20 +310,27 @@ mod tests {
                     terminal: true,
                     closed_keys: Vec::new(),
                 },
+                &released(None),
             );
             let long: Vec<String> = (0..ROWS_PER_READING + 2).map(|i| format!("v{i}")).collect();
             let long: Vec<&str> = long.iter().map(String::as_str).collect();
-            table.observe(Some(ids[3]), 2, "MapResult#1", &collection(&long, &[]));
+            table.observe(
+                Some(ids[3]),
+                2,
+                "MapResult#1",
+                &collection(&long, &[]),
+                &released(None),
+            );
         }
         let window = render_source_window(
             vec![ids[0]],
             "stdin",
+            1,
             &ColumnValue::UInts(vec![1]),
             &strings(&["b"]),
-            ROWS_PER_READING,
         );
 
-        let mut frame = serde_json::to_value(probe_frame(&probes, &[window], 4, 2, false))
+        let mut frame = serde_json::to_value(probe_frame(&table, &[window], 2, false))
             .expect("a probe frame serializes");
         assert_probe_frame_shape(&frame);
         let minted: HashMap<u64, u64> = ids

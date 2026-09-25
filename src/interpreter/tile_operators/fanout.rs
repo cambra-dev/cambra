@@ -605,7 +605,7 @@ impl TileOperator for FanOutBranch {
             // component separates them, not the second. Subscribing one branch
             // twice would land both producers in one slot; nothing does, and
             // `FanOut::branch` mints a fresh branch per call.
-            base: ProducerBase::new(shared_rc.borrow().id, self.tiling()),
+            base: ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, scheduler),
             // The producer a subscription hands out holds the fan-out the same
             // way this branch does: a recurrence's producer must not own it
             // either.
@@ -826,6 +826,8 @@ impl TileOperator for Memo {
             base: ProducerBase::listening(
                 MemoProducer::alloc_id(),
                 self.tiling(),
+                &self.base,
+                scheduler,
                 notified.clone(),
             ),
             input: self
@@ -1083,7 +1085,7 @@ mod tests {
         ) -> Box<dyn TileProducer> {
             *self.consumer.borrow_mut() = Some(consumer);
             Box::new(ScriptedProducer {
-                base: ProducerBase::new(ScriptedProducer::alloc_id(), self.tiling()),
+                base: ProducerBase::unowned(ScriptedProducer::alloc_id(), self.tiling()),
                 tiles: self.tiles.clone(),
                 pulls: self.pulls.clone(),
             })
@@ -1206,7 +1208,7 @@ mod tests {
         let (upstream, _released) =
             QuietSpy::new(Tile::Scalar(ColumnValue::Ints(vec![-5])), tiling.clone());
         let mut memo = MemoProducer {
-            base: ProducerBase::new(MemoProducer::alloc_id(), &tiling),
+            base: ProducerBase::unowned(MemoProducer::alloc_id(), &tiling),
             input: Box::new(upstream),
             cached_tile: tiling.empty_tile(),
             upstream_drained: false,

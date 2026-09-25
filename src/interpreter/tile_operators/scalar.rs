@@ -118,11 +118,16 @@ impl TileOperator for Constant {
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,
-        _scheduler: &mut Scheduler,
+        scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         consumer.notify();
         Box::new(ConstantProducer {
-            base: ProducerBase::new(ConstantProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ConstantProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             tile: self.tile.clone(),
             released: false,
         })
@@ -229,7 +234,12 @@ impl TileOperator for ToScalar {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(ToScalarProducer {
-            base: ProducerBase::new(ToScalarProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ToScalarProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
         })
     }
@@ -340,7 +350,12 @@ impl TileOperator for VariantWrap {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantWrapProducer {
-            base: ProducerBase::new(VariantWrapProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                VariantWrapProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input,
             tag: self.tag.clone(),
             variant_extents: self.variant_extents.clone(),
@@ -535,7 +550,12 @@ impl TileOperator for VariantProject {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantProjectProducer {
-            base: ProducerBase::new(VariantProjectProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                VariantProjectProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input,
             tag: self.tag.clone(),
             payload_extent: self.payload_extent.clone(),
@@ -741,7 +761,12 @@ impl TileOperator for VariantIs {
     ) -> Box<dyn TileProducer> {
         let input = self.input.subscribe(intent_guard, consumer, scheduler);
         Box::new(VariantIsProducer {
-            base: ProducerBase::new(VariantIsProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(
+                VariantIsProducer::alloc_id(),
+                &self.base.tiling,
+                &self.base,
+                scheduler,
+            ),
             input,
             tag: self.tag.clone(),
         })
@@ -1195,7 +1220,7 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let mut producer = VariantProjectProducer {
-            base: ProducerBase::new(VariantProjectProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(VariantProjectProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
             tag: FieldKey::Index(0),
             payload_extent: Extent::Base(BaseType::Int),
@@ -1242,7 +1267,7 @@ mod tests {
             )]))),
         );
         let mut producer = VariantWrapProducer {
-            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(VariantWrapProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
             tag: commit.clone(),
             variant_extents: TagMap::from_arms(vec![(commit, Extent::Base(BaseType::Int))]),

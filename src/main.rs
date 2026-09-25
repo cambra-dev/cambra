@@ -1,16 +1,19 @@
-use std::{cell::RefCell, rc::Rc, thread, time::Duration};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, thread, time::Duration};
 
 use cambra::{
-    ccl::context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
+    ccl::{
+        context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
+        provenance::NodeId,
+    },
     control_port::{ControlPort, ControlReply, ControlRequest},
-    inspector_server::serve_compiled,
+    inspector_server::{live::LiveChannel, serve_compiled},
     interpreter::{
-        Consumer, Scheduler,
+        ColumnValue, Consumer, Scheduler,
         operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard},
         value_probe::{
-            self, ProbeTable, ROWS_PER_READING, SharedProbeTable, SourceWindow,
-            render_source_window,
+            ProbeSlot, ProbeTable, ROWS_PER_READING, SourceWindow, render_source_window,
+            window_tail,
         },
     },
     live_program::{LiveProgram, render_unreadable},
@@ -28,7 +31,6 @@ fn poll_control(
     live: &mut LiveProgram,
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
     new_data: &Rc<RefCell<bool>>,
-    probe_table: Option<&SharedProbeTable>,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
@@ -42,16 +44,9 @@ fn poll_control(
             Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
         },
         ControlRequest::Reload { code } => {
-            // A reload rebuilds the operators it could not keep, and a producer
-            // attaches its probe when it is built, so the replacement is probed
-            // only under a session, exactly as the first compile is.
-            // `diff_against` is left out: it compiles a version to compare and
-            // throws it away.
-            let reloaded = {
-                let _probing = probe_table.cloned().map(value_probe::attach_probes);
-                live.reload(ctx, code, main_consumer)
-            };
-            match reloaded {
+            // A rebuilt operator's producer takes the scheduler's probe slot
+            // when it is built, as the first compile's did.
+            match live.reload(ctx, code, main_consumer) {
                 Ok(report) => {
                     // The new graph has subscribed but nothing has pulled it, so arm
                     // the driver for one pass.
@@ -92,20 +87,12 @@ fn run_program(
         })
     };
 
-    // The probe session spans the whole subscribe, which happens inside
-    // `compile_program`: a producer attaches its probe when its `ProducerBase` is
-    // built, and there is no traversal of the live graph to attach one later.
-    let probe_table = inspect_port.map(|_| Rc::new(RefCell::new(ProbeTable::with_defaults())));
-
     let mut ctx = GlobalContext::default();
-    let mut live = {
-        let _probing = probe_table.clone().map(value_probe::attach_probes);
-        match LiveProgram::start(&mut ctx, code, &main_consumer) {
-            Ok(p) => p,
-            Err(errs) => {
-                eprint_errors(&errs, src_name, code);
-                return Err(());
-            }
+    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
+        Ok(p) => p,
+        Err(errs) => {
+            eprint_errors(&errs, src_name, code);
+            return Err(());
         }
     };
 
@@ -113,9 +100,13 @@ fn run_program(
     // click in a pane names a node the running graph actually built. A reload
     // replaces neither the panes nor `source_node_ids` below: see
     // `src/inspector_model/design.md`, "A reload is not followed".
-    let probe_channel = match inspect_port {
+    let mut inspection = match inspect_port {
         Some(port) => match serve_compiled(live.program(), src_name, port) {
-            Ok(channel) => Some(channel),
+            Ok(channel) => Some(Inspection::new(
+                channel,
+                ctx.scheduler().probes().clone(),
+                source_nodes(&live.program().operator_graph),
+            )),
             Err(e) => {
                 eprintln!("error: serving the inspector: {e}");
                 return Err(());
@@ -132,70 +123,6 @@ fn run_program(
         }
     };
 
-    // Probe publishing happens only when some probe took a reading that carried
-    // rows. The sink loop below polls on a 10ms timer, and a poll that delivers
-    // nothing still takes an empty reading from every producer it pulls. Gating
-    // on every reading would broadcast an unchanged frame a hundred times a
-    // second, make `tick` count timer ticks rather than data, and pair each of
-    // those frames with a window sampled on a tick that carried nothing. Returns
-    // whether it published, so the caller advances `tick` only over a tick that
-    // carried something.
-    let probes_published_through = std::cell::Cell::new(0u64);
-    let publish_probes = |tick: u64, sources: &[SourceWindow]| -> bool {
-        let (Some(channel), Some(probes)) = (probe_channel.as_ref(), probe_table.as_ref()) else {
-            return false;
-        };
-        let flows = probes.borrow().flows();
-        if flows == probes_published_through.get() {
-            return false;
-        }
-        probes_published_through.set(flows);
-        channel.publish_probes(probes, sources, tick);
-        true
-    };
-
-    // The last probe frame, marked `final`, so a reader can tell a finished run
-    // from an idle one. The process parks afterwards, so the socket stays open.
-    let publish_final_probes = |tick: u64, sources: &[SourceWindow]| {
-        if let (Some(channel), Some(probes)) = (probe_channel.as_ref(), probe_table.as_ref()) {
-            channel.publish_final_probes(probes, sources, tick);
-        }
-    };
-
-    // A source's retained window, read on the thread that owns the graph: the
-    // handles are `Rc`, and `retained_keys`/`get` are `&self`, so sampling
-    // releases nothing. Sampled before the release below, so a window still
-    // shows what the tick delivered.
-    //
-    // The scheduler's handles are the sources the program *reads*: a handle is
-    // registered when an `IterateExtent` over the source is subscribed. Every
-    // context registers `stdin` whether or not the program mentions it, so
-    // iterating the context's sources instead would report a window for a
-    // source that is not part of the program.
-    let source_node_ids = source_nodes(&live.program().operator_graph);
-    let sample_sources = |scheduler: &Scheduler| -> Vec<SourceWindow> {
-        if probe_channel.is_none() {
-            return Vec::new();
-        }
-        scheduler
-            .sources()
-            .filter_map(|(name, handle)| {
-                let source = handle.borrow();
-                let keys = source.retained_keys()?;
-                let values = source.get(keys.clone());
-                Some(render_source_window(
-                    source_node_ids.get(name).cloned().unwrap_or_default(),
-                    name,
-                    &keys,
-                    &values,
-                    ROWS_PER_READING,
-                ))
-            })
-            .collect()
-    };
-
-    let mut tick = 0u64;
-
     // Drive the `main` output (if any) until it signals a universal release.
     // For sink-only programs this loop is skipped entirely.
     while live.has_main() {
@@ -209,7 +136,6 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
-                probe_table.as_ref(),
             );
             if *new_data.borrow() {
                 break;
@@ -218,23 +144,23 @@ fn run_program(
         }
         *new_data.borrow_mut() = false;
 
-        // Re-read the producer each pass: a reload between ticks replaces it.
+        // Re-read the producer each pass: a reload between pulls replaces it.
         let Some(producer) = live.main_producer_mut() else {
             break;
         };
         debug!("Main calling get");
-        if let Some(probes) = probe_table.as_ref() {
-            probes.borrow_mut().set_tick(tick);
-        }
         // Sampled before the pull, not after. A `Memo` releases its input from
         // inside `get_impl`, so the release cascade reaches the source buffer
         // partway through the driver's own `get` — sampling afterwards reads a
-        // buffer the pull already drained. Before it, the tick's arrivals are
+        // buffer the pull already drained. Before it, the pass's arrivals are
         // present and nothing has taken delivery.
-        let sources = sample_sources(ctx.scheduler());
+        let sources = match inspection.as_mut() {
+            Some(inspection) => inspection.before_pull(ctx.scheduler()),
+            None => Vec::new(),
+        };
         let tile = producer.get(producer.tiling().universal_guard());
-        if publish_probes(tick, &sources) {
-            tick += 1;
+        if let Some(inspection) = inspection.as_mut() {
+            inspection.publish(&sources);
         }
 
         let release_guard = release_guard_for(&tile);
@@ -256,19 +182,19 @@ fn run_program(
     // loop runs until the process exits.
     if live.program().sinks().next().is_some() {
         loop {
-            if let Some(probes) = probe_table.as_ref() {
-                probes.borrow_mut().set_tick(tick);
-            }
             // Sampled between the poll and the delivery. The poll takes this
             // pass's arrivals into the source buffers; the delivery is where a
             // sink pulls them and a `Memo` releases its input from inside
             // `get_impl`. A window read before the poll misses the arrivals,
             // and one read after the delivery reports what the pass consumed.
             let delivery = ctx.scheduler().poll_sources();
-            let sources = sample_sources(ctx.scheduler());
+            let sources = match inspection.as_mut() {
+                Some(inspection) => inspection.before_pull(ctx.scheduler()),
+                None => Vec::new(),
+            };
             ctx.scheduler().deliver(delivery);
-            if publish_probes(tick, &sources) {
-                tick += 1;
+            if let Some(inspection) = inspection.as_mut() {
+                inspection.publish(&sources);
             }
             poll_control(
                 control.as_ref(),
@@ -276,7 +202,6 @@ fn run_program(
                 &mut live,
                 &main_consumer,
                 &new_data,
-                probe_table.as_ref(),
             );
             if live.done().try_recv().is_ok() {
                 break;
@@ -287,7 +212,9 @@ fn run_program(
         }
     }
 
-    publish_final_probes(tick, &sample_sources(ctx.scheduler()));
+    if let Some(inspection) = inspection.as_ref() {
+        inspection.publish_final(ctx.scheduler());
+    }
     Ok(())
 }
 
@@ -319,6 +246,127 @@ fn tile_is_empty(tile: &Tile) -> bool {
         Tile::DataFunction { domain, .. } => domain.is_empty(),
         Tile::Record(fields) => fields.values().all(tile_is_empty),
         _ => false,
+    }
+}
+
+/// The `--inspect` side of a run: the channel frames go out on, and the probe
+/// slot a connected client switches on.
+///
+/// Probing is all or nothing, and follows `/api/live`: every producer takes
+/// readings while at least one client is connected, and none while no client
+/// is. See `src/inspector_model/design.md`, "Probing follows the live route".
+struct Inspection {
+    channel: LiveChannel,
+    probes: ProbeSlot,
+    /// The `IterateExtent`s over each source, which is where a click on its
+    /// window resolves. A reload does not update these: see
+    /// `src/inspector_model/design.md`, "A reload is not followed".
+    source_node_ids: HashMap<String, Vec<NodeId>>,
+    /// [`ProbeTable::flows`] at the last publish. Zero again whenever probing
+    /// switches, because each switch starts a fresh table or none.
+    published_through: u64,
+}
+
+impl Inspection {
+    fn new(
+        channel: LiveChannel,
+        probes: ProbeSlot,
+        source_node_ids: HashMap<String, Vec<NodeId>>,
+    ) -> Self {
+        Self {
+            channel,
+            probes,
+            source_node_ids,
+            published_through: 0,
+        }
+    }
+
+    /// Switch probing to match whether a client is connected, and sample the
+    /// source windows while probing is on.
+    ///
+    /// Called before each pull, so a switch never lands inside a `get`.
+    fn before_pull(&mut self, scheduler: &Scheduler) -> Vec<SourceWindow> {
+        let watched = self.channel.is_watched();
+        if watched != self.probes.is_enabled() {
+            if watched {
+                self.probes.enable();
+            } else {
+                self.probes.disable();
+                self.channel.forget_frame();
+            }
+            self.published_through = 0;
+        }
+        if !watched {
+            return Vec::new();
+        }
+        self.sample_sources(scheduler)
+    }
+
+    /// Publish a frame if some probe took a reading that carried rows since the
+    /// last publish.
+    ///
+    /// The sink loop polls on a 10ms timer, and a poll that delivers nothing
+    /// still takes an empty reading from every producer it pulls. Gating on
+    /// every reading would broadcast an unchanged frame a hundred times a
+    /// second, each paired with a window sampled on a pass that carried
+    /// nothing.
+    fn publish(&mut self, sources: &[SourceWindow]) {
+        let flows = self.probes.with_table(ProbeTable::flows);
+        let Some(flows) = flows.filter(|&flows| flows != self.published_through) else {
+            return;
+        };
+        self.published_through = flows;
+        self.probes
+            .with_table(|table| self.channel.publish_probes(table, sources));
+    }
+
+    /// The last probe frame, marked `final`, so a reader can tell a finished
+    /// run from an idle one. Published whether or not a client is connected: a
+    /// client connecting later is handed it, and with probing off it carries
+    /// the source windows and no readings. The process parks afterwards, so
+    /// the socket stays open.
+    fn publish_final(&self, scheduler: &Scheduler) {
+        let sources = self.sample_sources(scheduler);
+        let published = self
+            .probes
+            .with_table(|table| self.channel.publish_final_probes(table, &sources));
+        if published.is_none() {
+            self.channel
+                .publish_final_probes(&ProbeTable::with_defaults(), &sources);
+        }
+    }
+
+    /// The last [`ROWS_PER_READING`] keys of each source's retained window,
+    /// read on the thread that owns the graph: the handles are `Rc`, and
+    /// `retained_window`/`get` are `&self`, so sampling releases nothing.
+    ///
+    /// Only the tail is fetched, so a pass costs the same however much a source
+    /// retains: a program accumulating every stdin line keeps its whole input.
+    ///
+    /// The scheduler's handles are the sources the program reads: a handle is
+    /// registered when an `IterateExtent` over the source is subscribed. Every
+    /// context registers `stdin` whether or not the program mentions it, so
+    /// iterating the context's sources instead would report a window for a
+    /// source that is not part of the program.
+    fn sample_sources(&self, scheduler: &Scheduler) -> Vec<SourceWindow> {
+        scheduler
+            .sources()
+            .filter_map(|(name, handle)| {
+                let source = handle.borrow();
+                let window = source.retained_window()?;
+                let keys = ColumnValue::from_uints(
+                    window_tail(window.clone(), ROWS_PER_READING).collect(),
+                );
+                let values = source.get(keys.clone());
+                Some(render_source_window(
+                    self.source_node_ids.get(name).cloned().unwrap_or_default(),
+                    name,
+                    window.len(),
+                    &keys,
+                    &values,
+                ))
+            })
+            .collect()
     }
 }
 

@@ -89,9 +89,18 @@ gracefully to source + diagnostics on a compile failure), `GET /api/diagnostics`
 and `GET /api/live` (a websocket carrying a run's recorded values).
 
 `--inspect-only` compiles the program and does not run it, so `/api/live`
-completes its handshake and carries nothing. `--inspect` runs the program and
-publishes a probe frame to that route after each pull that carried rows. The two
-are exclusive, and both serve the same panes.
+completes its handshake and carries nothing. `--inspect` runs the program, and
+while at least one client holds `/api/live` open it records the values each
+operator returns and publishes a probe frame after each pull that carried rows.
+With no client connected nothing is recorded, and a run costs what it does
+without `--inspect`
+([design.md](../src/inspector_model/design.md#probing-follows-the-live-route)).
+The two modes are exclusive, and both serve the same panes.
+
+A probe frame's shape is defined by `ProbeFrame` in
+[`frame.rs`](../src/inspector_model/frame.rs), and pinned by
+`wire_check::assert_probe_frame_shape` and the fixture
+[`probe_frame.json`](../web/src/__fixtures__/probe_frame.json).
 
 With `--control` as well, the panes keep showing the version the run started
 with after a `/reload`. Probe frames for operators the reload rebuilt name nodes

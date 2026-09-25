@@ -143,7 +143,12 @@ impl TileOperator for MapResult {
             scheduler,
         );
         Box::new(MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapResultProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             function: function_producer,
         })
@@ -564,7 +569,12 @@ impl TileOperator for MapResultToConst {
             scheduler,
         );
         Box::new(MapResultToConstProducer {
-            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapResultToConstProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -735,11 +745,18 @@ impl TileOperator for MapResultWithSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(MapResultWithSourceProducer::new(
+        let input =
             self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        Box::new(MapResultWithSourceProducer::new(
+            ProducerBase::new(
+                MapResultWithSourceProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
+            input,
             self.source.clone(),
-            self.tiling().clone(),
             self.input
                 .result_correlation()
                 .expect("MapResultWithSource requires input result_correlation"),
@@ -761,13 +778,13 @@ struct MapResultWithSourceProducer {
 
 impl MapResultWithSourceProducer {
     fn new(
+        base: ProducerBase,
         input: Box<dyn TileProducer>,
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-        tiling: Tiling,
         result_correlation: Vec<TilePathStep>,
     ) -> Self {
         let result = Self {
-            base: ProducerBase::new(MapResultWithSourceProducer::alloc_id(), &tiling),
+            base,
             input,
             source,
             result_correlation,
@@ -885,7 +902,7 @@ mod tests {
             in_tiling.clone(),
         );
         let producer = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &in_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &in_tiling),
             input: Box::new(input),
             function: Box::new(fn_spy),
         };
@@ -976,7 +993,7 @@ mod tests {
         );
 
         let mut map_result = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             function: Box::new(function_producer),
         };
@@ -1102,7 +1119,7 @@ mod tests {
             ),
         );
         let mut map_result = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
         };
@@ -1173,7 +1190,7 @@ mod tests {
             ),
         );
         let mut map_result = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
         };
