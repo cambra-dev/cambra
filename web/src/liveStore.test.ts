@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { LiveStore, applyFrame, shownNodes, tagsFor, type LiveState } from "./liveStore";
-import type { LiveFrame, LiveProducer } from "./types";
+import type { LiveFrame, LiveProbe } from "./types";
 
-function producer(tick: number, value: string): LiveProducer {
+function probe(tick: number, value: string): LiveProbe {
   return {
     producerId: 1,
     producer: "P#1",
@@ -24,7 +24,7 @@ function frame(tick: number, nodes: [number, string][], final = false): LiveFram
     tick,
     published: tick,
     final,
-    nodes: nodes.map(([nodeId, value]) => ({ nodeId, producers: [producer(tick, value)] })),
+    nodes: nodes.map(([nodeId, value]) => ({ nodeId, probes: [probe(tick, value)] })),
     sources: [],
   };
 }
@@ -45,9 +45,9 @@ describe("applyFrame", () => {
     const first = applyFrame(empty, frame(1, [[10, '"a"'], [11, '"b"']]));
     const second = applyFrame(first, frame(2, [[10, '"c"']]));
 
-    expect(second.nodes.get(10)?.producers[0]?.rows[0]?.value).toBe('"c"');
+    expect(second.nodes.get(10)?.probes[0]?.rows[0]?.value).toBe('"c"');
     expect(second.nodes.get(10)?.tick).toBe(2);
-    expect(second.nodes.get(11)?.producers[0]?.rows[0]?.value).toBe('"b"');
+    expect(second.nodes.get(11)?.probes[0]?.rows[0]?.value).toBe('"b"');
     expect(second.nodes.get(11)?.tick).toBe(1);
   });
 

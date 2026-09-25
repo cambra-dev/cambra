@@ -12,7 +12,7 @@
 // bounds this list.
 
 import { type LiveEntry, type LiveState, type LiveStatus, type LiveTag, shownNodes, tagsFor } from "./liveStore";
-import type { LiveProducer, LiveRow, LiveSource } from "./types";
+import type { LiveProbe, LiveRow, LiveSource } from "./types";
 
 /** One inspected operator, or one inspected source, as the pane draws it. */
 export type LiveGroup = {
@@ -30,7 +30,7 @@ export type LiveGroup = {
       nodeId: number;
       /** Ticks between this entry and the newest one. Zero when it produced this tick. */
       staleBy: number;
-      producers: LiveProducer[];
+      probes: LiveProbe[];
     }
   | { kind: "source"; nodeId: number; source: LiveSource }
   // Asked for, but nothing has ever arrived for it. Rendered rather than
@@ -103,7 +103,7 @@ function group(
       kind: "operator",
       nodeId,
       staleBy: tick - entry.tick,
-      producers: entry.producers,
+      probes: entry.probes,
       tags,
     };
   }
@@ -140,7 +140,7 @@ function serializeGroup(group: LiveGroup): string {
       return [head, ...group.source.rows.map((r) => `  ${rowText(r)}`)].join("\n");
     }
     case "operator":
-      return group.producers
+      return group.probes
         .map((p) => {
           const head = `${prefix}#${group.nodeId} ${p.producer} ${p.shape} — ${countOf(
             p.rows.length,
@@ -403,14 +403,14 @@ export class LiveView {
 
 function rowsOf(group: LiveGroup): LiveRow[] {
   if (group.kind === "source") return group.source.rows;
-  if (group.kind === "operator") return group.producers.flatMap((p) => p.rows);
+  if (group.kind === "operator") return group.probes.flatMap((p) => p.rows);
   return [];
 }
 
 function droppedOf(group: LiveGroup): number {
   if (group.kind === "source") return group.source.dropped;
   if (group.kind === "operator") {
-    return group.producers.reduce((sum, p) => sum + p.dropped, 0);
+    return group.probes.reduce((sum, p) => sum + p.dropped, 0);
   }
   return 0;
 }
@@ -422,7 +422,7 @@ function headText(group: LiveGroup): string {
     case "source":
       return `#${group.nodeId} ${group.source.name}`;
     case "operator": {
-      const names = group.producers.map((p) => p.producer).join(", ");
+      const names = group.probes.map((p) => p.producer).join(", ");
       return `#${group.nodeId} ${names}`;
     }
   }
@@ -435,11 +435,11 @@ function metaText(group: LiveGroup, tick: number): string | null {
     case "source":
       return `retained ${countOf(group.source.rows.length, group.source.total)}`;
     case "operator": {
-      const first = group.producers[0];
+      const first = group.probes[0];
       if (first === undefined) return null;
-      const shape = group.producers.length === 1 ? first.shape : "several producers";
-      const shown = group.producers.reduce((sum, p) => sum + p.rows.length, 0);
-      const total = group.producers.reduce((sum, p) => sum + p.total, 0);
+      const shape = group.probes.length === 1 ? first.shape : "several probes";
+      const shown = group.probes.reduce((sum, p) => sum + p.rows.length, 0);
+      const total = group.probes.reduce((sum, p) => sum + p.total, 0);
       const parts = [shape, countOf(shown, total)];
       if (first.watermark !== null) parts.push(first.watermark);
       const stale = staleText(group.staleBy, tick);

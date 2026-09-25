@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import type { LiveState } from "./liveStore";
 import { TAG_SLOTS, countOf, livePanelState, serializeLivePanel, staleText, tagColour } from "./liveView";
-import type { LiveProducer, LiveSource } from "./types";
+import type { LiveProbe, LiveSource } from "./types";
 
-function producer(overrides: Partial<LiveProducer> = {}): LiveProducer {
+function probe(overrides: Partial<LiveProbe> = {}): LiveProbe {
   return {
     producerId: 1,
     producer: "MapResultWithSource#1",
@@ -82,7 +82,7 @@ describe("livePanelState", () => {
   // survives as a number the pane can state.
   it("carries how far behind an entry is", () => {
     const panel = livePanelState(
-      state({ tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }], nodes: new Map([[10, { tick: 2, producers: [producer()] }]]) }),
+      state({ tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }], nodes: new Map([[10, { tick: 2, probes: [probe()] }]]) }),
     );
     if (panel.kind !== "groups") throw new Error("expected groups");
     const group = panel.groups[0];
@@ -107,7 +107,7 @@ describe("serializeLivePanel", () => {
       state({
         tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }],
         nodes: new Map([
-          [10, { tick: 5, producers: [producer({ total: 40, dropped: 39 })] }],
+          [10, { tick: 5, probes: [probe({ total: 40, dropped: 39 })] }],
         ]),
       }),
     );
@@ -123,7 +123,7 @@ describe("serializeLivePanel", () => {
             10,
             {
               tick: 5,
-              producers: [producer({ rows: [{ key: "u1", value: '"skip"', deleted: true }] })],
+              probes: [probe({ rows: [{ key: "u1", value: '"skip"', deleted: true }] })],
             },
           ],
         ]),
@@ -137,7 +137,7 @@ describe("serializeLivePanel", () => {
       state({
         tags: [{ id: "t10", label: "T10", nodes: [10], shown: true }],
         nodes: new Map([
-          [10, { tick: 5, producers: [producer({ shape: "Store", rows: [], total: 0, note: "a store is a changelog" })] }],
+          [10, { tick: 5, probes: [probe({ shape: "Store", rows: [], total: 0, note: "a store is a changelog" })] }],
         ]),
       }),
     );

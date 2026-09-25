@@ -13,13 +13,13 @@
 // store: `apply` replaces a node's entry and leaves the others alone.
 
 import { validateLiveFrame } from "./liveValidate";
-import type { LiveFrame, LiveProducer, LiveSource } from "./types";
+import type { LiveFrame, LiveProbe, LiveSource } from "./types";
 
 /** What one operator last produced, and when. */
 export interface LiveEntry {
   /** The tick the answer came from, which lags the newest tick when the operator has since produced nothing. */
   tick: number;
-  producers: LiveProducer[];
+  probes: LiveProbe[];
 }
 
 /**
@@ -97,7 +97,7 @@ type Listener = (state: LiveState) => void;
 export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
   const nodes = new Map(state.nodes);
   for (const node of frame.nodes) {
-    nodes.set(node.nodeId, { tick: frame.tick, producers: node.producers });
+    nodes.set(node.nodeId, { tick: frame.tick, probes: node.probes });
   }
   const sources = new Map(state.sources);
   for (const source of frame.sources) {
