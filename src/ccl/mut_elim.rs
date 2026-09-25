@@ -2356,9 +2356,12 @@ fn transform_chain(
                 // Both of the branch's escapes leave the scope of the bindings its
                 // own chain introduced: the feeds it just appended, which land on
                 // the top decision record, and its write set, which the merge
-                // below lifts into value-`Case` arms. Each is re-bound over what
-                // it reads.
-                let dec = decision_writes(dec);
+                // below lifts into value-`Case` arms. Each is closed over what it
+                // reads: the branch's scope beneath its prefix, then the prefix.
+                let (dec, scope) = decision_writes(dec);
+                for feed in &mut feeds[collected..] {
+                    feed.value = scope.close(feed.value.clone());
+                }
                 close_feeds_over_prefix(&dec.prefix, &mut feeds[collected..]);
                 all.push((pi, dec));
             }
@@ -2480,6 +2483,14 @@ fn transform_chain(
                     for acc in accs {
                         value_tys.insert(acc.name.clone(), acc.ty.clone());
                     }
+                    // An inner loop whose calls inlined to no write, and which feeds
+                    // nothing, is a no-op, as a flat one is: lowering let it through only
+                    // because a call might have hidden a pass-by-reference write.
+                    let mut inner_accs = Vec::new();
+                    collect_writes(&inner_body, &value_tys, &mut inner_accs);
+                    if inner_accs.is_empty() && !body_has_feed(&inner_body) {
+                        return transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
+                    }
                     let fold = fold_induction_loop(&target, &iter, *inner_body, &value_tys);
                     // Both halves of a binding: a binder's declared type is written in
                     // the enclosing scope, so an inner loop correlated with this one's
@@ -2494,8 +2505,15 @@ fn transform_chain(
                         .into_iter()
                         .map(|(b, def)| (b, Subst::discharge_env_in_place(def, env)))
                         .collect();
+                    // Typed from the fold's own accumulators: an inner loop may write a
+                    // variable it never reads, which the reads it was folded against omit.
                     for (acc, x_final) in &fold.renames {
-                        let ty = value_tys.get(acc).cloned().unwrap_or(Type::Hole);
+                        let ty = fold
+                            .accs
+                            .iter()
+                            .find(|a| a.name == *acc)
+                            .map(|a| a.ty.clone())
+                            .unwrap_or_else(|| unreachable!("a rename names a folded accumulator"));
                         env.insert(acc.clone(), tvar(x_final, ty));
                     }
                     // A feed from inside the inner loop is a feed of **this** body: there
@@ -2754,19 +2772,44 @@ impl PartialEq for BranchWrites {
     }
 }
 
-/// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
-/// (as [`transform_chain`] builds it), with the `let*` prefix they read.
+/// A branch decision's scope beneath its `let*` prefix: the `letrec` groups it passes under,
+/// outermost first, and the `let`s beneath them, inlined into one environment.
 ///
-/// A `letrec` the decision passes under is **kept** rather than inlined: its bindings are
-/// mutually recursive, so there is no value to substitute in. An inner loop inside a branch
-/// is exactly this — the inner recurrence sits between the prefix and the record — and each
-/// write is re-wrapped in the groups it was under, which is what keeps it self-contained. A
-/// `let` beneath a group reads the group (an inner loop's final), so it is inlined into the
-/// writes rather than joining the prefix, which stands outside the groups.
-fn decision_writes(dec: Expr) -> BranchWrites {
+/// A `letrec` is **kept** rather than inlined: its bindings are mutually recursive, so there
+/// is no value to substitute in. An inner loop inside a branch is exactly this — the inner
+/// recurrence sits between the prefix and the record. A `let` beneath a group reads the group
+/// (an inner loop's final), so it is inlined rather than joining the prefix, which stands
+/// outside the groups ([`close_feeds_over_prefix`], [`wrap_reads`]).
+#[derive(Default)]
+struct BranchScope {
+    groups: Vec<Vec<(TypedBinding, Expr)>>,
+    beneath: HashMap<Name, Expr>,
+}
+
+impl BranchScope {
+    /// `e`, read inside the branch beneath its prefix, made self-contained there: the `let`s
+    /// beneath the groups inlined and the groups wrapped around it.
+    fn close(&self, e: Expr) -> Expr {
+        let inlined = Subst::discharge_env_in_place(e, &self.beneath);
+        self.groups.iter().rev().fold(inlined, |inner, bindings| {
+            let ty = inner.ty.clone();
+            let mut wrapped = Expr::new(TypedExprNode::LetRec {
+                bindings: bindings.clone(),
+                body: Box::new(inner),
+            });
+            wrapped.ty = ty;
+            wrapped
+        })
+    }
+}
+
+/// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
+/// (as [`transform_chain`] builds it), with the `let*` prefix they read, each closed over the
+/// branch's scope beneath that prefix ([`BranchScope`]), which is returned for the branch's
+/// feeds to be closed over too.
+fn decision_writes(dec: Expr) -> (BranchWrites, BranchScope) {
     let mut prefix: Vec<PrefixBinding> = Vec::new();
-    let mut groups: Vec<Vec<(TypedBinding, Expr)>> = Vec::new();
-    let mut beneath: HashMap<Name, Expr> = HashMap::new();
+    let mut scope = BranchScope::default();
     let mut record = dec;
     loop {
         match record.node {
@@ -2774,7 +2817,7 @@ fn decision_writes(dec: Expr) -> BranchWrites {
                 binding,
                 bound_expr,
                 body,
-            } if groups.is_empty() => {
+            } if scope.groups.is_empty() => {
                 prefix.push((record.node_id, binding, *bound_expr));
                 record = *body;
             }
@@ -2783,12 +2826,12 @@ fn decision_writes(dec: Expr) -> BranchWrites {
                 bound_expr,
                 body,
             } => {
-                let bound = Subst::discharge_env_in_place(*bound_expr, &beneath);
-                beneath.insert(binding.name.clone(), bound);
+                let bound = Subst::discharge_env_in_place(*bound_expr, &scope.beneath);
+                scope.beneath.insert(binding.name.clone(), bound);
                 record = *body;
             }
             TypedExprNode::LetRec { bindings, body } => {
-                groups.push(bindings);
+                scope.groups.push(bindings);
                 record = *body;
             }
             node => {
@@ -2812,24 +2855,8 @@ fn decision_writes(dec: Expr) -> BranchWrites {
     let TypedExprNode::Record(elts) = writes.node else {
         panic!("letrec phase: a decision `writes` is keyed by accumulator");
     };
-    BranchWrites {
-        prefix,
-        writes: elts
-            .into_iter()
-            .map(|(_, e)| {
-                let write = Subst::discharge_env_in_place(e, &beneath);
-                groups.iter().rev().fold(write, |inner, bindings| {
-                    let ty = inner.ty.clone();
-                    let mut wrapped = Expr::new(TypedExprNode::LetRec {
-                        bindings: bindings.clone(),
-                        body: Box::new(inner),
-                    });
-                    wrapped.ty = ty;
-                    wrapped
-                })
-            })
-            .collect(),
-    }
+    let writes = elts.into_iter().map(|(_, e)| scope.close(e)).collect();
+    (BranchWrites { prefix, writes }, scope)
 }
 
 /// Build the writer decision `{commit, writes}` for a statement-`Case`, from its
