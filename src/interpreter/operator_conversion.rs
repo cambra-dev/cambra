@@ -450,17 +450,21 @@ pub struct OpConversionContext {
 /// a store in the handover anyway.
 ///
 /// Every consumer reads it as the running graph:
-/// [`live_state`](OpConversionContext::live_state) takes a value off each store,
+/// [`live_state`](Self::live_state) takes a value off each store,
 /// [`state_conflicts`](OpConversionContext::state_conflicts) guards each
 /// variable, and the next compilation keeps from it.
-#[derive(Default)]
+///
+/// A branch's entry holds one of these, and cloning it is how a branch is created
+/// as a copy of its origin: every [`Recorded`] holds its operator by `Rc`, so the
+/// clone builds nothing and the two entries hold the same operators.
+#[derive(Default, Clone)]
 pub struct Inheritance {
     /// What the graph holds, by the node it was built from.
     entries: HashMap<NodeId, Recorded>,
     /// The value each mutable variable hands to the variable that replaces it, by
-    /// identity. Read off `stores` at handover
-    /// ([`OpConversionContext::into_inheritance`]), so the copy a compilation is
-    /// still accumulating into carries none — only the one it hands on.
+    /// identity. Read off `stores` at handover ([`Inheritance::handover`]), so
+    /// the record a compilation accumulates, and a branch's entry holds, carries
+    /// none — only the offer does.
     ///
     /// A value and nothing else. Where the recurrence had reached is a property
     /// of the input it was reading rather than of the variable, and the reload
@@ -472,6 +476,107 @@ pub struct Inheritance {
 }
 
 impl Inheritance {
+    /// This record as an offer to the next compilation: the same operators, with
+    /// every fan reopened and the value each mutable variable holds read off its
+    /// store.
+    ///
+    /// Reopens every fan first. A fan closes when its subscribers go, and the
+    /// reloaded branch's are about to; a carried-forward one has to be open for
+    /// the replacement to subscribe to it. Reopening drops only dead slots
+    /// ([`FanOut::reopen`]), so a fan another branch still subscribes keeps
+    /// that subscription and its guard.
+    ///
+    /// Hands on every entry, including ones whose subscribers released them in
+    /// full. Those can no longer produce, so a binding standing behind one is
+    /// rebuilt where its term is recomputable
+    /// ([`bind_let`](OpConversionContext::bind_let)), but the value a store's
+    /// variables hand on is still readable off its fan and the progress a
+    /// recurrence continues from is still recorded on it.
+    ///
+    /// By reference, because the record offered to a branch's reload is its
+    /// origin's entry, which stays the origin's.
+    pub fn handover(&self) -> Inheritance {
+        for entry in self.entries.values() {
+            entry.fan().reopen();
+        }
+        Inheritance {
+            entries: self.entries.clone(),
+            mutable_state: self.live_state(),
+        }
+    }
+
+    /// Every fan-out this record holds, one per operator however many nodes
+    /// record it.
+    ///
+    /// What an entry holds, as against what it reads: an operator is alive while
+    /// some record lists it here, which is what a branch's operator count and its
+    /// sharing are counted over.
+    pub fn operators(&self) -> Vec<Rc<FanOut>> {
+        let mut out: Vec<Rc<FanOut>> = Vec::new();
+        for entry in self.entries.values() {
+            let fan = entry.fan();
+            if !out.iter().any(|held| Rc::ptr_eq(held, fan)) {
+                out.push(fan.clone());
+            }
+        }
+        out
+    }
+
+    /// The value each mutable variable currently holds, by the identity state is
+    /// carried under. Readable while the graph runs, so a replacement can be
+    /// checked against what it would inherit.
+    ///
+    /// A store [`state_conflicts`](OpConversionContext::state_conflicts) treated
+    /// as carryable is skipped here only when it holds nothing, because a store
+    /// with a value that this drops is the one outcome the guard exists to
+    /// prevent: the replacement reseeds from the init, the program carries on
+    /// answering, and only the history is gone. So the absent cached tile is an
+    /// assertion — a store's fan is always cyclic ([`FanOut::new_cyclic`]) and a
+    /// cyclic fan always has one — while the two ways of holding nothing are
+    /// ordinary cases: a store that has decided no position has no frontier, and
+    /// a variable no position has written has no value at the frontier. Either
+    /// way its replacement reads its init, which is what it would have read
+    /// anyway.
+    pub fn live_state(&self) -> HashMap<VarPath, Value> {
+        let mut out: HashMap<VarPath, Value> = HashMap::new();
+        for info in self.stores() {
+            let Some(tile) = info.fan.cached_tile() else {
+                debug_assert!(
+                    false,
+                    "a store's fan is cyclic, so it has a cached tile: {:?}",
+                    info.keys.keys().collect::<Vec<_>>()
+                );
+                continue;
+            };
+            // No frontier means no position has been decided, so there is no
+            // accumulated value to hand over and nothing is lost by starting the
+            // replacement at its init.
+            let Some(frontier) = store_frontier(&tile) else {
+                continue;
+            };
+            for (path, key) in info.carried_keys() {
+                if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
+                    let prior = out.insert(path.clone(), value);
+                    debug_assert!(
+                        prior.is_none(),
+                        "{path} is declared by two stores, so the walk that assigns \
+identities is not distinguishing them",
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// The extent the graph's store declares for `path`, which is what a value
+    /// read off it is.
+    fn declared_extent(&self, path: &VarPath) -> Option<Extent> {
+        self.stores()
+            .flat_map(StoreReadInfo::carried_keys)
+            .find(|(p, _)| *p == path)
+            .map(|(_, key)| key.value_extent.clone())
+    }
+
     /// Every `Transact` store the graph holds. The handover is one map over all
     /// three reuse sites, and a store is the one entry a reader projects.
     fn stores(&self) -> impl Iterator<Item = &StoreReadInfo> {
@@ -776,7 +881,7 @@ impl OpConversionContext {
         // A spent store answers its variable reads with nothing, so it is rebuilt
         // and reseeded from the value it is still holding — the handover carries
         // that value whatever the operator can produce
-        // ([`live_state`](Self::live_state)). Rebuilding for that reason does not
+        // ([`Inheritance::live_state`]). Rebuilding for that reason does not
         // change what the store computes, so it is not recorded as rebuilt.
         let spent = correspondent
             .as_ref()
@@ -1082,14 +1187,14 @@ in it has a correspondent",
     /// Both directions are answered here rather than half of them at conversion,
     /// because conversion runs after the teardown: a failure there is a panic
     /// with no running program left to keep serving.
-    pub fn state_conflicts(&self, planned: &Expr) -> Vec<StateConflict> {
+    pub fn state_conflicts(&self, predecessor: &Inheritance, planned: &Expr) -> Vec<StateConflict> {
         let identities = state_identities(planned);
         let declared = identities.declared();
-        // Off the stores, not off `minted.mutable_state`: that field is filled at
-        // handover ([`Self::into_inheritance`]), so the copy this compilation is
-        // still accumulating into carries none. The guard runs while the program
-        // it is guarding is the running one.
-        let held = self.live_state();
+        // Off the stores, not off `predecessor.mutable_state`: that field is
+        // filled at handover ([`Inheritance::handover`]), so a branch's own
+        // record carries none. The guard runs while the program it is guarding
+        // is the running one.
+        let held = predecessor.live_state();
         let mut out = Vec::new();
 
         // What `@LoadFrom(x)` reads, which decides two things: a site addressing a
@@ -1097,7 +1202,7 @@ in it has a correspondent",
         // conversion, which runs after the teardown and has nothing to reject
         // to; and a variable a site takes over has somewhere to go, so retiring
         // it is not a drop.
-        let declared_by_predecessor = self.minted.declared_paths();
+        let declared_by_predecessor = predecessor.declared_paths();
         let mut taken_over: HashSet<VarPath> = HashSet::new();
         for (site, target) in identities.read_load_from(&declared_by_predecessor) {
             let path = match target {
@@ -1133,7 +1238,7 @@ in it has a correspondent",
             // at the swap. A type the conversion context cannot resolve is a
             // compile error the real compile raises with its own diagnostic.
             if let (Some(declared), Ok(read_at)) =
-                (self.declared_extent(&path), self.extent_of(&site.ty))
+                (predecessor.declared_extent(&path), self.extent_of(&site.ty))
                 && read_at != declared
             {
                 out.push(StateConflict::LoadFromAt {
@@ -1145,7 +1250,7 @@ in it has a correspondent",
             taken_over.insert(path);
         }
 
-        for info in self.minted.stores() {
+        for info in predecessor.stores() {
             for (path, key) in info.carried_keys() {
                 let Some(decl) = declared.get(path) else {
                     // Declared by the new version or read by a `@LoadFrom`: an *or*,
@@ -1210,7 +1315,12 @@ in it has a correspondent",
     ///
     /// Read off the planned tree before anything is torn down, so `/diff` answers
     /// it as well as `/reload`.
-    pub fn unreadable_inputs(&self, previous: &Expr, planned: &Expr) -> Vec<UnreadablePrefix> {
+    pub fn unreadable_inputs(
+        &self,
+        predecessor: &Inheritance,
+        previous: &Expr,
+        planned: &Expr,
+    ) -> Vec<UnreadablePrefix> {
         // Diffing two planned trees costs more than the rest of this put together, and
         // only a variable this version adds to a loop that already carries one needs the
         // answer. A reload whose state all carries forward asks for none, so the
@@ -1218,7 +1328,7 @@ in it has a correspondent",
         let correspondence = std::cell::OnceCell::new();
         let [unrecomputable, load_from_derived] =
             nodes_reaching(planned, [reads_a_source, is_a_load]);
-        let carried = self.live_state();
+        let carried = predecessor.live_state();
         let sources = writer_sources(planned);
         let mut out = Vec::new();
 
@@ -1256,12 +1366,12 @@ in it has a correspondent",
                 }
                 // Where the loop will begin, by the same two answers
                 // `iteration_input` chooses between. The kept iteration's
-                // release is read from this version's own ledger, which is still
-                // `minted` here: `retire_version` has not run.
+                // release is read from the record the reload will offer, which
+                // `previous` is the tree of.
                 let kept = correspondence
                     .get_or_init(|| Correspondence::of(&crate::ccl::diff::diff(previous, planned)))
                     .previous(source.node_id())
-                    .and_then(|prev| self.minted.entries.get(&prev))
+                    .and_then(|prev| predecessor.entries.get(&prev))
                     .and_then(|entry| entry.fan().released_position());
                 let begins = match kept {
                     Some(released) => released + 1,
@@ -1290,79 +1400,22 @@ in it has a correspondent",
         out
     }
 
-    /// The value each mutable variable currently holds, by the identity state is
-    /// carried under. Readable before the version is retired, so a replacement
-    /// can be checked against what it would inherit.
+    /// Hand this compilation's record to its owner, and forget every operator
+    /// the context still reaches.
     ///
-    /// A store [`state_conflicts`](Self::state_conflicts) treated as carryable is
-    /// skipped here only when it holds nothing, because a store with a value that
-    /// this drops is the one outcome the guard exists to prevent: the replacement
-    /// reseeds from the init, the program carries on answering, and only the
-    /// history is gone. So the absent cached tile is an assertion — a store's fan
-    /// is always cyclic ([`FanOut::new_cyclic`]) and a cyclic fan always has one —
-    /// while the two ways of holding nothing are ordinary cases: a store that has
-    /// decided no position has no frontier, and a variable no position has written
-    /// has no value at the frontier. Either way its replacement reads its init,
-    /// which is what it would have read anyway.
-    pub(crate) fn live_state(&self) -> HashMap<VarPath, Value> {
-        let mut out: HashMap<VarPath, Value> = HashMap::new();
-        for info in self.minted.stores() {
-            let Some(tile) = info.fan.cached_tile() else {
-                debug_assert!(
-                    false,
-                    "a store's fan is cyclic, so it has a cached tile: {:?}",
-                    info.keys.keys().collect::<Vec<_>>()
-                );
-                continue;
-            };
-            // No frontier means no position has been decided, so there is no
-            // accumulated value to hand over and nothing is lost by starting the
-            // replacement at its init.
-            let Some(frontier) = store_frontier(&tile) else {
-                continue;
-            };
-            for (path, key) in info.carried_keys() {
-                if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
-                    let prior = out.insert(path.clone(), value);
-                    debug_assert!(
-                        prior.is_none(),
-                        "{path} is declared by two stores, so the walk that assigns \
-identities is not distinguishing them",
-                    );
-                }
-            }
-        }
-        out
-    }
-
-    /// The extent the running graph's store declares for `path`, which is what a
-    /// value read off it is.
-    fn declared_extent(&self, path: &VarPath) -> Option<Extent> {
-        self.minted
-            .stores()
-            .flat_map(StoreReadInfo::carried_keys)
-            .find(|(p, _)| *p == path)
-            .map(|(_, key)| key.value_extent.clone())
-    }
-
-    /// Everything the running graph holds: its bindings and stores, and the
-    /// value each mutable variable is at.
-    ///
-    /// Reopens every fan first. A fan closes when its subscribers go, and this
-    /// version's are about to; a carried-forward one has to be open for the
-    /// replacement to subscribe to it.
-    ///
-    /// Hands on every entry, including ones whose subscribers released them in
-    /// full. Those can no longer produce, so a binding standing behind one is
-    /// rebuilt where its term is recomputable ([`bind_let`](Self::bind_let)), but
-    /// the value a store's variables hand on is still readable off its fan and
-    /// the progress a recurrence continues from is still recorded on it.
-    pub fn into_inheritance(mut self) -> Inheritance {
-        for entry in self.minted.entries.values() {
-            entry.fan().reopen();
-        }
-        self.minted.mutable_state = self.live_state();
-        self.minted
+    /// Called once the compilation's outputs are subscribed. The record is what
+    /// a branch's entry holds ([`LiveProgram`](crate::live_program::LiveProgram)),
+    /// and an entry holding it is what keeps an operator alive, so the context
+    /// keeps no second reference: the store table is keyed by this tree's
+    /// binders and nothing reads it after conversion.
+    pub fn take_record(&mut self) -> Inheritance {
+        debug_assert!(
+            self.inherited.entries.is_empty(),
+            "the offer is released before the record is taken, so no operator the \
+compilation declined outlives it here"
+        );
+        self.transactional_stores.clear();
+        std::mem::take(&mut self.minted)
     }
 
     /// Drop what the previous version offered and this compilation did not take.

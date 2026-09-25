@@ -1,11 +1,22 @@
 //! Control port: HTTP endpoints for diffing a running program against a new
-//! version of its source, and for replacing it with that version.
+//! version of its source, for replacing a branch's version with it, and for
+//! creating, deleting, retargeting and listing branches.
 //!
-//! Two endpoints, both taking the new source as their argument:
+//! Dispatch is on the path alone. A `<branch>` segment that is omitted means
+//! `production` ([`ROOT`]), and a name is one path segment of ASCII letters,
+//! digits, `-` and `_` ([`is_branch_name`]):
 //!
-//! - `/diff` — how the new version differs from the running one, rendered as an
-//!   annotated tree. Answers the question without changing anything.
-//! - `/reload` — replace the running program with the new version.
+//! - `/diff[/<branch>]` — how the new version differs from the one a reload of
+//!   the branch would diff against, rendered as an annotated tree. Answers the
+//!   question without changing anything.
+//! - `/reload[/<branch>]` — replace the branch's version with the new one.
+//! - `/branch/<name>[/from/<origin>]` — create a branch as a copy of `origin`.
+//! - `/branch/<name>/delete` — delete a branch.
+//! - `/branch/<name>/retarget/<origin>` — make `origin` the branch's origin.
+//! - `/branches/list` — one line per branch.
+//!
+//! The verb table and its status codes are `src/ccl/design/program-evolution.md`,
+//! "The control port".
 //!
 //! The source may be the whole query string, percent-decoded, or a `POST` body.
 //! The query form is percent-encoded rather than form-encoded: `+` stands for
@@ -30,13 +41,28 @@ use std::thread;
 use log::info;
 
 use crate::ccl::context::Phase;
+use crate::live_program::{ROOT, is_branch_name};
 
 /// What a control-port client asked for.
+#[derive(Debug, PartialEq)]
 pub enum ControlRequest {
-    /// Report how `code` differs from the running program, comparing at `phase`.
-    Diff { code: String, phase: Phase },
-    /// Replace the running program with `code`.
-    Reload { code: String },
+    /// Report how `code` differs from the version a reload of `branch` would
+    /// diff against, comparing at `phase`.
+    Diff {
+        branch: String,
+        code: String,
+        phase: Phase,
+    },
+    /// Replace `branch`'s version with `code`.
+    Reload { branch: String, code: String },
+    /// Create branch `name` as a copy of `origin`'s entry.
+    CreateBranch { name: String, origin: String },
+    /// Delete branch `name`.
+    DeleteBranch { name: String },
+    /// Make `origin` the origin of branch `name`.
+    RetargetBranch { name: String, origin: String },
+    /// List every branch.
+    ListBranches,
 }
 
 /// The answer to one [`ControlRequest`], as an HTTP status and a plain-text body.
@@ -56,10 +82,20 @@ impl ControlReply {
     }
 
     /// A `400` carrying `body` — the request named a version the running
-    /// program cannot compile or cannot take over the running state.
+    /// program cannot compile or cannot take over the running state, or asked
+    /// for a branch operation that is refused.
     pub fn rejected(body: impl Into<String>) -> Self {
         Self {
             status: 400,
+            body: body.into(),
+        }
+    }
+
+    /// A `404` carrying `body` — an unknown path, or a branch name the table
+    /// does not hold.
+    pub fn not_found(body: impl Into<String>) -> Self {
+        Self {
+            status: 404,
             body: body.into(),
         }
     }
@@ -224,13 +260,65 @@ fn split_url(url: &str) -> (&str, &str) {
     }
 }
 
+/// The reply to a path that names no verb.
+fn unknown_path() -> ControlReply {
+    ControlReply::not_found(
+        "endpoints: /diff[/<branch>]?<source>, /reload[/<branch>]?<source>, \
+/branch/<name>[/from/<origin>], /branch/<name>/delete, /branch/<name>/retarget/<origin>, \
+/branches/list\n",
+    )
+}
+
+/// The verb a path names, with the branch names it carries, or `None` for a
+/// path that names none.
+///
+/// A segment that is not a branch name is a path that names no verb, so it
+/// answers 404 like any other unknown path rather than reaching the table.
+fn parse_path(path: &str) -> Option<Verb<'_>> {
+    let segments: Vec<&str> = path.strip_prefix('/')?.split('/').collect();
+    let verb = match segments.as_slice() {
+        ["diff"] => Verb::Diff(ROOT),
+        ["diff", branch] => Verb::Diff(branch),
+        ["reload"] => Verb::Reload(ROOT),
+        ["reload", branch] => Verb::Reload(branch),
+        ["branch", n] => Verb::Create(n, ROOT),
+        ["branch", n, "from", origin] => Verb::Create(n, origin),
+        ["branch", n, "delete"] => Verb::Delete(n),
+        ["branch", n, "retarget", origin] => Verb::Retarget(n, origin),
+        ["branches", "list"] => Verb::List,
+        _ => return None,
+    };
+    verb.names().into_iter().all(is_branch_name).then_some(verb)
+}
+
+/// A verb and the branch names its path carries, before the source is read.
+enum Verb<'a> {
+    Diff(&'a str),
+    Reload(&'a str),
+    Create(&'a str, &'a str),
+    Delete(&'a str),
+    Retarget(&'a str, &'a str),
+    List,
+}
+
+impl Verb<'_> {
+    fn names(&self) -> Vec<&str> {
+        match *self {
+            Verb::Diff(b) | Verb::Reload(b) | Verb::Delete(b) => vec![b],
+            Verb::Create(n, o) | Verb::Retarget(n, o) => vec![n, o],
+            Verb::List => vec![],
+        }
+    }
+}
+
 /// Parse a request into the [`ControlRequest`] the main loop services, or the
 /// reply to send when it is not one.
 fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> {
     let (path, query) = split_url(url);
+    let verb = parse_path(path).ok_or_else(unknown_path)?;
     // Only `/diff` takes a phase, so only `/diff` peels one. On `/reload` a
     // leading `phase=` is the program's own first characters.
-    let (phase_name, rest) = if path == "/diff" {
+    let (phase_name, rest) = if matches!(verb, Verb::Diff(_)) {
         split_phase_param(query)
     } else {
         (None, query)
@@ -238,14 +326,16 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
 
     // The source is the body when there is one, so a program containing `&` or
     // `#` need not be percent-encoded to survive the query string.
-    let code = if body.trim().is_empty() {
-        percent_decode(rest)
-    } else {
-        body.to_string()
+    let code = || {
+        if body.trim().is_empty() {
+            percent_decode(rest)
+        } else {
+            body.to_string()
+        }
     };
 
-    match path {
-        "/diff" => {
+    match verb {
+        Verb::Diff(branch) => {
             let phase = match phase_name {
                 None => DEFAULT_PHASE,
                 Some(name) => phase_from_name(name).ok_or_else(|| {
@@ -255,17 +345,34 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
                     ))
                 })?,
             };
+            let code = code();
             require_code(&code)?;
-            Ok(ControlRequest::Diff { code, phase })
+            Ok(ControlRequest::Diff {
+                branch: branch.to_string(),
+                code,
+                phase,
+            })
         }
-        "/reload" => {
+        Verb::Reload(branch) => {
+            let code = code();
             require_code(&code)?;
-            Ok(ControlRequest::Reload { code })
+            Ok(ControlRequest::Reload {
+                branch: branch.to_string(),
+                code,
+            })
         }
-        _ => Err(ControlReply {
-            status: 404,
-            body: "endpoints: /diff?<source>, /reload?<source>\n".to_string(),
+        Verb::Create(name, origin) => Ok(ControlRequest::CreateBranch {
+            name: name.to_string(),
+            origin: origin.to_string(),
         }),
+        Verb::Delete(name) => Ok(ControlRequest::DeleteBranch {
+            name: name.to_string(),
+        }),
+        Verb::Retarget(name, origin) => Ok(ControlRequest::RetargetBranch {
+            name: name.to_string(),
+            origin: origin.to_string(),
+        }),
+        Verb::List => Ok(ControlRequest::ListBranches),
     }
 }
 
@@ -352,8 +459,8 @@ mod tests {
 
     fn diff_of(url: &str) -> (String, Phase) {
         match parse_request(url, "").expect("parses") {
-            ControlRequest::Diff { code, phase } => (code, phase),
-            ControlRequest::Reload { .. } => panic!("expected a diff request"),
+            ControlRequest::Diff { code, phase, .. } => (code, phase),
+            other => panic!("expected a diff request, got {other:?}"),
         }
     }
 
@@ -401,8 +508,8 @@ mod tests {
     fn reload_does_not_peel_a_phase() {
         let request = parse_request("/reload?phase=1; phase", "").expect("parses");
         match request {
-            ControlRequest::Reload { code } => assert_eq!(code, "phase=1; phase"),
-            ControlRequest::Diff { .. } => panic!("expected a reload request"),
+            ControlRequest::Reload { code, .. } => assert_eq!(code, "phase=1; phase"),
+            other => panic!("expected a reload request, got {other:?}"),
         }
     }
 
@@ -416,24 +523,123 @@ mod tests {
     fn a_body_supplies_the_source_when_the_query_does_not() {
         let request = parse_request("/reload", "y = 2; y").expect("parses");
         match request {
-            ControlRequest::Reload { code } => assert_eq!(code, "y = 2; y"),
-            ControlRequest::Diff { .. } => panic!("expected a reload request"),
+            ControlRequest::Reload { code, .. } => assert_eq!(code, "y = 2; y"),
+            other => panic!("expected a reload request, got {other:?}"),
         }
     }
 
     #[test]
     fn an_unknown_phase_is_rejected_rather_than_defaulted() {
-        let reply = parse_request("/diff?phase=nonsense&x", "")
-            .err()
-            .expect("rejected");
+        let reply = parse_request("/diff?phase=nonsense&x", "").expect_err("rejected");
         assert_eq!(reply.status, 400);
         assert!(reply.body.contains("channelized"), "{}", reply.body);
     }
 
     #[test]
     fn a_request_with_no_source_is_rejected() {
-        let reply = parse_request("/diff", "").err().expect("rejected");
+        let reply = parse_request("/diff", "").expect_err("rejected");
         assert_eq!(reply.status, 400);
+    }
+
+    fn parsed(url: &str) -> ControlRequest {
+        parse_request(url, "").unwrap_or_else(|r| panic!("{url} refused: {r:?}"))
+    }
+
+    fn status_of(url: &str, body: &str) -> u16 {
+        parse_request(url, body).expect_err("refused").status
+    }
+
+    /// An omitted `<branch>` segment means the root.
+    #[test]
+    fn diff_and_reload_address_production_without_a_branch_segment() {
+        assert!(matches!(
+            parse_request("/diff", "x").unwrap(),
+            ControlRequest::Diff { branch, .. } if branch == ROOT
+        ));
+        assert!(matches!(
+            parse_request("/reload", "x").unwrap(),
+            ControlRequest::Reload { branch, .. } if branch == ROOT
+        ));
+    }
+
+    #[test]
+    fn diff_and_reload_take_a_branch_segment() {
+        assert_eq!(
+            parse_request("/diff/staging?phase=inferred&x = 1; x", "").unwrap(),
+            ControlRequest::Diff {
+                branch: "staging".to_string(),
+                code: "x = 1; x".to_string(),
+                phase: Phase::Infer,
+            }
+        );
+        assert_eq!(
+            parse_request("/reload/qa-2_b", "y").unwrap(),
+            ControlRequest::Reload {
+                branch: "qa-2_b".to_string(),
+                code: "y".to_string(),
+            }
+        );
+        assert_eq!(status_of("/reload/staging", ""), 400, "no source");
+    }
+
+    #[test]
+    fn the_branch_verbs_parse_from_the_path_alone() {
+        assert_eq!(
+            parsed("/branch/staging"),
+            ControlRequest::CreateBranch {
+                name: "staging".to_string(),
+                origin: ROOT.to_string(),
+            }
+        );
+        assert_eq!(
+            parsed("/branch/scratch/from/qa"),
+            ControlRequest::CreateBranch {
+                name: "scratch".to_string(),
+                origin: "qa".to_string(),
+            }
+        );
+        assert_eq!(
+            parsed("/branch/scratch/delete"),
+            ControlRequest::DeleteBranch {
+                name: "scratch".to_string(),
+            }
+        );
+        assert_eq!(
+            parsed("/branch/scratch/retarget/production"),
+            ControlRequest::RetargetBranch {
+                name: "scratch".to_string(),
+                origin: ROOT.to_string(),
+            }
+        );
+        assert_eq!(parsed("/branches/list"), ControlRequest::ListBranches);
+        assert_eq!(
+            parse_request("/branches/list", "ignored body").unwrap(),
+            ControlRequest::ListBranches,
+            "a verb that takes nothing ignores the body"
+        );
+    }
+
+    /// A segment that is not a branch name, and a path of the wrong shape, name
+    /// no verb.
+    #[test]
+    fn a_path_naming_no_verb_is_not_found() {
+        for url in [
+            "/diff/",
+            "/diff/a.b",
+            "/reload/a/b",
+            "/branch",
+            "/branch/",
+            "/branch/a b",
+            "/branch/a/from",
+            "/branch/a/from/",
+            "/branch/a/rename/b",
+            "/branch/a/retarget",
+            "/branches",
+            "/branches/all",
+            "/nope",
+        ] {
+            assert_eq!(status_of(url, "x"), 404, "{url}");
+        }
     }
 
     #[test]
@@ -442,6 +648,7 @@ mod tests {
         let waiter = thread::spawn(move || rx.recv().expect("a reply").status);
         drop(ControlMessage {
             request: ControlRequest::Reload {
+                branch: ROOT.to_string(),
                 code: "x".to_string(),
             },
             reply: Some(tx),
