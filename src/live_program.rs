@@ -500,19 +500,17 @@ impl LiveProgram {
             .ok_or_else(|| BranchError::Unknown(name.to_string()))
     }
 
-    /// The branch the single-branch accessors answer for: `main` while the table
-    /// holds it, and otherwise the oldest branch left.
-    fn primary(&self) -> &Branch {
-        self.branches
-            .iter()
-            .find(|b| b.name == ROOT)
-            .unwrap_or(&self.branches[0])
+    /// The branch the single-branch accessors answer for: the one named `main`.
+    /// Once `main` is deleted they answer `None` rather than pick another
+    /// branch, the way a control verb without a branch segment answers 404
+    /// (`src/ccl/design/program-evolution.md`, "The control port").
+    fn primary(&self) -> Option<&Branch> {
+        self.branches.iter().find(|b| b.name == ROOT)
     }
 
-    /// The compiled program `main` runs, or the oldest branch's once `main` is
-    /// deleted.
-    pub fn program(&self) -> &CompiledProgram {
-        &self.primary().program
+    /// The compiled program `main` runs, while the table holds `main`.
+    pub fn program(&self) -> Option<&CompiledProgram> {
+        self.primary().map(|b| &b.program)
     }
 
     /// The compiled program branch `name` runs.
@@ -523,7 +521,7 @@ impl LiveProgram {
 
     /// `main`'s `main` output's producer, for inspection.
     pub fn main_producer(&self) -> Option<&dyn TileProducer> {
-        self.primary().main_producer.as_deref()
+        self.primary()?.main_producer.as_deref()
     }
 
     /// `main`'s `main` output's producer, for a driver to pull.
@@ -537,9 +535,10 @@ impl LiveProgram {
         self.branches[at].main_producer.as_mut()
     }
 
-    /// The source `main`'s current version was compiled from.
-    pub fn source(&self) -> &str {
-        &self.primary().program.source
+    /// The source `main`'s current version was compiled from, while the table
+    /// holds `main`.
+    pub fn source(&self) -> Option<&str> {
+        self.primary().map(|b| b.program.source.as_str())
     }
 
     /// Pull every branch's `main` output that has something new, in creation
