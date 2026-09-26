@@ -14,9 +14,10 @@ still declares with the value it was holding.
 
 The operational semantics of a reload, and the three properties that make one well defined, are
 [Reload](/docs/operational-semantics/semantics.md#4-reload). This doc is the mechanism that realizes
-them. Computing the difference between two programs is [diffing.md](diffing.md). The reload entry
-point is `LiveProgram::reload` in `src/live_program.rs`, and the control port is
-`src/control_port.rs`, serviced from `src/main.rs`.
+them. Computing the difference between two programs is [diffing.md](diffing.md). The branch table is
+`LiveProgram` in `src/live_program.rs`, whose verbs are `reload_branch`, `create_branch` and
+`delete_branch`. The control port is `src/control_port.rs`, whose `service` answers each request
+from the driver loop in `src/main.rs`.
 
 Three questions decide a reload:
 
@@ -61,8 +62,9 @@ Three questions decide a reload:
 
 ## The control port
 
-> **Status: [Decided]** for `/diff` and `/reload` without a branch segment, which address `main`.
-> **[Prescribed]** for every other form.
+> **Status: [Decided].** Parsing is pinned by the tests in `src/control_port.rs`
+> (`every_branch_verb_parses_by_position`, `a_malformed_name_or_path_answers_404`) and each verb's
+> reply by `tests/hot_reload/branching.rs`.
 
 `--control` (default 8081, `--control=PORT` to change it) serves the verbs below. Dispatch is on the
 path alone, so the HTTP method is not checked. A verb that takes a source reads it from the request
@@ -85,9 +87,11 @@ that is omitted means `main`.
 Status codes: 200 on success, 400 for a refusal or a compile error, 404 for an unknown path or a
 branch name the table does not hold, and 503 or 500 for a request the program dropped or never
 answered. A tombstoned name is one the table does not hold. A path segment in a `<name>` position
-that is not a valid `<name>` is an unknown path, so it answers 404. A refusal's body names what was
-refused and why. `/branch/<name>/delete`, `/branch/<name>/info` and `/branches/list` ignore the
-request body.
+that is not a valid `<name>` is an unknown path, so it answers 404. Segments are read by position,
+so a branch may be named `delete`, `info` or `from`. A refusal's body names what was refused and
+why.
+`/branch/<name>/delete`, `/branch/<name>/info`, `/branches/list` and `/diff/<branch>/<branch>`
+ignore the request body.
 
 ### `/diff`
 
@@ -103,9 +107,12 @@ followed by every variable that would begin above its loop's input, per [A varia
 above its loop's input](#a-variable-that-begins-above-its-loops-input).
 
 With two, `/diff/<a>/<b>` compiles `<a>`'s and `<b>`'s current sources and replies with the
-rendered difference from `<a>`'s version to `<b>`'s. Both names are required, and each must be one
-the table holds. Only current versions can be compared, because an entry keeps only its current
-version's source, per [The branch table](#the-branch-table).
+rendered difference from `<a>`'s version to `<b>`'s, or `no difference at phase <p>`. It carries no
+report of variables that begin above their loops' inputs, because no reload takes one branch's
+version to the other's. Both names are required, and each must be one the table holds. Query text
+after the phase is refused with 400, because the verb takes no source. Only current versions can be
+compared, because an entry keeps only its current version's source, per [The branch
+table](#the-branch-table).
 
 ### `/reload`
 
@@ -119,10 +126,11 @@ does not hold answers 404. Every other refusal is [State takeover](#state-takeov
 **Create** is branch-and-reload. It copies `<parent>`'s entry, `main`'s by default, under `<name>`,
 and reloads the copy with `<source>`, per [A branch is created by
 branch-and-reload](#a-branch-is-created-by-branch-and-reload). A compile error or a refusal at that
-reload leaves no entry, and the reply is the reload's 400. Creation is also refused when `<name>` is
-already in the table or `<parent>` is not. A tombstoned `<name>` is not in the table, so creating it
-succeeds and continues the tombstone's numbering. A 200 reply reads `` created `<name>@<n>` from
-`<parent>@<m>` `` followed by the reply `/reload` gives.
+reload leaves no entry and consumes no version number, and the reply is the reload's 400. Creation
+is also refused when `<name>` is already in the table, with 400, and answers 404 when `<parent>` is
+not, because a branch name the table does not hold is a 404. A tombstoned `<name>` is not in the
+table, so creating it succeeds and continues the tombstone's numbering. A 200 reply reads ``
+created `<name>@<n>` from `<parent>@<m>` ``, a newline, and the reply `/reload` gives.
 
 **Delete** removes `<name>`'s entry and leaves its tombstone, per [Deleting a
 branch](#deleting-a-branch). It is refused for a name the table does not hold and for the last
@@ -144,7 +152,8 @@ staging	version=3	from=main@2	operators=14	shared=9
 
 The version lines start at the version the entry was created at, so a recreated name lists none of
 its tombstone's versions. A version line's tally is the `<kept>/<bound>` of the reload that
-installed it, the creating one included.
+installed it, the creating one included. The root's first version was installed by the process's
+first compile, which keeps nothing, so its line reads `kept=0/<bound>`.
 
 ### `/branches/list`
 
@@ -189,9 +198,16 @@ decided, the one built-in rule is that the last branch in the table cannot be de
 
 ## The branch table
 
-> **Status: [Prescribed].** The code has one `LiveProgram` and one `OpConversionContext` whose
-> `minted` `Inheritance` is the single version's record. The table generalizes that record to one
-> per branch.
+> **Status: [Decided].** `LiveProgram` holds one `Branch` per entry and a tombstone per deleted
+> name. Pinned by these cases in `tests/hot_reload/branching.rs`:
+> `branch_and_reload_creates_a_branch_forked_from_its_parent`,
+> `a_refused_branch_and_reload_leaves_no_entry`, `a_parents_reload_leaves_its_child_untouched`,
+> `a_childs_reload_keeps_its_own_accumulated_value`, `list_and_info_report_versions_and_provenance`,
+> `a_recreated_name_continues_its_tombstones_numbering`,
+> `deleting_a_branch_frees_only_what_no_other_entry_holds`, `the_last_branch_cannot_be_deleted`,
+> `a_lagging_branch_does_not_make_a_reload_fold_twice`,
+> `a_lagging_branch_does_not_make_a_new_branch_fold_twice` and
+> `the_driver_pulls_every_branch_and_exits_when_all_have_finished`.
 
 **A branch's entry is its branch provenance, its version number, its version, and the operators it
 holds.** The version is what a `LiveProgram` holds today: the `CompiledProgram` (source, tree,
@@ -211,8 +227,9 @@ version its parent has since replaced, or a branch since deleted.
 its `Rc<FanOut>`, and each fan-out owns the chain under it, per [Nothing inside a fan-out owns
 it](#nothing-inside-a-fan-out-owns-it). Dropping an operator from one entry therefore frees it only
 when no other entry holds it. A sink consumer needs an explicit `SinkConsumer::detach` to stop
-dispatch, so that call is the one place the ownership check is written out: a branch detaches only
-the sink consumers no other entry holds.
+dispatch, and a branch detaches only the sink consumers no other entry holds. Every sink consumer is
+built by the compile that installs one entry's version, branch-and-reload's included, so no two
+entries hold one and a teardown detaches all of its own (`Branch::tear_down`).
 
 ![An operator graph beside its branch table: main holds r1, r2 and r3; v1, v2 and v3 each hold the part of that chain they share with it and their own ember nodes g1, b1 to b2, and o1](img/branch-table.svg)
 
@@ -242,7 +259,9 @@ the parent's name and version number at that instant.
 
 The copy is not exposed on its own. Until its reload, a copied entry computes and sends exactly what
 its parent does, so a branch comes into existence with a version of its own, and a refused reload
-leaves no entry.
+leaves no entry. `LiveProgram::create_branch` therefore builds no copy: it runs the reload's checks
+against the parent's entry and offers that entry to the compile by reference, and only an accepted
+compile adds an entry.
 
 The root is created at process start as `main@1`, holding the version the process was started with,
 and is the one branch not created by branch-and-reload.
@@ -284,9 +303,12 @@ the `released_position` of every fan-out it reads stops rising, per [Guards inte
 fan-out](#guards-intersect-at-a-fan-out). The next reload of any branch that keeps such a fan-out
 would then resume those iterations below where that branch had reached, and decide positions a
 second time. A branch's outputs stay subscribed and pulled for as long as its entry exists. The
-binary's driver pulls every branch's `main` output, and prints a value from a branch other than the
-root as `Got value from <branch>: …`. A version whose `main` output has finished is no longer
-pulled, and the process exits when every branch's `main` output has finished.
+binary's driver pulls every branch's `main` output (`LiveProgram::pull_mains`), and prints a value
+from a branch other than the root as `Got value from <branch>: …`. The root is the branch with no
+branch provenance, so a branch created under the name `main` after the root's deletion prints
+labelled. A version whose `main` output has finished is no longer pulled. The process exits when
+every branch's `main` output has finished and every branch's sink outputs have signalled
+completion, which a sink program serving a route never does.
 
 ![main's operator graph with branch_1 hanging off n1, then the same graph after main's reload: n4 to n6 built, n1 kept, n2 and n3 freed](img/branching-flow.svg)
 
@@ -333,8 +355,25 @@ lag the predecessor's. A replacement starting at that agreement would be offered
 it carries already summarizes, and a store rebuilt from that state would fold them a second time.
 `carry_release_to_new_producers` therefore records, per source, the intersection of the
 predecessor's producers' releases, and the source's own agreement goes on governing retention only.
-Every branch reading a source reads it through its own producer, and no producer's progress advances
-another's view.
+A predecessor with no producer on a source records the agreement there. Every branch reading a
+source reads it through its own producer, and no producer's progress advances another's view
+(`a_lagging_branch_does_not_make_a_reload_fold_twice`,
+`a_lagging_branch_does_not_make_a_new_branch_fold_twice`).
+
+**A branch's producers are the ones its version's compile registered and the ones under the
+operators it holds.** A producer registers with a source from `IterateExtent::subscribe`, which
+reports it to the innermost frame `Scheduler::begin_source_readers` opened. A fan-out opens a frame
+around subscribing its input and keeps what it collects (`FanOut::source_readers`), so the producers
+under a kept operator are read off the operator. A compile opens a frame around conversion and
+subscription and keeps what it collects (`CompiledProgram::source_readers`), which covers its
+outputs' producers. The carry runs before the reloaded branch's teardown, because the teardown drops
+its outputs' producers and a record dies with its producer. A producer that registers outside every
+frame, which only a subscription made outside a compile does, is attributed to no branch.
+
+> **Open: a fan-out seeds a new subscriber from every branch's slots.** A rebuilt reader
+> subscribing to a kept fan-out starts at `FanOutShared::released`, the intersection over every
+> slot, so another branch's lagging slot holds it down the way a lagging producer would hold down a
+> source. The one-branch form of this is the pinned failure in `tests/hot_reload/fanout_lag.rs`.
 
 **Every branch pins retention for every other.** A source keeps an element until every branch's
 producer releases it, so a slow branch holds memory for all of them, until it is reloaded or
@@ -343,8 +382,9 @@ costs its compute and retention until every entry holding it has dropped it.
 
 ## How a reload works
 
-> **Status: [Decided]** for `main`. Every other branch's reload runs the same three steps, and so
-> does branch-and-reload against its parent's tree and entry, [Prescribed].
+> **Status: [Decided]** for every branch, and for branch-and-reload against its parent's tree and
+> entry (`a_childs_reload_keeps_its_own_accumulated_value`,
+> `branch_and_reload_creates_a_branch_forked_from_its_parent`).
 
 A reload drops the running version's subscriptions and then builds the replacement's, so one
 version's graph is subscribed at a time and nothing observes a half-swapped one. What crosses the
@@ -539,8 +579,8 @@ changed at all is rebuilt whole, even where it still computes most of what it di
 
 ## The release model
 
-> **Status: [Current].** What the code does today, for one branch. [Routes across
-> branches](#routes-across-branches) says what changes with more.
+> **Status: [Current].** What the code does today. [Routes across
+> branches](#routes-across-branches) says what a second branch changes.
 
 A subscriber tells its input what it will never read again, and an input keeps a value until every
 subscriber has said so. Reuse, resumption and retirement all follow from that rule.
@@ -622,19 +662,22 @@ mask it).
 
 ### Where a producer registering now starts
 
-`carry_release_to_new_producers` records the agreement as the starting point for producers
-registering from then on, and `first_position_for_a_new_producer`
-(`StreamBuffer::first_index_for_a_new_producer`) is that released prefix plus one. Neither has a
-default: a source that did not carry would replay its history into the replacement and re-emit an
-output for every input the replaced version answered.
+`carry_release_to_new_producers` records, as the starting point for producers registering from then
+on, the intersection of the releases of the producers the replaced version holds, per [Routes
+across branches](#routes-across-branches). With one branch that is the agreement.
+`first_position_for_a_new_producer` (`StreamBuffer::first_index_for_a_new_producer`) is that
+released prefix plus one. Neither has a default: a source that did not carry would replay its
+history into the replacement and re-emit an output for every input the replaced version answered.
 
-The starting point is the agreement, not the newest position, because an index some producer has not
-finished with must not be skipped. An element that arrived and went unhandled is still delivered to
-whichever version takes over.
+The starting point is an intersection, not the newest position, because an index one of those
+producers has not finished with must not be skipped. An element that arrived and went unhandled is
+still delivered to whichever version takes over.
 
 ## State takeover
 
-> **Status: [Decided]** for `main`. [Prescribed] for every other branch and for branch-and-reload.
+> **Status: [Decided]** for every branch and for branch-and-reload
+> (`a_refused_branch_and_reload_leaves_no_entry`,
+> `a_childs_reload_keeps_its_own_accumulated_value`).
 
 **A reload is refused unless the new version can receive the state its predecessor holds.** The
 predecessor is the branch's running version, or the parent's for branch-and-reload, per [A branch
@@ -647,7 +690,8 @@ the reload is refused.
 in its neighbour's variable is receivable, so takeover does not catch it. It is the third and fourth
 refusals of [Five refusals](#five-refusals).
 
-`LiveProgram::reload` runs both checks before anything is torn down. It compares the variables the
+`LiveProgram::check` runs both checks before anything is torn down, for `reload_branch` and
+`create_branch` alike. It compares the variables the
 predecessor holds against those the new version declares, read off its planned tree
 (`OpConversionContext::state_conflicts`). A refused reload leaves every branch whole and serving.
 
@@ -906,8 +950,7 @@ and the input reads a source), and `a_loop_added_over_a_buildable_collection_rep
 
 ## The reload lifecycle
 
-> **Status: [Decided]** for `main`. Every other branch's reload, and branch-and-reload, follow the
-> same order, [Prescribed].
+> **Status: [Decided]** for every branch's reload and for branch-and-reload.
 
 A reload is a **swap**: the reloaded branch's subscriptions are dropped and the replacement's are
 built, so one version of that branch is subscribed at a time and nothing observes a half-swapped
@@ -922,20 +965,22 @@ one.
    version that fails either leaves every branch serving, and a refusal hands the ports back
    (`release_unrouted_ports`). The report of every variable that begins above its loop's input comes
    off this tree and is carried in `ReloadReport`, not rendered into the difference.
-3. Tear down the branch's graph: detach its sink consumers and drop its outputs. Only the sink
-   consumers no other entry holds are detached, per [The branch table](#the-branch-table). For
-   branch-and-reload this step does nothing, because every sink consumer the copy holds is its
-   parent's.
-4. Offer the predecessor's operators and stores as the next compilation's inheritance.
-   `GlobalContext::retire_version` records, for each source, where producers registering from then
-   on start (`carry_release_to_new_producers`), per [Routes across
-   branches](#routes-across-branches), and moves the retiring conversion context's record into the
-   inheritance. For branch-and-reload nothing retires: the parent's entry is offered by reference
-   and stays the parent's, and each source's starting point is taken from the parent's producers.
+3. Record, for each source, where producers registering from then on start
+   (`GlobalContext::carry_release_from`, `carry_release_to_new_producers`): where the predecessor's
+   producers stopped, per [Routes across branches](#routes-across-branches). This runs while the
+   predecessor's producers all exist. Then tear down the branch's graph: detach its sink consumers
+   and drop its outputs. Only the sink consumers no other entry holds are detached, per [The branch
+   table](#the-branch-table). For branch-and-reload the teardown does nothing, because every sink
+   consumer the copy holds is its parent's.
+4. Offer the predecessor's operators and stores as the next compilation's inheritance
+   (`GlobalContext::offer_predecessor`, `Inheritance::handover`). The record is offered by
+   reference: for a reload the branch's own entry, which the branch replaces at step 5, and for
+   branch-and-reload the parent's, which stays the parent's.
 5. Compile and subscribe the new version against the same registry, which binds every endpoint a
-   running version left open and opens the ones it adds. This compile diffs its own tree against the
-   predecessor's (`compile_replacement`) to get the correspondence reuse is keyed on. The branch's
-   entry becomes what it recorded, and its version number rises by one.
+   running version left open and opens the ones it adds, and retires every route no branch's
+   version binds. This compile diffs its own tree against the predecessor's (`compile_replacement`)
+   to get the correspondence reuse is keyed on. The branch's entry becomes what it recorded
+   (`GlobalContext::take_record`), and its version number rises by one.
 6. Notify each of the branch's sinks, so whatever is already available is pulled.
 
 Where each part of a program stands after a swap:
@@ -976,10 +1021,10 @@ arrival (`a_version_installed_mid_fold_is_pulled_without_a_new_arrival`).
 An accepted reload compiles four times: twice for the diff, once to `Planning` for the guard and the
 report, and once for real. `run_frontend` goes from source to a stop phase and cannot continue a
 stopped tree into operator conversion, so the guard's tree is not the one that gets built, and
-`LiveProgram::reload` documents a panic for the two compiles disagreeing. `/diff` compiles three
-times: the same two, and a `Planning` tree of its own for the report. Reuse is keyed on step 5's
-tree, because a node's identity is its address and a correspondence taken against step 1's or step
-2's tree would name nodes the built graph was not built from.
+`LiveProgram::reload_branch` documents a panic for the two compiles disagreeing. `/diff` compiles
+three times: the same two, and a `Planning` tree of its own for the report. Reuse is keyed on step
+5's tree, because a node's identity is its address and a correspondence taken against step 1's or
+step 2's tree would name nodes the built graph was not built from.
 
 > **Open: the swap pauses the process.** Steps 3 to 5 run between two pulls with `&mut self`, and a
 > rebuilt store folds what its input offers before the new version answers anything. A `@LoadFrom`
@@ -992,8 +1037,8 @@ tree, because a node's identity is its address and a correspondence taken agains
 The swap has a place in execution order and no place in any domain the program has.
 
 **It is totally ordered against everything.** The driver services the control port between two
-pulls, `LiveProgram::reload` takes `&mut self`, and one version of a branch is subscribed at a time,
-so every operator in the process has an unambiguous before and after.
+pulls, `LiveProgram::reload_branch` takes `&mut self`, and one version of a branch is subscribed at
+a time, so every operator in the process has an unambiguous before and after.
 
 **It is not a position.** Positions are indexed by the reading loop
 ([mutability.md](mutability.md)), each store has a private commit tick, and a rebuilt store restarts
