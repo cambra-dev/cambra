@@ -137,10 +137,12 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
         return Tiling::Scalar(option_extent);
     }
     match keys {
-        Tiling::DataFunction { domain, .. } => Tiling::DataFunction {
-            domain: domain.clone(),
-            codomain: Box::new(Tiling::Scalar(option_extent)),
-        },
+        // One key per row at one level, and a **collection of keys per row** deeper — what
+        // a correlated comprehension's key binder is, one group of keys per outer row. The
+        // answer keeps the shape either way: one answer per key, where its key sits.
+        keys @ Tiling::DataFunction { .. } => {
+            change_tiling_result(keys, |_| Tiling::Scalar(option_extent))
+        }
         other => panic!("CheckedLookup keys must be a scalar or a stream, got {other}"),
     }
 }
@@ -349,7 +351,10 @@ impl TileProducer for CheckedLookupProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
-            Tiling::DataFunction { codomain, .. } => codomain.extent(),
+            // One answer per row at one level, and a collection of answers per row —
+            // one per key of that row's group — deeper. Either way the answers sit where
+            // the keys do.
+            t @ Tiling::DataFunction { .. } => t.deepest_values().extent(),
             other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
         };
         let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
@@ -381,29 +386,47 @@ impl TileProducer for CheckedLookupProducer {
                         }
                     }
                     // A stream of keys, each answered against the same collection — read
-                    // once, not lifted into every row.
-                    Tile::DataFunction {
-                        ref domain,
-                        ref codomain,
+                    // once, not lifted into every row. One key per row at one level, and a
+                    // group of keys per row deeper, which is what a correlated
+                    // comprehension's key binder is.
+                    ref tile @ Tile::DataFunction {
                         ref domain_predicate,
+                        ref codomain,
                         ..
                     } => {
+                        let nested = codomain.is_data_function();
+                        let Tile::DataFunction { domain: inner, .. } = tile
+                            .innermost_level()
+                            .unwrap_or_else(|| unreachable!("the arm matched a collection"))
+                        else {
+                            unreachable!("innermost_level answers a collection")
+                        };
                         // A product key arrives as a record of columns and pivots to the one
                         // column a domain is searched with; a scalar one is already that, and
                         // borrows, so the common shape is not charged a copy per pull.
-                        let key_col = match codomain.as_ref() {
+                        let key_col = match tile.deepest_values() {
                             Tile::Scalar(col) => Cow::Borrowed(col),
-                            record @ Tile::Record(_) => {
-                                Cow::Owned(scalar_tile_to_column_value(record.clone()))
-                            }
-                            other => panic!(
-                                "CheckedLookup: a key is one value, so the key stream's codomain \
-                                 tiles as a scalar or a record of them; got {other:?}"
-                            ),
+                            record => Cow::Owned(scalar_tile_to_column_value(record.clone())),
                         };
                         let (kept, answers) =
-                            Self::answer_rows(domain, &key_col, &RowCollection::Shared(&coll));
-                        self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
+                            Self::answer_rows(inner, &key_col, &RowCollection::Shared(&coll));
+                        if !nested {
+                            // One key per row: an undecided key drops its row, and the rows
+                            // that did answer go out now.
+                            self.stream_tile(kept, answers, inner, domain_predicate, &out_extent)
+                        } else {
+                            // A group of keys per row, the grouping carried through
+                            // untouched. An undecided key would have to re-offset the groups
+                            // it left, so a tile that cannot answer them all answers none
+                            // and waits.
+                            if kept.len() < inner.len() {
+                                return empty_scalar;
+                            }
+                            let mut out = tile.clone();
+                            *out.deepest_values_mut() =
+                                Tile::Scalar(ColumnValue::from_values(answers, &out_extent));
+                            out
+                        }
                     }
                     other => {
                         panic!("CheckedLookup keys tile as a scalar or a stream, got {other:?}")
