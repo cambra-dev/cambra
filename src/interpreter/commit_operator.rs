@@ -42,6 +42,7 @@
 //! [`CommitEngine::attempt`] is called. There is no parallelism; serialization
 //! semantics are validated deterministically.
 
+use bit_set::BitSet;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ccl::F_WRITES;
@@ -58,8 +59,7 @@ use crate::pretty_tree::InspectNode;
 
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
 use crate::interpreter::tile_operators::{
-    OperatorBase, impl_operator_base, impl_producer_base, materialize_collections,
-    open_row_collections,
+    OperatorBase, impl_operator_base, impl_producer_base, materialize_collections, open_collections,
 };
 
 /// A commit timestamp — a position on the runtime's monotonic commit clock.
@@ -705,6 +705,45 @@ enum ReleasedExtent {
     Nothing,
     Through(usize),
     All,
+}
+
+/// The tiling a store read hands out for `value_extent`, one level deeper when the value
+/// is a collection.
+///
+/// A store holds one value per key per tick, so a collection-valued key is a map in a cell.
+/// Handing its keys out as a level is what lets a consumer fold the elements directly,
+/// rather than reading a column of maps something downstream has to open first.
+pub(crate) fn read_tiling(position: Extent, value_extent: &Extent) -> Tiling {
+    Tiling::data_function(position, Tiling::from_extent(value_extent))
+}
+
+/// The tile for [`read_tiling`]: one value per position, opened to match
+/// [`Tiling::from_extent`].
+pub(crate) fn read_tile(
+    positions: ColumnValue,
+    values: Vec<Value>,
+    value_extent: &Extent,
+    domain_predicate: Predicate,
+) -> Tile {
+    Tile::data_function(
+        positions,
+        Box::new(stored_value_tile(values, value_extent)),
+        domain_predicate,
+        BitSet::new(),
+    )
+}
+
+/// One stored value per position, opened into the shape [`Tiling::from_extent`] declares.
+fn stored_value_tile(values: Vec<Value>, value_extent: &Extent) -> Tile {
+    let tile = open_collections(
+        &ColumnValue::from_values(values, value_extent),
+        value_extent,
+    );
+    debug_assert!(
+        tile.check_from(&Tiling::from_extent(value_extent)),
+        "a store read's values take the tiling of their extent: {tile:?} vs {value_extent}"
+    );
+    tile
 }
 
 /// Encode a `Key ⇀ Value` map (a read set, write set, or store delta) as a
@@ -1609,10 +1648,7 @@ impl StoreValueStream {
         carry_forward: bool,
     ) -> Self {
         Self {
-            base: OperatorBase::new(Tiling::data_function(
-                Extent::Base(BaseType::UInt),
-                Tiling::Scalar(value_extent.clone()),
-            )),
+            base: OperatorBase::new(read_tiling(Extent::Base(BaseType::UInt), &value_extent)),
             store_op,
             key,
             value_extent,
@@ -1754,14 +1790,11 @@ impl TileProducer for StoreValueStreamProducer {
                 values.push(v);
             }
         }
-        Tile::data_function(
+        read_tile(
             ColumnValue::from_uints(ticks),
-            Box::new(Tile::Scalar(ColumnValue::from_values(
-                values,
-                &self.value_extent,
-            ))),
+            values,
+            &self.value_extent,
             domain_predicate.clone(),
-            bit_set::BitSet::new(),
         )
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1937,7 +1970,7 @@ impl TileProducer for StoreFinalReadProducer {
 /// at `p + 1` here, commit ticks there) and how they emit (full re-emit here for
 /// `zip_arms`/`ExtractFinal`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
-    /// Output tiling `DataFunction { domain: D, codomain: Scalar(V) }`.
+    /// Output tiling [`read_tiling`] over `D`.
     base: OperatorBase,
     /// Enumerates the loop extent `D` (its positions drive the output domain, so
     /// it aligns with any co-iterated source over the same `D`).
@@ -1975,9 +2008,8 @@ impl StoreDenseRead {
             "StoreDenseRead source must be a Store, got {}",
             store_op.tiling()
         );
-        let tiling = Tiling::data_function(domain.clone(), Tiling::Scalar(value_extent.clone()));
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new(read_tiling(domain.clone(), &value_extent)),
             trigger,
             store_op,
             key,
@@ -2151,15 +2183,7 @@ impl TileProducer for StoreDenseReadProducer {
         } else {
             Predicate::from_column_value(&positions)
         };
-        Tile::data_function(
-            positions,
-            Box::new(Tile::Scalar(ColumnValue::from_values(
-                values,
-                &self.value_extent,
-            ))),
-            domain_predicate,
-            bit_set::BitSet::new(),
-        )
+        read_tile(positions, values, &self.value_extent, domain_predicate)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -2254,27 +2278,14 @@ pub struct AsOfField {
     pub value_extent: Extent,
 }
 
-/// One snapshot field's tile, in the form [`Tiling::from_extent`] gives its extent: a
-/// collection-valued field opens each row's map into that row's group.
-fn field_tile(value_extent: &Extent, values: Vec<Value>) -> Tile {
-    match value_extent {
-        Extent::Function { domain, codomain } => open_row_collections(
-            &ColumnValue::from_values(values, value_extent),
-            domain,
-            codomain,
-        ),
-        _ => Tile::Scalar(ColumnValue::from_values(values, value_extent)),
-    }
-}
-
 /// What an [`AsOf`] latches and emits per trigger position.
 #[derive(Clone)]
 enum AsOfOutput {
-    /// A single mutable variable → scalar codomain `Fun(B, Scalar(V))` — the bare or
-    /// computed single-variable as-of read.
+    /// A single mutable variable → `Fun(B, V)` — the bare or computed single-variable
+    /// as-of read.
     Scalar { key: Value, value_extent: Extent },
-    /// A whole-snapshot record → `Fun(B, Record{field: Scalar(V)})` — the
-    /// multi-variable as-of read. Every field is folded from a single source render
+    /// A whole-snapshot record → `Fun(B, Record{field: V})` — the multi-variable as-of
+    /// read. Every field is folded from a single source render
     /// at one commit frontier (§I-c), so a reply reading several mutable variables sees a
     /// consistent snapshot.
     Record { fields: Vec<AsOfField> },
@@ -2288,12 +2299,12 @@ impl AsOfOutput {
             AsOfOutput::Record { fields } => fields.iter().map(|f| &f.key).collect(),
         }
     }
-    /// The codomain tiling (`Scalar(V)` or `Record{field: Scalar(V)}`).
+    /// The codomain tiling: each sampled value takes the tiling of its extent, as every
+    /// store read's does ([`read_tiling`]), so a collection-valued one is a level
+    /// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
     fn codomain_tiling(&self) -> Tiling {
         match self {
-            AsOfOutput::Scalar { value_extent, .. } => Tiling::Scalar(value_extent.clone()),
-            // A collection-valued field stays a tile (`src/interpreter/design-operators.md`,
-            // "A collection inside a value stays a tile").
+            AsOfOutput::Scalar { value_extent, .. } => Tiling::from_extent(value_extent),
             AsOfOutput::Record { fields } => Tiling::Record(
                 fields
                     .iter()
@@ -2305,8 +2316,8 @@ impl AsOfOutput {
 }
 
 pub struct AsOf {
-    /// Output tiling: `DataFunction { domain: B, codomain }` where `codomain`
-    /// is `Scalar(V)` (single mutable variable) or `Record{field: Scalar(V)}` (snapshot).
+    /// Output tiling: `DataFunction { domain: B, codomain }` where `codomain` is
+    /// [`AsOfOutput::codomain_tiling`].
     base: OperatorBase,
     /// The trigger stream `Fun(B, _)` — drives one output position each.
     trigger: Box<dyn TileOperator>,
@@ -2320,7 +2331,7 @@ pub struct AsOf {
 impl AsOf {
     /// `trigger : Fun(B, _)`, `source` the shared commit store (`Tiling::Store`),
     /// `key`/`value_extent` the mutable variable to sample → output
-    /// `Fun(B, Scalar(value_extent))`.
+    /// `Fun(B, value_extent)`.
     pub fn new(
         trigger: Box<dyn TileOperator>,
         source: Box<dyn TileOperator>,
@@ -2331,7 +2342,7 @@ impl AsOf {
     }
 
     /// The multi-variable **snapshot** read: sample every `field`'s mutable variable at
-    /// one commit snapshot → output `Fun(B, Record{field: Scalar(V)})`, from which
+    /// one commit snapshot → output `Fun(B, Record{field: V})`, from which
     /// the reply projects each mutable variable. This is the §I-c snapshot-consistent
     /// as-of read.
     pub fn new_snapshot(
@@ -2443,9 +2454,8 @@ impl AsOfProducer {
 
     /// Build the output tile from the currently-latched `(b ↦ snapshot)` pairs,
     /// under `domain_predicate`. The latched set is already compacted of released
-    /// positions, so it emits exactly the live response window. The codomain is a
-    /// `Scalar` column (single mutable variable) or a `Record` of per-field `Scalar`
-    /// columns (snapshot), each column indexed by the emitted domain position.
+    /// positions, so it emits exactly the live response window. The codomain is
+    /// [`AsOfOutput::codomain_tiling`]'s, each value indexed by the emitted domain position.
     fn emit_latched(&self, domain_predicate: Predicate) -> Tile {
         let n_keys = self.output.keys().len();
         let mut bs = Vec::with_capacity(self.latched.len());
@@ -2457,15 +2467,14 @@ impl AsOfProducer {
             }
         }
         let codomain = match &self.output {
-            AsOfOutput::Scalar { value_extent, .. } => Tile::Scalar(ColumnValue::from_values(
-                cols.into_iter().next().unwrap_or_default(),
-                value_extent,
-            )),
+            AsOfOutput::Scalar { value_extent, .. } => {
+                stored_value_tile(cols.into_iter().next().unwrap_or_default(), value_extent)
+            }
             AsOfOutput::Record { fields } => Tile::Record(
                 fields
                     .iter()
                     .zip(cols)
-                    .map(|(f, col)| (f.field.clone(), field_tile(&f.value_extent, col)))
+                    .map(|(f, col)| (f.field.clone(), stored_value_tile(col, &f.value_extent)))
                     .collect(),
             ),
         };
@@ -2475,7 +2484,7 @@ impl AsOfProducer {
             // Terminality rides with the trigger: when no more requests will
             // arrive (trigger terminal) the response set is complete.
             domain_predicate,
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 }
@@ -2762,17 +2771,26 @@ impl DriverWindow {
                     }
                 })
                 .collect();
-            Tile::Scalar(ColumnValue::from_values(column, ext))
+            stored_value_tile(column, ext)
         });
+        let positions: Vec<usize> = self.rows.iter().map(|r| r.position).collect();
+        let domain = ColumnValue::from_uints(positions);
         Tile::data_function(
-            ColumnValue::from_uints(self.rows.iter().map(|r| r.position).collect()),
+            domain.clone(),
             Box::new(Tile::Record(fields)),
+            // A row is final once it is emitted: it was built from one `(item, frontier)`
+            // pair, and a retry at a moved frontier is a fresh position. `push` asserts that
+            // by refusing a position at or below one already pushed, against a
+            // `next_position` that survives compaction, so the check spans pulls. Reporting
+            // the emitted positions rather than `False` lets a fold over a field's own
+            // collection settle per row. Waiting for the whole drive to finish would never
+            // end, since the drive waits on the decision that fold feeds.
             if done {
                 Predicate::True
             } else {
-                Predicate::False
+                Predicate::from_column_value(&domain)
             },
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 }
@@ -3448,11 +3466,16 @@ impl TileProducer for TransactDriverProducer {
 
 /// The body-input tiling both writers' drivers produce: `UInt → {_0…_{r-1}:
 /// read, _r: item}`.
+///
+/// Each field is opened the way every other store read is ([`Tiling::from_extent`]), so a
+/// collection-valued read reaches the body as a level rather than as a map in a cell — which
+/// is what lets the body iterate it. A write goes the other way: a store write is one value
+/// per key, so what the body computes materializes where it becomes the decision's payload.
 fn body_input_tiling(read_extents: &[Extent], item_extent: &Extent) -> Tiling {
     Tiling::data_function(
         Extent::Base(BaseType::UInt),
         Tiling::Record(body_input_fields(read_extents, item_extent, |_, ext| {
-            Tiling::Scalar(ext.clone())
+            Tiling::from_extent(ext)
         })),
     )
 }
@@ -3850,7 +3873,7 @@ impl TransactWriterProducer {
             } else {
                 Predicate::False
             },
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 
@@ -4297,7 +4320,7 @@ mod tests {
                     &value_extent(),
                 ))),
                 Predicate::True,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             );
             Self { tiling, tile }
         }
@@ -4475,7 +4498,7 @@ mod tests {
                 // exactly when its input is, as a compiled body's operator chain
                 // propagates it. The store reads this to close its frontier.
                 domain_predicate,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             )
         }
 
@@ -5781,7 +5804,7 @@ mod tests {
             } else {
                 Predicate::False
             },
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 
@@ -6467,7 +6490,7 @@ mod tests {
                 ColumnValue::from_uints(vec![]),
                 Box::new(Tile::Scalar(ColumnValue::from_ints(vec![]))),
                 Predicate::False,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             ),
         };
         let g = nonscalar.tiling().universal_guard();
@@ -6498,7 +6521,7 @@ mod tests {
                     ),
                     Box::new(codomain),
                     Predicate::True,
-                    bit_set::BitSet::new(),
+                    BitSet::new(),
                 ),
             };
             let g = source.tiling().universal_guard();
@@ -6676,7 +6699,7 @@ mod tests {
             ColumnValue::from_uints(vec![2, 0, 1]),
             Box::new(Tile::Scalar(ColumnValue::from_ints(vec![30, 10, 20]))),
             Predicate::True,
-            bit_set::BitSet::new(),
+            BitSet::new(),
         );
         assert_eq!(
             decode_source_positioned(&tile),

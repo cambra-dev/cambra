@@ -4879,7 +4879,7 @@
           "label": "Constant",
           "nodeId": 620,
           "role": "operator",
-          "tiling": "({[0, 3]} -> Int)",
+          "tiling": "Fn({[0, 3]} → Int)",
           "spans": [
             {
               "start": 73,

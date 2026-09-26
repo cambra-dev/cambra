@@ -5,6 +5,7 @@ use crate::{
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
+use bit_vec::BitVec;
 
 // ---------------------------------------------------------------------------
 // ExtractFinal / ExtractFinalProducer
@@ -33,7 +34,7 @@ pub struct ExtractFinal {
     /// case to fall back from and no default value has to be invented. An empty
     /// source with no default is an invariant violation, not a fallback.
     default: Option<Box<dyn TileOperator>>,
-    /// Output tiling — the codomain of the source Function (always `Scalar`).
+    /// Output tiling — what one position of the source holds.
     base: OperatorBase,
 }
 
@@ -87,10 +88,14 @@ impl ExtractFinal {
         }
     }
 
+    /// What one position of `source` holds: its levels minus the one being indexed.
+    ///
+    /// A one-level source holds a scalar per position; a deeper one holds a collection, and
+    /// the final position's value is that collection rather than an element of it.
     fn source_codomain_tiling(source: &dyn TileOperator) -> Tiling {
         match source.tiling() {
             Tiling::DataFunction { codomain, .. } => *codomain.clone(),
-            other => panic!("ExtractFinal source must have a function tiling, got {other}"),
+            other => panic!("ExtractFinal source must have a collection tiling, got {other}"),
         }
     }
 }
@@ -129,7 +134,7 @@ impl TileOperator for ExtractFinal {
             base: ProducerBase::new(ExtractFinalProducer::alloc_id(), self.tiling()),
             source: source_producer,
             default: default_producer,
-            final_value: None,
+            final_tile: None,
             released: false,
         })
     }
@@ -150,7 +155,9 @@ struct ExtractFinalProducer {
     /// that pull repeatedly (e.g. sibling `Final` projections off a
     /// shared multi-accumulator mutation-loop) see a stable value
     /// instead of an empty source after the first terminal pull.
-    final_value: Option<Value>,
+    /// The extracted result, re-emitted until released. A tile rather than a value: a
+    /// collection-valued position holds a whole sub-tile.
+    final_tile: Option<Tile>,
     /// Set to `true` by [`Self::release_impl`] on a universal release.
     /// Returns an empty scalar from every subsequent `get`.  The
     /// surrounding `Memo` normally issues this universal release as
@@ -179,7 +186,7 @@ impl TileProducer for ExtractFinalProducer {
         // with the ones that did not occur empty, which is the shape downstream
         // merges and appends require.
         let extent = self.tiling().extent();
-        let empty = Tile::Scalar(ColumnValue::from_values(vec![], &extent));
+        let empty = self.tiling().empty_tile();
         if self.released {
             return empty;
         }
@@ -188,8 +195,8 @@ impl TileProducer for ExtractFinalProducer {
         // sight of a non-empty tile, so this branch only stays active
         // across pulls when the consumer doesn't release immediately
         // (e.g. while a sibling pipeline is still converging).
-        if let Some(v) = &self.final_value {
-            return Tile::Scalar(ColumnValue::from_values(vec![v.clone()], &extent));
+        if let Some(tile) = &self.final_tile {
+            return tile.clone();
         }
         let source_tiling = self.source.tiling().clone();
         let source_tile = self.source.get(source_tiling.universal_guard());
@@ -237,25 +244,50 @@ impl TileProducer for ExtractFinalProducer {
         // a repeated call from the consumer's outer pull loop is fine.
         self.source.release(source_tiling.universal_guard());
         let Tile::DataFunction {
+            domain,
             codomain,
-            deleted: removed,
+            deleted,
             ..
         } = source_tile
         else {
             panic!("ExtractFinal source must be a collection tile");
         };
-        let cv = scalar_tile_to_column_value(*codomain);
-        let n = cv.len();
-        // Try to extract the final non-deleted value from the source.
-        // TODO don't assume sorting; we need to sort by the domain value instead.
-        if let Some(final_idx) = (0..n).rev().find(|&i| !removed.contains(i)) {
-            let value = cv.index_at(final_idx);
-            self.final_value = Some(value.clone());
-            return Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
+        // The position being indexed is this collection's key, and what it holds is
+        // everything below it: a value where the values are a column, a whole collection
+        // where they are one.
+        // TODO don't assume sorting; we need to sort by the key value instead.
+        let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
+        if let Some(final_idx) = live_outer {
+            let tile = if codomain.is_data_function() {
+                // Keeping one row leaves that key's group standing alone, which is the
+                // value at this position. The source is terminal and this is its last
+                // position, so what it holds is the whole collection.
+                let mut sub = *codomain;
+                sub.retain_rows(&BitVec::from_fn(domain.len(), |i| i == final_idx));
+                let Tile::DataFunction {
+                    domain_predicate, ..
+                } = &mut sub
+                else {
+                    unreachable!("retain keeps a collection a collection")
+                };
+                *domain_predicate = Predicate::True;
+                sub
+            } else {
+                // Built at the *declared* extent: a tag `match` collapses its arms to their
+                // join, and the arm that answers carries only its own tag.
+                let cv = scalar_tile_to_column_value(*codomain);
+                Tile::Scalar(ColumnValue::from_values(
+                    vec![cv.index_at(final_idx)],
+                    &extent,
+                ))
+            };
+            self.final_tile = Some(tile.clone());
+            return tile;
         }
         // Source is terminal *and* empty (the loop body ran zero times).  Pull the
         // default scalar and emit that instead, then release the default so its
         // upstream chain can release too.
+        let yields_a_level = self.tiling().is_data_function();
         let Some(default) = self.default.as_mut() else {
             // No default means the source was declared total — an exhaustive tag
             // partition always covers exactly one position. An empty source here is
@@ -267,11 +299,23 @@ impl TileProducer for ExtractFinalProducer {
         };
         let default_tiling = default.tiling().clone();
         let default_tile = default.get(default_tiling.universal_guard());
+        // A collection-valued position falls back to the whole collection, so the default
+        // is the tile it is rather than a value to rebuild a column from. It has converged
+        // once it is terminal, which is what `as_single` says for the scalar case.
+        if yields_a_level {
+            if !default_tile.is_terminal() {
+                return empty;
+            }
+            default.release(default_tiling.universal_guard());
+            self.final_tile = Some(default_tile.clone());
+            return default_tile;
+        }
         match scalar_tile_to_column_value(default_tile).as_single() {
             Some(value) => {
                 default.release(default_tiling.universal_guard());
-                self.final_value = Some(value.clone());
-                Tile::Scalar(ColumnValue::from_values(vec![value], &extent))
+                let tile = Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
+                self.final_tile = Some(tile.clone());
+                tile
             }
             // Default hasn't converged yet — emit empty.  Outer pull
             // loop will retry; once default resolves, we'll cache it.

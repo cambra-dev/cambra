@@ -255,3 +255,109 @@ fn a_correlated_filter_beside_a_correlated_body_is_refused_for_its_pair_binder()
         "a `__pair` binder survived into a compiled predicate term",
     );
 }
+
+/// A transactional collection read **as a collection**, once per transaction.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::one_transaction("[1]", 3)]
+#[case::three_transactions("[1, 2, 3]", 9)]
+fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+                n: Mut(Int, Txn) := 0
+                for r in {}:
+                    with begin():
+                        n := n + sum([v for v in m])
+                await_final(n)
+            "#},
+            rows
+        ),
+        Value::Int(total),
+    );
+}
+
+/// A transactional map read back after a keyed write in the same block: the comprehension's
+/// source is the `insert` result rather than a store read (`src/ccl/design/optimization.md`,
+/// "A generator over a sum composes with its source"). Each transaction writes `b := 10` and
+/// then sums `{a: 1, b: 10}`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::identity("v", 22)]
+#[case::element_function("v * 2", 44)]
+fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[case] total: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+                n: Mut(Int, Txn) := 0
+                for r in [1, 2]:
+                    with begin():
+                        m["b"] := 10
+                        n := n + sum([{} for v in m])
+                await_final(n)
+            "#},
+            element
+        ),
+        Value::Int(total),
+    );
+}
+
+/// A collection-valued field of a transactional record, iterated inside a transaction.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_value_binder_reads_a_collection_field_of_a_transactional_record() {
+    check_scalar(
+        indoc! {r#"
+            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+            n: Mut(Int, Txn) := 0
+            for r in [1, 2, 3]:
+                with begin():
+                    n := n + sum([v for v in s.b])
+            await_final(n)
+        "#},
+        Value::Int(9),
+    );
+}
+
+/// A nested collection literal is a **level per nesting**, so a chain of aggregates collapses
+/// one level each to reach the integers.
+///
+/// The literal builds the table it denotes rather than a column of materialized maps, so
+/// nothing opens a level on the way in — the levels are there from the start.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::depth_two("sum([sum([v for v in xs]) for xs in [[1, 2], [3, 4]]])", 10)]
+#[case::depth_three(
+    "sum([sum([sum([v for v in ys]) for ys in xs]) for xs in [[[1, 2], [3, 4]]]])",
+    10
+)]
+#[case::depth_four(
+    "sum([sum([sum([sum([v for v in zs]) for zs in ys]) for ys in xs]) \
+     for xs in [[[[1, 2], [3, 4]]]]])",
+    10
+)]
+fn a_nested_collection_literal_is_a_level_per_nesting(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// `Sole` and `Drain` fold a collection whole, so the adapter leaves one materialized.
+///
+/// `map()` collapses each key's group with `Sole`, and a value that is itself a collection
+/// is the element that fold yields — opening it would hand `Sole` the keys instead.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::map_of_collections(
+    indoc! {r#"
+        mm = map([("a", [1, 2]), ("b", [3, 4])])
+        sum([sum([v for v in vs]) for vs in mm])
+    "#},
+    10
+)]
+fn a_whole_collection_fold_keeps_its_element_materialized(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
+}

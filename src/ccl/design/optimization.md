@@ -124,6 +124,31 @@ where `src_refined` is `src_elim` with its domain wrapped in `Type::Refinement` 
 
 The filter check happens at the `Compose` level (rather than inside the `Lambda` arm) because the refinement must be attached to the source, which is only visible alongside the lambda at the compose level.
 
+### A generator over a sum composes with its source
+
+A comprehension over a Σ-typed collection lowers to a lambda that is itself a sum,
+`λ k : σ → (k ▷ 𝑆) ▷ 𝑓`, whose key ranges over the source's witness. Before elimination,
+`compose_sum_generators` rewrites each such generator to `𝑆 ≫ 𝑓` when `k` is free in neither `𝑆`
+nor `𝑓`. The composite takes its kind from `𝑆`, so it is `𝑆`'s sum with `𝑓`'s codomain. A filtered
+generator is left to the cast-wrapped arm, since the filter's refinement reads the key.
+
+The rewrite keeps the witness out of the nested-lambda rule. That rule turns `λ 𝑥 → λ 𝑦 → body`
+into `curry(λ __pair → body)` with `__pair : (𝑋, 𝑌)`. For a Σ-typed inner lambda `𝑌` is `σ`, whose
+binder sits on the inner lambda's type rather than on the pair, and the key's witness depends on
+the pair's first component, which `Type` has no dependent pair to state. After the rewrite the
+inner lambda is the element function `𝑓`, over the source's values, which carry no witness.
+
+Where `𝑓` reads nothing from the enclosing scope, elimination leaves
+`⟨𝑆, 𝑓 ▷ const⟩ ▷ zip ≫ compose`, which `simplify` rewrites to `𝑆 ≫ map(𝑓)`, or to `𝑆` where `𝑓`
+is `id`. Where `𝑓` reads the enclosing scope, the `curry` over `(𝑋, 𝑉)` needs each row paired with
+its own collection's values, which operator conversion does not build yet.
+
+#### A pair naming a sum's witness is refused
+
+`lambda_elim::run` refuses a `curry` whose argument's type still names a witness free once
+simplification has run: the nested-lambda rule reached a Σ-typed inner lambda that
+`compose_sum_generators` did not rewrite.
+
 ### `Let` nodes after rule 7
 
 When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the bound variable changes type from `T` to `ParamTy ⇒ T`. The rewritten `Let` node has `bound_ty: None` because the old annotation is stale and would be incorrect.

@@ -212,7 +212,7 @@ impl Tiling {
     /// walks a chain of them.
     ///
     /// Narrower than [`Self::has_domain`], which a materialized function cell and a store
-    /// also answer: only this variant has keys in a column and a nested tiling under them.
+    /// also answer: only this variant has its keys in a column and a tiling under them.
     pub fn is_data_function(&self) -> bool {
         matches!(self, Tiling::DataFunction { .. })
     }
