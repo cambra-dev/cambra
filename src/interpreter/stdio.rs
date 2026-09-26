@@ -133,8 +133,8 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         self.buf.release(producer, obsolete);
     }
 
-    fn carry_release_to_new_producers(&mut self) {
-        self.buf.carry_release_to_new_producers();
+    fn carry_release_to_new_producers(&mut self, predecessor: &std::collections::HashSet<String>) {
+        self.buf.carry_release_to_new_producers(predecessor);
     }
 
     fn first_position_for_a_new_producer(&self) -> usize {

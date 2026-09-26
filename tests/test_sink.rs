@@ -559,7 +559,7 @@ fn a_sink_accumulates_across_a_reload() {
     let mut completed = false;
     for _ in 0..200 {
         ctx.scheduler().check_for_notifications();
-        if live.done().try_recv().is_ok() {
+        if live.finished() {
             completed = true;
             break;
         }

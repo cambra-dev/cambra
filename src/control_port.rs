@@ -1,11 +1,19 @@
-//! Control port: HTTP endpoints for diffing a running program against a new
-//! version of its source, and for replacing it with that version.
+//! Control port: HTTP endpoints for diffing, reloading, creating, deleting and
+//! listing the branches of a running program — see
+//! `src/ccl/design/program-evolution.md`, "The control port".
 //!
-//! Two endpoints, both taking the new source as their argument:
+//! | Verb | Takes | Does |
+//! | --- | --- | --- |
+//! | `/diff[/<branch>]` | `[phase=<p>&]<source>` | How `<source>` differs from the branch's current version |
+//! | `/diff/<a>/<b>` | `[phase=<p>]` | How `<b>`'s current version differs from `<a>`'s |
+//! | `/reload[/<branch>]` | `<source>` | Replace the branch's version with `<source>` |
+//! | `/branch/<name>[/from/<parent>]` | `<source>` | Create `<name>` from `<parent>` and reload it with `<source>` |
+//! | `/branch/<name>/delete` | nothing | Delete `<name>` |
+//! | `/branch/<name>/info` | nothing | Report `<name>`'s provenance, versions and source |
+//! | `/branches/list` | nothing | List every branch |
 //!
-//! - `/diff` — how the new version differs from the running one, rendered as an
-//!   annotated tree. Answers the question without changing anything.
-//! - `/reload` — replace the running program with the new version.
+//! An omitted `<branch>` or `<parent>` means `main`. A segment in a name
+//! position that is not a branch name is an unknown path, and answers 404.
 //!
 //! The source may be the whole query string, percent-decoded, or a `POST` body.
 //! The query form is percent-encoded rather than form-encoded: `+` stands for
@@ -29,14 +37,43 @@ use std::thread;
 
 use log::info;
 
-use crate::ccl::context::Phase;
+use crate::ccl::context::{GlobalContext, Phase, ReuseTally, render_errors};
+use crate::live_program::{
+    BranchError, LiveProgram, MainConsumerFactory, ROOT, ReloadReport, is_branch_name,
+    render_unreadable,
+};
 
 /// What a control-port client asked for.
+#[derive(Debug, PartialEq)]
 pub enum ControlRequest {
-    /// Report how `code` differs from the running program, comparing at `phase`.
-    Diff { code: String, phase: Phase },
-    /// Replace the running program with `code`.
-    Reload { code: String },
+    /// Report how `code` differs from `branch`'s current version, comparing at
+    /// `phase`.
+    Diff {
+        branch: String,
+        code: String,
+        phase: Phase,
+    },
+    /// Report how `to`'s current version differs from `from`'s, comparing at
+    /// `phase`.
+    DiffBranches {
+        from: String,
+        to: String,
+        phase: Phase,
+    },
+    /// Replace `branch`'s version with `code`.
+    Reload { branch: String, code: String },
+    /// Create `name` from `parent`'s current version and reload it with `code`.
+    Branch {
+        name: String,
+        parent: String,
+        code: String,
+    },
+    /// Delete `name`.
+    Delete { name: String },
+    /// Report `name`'s branch provenance, versions and current source.
+    Info { name: String },
+    /// List every branch.
+    List,
 }
 
 /// The answer to one [`ControlRequest`], as an HTTP status and a plain-text body.
@@ -56,12 +93,112 @@ impl ControlReply {
     }
 
     /// A `400` carrying `body` — the request named a version the running
-    /// program cannot compile or cannot take over the running state.
+    /// program cannot compile or cannot take over the running state, or asked
+    /// for something the branch table refuses.
     pub fn rejected(body: impl Into<String>) -> Self {
         Self {
             status: 400,
             body: body.into(),
         }
+    }
+
+    /// A `404` carrying `body` — an unknown path, or a branch name the table
+    /// does not hold.
+    pub fn not_found(body: impl Into<String>) -> Self {
+        Self {
+            status: 404,
+            body: body.into(),
+        }
+    }
+}
+
+/// A reload's `200` body: the tally, a blank line, the difference at
+/// `as-of-read`, and the variables that begin above their loops' inputs.
+fn render_reload(report: &ReloadReport) -> String {
+    let ReuseTally { kept, bound } = report.reuse;
+    format!(
+        "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+        report.diff,
+        render_unreadable(&report.unreadable),
+    )
+}
+
+/// The reply to a branch operation that did nothing: `404` for a name the
+/// table does not hold, `400` for a refusal or a compile error. `code` is the
+/// source a compile error's spans point into.
+fn branch_error(error: BranchError, code: &str) -> ControlReply {
+    match error {
+        BranchError::Unknown(name) => {
+            ControlReply::not_found(format!("no branch named `{name}`\n"))
+        }
+        BranchError::Refused(why) => ControlReply::rejected(why),
+        BranchError::Compile(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
+    }
+}
+
+/// Answer `request` against the running branch table.
+///
+/// The main loop's half of the control port, a library function so a test can
+/// drive every verb without a socket. A reload or a creation arms the reloaded
+/// branch's `main` output for the driver's next pass
+/// ([`LiveProgram::pull_mains`]).
+pub fn service(
+    request: &ControlRequest,
+    ctx: &mut GlobalContext,
+    live: &mut LiveProgram,
+    main_consumer: MainConsumerFactory<'_>,
+) -> ControlReply {
+    match request {
+        ControlRequest::Diff {
+            branch,
+            code,
+            phase,
+        } => match live.diff_branch(ctx, branch, code, *phase) {
+            Ok(report) => ControlReply::ok(format!(
+                "{}{}",
+                report.diff,
+                render_unreadable(&report.unreadable)
+            )),
+            Err(e) => branch_error(e, code),
+        },
+        ControlRequest::DiffBranches { from, to, phase } => {
+            match live.diff_between(ctx, from, to, *phase) {
+                Ok(diff) => ControlReply::ok(diff),
+                // A compile error here is in a running branch's source, and
+                // which of the two it is in is not known here; the rendering
+                // names no source text.
+                Err(e) => branch_error(e, ""),
+            }
+        }
+        // A rebuilt operator's producer takes the scheduler's probe slot when it
+        // is built, as the first compile's did; a created branch's do too.
+        ControlRequest::Reload { branch, code } => {
+            match live.reload_branch(ctx, branch, code, main_consumer) {
+                Ok(report) => ControlReply::ok(render_reload(&report)),
+                Err(e) => branch_error(e, code),
+            }
+        }
+        ControlRequest::Branch { name, parent, code } => {
+            match live.create_branch(ctx, name, parent, code, main_consumer) {
+                Ok(created) => ControlReply::ok(format!(
+                    "created `{}@{}` from `{}`\n{}",
+                    created.name,
+                    created.version,
+                    created.from,
+                    render_reload(&created.report),
+                )),
+                Err(e) => branch_error(e, code),
+            }
+        }
+        ControlRequest::Delete { name } => match live.delete_branch(ctx, name) {
+            Ok(_) => ControlReply::ok(format!("deleted branch `{name}`\n")),
+            Err(e) => branch_error(e, ""),
+        },
+        ControlRequest::Info { name } => match live.render_info(name) {
+            Ok(info) => ControlReply::ok(info),
+            Err(e) => branch_error(e, ""),
+        },
+        ControlRequest::List => ControlReply::ok(live.render_branches()),
     }
 }
 
@@ -224,13 +361,35 @@ fn split_url(url: &str) -> (&str, &str) {
     }
 }
 
+/// Every verb, for the reply to an unknown path.
+const ENDPOINTS: &str = "endpoints: /diff[/<branch>]?<source>, /diff/<branch>/<branch>, \
+/reload[/<branch>]?<source>, /branch/<name>[/from/<parent>]?<source>, /branch/<name>/delete, \
+/branch/<name>/info, /branches/list\n";
+
+/// The branch names a path's segments after its verb spell, or the `404` for a
+/// path that is no verb.
+///
+/// A segment in a name position that is not a branch name makes the whole path
+/// unknown, so it answers `404` rather than being read as some other verb.
+fn names<'a>(segments: &[&'a str]) -> Result<Vec<&'a str>, ControlReply> {
+    if segments.iter().all(|s| is_branch_name(s)) {
+        Ok(segments.to_vec())
+    } else {
+        Err(ControlReply::not_found(ENDPOINTS))
+    }
+}
+
 /// Parse a request into the [`ControlRequest`] the main loop services, or the
 /// reply to send when it is not one.
 fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> {
     let (path, query) = split_url(url);
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let (verb, rest) = segments
+        .split_first()
+        .map_or(("", &[][..]), |(verb, rest)| (*verb, rest));
     // Only `/diff` takes a phase, so only `/diff` peels one. On `/reload` a
     // leading `phase=` is the program's own first characters.
-    let (phase_name, rest) = if path == "/diff" {
+    let (phase_name, rest_of_query) = if verb == "diff" {
         split_phase_param(query)
     } else {
         (None, query)
@@ -239,33 +398,80 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
     // The source is the body when there is one, so a program containing `&` or
     // `#` need not be percent-encoded to survive the query string.
     let code = if body.trim().is_empty() {
-        percent_decode(rest)
+        percent_decode(rest_of_query)
     } else {
         body.to_string()
     };
+    let phase = || -> Result<Phase, ControlReply> {
+        match phase_name {
+            None => Ok(DEFAULT_PHASE),
+            Some(name) => phase_from_name(name).ok_or_else(|| {
+                ControlReply::rejected(format!(
+                    "unknown phase {name:?}; expected one of: {}\n",
+                    phase_names()
+                ))
+            }),
+        }
+    };
 
-    match path {
-        "/diff" => {
-            let phase = match phase_name {
-                None => DEFAULT_PHASE,
-                Some(name) => phase_from_name(name).ok_or_else(|| {
-                    ControlReply::rejected(format!(
-                        "unknown phase {name:?}; expected one of: {}\n",
-                        phase_names()
-                    ))
-                })?,
-            };
+    match (verb, names(rest)?.as_slice()) {
+        ("diff", [] | [_]) => {
+            let phase = phase()?;
             require_code(&code)?;
-            Ok(ControlRequest::Diff { code, phase })
+            Ok(ControlRequest::Diff {
+                branch: rest.first().copied().unwrap_or(ROOT).to_string(),
+                code,
+                phase,
+            })
         }
-        "/reload" => {
+        ("diff", [from, to]) => {
+            let phase = phase()?;
+            // This verb takes no source, so the body is ignored as the other
+            // sourceless verbs ignore theirs. What follows the phase in the query
+            // is refused rather than ignored: it reads as a source for a verb
+            // that compares two running versions and would take none.
+            if !percent_decode(rest_of_query).trim().is_empty() {
+                return Err(ControlReply::rejected(
+                    "/diff/<branch>/<branch> compares two running versions and takes no source\n",
+                ));
+            }
+            Ok(ControlRequest::DiffBranches {
+                from: from.to_string(),
+                to: to.to_string(),
+                phase,
+            })
+        }
+        ("reload", [] | [_]) => {
             require_code(&code)?;
-            Ok(ControlRequest::Reload { code })
+            Ok(ControlRequest::Reload {
+                branch: rest.first().copied().unwrap_or(ROOT).to_string(),
+                code,
+            })
         }
-        _ => Err(ControlReply {
-            status: 404,
-            body: "endpoints: /diff?<source>, /reload?<source>\n".to_string(),
+        ("branch", [name]) => {
+            require_code(&code)?;
+            Ok(ControlRequest::Branch {
+                name: name.to_string(),
+                parent: ROOT.to_string(),
+                code,
+            })
+        }
+        ("branch", [name, "from", parent]) => {
+            require_code(&code)?;
+            Ok(ControlRequest::Branch {
+                name: name.to_string(),
+                parent: parent.to_string(),
+                code,
+            })
+        }
+        ("branch", [name, "delete"]) => Ok(ControlRequest::Delete {
+            name: name.to_string(),
         }),
+        ("branch", [name, "info"]) => Ok(ControlRequest::Info {
+            name: name.to_string(),
+        }),
+        ("branches", ["list"]) => Ok(ControlRequest::List),
+        _ => Err(ControlReply::not_found(ENDPOINTS)),
     }
 }
 
@@ -352,8 +558,8 @@ mod tests {
 
     fn diff_of(url: &str) -> (String, Phase) {
         match parse_request(url, "").expect("parses") {
-            ControlRequest::Diff { code, phase } => (code, phase),
-            ControlRequest::Reload { .. } => panic!("expected a diff request"),
+            ControlRequest::Diff { code, phase, .. } => (code, phase),
+            other => panic!("expected a diff request, got {other:?}"),
         }
     }
 
@@ -401,8 +607,8 @@ mod tests {
     fn reload_does_not_peel_a_phase() {
         let request = parse_request("/reload?phase=1; phase", "").expect("parses");
         match request {
-            ControlRequest::Reload { code } => assert_eq!(code, "phase=1; phase"),
-            ControlRequest::Diff { .. } => panic!("expected a reload request"),
+            ControlRequest::Reload { code, .. } => assert_eq!(code, "phase=1; phase"),
+            other => panic!("expected a reload request, got {other:?}"),
         }
     }
 
@@ -416,23 +622,21 @@ mod tests {
     fn a_body_supplies_the_source_when_the_query_does_not() {
         let request = parse_request("/reload", "y = 2; y").expect("parses");
         match request {
-            ControlRequest::Reload { code } => assert_eq!(code, "y = 2; y"),
-            ControlRequest::Diff { .. } => panic!("expected a reload request"),
+            ControlRequest::Reload { code, .. } => assert_eq!(code, "y = 2; y"),
+            other => panic!("expected a reload request, got {other:?}"),
         }
     }
 
     #[test]
     fn an_unknown_phase_is_rejected_rather_than_defaulted() {
-        let reply = parse_request("/diff?phase=nonsense&x", "")
-            .err()
-            .expect("rejected");
+        let reply = parse_request("/diff?phase=nonsense&x", "").expect_err("rejected");
         assert_eq!(reply.status, 400);
         assert!(reply.body.contains("channelized"), "{}", reply.body);
     }
 
     #[test]
     fn a_request_with_no_source_is_rejected() {
-        let reply = parse_request("/diff", "").err().expect("rejected");
+        let reply = parse_request("/diff", "").expect_err("rejected");
         assert_eq!(reply.status, 400);
     }
 
@@ -442,10 +646,119 @@ mod tests {
         let waiter = thread::spawn(move || rx.recv().expect("a reply").status);
         drop(ControlMessage {
             request: ControlRequest::Reload {
+                branch: ROOT.to_string(),
                 code: "x".to_string(),
             },
             reply: Some(tx),
         });
         assert_eq!(waiter.join().unwrap(), 503);
+    }
+
+    fn parsed(url: &str) -> ControlRequest {
+        parse_request(url, "").unwrap_or_else(|r| panic!("{url} did not parse: {r:?}"))
+    }
+
+    fn status_of(url: &str) -> u16 {
+        parse_request(url, "").err().map_or(200, |r| r.status)
+    }
+
+    /// A verb without a branch segment addresses `main`, and one with a segment
+    /// addresses that branch.
+    #[test]
+    fn an_omitted_branch_segment_means_main() {
+        assert_eq!(
+            parsed("/diff?x"),
+            ControlRequest::Diff {
+                branch: "main".into(),
+                code: "x".into(),
+                phase: DEFAULT_PHASE,
+            }
+        );
+        assert_eq!(
+            parsed("/reload/staging?x"),
+            ControlRequest::Reload {
+                branch: "staging".into(),
+                code: "x".into(),
+            }
+        );
+        assert_eq!(
+            parsed("/branch/staging?x"),
+            ControlRequest::Branch {
+                name: "staging".into(),
+                parent: "main".into(),
+                code: "x".into(),
+            }
+        );
+    }
+
+    /// Every branch verb parses to its request, by position: a name that is
+    /// also a keyword (`delete`, `from`) is still a name where a name stands.
+    #[test]
+    fn every_branch_verb_parses_by_position() {
+        assert_eq!(
+            parsed("/branch/qa/from/staging?x"),
+            ControlRequest::Branch {
+                name: "qa".into(),
+                parent: "staging".into(),
+                code: "x".into(),
+            }
+        );
+        assert_eq!(
+            parsed("/branch/qa/delete"),
+            ControlRequest::Delete { name: "qa".into() }
+        );
+        assert_eq!(
+            parsed("/branch/qa/info"),
+            ControlRequest::Info { name: "qa".into() }
+        );
+        assert_eq!(parsed("/branches/list"), ControlRequest::List);
+        assert_eq!(
+            parsed("/branch/delete/delete"),
+            ControlRequest::Delete {
+                name: "delete".into()
+            }
+        );
+        assert_eq!(
+            parsed("/diff/main/staging?phase=inferred"),
+            ControlRequest::DiffBranches {
+                from: "main".into(),
+                to: "staging".into(),
+                phase: Phase::Infer,
+            }
+        );
+    }
+
+    /// A segment in a name position that is not a branch name is an unknown
+    /// path, as is any path that is no verb.
+    #[test]
+    fn a_malformed_name_or_path_answers_404() {
+        assert_eq!(status_of("/branch/no.dots?x"), 404);
+        assert_eq!(status_of("/reload/?x"), 404);
+        assert_eq!(status_of("/diff/a/b/c?x"), 404);
+        assert_eq!(status_of("/branch/a/rename"), 404);
+        assert_eq!(status_of("/branches"), 404);
+        assert_eq!(status_of("/nonsense"), 404);
+    }
+
+    /// The sourceless verbs ignore the request body.
+    #[test]
+    fn delete_info_and_list_ignore_the_body() {
+        assert_eq!(
+            parse_request("/branch/qa/delete", "x = 1; x").expect("parses"),
+            ControlRequest::Delete { name: "qa".into() }
+        );
+        assert_eq!(
+            parse_request("/branches/list", "x = 1; x").expect("parses"),
+            ControlRequest::List
+        );
+    }
+
+    /// Comparing two branches takes a phase and no source: query text after the
+    /// phase is refused, and a creation or reload without a source is too.
+    #[test]
+    fn a_two_branch_diff_takes_no_source_and_a_creation_needs_one() {
+        assert_eq!(status_of("/diff/a/b?x = 1; x"), 400);
+        assert_eq!(status_of("/branch/qa"), 400);
+        assert_eq!(status_of("/reload/qa"), 400);
     }
 }

@@ -34,7 +34,7 @@ use crate::{
         Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
         http_server::SharedHttpServer,
         operator_conversion::{
-            ConversionError, OpConversionContext, convert_outputs_to_operators,
+            ConversionError, Inheritance, OpConversionContext, convert_outputs_to_operators,
             convert_to_operators,
         },
         operator_graph::{BoundarySession, OperatorGraph, assert_graph_invariants},
@@ -670,15 +670,33 @@ impl GlobalContext {
         &mut self.sources_and_sinks
     }
 
-    /// Retire the running version's conversion context and carry its operators
-    /// forward to the version replacing it.
+    /// Record, for every source, where the producers named in `predecessor`
+    /// stopped, as the start for producers registering from now on
+    /// ([`DataSourceDomainExtentImpl::carry_release_to_new_producers`]).
     ///
-    /// Call once the running operator graph has been dropped. Each operator a
-    /// `Let` binding produced is offered to the next compilation by the identity
-    /// of the term it computes, and the replaced version's subscriptions to it
-    /// are neutralized ([`OpConversionContext::into_inheritance`]). The source
-    /// consumers the scheduler holds go the same way: a source handle outlives a
-    /// version, the subscriptions against it do not.
+    /// `predecessor` is every producer the version being replaced holds: the
+    /// reloaded branch's own, or the parent's for branch-and-reload. Called
+    /// before the reloaded branch's graph is torn down, because tearing it down
+    /// drops the producers of its outputs and their records with them. A kept
+    /// operator keeps the registration it already has, and an element one of
+    /// the predecessor's producers had not finished is still delivered.
+    pub fn carry_release_from(&mut self, predecessor: &HashSet<String>) {
+        for source in self.sources_and_sinks.sources.values() {
+            source
+                .borrow_mut()
+                .carry_release_to_new_producers(predecessor);
+        }
+    }
+
+    /// Offer `predecessor`'s operators to the next compilation, in a fresh
+    /// conversion context.
+    ///
+    /// Call once the reloaded branch's graph has been torn down. Each operator
+    /// the record holds is offered by the node it was built from, and its fan is
+    /// reopened for the replacement to subscribe to ([`Inheritance::handover`]).
+    /// The record itself is read and left as it was: for branch-and-reload it is
+    /// the parent's entry, which stays the parent's, and for a reload it is the
+    /// branch's own, which the branch replaces once the compile is done.
     ///
     /// The scheduler's *subscriptions* need no attention here: they are weak and
     /// owned by the producers that made them, so dropping the graph prunes
@@ -687,16 +705,30 @@ impl GlobalContext {
     /// strong and outlives every version, which is what a source outliving the
     /// program reading it means; that handle goes when the route behind it is
     /// retired ([`Scheduler::forget_source`]).
-    pub fn retire_version(&mut self) {
-        // Every source records what its current producers have collectively
-        // released, so the replacement's new producers start there rather than at
-        // the oldest value it retains. A kept operator keeps the registration it
-        // already has, and an element nobody finished is still delivered.
-        for source in self.sources_and_sinks.sources.values() {
-            source.borrow_mut().carry_release_to_new_producers();
-        }
-        let previous = std::mem::replace(&mut self.conversion, OpConversionContext::new());
-        self.conversion.inherit(previous.into_inheritance());
+    pub fn offer_predecessor(&mut self, predecessor: &Inheritance) {
+        self.conversion = OpConversionContext::new();
+        self.conversion.inherit(predecessor.handover());
+    }
+
+    /// The record of what the last compilation built and kept, for the branch
+    /// that runs it to hold ([`OpConversionContext::take_record`]).
+    pub fn take_record(&mut self) -> Inheritance {
+        self.conversion.take_record()
+    }
+
+    /// Stop serving every route `still_bound` does not name, and release the
+    /// ports left with none.
+    ///
+    /// For deleting a branch, which installs no version: `still_bound` is the
+    /// union of the routes every remaining branch's version binds. A reload runs
+    /// the same retirement from the compile that installs its version.
+    pub fn retire_routes_absent_from(&mut self, still_bound: &HashSet<String>) {
+        let GlobalContext {
+            sources_and_sinks,
+            scheduler,
+            ..
+        } = self;
+        sources_and_sinks.retire_routes_absent_from(still_bound, scheduler);
     }
 
     /// Install a fresh [`LoweringContext`] seeded from the source/sink registry,
@@ -724,16 +756,25 @@ impl GlobalContext {
     /// one it no longer declares, one it declares at a different type, and one
     /// whose value would move between two declarations the source tells apart
     /// only by where they appear. See [`StateConflict`].
-    pub fn state_conflicts(&self, planned: &Expr) -> Vec<StateConflict> {
-        self.conversion.state_conflicts(planned)
+    ///
+    /// `predecessor` is the record the reload would offer: the branch's own
+    /// entry, or the parent's for branch-and-reload.
+    pub fn state_conflicts(&self, predecessor: &Inheritance, planned: &Expr) -> Vec<StateConflict> {
+        self.conversion.state_conflicts(predecessor, planned)
     }
 
     /// Every variable `planned` declares whose loop begins above the beginning of
     /// what it reads — see [`OpConversionContext::unreadable_inputs`].
-    /// `previous` is the tree the running graph was built from
+    /// `previous` is the tree `predecessor`'s graph was built from
     /// ([`CompiledProgram::ast`]).
-    pub fn unreadable_inputs(&self, previous: &Expr, planned: &Expr) -> Vec<UnreadablePrefix> {
-        self.conversion.unreadable_inputs(previous, planned)
+    pub fn unreadable_inputs(
+        &self,
+        predecessor: &Inheritance,
+        previous: &Expr,
+        planned: &Expr,
+    ) -> Vec<UnreadablePrefix> {
+        self.conversion
+            .unreadable_inputs(predecessor, previous, planned)
     }
 
     /// How much of the version it replaced the last compilation kept.
@@ -992,6 +1033,18 @@ pub struct CompiledProgram {
     /// spans) is a byte offset *into this string*, so retaining it is what makes
     /// those offsets resolvable to text. Cheap (one program's source).
     pub source: String,
+    /// Every `http_serve` route this version binds, by the route's source name.
+    ///
+    /// What a route is retired against once more than one branch runs: the
+    /// endpoint registry is the process's, so a route is retired only when no
+    /// branch's version binds it (`src/ccl/design/program-evolution.md`,
+    /// "Routes across branches").
+    pub routes: HashSet<String>,
+    /// The name of every producer this compilation registered with a data
+    /// source. Every one is new, since a kept operator's chain was subscribed by
+    /// the compilation that built it; the producers under a kept operator are
+    /// read off its fan-out instead ([`Inheritance::source_readers`]).
+    pub source_readers: HashSet<String>,
 }
 
 impl CompiledProgram {
@@ -2246,25 +2299,30 @@ pub fn compile_program(
     code: &str,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, code, main_consumer, None)
+    compile_version(ctx, code, main_consumer, None, &HashSet::new())
 }
 
 /// Compile `code` as the version replacing `previous`, keeping whichever of the
 /// running graph's operators compute what this version's tree still asks for.
 ///
-/// `previous` is the tree the running graph was built from
+/// `previous` is the tree the offered graph was built from
 /// ([`CompiledProgram::ast`]), and the correspondence between it and this
 /// version's tree is what says where an operator can be kept — see
-/// [`OpConversionContext::set_correspondence`]. The running graph itself reaches
+/// [`OpConversionContext::set_correspondence`]. The offered graph itself reaches
 /// conversion separately, through
-/// [`GlobalContext::retire_version`](GlobalContext::retire_version).
+/// [`GlobalContext::offer_predecessor`](GlobalContext::offer_predecessor).
+///
+/// `bound_elsewhere` is every route another branch's version binds. A route
+/// this version does not bind is retired only when no other branch binds it
+/// either, because the endpoint registry is the process's.
 pub fn compile_replacement(
     ctx: &mut GlobalContext,
     code: &str,
     main_consumer: Box<dyn Consumer>,
     previous: &Expr,
+    bound_elsewhere: &HashSet<String>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, code, main_consumer, Some(previous))
+    compile_version(ctx, code, main_consumer, Some(previous), bound_elsewhere)
 }
 
 fn compile_version(
@@ -2272,6 +2330,7 @@ fn compile_version(
     code: &str,
     main_consumer: Box<dyn Consumer>,
     previous: Option<&Expr>,
+    bound_elsewhere: &HashSet<String>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
     ctx.seed_lowering();
     // `run_frontend` runs parse through join planning, every check between, and
@@ -2306,13 +2365,9 @@ fn compile_version(
     // Boxed before anything records a node: a `NodeId` is an address, and the
     // tree conversion walks is the tree `CompiledProgram::ast` keeps.
     let join_planned = Box::new(join_planned);
-    let bound = ctx.lowering.routes_bound_this_pass().clone();
-    let GlobalContext {
-        sources_and_sinks,
-        scheduler,
-        ..
-    } = ctx;
-    sources_and_sinks.retire_routes_absent_from(&bound, scheduler);
+    let routes = ctx.lowering.routes_bound_this_pass().clone();
+    let still_bound: HashSet<String> = routes.union(bound_elsewhere).cloned().collect();
+    ctx.retire_routes_absent_from(&still_bound);
     // The frontend ran to `Phase::Planning`, which is past every pane boundary.
     let mut pane = |phase: Phase| {
         panes
@@ -2360,6 +2415,11 @@ fn compile_version(
     // `CAMBRA_PROVENANCE` says. Gating it would ship an empty pane, which both
     // wire validators reject.
     let boundary_session = BoundarySession::install();
+    // Every producer this compilation registers with a source, so the branch
+    // running it can say which producers it holds. Opened before conversion in
+    // case an operator subscribes while being built, and closed once every
+    // output has subscribed.
+    ctx.scheduler().begin_source_readers();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
         if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
@@ -2368,7 +2428,10 @@ fn compile_version(
             convert_outputs_to_operators(&join_planned, ctx.conversion_ctx())
         }
     })
-    .errs()?;
+    .errs()
+    .inspect_err(|_| {
+        ctx.scheduler().end_source_readers();
+    })?;
     // Conversion is over, so what the retired version offered and this one did
     // not take is released here. Holding it any longer keeps the producers under
     // a rebuilt operator alive, and a source goes on retaining data for a
@@ -2452,6 +2515,8 @@ fn compile_version(
         }
     }
 
+    let source_readers: HashSet<String> =
+        ctx.scheduler().end_source_readers().into_iter().collect();
     let provenance_table = table_session.into_table();
 
     let program = CompiledProgram {
@@ -2467,6 +2532,8 @@ fn compile_version(
         provenance_table,
         operator_graph,
         source: code.to_string(),
+        routes,
+        source_readers,
     };
 
     // Every compile its own gate — see `provenance_gate_every_compile` for why this

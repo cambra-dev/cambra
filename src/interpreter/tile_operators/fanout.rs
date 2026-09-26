@@ -116,6 +116,13 @@ struct FanOutShared {
     /// fan-outs (the overwhelming majority); `Some` only when constructed
     /// via [`FanOut::new_cyclic`].
     reentrancy: Option<FanOutReentrancy>,
+    /// The name of every producer [`producer`](Self::producer)'s chain
+    /// registered with a data source when it was subscribed.
+    ///
+    /// The chain is subscribed once and owned here, so these producers live as
+    /// long as this fan-out does. What a branch that holds this fan-out holds of
+    /// each source is read off it ([`FanOut::source_readers`]).
+    source_readers: Vec<String>,
 }
 
 impl FanOutShared {
@@ -276,6 +283,7 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
+            source_readers: Vec::new(),
         }));
         Self {
             input: Rc::new(RefCell::new(input)),
@@ -387,6 +395,13 @@ impl FanOut {
     /// ([`FanOutShared::released_position`]).
     pub fn released_position(&self) -> Option<Position> {
         self.shared.borrow().released_position.clone()
+    }
+
+    /// The name of every producer registered with a data source from inside
+    /// this fan-out's input chain, nested fan-outs included, when the chain was
+    /// subscribed. Empty before the first subscription.
+    pub fn source_readers(&self) -> Vec<String> {
+        self.shared.borrow().source_readers.clone()
     }
 
     /// Reopen this fan-out for a fresh set of branches, keeping the inner
@@ -572,6 +587,7 @@ impl TileOperator for FanOutBranch {
             // on this fan-out.
             let _guard = SubscribingInnerGuard { shared: &shared_rc };
             let shared_weak = Rc::downgrade(&shared_rc);
+            scheduler.begin_source_readers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
                 Box::new(move || {
@@ -596,7 +612,11 @@ impl TileOperator for FanOutBranch {
                 }),
                 scheduler,
             );
-            shared_rc.borrow_mut().producer = Some(inner);
+            let readers = scheduler.end_source_readers();
+            let mut shared = shared_rc.borrow_mut();
+            shared.producer = Some(inner);
+            shared.source_readers = readers;
+            drop(shared);
             // `_guard` drops here, resetting `subscribing_inner`.
         }
 

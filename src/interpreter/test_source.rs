@@ -147,8 +147,8 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.data.retain(|k, _| !key_matches_predicate(k, &agreed));
     }
 
-    fn carry_release_to_new_producers(&mut self) {
-        self.releases.carry_to_new_producers();
+    fn carry_release_to_new_producers(&mut self, predecessor: &std::collections::HashSet<String>) {
+        self.releases.carry_to_new_producers(predecessor);
     }
 
     fn first_position_for_a_new_producer(&self) -> usize {

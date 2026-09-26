@@ -140,7 +140,7 @@ impl RunningProgram {
     ///
     /// Polled rather than waited on: a program that never exits fails the test
     /// here instead of hanging the run.
-    fn wait_for_exit(&mut self, within: Duration) {
+    pub(crate) fn wait_for_exit(&mut self, within: Duration) {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if self.child.try_wait().expect("wait on cambra").is_some() {
