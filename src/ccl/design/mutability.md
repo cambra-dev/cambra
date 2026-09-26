@@ -867,7 +867,7 @@ causal matcher (`letrec::check_letrec_causal`).
   `ExtractFinal` and a co-iterated `zip_arms_at`). A single always-commit or commit-gated writer
   over a finite *or* async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
-  store is an MVCC commit log `Txn ⇀ (Key ⇀ Value)`. A writer reads a snapshot of its footprint,
+  store is an MVCC commit log `Txn ⇀ {key: value}`, one changelog per key. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
   the current store (backward / optimistic concurrency) ahead of allocating a timestamp — a valid
   proposal commits and consumes a tick, a stale one is skipped and retries against the advanced
