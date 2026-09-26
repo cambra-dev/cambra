@@ -666,27 +666,63 @@ impl TileProducer for FilterProducer {
                 }
                 _ => panic!("Filter predicate is not a function"),
             },
-            // Both predicate and input are collections over the same keys.
-            (
-                Tile::DataFunction {
-                    domain: pred_keys,
-                    codomain: pred_outputs,
-                    ..
-                },
-                mut input @ Tile::DataFunction { .. },
-            ) => {
-                // We rely on the predicate and the input sharing exactly the same keys so
-                // the mask reads off the predicate's values positionally. The check is
-                // expensive, so only run it in debug builds.
-                debug_assert!(
-                    matches!(&input, Tile::DataFunction { domain, .. } if *domain == pred_keys)
+            // Both predicate and input are collections over the same entries: the predicate
+            // compiled over the same rows, so its innermost values are one boolean per
+            // innermost key, in key order — the mask `retain_keys` takes, which re-offsets
+            // the groups a filter shortens.
+            (pred @ Tile::DataFunction { .. }, mut input @ Tile::DataFunction { .. }) => {
+                let Tile::DataFunction {
+                    domain: pred_keys, ..
+                } = pred
+                    .innermost_level()
+                    .unwrap_or_else(|| unreachable!("the arm matched a collection"))
+                else {
+                    unreachable!("innermost_level answers a collection")
+                };
+                let Tile::DataFunction { domain: inner, .. } = input
+                    .innermost_level()
+                    .unwrap_or_else(|| unreachable!("the arm matched a collection"))
+                else {
+                    unreachable!("innermost_level answers a collection")
+                };
+                // **The mask is positional**, so it applies only while the two sides are in
+                // step. An input with nothing in it is already filtered — the predicate
+                // keeps answering for entries whose rows have been handed on.
+                if inner.is_empty() {
+                    return input;
+                }
+                // Anything else out of step is a shape this does not serve, and it says so
+                // rather than reading a mask across the misalignment (which drops the wrong
+                // entries, silently) or answering empty (which waits for an alignment that is
+                // not coming). Each side is pulled from its own branch of the pairs, and a
+                // source delivering its rows one at a time — a transaction's — lets the
+                // predicate reach entries the input has not.
+                assert_eq!(
+                    pred_keys.len(),
+                    inner.len(),
+                    "a correlated filter needs its predicate and its rows in step; the \
+                     predicate has answered for a different number of entries than the rows \
+                     carry. A source that delivers rows one at a time is the case this does \
+                     not serve yet.",
                 );
-                let pred_outputs = scalar_tile_to_column_value(*pred_outputs);
-                let mask = pred_outputs
+                // Equal counts are what a positional mask needs stated on every pull, and
+                // equal keys are what makes it the right mask. The second walks both columns,
+                // so it is checked where checks cost nothing.
+                debug_assert!(
+                    pred_keys == inner,
+                    "a correlated filter's predicate and rows agree in count but not in keys, \
+                     so the mask is positional over two different orders",
+                );
+                let pred_column = scalar_tile_to_column_value(pred.deepest_values().clone());
+                let mask = pred_column
                     .as_bitvec()
                     .unwrap_or_else(|| panic!("Expected bools"));
-                // The mask names keys, so it drops entries from each row's group.
-                input.retain_keys(mask);
+                // The mask names the innermost keys, so it drops entries from each row's
+                // group and leaves every level above standing.
+                input
+                    .innermost_level_mut()
+                    .unwrap_or_else(|| unreachable!("the arm matched a collection"))
+                    .retain_keys(mask);
                 input
             }
             _ => panic!("Invalid Filter input tiles"),
