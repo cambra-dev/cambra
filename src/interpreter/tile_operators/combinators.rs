@@ -1183,14 +1183,14 @@ impl TileProducer for RestrictProducer {
 
 /// Pair each key of `outer` with the keys of the collection `inner` holds for it, at one
 /// level: the shape [`Product`] produces beneath whatever standing levels both sides
-/// carry.
+/// carry. `second` says whether a pair's second component is the key or the value under it.
 ///
 /// Both sides are pulled from their own branch and need not have reached the same rows, so
 /// only the rows *both* have carry a group. A row the inner side has not delivered has no
 /// domain yet. A row whose collection is still arriving is paired with the keys it holds so
 /// far and left open, so a later tile adds to its group
 /// ([`Tile::append_open_level_beneath`]).
-fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling) -> Tile {
+fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> Tile {
     let (
         Tile::DataFunction {
             domain: outer_keys, ..
@@ -1209,7 +1209,9 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling) -> Tile {
         )
     };
     let Tile::DataFunction {
-        domain: group_keys, ..
+        domain: group_keys,
+        codomain: group_values,
+        ..
     } = &**groups
     else {
         unreachable!(
@@ -1252,7 +1254,11 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling) -> Tile {
     let total: usize = runs.iter().map(|(a, b)| b - a).sum();
     emitted.append_open_level_beneath(CurryLevel::OUTERMOST, |codomain| {
         let key_indices: Vec<usize> = runs.iter().flat_map(|(a, b)| *a..*b).collect();
-        let keys = group_keys.select_indices(key_indices.into_iter(), total);
+        let keys = group_keys.select_indices(key_indices.iter().copied(), total);
+        let second = match second {
+            Paired::Key => Tile::Scalar(keys.clone()),
+            Paired::Value => group_values.select_rows(&key_indices),
+        };
         let row_indices: Vec<usize> = runs
             .iter()
             .enumerate()
@@ -1272,25 +1278,33 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling) -> Tile {
         Tile::grouped(
             ColumnValue::UInts(starts),
             keys.clone(),
-            Box::new(pair_tile(outer_values, keys, pair)),
+            Box::new(pair_tile(outer_values, second, pair)),
             Predicate::False,
             BitSet::new(),
         )
     })
 }
 
-/// The pair `{_0: element, _1: key}` in the representation `pair` names.
+/// The pair `{_0: element, _1: second}` in the representation `pair` names.
 ///
 /// One rule, stated in [`Product`]'s constructor and read here: a materialized record column
-/// unless the element carries a level, which a column has nowhere to put.
-fn pair_tile(element: Tile, keys: ColumnValue, pair: &Tiling) -> Tile {
+/// unless a component carries a level, which a column has nowhere to put.
+fn pair_tile(element: Tile, second: Tile, pair: &Tiling) -> Tile {
     match pair {
-        Tiling::Record(_) => Tile::tuple(vec![element, Tile::Scalar(keys)]),
+        Tiling::Record(_) => Tile::tuple(vec![element, second]),
         _ => Tile::Scalar(ColumnValue::Records(HashMap::from([
             (tuple_field(0), scalar_tile_to_column_value(element)),
-            (tuple_field(1), keys),
+            (tuple_field(1), scalar_tile_to_column_value(second)),
         ]))),
     }
+}
+
+/// What a [`Product`] pair holds beside the outer row's value: the key of the row's inner
+/// collection, or the value that collection holds at that key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paired {
+    Key,
+    Value,
 }
 
 /// Each row of one stream paired with every key of its group in another: the product that
@@ -1330,6 +1344,8 @@ pub struct Product {
     /// one collection every row pairs with, whose values are the keys paired.
     inner: Box<dyn TileOperator>,
     shared: bool,
+    /// What each pair holds beside the outer row's value.
+    second: Paired,
 }
 
 impl Product {
@@ -1345,6 +1361,12 @@ impl Product {
         inner: Box<dyn TileOperator>,
         paired: CurryLevel,
     ) -> Self {
+        let row_domain = Self::per_row_domain(&*inner, paired);
+        Self::build(outer, inner, paired, row_domain, false, Paired::Key)
+    }
+
+    /// The domain of the collection a per-row inner side holds for each row, at `paired`.
+    fn per_row_domain(inner: &dyn TileOperator, paired: CurryLevel) -> Extent {
         assert!(
             inner.tiling().levels() > paired.index(),
             "Product's inner side holds one collection per row of the outer at {paired}, \
@@ -1360,8 +1382,24 @@ impl Product {
                 inner.tiling()
             )
         };
-        let row_domain = row_domain.clone();
-        Self::build(outer, inner, paired, row_domain, false)
+        row_domain.clone()
+    }
+
+    /// [`Self::per_row_at`], pairing every row of `outer` with the **values** of the
+    /// collection `inner` holds for it rather than its keys, one pair per key.
+    ///
+    /// What a generator over a sum that reads its enclosing scope compiles to: lambda
+    /// elimination composes the generator with its source, so the element function takes
+    /// the row and a value (`src/ccl/design/optimization.md`, "A generator over a sum
+    /// composes with its source"). The output keeps the collection's keys as the paired
+    /// level, so each row's result is a collection over its own collection's domain.
+    pub fn per_row_values_at(
+        outer: Box<dyn TileOperator>,
+        inner: Box<dyn TileOperator>,
+        paired: CurryLevel,
+    ) -> Self {
+        let row_domain = Self::per_row_domain(&*inner, paired);
+        Self::build(outer, inner, paired, row_domain, false, Paired::Value)
     }
 
     /// Pair every row of `outer` at `paired`'s enclosing level with every element of the one
@@ -1382,7 +1420,7 @@ impl Product {
             )
         };
         let row_domain = elements.extent();
-        Self::build(outer, inner, paired, row_domain, true)
+        Self::build(outer, inner, paired, row_domain, true, Paired::Key)
     }
 
     fn build(
@@ -1391,6 +1429,7 @@ impl Product {
         paired: CurryLevel,
         row_domain: Extent,
         shared: bool,
+        second: Paired,
     ) -> Self {
         let outer_tiling = outer.tiling();
         assert!(
@@ -1398,15 +1437,24 @@ impl Product {
             "Product pairs the rows of a collection, got {outer_tiling:?} at {paired}"
         );
         let element = outer_tiling.values_at(paired).clone();
-        // The pair rides materialized in one column unless the element carries a level, which a
-        // column has nowhere to put: a nest whose elements are collections pairs each of
+        let second_tiling = match second {
+            Paired::Key => Tiling::Scalar(row_domain.clone()),
+            Paired::Value => {
+                let Tiling::DataFunction { codomain, .. } = inner.tiling().values_at(paired) else {
+                    unreachable!("a per-row inner side holds a collection per row")
+                };
+                (**codomain).clone()
+            }
+        };
+        // The pair rides materialized in one column unless a component carries a level, which
+        // a column has nowhere to put: a nest whose elements are collections pairs each of
         // them against its own keys, so the pair is a struct of arrays there.
-        let pair = if element.holds_a_level() {
-            Tiling::tuple(&[element, Tiling::Scalar(row_domain.clone())])
+        let pair = if element.holds_a_level() || second_tiling.holds_a_level() {
+            Tiling::tuple(&[element, second_tiling])
         } else {
             Tiling::Scalar(Extent::Record(HashMap::from([
                 (tuple_field(0), element.extent()),
-                (tuple_field(1), row_domain.clone()),
+                (tuple_field(1), second_tiling.extent()),
             ])))
         };
         let tiling = level_beneath(outer_tiling, paired.index() - 1, row_domain, pair);
@@ -1416,6 +1464,7 @@ impl Product {
             inner,
             paired,
             shared,
+            second,
         }
     }
 }
@@ -1478,6 +1527,7 @@ impl TileOperator for Product {
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
+            second: self.second,
             shared: self.shared.then_some(SharedInner {
                 elements: None,
                 complete: false,
@@ -1508,6 +1558,8 @@ struct ProductProducer {
     empty_level: Tile,
     /// The pair's own tiling, which says whether it rides materialized in one column.
     pair: Tiling,
+    /// What each pair holds beside the outer row's value.
+    second: Paired,
     /// Where the inner side is one collection every row pairs with ([`Product::shared_at`]).
     shared: Option<SharedInner>,
 }
@@ -1539,7 +1591,7 @@ impl ProductProducer {
                     return self.empty_level.clone();
                 };
                 let inner = every_row_holding(&outer, &elements, complete);
-                pair_one_level(&outer, &inner, &self.pair)
+                pair_one_level(&outer, &inner, &self.pair, Paired::Key)
             });
         if !complete {
             for depth in (0..self.level.index()).map(CurryLevel::new) {
@@ -1619,7 +1671,7 @@ impl TileProducer for ProductProducer {
                     // pulled from their own branches, so either may be ahead.
                     return self.empty_level.clone();
                 };
-                pair_one_level(&outer, &inner, &self.pair)
+                pair_one_level(&outer, &inner, &self.pair, self.second)
             });
         // Beneath a standing level both sides fill the row, so a row there is complete
         // where both call it complete; the outer side's statement alone is about half of it.
@@ -2343,6 +2395,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: out_tiling.empty_at_no_rows(),
             pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
             shared: None,
         };
         let out = producer.get(out_tiling.universal_guard());
@@ -2375,6 +2428,85 @@ mod tests {
         assert_eq!(
             fields[&tuple_field(1)],
             ColumnValue::from_uints(vec![0, 1, 0, 1, 2])
+        );
+    }
+
+    /// [`Product::per_row_values_at`] pairs each row with the **values** of its own
+    /// collection, keyed by that collection's keys: the rows of
+    /// [`product_per_row_takes_each_row_s_own_domain`] give the same five-pair groups, with
+    /// the second components `7 8 ‖ 9 10 11` rather than the keys.
+    #[test]
+    fn product_per_row_values_pairs_each_row_with_its_own_values() {
+        let outer = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 200]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let outer_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let inner = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0, 2]),
+                ColumnValue::from_uints(vec![0, 1, 0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8, 9, 10, 11]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let inner_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let mut product = Product::per_row_values_at(
+            Box::new(Constant::collection(outer, outer_tiling)),
+            Box::new(Constant::collection(inner, inner_tiling)),
+            CurryLevel::new(1),
+        );
+        let out_tiling = product.tiling().clone();
+        let mut scheduler = Scheduler::new();
+        let mut producer = product.subscribe(
+            out_tiling.universal_guard(),
+            Box::new(|| {}),
+            &mut scheduler,
+        );
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::DataFunction { codomain, .. } = &out else {
+            panic!("Product tiles as a collection of collections, got {out:?}")
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain: pairs,
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("the paired level is a collection")
+        };
+        assert_eq!(row_starts, &ColumnValue::from_uints(vec![0, 2]));
+        assert_eq!(
+            domain,
+            &ColumnValue::from_uints(vec![0, 1, 0, 1, 2]),
+            "the paired level keeps each row's own keys"
+        );
+        let Tile::Scalar(ColumnValue::Records(fields)) = pairs.as_ref() else {
+            panic!("a pair is a record of the row's value and a value of its collection")
+        };
+        assert_eq!(
+            fields[&tuple_field(0)],
+            ColumnValue::Ints(vec![100, 100, 200, 200, 200])
+        );
+        assert_eq!(
+            fields[&tuple_field(1)],
+            ColumnValue::Ints(vec![7, 8, 9, 10, 11])
         );
     }
 
@@ -2419,6 +2551,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: out_tiling.empty_at_no_rows(),
             pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
             shared: Some(SharedInner {
                 elements: None,
                 complete: false,
@@ -2482,6 +2615,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: out_tiling.empty_at_no_rows(),
             pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
             shared: Some(SharedInner {
                 elements: None,
                 complete: false,
@@ -2551,6 +2685,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: out_tiling.empty_at_no_rows(),
             pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
             shared: None,
         };
         let _ = producer.get(out_tiling.universal_guard());
@@ -2611,6 +2746,7 @@ mod tests {
             level: CurryLevel::OUTERMOST,
             empty_level: out_tiling.empty_at_no_rows(),
             pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
             shared: None,
         };
         let out = producer.get(out_tiling.universal_guard());
