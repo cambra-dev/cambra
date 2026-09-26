@@ -160,7 +160,6 @@ fn key_matches_predicate(key: &Value, predicate: &Predicate) -> bool {
     match predicate {
         Predicate::True => true,
         Predicate::False => false,
-        Predicate::LessThanEq(value) => key <= value,
         Predicate::Intervals(intervals) => intervals.contains(key),
         _ => panic!("Unsupported predicate type in TestDataSource release: {predicate:?}"),
     }
@@ -192,7 +191,7 @@ mod tests {
         .collect();
 
         // First release from producer A: value 0 is obsolete
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(0)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Verify data has been updated
         assert_eq!(source.data.len(), 2, "One entry should be removed");
@@ -203,7 +202,7 @@ mod tests {
 
         // Second release from producer A: value 1 is obsolete
         // This should union with the existing predicate for producer_a
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(1)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify the second predicate was added
         assert_eq!(source.data.len(), 1, "Another entry should be removed");
@@ -243,7 +242,7 @@ mod tests {
         .collect();
 
         // Release from producer A
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(1)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify producer_a's predicate is stored
         assert!(
@@ -252,7 +251,7 @@ mod tests {
         );
 
         // Release from producer B
-        source.release("producer_b", Predicate::LessThanEq(Value::UInt(2)));
+        source.release("producer_b", Predicate::at_or_below(Value::UInt(2)));
 
         // Verify both predicates are stored
         assert!(
@@ -287,7 +286,7 @@ mod tests {
         .collect();
 
         // First release from producer A
-        source.release("producer_a", Predicate::LessThanEq(Value::UInt(0)));
+        source.release("producer_a", Predicate::at_or_below(Value::UInt(0)));
 
         // Verify producer_a has a record
         assert!(
@@ -298,7 +297,7 @@ mod tests {
         let after_first_release = source.data.len();
 
         // Second release from producer B
-        source.release("producer_b", Predicate::LessThanEq(Value::UInt(1)));
+        source.release("producer_b", Predicate::at_or_below(Value::UInt(1)));
 
         // Verify both are recorded
         assert!(

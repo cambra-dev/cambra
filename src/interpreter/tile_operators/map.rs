@@ -92,6 +92,66 @@ fn gather_applied(values: &Tile, groups: &[Vec<usize>]) -> Tile {
     values.select_rows(&rows)
 }
 
+/// The keys an application looks up that the function has not called complete, each with the
+/// complete input paths that look it up. `lookups` pairs each input path with the key it looks
+/// up; `complete` is the input's statement over whole paths.
+///
+/// Beneath every other complete input path the looked-up key is complete in the function, so
+/// everything gathered beneath it is complete, and [`restate_gathered`] states that with one
+/// arm however many paths share it.
+fn incomplete_lookups(
+    lookups: impl Iterator<Item = (Vec<Value>, Value)>,
+    complete: &Predicate,
+    f_domain_predicate: &Predicate,
+) -> Vec<(Value, Predicate)> {
+    // Keys in the order they first appear, so the statement is spelled the same way each time.
+    let mut by_key: Vec<(Value, Vec<Predicate>)> = Vec::new();
+    for (path, key) in lookups {
+        if !complete.contains_path(&path) || f_domain_predicate.contains(&key) {
+            continue;
+        }
+        let path = Predicate::exactly(&path);
+        match by_key.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, paths)) => paths.push(path),
+            None => by_key.push((key, vec![path])),
+        }
+    }
+    by_key
+        .into_iter()
+        .map(|(key, paths)| (key, Predicate::flatten_or(paths)))
+        .collect()
+}
+
+/// A level of the function's values, gathered beneath the input's paths, restated over those
+/// paths. `stated` is the level's statement over the function's paths, `depth` levels beneath
+/// the function's key.
+///
+/// A gathered path is complete where the input path above it is complete and the function
+/// calls complete what lies beneath the key that path looks up. Beneath a key the function
+/// calls complete, that is everything; beneath one of `incomplete` (from
+/// [`incomplete_lookups`]), it is the function's own statement within that key
+/// ([`Predicate::within`]), qualified by the paths that look it up.
+fn restate_gathered(
+    stated: &Predicate,
+    depth: usize,
+    complete: &Predicate,
+    incomplete: &[(Value, Predicate)],
+) -> Predicate {
+    let looking_up_incomplete = incomplete
+        .iter()
+        .fold(Predicate::False, |all, (_, paths)| all.union(paths));
+    incomplete.iter().fold(
+        Predicate::True.qualified_by(&complete.minus(&looking_up_incomplete), depth),
+        |all, (key, paths)| {
+            all.union(
+                &stated
+                    .within(std::slice::from_ref(key), depth)
+                    .qualified_by(paths, depth),
+            )
+        },
+    )
+}
+
 /// Substitute `result` for the outermost value `fn_domain` accepts.
 ///
 /// The applied value takes the place of the input value it was applied to, which is the
@@ -235,18 +295,12 @@ impl TileProducer for MapResultProducer {
                 // One group: with no level above, the matching keys' groups run together
                 // into the collection this application yields.
                 let mut out = gather_applied(&f_groups, &[rows]);
-                // A collection result answers for its own keys; a record one is a row of
-                // the function's values and carries whatever its fields carry.
-                if let Tile::DataFunction {
-                    domain_predicate, ..
-                } = &mut out
-                {
-                    *domain_predicate = if settled {
-                        Predicate::True
-                    } else {
-                        Predicate::False
-                    };
-                }
+                // Only a settled key's group is answered, and that group is final at every
+                // depth; an unsettled key answers nothing yet, so every level says nothing.
+                out.map_level_predicates(&mut |_, _| match settled {
+                    true => Predicate::True,
+                    false => Predicate::False,
+                });
                 return out;
             }
 
@@ -323,9 +377,29 @@ impl TileProducer for MapResultProducer {
             let incomplete_predicate =
                 Predicate::from_column_value(&incomplete_domain).minus(&domain_obsolete);
             let output_domain_predicate = domain_predicate.minus(&incomplete_predicate);
+            // Each group states its completeness over the function's paths, beneath the
+            // function's key. Placed under output row `x`, it is restated over `x`'s paths
+            // ([`restate_gathered`]): complete where `x` is complete in the input and the
+            // function calls complete what lies beneath `x`'s value. Every input row counts,
+            // kept or not: a complete row whose value's group has not arrived is still
+            // looked up, and its group arrives beneath it later.
+            let incomplete = incomplete_lookups(
+                (0..sorted_domain.len()).map(|i| {
+                    (
+                        vec![sorted_domain.index_at(i)],
+                        sorted_codomain_values.index_at(i),
+                    )
+                }),
+                &domain_predicate,
+                &f_domain_predicate,
+            );
+            let mut applied = gather_applied(&f_groups, &groups);
+            applied.map_level_predicates(&mut |depth, stated| {
+                restate_gathered(stated, depth, &domain_predicate, &incomplete)
+            });
             return Tile::data_function(
                 new_domain,
-                Box::new(gather_applied(&f_groups, &groups)),
+                Box::new(applied),
                 output_domain_predicate,
                 BitSet::new(),
             );
@@ -360,24 +434,20 @@ impl TileProducer for MapResultProducer {
                     input_tile.deepest_values()
                 );
             };
-            // The key path of every argument, so a withheld one can name the outermost key
-            // that owns it: a key with a row still to come is not answered whole, whatever
-            // depth that row sits at. The arguments are the innermost level's keys, so
-            // their paths are the rows one level further in.
+            // The key path of every argument, so a withheld one can be taken out of every
+            // level's statement: its row arrives later beneath each prefix of its path, so no
+            // level may call that prefix complete. The arguments are the innermost level's
+            // keys, so their paths are the rows one level further in.
             let innermost = input_tile
                 .innermost_depth()
                 .unwrap_or_else(|| unreachable!("the input was matched as a collection"));
             let paths = input_tile.row_paths_at(innermost + 1);
-            let domain_extent = i_tiling.domain_extent().unwrap();
             let mut keep = bit_vec::BitVec::from_elem(arguments.len(), true);
-            let mut withheld = ColumnValue::from_values(Vec::new(), &domain_extent);
+            let mut withheld: Vec<&[Value]> = Vec::new();
             for (i, path) in paths.iter().enumerate() {
                 if !f_domain_predicate.contains(&arguments.index_at(i)) {
                     keep.set(i, false);
-                    withheld.append(ColumnValue::from_values(
-                        vec![path[0].clone()],
-                        &domain_extent,
-                    ));
+                    withheld.push(path);
                 }
             }
             if !withheld.is_empty() {
@@ -385,14 +455,21 @@ impl TileProducer for MapResultProducer {
                     .innermost_level_mut()
                     .unwrap_or_else(|| unreachable!("the chain was walked above"))
                     .retain_keys(&keep);
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = &mut input_tile
-                else {
-                    unreachable!("retain_keys keeps a collection a collection")
-                };
-                *domain_predicate =
-                    domain_predicate.minus(&Predicate::from_column_value(&withheld));
+                for depth in 0..=innermost {
+                    let prefixes = Predicate::flatten_or(
+                        withheld
+                            .iter()
+                            .map(|path| Predicate::exactly(&path[..=depth]))
+                            .collect(),
+                    );
+                    let Tile::DataFunction {
+                        domain_predicate, ..
+                    } = input_tile.values_at_mut(CurryLevel::new(depth))
+                    else {
+                        unreachable!("retain_keys keeps a collection a collection")
+                    };
+                    *domain_predicate = domain_predicate.minus(&prefixes);
+                }
             }
         }
 
@@ -404,6 +481,7 @@ impl TileProducer for MapResultProducer {
         if let Tile::DataFunction {
             domain: f_keys,
             codomain: f_values,
+            domain_predicate: f_domain_predicate,
             ..
         } = &function_tile
             && f_values.holds_a_level()
@@ -424,7 +502,44 @@ impl TileProducer for MapResultProducer {
                         .collect()
                 })
                 .collect();
-            let gathered = gather_applied(f_values, &groups);
+            let mut gathered = gather_applied(f_values, &groups);
+            // Each gathered row states its levels' completeness over the function's paths,
+            // beneath the function's key. Placed where its argument was, it is restated over
+            // the argument's path ([`restate_gathered`]), as the level-valued case above does.
+            match input_tile.innermost_depth() {
+                Some(innermost) => {
+                    let paths = input_tile.row_paths_at(innermost + 1);
+                    let complete = input_tile.completion_at(CurryLevel::new(innermost));
+                    let incomplete = incomplete_lookups(
+                        paths
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, path)| (path, arguments.index_at(i))),
+                        &complete,
+                        f_domain_predicate,
+                    );
+                    gathered.map_level_predicates(&mut |depth, stated| {
+                        restate_gathered(stated, depth, &complete, &incomplete)
+                    });
+                }
+                // A scalar argument is a lookup with no path above it, so each level states
+                // what the function states within the key looked up.
+                None => {
+                    let keys: Vec<Value> = (0..arguments.len())
+                        .map(|i| arguments.index_at(i))
+                        .collect();
+                    gathered.map_level_predicates(&mut |depth, stated| {
+                        keys.iter().fold(Predicate::True, |all, key| {
+                            match f_domain_predicate.contains(key) {
+                                true => all,
+                                false => {
+                                    all.intersect(&stated.within(std::slice::from_ref(key), depth))
+                                }
+                            }
+                        })
+                    });
+                }
+            }
             *input_tile.deepest_values_mut() = gathered;
             return input_tile;
         }
@@ -448,21 +563,17 @@ impl TileProducer for MapResultProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // TODO once we have guards that express codomain predicates, handle them here
         // A guard is shaped by the tiling it is handed to, so the input's is built
         // from the input's tiling — never from the function's, whose tiling is
         // unrelated (a function tiling, against the input's stream).
-        let upstream_guard = match obsolete_guard {
-            g if g.is_empty() => self.input.tiling().empty_guard(),
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            TileGuard::Function(FunctionGuard::Codomain(g)) => {
-                TileGuard::Function(FunctionGuard::Codomain(g))
-            }
-            g => todo!("Unimplemented guard in MapResultProducer: {g:?}"),
-        };
+        // The input's levels are the output's, and beneath them the function's values stand
+        // where the input's did, so only a guard naming them whole translates.
+        let input = self.input.tiling();
+        let upstream_guard = crate::interpreter::tiling::through_shared_levels(
+            obsolete_guard,
+            input.levels(),
+            input,
+        );
         let done = upstream_guard.is_universal();
         self.input.release(upstream_guard);
         // The **function** is re-read on every pull, so it can only be released
@@ -573,6 +684,50 @@ struct MapResultToConstProducer {
     mode: MapResultToConstMode,
 }
 
+impl MapResultToConstProducer {
+    /// No rows, stating what `input` states except beneath the paths holding a live row.
+    ///
+    /// Each output value is the input's value at its path paired with the constant, so a
+    /// path the input calls complete is complete here once the constant is terminal. A path
+    /// holding no live row depends on nothing else: a filtered row never reaches the output
+    /// and a missing one never arrives. A path holding a live row gains that row once the
+    /// constant is terminal, so until then no level calls it complete
+    /// (`src/interpreter/design-operators.md`, "The completeness contract").
+    fn empty_beneath_live_rows(&self, input: &Tile) -> Tile {
+        let mut live = input.clone();
+        live.compact();
+        let mut out = self.tiling().empty_tile();
+        // The levels the output shares with the input are the input's whole chain, since the
+        // constant replaces what sits below it. A collection constant adds levels of its own
+        // beneath those, and nothing in the input names them.
+        for level in (0..self.input.tiling().levels()).map(CurryLevel::new) {
+            let held: Vec<Predicate> = live
+                .paths_at(level)
+                .iter()
+                .map(|path| Predicate::exactly(path))
+                .collect();
+            let (
+                Tile::DataFunction {
+                    domain_predicate: stated,
+                    ..
+                },
+                Tile::DataFunction {
+                    domain_predicate: out_stated,
+                    ..
+                },
+            ) = (input.values_at(level), out.values_at_mut(level))
+            else {
+                unreachable!("MapResultToConst keeps its input's collection levels")
+            };
+            *out_stated = match held.is_empty() {
+                true => stated.clone(),
+                false => stated.minus(&Predicate::flatten_or(held)),
+            };
+        }
+        out
+    }
+}
+
 impl TileProducer for MapResultToConstProducer {
     impl_producer_base!();
 
@@ -602,40 +757,18 @@ impl TileProducer for MapResultToConstProducer {
         // constant's value is never observed. Crucially we must not *pull* it: the
         // arm's value may be a partial expression (`//`, `%`, an index) the gate
         // exists to guard, and pulling it would evaluate e.g. `x // 0` and panic.
-        // Return a terminal-empty tile carrying the input's decidedness, so the
-        // union / `final_or_default` sees this arm resolve to nothing rather than
-        // waiting forever. The data-collection fan-out is lazy the same way (an
-        // emptied restrict is never iterated); this brings the scalar form in line.
-        if let Tile::DataFunction {
-            domain_predicate, ..
-        } = &input_tile
-            && input_tile.is_empty()
-        {
-            let mut out = self.tiling().empty_tile();
-            if let Tile::DataFunction {
-                domain_predicate: out_pred,
-                ..
-            } = &mut out
-            {
-                // Carry the input's decidedness so a decided (false-gate) arm reads
-                // terminal-empty — the union / `final_or_default` sees it resolve to
-                // nothing rather than waiting forever.
-                *out_pred = domain_predicate.clone();
-            } else {
-                // MapResultToConst's output is always a collection tiling; anything else
-                // here would silently drop the decidedness carry-over and leave a decided
-                // arm reading non-terminal forever.
-                unreachable!("MapResultToConst output tiling is always a collection");
-            }
-            return out;
+        // The data-collection fan-out is lazy the same way (an emptied restrict is never
+        // iterated); this brings the scalar form in line.
+        if input_tile.is_data_function() && input_tile.is_empty() {
+            return self.empty_beneath_live_rows(&input_tile);
         }
         let constant_tile = {
             // The broadcast value must be fully known before we can replicate it
             // across the input's domain: `repeat` fabricates nothing, it copies a
             // single present value. A constant that is still absent (e.g. a scalar
             // read from a sibling induction loop that has not yet converged) yields
-            // an empty (non-terminal) output — the consumer re-pulls once it lands,
-            // rather than us inventing a value for the unknown positions.
+            // an empty output — the consumer re-pulls once it lands, rather than us
+            // inventing a value for the unknown positions.
             //
             // This is one half of a single invariant — "never fabricate a position
             // from a not-yet-converged sibling read." The other half is the
@@ -644,17 +777,34 @@ impl TileProducer for MapResultToConstProducer {
             // returning the longer side's tail. Keep the two in step.
             let ct = self.constant.get(c_tiling.universal_guard());
             if !ct.is_terminal() {
-                return self.tiling().empty_tile();
+                return match input_tile.is_data_function() {
+                    true => self.empty_beneath_live_rows(&input_tile),
+                    false => self.tiling().empty_tile(),
+                };
             }
             ct
         };
 
         let mode = self.mode;
+        // A collection constant repeated down a column states each copy's completeness without
+        // knowing which row holds it, so it is qualified by the rows that do
+        // (`src/interpreter/design-operators.md`, "The completeness contract").
+        let input_levels = self.input.tiling().levels();
+        let held = (input_levels > 0).then(|| {
+            input_tile
+                .paths_at(CurryLevel::new(input_levels - 1))
+                .iter()
+                .map(|path| Predicate::exactly(path))
+                .fold(Predicate::False, |all, one| all.union(&one))
+        });
         // Stated over tiles rather than columns: `Replace` never reads the values, and the
         // two `Zip` modes pair with them whatever they carry — a level included, which a
         // column has nowhere to put.
         map_tile_result(input_tile, move |values| {
-            let const_tile = repeat_tile(constant_tile, values.rows());
+            let mut const_tile = repeat_tile(constant_tile, values.rows());
+            if let Some(held) = &held {
+                const_tile.map_level_predicates(&mut |depth, pred| pred.qualified_by(held, depth));
+            }
             match mode {
                 MapResultToConstMode::Replace => const_tile,
                 MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
@@ -746,6 +896,10 @@ struct MapResultWithSourceProducer {
     /// We need this in order to translate domain obsolete guards into releases of the underlying
     /// source.
     result_correlation: Vec<TilePathStep>,
+    /// The input last read, where it holds a level beneath its keys: a release naming paths
+    /// beneath particular keys is read against the paths it holds
+    /// ([`Self::released_beneath_every_key`]).
+    last_nested_input: Option<Tile>,
 }
 
 impl MapResultWithSourceProducer {
@@ -760,6 +914,7 @@ impl MapResultWithSourceProducer {
             input,
             source,
             result_correlation,
+            last_nested_input: None,
         };
         // Register this producer with the source by calling release with a false predicate.
         // This way the source knows about all producers that read it before execution starts.
@@ -770,6 +925,73 @@ impl MapResultWithSourceProducer {
             .borrow_mut()
             .release(&result.name(), Predicate::False);
         result
+    }
+}
+
+impl MapResultWithSourceProducer {
+    /// The inner keys a release of paths `[k, d]` frees for good: those released beneath
+    /// every outer key, since the source row a value reads is read wherever that key stands.
+    ///
+    /// An unqualified release already says the same beneath every outer key. Otherwise `d` is
+    /// free once every path this producer holds through `d` is released — by this release or
+    /// an earlier one, so the accumulated `obsolete_guard` is what is read — and no path
+    /// through `d` can still arrive: the input calls `d` complete beneath every outer key,
+    /// either unqualified at the inner level or beneath each outer key of a complete outer
+    /// level ([`Tile::completion_at`]).
+    fn released_beneath_every_key(&self, pred: &Predicate) -> Predicate {
+        let unqualified = |p: &Predicate| match p {
+            Predicate::Or(arms) => arms
+                .iter()
+                .filter(|arm| !arm.qualifies())
+                .fold(Predicate::False, |all, one| all.union(one)),
+            one if !one.qualifies() => one.clone(),
+            _ => Predicate::False,
+        };
+        let everywhere = unqualified(pred);
+        if !pred.qualifies() {
+            return everywhere;
+        }
+        let Some(
+            input @ Tile::DataFunction {
+                domain_predicate: outer_stated,
+                ..
+            },
+        ) = &self.last_nested_input
+        else {
+            return everywhere;
+        };
+        let Tile::DataFunction {
+            domain_predicate: stated,
+            ..
+        } = input.values_at(CurryLevel::new(1))
+        else {
+            return everywhere;
+        };
+        let complete_under_every_key = unqualified(stated);
+        let complete = input.completion_at(CurryLevel::new(1));
+        let outer_keys = input.paths_at(CurryLevel::OUTERMOST);
+        let released = &self.base.obsolete_guard;
+        let mut all_released: Vec<(Value, bool)> = Vec::new();
+        for path in input.paths_at(CurryLevel::new(1)) {
+            let key = path[path.len() - 1].clone();
+            let covered = released.covers_path(&path);
+            match all_released.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, all)) => *all &= covered,
+                None => all_released.push((key, covered)),
+            }
+        }
+        all_released
+            .into_iter()
+            .filter(|(key, all)| {
+                *all && (complete_under_every_key.contains(key)
+                    || (outer_stated.is_true()
+                        && outer_keys
+                            .iter()
+                            .all(|outer| complete.contains_path(&[outer[0].clone(), key.clone()]))))
+            })
+            .fold(everywhere, |all, (key, _)| {
+                all.union(&Predicate::point(key))
+            })
     }
 }
 
@@ -785,6 +1007,9 @@ impl TileProducer for MapResultWithSourceProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
+        if self.input.tiling().levels() > 1 {
+            self.last_nested_input = Some(input_tile.clone());
+        }
         let source = self.source.borrow();
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             source.get(codomain)
@@ -807,8 +1032,9 @@ impl TileProducer for MapResultWithSourceProducer {
                         self.result_correlation.first(),
                         Some(&TilePathStep::Codomain)
                     );
+                    let keys = self.released_beneath_every_key(pred);
                     let extracted_pred =
-                        extract_predicate(pred, &self.result_correlation[1..]).clone();
+                        extract_predicate(&keys, &self.result_correlation[1..]).clone();
                     self.source
                         .borrow_mut()
                         .release(&self.name(), extracted_pred);
@@ -902,7 +1128,7 @@ mod tests {
     fn map_result_keeps_its_function_for_a_narrower_release() {
         let (mut producer, released, _) = map_result_with_function_spy();
         producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(0)),
+            Predicate::at_or_below(Value::UInt(0)),
         )));
         assert!(
             released.borrow().is_empty(),
@@ -1179,5 +1405,307 @@ mod tests {
             Predicate::True,
             "both predicates True → output should be True (terminal)"
         );
+    }
+
+    /// A function whose values are a record holding a collection, applied over a streaming
+    /// input: the gathered collection is restated beneath each input row it lands under,
+    /// so it states nothing beneath a row the input has not called complete, and the pull that
+    /// brings that row keeps the completeness contract.
+    #[test]
+    fn a_record_valued_function_states_nothing_beneath_an_incomplete_row() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let uint = || Extent::Base(BaseType::UInt);
+        let value_tiling = Tiling::Record(HashMap::from([
+            ("n".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            (
+                "xs".to_string(),
+                Tiling::data_function(uint(), Tiling::Scalar(uint())),
+            ),
+        ]));
+        let fn_tiling = Tiling::data_function(uint(), value_tiling.clone());
+        let in_tiling = Tiling::data_function(uint(), Tiling::Scalar(uint()));
+        let out_tiling = Tiling::data_function(uint(), value_tiling);
+        // f = {5 ↦ (n: 1, xs: [7 ↦ 70])}, complete at every level.
+        let f = Tile::data_function(
+            ColumnValue::UInts(vec![5]),
+            Box::new(Tile::Record(HashMap::from([
+                ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                (
+                    "xs".to_string(),
+                    Tile::grouped(
+                        ColumnValue::UInts(vec![0]),
+                        ColumnValue::UInts(vec![7]),
+                        Box::new(Tile::Scalar(ColumnValue::UInts(vec![70]))),
+                        Predicate::True,
+                        BitSet::new(),
+                    ),
+                ),
+            ]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        // Every input row holds argument 5, and the rows through `upto` are complete.
+        let input_at = |keys: Vec<usize>, upto: usize| {
+            let n = keys.len();
+            Tile::data_function(
+                ColumnValue::UInts(keys),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![5; n]))),
+                Predicate::at_or_below(Value::UInt(upto)),
+                BitSet::new(),
+            )
+        };
+        let (input, next) = ScriptedProducer::new(input_at(vec![0], 0), in_tiling);
+        let mut producer = MapResultProducer {
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &out_tiling),
+            input: Box::new(input),
+            function: Box::new(TestTileProducer::new(f, fn_tiling)),
+        };
+        let out = producer.get(producer.tiling().universal_guard());
+        let Tile::DataFunction { codomain, .. } = &out else {
+            panic!("expected a collection, got {out:?}")
+        };
+        let Tile::Record(fields) = &**codomain else {
+            panic!("expected a record codomain, got {codomain:?}")
+        };
+        let Tile::DataFunction {
+            domain_predicate: xs_stated,
+            ..
+        } = &fields["xs"]
+        else {
+            panic!("xs is a collection")
+        };
+        assert!(
+            xs_stated.contains_path(&[Value::UInt(0), Value::UInt(7)]),
+            "row 0 is complete and f calls 5 complete, so [0, 7] is complete: {xs_stated:?}"
+        );
+        assert!(
+            !xs_stated.contains_path(&[Value::UInt(1), Value::UInt(7)]),
+            "row 1 has not arrived, so nothing beneath it is complete: {xs_stated:?}"
+        );
+        // The debug completeness check in `get` compares this pull with the last.
+        *next.borrow_mut() = input_at(vec![0, 1], 1);
+        let _ = producer.get(producer.tiling().universal_guard());
+    }
+
+    /// An argument the function has not answered is withheld, and its row arrives later
+    /// beneath each prefix of its path, so no level of the output calls that prefix complete.
+    #[test]
+    fn a_withheld_argument_is_taken_out_of_every_levels_statement() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::UInt)),
+            ),
+        );
+        let fn_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let out_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        // Outer row 0 is open; its inner rows 0 and 1 (arguments 5 and 6) are complete.
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0]),
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![5, 6]))),
+                Predicate::qualified(
+                    Predicate::point(Value::UInt(0)),
+                    Predicate::at_or_below(Value::UInt(1)),
+                ),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let f_at = |keys: Vec<usize>| {
+            let vals: Vec<i64> = keys.iter().map(|k| *k as i64 * 10).collect();
+            let pred = Predicate::from_column_value(&ColumnValue::UInts(keys.clone()));
+            Tile::data_function(
+                ColumnValue::UInts(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+                pred,
+                BitSet::new(),
+            )
+        };
+        let (function, next) = ScriptedProducer::new(f_at(vec![5]), fn_tiling);
+        let mut producer = MapResultProducer {
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &out_tiling),
+            input: Box::new(TestTileProducer::new(input, in_tiling)),
+            function: Box::new(function),
+        };
+        let out = producer.get(producer.tiling().universal_guard());
+        let Tile::DataFunction { codomain, .. } = &out else {
+            panic!("expected a collection, got {out:?}")
+        };
+        let Tile::DataFunction {
+            domain_predicate: inner_stated,
+            ..
+        } = &**codomain
+        else {
+            panic!("expected a nested collection")
+        };
+        assert!(
+            !inner_stated.contains_path(&[Value::UInt(0), Value::UInt(1)]),
+            "[0, 1] was withheld, yet the inner level calls it complete: {out:?}"
+        );
+        *next.borrow_mut() = f_at(vec![5, 6]);
+        let _ = producer.get(producer.tiling().universal_guard());
+    }
+
+    /// While its constant is not terminal, `MapResultToConst` emits no rows and states what
+    /// its input states except beneath the rows it holds live: it neither takes back a
+    /// filtered key it called complete nor claims the live key it has not emitted.
+    #[test]
+    fn map_result_to_const_states_its_input_while_the_constant_is_incomplete() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let c_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let out_tiling = in_tiling.clone();
+        // Key 0 is filtered out (deleted); every other key is live.
+        let input_at = |keys: Vec<usize>, vals: Vec<i64>, upto: usize| {
+            Tile::data_function(
+                ColumnValue::UInts(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
+                Predicate::at_or_below(Value::UInt(upto)),
+                BitSet::from_iter([0usize]),
+            )
+        };
+        let stated = |tile: &Tile| match tile {
+            Tile::DataFunction {
+                domain_predicate, ..
+            } => domain_predicate.clone(),
+            other => panic!("expected a collection, got {other:?}"),
+        };
+        // Pull 1: only the filtered key, so the constant is not pulled.
+        let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![1], 0), in_tiling);
+        let mut producer = MapResultToConstProducer {
+            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), &out_tiling),
+            input: Box::new(input),
+            constant: Box::new(TestTileProducer::new(
+                Tile::Scalar(ColumnValue::Ints(vec![])),
+                c_tiling,
+            )),
+            mode: MapResultToConstMode::Replace,
+        };
+        let first = producer.get(producer.tiling().universal_guard());
+        assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
+        // Pull 2: key 1 arrives live, and the constant is still not terminal.
+        *next.borrow_mut() = input_at(vec![0, 1], vec![1, 10], 1);
+        let second = producer.get(producer.tiling().universal_guard());
+        assert!(second.is_empty(), "no row before the constant: {second:?}");
+        assert_eq!(
+            stated(&second),
+            Predicate::at_or_below(Value::UInt(0)),
+            "key 0 stays complete; key 1 waits for the constant"
+        );
+    }
+
+    /// Source key 10, held beneath complete outer rows 0 and 1, released beneath them either
+    /// one row at a time or by one guard naming both. Answers what the source has agreed to
+    /// release after each step.
+    fn release_a_source_key_beneath_two_rows(
+        inner_stated: Predicate,
+        one_guard: bool,
+    ) -> Vec<Predicate> {
+        use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
+        let src = Rc::new(RefCell::new(TestDataSource::new(
+            "source_key",
+            crate::ccl::Type::Base(BaseType::String),
+            Extent::Base(BaseType::String),
+        )));
+        src.borrow_mut()
+            .add_data(&[(Value::UInt(10), Value::String("x".into()))]);
+        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        let key_extent = Extent::DataSourceDomain(as_domain.clone());
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(key_extent.clone(), Tiling::Scalar(key_extent.clone())),
+        );
+        let out_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(key_extent, Tiling::Scalar(Extent::Base(BaseType::String))),
+        );
+        // Outer rows 0 and 1 are complete; each holds source key 10.
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![10, 10]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 10]))),
+                inner_stated,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut producer = MapResultWithSourceProducer::new(
+            Box::new(TestTileProducer::new(input, in_tiling)),
+            as_domain,
+            out_tiling,
+            vec![TilePathStep::Codomain],
+        );
+        let _ = producer.get(producer.tiling().universal_guard());
+        let beneath = |outer: usize| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(
+                    Predicate::point(Value::UInt(outer)),
+                    Predicate::point(Value::UInt(10)),
+                )),
+            ))))
+        };
+        let mut agreed = Vec::new();
+        if one_guard {
+            producer.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
+                    Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1])),
+                    Predicate::point(Value::UInt(10)),
+                ))),
+            ))));
+            agreed.push(Predicate::False);
+            agreed.push(src.borrow().get_released_predicate());
+            return agreed;
+        }
+        producer.release(beneath(0));
+        agreed.push(src.borrow().get_released_predicate());
+        producer.release(beneath(1));
+        agreed.push(src.borrow().get_released_predicate());
+        agreed
+    }
+
+    /// Released one row at a time, the source key is released only once the second row
+    /// releases it.
+    #[test]
+    fn a_source_key_is_released_once_released_beneath_every_outer_row() {
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::True, false);
+        assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
+        assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
+    }
+
+    /// One guard naming both rows releases the source key.
+    #[test]
+    fn a_source_key_is_released_by_one_release_naming_every_outer_row() {
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::True, true);
+        assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
+    }
+
+    /// The inner level states nothing itself, and the outer level calls both rows complete,
+    /// which is complete at every depth, so no later path reaches key 10.
+    #[test]
+    fn a_source_key_is_released_when_completeness_is_stated_above_it() {
+        let agreed = release_a_source_key_beneath_two_rows(Predicate::False, true);
+        assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
+        assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
     }
 }

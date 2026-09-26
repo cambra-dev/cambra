@@ -8,79 +8,75 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-/// Pairs its operands over their first `depth` levels, producing a collection carrying those
-/// levels whose values are a record of what each operand holds below them.
+/// Pairs its operands at `level`, producing a collection carrying the levels standing above it
+/// whose values are a record of what each operand holds there.
 ///
-/// `depth` is the **ambient iteration** — the levels every operand runs over, which is a
-/// property of what they were applied to and not of their own shapes, so the caller states
-/// it ([`zip_arms_at`]). Below it the operands may differ, which is what lets one of them
-/// hold a collection while its sibling holds a column.
+/// The standing levels are the ones every operand was applied over. That is a property of what
+/// they were applied to and not of their own shapes, so the caller states `level`
+/// ([`zip_arms_at`]). Beneath the standing levels the operands may differ, which is what lets
+/// one of them hold a collection while its sibling holds a column.
 ///
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct Zip {
-    /// Output tiling: the ambient levels, with a `Record` where the operands' values sat.
+    /// Output tiling: the standing levels, with a `Record` where the operands' values sat.
     base: OperatorBase,
     /// Field names in input order, used when producing the output Record tile.
     names: Vec<String>,
     /// The input collections to pair.
     inputs: Vec<Box<dyn TileOperator>>,
-    /// The ambient levels the pair sits under.
-    depth: usize,
+    /// The level the record sits at — the values every standing level is over.
+    level: CurryLevel,
 }
 
-/// The number of collection levels `tiling` carries before its values.
-pub fn level_count(tiling: &Tiling) -> usize {
-    match tiling {
-        Tiling::DataFunction { codomain, .. } => 1 + level_count(codomain),
-        _ => 0,
-    }
-}
-
-/// `tiling`'s first `depth` levels, with `inner` beneath them.
-fn with_values_at(tiling: &Tiling, depth: usize, inner: Tiling) -> Tiling {
-    if depth == 0 {
+/// `tiling`'s levels above `level`, with `inner` at it.
+pub fn with_values_at(tiling: &Tiling, level: CurryLevel, inner: Tiling) -> Tiling {
+    if level == CurryLevel::OUTERMOST {
         return inner;
     }
     let Tiling::DataFunction { domain, codomain } = tiling else {
-        unreachable!("the depth was counted off this tiling")
+        unreachable!("{level} was counted off this tiling")
     };
     Tiling::DataFunction {
         domain: domain.clone(),
-        codomain: Box::new(with_values_at(codomain, depth - 1, inner)),
+        codomain: Box::new(with_values_at(codomain, level.in_codomain(), inner)),
     }
 }
 
 impl Zip {
-    /// Create a `Zip` pairing its operands over their first `depth` levels.
+    /// Create a `Zip` pairing its operands at `level`, beneath the levels standing above it.
     ///
-    /// `depth` is the **ambient iteration** — how many levels the operands were applied
-    /// over. It is the caller's to state, not something the operands say: two arms that
-    /// agree below the ambient (two projections of one grouped row, say) look pairable all
-    /// the way down, and two that differ there are the collection-valued component case.
-    pub fn new_at(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>, depth: usize) -> Self {
+    /// `level` is the caller's to state, not something the operands say: the standing levels
+    /// are the ones the operands were applied over. Two arms that agree beneath them (two
+    /// projections of one grouped row, say) look pairable all the way down, and two that
+    /// differ there are the collection-valued component case.
+    pub fn new_at(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Self {
         assert!(!ops.is_empty(), "Zip requires at least one input");
-        assert!(depth > 0, "Zip pairs under at least one ambient level");
-        // The operands agree on the ambient levels — they were applied over them — and may
+        assert!(
+            level != CurryLevel::OUTERMOST,
+            "Zip pairs under at least one standing level"
+        );
+        // The operands agree on the standing levels — they were applied over them — and may
         // differ below, which is what lets one hold a collection while its sibling holds a
         // column. Their runtime *presence* may still differ (one branch has emitted 0..3
         // while another has 0..2), which `ZipProducer::get_impl` intersects.
         for op in ops.iter() {
-            for d in 0..depth {
+            for d in (0..level.index()).map(CurryLevel::new) {
                 let (
                     Tiling::DataFunction { domain, .. },
                     Tiling::DataFunction { domain: other, .. },
                 ) = (ops[0].tiling().values_at(d), op.tiling().values_at(d))
                 else {
                     panic!(
-                        "Zip pairs collections over {depth} ambient level(s), got {} and {}",
+                        "Zip pairs collections over the {} levels above it, got {} and {}",
+                        level.index(),
                         ops[0].tiling(),
                         op.tiling()
                     )
                 };
                 assert_eq!(
                     domain, other,
-                    "Zip's operands share the ambient iteration, so they agree on its keys \
-                     at every level"
+                    "Zip's operands were applied over the same standing levels, so they agree \
+                     on their keys at every one"
                 );
             }
         }
@@ -88,46 +84,46 @@ impl Zip {
             names
                 .iter()
                 .zip(ops.iter())
-                .map(|(name, op)| (name.clone(), op.tiling().values_at(depth).clone()))
+                .map(|(name, op)| (name.clone(), op.tiling().values_at(level).clone()))
                 .collect(),
         );
-        let tiling = with_values_at(ops[0].tiling(), depth, record);
+        let tiling = with_values_at(ops[0].tiling(), level, record);
         Self {
             base: OperatorBase::new(tiling),
             names,
             inputs: ops,
-            depth,
+            level,
         }
     }
 }
 
-/// Build the right product combinator for the compiled arms, pairing over `depth` ambient
-/// levels.
+/// Build the right product combinator for the compiled arms, pairing at `level`, over the
+/// levels standing above it.
 ///
 /// A scalar-only product is a record of values ([`MakeRecord`]); anything with a collection
-/// among its arms is a pointwise pairing over the ambient iteration ([`Zip`]). `depth` is
-/// how many levels that iteration has — the caller's to know, since the arms were applied
-/// over it. See the "CCL types vs. tilings" section of
+/// among its arms is a pointwise pairing over the levels the arms were applied over
+/// ([`Zip`]). `level` is where the record lands, which the caller knows because it applied
+/// them. See the "CCL types vs. tilings" section of
 /// [`design-operators.md`](./design-operators.md) for why the same CCL-level `zip` compiles
 /// to two different tile operators.
-pub fn zip_arms_at(inputs: Vec<Box<dyn TileOperator>>, depth: usize) -> Box<dyn TileOperator> {
+pub fn zip_arms_at(inputs: Vec<Box<dyn TileOperator>>, level: CurryLevel) -> Box<dyn TileOperator> {
     if inputs.iter().all(|op| op.tiling().is_scalar()) {
         return Box::new(MakeRecord::new(inputs));
     }
     let names = (0..inputs.len()).map(tuple_field).collect();
-    Box::new(Zip::new_at(names, inputs, depth))
+    Box::new(Zip::new_at(names, inputs, level))
 }
 
 /// Named-field variant of [`zip_arms_at`], for record literals.
 pub fn zip_arms_named_at(
     inputs: Vec<(String, Box<dyn TileOperator>)>,
-    depth: usize,
+    level: CurryLevel,
 ) -> Box<dyn TileOperator> {
     if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
         return Box::new(MakeRecord::new_named(inputs));
     }
     let (names, ops) = inputs.into_iter().unzip();
-    Box::new(Zip::new_at(names, ops, depth))
+    Box::new(Zip::new_at(names, ops, level))
 }
 
 impl TileOperator for Zip {
@@ -149,7 +145,7 @@ impl TileOperator for Zip {
         Box::new(ZipProducer {
             base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling()),
             names: self.names.clone(),
-            depth: self.depth,
+            level: self.level,
             inputs: self
                 .inputs
                 .iter_mut()
@@ -172,8 +168,8 @@ struct ZipProducer {
     names: Vec<String>,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
-    /// The ambient levels the pair sits under ([`Zip`]).
-    depth: usize,
+    /// The level the record sits at ([`Zip`]).
+    level: CurryLevel,
 }
 
 impl TileProducer for ZipProducer {
@@ -249,7 +245,23 @@ impl TileProducer for ZipProducer {
                 // intersection, then drop those rows).
                 let mut skeleton: Option<Tile> = None;
                 let mut codomains: Vec<Tile> = Vec::with_capacity(tiles.len());
+                // A pair is complete where every arm's key is: each level above the pair
+                // states the meet of the arms' statements, not the skeleton arm's alone,
+                // which calls a row complete that another arm is still filling.
+                let mut standing: Vec<Predicate> = Vec::new();
                 for mut filtered in tiles.into_iter() {
+                    for depth in 1..self.level.index() {
+                        let Tile::DataFunction {
+                            domain_predicate, ..
+                        } = filtered.values_at(CurryLevel::new(depth))
+                        else {
+                            unreachable!("the levels above the pair are collections")
+                        };
+                        match standing.get_mut(depth - 1) {
+                            Some(meet) => *meet = meet.intersect(domain_predicate),
+                            None => standing.push(domain_predicate.clone()),
+                        }
+                    }
                     let Tile::DataFunction { domain, .. } = &filtered else {
                         unreachable!()
                     };
@@ -262,16 +274,19 @@ impl TileProducer for ZipProducer {
                     // Lift the values out, leaving the chain of keys behind: what stays is
                     // the output's own shape, and every input has to agree on it.
                     codomains.push(std::mem::replace(
-                        filtered.values_at_mut(self.depth),
+                        filtered.values_at_mut(self.level),
                         Tile::Record(HashMap::new()),
                     ));
                     // Presence is intersected over the outermost keys only, so arms that
                     // disagree beneath them would pair one arm's values under another's keys.
                     assert!(
                         skeleton.as_ref().is_none_or(|s: &Tile| {
-                            s.key_levels()[..self.depth] == filtered.key_levels()[..self.depth]
+                            s.key_levels()[..self.level.index()]
+                                == filtered.key_levels()[..self.level.index()]
                         }),
-                        "Zip: inputs disagree on the levels they are paired over"
+                        "Zip: inputs disagree on the {} levels above the pair, after \
+                         aligning them: {skeleton:?} against {filtered:?}",
+                        self.level.index(),
                     );
                     skeleton.get_or_insert(filtered);
                 }
@@ -285,7 +300,16 @@ impl TileProducer for ZipProducer {
                         .collect(),
                 );
                 let mut out = skeleton.expect("Zip has at least one input");
-                *out.values_at_mut(self.depth) = codomain_record;
+                *out.values_at_mut(self.level) = codomain_record;
+                for (at, meet) in standing.into_iter().enumerate() {
+                    let Tile::DataFunction {
+                        domain_predicate, ..
+                    } = out.values_at_mut(CurryLevel::new(at + 1))
+                    else {
+                        unreachable!("the levels above the pair are collections")
+                    };
+                    *domain_predicate = meet;
+                }
                 let Tile::DataFunction {
                     domain_predicate, ..
                 } = &mut out
@@ -472,19 +496,21 @@ pub struct SelectField {
 }
 
 /// What a selector of field `name` releases of the product `tiling`, given its consumer's
-/// release `guard` of that field: `guard` placed at the field, under one `Codomain` wrapper
-/// per level the record sits beneath, and nothing on the other fields.
+/// release `guard` of that field: `guard` on the field, and every other field whole.
 ///
-/// TODO(exact-field-release): this release is lossy, which the guard algebra forbids
-/// (`src/interpreter/design-operators.md`, "Guard operations are exact"). Do not copy it. It
-/// drops a guard naming keys of a level above the record, and releases nothing of the other
-/// fields, so a `FanOut` meeting two selectors releases nothing at all. The exact release is
-/// `guard` on this field and every other field whole, and the `FanOut` meet of two of those
-/// beneath a level names one field's cells under some of the rows. That region needs a scalar
-/// guard qualified by the rows above it, which the guard algebra cannot spell yet.
+/// **A selector's subscription reads one field**, so nothing beneath it needs the others.
+/// A sibling selector reads the product through the [`FanOut`] a shared product sits
+/// behind, which forwards only the meet of its readers' releases, so a field reaches the
+/// product released only where every reader has released it. The meet of two such releases
+/// beneath a level names one field's cells under some rows, which a keyless field's guard
+/// states by the rows above it ([`TileGuard::Scalar`]).
+///
+/// A guard naming keys of a level above the record names every field at those keys, and it
+/// passes through as those keys.
 fn guard_at_field(tiling: &Tiling, name: &str, guard: TileGuard) -> TileGuard {
     match tiling {
         Tiling::DataFunction { codomain, .. } => match guard {
+            g if g.is_universal() => tiling.universal_guard(),
             TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
                 FunctionGuard::Codomain(Box::new(guard_at_field(codomain, name, *inner))),
             ),
@@ -493,15 +519,26 @@ fn guard_at_field(tiling: &Tiling, name: &str, guard: TileGuard) -> TileGuard {
                     .map(|arm| guard_at_field(tiling, name, arm))
                     .collect(),
             ),
-            _ => tiling.empty_guard(),
+            keys @ TileGuard::Function(FunctionGuard::Domain(_)) => {
+                let field = select_field_tiling(codomain, name).empty_guard();
+                TileGuard::flatten_or(vec![
+                    keys,
+                    TileGuard::Function(FunctionGuard::Codomain(Box::new(guard_at_field(
+                        codomain, name, field,
+                    )))),
+                ])
+            }
+            other => unreachable!("a collection's guard is a function guard, got {other:?}"),
         },
-        Tiling::Record(_) => {
-            let TileGuard::Record(mut fields) = tiling.empty_guard() else {
-                unreachable!("a record tiling answers a record guard")
-            };
-            fields.insert(name.to_string(), guard);
-            TileGuard::Record(fields)
-        }
+        Tiling::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(field, t)| match field == name {
+                    true => (field.clone(), guard.clone()),
+                    false => (field.clone(), t.universal_guard()),
+                })
+                .collect(),
+        ),
         other => unreachable!("SelectField's input holds a record, got {other}"),
     }
 }
@@ -584,8 +621,8 @@ impl TileOperator for SelectField {
 /// **A pull reads the whole product.** A narrowed pull is unsound through a cumulative
 /// cache: [`Memo`] merges what a pull returned and answers later pulls from it without going
 /// below, so a pull naming one field would record a partial answer as the whole one, and a
-/// sibling selector would read a field never fetched. A release names only this field's
-/// part ([`guard_at_field`], whose TODO says why that is lossy).
+/// sibling selector would read a field never fetched. A release names this field's part and
+/// every other field whole ([`guard_at_field`]).
 struct SelectFieldProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
@@ -621,8 +658,8 @@ impl TileProducer for SelectFieldProducer {
                 self.name
             )
         });
-        // The input is released only where every reader of it has released, and less than
-        // that ([`guard_at_field`]), so it can still hold what this consumer released.
+        // The input is released only where every reader of it has released
+        // ([`guard_at_field`]), so it can still hold what this consumer released.
         tile.remove_guarded(self.obsolete_guard().clone());
         tile.compact();
         tile
@@ -724,8 +761,8 @@ mod tests {
         // Field `_0` released, `_1` still live — neither empty nor universal.
         let partial = TileGuard::Record(
             [
-                (names[0].clone(), TileGuard::Scalar(true)),
-                (names[1].clone(), TileGuard::Scalar(false)),
+                (names[0].clone(), TileGuard::Scalar(Predicate::True)),
+                (names[1].clone(), TileGuard::Scalar(Predicate::False)),
             ]
             .into_iter()
             .collect(),
@@ -734,7 +771,7 @@ mod tests {
 
         assert_eq!(
             *logs[0].borrow(),
-            vec![TileGuard::Scalar(true)],
+            vec![TileGuard::Scalar(Predicate::True)],
             "the named field's operand is released",
         );
         assert!(
@@ -808,11 +845,10 @@ mod tests {
         );
     }
 
-    /// A release naming rows of the level above the record reaches nothing upstream today
-    /// (TODO(exact-field-release) on [`guard_at_field`]). This pins the gap: the exact release
-    /// names those rows, and this assertion flips when the guard algebra can spell it.
+    /// A consumer finishing rows of one field releases those rows whole, and every other
+    /// field everywhere: nothing beneath the selector reads the others ([`guard_at_field`]).
     #[test]
-    fn select_field_drops_a_release_naming_rows_above_the_record() {
+    fn select_field_releases_finished_rows_and_every_other_field() {
         let input_tiling = record_under_a_level();
         let (spy, log) = ReleaseSpy::new(
             Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -823,15 +859,46 @@ mod tests {
             base: ProducerBase::new(SelectFieldProducer::alloc_id(), &output_tiling),
             input: Box::new(spy),
             name: "a".to_string(),
-            input_tiling,
+            input_tiling: input_tiling.clone(),
         };
-        producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(0)),
+        let rows = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+            0,
+        ))));
+        producer.release(rows.clone());
+
+        let Tiling::DataFunction { codomain, .. } = &input_tiling else {
+            unreachable!("built as a collection")
+        };
+        let Tiling::Record(fields) = &**codomain else {
+            unreachable!("built over a record")
+        };
+        let other_fields = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Record(HashMap::from([
+                ("a".to_string(), TileGuard::Scalar(Predicate::False)),
+                ("xs".to_string(), fields["xs"].universal_guard()),
+            ])),
         )));
-        assert!(
-            log.borrow().iter().all(TileGuard::is_empty),
-            "the rows reach upstream now, so the TODO is done: {:?}",
-            log.borrow(),
+        assert_eq!(
+            *log.borrow(),
+            vec![TileGuard::flatten_or(vec![rows, other_fields])],
+        );
+    }
+
+    /// Over a bare product the other fields are released whole and the selected one as its
+    /// consumer released it.
+    #[test]
+    fn select_field_over_a_bare_product_releases_every_other_field() {
+        let int = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let product = Tiling::Record(HashMap::from([
+            ("a".to_string(), int.clone()),
+            ("b".to_string(), int.clone()),
+        ]));
+        assert_eq!(
+            guard_at_field(&product, "a", TileGuard::Scalar(Predicate::False)),
+            TileGuard::Record(HashMap::from([
+                ("a".to_string(), TileGuard::Scalar(Predicate::False)),
+                ("b".to_string(), TileGuard::Scalar(Predicate::True)),
+            ])),
         );
     }
 
@@ -888,7 +955,7 @@ mod tests {
             ])),
         );
         let mut zip = ZipProducer {
-            depth: 1,
+            level: CurryLevel::new(1),
             base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
             inputs: vec![

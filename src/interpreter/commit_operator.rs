@@ -356,12 +356,12 @@ impl CommitEngine {
     }
 
     /// The decided frontier as a predicate: the watermark, or `False` for an induction
-    /// engine that has not stepped yet. It is `LessThanEq(w)` even when the latest
+    /// engine that has not stepped yet. It is `at_or_below(w)` even when the latest
     /// position(s) carried no write, so a trailing run of carries stays decided — a
     /// changelog is sparse but the frontier is not.
     fn frontier_predicate(&self) -> Predicate {
         match self.decided_watermark() {
-            Some(w) => Predicate::LessThanEq(Value::UInt(w)),
+            Some(w) => Predicate::at_or_below(Value::UInt(w)),
             None => Predicate::False,
         }
     }
@@ -491,13 +491,13 @@ fn decided_seed_column(tile: Tile) -> Option<ColumnValue> {
 const MAX_INIT_PULLS: usize = 8;
 
 /// The watermark of a store tile's `frontier` predicate (the decode behind
-/// [`store_frontier`]). A store always carries its watermark as `LessThanEq(w)`
+/// [`store_frontier`]). A store always carries its watermark as `at_or_below(w)`
 /// — terminality is a separate flag, never a `True` frontier that would discard
 /// `w` — so the watermark reads directly and counts trailing carries. `None` for
 /// an undecided/empty changelog.
 fn frontier_from_domain(domain_predicate: &Predicate) -> Option<CommitTs> {
-    match domain_predicate {
-        Predicate::LessThanEq(Value::UInt(f)) => Some(*f),
+    match domain_predicate.as_at_or_below() {
+        Some(Value::UInt(f)) => Some(f),
         _ => None,
     }
 }
@@ -515,7 +515,7 @@ fn frontier_from_domain(domain_predicate: &Predicate) -> Option<CommitTs> {
 
 /// The decided frontier tick of a store tile, from its `frontier` predicate. `None` if
 /// `tile` is not a [`Tile::Store`], has recorded no write at all, or is undecided.
-/// Mirrors [`frontier_from_domain`]: `LessThanEq(w)` reads the watermark directly.
+/// Mirrors [`frontier_from_domain`]: `at_or_below(w)` reads the watermark directly.
 pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
     let Tile::Store { frontier, .. } = tile else {
         return None;
@@ -735,12 +735,14 @@ pub(crate) fn read_tile(
     value_extent: &Extent,
     domain_predicate: Predicate,
 ) -> Tile {
-    Tile::data_function(
+    let mut tile = Tile::data_function(
         positions,
         Box::new(stored_value_tile(values, value_extent)),
         domain_predicate,
         BitSet::new(),
-    )
+    );
+    tile.qualify_codomain_by_keys();
+    tile
 }
 
 /// One stored value per position, opened into the shape [`Tiling::from_extent`] declares.
@@ -1053,6 +1055,7 @@ impl TileOperator for CommitOperator {
             engine: CommitEngine::new(init),
             output_tiling: self.tiling().clone(),
             drain_start: 0,
+            notifier: ChangeNotifier::new(consumer, scheduler),
         })
     }
 }
@@ -1082,6 +1085,8 @@ struct CommitProducer {
     /// changes only *which* transaction wins a race between conflicting writers,
     /// never correctness (conservation/non-negativity hold under any order).
     drain_start: usize,
+    /// Wakes this store's readers when a pull changes what it answers.
+    notifier: ChangeNotifier,
 }
 
 /// A proposal-stream record field, as its scalar column. The proposal codomain
@@ -1212,7 +1217,7 @@ impl TileProducer for CommitProducer {
                     // advance and to compact its proposal window. A stale
                     // proposal is left unreleased.
                     self.writer_producers[k].release(TileGuard::Function(FunctionGuard::Domain(
-                        Predicate::LessThanEq(Value::UInt(step)),
+                        Predicate::at_or_below(Value::UInt(step)),
                     )));
                 }
             }
@@ -1224,7 +1229,7 @@ impl TileProducer for CommitProducer {
         }
         let mut store = self.engine.render_full_store_tile(self.tiling());
         // Signal terminality once every writer is done: the store is then fully
-        // decided (no more commits), so the watermark `LessThanEq(w)` becomes
+        // decided (no more commits), so the watermark `at_or_below(w)` becomes
         // `True`. A downstream `read`/output gates on this to know the cycle has
         // converged (the harness re-pulls a non-terminal output to drive it).
         // A store with **no** writers is trivially terminal (no commit can ever
@@ -1264,7 +1269,7 @@ impl TileProducer for CommitProducer {
             store.check_from(&self.output_tiling),
             "rendered store tile does not match the full-store tiling"
         );
-        store
+        self.notifier.notify_if_changed(store)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1473,11 +1478,45 @@ impl TileOperator for InductionStore {
             write_keys: self.write_keys.clone(),
             tap_fields: self.tap_fields.clone(),
             output_tiling: self.tiling().clone(),
+            notifier: ChangeNotifier::new(consumer, scheduler),
         })
     }
 }
 
+/// A producer's consumer, woken whenever a pull answers differently from the pull before.
+///
+/// A store changes on being pulled: it opens at a seed, decides a position or commits a
+/// transaction, and closes. Every reader holds what it last read until told otherwise, and
+/// the change is made inside a `get`, where the producers that must re-pull are still on
+/// the stack, so the wake goes through the scheduler's queue ([`WakeupQueue`]).
+struct ChangeNotifier {
+    consumer: SharedConsumer,
+    wakeups: WakeupQueue,
+    last: Option<Tile>,
+}
+
+impl ChangeNotifier {
+    fn new(consumer: SharedConsumer, scheduler: &Scheduler) -> Self {
+        Self {
+            consumer,
+            wakeups: scheduler.wakeup_queue(),
+            last: None,
+        }
+    }
+
+    /// `tile`, with the consumer woken if it differs from the tile this last passed on.
+    fn notify_if_changed(&mut self, tile: Tile) -> Tile {
+        if self.last.as_ref() != Some(&tile) {
+            self.wakeups.request(self.consumer.clone());
+            self.last = Some(tile.clone());
+        }
+        tile
+    }
+}
+
 struct InductionStoreProducer {
+    /// Wakes this store's readers when a pull changes what it answers.
+    notifier: ChangeNotifier,
     base: ProducerBase,
     engine: CommitEngine,
     body_producer: Box<dyn TileProducer>,
@@ -1595,14 +1634,14 @@ impl TileProducer for InductionStoreProducer {
         if self.processed() > started_at {
             self.body_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(self.processed() - 1)),
+                    Predicate::at_or_below(Value::UInt(self.processed() - 1)),
                 )));
         }
         // Signal terminality once the body's decision stream is final and every
         // position in it has been decided: the accumulator is final, so the
         // frontier *closes* (`terminal`) and a downstream
         // `ExtractFinal`/`final_or_default` resolves. The frontier keeps its
-        // `LessThanEq(w)` watermark, which spans the whole extent including a
+        // `at_or_below(w)` watermark, which spans the whole extent including a
         // trailing run of carries — so `len`/`store_frontier` do not undercount
         // to the latest change tick when the tail is all carry. The driver closes
         // its body-input domain once a complete source has been fully emitted,
@@ -1622,7 +1661,8 @@ impl TileProducer for InductionStoreProducer {
             next_decided_position(&body_tile, self.processed()),
             self.processed()
         );
-        self.render_store(done)
+        let store = self.render_store(done);
+        self.notifier.notify_if_changed(store)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1654,7 +1694,7 @@ impl TileProducer for InductionStoreProducer {
 /// time. Each entry is an immutable committed value at a tick, so the stream is
 /// genuinely monotonic (append-only) and needs **no terminal gate** — every
 /// commit is observable the instant it lands, not held back until all writers
-/// finish. Its `domain_predicate` is `LessThanEq(watermark)` while the stream is
+/// finish. Its `domain_predicate` is `at_or_below(watermark)` while the stream is
 /// still growing and `True` once it is closed — which of the store's two closure
 /// axes closes it is decided by `carry_forward`, below.
 ///
@@ -1778,7 +1818,7 @@ impl TileProducer for StoreValueStreamProducer {
         let store = self.store_producer.get(sg);
         // Fold the changelog directly. A closed stream yields a `True` output
         // domain predicate so a downstream terminal read resolves; a live one
-        // carries the store's `LessThanEq` watermark through.
+        // carries the store's `at_or_below` watermark through.
         let Tile::Store {
             frontier,
             terminal,
@@ -1856,7 +1896,7 @@ impl TileProducer for StoreValueStreamProducer {
             let forward = match self.release_cursor.advance_from(pred) {
                 ReleasedExtent::Nothing => None,
                 ReleasedExtent::Through(max_tick) => {
-                    Some(Predicate::LessThanEq(Value::UInt(max_tick)))
+                    Some(Predicate::at_or_below(Value::UInt(max_tick)))
                 }
                 ReleasedExtent::All => Some(Predicate::True),
             };
@@ -2216,7 +2256,7 @@ impl TileProducer for StoreDenseReadProducer {
         // exactly the positions emitted above — which are final, by the filter — so
         // report those rather than `False`: a consumer may consume the prefix, and a
         // `Memo` may cache it, without waiting for the loop to end. Reporting the
-        // emitted set rather than a `LessThanEq` bound keeps it honest when the
+        // emitted set rather than an `at_or_below` bound keeps it honest when the
         // trigger has not yet delivered every position below the frontier.
         let domain_predicate = if store.is_terminal() {
             trigger_pred
@@ -2265,7 +2305,7 @@ impl TileProducer for StoreDenseReadProducer {
                 if let Some(upto) = store_release_upto {
                     self.store_producer
                         .release(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::LessThanEq(Value::UInt(upto)),
+                            Predicate::at_or_below(Value::UInt(upto)),
                         )));
                 }
             }
@@ -2518,14 +2558,16 @@ impl AsOfProducer {
                     .collect(),
             ),
         };
-        Tile::data_function(
+        let mut tile = Tile::data_function(
             ColumnValue::from_values(bs, &self.b_extent),
             Box::new(codomain),
             // Terminality rides with the trigger: when no more requests will
             // arrive (trigger terminal) the response set is complete.
             domain_predicate,
             BitSet::new(),
-        )
+        );
+        tile.qualify_codomain_by_keys();
+        tile
     }
 }
 
@@ -2613,7 +2655,7 @@ impl TileProducer for AsOfProducer {
         {
             self.source
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(f - 1)),
+                    Predicate::at_or_below(Value::UInt(f - 1)),
                 )));
         }
         // Terminality gate. This reader samples one watermark per pull — it does not
@@ -2815,7 +2857,9 @@ impl DriverWindow {
         });
         let positions: Vec<usize> = self.rows.iter().map(|r| r.position).collect();
         let domain = ColumnValue::from_uints(positions);
-        Tile::data_function(
+        // Each column is built from values alone, so it states its collections whole without
+        // knowing which positions they stand under, so it is qualified by the positions held.
+        let mut tile = Tile::data_function(
             domain.clone(),
             Box::new(Tile::Record(fields)),
             // A row is final once it is emitted: it was built from one `(item, frontier)`
@@ -2831,7 +2875,9 @@ impl DriverWindow {
                 Predicate::from_column_value(&domain)
             },
             BitSet::new(),
-        )
+        );
+        tile.qualify_codomain_by_keys();
+        tile
     }
 }
 
@@ -3120,7 +3166,7 @@ impl TileProducer for InductionDriverProducer {
         if let Some(frontier) = frontier {
             self.store_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(frontier)),
+                    Predicate::at_or_below(Value::UInt(frontier)),
                 )));
         }
         // Reclaim the source prefix this driver has consumed. It only ever reads
@@ -3130,7 +3176,7 @@ impl TileProducer for InductionDriverProducer {
         {
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(through)),
+                    Predicate::at_or_below(Value::UInt(through)),
                 )));
             self.source_released_through = Some(through);
         }
@@ -3461,7 +3507,12 @@ impl TileProducer for TransactDriverProducer {
         if next_item.is_some() {
             self.wakeups.request(self.consumer.clone());
         }
-        self.window.render(done)
+        // A release naming part of a row rather than the row leaves the row in the window
+        // (`release_impl`), so what it names is withheld here.
+        let mut tile = self.window.render(done);
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.compact();
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -3473,9 +3524,10 @@ impl TileProducer for TransactDriverProducer {
         // intersection of the two is the finish, and that is what advances the
         // item cursor. Superseded retries for the same item ride the same prefix
         // and give the same answer, so the rule is idempotent under any order.
-        let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard else {
-            return;
-        };
+        //
+        // The window holds rows, so it acts on the rows the release names whole. What the
+        // release names of a row's values is withheld from the output (`get_impl`).
+        let pred = &obsolete_guard.whole_keys();
         // Only the **newest** live row's release is the item's finish. An older one
         // is a superseded retry, which the writer releases as soon as a newer
         // attempt replaces it — reclaiming that row must not advance the cursor past
@@ -3496,7 +3548,7 @@ impl TileProducer for TransactDriverProducer {
             // "Where a producer registering now starts".
             self.source_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(finished)),
+                    Predicate::at_or_below(Value::UInt(finished)),
                 )));
         }
         self.window.compact(pred);
@@ -3926,9 +3978,9 @@ impl TransactWriterProducer {
     /// bounds the body sub-operator's caches. Positions are absolute, so the
     /// windows slide forward without renumbering.
     fn ack_through(&mut self, pos: usize) {
-        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(
-            pos,
-        ))));
+        let guard = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            Value::UInt(pos),
+        )));
         self.driver_producer.release(guard.clone());
         self.body_producer.release(guard);
     }
@@ -4044,7 +4096,7 @@ impl TileProducer for TransactWriterProducer {
         if let Some(through) = release_through {
             self.store_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(through)),
+                    Predicate::at_or_below(Value::UInt(through)),
                 )));
         }
         // The decisions for every live attempt. Which one to act on is settled
@@ -4092,7 +4144,7 @@ impl TileProducer for TransactWriterProducer {
         {
             self.driver_producer
                 .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(through)),
+                    Predicate::at_or_below(Value::UInt(through)),
                 )));
         }
         // Decide a position once. A *new* newest position is a fresh attempt (a
@@ -4204,15 +4256,21 @@ impl TileProducer for TransactWriterProducer {
             }
         }
         self.debug_assert_position_invariant();
-        self.render()
+        // A release naming part of a proposal rather than the proposal leaves it in the
+        // window (`release_impl`), so what it names is withheld here.
+        let mut tile = self.render();
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.compact();
+        tile
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // commit-ack: advance past the item each released proposal was for, then
         // compact the released prefix out of the live window. Idempotent.
         self.debug_assert_position_invariant();
-        let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard else {
-            return;
-        };
+        //
+        // The window holds rows, so it acts on the rows the release names whole. What the
+        // release names of a row's values is withheld from the output (`get_impl`).
+        let pred = &obsolete_guard.whole_keys();
         // The entry at vector index `i` is absolute position `committed_base + i`
         // (positions are stable; the consumer releases by that absolute value).
         // A committed proposal finishes its item, so ack the driver row it was
@@ -4228,7 +4286,7 @@ impl TileProducer for TransactWriterProducer {
             self.ack_through(pos);
         }
         // Drop the released leading prefix and advance the window base. Releases
-        // are prefixes (`LessThanEq(step)`, accumulated across commits), so the
+        // are prefixes (`at_or_below(step)`, accumulated across commits), so the
         // released positions form a run from `committed_base` up. Dropping frees
         // the proposal records (their read/write maps) without renumbering the
         // live suffix — `CommitProducer` reads remaining positions by value.
@@ -4330,7 +4388,7 @@ mod tests {
             2,
             "only the two committing positions are changes"
         );
-        assert_eq!(*frontier, Predicate::LessThanEq(Value::UInt(3)));
+        assert_eq!(*frontier, Predicate::at_or_below(Value::UInt(3)));
         assert_eq!(
             store_frontier(&tile).map(|w| w + 1),
             Some(4),
@@ -4666,7 +4724,7 @@ mod tests {
 
         // A reader consumed loop positions ≤ 1 → store ticks ≤ 2.
         producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(2)),
+            Predicate::at_or_below(Value::UInt(2)),
         )));
 
         let bounded = producer.get(producer.tiling().universal_guard());
@@ -4815,7 +4873,7 @@ mod tests {
         // Release the leading position, then re-read. The carry source (tick 1)
         // must survive so positions 1, 2 still fold to 5 — not the seed 0.
         producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(0)),
+            Predicate::at_or_below(Value::UInt(0)),
         )));
         let after = read_values(&mut producer);
         for (p, v) in [(1usize, 5i64), (2, 5), (3, 14)] {
@@ -4910,7 +4968,7 @@ mod tests {
         let _ = pull_to_terminal(&mut sched, &mut producer);
 
         producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(0)),
+            Predicate::at_or_below(Value::UInt(0)),
         )));
         assert_eq!(
             releases.borrow().last().copied(),
@@ -4920,7 +4978,7 @@ mod tests {
 
         let _ = producer.get(producer.tiling().universal_guard());
         producer.release(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(2)),
+            Predicate::at_or_below(Value::UInt(2)),
         )));
         assert_eq!(
             releases.borrow().last().copied(),
@@ -5222,7 +5280,7 @@ mod tests {
         let Tile::Store { frontier, .. } = &tile else {
             panic!("expected Store");
         };
-        assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(2)));
+        assert_eq!(frontier, &Predicate::at_or_below(Value::UInt(2)));
         // Tick 0 = init {alice, bob}; tick 1 = {alice}; tick 2 = {alice, bob}. So
         // alice's changelog carries every tick and bob's skips the one that passed him
         // over — the tick numbering is shared, the ticks held are not.
@@ -5422,7 +5480,7 @@ mod tests {
             changelog_of(&tile, "pool"),
             vec![(0, int(100)), (1, int(30))]
         );
-        assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(1)));
+        assert_eq!(frontier, &Predicate::at_or_below(Value::UInt(1)));
         assert!(terminal);
         assert_eq!(store_at(&tile, &acct("pool")), Some((1, 30)));
     }
@@ -5450,7 +5508,7 @@ mod tests {
         // Both proposals committed and the writer is terminal → store closed at
         // watermark 2 (the frontier keeps its numeric watermark; terminality is
         // the separate flag).
-        assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(2)));
+        assert_eq!(frontier, &Predicate::at_or_below(Value::UInt(2)));
         assert!(terminal);
         assert_eq!(store_at(&tile, &acct("pool")), Some((2, 20)));
     }
@@ -6667,7 +6725,7 @@ mod tests {
                 (1, &[("alice", 70)]),
                 (2, &[("bob", 40)]),
             ],
-            Predicate::LessThanEq(Value::UInt(w)),
+            Predicate::at_or_below(Value::UInt(w)),
         )
     }
 
@@ -6675,7 +6733,7 @@ mod tests {
     fn store_frontier_reads_watermark_and_terminal() {
         let live = skew_store(2);
         assert_eq!(store_frontier(&live), Some(2));
-        // A terminal store keeps its `LessThanEq(w)` watermark (terminality is the
+        // A terminal store keeps its `at_or_below(w)` watermark (terminality is the
         // separate flag), so `store_frontier` reads `w` directly — even when the
         // watermark is *past the latest change tick* (trailing carries). Here the
         // latest change is at tick 3 but the decided watermark is 5: the frontier is
@@ -6684,7 +6742,7 @@ mod tests {
         let done = store_tile(
             &["alice"],
             &[(0, &[("alice", 100)]), (3, &[("alice", 70)])],
-            Predicate::LessThanEq(Value::UInt(5)),
+            Predicate::at_or_below(Value::UInt(5)),
         );
         assert_eq!(store_frontier(&done), Some(5));
         // The decided region is the watermark + 1, spanning the trailing carries at ticks
@@ -6779,12 +6837,12 @@ mod tests {
         let mut s = store_tile(
             &["alice", "bob"],
             &[(0, &[("alice", 100), ("bob", 50)]), (1, &[("alice", 70)])],
-            Predicate::LessThanEq(Value::UInt(1)),
+            Predicate::at_or_below(Value::UInt(1)),
         );
         s.merge(store_tile(
             &["alice", "bob"],
             &[(2, &[("bob", 40)])],
-            Predicate::LessThanEq(Value::UInt(2)),
+            Predicate::at_or_below(Value::UInt(2)),
         ));
         // The merged changelog reads identically to a store built in one shot
         // (compared semantically — delta cells are `map_to_value` of a `HashMap`,

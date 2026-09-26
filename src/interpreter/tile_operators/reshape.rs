@@ -133,13 +133,7 @@ impl TileProducer for PermuteRecordDomainProducer {
             unreachable!();
         };
         let output_domain = ColumnValue::Records(permute_record(input_fields, &self.permutation));
-        let output_domain_pred = match domain_predicate {
-            g @ Predicate::True | g @ Predicate::False => g,
-            Predicate::Record(fields) => {
-                Predicate::Record(permute_record(fields, &self.permutation))
-            }
-            _ => unreachable!(),
-        };
+        let output_domain_pred = permute_boxes(&domain_predicate, &self.permutation);
         Tile::grouped(
             row_starts,
             output_domain,
@@ -153,15 +147,29 @@ impl TileProducer for PermuteRecordDomainProducer {
         let upstream_guard = match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(Predicate::Record(fields))) => {
-                TileGuard::Function(FunctionGuard::Domain(Predicate::Record(permute_record(
-                    fields,
-                    &self.permutation,
-                ))))
-            }
+            TileGuard::Function(FunctionGuard::Domain(pred)) => TileGuard::Function(
+                FunctionGuard::Domain(permute_boxes(&pred, &self.permutation)),
+            ),
             g => unreachable!("PermuteRecordDomain cannot honor the release guard {g:?}"),
         };
         self.input.release(upstream_guard);
+    }
+}
+
+/// `pred`, a region of a tuple domain, with its fields permuted.
+///
+/// A region of records is a union of boxes, one predicate per field
+/// (`src/interpreter/design-operators.md`, "Boxes and prefixes"), so it permutes box by box.
+fn permute_boxes(pred: &Predicate, permutation: &[usize]) -> Predicate {
+    match pred {
+        Predicate::True | Predicate::False => pred.clone(),
+        Predicate::Record(fields) => Predicate::Record(permute_record(fields.clone(), permutation)),
+        Predicate::Or(arms) => Predicate::flatten_or(
+            arms.iter()
+                .map(|arm| permute_boxes(arm, permutation))
+                .collect(),
+        ),
+        p => unreachable!("a tuple domain's region is a union of boxes, got {p:?}"),
     }
 }
 
@@ -213,6 +221,12 @@ fn flatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)]) -
                 })
                 .collect(),
         ),
+        // A region of records is a union of boxes, and flattening acts box by box.
+        Predicate::Or(arms) => Predicate::flatten_or(
+            arms.iter()
+                .map(|arm| flatten_predicate(arm, field_map))
+                .collect(),
+        ),
         p => panic!("FlattenTupleDomain: unsupported domain predicate: {p:?}"),
     }
 }
@@ -249,7 +263,7 @@ fn unflatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)])
             }
             Predicate::Record(result)
         }
-        Predicate::Or(preds) => Predicate::Or(
+        Predicate::Or(preds) => Predicate::flatten_or(
             preds
                 .iter()
                 .map(|p| unflatten_predicate(p, field_map))
@@ -983,14 +997,22 @@ mod tests {
             input: Box::new(sender),
             permutation: vec![2usize, 0, 1],
         };
+        // Every field holds something: a record's fields are an AND, so a field naming
+        // nothing would make the whole guard empty, and `release` short-circuits an
+        // empty release rather than forwarding it — which tests the short-circuit
+        // instead of the permutation this case is about.
         let obsolete =
             TileGuard::Function(FunctionGuard::Domain(Predicate::Record(HashMap::from([
                 (tuple_field(0), Predicate::True),
-                (tuple_field(1), Predicate::False),
+                (tuple_field(1), Predicate::at_or_below(Value::Int(1))),
                 (tuple_field(2), Predicate::True),
             ]))));
         producer.release(obsolete);
-        let upstream = rx.recv().expect("release_impl did not send upstream guard");
+        // Bounded, so a release that never reaches the input fails this case rather than
+        // parking the whole suite on a channel nothing will send to.
+        let upstream = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("release_impl did not send upstream guard");
         let TileGuard::Function(FunctionGuard::Domain(Predicate::Record(fields))) = upstream else {
             panic!("expected Function/Domain/Record guard, got {upstream:?}");
         };
@@ -998,10 +1020,13 @@ mod tests {
         // `release_impl` calls permute_record(fields, permutation):
         //   upstream._0 ← downstream._2 = True
         //   upstream._1 ← downstream._0 = True
-        //   upstream._2 ← downstream._1 = False
+        //   upstream._2 ← downstream._1 = (-∞, 1]
         assert_eq!(fields[&tuple_field(0)], Predicate::True);
         assert_eq!(fields[&tuple_field(1)], Predicate::True);
-        assert_eq!(fields[&tuple_field(2)], Predicate::False);
+        assert_eq!(
+            fields[&tuple_field(2)],
+            Predicate::at_or_below(Value::Int(1))
+        );
     }
 
     // ── permute_result_correlation ────────────────────────────────────────────
@@ -1125,5 +1150,61 @@ mod tests {
             &nested_field_map(),
         );
         assert_eq!(result, Some(vec![tuple_step(1), TilePathStep::Codomain]));
+    }
+
+    /// A record key's statement after a subtraction (a withheld key, a released one) is a
+    /// staircase of boxes, an `Or`, which permuting the key's fields permutes box by box.
+    #[test]
+    fn permuting_a_record_domain_permutes_a_staircase_statement() {
+        let (mut input_tile, input_tiling) = make_three_field_records_tile_and_tiling();
+        let whole = Predicate::Record(HashMap::from([
+            (tuple_field(0), Predicate::at_or_below(Value::Int(3))),
+            (tuple_field(1), Predicate::True),
+            (tuple_field(2), Predicate::True),
+        ]));
+        let one_key = Predicate::point(Value::Record(HashMap::from([
+            (tuple_field(0), Value::Int(1)),
+            (tuple_field(1), Value::Int(3)),
+            (tuple_field(2), Value::Int(5)),
+        ])));
+        let stated = whole.minus(&one_key);
+        if let Tile::DataFunction {
+            ref mut domain_predicate,
+            ..
+        } = input_tile
+        {
+            *domain_predicate = stated.clone();
+        }
+        let mut producer = PermuteRecordDomainProducer {
+            base: ProducerBase::new(
+                PermuteRecordDomainProducer::alloc_id(),
+                &flat_three_int_tiling(),
+            ),
+            input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
+            permutation: vec![2usize, 0, 1],
+        };
+        let result = producer.get(producer.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = result
+        else {
+            panic!("expected Function");
+        };
+        // (1, 3, 5) permuted by [2, 0, 1] is (5, 1, 3): still excluded; (2, 4, 6) → (6, 2, 4) kept.
+        let key = |a: i64, b: i64, c: i64| {
+            Value::Record(HashMap::from([
+                (tuple_field(0), Value::Int(a)),
+                (tuple_field(1), Value::Int(b)),
+                (tuple_field(2), Value::Int(c)),
+            ]))
+        };
+        assert!(
+            !domain_predicate.contains(&key(5, 1, 3)),
+            "{stated:?} -> {domain_predicate:?}"
+        );
+        assert!(
+            domain_predicate.contains(&key(6, 2, 4)),
+            "{stated:?} -> {domain_predicate:?}"
+        );
     }
 }

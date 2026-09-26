@@ -152,7 +152,9 @@ fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
         // its own tag; the arms stay keyed by tag so a downstream consumer can
         // split per-variant releases back to their source sub-extents by name
         // rather than relying on two arm vectors staying in the same order.
-        Extent::Union(arms) => Predicate::Union(arms.map(|_, e| get_iterate_extent_predicate(e))),
+        Extent::Union(arms) => {
+            Predicate::over_every_tag(arms.map(|_, e| get_iterate_extent_predicate(e)))
+        }
         _ => Predicate::True,
     }
 }
@@ -228,11 +230,6 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
                 *remaining = IntervalSet::from(Interval::<usize>::empty());
             }
             Predicate::False => {}
-            Predicate::LessThanEq(v) => {
-                // Release every index up to and including v.
-                let to_remove = IntervalSet::from(Interval::closed(0usize, v.as_uint()));
-                *remaining = remaining.difference(&to_remove);
-            }
             Predicate::Intervals(intervals) => {
                 // Subtract the released sub-intervals directly from the remaining set.
                 let to_remove = predicate_intervals_to_usize(intervals);
@@ -256,13 +253,13 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
             // arm releases its own sub-extent. Pairing positionally would release
             // the wrong sub-extent whenever the predicate covers a different tag
             // set than the extent — which width subtyping makes legal.
-            Predicate::Union(pred_arms) => {
+            Predicate::Union { .. } => {
                 for (tag, e) in ext_arms.iter_mut() {
-                    // A tag the predicate does not mention is unconstrained, so
-                    // nothing of it is released.
-                    if let Some(arm) = pred_arms.get(tag) {
-                        release_extent(e, arm, releaser);
-                    }
+                    // A tag the predicate does not name releases what its `rest` says.
+                    let arm = pred
+                        .under_tag(tag)
+                        .unwrap_or_else(|| unreachable!("matched as a union predicate"));
+                    release_extent(e, &arm, releaser);
                 }
             }
             _ => todo!("Got {pred:?} for Union extent"),
@@ -453,11 +450,11 @@ mod tests {
         }
     }
 
-    /// `Predicate::LessThanEq(v)` releases [0, v] inclusive.
+    /// `Predicate::at_or_below(v)` releases [0, v] inclusive.
     #[test]
-    fn release_extent_less_than_eq_releases_prefix() {
+    fn release_extent_at_or_below_releases_prefix() {
         let mut extent = Extent::uint_range(10); // [0, 9]
-        release_extent(&mut extent, &Predicate::LessThanEq(Value::UInt(4)), "");
+        release_extent(&mut extent, &Predicate::at_or_below(Value::UInt(4)), "");
         let s = uint_range_set(&extent);
         for i in 0..=4usize {
             assert!(!s.contains(&i), "{i} should be released");
@@ -487,13 +484,8 @@ mod tests {
     /// releases everything from 5 to the end of the extent.
     #[test]
     fn release_extent_right_unbounded_intervals_predicate() {
-        // LessThanEq(4) union True = True, so build the right-unbounded interval
-        // directly via the complement: values NOT ≤ 4 are > 4, i.e. [5, +∞).
-        // We exercise this by unioning {5} with a GreaterThan-style Intervals predicate.
-        // Simplest path: union two Intervals so the result stays as Intervals.
-        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![5])).union(
-            &Predicate::from_column_value(&ColumnValue::UInts(vec![6, 7, 8, 9, 10])),
-        );
+        // Everything not at or below 4: [5, +∞).
+        let p = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4)));
         let mut extent = Extent::uint_range(10); // [0, 9]
         release_extent(&mut extent, &p, "");
         let s = uint_range_set(&extent);
@@ -505,20 +497,17 @@ mod tests {
         }
     }
 
-    /// Releasing a `Predicate::Intervals` that contains a left-unbounded interval
-    /// (produced by `Predicate::union(LessThanEq, Intervals)`) must subtract the
-    /// full interval from the `UIntRange` extent, not silently drop it.
+    /// A prefix release unioned with a later point subtracts both from the `UIntRange`
+    /// extent: `[0, 3] ∪ {7}`.
     #[test]
-    fn release_extent_left_unbounded_intervals_predicate() {
-        // Build the predicate that union() produces from LessThanEq(3) | {7}:
-        // result is Predicate::Intervals containing (-∞, 3] ∪ {7}.
-        let p = Predicate::LessThanEq(Value::UInt(3))
+    fn release_extent_prefix_and_point_predicate() {
+        let p = Predicate::at_or_below(Value::UInt(3))
             .union(&Predicate::from_column_value(&ColumnValue::UInts(vec![7])));
 
         let mut extent = Extent::uint_range(10); // [0, 9]
         release_extent(&mut extent, &p, "");
 
-        // After releasing (-∞, 3] ∪ {7}, remaining should be {4, 5, 6, 8, 9}.
+        // After releasing [0, 3] ∪ {7}, remaining should be {4, 5, 6, 8, 9}.
         let Extent::UIntRange(ref remaining) = extent else {
             panic!("expected UIntRange");
         };

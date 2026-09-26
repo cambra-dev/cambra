@@ -180,7 +180,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
@@ -190,7 +190,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source2
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -288,7 +288,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
@@ -298,7 +298,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source2
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -324,7 +324,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(30usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(30usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -365,11 +365,11 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(100))]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
     src2.borrow_mut()
         .add_data(&[(Value::UInt(10), Value::Int(100))]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -416,7 +416,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src2.borrow_mut()
         .add_data(&[(Value::UInt(20), Value::Int(100))]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -429,7 +429,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .add_data(&[(Value::UInt(2), Value::Int(100))]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(2usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(2usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -941,5 +941,93 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
         pull_and_release(&[(3, 40)]),
         delivered(vec![3], vec![40]),
         "and the release still lands after the accumulated guard has two regions",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Completeness across batches: each batch is pulled to quiescence before the next
+// arrives, so the debug completeness check in `TileProducer::get` compares an output
+// with one taken before the batch
+// (`src/interpreter/design-operators.md`, "The completeness contract").
+// ---------------------------------------------------------------------------
+
+/// Compile `code` over an Int `source1`, deliver each batch (its rows, then a yield
+/// through the given key) and pull to quiescence after each, then close the source and
+/// pull to a terminal tile.
+fn run_in_batches(code: &str, batches: &[(&[(usize, i64)], usize)]) -> Tile {
+    let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    for (rows, upto) in batches {
+        let data: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+            .collect();
+        source.borrow_mut().add_data(&data);
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
+        let _ = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+    }
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
+    assert!(
+        tile.is_terminal(),
+        "{code}: stopped short of a terminal tile: {tile:?}"
+    );
+    tile.compact();
+    tile
+}
+
+/// A record holding a collection, looked up under each row of a streamed join: the
+/// gathered collection is stated complete beneath a row only once that row has arrived.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::summed("sum([sum(r.xs) for x in source1() for r in rs])")]
+#[case::iterated("sum([sum([z for z in r.xs]) for x in source1() for r in rs])")]
+fn a_record_valued_lookup_is_restated_under_each_streamed_row(#[case] tail: &str) {
+    let code = format!("rs = [(n=1, xs=[7, 8])]\n{tail}");
+    let tile = run_in_batches(&code, &[(&[(0, 1)], 0), (&[(1, 1)], 1)]);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![30])));
+}
+
+/// A constant broadcast over a filtered stream, where the constant comes from a loop that
+/// takes several pulls to finish: a batch whose rows are all filtered out arrives first,
+/// and the next batch's live row waits for the constant without the arm taking back
+/// what it called complete.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::induction(indoc::indoc! {r"
+    acc := 0
+    for i in [1, 2, 3]:
+        acc += i
+    t = acc + 0
+    [t for x in source1() if x > 5]
+"})]
+#[case::transaction(indoc::indoc! {r"
+    n: Mut(Int, Txn) := 0
+    for r in [1, 2, 3]:
+        with begin():
+            n := n + r
+    t = await_final(n)
+    [t for x in source1() if x > 5]
+"})]
+fn a_constant_arm_waits_for_its_constant_after_a_filtered_batch(#[case] code: &str) {
+    let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 10)], 1)]);
+    assert_eq!(
+        sort_function_by_domain(tile),
+        Tile::data_function(
+            ColumnValue::UInts(vec![1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![6]))),
+            Predicate::True,
+            BitSet::new(),
+        )
     );
 }

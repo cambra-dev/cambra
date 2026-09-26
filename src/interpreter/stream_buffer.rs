@@ -109,7 +109,7 @@ impl UIntStreamBuffer {
         } else if self.ready_size == 0 {
             Predicate::False
         } else {
-            Predicate::LessThanEq(Value::UInt(self.ready_size - 1))
+            Predicate::at_or_below(Value::UInt(self.ready_size - 1))
         };
         trace!("UIntStreamBuffer yielding {predicate:?}");
         predicate
@@ -130,7 +130,7 @@ impl UIntStreamBuffer {
     /// The indices `guard` admits, and the only place the buffer reads a guard's
     /// shape.
     ///
-    /// Four predicate shapes inhabit a `UInt` extent, and each denotes an index
+    /// Three predicate shapes inhabit a `UInt` extent, and each denotes an index
     /// set directly. A guard of any other shape was built for a different
     /// extent: the buffer can neither subtract it in [`get_elements`] nor free a
     /// prefix for it, so it fails here rather than being recorded as obsolete
@@ -141,9 +141,6 @@ impl UIntStreamBuffer {
         match guard {
             Predicate::True => IntervalSet::from(Interval::unbounded()),
             Predicate::False => IntervalSet::empty(),
-            Predicate::LessThanEq(v @ Value::UInt(_)) => {
-                IntervalSet::from(Interval::unbound_closed(v.clone()))
-            }
             Predicate::Intervals(s) if s.intervals().iter().all(Self::is_index_interval) => {
                 s.clone()
             }
@@ -285,7 +282,7 @@ mod tests {
     /// extent's predicate shapes carries the release.
     #[test]
     fn releasing_a_prefix_frees_it() {
-        for release in [covering(0, 4), Predicate::LessThanEq(Value::UInt(4))] {
+        for release in [covering(0, 4), Predicate::at_or_below(Value::UInt(4))] {
             let mut buf = buffer_with(8);
             buf.release("p", release);
             assert_eq!(
@@ -393,7 +390,7 @@ mod tests {
             "p",
             Predicate::Record(HashMap::from([(
                 "k".to_string(),
-                Predicate::LessThanEq(Value::UInt(4)),
+                Predicate::at_or_below(Value::UInt(4)),
             )])),
         );
     }
@@ -403,7 +400,7 @@ mod tests {
     #[should_panic(expected = "not a subset of its UInt index extent")]
     fn a_guard_over_the_wrong_value_sort_is_rejected() {
         let mut buf = buffer_with(8);
-        buf.release("p", Predicate::LessThanEq(Value::Int(4)));
+        buf.release("p", Predicate::at_or_below(Value::Int(4)));
     }
 
     /// A producer registering before any release has been carried reads the

@@ -70,6 +70,12 @@ impl WakeupQueue {
     fn take(&self) -> Vec<SharedConsumer> {
         std::mem::take(&mut *self.0.borrow_mut())
     }
+
+    /// Whether a wakeup is waiting for the next drain.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
 }
 
 /// Basic scheduler implementation.
@@ -140,7 +146,10 @@ other's subscribers",
         self.wakeups.clone()
     }
 
-    pub fn check_for_notifications(&mut self) {
+    /// Deliver every pending notification — new data a source reports, then the wakes
+    /// queued during the last pull — and say whether anything was delivered.
+    pub fn check_for_notifications(&mut self) -> bool {
+        let mut delivered = false;
         self.source_handles
             .values_mut()
             .for_each(|(source, consumers)| {
@@ -150,6 +159,7 @@ other's subscribers",
                 if source.borrow_mut().check_for_new_data() {
                     for consumer in consumers.iter().filter_map(Weak::upgrade) {
                         consumer.borrow_mut().notify();
+                        delivered = true;
                     }
                 }
             });
@@ -158,12 +168,14 @@ other's subscribers",
         // operator mid-borrow (see [`WakeupQueue`]).
         for consumer in self.wakeups.take() {
             consumer.borrow_mut().notify();
+            delivered = true;
         }
+        delivered
     }
 }
 
-/// Deliver, then pull — `laps` times, stopping as soon as `done` accepts the tile.
-/// Returns the last tile pulled.
+/// Deliver, then pull — `laps` times, stopping as soon as `done` accepts the tile or the
+/// program is quiescent. Returns the last tile pulled.
 ///
 /// The alternation `src/main.rs` runs, and the one a test should write. A lap runs on any
 /// pull that reaches the store, so a loop that only pulls is not stalled by itself; what
@@ -180,12 +192,20 @@ pub fn pull_laps(
 ) -> crate::interpreter::Tile {
     let guard = producer.tiling().universal_guard();
     let mut tile = producer.tiling().empty_tile();
-    for _ in 0..laps {
-        scheduler.check_for_notifications();
-        tile = producer.get(guard.clone());
-        if done(&tile) {
-            break;
+    for lap in 0..laps {
+        let delivered = scheduler.check_for_notifications();
+        let pulled = producer.get(guard.clone());
+        if done(&pulled) {
+            return pulled;
         }
+        // Nothing was delivered, the pull answered what the last one did, and it queued no
+        // wakeup, so every operator saw what it saw before and nothing moves until an input
+        // changes: the laps left would only repeat this one. A wakeup this pull queued is
+        // delivered by the next lap's check, so that lap is not a repeat.
+        if lap > 0 && !delivered && pulled == tile && scheduler.wakeups.is_empty() {
+            return pulled;
+        }
+        tile = pulled;
     }
     tile
 }
@@ -193,6 +213,53 @@ pub fn pull_laps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pull that answers what the last one did but queues a wakeup is not quiescence: the
+    /// wakeup is delivered by the next lap, and the producer it wakes answers anew.
+    #[test]
+    fn a_pull_that_queues_a_wakeup_is_not_quiescent() {
+        use crate::interpreter::tile_operators::{ProducerBase, TileProducer};
+        use crate::interpreter::{BaseType, ColumnValue, Extent, Tile, TileGuard, Tiling};
+        struct WakesOnSecondPull {
+            base: ProducerBase,
+            pulls: usize,
+            woken: Rc<RefCell<bool>>,
+            queue: WakeupQueue,
+        }
+        impl TileProducer for WakesOnSecondPull {
+            fn base(&self) -> &ProducerBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut ProducerBase {
+                &mut self.base
+            }
+            fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+                self.pulls += 1;
+                if self.pulls == 2 {
+                    let woken = self.woken.clone();
+                    self.queue
+                        .request(Rc::new(RefCell::new(move || *woken.borrow_mut() = true)));
+                }
+                let value = match *self.woken.borrow() {
+                    true => 2,
+                    false => 1,
+                };
+                Tile::Scalar(ColumnValue::Ints(vec![value]))
+            }
+            fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+        }
+        let mut scheduler = Scheduler::new();
+        let mut producer = WakesOnSecondPull {
+            base: ProducerBase::new(0, &Tiling::Scalar(Extent::Base(BaseType::Int))),
+            pulls: 0,
+            woken: Rc::new(RefCell::new(false)),
+            queue: scheduler.wakeup_queue(),
+        };
+        let tile = pull_laps(&mut scheduler, &mut producer, 8, |t| {
+            *t == Tile::Scalar(ColumnValue::Ints(vec![2]))
+        });
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![2])));
+    }
 
     /// A requested wakeup is not delivered synchronously — only by the next
     /// `check_for_notifications` — and it is delivered exactly once (the queue is

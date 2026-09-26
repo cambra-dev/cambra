@@ -230,7 +230,7 @@ impl TileProducer for ExtractFinalProducer {
                 {
                     self.source
                         .release(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::LessThanEq(Value::UInt(max_pos - 1)),
+                            Predicate::at_or_below(Value::UInt(max_pos - 1)),
                         )));
                 }
             }
@@ -386,11 +386,10 @@ mod tests {
             )
         }
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
-            if let TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(
-                w,
-            )))) = &obsolete_guard
+            if let TileGuard::Function(FunctionGuard::Domain(released)) = &obsolete_guard
+                && let Some(Value::UInt(w)) = released.as_at_or_below()
             {
-                self.releases.borrow_mut().push(*w);
+                self.releases.borrow_mut().push(w);
             }
         }
     }

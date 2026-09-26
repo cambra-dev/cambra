@@ -7,7 +7,10 @@ use std::{
 use super::*;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
-    interpreter::{Consumer, Scheduler},
+    interpreter::{
+        Consumer, Scheduler,
+        scheduler::{SharedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
+    },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -815,17 +818,22 @@ impl TileOperator for Memo {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let notified = Notified::flag();
+        let consumer = shared_consumer(consumer);
         Box::new(MemoProducer {
             base: ProducerBase::listening(
                 MemoProducer::alloc_id(),
                 self.tiling(),
                 notified.clone(),
             ),
-            input: self
-                .input
-                .subscribe(intent_guard, notified.consumer(consumer), scheduler),
+            input: self.input.subscribe(
+                intent_guard,
+                notified.consumer(forwarding_consumer(&consumer)),
+                scheduler,
+            ),
             cached_tile: self.tiling().empty_tile(),
             upstream_drained: false,
+            consumer,
+            wakeups: scheduler.wakeup_queue(),
         })
     }
 
@@ -846,6 +854,16 @@ struct MemoProducer {
     /// released, which merges to nothing. So skipping the pull is an
     /// *optimization*, and only release builds take it — see [`Self::get_impl`].
     upstream_drained: bool,
+    /// This memo's consumer, woken through [`wakeups`](Self::wakeups) when a pull nothing
+    /// notified finds data the cache did not hold.
+    ///
+    /// A memo answers from its cache until its input notifies, so every consumer downstream
+    /// counts on its output changing only after a notification. A pull taken without one —
+    /// an empty cache, or a drained input a debug build still probes — can still find new
+    /// data, and then the change reaches no one: a sibling memo over the same input has
+    /// already answered from its own cache and will keep doing so.
+    consumer: SharedConsumer,
+    wakeups: WakeupQueue,
 }
 
 impl TileProducer for MemoProducer {
@@ -903,7 +921,15 @@ impl TileProducer for MemoProducer {
             self.name(),
             self.cached_tile
         );
-        self.cached_tile.merge(input);
+        if notified {
+            self.cached_tile.merge(input);
+        } else {
+            let before = self.cached_tile.clone();
+            self.cached_tile.merge(input);
+            if self.cached_tile != before {
+                self.wakeups.request(self.consumer.clone());
+            }
+        }
         self.cached_tile.clone()
     }
 
@@ -958,7 +984,7 @@ mod tests {
         assert_eq!(fan.shared.borrow().subscribers.len(), 2);
 
         // Distinguish the survivor's guard from the empty one the dead slot holds.
-        let mine = TileGuard::Scalar(true);
+        let mine = TileGuard::Scalar(Predicate::True);
         second.release(mine.clone());
         drop(first);
 
@@ -998,7 +1024,7 @@ mod tests {
             !fan.released_in_full(),
             "nothing has released, so the fan-out still has its value to give"
         );
-        first.release(TileGuard::Scalar(true));
+        first.release(TileGuard::Scalar(Predicate::True));
         drop(first);
         fan.reopen();
 
@@ -1011,7 +1037,7 @@ mod tests {
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
         assert_eq!(
             fan.shared.borrow().release_guards[0],
-            TileGuard::Scalar(true),
+            TileGuard::Scalar(Predicate::True),
             "the late subscriber inherits the release rather than starting at nothing"
         );
         drop(late);
@@ -1116,7 +1142,7 @@ mod tests {
         Tile::data_function(
             ColumnValue::UInts(vec![key]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![value]))),
-            Predicate::LessThanEq(Value::UInt(key)),
+            Predicate::at_or_below(Value::UInt(key)),
             BitSet::new(),
         )
     }
@@ -1203,6 +1229,8 @@ mod tests {
             input: Box::new(upstream),
             cached_tile: tiling.empty_tile(),
             upstream_drained: false,
+            consumer: shared_consumer(Box::new(|| {})),
+            wakeups: WakeupQueue::default(),
         };
 
         for pull in 1..=3 {

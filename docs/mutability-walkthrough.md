@@ -778,7 +778,7 @@ What is new is the **progress algebra** — which is exactly the split §2's tab
 | a position present | its value is known | a write landed *at* that tick |
 | a position absent | **unknown** — may still arrive | **decided-absent**: the value holds from the latest earlier change |
 | how you read it | index the position | **fold** the changelog |
-| how much exists | the domain predicate | `frontier` — `LessThanEq(w)`: the history is `w + 1` ticks long, trailing carries included |
+| how much exists | the domain predicate | `frontier` — `at_or_below(w)`: the history is `w + 1` ticks long, trailing carries included |
 | `⊕` | run the keys together | append the changes, `max` the frontiers, `or` the terminal flags, union the closed keys |
 
 ### One shape, two engines

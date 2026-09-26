@@ -796,7 +796,7 @@ fn both_arms_feed_in_committing_block() {
                 vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            Predicate::Union(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
             ])),
@@ -884,7 +884,7 @@ fn conditional_if_else_reply_in_readonly_block() {
                 vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            Predicate::Union(TagMap::from_positional(vec![
+            Predicate::over_every_tag(TagMap::from_positional(vec![
                 Predicate::True,
                 Predicate::True,
             ])),
@@ -3032,7 +3032,7 @@ fn live_read_progresses_past_deny() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     src.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::from(0usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(0usize)));
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.
