@@ -143,21 +143,42 @@ pub fn check_letrec_causal(
 /// position-dependent data, or a map body that reads another group binding
 /// directly) is an ordinary, non-causal reference.
 fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
+    // A slot naming no group binding reads nothing through the accessor, so it is
+    // causal outright. This is what lets the structural cases below check only the
+    // pieces that do name one: a projection selecting which recurrence to consult, a
+    // `const`-wrapped step, a pointwise view's own combinators.
+    let mut refs = BTreeSet::new();
+    collect_noncausal_refs(history, live, &mut refs);
+    if refs.is_empty() {
+        return true;
+    }
     match &history.node {
         TypedExprNode::Var(_) => true,
         TypedExprNode::Compose(elts) => {
-            // Root must be a bare group reference; every later step must
-            // consult no group binding of its own (`Proj`s trivially, a
-            // pointful map lambda or its point-free combinator equally —
-            // `collect_noncausal_refs` respects the step's own binders). A
-            // step that *does* reference a binding reads it outside the
-            // accessor, so the slot is non-causal.
-            matches!(elts.first().map(|e| &e.node), Some(TypedExprNode::Var(_)))
-                && elts[1..].iter().all(|e| {
-                    let mut refs = BTreeSet::new();
-                    collect_noncausal_refs(e, live, &mut refs);
-                    refs.is_empty()
-                })
+            // Exactly one element may name the group, and it must be a causal slot
+            // itself. Everything before it is a group-free selector — which inner
+            // recurrence to read, for a history that is one recurrence per enclosing
+            // position — and everything after is a group-free pointwise step. Two
+            // elements naming the group would read one at a position derived from the
+            // other's output, which is outside the accessor.
+            //
+            // A selector is a projection, which picks a component and reads no position.
+            // Any other group-free morphism there could compute the position the accessor
+            // consults — a shift `𝑓: D ⇒ D` ahead of the history reads it at `𝑓(𝑝)` — so
+            // it is not admitted.
+            let names_the_group = |e: &TypedExpr| {
+                let mut r = BTreeSet::new();
+                collect_noncausal_refs(e, live, &mut r);
+                !r.is_empty()
+            };
+            let Some(at) = elts.iter().position(names_the_group) else {
+                return false;
+            };
+            elts[..at]
+                .iter()
+                .all(|e| matches!(&e.node, TypedExprNode::Proj(_)))
+                && !elts[at + 1..].iter().any(names_the_group)
+                && is_causal_history_slot(&elts[at], live)
         }
         TypedExprNode::Copair(ops) => {
             !ops.is_empty() && ops.iter().all(|o| is_causal_history_slot(o, live))
@@ -181,6 +202,12 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
                 }
                 _ => false,
             }
+        }
+        // `const(view)` — a view lifted to ignore the position it is read at.
+        TypedExprNode::Apply { function, argument }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Const)) =>
+        {
+            is_causal_history_slot(argument, live)
         }
         _ => false,
     }
@@ -209,13 +236,15 @@ fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
         return;
     }
     // The point-free guard shape (post-`lambda_elim`):
-    // `(⟨hist⟩ ▷ const, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*` — a
-    // compose ending in the guard builtin whose head zips the const-wrapped
-    // history slot with the position/default streams. The history slot is
-    // causal exactly as in the pointful shape; every other zip slot and any
-    // middle compose element is an ordinary reference position. This is what
-    // lets causality re-check at op-conversion entry, after `lambda_elim`
-    // has normalized the phase-emitted pointful form.
+    // `(⟨hist⟩, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*` — a compose ending in
+    // the guard builtin whose head zips the history slot with the position/default
+    // streams. The history slot is causal exactly as in the pointful shape, and it is
+    // `const`-wrapped only where the history does not depend on the enclosing
+    // argument: an inner loop's is one recurrence per enclosing position, so its slot
+    // selects with a projection instead. Every other zip slot and any middle compose
+    // element is an ordinary reference position. This is what lets causality re-check
+    // at op-conversion entry, after `lambda_elim` has normalized the phase-emitted
+    // pointful form.
     if let TypedExprNode::Compose(elts) = &e.node
         && let Some((last, init_elts)) = elts.split_last()
         && matches!(&last.node, TypedExprNode::Builtin(b) if is_causal_builtin(b))
@@ -224,12 +253,7 @@ fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))
         && let TypedExprNode::Tuple(slots) = &argument.node
         && let Some((h_slot, rest_slots)) = slots.split_first()
-        && let TypedExprNode::Apply {
-            argument: view,
-            function: const_fn,
-        } = &h_slot.node
-        && matches!(&const_fn.node, TypedExprNode::Builtin(Builtin::Const))
-        && is_causal_history_slot(view, live)
+        && is_causal_history_slot(h_slot, live)
     {
         for s in rest_slots {
             collect_noncausal_refs(s, live, out);

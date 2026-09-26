@@ -236,9 +236,17 @@ pub(super) fn insert_iterate_recurse(
         // Each transaction writer's source is iterated internally by the
         // mutable variable engine (the induction store for an accumulator); op-conversion
         // compiles it with `input=None`, so wrap it like a loop source.
-        TypedExprNode::Transact { writers, .. } => {
-            for w in writers.iter_mut() {
-                wrap_with_iterate(&mut w.source, discharged, "transact-source");
+        // A top-level carrier's source is one collection the engine sweeps, so it is an
+        // iteration site. A nested carrier's is a **family** — one collection per
+        // enclosing position — whose site is the collection under the enclosing level,
+        // named where the family is built rather than here.
+        TypedExprNode::Transact {
+            writers, parameter, ..
+        } => {
+            if parameter.is_none() {
+                for w in writers.iter_mut() {
+                    wrap_with_iterate(&mut w.source, discharged, "transact-source");
+                }
             }
         }
         // A product's components — and a program's outputs, which are the same
@@ -1290,6 +1298,7 @@ mod tests {
                 body,
             }],
             domain: Type::UIntRange(3),
+            parameter: None,
         })
         .with_ty(hist_ty);
 

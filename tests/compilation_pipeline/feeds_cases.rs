@@ -777,9 +777,10 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
     "#},
     "only assignments, function definitions, `<<` feeds and `yield`"
 )]
-// A mutable variable introduced in the body, at all three spellings — one rejection,
-// because whether the introduction carries an annotation says nothing about which
-// construct it is.
+// A mutable variable introduced in a **generator** body, at both `:=` spellings — one
+// rejection, because whether the introduction carries an annotation says nothing about
+// which construct it is. A mutation loop's body carries one; the yield path lowers its
+// statements without a recurrence, so this one has nothing to sequence it.
 #[case(
     indoc! {r#"
         o = defer()
@@ -800,6 +801,8 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
     "#},
     "`t` is a mutable variable introduced inside a for-loop body"
 )]
+// The `=` spelling is rejected for its **operator** instead, which is the answer
+// wherever it is written: a mutable variable is introduced solely with `:=`.
 #[case(
     indoc! {r#"
         o = defer()
@@ -808,7 +811,7 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
             o << i
         sum(o)
     "#},
-    "`t` is a mutable variable introduced inside a for-loop body"
+    "use `:=` instead"
 )]
 fn a_non_final_loop_body_statement_is_a_binding_or_a_feed(
     #[case] code: &str,

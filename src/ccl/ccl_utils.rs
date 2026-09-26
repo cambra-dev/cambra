@@ -396,6 +396,18 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             e.ty = ty;
             e
         }
+        // A nested recurrence: an inner loop's history binds inside this decision, and
+        // the decision itself is the `letrec`'s body.
+        TypedExprNode::LetRec { bindings, body } => {
+            let new_body = wrap_decision_variant(*body);
+            let ty = new_body.ty.clone();
+            let mut e = Expr::new(TypedExprNode::LetRec {
+                bindings,
+                body: Box::new(new_body),
+            });
+            e.ty = ty;
+            e
+        }
         TypedExprNode::Record(fields) => {
             let bool_ty = Type::Base(BaseType::Bool);
             let unit_ty = Type::Base(BaseType::Unit);
@@ -445,7 +457,7 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             case
         }
         other => panic!(
-            "wrap_decision_variant: a writer decision is `let* in {{commit, writes, …}}`, got {other:?}"
+            "wrap_decision_variant: a writer decision is `(let | letrec)* in {{commit, writes, …}}`, got {other:?}"
         ),
     }
 }

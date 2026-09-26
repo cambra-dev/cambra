@@ -1796,23 +1796,38 @@ A plain `=` whose target is a **fresh** name (not introduced in an outer
 frame) is unaffected: an ordinary per-iteration binding, in scope for the
 rest of that iteration and gone at the next.
 
-The converse also holds: a mutable variable must be introduced **before**
-the loop that accumulates it. A `:=` inside a loop body whose target is not
-an already-declared accumulator is a lowering error, at every spelling —
-`y := 0`, `y: Mut(Int) := 0`, and `y: Mut(Int, Txn) := 0` alike, since
-whether an introduction carries a type annotation says nothing about
-whether it introduces a mutable variable. A mutable variable scoped to one iteration would need
-the loop's own iteration extent as its sequencing domain, which is the
-nested-recurrence case below:
+A `:=` inside a loop body whose target is not an already-declared accumulator
+**introduces** a mutable variable scoped to the block that writes it. Its updates
+carry across the statements of that block, and it restarts at its seed on the
+next iteration, so the loop around it is its sequencing domain — a recurrence
+nested inside the enclosing one:
+
+```
+total := 0
+for x in [1, 2]:
+    y := x
+    y += 10
+    total += y
+total                     # 23
+```
+
+An `if` branch is a block of its own, so a `:=` there introduces a variable that
+branch alone writes and reads.
+
+Two introductions are lowering errors. A **transactional** one, `y: Mut(Int,
+Txn) := 0` inside a loop body, names commit time, a sequencing domain the loop
+around it does not supply. One inside a loop that writes no mutable variable
+declared before it (a generator, or a loop that only feeds) has no recurrence of
+that loop to live in.
 
 > `Y is a mutable variable introduced inside a for-loop body, which is not
 > supported: declare it before the loop (`Y := …`) so its updates carry
 > across iterations, or bind a per-iteration value immutably with `Y = …``
 
 The same holds for `op=`, which is a mutable write and not a rebind: `x += e`
-inside a loop body requires `x` to be a mutable variable declared before the
-loop. A target that is not gets the matching error rather than a
-per-iteration binding.
+inside a loop body requires `x` to be a mutable variable — one declared before
+the loop, or one an enclosing body introduced. A target that is neither gets the
+matching error rather than a per-iteration binding.
 
 Falling back to a per-iteration binding is deliberately *not* what happens in
 either case, for the reason a plain `=` to an outer name is rejected: it would
@@ -1822,8 +1837,8 @@ the old value, so a per-iteration rebind reads the binding's *initial* value on
 every iteration.
 
 *Currently unsupported* (see §12): nested for-loops with mutable
-variables, mutable variables introduced inside a loop body or a `with
-begin():` block, and `while` loops.
+variables, a mutable variable introduced inside a `with begin():` block, and
+`while` loops.
 
 ### 4.7 `pass`
 
@@ -3419,14 +3434,16 @@ with parser-level support that lowering rejects:
 - **`while` loops** — currently a parse error (the `while` keyword is
   not yet recognised). Tracked as future work under mutability
   ("while loop lowering").
-- **Nested `for` loops with mutable variables** — a single-level
-  for-loop accumulator works (§4.6), but mutation inside a nested loop
-  is not yet lowered.
-- **A mutable variable introduced inside a loop body or a transaction
-  block** — a mutable variable must be declared before the loop that
-  accumulates it (§4.6), and a `with begin():` block may write mutable variables
-  declared outside it but not introduce its own. Both would need a
-  sequencing domain nested inside the enclosing one.
+- **Nested `for` loops with mutable variables** — a nested loop that
+  writes a mutable variable of the loop around it lowers and plans to a
+  carrier per enclosing row, which operator conversion does not realize
+  yet. A nested loop that writes no mutable variable declared outside it
+  is rejected at lowering.
+- **A mutable variable introduced inside a transaction block** — a `with
+  begin():` block may write mutable variables declared outside it but not
+  introduce its own, which would need a sequencing domain nested inside commit
+  time. A loop body may introduce one (§4.6); commit time is what the loop
+  around it does not supply.
 - **Generator body shapes** — a `def` containing any `yield` is a
   generator function semantically (§4.2), but today the compiler only
   accepts bodies that are exactly one top-level `for`. Top-level

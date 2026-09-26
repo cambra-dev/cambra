@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{commit_payload_ty, count_free},
+    ccl_utils::{apply_primitive, commit_payload_ty, count_free},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, tvar},
     provenance,
@@ -117,6 +117,10 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
              to one commit-gated writer, not a per-leg group)"
         );
         let (h, def) = bindings.into_iter().next().unwrap();
+        // The definition is planned inside `recognize_group`, once this writer's own
+        // parameter is normalized. An inner loop's carrier is built against that
+        // parameter, so planning the definition first would build it against a shape
+        // this level is about to change.
         return recognize_group(h, def, body);
     }
     expr.map_children(plan_loops);
@@ -186,12 +190,34 @@ fn unwrap_const(e: Expr) -> Expr {
     *argument
 }
 
+/// Unwrap a guard's seed slot to the record of per-key seeds it carries, and whether
+/// that record is **closed** in the writer's argument.
+///
+/// Seeds that vary per enclosing position — the enclosing accumulators where an inner
+/// loop starts — are a record-valued morphism, `⟨…⟩ ▷ zip`, whose fields are already
+/// morphisms. Seeds closed in the argument are one `const` over the whole record,
+/// `⟨…⟩ ▷ const`, whose fields are values: every top-level loop's seeds, and an inner
+/// loop's where the enclosing body introduced the mutable variable, so it starts at the
+/// same value at every enclosing position.
+fn unwrap_seed_record(e: Expr) -> (Expr, bool) {
+    let TypedExprNode::Apply { argument, function } = e.node else {
+        panic!("letrec recognition: expected `⟨seeds⟩ ▷ const` or `⟨seeds⟩ ▷ zip`");
+    };
+    let closed = match function.node {
+        TypedExprNode::Builtin(Builtin::Const) => true,
+        TypedExprNode::Builtin(Builtin::Zip) => false,
+        _ => panic!("letrec recognition: guard seeds are neither const-wrapped nor zipped"),
+    };
+    (*argument, closed)
+}
+
 /// Destructure the post-elim guard compose
 /// `(⟨view⟩ ▷ const, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*`,
-/// returning `(default, which-guard)`. The view slot (the causal history
+/// returning the defaults record, whether it is closed in the writer's argument
+/// ([`unwrap_seed_record`]), and which guard. The view slot (the causal history
 /// read) is validated by `check_letrec_causal` and discarded here — the
 /// engine reconstructs every read from the history record itself.
-fn split_causal_compose(guard: Expr) -> (Expr, Builtin) {
+fn split_causal_compose(guard: Expr) -> (Expr, bool, Builtin) {
     let TypedExprNode::Compose(mut elts) = guard.node else {
         panic!("letrec recognition: guard is not a compose");
     };
@@ -220,16 +246,21 @@ fn split_causal_compose(guard: Expr) -> (Expr, Builtin) {
         panic!("letrec recognition: guard zip takes a tuple");
     };
     assert_eq!(slots.len(), 3, "guard arity (history, position, default)");
-    let default = unwrap_const(slots.pop().expect("default slot"));
-    (default, b)
+    let (default, closed) = unwrap_seed_record(slots.pop().expect("default slot"));
+    (default, closed, b)
 }
 
 /// Destructure a post-elim decision compose
 /// `(⟨slot₀⟩, …, ⟨source⟩) ▷ zip ≫ ⟨body…⟩` into its snapshot slots, the
-/// trailing source, and the writer body (the tail elements re-composed,
-/// verbatim). `p_tys` are the body's tuple-parameter element types (snapshot
-/// value types then the item), used only to stamp the rebuilt body compose.
-fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Expr, Expr) {
+/// trailing source, the writer body (the tail elements re-composed, verbatim), and
+/// the writer's parameter — the `(enclosing, position)` pair for a nested carrier,
+/// `None` for a top-level one. `p_tys` are the body's tuple-parameter element types
+/// (snapshot value types then the item), used only to stamp the rebuilt body compose.
+fn split_decision_compose(
+    decision: Expr,
+    decision_ty: &Type,
+    enclosing: Option<&Type>,
+) -> (Vec<Expr>, Expr, Expr, Option<Type>) {
     if !matches!(decision.node, TypedExprNode::Compose(_)) {
         panic!(
             "letrec recognition: decision is not a compose: {}",
@@ -255,21 +286,92 @@ fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Exp
     let TypedExprNode::Tuple(mut slots) = argument.node else {
         panic!("letrec recognition: decision snapshot is not a tuple");
     };
+    // The head builds the body's parameter. A nested writer whose body reads the
+    // enclosing row takes `(enclosing-and-position, slots)`, and the head then zips the
+    // parameter itself, `id`, with a zip of the slots; one whose body does not takes the
+    // slots directly, elimination having no reason to pass a row it never reads. Read off
+    // the head rather than the body's domain: every slot but the source is a read of
+    // `__prev`, so none is `id`, where an accumulator whose value is itself such a pair
+    // would give the body the same domain either way.
+    let body_takes_pair = enclosing.is_some()
+        && matches!(slots.as_slice(), [row, inner]
+            if matches!(row.node, TypedExprNode::Builtin(Builtin::Id))
+                && matches!(&inner.node, TypedExprNode::Apply { function, .. }
+                    if matches!(function.node, TypedExprNode::Builtin(Builtin::Zip))));
+    if body_takes_pair {
+        let [_row, inner] = slots.as_slice() else {
+            panic!("letrec recognition: a body taking the enclosing row is fed it beside the slots")
+        };
+        let TypedExprNode::Apply { argument, function } = &inner.node else {
+            panic!("letrec recognition: a nested decision's slots are not a zip application");
+        };
+        assert!(
+            matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)),
+            "letrec recognition: a nested decision's slots are not zipped"
+        );
+        let TypedExprNode::Tuple(inner_slots) = &argument.node else {
+            panic!("letrec recognition: a nested decision's slots are not a tuple");
+        };
+        slots = inner_slots.clone();
+    }
     let source = slots.pop().expect("snapshot carries the source");
+    // The writer's parameter is the domain every snapshot slot shares, and the source
+    // is one of them — so read it off the term rather than rebuilding it from
+    // `(enclosing, domain)`. The rebuilt pair is the weaker type: `lambda_elim` lifts a
+    // filter on the inner binder onto the pair, where it reads `__elem.1`, and neither
+    // component carries it.
+    let parameter = enclosing.map(|ctx_ty| {
+        let p = source
+            .ty
+            .domain()
+            .expect("letrec recognition: a snapshot slot is a function");
+        assert!(
+            matches!(p.peel_refinements(), Type::Tuple(parts)
+                if parts.len() == 2 && parts[0] == *ctx_ty),
+            "a nested writer's parameter is the (enclosing, position) pair, \
+             enclosing {ctx_ty}: {p}"
+        );
+        p
+    });
     let slot_val_ty = |e: &Expr| {
         e.ty.codomain()
             .expect("letrec recognition: snapshot slot is a function")
     };
     let mut p_tys: Vec<Type> = slots.iter().map(slot_val_ty).collect();
     p_tys.push(slot_val_ty(&source));
+    let param_ty = match &parameter {
+        Some(p) => Type::Tuple(vec![p.clone(), Type::Tuple(p_tys)]),
+        None => Type::Tuple(p_tys),
+    };
     let body = if tail.len() == 1 {
         tail.into_iter().next().expect("single body element")
     } else {
         let mut c = Expr::compose(tail);
-        c.ty = Type::fun(Type::Tuple(p_tys), decision_ty.clone());
+        c.ty = Type::fun(param_ty.clone(), decision_ty.clone());
         c
     };
-    (slots, source, body)
+    // Give every nested writer the same parameter. Where the body does not read the
+    // enclosing row it takes the slots alone, so projecting the slots out in front of
+    // it says the same thing at the shape the rest of the pipeline reads — a
+    // composition, which leaves the body itself untouched.
+    let body = match &parameter {
+        Some(pair) if !body_takes_pair => {
+            let pair = pair.clone();
+            let slots_ty = body
+                .ty
+                .domain()
+                .expect("letrec recognition: a writer body is a function");
+            let outer = Type::Tuple(vec![pair, slots_ty.clone()]);
+            let mut c = Expr::compose(vec![
+                Expr::proj_index(1).with_ty(Type::fun(outer.clone(), slots_ty)),
+                body,
+            ]);
+            c.ty = Type::fun(outer, decision_ty.clone());
+            c
+        }
+        _ => body,
+    };
+    (slots, source, body, parameter)
 }
 
 /// Which binding a transaction `LetRec` binding is (dispatched on its body\'s
@@ -392,7 +494,7 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
             body,
         };
     }
-    let (reads, source, body) = split_decision_compose(decision, &decision_ty);
+    let (reads, source, body, _) = split_decision_compose(decision, &decision_ty, None);
     // Each snapshot read is `__t ≫ hist_k` — the key is the trailing
     // history var.
     let read_keys: Vec<Name> = reads
@@ -468,7 +570,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         binding_names.push(b.name.clone());
         match classify_txn_binding(&def) {
             TxnBinding::History => {
-                let (init, which) = split_causal_compose(def);
+                let (init, _, which) = split_causal_compose(def);
                 assert!(
                     matches!(which, Builtin::GetPrevTxn),
                     "letrec recognition: transaction history guarded by get_prev_seq"
@@ -530,6 +632,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         keys,
         writers,
         domain: Type::Txn,
+        parameter: None,
     });
     transact.ty = hist_ty.clone();
 
@@ -634,6 +737,29 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
     e.walk_children_mut(|c| collapse_snapshot_sources(c, hist, hist_ty));
 }
 
+/// Whether a morphism of `(enclosing, position)` reads the position.
+///
+/// The parameter is read at the head of a compose, so a read of the position is a
+/// `.1` in that position. Used on a nested carrier's seed, which is the value entering
+/// the inner loop at an enclosing position and so cannot vary with the position the
+/// loop is about to run over.
+fn reads_own_position(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Proj(ProjKey::Index(1)) => true,
+        TypedExprNode::Compose(elts) => elts.first().is_some_and(reads_own_position),
+        // A zip's legs each read the parameter; a `const`'s argument reads nothing.
+        TypedExprNode::Apply { function, .. }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Const)) =>
+        {
+            false
+        }
+        TypedExprNode::Apply { argument, .. } => reads_own_position(argument),
+        TypedExprNode::Tuple(elts) => elts.iter().any(reads_own_position),
+        TypedExprNode::Record(fields) => fields.iter().any(|(_, v)| reads_own_position(v)),
+        _ => false,
+    }
+}
+
 /// Destructure the phase\'s decision-factored induction binding (post-elim)
 /// and rebuild it as a `Transact`:
 ///
@@ -648,7 +774,31 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
 /// (`__hist ≫ .writes ≫ .acc` extracts and `__hist ≫ .__to_<feed>` taps) become
 /// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
-    let (domain_ty, decision_ty) = fun_parts(&h.ty);
+    // An inner loop's history is a family — one recurrence per enclosing position —
+    // which `lambda_elim` leaves as a pair morphism under `curry`, typed
+    // `enclosing ⇒ (position ⤇ decision)`. Peel both so the recurrence recognized
+    // below is the inner level; the writer's parameter then carries the enclosing
+    // argument beside the position.
+    let curried = matches!(
+        &def.node,
+        TypedExprNode::Apply { function, .. }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Curry))
+    );
+    let (h_ty, def, enclosing) = if curried {
+        let TypedExprNode::Apply { argument, .. } = def.node else {
+            unreachable!("curried above")
+        };
+        let Type::Fun {
+            domain, codomain, ..
+        } = &h.ty
+        else {
+            panic!("letrec recognition: a curried history is a function");
+        };
+        ((**codomain).clone(), *argument, Some((**domain).clone()))
+    } else {
+        (h.ty.clone(), def, None)
+    };
+    let (domain_ty, decision_ty) = fun_parts(&h_ty);
     // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
     // ride the (dense) `commit` payload record `𝑃` alongside `writes`.
     let payload_ty = commit_payload_ty(&decision_ty);
@@ -672,7 +822,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
              shape"
         );
     };
-    let (defaults, which) = split_causal_compose(*guard);
+    let (defaults, seeds_closed, which) = split_causal_compose(*guard);
     assert!(
         matches!(which, Builtin::GetPrevSeq),
         "letrec recognition: induction history causal by get_prev_txn"
@@ -681,7 +831,34 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         panic!("letrec recognition: guard defaults are not the accumulators' inits record");
     };
 
-    let (prev_slots, source, writer_body) = split_decision_compose(*applied, &decision_ty);
+    let (prev_slots, source, writer_body, parameter) =
+        split_decision_compose(*applied, &decision_ty, enclosing.as_ref());
+    // A nested writer's components are morphisms of `(enclosing, position)` where a
+    // top-level writer's are morphisms of the position, and that is the whole of the
+    // difference — the terms stay exactly as elimination left them, which is what lets
+    // one level's output be the next level's input.
+    //
+    // The source is the one component that cannot: `WriterSite::source` is a
+    // collection, and `(enclosing, position) ⇒ item` is a function of pairs. Currying
+    // makes it the family it denotes, one collection per enclosing position — a
+    // wrapper that derives its own type rather than a rewrite of the term inside.
+    let source = match &enclosing {
+        None => source,
+        Some(ctx_ty) => {
+            let item = source
+                .ty
+                .codomain()
+                .expect("letrec recognition: a writer source is a function");
+            crate::ccl::lambda_elim::curry_at(
+                source,
+                Type::fun(ctx_ty.clone(), Type::data_fun(domain_ty.clone(), item)),
+            )
+        }
+    };
+    // Now that this writer's parameter is settled, plan what is inside it: an inner
+    // loop's carrier reads this parameter, so it has to be built against the final
+    // shape rather than the one elimination happened to leave.
+    let writer_body = plan_loops(writer_body);
     assert_eq!(
         prev_slots.len(),
         inits.len(),
@@ -703,9 +880,31 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // resume an accumulator rather than guess by position.
     let keys: Vec<TransactKey> = inits
         .into_iter()
-        .map(|(label, init)| TransactKey {
-            name: Name::fresh(label),
-            init,
+        .map(|(label, init)| {
+            // A nested carrier's seed is a morphism of the enclosing writer's parameter.
+            // A record of seeds closed in it rides under one `const`, which distributes
+            // over the fields — the shape a mutable variable the enclosing body
+            // introduces leaves, its seed being the same at every enclosing position.
+            let init = match (&parameter, seeds_closed) {
+                (Some(p), true) => {
+                    let init_ty = init.ty.clone();
+                    apply_primitive(init, Builtin::Const, Type::fun(p.clone(), init_ty))
+                }
+                _ => init,
+            };
+            // A nested carrier's seed is the value entering the inner loop at an
+            // enclosing position, so it is constant in this carrier's own position
+            // even though it is a morphism of the pair. The engine reads it anywhere
+            // in the row; the assertion is what makes that reading safe.
+            debug_assert!(
+                enclosing.is_none() || !reads_own_position(&init),
+                "letrec recognition: a nested carrier's seed `{label}` reads its own \
+                 position, which the value entering the loop cannot depend on"
+            );
+            TransactKey {
+                name: Name::fresh(label),
+                init,
+            }
         })
         .collect();
     let key_names: Vec<Name> = keys.iter().map(|k| k.name.clone()).collect();
@@ -742,19 +941,30 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         keys,
         writers: vec![writer],
         domain: domain_ty.clone(),
+        parameter,
     });
-    transact.ty = hist_ty.clone();
+    // A nested carrier is one history record per enclosing row, so it is a function of
+    // the enclosing parameter, and its reads are morphisms of that parameter
+    // (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence carrier").
+    let carrier_ty = match &enclosing {
+        Some(ctx_ty) => Type::fun(ctx_ty.clone(), hist_ty.clone()),
+        None => hist_ty.clone(),
+    };
+    transact.ty = carrier_ty.clone();
 
     let hist = Name::fresh("__hist");
     let mut body = letrec_body;
     rewrite_hist_reads(
         &mut body,
         &h.name,
-        &hist,
-        &hist_ty,
-        &key_names_for_reads,
-        &acc_tys,
-        &domain_ty,
+        &HistReads {
+            hist: &hist,
+            hist_ty: &hist_ty,
+            enclosing: enclosing.as_ref(),
+            keys: &key_names_for_reads,
+            acc_tys: &acc_tys,
+            domain_ty: &domain_ty,
+        },
     );
     assert_eq!(
         count_free(&h.name, &body),
@@ -763,7 +973,33 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         h.name
     );
 
-    Expr::let_in(binding(hist, hist_ty), transact, body)
+    Expr::let_in(binding(hist, carrier_ty), transact, body)
+}
+
+/// What a history read is rewritten against: the carrier's binder, its history record's
+/// type, and for a nested carrier the enclosing parameter it is a function of.
+struct HistReads<'a> {
+    hist: &'a Name,
+    hist_ty: &'a Type,
+    enclosing: Option<&'a Type>,
+    keys: &'a [Name],
+    acc_tys: &'a [Type],
+    domain_ty: &'a Type,
+}
+
+/// Key `field`'s history `Fun(D, V)` read off the carrier: the projection `__hist.field` of a
+/// top-level carrier's record, or for a nested carrier the morphism `__hist ≫ .field` of the
+/// enclosing parameter, one history per enclosing row.
+fn hist_field_read_of(reads: &HistReads<'_>, field: String, field_ty: Type) -> Expr {
+    match reads.enclosing {
+        None => hist_field_read(reads.hist, reads.hist_ty, field, field_ty),
+        Some(ctx_ty) => {
+            let mut proj = Expr::proj_field(field);
+            proj.ty = Type::fun(reads.hist_ty.clone(), field_ty.clone());
+            let carrier = tvar(reads.hist, Type::fun(ctx_ty.clone(), reads.hist_ty.clone()));
+            Expr::compose(vec![carrier, proj]).with_ty(Type::fun(ctx_ty.clone(), field_ty))
+        }
+    }
 }
 
 /// `__hist.field = Apply(Var(__hist), Proj(Field(field)))` — a history-record
@@ -781,21 +1017,66 @@ fn hist_field_read(hist: &Name, hist_ty: &Type, field: String, field_ty: Type) -
 /// compose `__hist ≫ .writes ≫ .acc` and feed reads as `__hist ≫ .__to_<feed>`;
 /// downstream normalization may extend those composes (`__hist ≫ .__to ≫ f`),
 /// so the match is on the *prefix*, keeping any tail elements.
-fn rewrite_hist_reads(
-    e: &mut Expr,
-    h: &Name,
-    hist: &Name,
-    hist_ty: &Type,
-    keys: &[Name],
-    acc_tys: &[Type],
-    domain_ty: &Type,
-) {
+fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
+    // An inner loop's history depends on the enclosing writer's parameter, so
+    // `lambda_elim` leaves every read of it as a combinator tree rather than the flat
+    // `h ≫ …` compose a parameter-independent history keeps. Peel that tree back to
+    // its steps and rewrite it against the carrier, which is a function of that same
+    // parameter, so the rewritten read is a morphism of it too.
+    // A closed transformer applied to the whole view eliminates to a plain compose
+    // element rather than to another zip, so a view may end in steps that take it
+    // whole. Those stand outside the rewritten read: composing them onto its values
+    // instead would read a collection-valued step as a map over the elements.
+    // Borrowed where `e` is not a split view: this runs at every node of the continuation,
+    // so a clone per visit would copy each subtree once per level above it.
+    let split = split_view_tail(e);
+    let view: &Expr = split.as_ref().map_or(&*e, |(view, _)| view);
+    if let Some(steps) = peel_view_steps(view, h)
+        // The decision's `` variant_project(`commit) `` step comes first, as on the flat
+        // path below; the payload-field reads follow it.
+        && matches!(
+            steps.first().map(|x| &x.node),
+            Some(TypedExprNode::Builtin(Builtin::VariantProject(_)))
+        )
+        && let Some((read, consumed)) = history_read_replacement(
+            steps.get(1).map(|x| &x.node),
+            steps.get(2).map(|x| &x.node),
+            reads,
+        )
+    {
+        let _g = provenance::enter(
+            e.node_id(),
+            "planning.hist_read",
+            provenance::Nature::Machinery,
+        );
+        let outer_ty = e.ty.clone();
+        let rest: Vec<Expr> = steps[1 + consumed..].to_vec();
+        let view_ty = view.ty.clone();
+        let after = split.map(|(_, after)| after).unwrap_or_default();
+        let rewritten = match reads.enclosing {
+            Some(_) => per_row_view(read, rest),
+            None => {
+                let inner = compose_onto_values(read, rest);
+                let const_ty = Type::compute_fun_or_hole(&inner.ty, &view_ty);
+                Expr::apply(inner, Expr::builtin(Builtin::Const).with_ty(const_ty)).with_ty(view_ty)
+            }
+        };
+        *e = if after.is_empty() {
+            rewritten
+        } else {
+            let mut elts = vec![rewritten];
+            elts.extend(after);
+            Expr::compose(elts)
+        };
+        e.ty = outer_ty;
+        return;
+    }
     if let TypedExprNode::Compose(elts) = &e.node
         && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
-        // The phase now interposes a ``variant_project(`commit)`` step between the
-        // history var and the `.writes`/`.__to_<feed>` reads, eliminating the
-        // `` {`commit{𝑃} | `abort} `` decision to its dense payload. Skip it, then
-        // match the payload-field prefix as before (`elts[2]`/`elts[3]`).
+        // A ``variant_project(`commit)`` step sits between the history var and the
+        // `.writes`/`.__to_<feed>` reads, eliminating the `` {`commit{𝑃} | `abort} ``
+        // decision to its dense payload. Skip it, then match the payload-field prefix
+        // (`elts[2]`/`elts[3]`).
         && matches!(
             elts.get(1).map(|x| &x.node),
             Some(TypedExprNode::Builtin(Builtin::VariantProject(_)))
@@ -812,51 +1093,212 @@ fn rewrite_hist_reads(
         );
         // The history-record read replacing the matched prefix, plus how many compose
         // elements the prefix covered (the `variant_project` step included).
-        let replacement: Option<(Expr, usize)> =
-            match (elts.get(2).map(|x| &x.node), elts.get(3).map(|x| &x.node)) {
-                // An accumulator read `` __hist ≫ variant_project(`commit) ≫
-                // .writes ≫ .acc ``. Both projections are named now that the
-                // write set is keyed by accumulator, so `.writes` on the outer
-                // one is what tells this from a tap read.
-                (
-                    Some(TypedExprNode::Proj(ProjKey::Field(f))),
-                    Some(TypedExprNode::Proj(ProjKey::Field(acc))),
-                ) if f == F_WRITES => {
-                    let i = keys
-                        .iter()
-                        .position(|k| k.field_key() == *acc)
-                        .unwrap_or_else(|| {
-                            panic!("letrec recognition: `.writes ≫ .{acc}` names no accumulator")
-                        });
-                    let field_ty = crate::ccl::ccl_utils::history_ty(domain_ty, &acc_tys[i]);
-                    Some((hist_field_read(hist, hist_ty, acc.clone(), field_ty), 4))
-                }
-                (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-                    // A tap read ``__hist ≫ variant_project(`commit) ≫ .__to_<feed>``:
-                    // its function type is the history record\'s field type.
-                    let field = f.clone();
-                    let field_ty = hist_ty_field(hist_ty, &field);
-                    Some((hist_field_read(hist, hist_ty, field, field_ty), 3))
-                }
-                _ => None,
-            };
+        let replacement: Option<(Expr, usize)> = history_read_replacement(
+            elts.get(2).map(|x| &x.node),
+            elts.get(3).map(|x| &x.node),
+            reads,
+        )
+        .map(|(read, consumed)| (read, 2 + consumed));
         if let Some((read, covered)) = replacement {
             let rest: Vec<Expr> = elts[covered..].to_vec();
-            if rest.is_empty() {
-                let outer_ty = e.ty.clone();
-                *e = read;
-                e.ty = outer_ty;
+            let outer_ty = e.ty.clone();
+            let inner = if rest.is_empty() {
+                read
             } else {
                 let mut new_elts = vec![read];
                 new_elts.extend(rest);
-                let outer_ty = e.ty.clone();
-                *e = Expr::compose(new_elts);
-                e.ty = outer_ty;
-            }
+                Expr::compose(new_elts)
+            };
+            *e = inner;
+            e.ty = outer_ty;
             return;
         }
     }
-    e.walk_children_mut(|c| rewrite_hist_reads(c, h, hist, hist_ty, keys, acc_tys, domain_ty));
+    e.walk_children_mut(|c| rewrite_hist_reads(c, h, reads));
+}
+
+/// `read ≫ steps`, the steps composed onto the read's values: a chain from the read's
+/// own domain to the last step's codomain, at the read's kind. `read` alone where there
+/// are no steps.
+fn compose_onto_values(read: Expr, steps: Vec<Expr>) -> Expr {
+    if steps.is_empty() {
+        return read;
+    }
+    let chain_ty = match (read.ty.domain(), steps[steps.len() - 1].ty.codomain()) {
+        (Some(d), Some(c)) => Type::fun_like(&read.ty, d, c),
+        _ => Type::Hole,
+    };
+    let mut elts = vec![read];
+    elts.extend(steps);
+    Expr::compose(elts).with_ty(chain_ty)
+}
+
+/// A nested carrier's read, `read : 𝐸 ⇒ (𝐷 ⤇ 𝑉)`, with `steps` composed onto each
+/// enclosing row's history: `(read, steps ▷ const) ▷ zip ≫ compose`, the shape
+/// `lambda_elim` gives a per-row value composed with a closed step. `read` alone where
+/// there are no steps.
+fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {
+    if steps.is_empty() {
+        return read;
+    }
+    let (Some(enclosing), Some(history_ty), Some(step_dom), Some(step_cod)) = (
+        read.ty.domain(),
+        read.ty.codomain(),
+        steps[0].ty.domain(),
+        steps[steps.len() - 1].ty.codomain(),
+    ) else {
+        panic!("letrec recognition: a nested history read and its steps are functions")
+    };
+    let fun_kind = read
+        .ty
+        .fun_kind()
+        .cloned()
+        .unwrap_or(crate::ccl::FunKind::Compute);
+    let step_ty = Type::fun(step_dom, step_cod.clone());
+    let chained = match steps.len() {
+        1 => steps
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| unreachable!("one step")),
+        _ => Expr::compose(steps).with_ty(step_ty.clone()),
+    };
+    let lifted_ty = Type::fun(enclosing.clone(), step_ty.clone());
+    let lifted = Expr::apply(
+        chained,
+        Expr::builtin(Builtin::Const).with_ty(Type::fun(step_ty.clone(), lifted_ty)),
+    )
+    .with_ty(Type::fun(enclosing.clone(), step_ty.clone()));
+    let paired = crate::ccl::lambda_elim::zip_pair(read, lifted, &fun_kind);
+    let history_domain = history_ty
+        .domain()
+        .unwrap_or_else(|| panic!("letrec recognition: a history is a function"));
+    let chain = Type::fun_like(&history_ty, history_domain, step_cod);
+    let compose_ty = Type::compute_fun_or_hole(&Type::Tuple(vec![history_ty, step_ty]), &chain);
+    Expr::compose(vec![
+        paired,
+        Expr::builtin(Builtin::Compose).with_ty(compose_ty),
+    ])
+    .with_ty(Type::fun(enclosing, chain))
+}
+
+/// A view compose split into the `⟨…⟩ ▷ zip ≫ compose` head [`peel_view_steps`] reads and
+/// the elements after it, which take the view whole.
+///
+/// `None` where `e` is not that shape, which the caller reads as `e` itself with no tail,
+/// so it peels the same way whether or not anything follows.
+fn split_view_tail(e: &Expr) -> Option<(Expr, Vec<Expr>)> {
+    let TypedExprNode::Compose(elts) = &e.node else {
+        return None;
+    };
+    let [head, marker, after @ ..] = elts.as_slice() else {
+        return None;
+    };
+    if after.is_empty() || !matches!(&marker.node, TypedExprNode::Builtin(Builtin::Compose)) {
+        return None;
+    }
+    // The head is a morphism of the writer's parameter and `compose` takes its pair to
+    // the chain it denotes, so the view runs from the head's domain to what `compose`
+    // yields, at the head's own kind.
+    let (Some(domain), Some(codomain)) = (head.ty.domain(), marker.ty.codomain()) else {
+        return None;
+    };
+    let mut view = Expr::compose(vec![head.clone(), marker.clone()]);
+    view.ty = Type::fun_like(&head.ty, domain, codomain);
+    Some((view, after.to_vec()))
+}
+
+/// Peel the eliminated form of a parameter-dependent history view, returning the
+/// steps applied to the history.
+///
+/// `λ 𝑥 → h(𝑥) ≫ step₁ ≫ … ≫ stepₙ` eliminates to a left-nested
+/// `⟨view, stepᵢ ▷ const⟩ ▷ zip ≫ compose`, innermost first, so the steps come back
+/// in application order with the bare history as the base. `None` where the tree is
+/// not that shape or its base is not `h` — a history that does not depend on the
+/// writer's parameter keeps the flat `h ≫ step₁ ≫ …` compose instead, which the
+/// caller matches directly.
+fn peel_view_steps(e: &Expr, h: &Name) -> Option<Vec<Expr>> {
+    if matches!(&e.node, TypedExprNode::Var(n) if n == h) {
+        return Some(Vec::new());
+    }
+    let TypedExprNode::Compose(elts) = &e.node else {
+        return None;
+    };
+    let [head, tail] = elts.as_slice() else {
+        return None;
+    };
+    if !matches!(&tail.node, TypedExprNode::Builtin(Builtin::Compose)) {
+        return None;
+    }
+    let TypedExprNode::Apply { argument, function } = &head.node else {
+        return None;
+    };
+    if !matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip)) {
+        return None;
+    }
+    let TypedExprNode::Tuple(legs) = &argument.node else {
+        return None;
+    };
+    let [inner, step] = legs.as_slice() else {
+        return None;
+    };
+    let TypedExprNode::Apply {
+        argument: step_inner,
+        function: const_fn,
+    } = &step.node
+    else {
+        return None;
+    };
+    if !matches!(&const_fn.node, TypedExprNode::Builtin(Builtin::Const)) {
+        return None;
+    }
+    let mut steps = peel_view_steps(inner, h)?;
+    steps.push((**step_inner).clone());
+    Some(steps)
+}
+
+/// The history-record read a `` variant_project(`commit) `` view resolves to, and how
+/// many of the steps after it the read consumes.
+///
+/// `a` and `b` are the two steps following the projection. An accumulator read takes
+/// both (`.writes ≫ .acc`); a feed tap takes one (`.__to_<defer>`).
+fn history_read_replacement(
+    a: Option<&TypedExprNode>,
+    b: Option<&TypedExprNode>,
+    reads: &HistReads<'_>,
+) -> Option<(Expr, usize)> {
+    let HistReads {
+        hist_ty,
+        keys,
+        acc_tys,
+        domain_ty,
+        ..
+    } = *reads;
+    match (a, b) {
+        // An accumulator read `` __hist ≫ variant_project(`commit) ≫ .writes ≫ .acc ``.
+        // Both projections are named now that the write set is keyed by accumulator,
+        // so `.writes` on the outer one is what tells this from a tap read.
+        (
+            Some(TypedExprNode::Proj(ProjKey::Field(f))),
+            Some(TypedExprNode::Proj(ProjKey::Field(acc))),
+        ) if f == F_WRITES => {
+            let i = keys
+                .iter()
+                .position(|k| k.field_key() == *acc)
+                .unwrap_or_else(|| {
+                    panic!("letrec recognition: `.writes ≫ .{acc}` names no accumulator")
+                });
+            let field_ty = crate::ccl::ccl_utils::history_ty(domain_ty, &acc_tys[i]);
+            Some((hist_field_read_of(reads, acc.clone(), field_ty), 2))
+        }
+        (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
+            // A tap read ``__hist ≫ variant_project(`commit) ≫ .__to_<feed>``: its
+            // function type is the history record's field type.
+            let field = f.clone();
+            let field_ty = hist_ty_field(hist_ty, &field);
+            Some((hist_field_read_of(reads, field, field_ty), 1))
+        }
+        _ => None,
+    }
 }
 
 /// The declared type of `field` on the history record.

@@ -1858,20 +1858,40 @@ fn collect_writes(
     value_tys: &HashMap<Name, Type>,
     out: &mut Vec<AccumulatorVariable>,
 ) {
-    collect_writes_in(expr, None, value_tys, out);
+    collect_writes_in(expr, None, value_tys, &mut Vec::new(), out);
 }
 
 /// `stmt` is the `ExprStmt` whose effect `expr` is, when the walk arrived through
 /// one. Post-[`flatten_spine`] every write on a statement chain is a direct
 /// `ExprStmt` effect, so a write reached with `stmt` unset is one in a
 /// hand-built tree; its own node then stands as the whole site.
+///
+/// `introduced` names the mutable variables a [`TypedExprNode::MutDecl`] on the way down
+/// declared. A write to one of those accumulates over the introduction's own scope, so it
+/// is not this loop's — the inner loop that sequences it carries it, and claiming it here
+/// would give this loop a key whose seed names something bound inside its own body.
 fn collect_writes_in(
     expr: &Expr,
     stmt: Option<NodeId>,
     value_tys: &HashMap<Name, Type>,
+    introduced: &mut Vec<Name>,
     out: &mut Vec<AccumulatorVariable>,
 ) {
-    if let TypedExprNode::MutWrite { name, value, .. } = &expr.node {
+    if let TypedExprNode::MutDecl {
+        binding,
+        init,
+        body,
+    } = &expr.node
+    {
+        collect_writes_in(init, None, value_tys, introduced, out);
+        introduced.push(binding.name.clone());
+        collect_writes_in(body, None, value_tys, introduced, out);
+        introduced.pop();
+        return;
+    }
+    if let TypedExprNode::MutWrite { name, value, .. } = &expr.node
+        && !introduced.contains(name)
+    {
         let write = expr.node_id();
         let site = StmtSite::new(stmt.unwrap_or(write), write);
         match out.iter_mut().find(|a| a.name == *name) {
@@ -1890,11 +1910,11 @@ fn collect_writes_in(
         }
     }
     if let TypedExprNode::ExprStmt { expr: effect, body } = &expr.node {
-        collect_writes_in(effect, Some(expr.node_id()), value_tys, out);
-        collect_writes_in(body, None, value_tys, out);
+        collect_writes_in(effect, Some(expr.node_id()), value_tys, introduced, out);
+        collect_writes_in(body, None, value_tys, introduced, out);
         return;
     }
-    expr.walk_children(|c| collect_writes_in(c, None, value_tys, out));
+    expr.walk_children(|c| collect_writes_in(c, None, value_tys, introduced, out));
 }
 
 /// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
@@ -1980,6 +2000,28 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
         TypedExprNode::ExprStmt { expr, body } => {
             Expr::expr_stmt(*expr, splice_after_unit(*body, tail))
         }
+        // A mutable variable the branch introduces scopes over the rest of that branch,
+        // so the splice goes inside it as it does inside a `Let`. Splicing after it
+        // instead leaves the whole introduction in *effect* position, where
+        // [`transform_chain`] meets a `MutDecl` as an `ExprStmt`'s effect and has no arm
+        // for it.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            let spliced = splice_after_unit(*body, tail);
+            let ty = spliced.ty.clone();
+            Expr::preserve(
+                chain.node_id,
+                TypedExprNode::MutDecl {
+                    binding,
+                    init,
+                    body: Box::new(spliced),
+                },
+            )
+            .with_ty(ty)
+        }
         // A `Unit`-valued terminal that is not the sentinel — a branch whose last
         // statement is a bare write or feed, which lowering leaves unwrapped
         // (`{p → acc := e; true → unit}`). It is a statement, so `tail` sequences
@@ -2034,6 +2076,21 @@ fn transform_chain(
             let bound = Subst::discharge_env_in_place(*bound_expr, env);
             let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
             Expr::let_in(b, bound, rest)
+        }
+        // A mutable variable the loop body **introduces**, scoped to one iteration. Its
+        // writes belong to whatever sequences them — an inner loop, which the `For` arm
+        // folds into its own recurrence — so it never joins `accs` and never reaches this
+        // loop's write set. Seeding the read-your-writes environment with its initial
+        // value is the whole of the introduction: the inner fold replaces that entry with
+        // its final read, which is what a statement after the inner loop reads.
+        TypedExprNode::MutDecl {
+            binding: b,
+            init,
+            body,
+        } => {
+            let seed = Subst::discharge_env_in_place(*init, env);
+            env.insert(b.name.clone(), seed);
+            transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
         }
         // A statement-position tag-`Case` (``match m: case `t(w): acc += e``,
         // lowered by `lower_loop_body_chain`). Rewrite it into the guard-`Case`
@@ -2107,6 +2164,7 @@ fn transform_chain(
                 // position. The write set is merged separately below (carry from the
                 // trailing branch, commit vs `entering`); feeds do not affect it.
                 let branch_path = conjoin_path(path, &pi);
+                let feeds_before = feeds.len();
                 let dec = transform_chain(
                     spliced,
                     &mut branch_env,
@@ -2116,6 +2174,13 @@ fn transform_chain(
                     &branch_path,
                     feeds,
                 );
+                // A feed's value is read where the branch put it, and the merged decision
+                // it rides stands outside the branch, so it is closed over the branch's
+                // scope as the writes are.
+                let scope = branch_scope(&dec);
+                for feed in &mut feeds[feeds_before..] {
+                    feed.value = close_over_branch(&scope, feed.value.clone());
+                }
                 all.push((pi, decision_writes(&dec)));
             }
             // The lowered `Case` always ends in the `true → carry` complement — the
@@ -2199,6 +2264,80 @@ fn transform_chain(
                     let spliced = Expr::expr_stmt(*inner_e, Expr::expr_stmt(*inner_b, *body));
                     transform_chain(spliced, env, accs, writes_ty, entering, path, feeds)
                 }
+                // An inner loop — a recurrence nested in the enclosing one. Folding it
+                // here is what makes nesting work at any depth: the fold walks the
+                // inner body with this same function, so a third loop meets this arm
+                // again. The inner history binds inside the enclosing writer's
+                // decision body, closing over the enclosing binder, which is what
+                // lets the inner source depend on the outer element.
+                //
+                // The accumulator's value after the inner loop is that loop's final,
+                // so the fold's seeds — plain references to the accumulator names —
+                // discharge against the read-your-writes environment in hand here,
+                // and each accumulator's new environment value is its final read.
+                TypedExprNode::For {
+                    target,
+                    iter,
+                    body: inner_body,
+                } => {
+                    let mut value_tys = mut_var_value_tys([&*inner_body]);
+                    for acc in accs {
+                        value_tys.insert(acc.name.clone(), acc.ty.clone());
+                    }
+                    // An inner loop whose calls inlined to no write, and which feeds
+                    // nothing, is a no-op, as a flat one is: lowering let it through only
+                    // because a call might have hidden a pass-by-reference write.
+                    let mut inner_accs = Vec::new();
+                    collect_writes(&inner_body, &value_tys, &mut inner_accs);
+                    if inner_accs.is_empty() && !body_has_feed(&inner_body) {
+                        return transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
+                    }
+                    let fold = fold_induction_loop(&target, &iter, *inner_body, &value_tys);
+                    // Both halves of a binding: a binder's declared type is written in
+                    // the enclosing scope, so an inner loop correlated with this one's
+                    // binder carries it there too — in the refinement on its own iteration
+                    // domain, say. Rewriting only the definition leaves the binding
+                    // disagreeing with its body about the same type.
+                    let (mut hist_binding, hist_def) = fold.binding;
+                    Subst::discharge_env_in_binder(&mut hist_binding, env);
+                    let hist_def = Subst::discharge_env_in_place(hist_def, env);
+                    let reads: Vec<(TypedBinding, Expr)> = fold
+                        .reads
+                        .into_iter()
+                        .map(|(b, def)| (b, Subst::discharge_env_in_place(def, env)))
+                        .collect();
+                    // Typed from the fold's own accumulators: an inner loop may write a
+                    // variable it never reads, which the reads it was folded against omit.
+                    for (acc, x_final) in &fold.renames {
+                        let ty = fold
+                            .accs
+                            .iter()
+                            .find(|a| a.name == *acc)
+                            .map(|a| a.ty.clone())
+                            .unwrap_or_else(|| unreachable!("a rename names a folded accumulator"));
+                        env.insert(acc.clone(), tvar(x_final, ty));
+                    }
+                    // A feed from inside the inner loop is a feed of **this** body: there
+                    // is no scope here to hoist it to, the decision being a writer's
+                    // value. It rides this decision as a tap the way a feed written
+                    // directly here does, holding the inner history's own tap — one
+                    // collection per position of this level. `attach_feed_fields`
+                    // descends through the `letrec` this group builds, so the view's
+                    // reference to the inner history is in scope where the field lands.
+                    let site = StmtSite::new(stmt_id, effect_id);
+                    for (defer, view) in fold.feed_views {
+                        let field = defer.defer_tap_field(feeds.len());
+                        feeds.push(FeedSite {
+                            defer,
+                            field,
+                            value: view,
+                            fire: path.clone(),
+                            site,
+                        });
+                    }
+                    let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
+                    close_recurrence_group(vec![(hist_binding, hist_def)], reads, Vec::new(), rest)
+                }
                 other => panic!(
                     "letrec phase: unexpected statement in loop body: {}",
                     symbolic(&Expr::throwaway(other))
@@ -2231,13 +2370,25 @@ fn transform_chain(
     }
 }
 
-/// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
-/// (as [`transform_chain`] builds it) — one *self-contained* expression per
-/// accumulator, in accumulator order. A branch's write introduces RYW `let`s
-/// (`let total = __p.0 + __p.1 in {…, writes: (total)}`) that the merged
-/// value-`Case` arms live outside of, so peel and inline those bindings.
-fn decision_writes(dec: &Expr) -> Vec<Expr> {
+/// A branch decision's scope: the read-your-writes `let`s it binds, inlined into one
+/// environment, and the `letrec` groups it passes under, outermost first, ending at its
+/// `{commit, writes(, __to_*)}` record.
+///
+/// A branch's decision is `(let | letrec)* in record`, and the merged value-`Case` arms
+/// live outside it, so anything taken out of the branch is closed over this scope
+/// ([`close_over_branch`]). A `letrec` is **kept** rather than inlined: its bindings are
+/// mutually recursive, so there is no value to substitute in. An inner loop inside a branch
+/// is exactly this — the inner recurrence sits between the read-your-writes `let`s and the
+/// record.
+struct BranchScope<'a> {
+    env: HashMap<Name, Expr>,
+    groups: Vec<Vec<(TypedBinding, Expr)>>,
+    record: &'a [(String, Expr)],
+}
+
+fn branch_scope(dec: &Expr) -> BranchScope<'_> {
     let mut env: HashMap<Name, Expr> = HashMap::new();
+    let mut groups: Vec<Vec<(TypedBinding, Expr)>> = Vec::new();
     let mut cur = dec;
     loop {
         match &cur.node {
@@ -2250,26 +2401,70 @@ fn decision_writes(dec: &Expr) -> Vec<Expr> {
                 env.insert(binding.name.clone(), bound);
                 cur = body;
             }
+            // The group's definitions can read the branch's `let`s above it — an inner
+            // loop body reading a value the branch bound — and those are inlined rather
+            // than kept around the group, so they are inlined into the group too.
+            TypedExprNode::LetRec { bindings, body } => {
+                groups.push(
+                    bindings
+                        .iter()
+                        .map(|(binding, def)| {
+                            let mut binding = binding.clone();
+                            Subst::discharge_env_in_binder(&mut binding, &env);
+                            (binding, Subst::discharge_env_in_place(def.clone(), &env))
+                        })
+                        .collect(),
+                );
+                cur = body;
+            }
             TypedExprNode::Record(fields) => {
-                let writes = &fields
-                    .iter()
-                    .find(|(f, _)| f == F_WRITES)
-                    .expect("letrec phase: a writer decision has a `writes` field")
-                    .1;
-                let TypedExprNode::Record(elts) = &writes.node else {
-                    panic!("letrec phase: a decision `writes` is keyed by accumulator");
+                return BranchScope {
+                    env,
+                    groups,
+                    record: fields,
                 };
-                return elts
-                    .iter()
-                    .map(|(_, e)| Subst::discharge_env_in_place(e.clone(), &env))
-                    .collect();
             }
             _ => panic!(
-                "letrec phase: a branch decision is `let* in {{commit, writes}}`, got {}",
-                symbolic(dec)
+                "letrec phase: a branch decision is `(let | letrec)* in {{commit, writes}}`, \
+                 got {}",
+                symbolic(cur)
             ),
         }
     }
+}
+
+/// `e`, read inside a branch's decision, made self-contained: the branch's `let`s inlined
+/// and its `letrec` groups wrapped around it, so it stands outside the branch.
+fn close_over_branch(scope: &BranchScope<'_>, e: Expr) -> Expr {
+    let inlined = Subst::discharge_env_in_place(e, &scope.env);
+    scope.groups.iter().rev().fold(inlined, |inner, bindings| {
+        let ty = inner.ty.clone();
+        let mut wrapped = Expr::new(TypedExprNode::LetRec {
+            bindings: bindings.clone(),
+            body: Box::new(inner),
+        });
+        wrapped.ty = ty;
+        wrapped
+    })
+}
+
+/// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
+/// (as [`transform_chain`] builds it) — one *self-contained* expression per
+/// accumulator, in accumulator order ([`close_over_branch`]).
+fn decision_writes(dec: &Expr) -> Vec<Expr> {
+    let scope = branch_scope(dec);
+    let writes = &scope
+        .record
+        .iter()
+        .find(|(f, _)| f == F_WRITES)
+        .expect("letrec phase: a writer decision has a `writes` field")
+        .1;
+    let TypedExprNode::Record(elts) = &writes.node else {
+        panic!("letrec phase: a decision `writes` is keyed by accumulator");
+    };
+    elts.iter()
+        .map(|(_, e)| close_over_branch(&scope, e.clone()))
+        .collect()
 }
 
 /// Build the writer decision `{commit, writes}` for a statement-`Case`, from its
@@ -2430,6 +2625,21 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             // The same logical `Let` with its feed fields attached, so it keeps its
             // own id rather than minting a replacement.
             Expr::let_in_preserving(node_id, binding, *bound_expr, new_body)
+        }
+        // An inner loop's history binds inside the decision, so the record sits under
+        // a `letrec` as readily as under a `let`. Attaching the fields under it keeps
+        // the group where it was rather than lifting the record out of its scope.
+        TypedExprNode::LetRec { bindings, body } => {
+            let new_body = attach_feed_fields(*body, feeds);
+            let ty = new_body.ty.clone();
+            Expr::preserve(
+                node_id,
+                TypedExprNode::LetRec {
+                    bindings,
+                    body: Box::new(new_body),
+                },
+            )
+            .with_ty(ty)
         }
         TypedExprNode::Record(fields) => {
             let bool_ty = Type::Base(BaseType::Bool);

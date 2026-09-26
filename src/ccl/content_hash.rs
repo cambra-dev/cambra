@@ -626,8 +626,15 @@ fn hash_payload<'a>(
             keys,
             writers,
             domain,
+            parameter,
         } => {
             hash_type(domain, env, free, h);
+            // A nested carrier is a different node from a top-level one with the same
+            // writers, so the writer parameter contributes.
+            parameter.is_some().hash(h);
+            if let Some(t) = parameter {
+                hash_type(t, env, free, h);
+            }
             keys.len().hash(h);
             writers.len().hash(h);
             for w in writers {

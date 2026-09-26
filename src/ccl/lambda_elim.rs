@@ -902,19 +902,29 @@ fn elim_lambda_impl(
             // take the proof away from the site that needs it. A filter the program wrote
             // is the other kind: nothing has applied it yet.
             //
-            // **A filter reading only the element lifts too, which is more than it needs.**
-            // Its natural home is the component, where the type would still say it depends
-            // on the element alone, and where the inner domain could be narrowed once
-            // instead of once per outer row. Neither inner-source builder applies a
-            // component refinement today: the type-read route strips it in `extent_of` and
-            // drops the filter, and the named-source route hands the refined domain to
-            // `IterateExtent`, which rejects it. Until both narrow the inner domain
-            // themselves, the pair is the only place a filter is applied at all.
-            let (lifting, staying): (Vec<Refinement>, Vec<Refinement>) = y_ty
-                .refinements()
+            // **A filter reading only the element stays on the component as well.**
+            // Lifting is what makes a `param`-reading predicate closed; a predicate that
+            // reads only `__elem` is already closed on the component, and the body's uses
+            // of `y` need it there. The inner comprehension's source is the filtered
+            // collection, typed `{𝐾 | 𝑝} ⤇ 𝑉`, and the body applies it to `y`: strip `𝑝`
+            // from `y_ty` and that application has a bare `𝐾` where a `{𝐾 | 𝑝}` is
+            // required. The pair's copy is what planning reads, because neither
+            // inner-source builder applies a component refinement — the type-read route
+            // strips it in `extent_of` and drops the filter, and the named-source route
+            // hands the refined domain to `IterateExtent`, which rejects it. So the two
+            // copies serve different readers: the component states what `y` is, the pair
+            // states what to narrow.
+            let refinements = y_ty.refinements().to_vec();
+            let lifting: Vec<Refinement> = refinements
                 .iter()
+                .filter(|r| !r.is_collection_membership())
                 .cloned()
-                .partition(|r| !r.is_collection_membership());
+                .collect();
+            let staying: Vec<Refinement> = refinements
+                .iter()
+                .filter(|r| r.is_collection_membership() || !is_free_in_value(param, &r.predicate))
+                .cloned()
+                .collect();
             let y_ty = {
                 let base = y_ty.peel_refinements().clone();
                 if staying.is_empty() {
@@ -1104,9 +1114,16 @@ fn elim_lambda_impl(
             for next in elim_elts {
                 let pair = zip_pair(acc, next, &fun_kind);
                 // compose: Tuple([A→B, B→C]) → (A→C); domain = codomain of pair
-                let compose_ty = match &pair.ty {
+                // The chain this step produces, `A → C`, types both the `compose`
+                // built-in and the step's own result. Leaving the result untyped is
+                // invisible while a chain of three or more is const-wrapped whole —
+                // it is only decomposed element-wise when it mentions the parameter,
+                // and the next `zip_pair` then has an untyped operand and cannot type
+                // the `zip` it builds.
+                let (compose_ty, step_ty) = match &pair.ty {
                     Type::Fun {
-                        domain: _,
+                        name: pair_name,
+                        domain: pair_domain,
                         codomain: cod,
                         ..
                     } => match cod.as_ref() {
@@ -1125,16 +1142,57 @@ fn elim_lambda_impl(
                                 // makes composing onto a collection yield a
                                 // capability.
                                 let chain = Type::fun_like(first, *a.clone(), *c.clone());
-                                Type::compute_fun_or_hole(cod, &chain)
+                                // The step names the pair's binder exactly when the chain
+                                // references it — the rule every function type here is
+                                // built by ([`zip_pair_ty`]). The chain keeps the first
+                                // operand's domain and the second's codomain and drops
+                                // what joins them, so the pair naming a binder does not
+                                // settle it. Leaving the step unnamed where the chain does
+                                // reference one strands the reference: the next
+                                // `zip_pair_ty` has no binder to ride, and
+                                // `open_codomain` none to open at. A correlated filter
+                                // beside a correlated body is the shape that gets there.
+                                // The `compose` built-in sits **under** the pair's
+                                // binder, so its own type speaks the opened form — the
+                                // same rule the `Apply` arm above builds its transformer
+                                // by. Leaving it closed hands the chain a function whose
+                                // type carries an index no binder of its own accounts for.
+                                let under_binder =
+                                    |t: &Type| crate::ccl::subst::open_codomain(&pair.ty, t);
+                                let compose_ty = Type::compute_fun_or_hole(
+                                    &under_binder(cod),
+                                    &under_binder(&chain),
+                                );
+                                let step = match pair_name {
+                                    Some(n)
+                                        if crate::ccl::subst::references_enclosing_function(
+                                            &chain,
+                                        ) =>
+                                    {
+                                        Type::pi_kinded(
+                                            n.clone(),
+                                            *pair_domain.clone(),
+                                            chain.clone(),
+                                            fun_kind.clone(),
+                                        )
+                                    }
+                                    _ => Type::Fun {
+                                        name: None,
+                                        fun_kind: fun_kind.clone(),
+                                        domain: pair_domain.clone(),
+                                        codomain: Box::new(chain.clone()),
+                                    },
+                                };
+                                (compose_ty, step)
                             }
-                            _ => Type::Hole,
+                            _ => (Type::Hole, Type::Hole),
                         },
-                        _ => Type::Hole,
+                        _ => (Type::Hole, Type::Hole),
                     },
-                    _ => Type::Hole,
+                    _ => (Type::Hole, Type::Hole),
                 };
                 let compose_var = Expr::builtin(Builtin::Compose).with_ty(compose_ty);
-                acc = compose(pair, compose_var);
+                acc = compose(pair, compose_var).with_ty(step_ty);
             }
             Ok(acc.with_ty(result_ty))
         }
@@ -1272,6 +1330,82 @@ fn elim_lambda_impl(
             let let_ty = crate::ccl::subst::Subst::discharge(&v, new_def.clone_preserving_ids())
                 .apply_type(&result_ty);
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
+        }
+
+        // A nested recurrence inside a writer body — an inner loop's history, bound
+        // where the enclosing writer can read it.
+        //
+        // Each definition is a lambda over the inner position that also reads the
+        // enclosing binder, so eliminating the enclosing parameter from it takes the
+        // nested-`Lambda` arm above: the two binders merge into one pair morphism and
+        // `curry_at` restores the function. The history therefore ends up a function of
+        // the enclosing argument, and every reference to it becomes that function
+        // applied — including the references inside the definitions, the group being
+        // recursive, which is the one way this differs from `Let`.
+        //
+        // Each reference, inside the definitions and in the body, is typed
+        // `𝑃 ⇒ 𝑇` from the binding's own type `𝑇`, before elimination. That is the
+        // eliminated definition's type wherever the history's type does not depend on the
+        // enclosing parameter; a history whose type does would be a dependent function,
+        // which these references would not say.
+        TypedExprNode::LetRec { bindings, body } => {
+            let eliminate_defs = |ctx: &mut ElimContext, hist_tys: &[Type]| {
+                let calls: Vec<(Name, Expr)> = bindings
+                    .iter()
+                    .zip(hist_tys)
+                    .map(|((b, _), hist_ty)| {
+                        let call = Expr::apply(
+                            Expr::var(param).with_ty(param_ty.clone()),
+                            Expr::var(&b.name).with_ty(hist_ty.clone()),
+                        )
+                        .with_ty(hist_ty.codomain().unwrap_or(Type::Hole));
+                        (b.name.clone(), call)
+                    })
+                    .collect();
+                let defs = bindings
+                    .iter()
+                    .map(|(_, def)| {
+                        let mut def = def.clone_preserving_ids();
+                        for (name, call) in &calls {
+                            def = substitute(def, name, call);
+                        }
+                        elim_lambda_kinded(ctx, param, param_ty, def, fun_kind.clone())
+                    })
+                    .collect::<Result<Vec<_>, LambdaElimError>>()?;
+                Ok::<_, LambdaElimError>((defs, calls))
+            };
+
+            let provisional: Vec<Type> = bindings
+                .iter()
+                .map(|(b, _)| Type::fun(param_ty.clone(), b.ty.clone()))
+                .collect();
+            let (defs, calls) = eliminate_defs(ctx, &provisional)?;
+
+            let new_bindings = bindings
+                .iter()
+                .zip(defs)
+                .map(|((b, _), def)| {
+                    let binding = crate::ccl::TypedBinding {
+                        name: b.name.clone(),
+                        ty: def.ty.clone(),
+                        user_annotation: b.user_annotation.clone(),
+                    };
+                    (binding, def)
+                })
+                .collect::<Vec<_>>();
+
+            let mut new_body = *body;
+            for (name, call) in &calls {
+                new_body = substitute(new_body, name, call);
+            }
+            let new_body = elim_lambda_kinded(ctx, param, param_ty, new_body, fun_kind.clone())?;
+            let ty = new_body.ty.clone();
+            let mut e = Expr::new(TypedExprNode::LetRec {
+                bindings: new_bindings,
+                body: Box::new(new_body),
+            });
+            e.ty = ty;
+            Ok(e)
         }
 
         // List — treat like Tuple: eliminate param element-wise.

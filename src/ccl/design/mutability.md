@@ -78,18 +78,27 @@ it has one, because the driver's decode drops a non-`UInt` key instead of failin
 unguarded product domain is a loop that runs zero times.
 
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
-inferred, always spelled at the introduction). What the **introduction** site fixes is not that
-domain but the constraint that it must sit *outside* the context that would sequence the mutable variable.
-A `:=` inside a `for` body, or inside a
-`with begin():` block, would need a domain nested within the enclosing one — the loop's iteration
-extent per iteration, or a `Txn` order per transaction — and neither the recurrence nor the commit
-model has a carrier for that. The **`for` body** is rejected at lowering, at every spelling: an
-annotation on the introduction says nothing about whether it introduces a mutable variable, so gating on one
-accepted `y := 0` and rejected `y: Mut(Int) := 0` for the same construct. The **block** has no gate
-of its own and is a diagnostic gap: lowering emits the `:=` as a *write*, so the program is rejected
-at inference as `Unbound variable`, naming neither the construct nor the alternative. The rejection
-is right; the message is about the wrong thing. The fallback that rejection
-replaces is a per-iteration shadowing `let`, which silently discards each update at the boundary —
+inferred, always spelled at the introduction). A `:=` inside a `for` body introduces one whose
+domain is nested within the enclosing loop's, and the nested carrier is what carries it: the
+introduction seeds the read-your-writes environment, an inner `for` that writes it folds it into its
+own recurrence, and a statement after that loop reads the final value. `body_introduced_mut_vars`
+in `lower/loops.rs` names them and `transform_chain`'s `MutDecl` arm in `mut_elim.rs` seeds them.
+The variable restarts at its seed on the next iteration, the seed being re-evaluated there; the
+write set the enclosing loop carries never names it, so the enclosing store has no key for it.
+
+The scope is the block that writes it, so an `if` branch introduces one of its own. The chain
+`splice_after_unit` carries onto each branch goes *inside* the introduction, as it does inside a
+`let`: spliced after it instead, the whole introduction sits in effect position, where the walk
+dispatches on the effect and meets a `MutDecl` it has no arm for.
+
+Three introductions have no such carrier. A **transactional** one inside a `for` body would need a
+`Txn` order per iteration, so it is rejected at lowering. One inside a loop that writes no mutable
+variable declared before it, a generator or a loop that only feeds, has no recurrence of that loop to
+nest in, and is rejected at lowering too. A `:=` inside a `with begin():` block
+would need one per transaction, and has no gate of its own: lowering emits it as a *write*, so the
+program is rejected at inference as `Unbound variable`, naming neither the construct nor the
+alternative. The rejection is right; the message is about the wrong thing. What both rejections
+replace is a per-iteration shadowing `let`, which silently discards each update at the boundary —
 the failure `:=` exists to make impossible.
 
 The structural difference between the two causal accessors mirrors a difference between the two
