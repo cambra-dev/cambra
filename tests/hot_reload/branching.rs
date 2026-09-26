@@ -717,6 +717,25 @@ fn the_last_branch_cannot_be_deleted() {
     );
     assert!(list(&mut ctx, &mut live).starts_with("staging\tversion=1\tfrom=main@1\t"));
 
+    // A verb without a branch segment names `main`, so with `main` gone it
+    // answers 404 rather than falling back to another branch.
+    for request in [
+        ControlRequest::Reload {
+            branch: ROOT.into(),
+            code: with_port(DASHED_LOG, port),
+        },
+        ControlRequest::Diff {
+            branch: ROOT.into(),
+            code: with_port(DASHED_LOG, port),
+            phase: Phase::AsOfRead,
+        },
+        create("scratch", ROOT, with_port(DASHED_LOG, port)),
+    ] {
+        let reply = ask(&mut ctx, &mut live, request);
+        assert_eq!(reply.status, 404, "{}", reply.body);
+    }
+    assert!(live.program().is_none() && live.main_producer().is_none());
+
     let replies = exchange(&mut ctx, move || {
         vec![http_post(port, "/set", "c"), http_get(port, "/get2")]
     });

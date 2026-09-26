@@ -72,7 +72,9 @@ body when the body is non-blank, and otherwise from the query string, percent-de
 is `text/plain; charset=utf-8`.
 
 A `<name>` is a non-empty path segment of ASCII letters, digits, `-` and `_`. A `<branch>` segment
-that is omitted means `main`.
+that is omitted means `main`, and so does an omitted `/from/<parent>`. No verb falls back to another
+branch, so once `main` is deleted every verb must name its branch, and one that does not answers
+404.
 
 | Verb | Takes | Does |
 | --- | --- | --- |

@@ -97,17 +97,20 @@ fn run_program(
     // replaces neither the panes nor `source_node_ids` below: see
     // `src/inspector_model/design.md`, "A reload is not followed".
     let mut inspection = match inspect_port {
-        Some(port) => match serve_compiled(live.program(), src_name, port) {
-            Ok(channel) => Some(Inspection::new(
-                channel,
-                ctx.scheduler().probes().clone(),
-                source_nodes(&live.program().operator_graph),
-            )),
-            Err(e) => {
-                eprintln!("error: serving the inspector: {e}");
-                return Err(());
+        Some(port) => {
+            let program = live.program().expect("the process starts with `main`");
+            match serve_compiled(program, src_name, port) {
+                Ok(channel) => Some(Inspection::new(
+                    channel,
+                    ctx.scheduler().probes().clone(),
+                    source_nodes(&program.operator_graph),
+                )),
+                Err(e) => {
+                    eprintln!("error: serving the inspector: {e}");
+                    return Err(());
+                }
             }
-        },
+        }
         None => None,
     };
 
