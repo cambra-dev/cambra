@@ -572,12 +572,18 @@ pre-realization type rather than relating the two by a typing rule
 ([type-inference.md, Planning asserts the type it
 replaces](type-inference.md#planning-asserts-the-type-it-replaces)).
 
-**A conditional collection is the only Σ-typed term the runtime can currently evaluate.**
-Its candidates are statically enumerable and the gates pick one. Every other Σ — a
-`Collection(𝑇)` whose producer is not statically known, a collection in a mutable variable
-or crossing a source boundary — waits on a runtime witness that does not exist yet, and a Σ
-that reaches op-conversion with no concrete domain has no extent and is reported as a
-compiler bug.
+**Realization is one of three dispositions a witness gets**, all decided in
+`planning/conditionals.rs`. A determined witness — one candidate — is erased, term and types
+together. One whose candidates a `Case` picks between is realized, as above. Every other is
+**materialized**: the `box` stays standing and the value carries its own keys, which is what a
+`List(𝑇)`'s `UIntRanges` and a `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` reach. `extent_of` bounds those
+keys from the witness's kind rather than enumerating them.
+
+Materializing does not yet give an **iteration site** over such a collection. Every site starts
+from `IterateExtent` over an extent read off the type, and a bound is not something to
+enumerate, so a witness reaching one is reported as unimplemented. A comprehension over the
+collection needs no site, since its generator composes with the collection
+([optimization.md](optimization.md#a-generator-over-a-sum-composes-with-its-source)).
 
 **One realization per site, at the node whose type carries the choice**: the outermost `Σ`
 binding the witness. Arms sharing a domain form no Σ at all, and substituting the arm for
@@ -625,11 +631,11 @@ different predicates, which one set of legs cannot hold.
 Only an **undetermined** witness is copied — a kind naming more than one candidate. A
 determined one has no realization to feed, since the candidate is already its domain and the
 erasure removes the binder where it stands; copying it duplicates the arms and puts a `box`
-inside each consumer, where the erasure reaches the term but not every type that named it. A
-runtime witness would remove the need for the copy, by letting one materialized union serve
-several consumers; until that exists the copy is the only compiling form. It would also make
-this substitution one choice among several rather than the only expressible form — the point
-at which the duplication becomes a cost question instead of an obligation.
+inside each consumer, where the erasure reaches the term but not every type that named it.
+Materializing the conditional rather than realizing it would remove the copy, by letting one
+value serve several consumers; planning realizes it, so the copy is the only compiling form. It
+would also make this substitution one choice among several rather than the only expressible
+form — the point at which the duplication becomes a cost question instead of an obligation.
 
 ### A site's witnesses are compiled together
 

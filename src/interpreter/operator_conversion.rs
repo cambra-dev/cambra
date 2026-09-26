@@ -1401,6 +1401,77 @@ identities is not distinguishing them",
         self.transactional_stores.get(name)
     }
 
+    /// The extent **bounding** a witness's domain — what the type says about a domain the
+    /// value holds.
+    ///
+    /// A witness stands in domain position and nowhere else
+    /// ([`Type::sum_over`](crate::ccl::Type::sum_over)), so every kind answers here the same
+    /// way: with a bound on the keys rather than with the key set. Which keys a collection has
+    /// is its value's to say, and how much of that is settled is its tile's `domain_predicate`.
+    ///
+    /// A witness classifying the *element* instead would convert to a union of its candidates.
+    /// The type representation has no such position (`src/ccl/design/type-inference.md`,
+    /// "Type kinds").
+    fn witness_domain_extent(
+        &self,
+        kind: &crate::ccl::TypeKind,
+        ty: &Type,
+    ) -> Result<Extent, ConversionError> {
+        match kind {
+            // `SubtypesOf(𝐾)`'s members are key types refined by membership, so `𝐾` bounds
+            // every one of them — the description a store already gives its own map cell
+            // (`map_extent`).
+            crate::ccl::TypeKind::SubtypesOf(key) => self.extent_of(key),
+            // Every member is a dense prefix of the naturals, so a key is a `UInt` and the
+            // length is the value's. `Type::Txn` converts the same way for the same reason:
+            // its positions are minted at runtime.
+            crate::ccl::TypeKind::UIntRanges => Ok(Extent::Base(BaseType::UInt)),
+            // Naming the candidates says which domains are possible and still not which one
+            // this value is, so the bound is over their keys as above. Candidates disagreeing
+            // on that have no common key type to bound.
+            crate::ccl::TypeKind::Enumerated(ds) => {
+                let mut bound: Option<Extent> = None;
+                for d in ds {
+                    let keys = self.candidate_key_extent(d)?;
+                    match &bound {
+                        None => bound = Some(keys),
+                        Some(held) if *held == keys => {}
+                        Some(held) => {
+                            return Err(ConversionError::Unsupported(format!(
+                                "a sum over candidates whose keys have no common type \
+                                 ({held:?} and {keys:?}) has no domain bound: {ty}"
+                            )));
+                        }
+                    }
+                }
+                bound.ok_or_else(|| {
+                    ConversionError::TypeError(format!(
+                        "a sum's witness names no candidate at all: {ty}; this is a compiler \
+                         bug — `Type::sum_over` rejects an empty candidate list"
+                    ))
+                })
+            }
+            // The universe bounds nothing, so a `Collection(𝑇)` reaching here has no key type
+            // to describe its domain with.
+            crate::ccl::TypeKind::Type => Err(ConversionError::Unsupported(format!(
+                "a collection over an opaque domain ({ty}) has no extent: its witness ranges \
+                 over every type, so nothing bounds its keys"
+            ))),
+        }
+    }
+
+    /// The extent of a candidate domain's **keys**, as against the key set the candidate is.
+    ///
+    /// A candidate is a domain — a set of keys — and [`Self::extent_of`] converts it as one.
+    /// What bounds a witness the value carries is the type a key has, so a range converts to
+    /// `UInt` rather than to the range: which range this value is, is the value's to say.
+    fn candidate_key_extent(&self, candidate: &Type) -> Result<Extent, ConversionError> {
+        match candidate.peel_refinements() {
+            Type::UIntRange(_) => Ok(Extent::Base(BaseType::UInt)),
+            other => self.extent_of(other),
+        }
+    }
+
     /// Convert a CCL [`Type`] to an interpreter [`Extent`].
     ///
     /// Refinements are enforced at runtime by [`crate::interpreter::tile_operators::Filter`] operators and are
@@ -1435,22 +1506,15 @@ identities is not distinguishing them",
                     .collect();
                 Ok(Extent::record(fields?))
             }
-            // A **keyed** sum, whose witness the value itself carries. `SubtypesOf(𝐾)`'s members
-            // are key types refined by membership, so the extent that describes one is the
-            // key type — a map cell holding only the keys it holds, which is how the store
-            // already describes its own (`map_extent`). That leaves nothing for a runtime
-            // witness to supply, unlike the arms below: a `UIntRanges` sum needs a concrete
-            // bound and a `Type` sum a domain, and neither is recoverable from a value's
-            // shape. Ahead of the general function arm because a sum's domain is its
-            // witness reference, which that arm cannot convert.
-            Type::Fun { codomain, .. }
-                if matches!(ty.witness_kind(), Some(crate::ccl::TypeKind::SubtypesOf(_))) =>
-            {
-                let Some(crate::ccl::TypeKind::SubtypesOf(key)) = ty.witness_kind() else {
+            // A sum, whose witness the value carries. The domain converts through
+            // [`Self::witness_domain_extent`]; the general function arm below would meet the
+            // witness reference standing in the domain and have nothing to convert it to.
+            Type::Fun { codomain, .. } if ty.witness_kind().is_some() => {
+                let Some(kind) = ty.witness_kind() else {
                     unreachable!("guarded by the arm")
                 };
                 Ok(Extent::Function {
-                    domain: Box::new(self.extent_of(&key)?),
+                    domain: Box::new(self.witness_domain_extent(&kind, ty)?),
                     codomain: Box::new(self.extent_of(codomain)?),
                 })
             }
@@ -1484,17 +1548,16 @@ identities is not distinguishing them",
             // source's. `transact_phase` emits `Mut(V, Txn)` stores, so this is a
             // live path — a transactional store's history domain converts here.
             Type::Txn => Ok(Extent::Base(BaseType::UInt)),
-            // An **unrealized sum**, rejected by name rather than through the catch-all
-            // below. Realization erases the sums whose witness is statically enumerable
-            // (`src/ccl/planning/conditionals.rs`), so one reaching here ranges over
-            // domains no fan-out could name — a `List(T)`'s `UIntRanges` or a
-            // `Collection(T)`'s universe — and what it needs is the runtime witness
-            // (`src/ccl/design/collections.md`, "Compiling a conditional collection"). That is an unimplemented
-            // capability, so it must not be reported as a compiler bug; `planning::iterate`
-            // and `planning::conditionals` both leave such a type standing for this arm.
+            // A **bare witness reference**, rejected by name rather than through the catch-all
+            // below. A sum converts through [`Self::witness_domain_extent`], which reads the
+            // bound off the binder; reaching here instead means the reference stands at a
+            // position that no longer holds its binder, so there is no kind to read. A site
+            // iterating such a domain is the standing case
+            // (`src/ccl/design/collections.md`, "Compiling a conditional collection"), and it
+            // is an unimplemented capability rather than a compiler bug.
             Type::WitnessRef(_) => Err(ConversionError::Unsupported(format!(
-                "a collection whose domain is not statically known ({ty}) has no extent: \
-                 the runtime witness is not implemented"
+                "a collection whose domain is a witness with no binder in hand ({ty}) has no \
+                 extent: iterating one is not implemented"
             ))),
             other => Err(ConversionError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent; \
@@ -2406,6 +2469,12 @@ fn convert_impl_inner(
                         TagMap::from_arms(variant_extents),
                     )))
                 }
+                // `box` has no runtime content — it introduces the sum at the type level, so
+                // the collection it re-views is the collection it is handed. Planning leaves
+                // the introduction standing where the witness is the value's to carry
+                // (`src/ccl/planning/conditionals.rs`, `binds_an_undetermined_witness`), which
+                // is how one reaches here at all.
+                Builtin::Box => Ok(input),
                 b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
                 b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
@@ -2659,6 +2728,20 @@ fn compile_list_fn(
 /// The base case is one entry per element, so `list_levels(&[], e)` is the empty tile at
 /// this extent and needs no case of its own.
 fn list_levels(elts: &[&Expr], elt_extent: &Extent) -> Result<(Tile, Tiling), ConversionError> {
+    // A boxed literal is that literal, `box` having no runtime content: it states the one
+    // candidate this element is, and the position binds a witness over all of them.
+    let unboxed: Vec<&Expr> = elts
+        .iter()
+        .map(|elt| match &elt.node {
+            TypedExprNode::Apply { argument, function }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
+            {
+                argument.as_ref()
+            }
+            _ => *elt,
+        })
+        .collect();
+    let elts: &[&Expr] = &unboxed;
     match elt_extent {
         // A collection element: its own keys are the level below, and the elements' tables
         // run together under one `row_starts` naming where each element's keys begin.
@@ -2902,6 +2985,14 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
                 })
                 .collect::<Result<Vec<_>, ConversionError>>()?,
         )),
+        // A boxed constant is that constant, `box` having no runtime content. This is the
+        // element position of a jagged nested collection, where each element states the one
+        // candidate it is and the position binds a witness over all of them.
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
+        {
+            expr_to_value(argument)
+        }
         // The element may well *be* a constant and still arrive here: what reaches this
         // point is what constant folding declined. Saying only "is a computation" reads as
         // a demand to write a constant where one is already written, so the message names
