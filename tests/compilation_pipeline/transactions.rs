@@ -502,6 +502,78 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
     assert_eq!(final_mut_var_value(code), expected);
 }
 
+/// A value whose declared type holds a sum enters that sum through `box` wherever the sum sits:
+/// a record field or a tuple component, of a seed written as a literal or bound first, or of a
+/// write (`mut_elim::view_values_at_value_type`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::record_seed(
+    indoc! {r#"
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + s.a
+        await_final(n)
+    "#},
+    15
+)]
+#[case::tuple_seed(
+    indoc! {r#"
+        s: Mut({Int, Map(String, Int)}, Txn) := (5, box(map([("x", 1), ("y", 2)])))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + s.0
+        await_final(n)
+    "#},
+    15
+)]
+#[case::bound_record_seed(
+    indoc! {r#"
+        init = (a=5, b=box(map([("x", 1), ("y", 2)])))
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := init
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + s.a
+        await_final(n)
+    "#},
+    15
+)]
+#[case::record_write(
+    indoc! {r#"
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1)])))
+        for r in [1, 2, 3]:
+            with begin():
+                s := (a=s.a + 1, b=box(map([("z", 3)])))
+        await_final(s).a
+    "#},
+    8
+)]
+fn a_sum_inside_a_product_enters_its_declared_sum(#[case] code: &str, #[case] expected: i64) {
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// A whole-variable write of a boxed collection enters the variable's declared sum, as its
+/// seed does.
+#[test]
+fn a_boxed_write_enters_its_declared_sum() {
+    assert_eq!(
+        final_mut_var_value(indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := box(map([("x", 1)]))
+            for r in [1, 2, 3]:
+                with begin():
+                    m := box(map([("z", 3)]))
+            await_final(m)
+        "#}),
+        Value::Function(vec![cambra::interpreter::FuncBinding {
+            input: Value::String("z".into()),
+            output: Value::Int(3),
+        }]),
+    );
+}
+
 /// A field projected off a tuple transactional mutable variable's completion read.
 #[test]
 fn test_compound_txn_mut_var_field() {
@@ -605,9 +677,13 @@ fn string_valued_store() {
 /// program returns both as a tuple. Each rides the writer decision as its own
 /// `__to_<defer>` tap and is read back per commit tick: `a` = 1,3,6 and `b` (sum
 /// of squares) = 1,5,14 over commit ticks 1,2,3.
+///
+/// The tuple is a value, so each component is a materialized collection keyed by
+/// commit tick rather than one collection of pairs. The two feeds have their own
+/// domains, and a pair of collections is not a collection of pairs.
 #[test]
 fn two_reply_feeds_one_transaction() {
-    check_tile(
+    check_collection_tile(
         indoc! {r#"
             outa = defer()
             outb = defer()
@@ -621,15 +697,22 @@ fn two_reply_feeds_one_transaction() {
                     outb << b
             (outa, outb)
         "#},
-        Tile::data_function(
-            ColumnValue::UInts(vec![1, 2, 3]),
-            Box::new(Tile::tuple(vec![
-                Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6])),
-                Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14])),
-            ])),
-            Predicate::True,
-            BitSet::new(),
-        ),
+        // A pair of collections, each keeping its own commit-tick domain — not one
+        // collection of pairs, which is what zipping the two would have made.
+        Tile::tuple(vec![
+            Tile::data_function(
+                ColumnValue::UInts(vec![1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            Tile::data_function(
+                ColumnValue::UInts(vec![1, 2, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+        ]),
     );
 }
 

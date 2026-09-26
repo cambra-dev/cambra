@@ -738,32 +738,36 @@ mod tests {
         );
     }
 
+    /// The whole-tree entry point reaches a program's outputs, a `Record` at the
+    /// tail of the root `Let*` chain: each output that holds a collection is an
+    /// iteration site, since `convert_outputs_to_operators` compiles each with
+    /// `input=None`.
     #[test]
-    fn test_insert_iterate_markers_record_root_wraps_each_function_field() {
-        // Programs that end in a sink-bound `Record` — each
-        // function-typed field is an iteration site (`compile_program`
-        // dispatches to `convert_record_fields_to_operators`, which
-        // compiles each field with `input=None`).
+    fn test_insert_iterate_markers_wraps_each_collection_output() {
         let int = int_ty();
-        let field_ty = fun_ty(Type::UIntRange(3), int.clone());
+        let out_ty = data_fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
             ("out_a".to_string(), list_123()),
             ("out_b".to_string(), list_123()),
+            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
         ]))
         .with_ty(Type::Record(vec![
-            ("out_a".to_string(), field_ty.clone()),
-            ("out_b".to_string(), field_ty),
+            ("out_a".to_string(), out_ty.clone()),
+            ("out_b".to_string(), out_ty),
+            ("n".to_string(), int),
         ]));
 
         insert_iterate_markers(&mut expr, &Default::default());
 
-        let TypedExprNode::Record(fields) = &expr.node else {
-            panic!("expected Record, got: {}", symbolic(&expr));
+        let TypedExprNode::Record(outs) = &expr.node else {
+            panic!("expected a record, got: {}", symbolic(&expr));
         };
-        for (name, value) in fields {
-            assert!(
+        for (name, value) in outs {
+            let expected = name != "n";
+            assert_eq!(
                 is_iterate_apply(chain_head(value)),
-                "sink field `{name}` should be iterate-led, got: {}",
+                expected,
+                "output `{name}`: got {}",
                 symbolic(value)
             );
         }

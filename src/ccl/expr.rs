@@ -553,8 +553,10 @@ pub enum TypedExprNode {
 
     /// A tuple constructor: `(e0, e1, ...)`.
     ///
-    /// Compiles to a [`crate::interpreter::tile_operators::FanIn`] record with fields
-    /// named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]).
+    /// Fields are named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]). A record
+    /// extent compiles to a [`crate::interpreter::tile_operators::MakeRecord`] and a function
+    /// extent to a [`crate::interpreter::tile_operators::Zip`]
+    /// (`src/interpreter/design-operators.md`, "A product value is a record of tiles").
     Tuple(Vec<TypedExpr>),
 
     /// A first-class projection morphism `.n` (tuple) or `.name` (record).

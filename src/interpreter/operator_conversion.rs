@@ -31,11 +31,11 @@ use crate::{
         operator_graph::{record_kept_operators, record_sink},
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
-            Filter, FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain,
+            Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, TileOperator, Tiling,
-            Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, fan_in_at,
-            fan_in_named_at, level_count,
+            MapResultWithSource, Memo, PermuteRecordDomain, Restrict, SelectField, TileOperator,
+            Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap, level_count,
+            zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
     },
@@ -68,7 +68,7 @@ use std::{
 /// - Let-bindings of the above
 ///  
 /// For converting to operators, scalars and application of functions to scalars are turned into a dag
-/// of Constant, MapResult, and ScalarFanIn operators.  Functions can only be combined via composition
+/// of Constant, MapResult, and MakeRecord operators.  Functions can only be combined via composition
 /// and zip, and every function is lifted over a domain with a Map-style operator (MapResult,
 /// MapResultToConst, or MapResultWithSource). The input to each lifted function is carried through
 /// conversion as the `input` argument.  Iteration is never inserted implicitly here — every
@@ -109,8 +109,8 @@ pub fn convert_to_operators(
     Ok(op)
 }
 
-/// One compiled operator per field of a trailing record.
-pub type RecordFieldOperators = Vec<(String, Box<dyn TileOperator>)>;
+/// One compiled operator per program output.
+pub type OutputOperators = Vec<(String, Box<dyn TileOperator>)>;
 
 /// Compile a `Let`'s bound expression into the innermost scope, shared by both
 /// conversion entry points, and return the input its body is converted with.
@@ -160,21 +160,22 @@ fn compile_let_binding(
     Ok(body_input)
 }
 
-/// Compile a `Let* Record{…}` tree into one operator per record field, sharing
-/// scope (and thus the [`FanOut`]/[`Memo`] handles for upstream `Let` bindings)
-/// across every field.
+/// Compile a `Let* Record{…}` tree into one operator per output, sharing scope
+/// (and thus the [`FanOut`]/[`Memo`] handles for upstream `Let` bindings) across
+/// every output.
 ///
-/// Used by [`crate::ccl::context::compile_program`] when the program ends in a
-/// trailing `Record` of sink-bound names: every field's operator subgraph
-/// branches off the same memoised upstream operators rather than each sink
-/// re-compiling the shared prefix into a fresh, independent subgraph.
+/// Used by [`crate::ccl::context::compile_program`] when the program binds a
+/// sink: every output's operator subgraph branches off the same memoised
+/// upstream operators rather than each sink re-compiling the shared prefix into
+/// a fresh, independent subgraph.
 ///
-/// The expression must consist of zero or more `Let` bindings followed by a
-/// trailing `Record`; any other shape returns [`ConversionError::Unsupported`].
-pub fn convert_record_fields_to_operators(
+/// The expression must consist of zero or more `Let` bindings followed by an
+/// [`Record`](TypedExprNode::Record); any other shape returns
+/// [`ConversionError::Unsupported`].
+pub fn convert_outputs_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
-) -> Result<RecordFieldOperators, ConversionError> {
+) -> Result<OutputOperators, ConversionError> {
     match &expr.node {
         TypedExprNode::Let {
             binding,
@@ -185,21 +186,21 @@ pub fn convert_record_fields_to_operators(
             // No surrounding iteration here — this entry point compiles a
             // `Let* Record` chain from the top — so every binding is free.
             compile_let_binding(expr.node_id(), binding, bound_expr, None, &mut scope)?;
-            convert_record_fields_to_operators(body, &mut scope)
+            convert_outputs_to_operators(body, &mut scope)
         }
-        TypedExprNode::Record(fields) => fields
+        TypedExprNode::Record(outs) => outs
             .iter()
             .map(|(name, elt)| {
                 let op = convert_impl(elt, None, ctx)?;
                 // The sink is the program's output boundary, so it belongs to the
-                // field expression rather than to the record or the program root.
+                // output expression rather than to the record or the program root.
                 let _scope = crate::ccl::provenance::converting(elt.node_id());
                 record_sink(name);
                 Ok((name.clone(), op))
             })
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
-            "convert_record_fields_to_operators: expected Let* Record, got {other:?}"
+            "convert_outputs_to_operators: expected Let* Record, got {other:?}"
         ))),
     }
 }
@@ -1627,16 +1628,16 @@ fn convert_impl_inner(
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
-                    // Zip-with-const fast path: avoid the FanOut+FanIn dance
+                    // Zip-with-const fast path: avoid the FanOut+Zip dance
                     // when exactly one arm of a 2-arm zip is a const-lift.
                     if elts.len() == 2
                         && let Some(const_idx) = consts.iter().position(|c| c.is_some())
                     {
                         let const_arm = convert_impl(consts[const_idx].unwrap(), None, ctx)?;
                         let mode = if const_idx == 0 {
-                            MapResultToConstMode::FanInLeft
+                            MapResultToConstMode::ZipLeft
                         } else {
-                            MapResultToConstMode::FanInRight
+                            MapResultToConstMode::ZipRight
                         };
                         let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), ctx)?;
                         return Ok(Box::new(MapResultToConst::new(
@@ -1648,7 +1649,7 @@ fn convert_impl_inner(
                     // Generic path: fan_out the input so every branch shares the
                     // same upstream producer.  The arms' runtime tilings depend
                     // on the upstream `input` — scalar upstream produces scalar
-                    // arms, function upstream produces function arms.  `fan_in`
+                    // arms, function upstream produces function arms.  `zip_arms`
                     // picks the matching combinator.
                     //
                     // A **store-read arm** (`__hist.k`) is a *leaf* source over
@@ -1657,7 +1658,7 @@ fn convert_impl_inner(
                     // reject it). This is the cross-domain co-iteration shape: a
                     // commit writer's source `zip((reqs, __cnt.acc))` pairs the
                     // request stream (input-driven) with an induction accumulator
-                    // read (leaf) position-by-position; `fan_in` co-aligns them by
+                    // read (leaf) position-by-position; `zip_arms` co-aligns them by
                     // domain.
                     let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
                     let mut ops = Vec::new();
@@ -1670,7 +1671,7 @@ fn convert_impl_inner(
                         ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
                     let ambient = zip_ambient(input_levels, ops.iter().map(|op| op.tiling()));
-                    Ok(fan_in_at(ops, ambient))
+                    Ok(zip_arms_at(ops, ambient))
                 }
                 TypedExprNode::Record(fields) => {
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
@@ -1687,7 +1688,7 @@ fn convert_impl_inner(
                         .collect();
                     let ops = ops?;
                     let ambient = zip_ambient(input_levels, ops.iter().map(|(_, op)| op.tiling()));
-                    Ok(fan_in_named_at(ops, ambient))
+                    Ok(zip_arms_named_at(ops, ambient))
                 }
                 other => Err(ConversionError::Unsupported(format!(
                     "zip expects a Tuple or Record argument, got {:?}",
@@ -2159,11 +2160,22 @@ fn convert_impl_inner(
         }
 
         TypedExprNode::Apply { argument, function } => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(format!(
-                    "Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator {}",
-                    symbolic(function)
-                )));
+            // An `Apply` whose type is a collection sits in function position as a free
+            // [`TypedExprNode::Var`] does below, whatever its function: an input reaching it
+            // is a domain to look the collection up at, `λ 𝑥 → (arg ▷ f)(𝑥)`. A filter over a
+            // product's component plans as `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠` with `𝑠` such an
+            // `Apply`, and its second `𝑠` reaches here. An input reaching any other `Apply`
+            // is an iteration planning left out.
+            if let Some(input) = input {
+                if !expr.ty.is_collection() {
+                    return Err(ConversionError::Unsupported(format!(
+                        "Only higher-order combinators (map, const, zip) can take an input \
+                         operator; found input for non-combinator {}",
+                        symbolic(function)
+                    )));
+                }
+                let collection = convert_impl_inner(expr, None, ctx)?;
+                return Ok(Box::new(MapResult::new(input, collection)));
             }
             let arg = convert_impl(argument, None, ctx)?;
             convert_impl(function, Some(arg), ctx)
@@ -2430,22 +2442,25 @@ fn convert_impl_inner(
 
         // Tuple: compile to a record.
         //
-        // Zipped tuples are handled by the zip rule earlier; this case
-        // fires when a `Tuple` appears as the argument of a non-Zip Apply
-        // (e.g. `Apply(Tuple([acc, i]), Builtin(BinOp(Add)))` after
-        // lambda-elim of `acc + i`).  Element tilings can be either all
-        // scalar or all function-tiled (when the elements are
-        // mutation-loop projections like `Var(acc)`); `fan_in` dispatches
-        // between `ScalarFanIn` and `FanIn` accordingly.
+        // Zipped tuples are handled by the zip rule earlier; this case fires when a
+        // `Tuple` appears as the argument of a non-Zip Apply (e.g.
+        // `Apply(Tuple([acc, i]), Builtin(BinOp(Add)))` after lambda-elim of
+        // `acc + i`). Each component compiles as the term it is, and
+        // [`build_product`] assembles them by the node's extent.
         TypedExprNode::Tuple(elts) => {
             expect_no_input(input, "tuple literal")?;
             let ops: Result<Vec<_>, _> = elts
                 .iter()
                 .map(|elt| convert_impl(elt, None, ctx))
                 .collect();
-            let ops = ops?;
-            let ambient = leaf_ambient(ops.iter().map(|op| op.tiling()));
-            Ok(fan_in_at(ops, ambient))
+            build_product(
+                ops?.into_iter()
+                    .enumerate()
+                    .map(|(i, op)| (tuple_field(i), op))
+                    .collect(),
+                expr,
+                ctx,
+            )
         }
 
         TypedExprNode::Record(fields) => {
@@ -2454,9 +2469,7 @@ fn convert_impl_inner(
                 .iter()
                 .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
                 .collect();
-            let ops = ops?;
-            let ambient = leaf_ambient(ops.iter().map(|(_, op)| op.tiling()));
-            Ok(fan_in_named_at(ops, ambient))
+            build_product(ops?, expr, ctx)
         }
 
         // Literal constant: produce a scalar.
@@ -2629,22 +2642,90 @@ fn zip_ambient<'a>(input_levels: usize, arms: impl Iterator<Item = &'a Tiling>) 
     arms.map(level_count).fold(input_levels, usize::min)
 }
 
+/// Whether two extents have the same constructor skeleton.
+///
+/// Coarser than equality in the two ways an operator's extent legitimately
+/// differs from its node's type: an index extent carries a different bound
+/// (`extent_of` strips the refinement that names one), and a constructed variant
+/// inhabits a subset of the arms its type declares.
+fn extent_shapes_agree(got: &Extent, want: &Extent) -> bool {
+    match (got, want) {
+        (Extent::Restricted { base, .. }, w) => extent_shapes_agree(base, w),
+        (g, Extent::Restricted { base, .. }) => extent_shapes_agree(g, base),
+        (
+            Extent::UIntRange(_) | Extent::DataSourceDomain(_) | Extent::Base(BaseType::UInt),
+            Extent::UIntRange(_) | Extent::DataSourceDomain(_) | Extent::Base(BaseType::UInt),
+        ) => true,
+        (Extent::Base(a), Extent::Base(b)) => a == b,
+        (
+            Extent::Function {
+                domain: gd,
+                codomain: gc,
+            },
+            Extent::Function {
+                domain: wd,
+                codomain: wc,
+            },
+        ) => extent_shapes_agree(gd, wd) && extent_shapes_agree(gc, wc),
+        (Extent::Record(a), Extent::Record(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|w| extent_shapes_agree(v, w)))
+        }
+        (Extent::Union(a), Extent::Union(b)) => a
+            .iter()
+            .all(|(k, v)| b.get(k).is_some_and(|w| extent_shapes_agree(v, w))),
+        _ => false,
+    }
+}
+
+/// Assemble a product from its compiled components, by the node's own extent.
+///
+/// A record extent is built by [`MakeRecord`] (`src/interpreter/design-operators.md`, "A
+/// product value is a record of tiles"). A function extent `𝐷 ⤇ {…}` is a collection of
+/// records, such as `Tuple([acc, i])` under a binop, which [`zip_arms_named_at`] pairs over
+/// the ambient iteration. Both arrive as the same node with the same operands, so the
+/// extent is the only thing that separates them.
+///
+/// The built operator's extent is checked against the node's, and a disagreement is a
+/// [`ConversionError::TypeError`]. Function-tiled components under a record extent would
+/// otherwise build a record of collections where the consumer reads a collection of records.
+fn build_product(
+    components: Vec<(String, Box<dyn TileOperator>)>,
+    expr: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let want = ctx.extent_of(&expr.ty)?;
+    let product: Box<dyn TileOperator> = if matches!(want, Extent::Record(_)) {
+        Box::new(MakeRecord::new_named(components))
+    } else {
+        let ambient = leaf_ambient(components.iter().map(|(_, op)| op.tiling()));
+        zip_arms_named_at(components, ambient)
+    };
+    let got = product.tiling().extent();
+    if !extent_shapes_agree(&got, &want) {
+        return Err(ConversionError::TypeError(format!(
+            "the product {} compiled to {got}, but its type's extent is {want}",
+            symbolic(expr),
+        )));
+    }
+    Ok(product)
+}
+
 /// The ambient iteration a product's **leaf** components stand over.
 ///
 /// A product former with no input compiles components that each carry their own iteration,
 /// so there is nothing to read the ambient off except the components themselves, and they
-/// must agree on it. A scalar component contributes no level and the pairing is a plain
-/// record, which [`fan_in_at`] routes elsewhere.
+/// must agree on it.
 fn leaf_ambient<'a>(tilings: impl Iterator<Item = &'a Tiling>) -> usize {
     let mut ambient = 1;
     for (i, t) in tilings.enumerate() {
-        let levels = level_count(t);
+        let levels = level_count(t).max(1);
         if i == 0 {
-            ambient = levels.max(1);
+            ambient = levels;
         } else {
             assert_eq!(
-                levels.max(1),
-                ambient,
+                levels, ambient,
                 "a product's leaf components stand over one iteration, so they nest alike",
             );
         }
@@ -2692,6 +2773,22 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
             tag: FieldKey::Name(tag.as_str().into()),
             inner: Box::new(expr_to_value(payload)?),
         }),
+        // A nested collection is constant exactly when its elements are, and its
+        // value is the bindings table. A list literal's elements are values, so a
+        // collection among them is a table written down rather than an operator's
+        // output. Without this arm `[(a=1, b=[1, 2])]` is rejected for holding a
+        // computation, though nothing in it computes.
+        TypedExprNode::List(elts) => Ok(Value::Function(
+            elts.iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    Ok(FuncBinding {
+                        input: Value::UInt(i),
+                        output: expr_to_value(e)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ConversionError>>()?,
+        )),
         // The element may well *be* a constant and still arrive here: what reaches this
         // point is what constant folding declined. Saying only "is a computation" reads as
         // a demand to write a constant where one is already written, so the message names
@@ -4233,6 +4330,23 @@ fn convert_store_read(
     }
 }
 
+/// Whether projecting `name` out of `input` is a [`SelectField`] rather than the
+/// `RecordField` application.
+///
+/// Every field of a bare product is a tile. Under a collection the record's fields share its
+/// levels, and a release naming keys of one cannot reach the input ([`SelectField`]), so the
+/// application keeps every record it can box into a column. A record holding a level is one
+/// it cannot, and then every field of it goes this way.
+fn selects_a_tile(tiling: &Tiling, name: &str) -> bool {
+    match tiling {
+        Tiling::Record(fields) => fields.contains_key(name),
+        _ => matches!(
+            tiling.deepest_values(),
+            Tiling::Record(fields) if fields.contains_key(name) && fields.values().any(Tiling::holds_a_level)
+        ),
+    }
+}
+
 /// Build an operator that extracts field `_n` from the record codomain of `input`.
 ///
 /// Produces `MapResult(input, Constant(RecordField("_n")))`.
@@ -4241,6 +4355,9 @@ fn proj_field(
     n: usize,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let field_name = tuple_field(n);
+    if selects_a_tile(input.tiling(), &field_name) {
+        return Ok(Box::new(SelectField::new(input, field_name)));
+    }
     let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, &field_name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
@@ -4306,6 +4423,9 @@ fn proj_named_field(
     input: Box<dyn TileOperator>,
     name: &str,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
+    if selects_a_tile(input.tiling(), name) {
+        return Ok(Box::new(SelectField::new(input, name)));
+    }
     let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(name.to_string()));
@@ -4524,7 +4644,7 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
 /// Return the value (codomain) [`Extent`] from a tiling.
 ///
 /// For `Scalar(e)` returns `e`; for `Record(fields)` returns `Extent::Record` over
-/// the field extents (arising when a non-constant tuple is compiled via [`ScalarFanIn`]);
+/// the field extents (arising when a non-constant tuple is compiled via [`MakeRecord`]);
 /// for `DataFunction { codomain, .. }` returns `codomain.extent()`.
 fn result_extent(tiling: &Tiling) -> Extent {
     match tiling {
@@ -4567,7 +4687,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
 /// `__hist.k` or an `as_of((trigger, store))` read — rather than an
 /// iteration-driven morphism. Such an arm is converted with *no* input (it would
-/// reject the fanned iteration input); `fan_in` co-aligns it with the
+/// reject the fanned iteration input); `zip_arms` co-aligns it with the
 /// input-driven arms by domain position. This is the cross-domain co-iteration
 /// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a reply
 /// combining the request with a store read (`zip((trigger, as_of(store)))`).
@@ -5136,7 +5256,7 @@ mod variant_ctor_tests {
     /// lambda_elim compiles it to the zip form `⟨id, .decision ▷
     /// variant_project(0)⟩ ▷ zip ≫ (λ (__c, w) → …)`; we drive that over a
     /// two-row `{time, decision: commit}` stream. The outer element and the
-    /// tag-restricted payload co-iterate by key through the `FanIn`, so each row
+    /// tag-restricted payload co-iterate by key through the `Zip`, so each row
     /// pairs its own `time` with its own commit payload.
     #[test]
     fn variant_elim_outer_binder_zip() {

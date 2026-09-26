@@ -856,8 +856,8 @@ causal matcher (`letrec::check_letrec_causal`).
   value at it. The accumulator therefore crosses between them as a tile, like every other
   operator-to-operator value, at one position per pull. `StoreDenseRead` then folds the
   changelog over the loop domain to the dense `𝐷 ⇀ 𝑉` stream (serving both a scalar-final
-  `ExtractFinal` and a co-iterated `fan_in`). A single always-commit or commit-gated writer over a
-  finite *or* async domain.
+  `ExtractFinal` and a co-iterated `zip_arms_at`). A single always-commit or commit-gated writer
+  over a finite *or* async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ (Key ⇀ Value)`. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
@@ -959,8 +959,9 @@ verbatim (a `zip` is opaque to its shape parser), so no recognition change is ne
 
 - *`zip` conversion.* An arm of a `zip` that reads a mutable variable (`__cnt.acc`) is a **leaf** source over its own
   domain, not an iteration-driven morphism. The generic `zip` path converts such an arm with *no*
-  input (rather than fanning the shared iteration input into it, which it would reject); `fan_in`
-  then co-aligns the leaf accumulator stream with the input-driven request stream by domain position.
+  input (rather than fanning the shared iteration input into it, which it would reject);
+  `zip_arms_at` then co-aligns the leaf accumulator stream with the input-driven request stream by
+  domain position.
 - *Source decoding.* The co-iterated source's codomain is a `Record` (the `(item, acc(𝑟))` tuple);
   `decode_source_positioned` decodes each position into a `Value::Record` (`source_value_at`
   descends the record's scalar columns), which the writer body reads off its `._0` / `._𝑖` slots.
@@ -968,7 +969,7 @@ verbatim (a `zip` is opaque to its shape parser), so no recognition change is ne
 The accumulator stream is on the writer's own request domain, so it is position-aligned and needs no
 as-of latch. The `balance ↔ incr_commits` cycle is unchanged (`get_prev_txn`-guarded); `𝑐𝑛𝑡` sits
 outside it, read-only to the transaction, so guardedness is unaffected. No new operator — the
-existing `zip`/`fan_in` co-iteration plus a wider source decode.
+existing `zip`/`zip_arms_at` co-iteration plus a wider source decode.
 
 ### Co-indexed vs. cross-loop (broadcast)
 
