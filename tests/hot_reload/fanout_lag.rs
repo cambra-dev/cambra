@@ -195,31 +195,32 @@ fn a_feed_replays_its_prefix_when_an_unpulled_sibling_holds_its_store() {
 /// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
 /// ```
 ///
-/// Pinned: cuts 0 and 1 are correct. Each cut from 2 to 8 repeats the last value
-/// decided before the swap, and cuts 9 and 10, after the fold finished, repeat the
-/// last two:
+/// Pinned: cuts 0 and 1 are correct. Each cut from 2 to 10 repeats the last value
+/// decided before the swap, which after the fold finished is the last value:
 ///
 /// ```text
 /// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
 /// 8 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefg", "abcdefgh"]
+/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
 /// ```
 ///
 /// In-process only: through the binary over `stdin` the recurrence has caught up at
 /// the quiet point where `--control` reloads, and nothing is replayed.
 ///
-/// No reader here is unpulled. The induction driver's recurrence branch reads the
-/// store's previous tick, so its release trails the tap reader's by one tick, and
-/// the rebuilt tap reader is seeded at the driver's frontier.
+/// No reader here is unpulled. The induction driver's recurrence branch reads each key
+/// at the store's frontier, the position before the one it feeds, so its release trails
+/// the tap reader's by one position, and the rebuilt tap reader is seeded at the driver's
+/// frontier.
 #[test]
 fn a_feed_repeats_the_position_the_recurrence_still_reads() {
     let pinned: Vec<Vec<String>> = (0..=10)
         .map(|pulls| match pulls {
             0 | 1 => strings(&EXPECTED),
-            // The value at the cut, `EXPECTED[pulls - 2]`, twice.
-            2..=8 => strings(&[&EXPECTED[..pulls - 1], &EXPECTED[pulls - 2..]].concat()),
-            // The finished feed, then its last two values again.
-            _ => strings(&[&EXPECTED[..], &EXPECTED[6..]].concat()),
+            // The last value decided before the swap, twice.
+            _ => {
+                let decided = (pulls - 1).min(EXPECTED.len());
+                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
+            }
         })
         .collect();
     assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);

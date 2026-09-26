@@ -33,6 +33,11 @@ pub struct UnionOperator {
     /// extent with disjoint positions, merged into a single flat `DataFunction`
     /// (sorted by domain key) rather than a tagged `ColumnValue::Union`.
     flat: bool,
+    /// The level the union merges at, which leaves every level above it standing — the
+    /// same parameter [`Zip::new_at`](super::Zip::new_at) takes, and for the same reason. A
+    /// partition inside a nested recurrence runs once per enclosing row, so its arms
+    /// agree above the level being merged and differ only below it.
+    level: CurryLevel,
 }
 
 impl UnionOperator {
@@ -52,26 +57,52 @@ impl UnionOperator {
             base: OperatorBase::new(tiling),
             inputs,
             flat: false,
+            level: CurryLevel::OUTERMOST,
         }
+    }
+
+    /// The tiling of each input `level` levels in — what the union combines, with the
+    /// levels above it left standing.
+    fn inner_tilings(inputs: &[Box<dyn TileOperator>], level: CurryLevel) -> Vec<Tiling> {
+        inputs
+            .iter()
+            .map(|op| {
+                let mut t = op.tiling();
+                for _ in 0..level.index() {
+                    let Tiling::DataFunction { codomain, .. } = t else {
+                        panic!("UnionOperator: no {level} in {}", op.tiling())
+                    };
+                    t = codomain;
+                }
+                t.clone()
+            })
+            .collect()
     }
 
     /// The tagged coproduct tiling the arms imply: one `Extent::Union` domain,
     /// and the codomain they agree on or the declared one they merge into.
     fn coproduct_tiling(inputs: &[Box<dyn TileOperator>], declared_codomain: Extent) -> Tiling {
+        let arms = Self::inner_tilings(inputs, CurryLevel::OUTERMOST);
+        Self::coproduct_of(&arms, declared_codomain)
+    }
+
+    /// [`coproduct_tiling`](Self::coproduct_tiling) over the arm tilings themselves, so
+    /// the same rule applies at a standing level as at the top.
+    fn coproduct_of(arms: &[Tiling], declared_codomain: Extent) -> Tiling {
         assert!(
-            !inputs.is_empty(),
+            !arms.is_empty(),
             "UnionOperator requires at least one input"
         );
-        let domains: Vec<Extent> = inputs
+        let domains: Vec<Extent> = arms
             .iter()
-            .map(|op| match op.tiling() {
+            .map(|t| match t {
                 Tiling::DataFunction { domain, .. } => domain.clone(),
                 other => panic!("UnionOperator: expected a function tiling, got {other}"),
             })
             .collect();
-        let codomains: Vec<&Tiling> = inputs
+        let codomains: Vec<&Tiling> = arms
             .iter()
-            .map(|op| match op.tiling() {
+            .map(|t| match t {
                 Tiling::DataFunction { codomain, .. } => codomain.as_ref(),
                 _ => unreachable!(),
             })
@@ -156,14 +187,31 @@ impl UnionOperator {
     /// is for a sourceless union whose arms have genuinely distinct extents — a Σ /
     /// C-form dispatch read by `final_or_default`.)
     pub fn new_flat(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
+        Self::new_flat_at(inputs, declared_codomain, CurryLevel::OUTERMOST)
+    }
+
+    /// [`new_flat`](Self::new_flat) at `level`, leaving every level above it standing.
+    ///
+    /// `level` is the caller's to state, exactly as it is for
+    /// [`Zip::new_at`](super::Zip::new_at): the arms of a partition agree below the
+    /// merged level just as readily as at it, so their own shapes cannot say where the
+    /// merge belongs.
+    pub fn new_flat_at(
+        inputs: Vec<Box<dyn TileOperator>>,
+        declared_codomain: Extent,
+        level: CurryLevel,
+    ) -> Self {
         // Narrow before minting, so the identity an operator is born with carries
         // the tiling it keeps. Reaching into `base.tiling` afterwards would leave
         // the shape recorded at construction stale.
-        let tiling = Self::flatten_domain(Self::coproduct_tiling(&inputs, declared_codomain));
+        let arms = Self::inner_tilings(&inputs, level);
+        let merged = Self::flatten_domain(Self::coproduct_of(&arms, declared_codomain));
+        let tiling = with_values_at(inputs[0].tiling(), level, merged);
         Self {
             base: OperatorBase::new(tiling),
             inputs,
             flat: true,
+            level,
         }
     }
 }
@@ -173,7 +221,7 @@ impl UnionOperator {
 /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`, or a `match`'s
 /// tag fan-out), so the arms' keys are disjoint and reassemble the full column —
 /// which then co-iterates with the decision record's sibling `commit` field. The
-/// codomain is a scalar decision-field value, or a boxed-compound `Tile::Record`
+/// codomain is a scalar decision-field value, or a materialized compound `Tile::Record`
 /// for a tuple/record accumulator. A key is complete once every arm calls it complete,
 /// and beneath a key each level states what the arm holding it says.
 ///
@@ -189,7 +237,7 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     // The arms' codomains are concatenated and then gathered in key order, rather than
     // reassembled as a list of `Value` pairs. A gather is shape-agnostic, so an arm whose
     // codomain carries a level — a collection-valued mutable variable's write — travels like
-    // any other; boxing each row into a value could not carry one.
+    // any other; materializing each row into a value could not carry one.
     let mut pairs: Vec<(Value, usize)> = Vec::new();
     let mut codomains: Option<Tile> = None;
     // A key comes from whichever arm holds it, so it is complete once every arm calls it
@@ -221,10 +269,11 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
             pairs.push((domain.index_at(row), offset + row));
         }
         offset += domain.len();
-        // Arms disagree on whether a compound value rides boxed (`Scalar(Records)`) or as
-        // a struct-of-arrays `Record`, so a value-shaped arm is restated in the declared
-        // shape before being concatenated. An arm carrying a level passes through: it is
-        // already the shape its tiling names, and boxing it is what has no column to go in.
+        // Arms disagree on whether a compound value rides materialized (`Scalar(Records)`)
+        // or as a struct-of-arrays `Record`, so a value-shaped arm is restated in the
+        // declared shape before being concatenated. An arm carrying a level passes through:
+        // it is already the shape its tiling names, and materializing it is what has no
+        // column to go in.
         let codomain = if codomain.holds_a_level() {
             // What an arm states beneath a key is the arm's to say only for the keys it holds
             // live: a key it deleted or never held is a sibling's, whose own statement is the
@@ -321,7 +370,7 @@ impl TileOperator for UnionOperator {
             .map(|op| {
                 op.subscribe(
                     op.tiling().universal_guard(),
-                    forwarding_consumer(&shared),
+                    forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                     scheduler,
                 )
             })
@@ -330,6 +379,7 @@ impl TileOperator for UnionOperator {
             base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling()),
             inputs: input_producers,
             flat: self.flat,
+            level: self.level,
         })
     }
 }
@@ -338,9 +388,105 @@ impl TileOperator for UnionOperator {
 /// into a single tile with a `ColumnValue::Union` domain and interleaved codomain.
 struct UnionProducer {
     base: ProducerBase,
+    /// The level the union merges at — see [`UnionOperator::new_flat_at`].
+    level: CurryLevel,
     inputs: Vec<Box<dyn TileProducer>>,
     /// Flat-merge mode (see [`UnionOperator::new_flat`]).
     flat: bool,
+}
+
+impl UnionProducer {
+    /// [`flat_merge`] once per row of the standing levels, reassembled beneath them.
+    ///
+    /// A row's group is a collection in its own right, so retaining it leaves exactly the
+    /// flat tile the merge already knows how to handle — which is why the standing case
+    /// needs no second merge, only [`Tile::regroup_beneath`]. At level zero that is the
+    /// whole tile as one group, so this is the only path.
+    fn merged(
+        &self,
+        mut tiles: Vec<Tile>,
+        domain_extent: &Extent,
+        codomain_tiling: &Tiling,
+    ) -> Tile {
+        tiles.retain(Tile::is_data_function);
+        if tiles.is_empty() {
+            return self.tiling().empty_tile();
+        }
+        let Some(enclosing) = self.level.enclosing() else {
+            return flat_merge(tiles, domain_extent, codomain_tiling);
+        };
+        // The arms are one collection's disjoint slices over the same standing levels. Each
+        // is pulled through its own branch and holds the rows it has reached and not
+        // released, so the standing rows are the arms' together: every arm's standing
+        // levels with nothing beneath, merged by key.
+        let empty_group = self.tiling().values_at(self.level).empty_tile();
+        let mut standing = tiles
+            .iter()
+            .map(|tile| tile.per_group(self.tiling(), self.level, &mut |_| empty_group.clone()))
+            .reduce(|mut all, one| {
+                all.merge(one);
+                all
+            })
+            .expect("at least one arm is a collection");
+        // A standing row is complete once every arm calls it complete, since each holds its
+        // own share of what lies beneath: the statements meet, as `flat_merge` meets them at
+        // the level it merges. An arm released whole states `True` and constrains nothing.
+        for depth in (0..self.level.index()).map(CurryLevel::new) {
+            let met = tiles
+                .iter()
+                .filter_map(|tile| match tile.values_at(depth) {
+                    Tile::DataFunction {
+                        domain_predicate, ..
+                    } => Some(domain_predicate),
+                    _ => None,
+                })
+                .fold(Predicate::True, |all, one| all.intersect(one));
+            if let Tile::DataFunction {
+                domain_predicate, ..
+            } = standing.values_at_mut(depth)
+            {
+                *domain_predicate = met;
+            }
+        }
+        let rows: Vec<_> = tiles
+            .iter()
+            .map(|tile| tile.rows_by_path(enclosing))
+            .collect();
+        let paths = standing.paths_at(enclosing);
+        let empty_group = self.tiling().values_at(self.level).empty_tile();
+        standing.per_group(self.tiling(), self.level, &mut |row| {
+            // An arm that has not reached this row holds nothing of it, but still says
+            // whether more may come: complete where the arm calls the row complete, and not
+            // otherwise. The arms are disjoint slices of one collection, so its keys are an
+            // absence the merge takes as none, and its statement is one the merged row's
+            // has to meet.
+            let per_arm: Vec<Tile> = tiles
+                .iter()
+                .zip(&rows)
+                .map(|(tile, rows)| {
+                    if let Some(group) = rows
+                        .get(&paths[row])
+                        .and_then(|&at| tile.group_at(self.level, at))
+                    {
+                        return group.into_owned();
+                    }
+                    let mut group = empty_group.clone();
+                    if let Tile::DataFunction {
+                        domain_predicate, ..
+                    } = &mut group
+                    {
+                        *domain_predicate =
+                            match tile.completion_at(enclosing).contains_path(&paths[row]) {
+                                true => Predicate::True,
+                                false => Predicate::False,
+                            };
+                    }
+                    group
+                })
+                .collect();
+            flat_merge(per_arm, domain_extent, codomain_tiling)
+        })
+    }
 }
 
 impl TileProducer for UnionProducer {
@@ -385,12 +531,20 @@ impl TileProducer for UnionProducer {
         if self.flat {
             // The merged column is described by the operator's *declared* tiling at
             // both ends: the domain the arms share, and the codomain shape the
-            // decision field carries.
-            let (domain_extent, codomain_tiling) = match self.tiling() {
+            // decision field carries. Under a standing level the same description sits
+            // `level` levels in, and the merge runs once per row of the level above.
+            let mut merged_at = self.tiling();
+            for _ in 0..self.level.index() {
+                let Tiling::DataFunction { codomain, .. } = merged_at else {
+                    panic!("a flat union has a standing level it does not tile for")
+                };
+                merged_at = codomain;
+            }
+            let (domain_extent, codomain_tiling) = match merged_at {
                 Tiling::DataFunction { domain, codomain } => (domain.clone(), (**codomain).clone()),
                 other => panic!("a flat union tiling is a function, got {other}"),
             };
-            return flat_merge(tiles, &domain_extent, &codomain_tiling);
+            return self.merged(tiles, &domain_extent, &codomain_tiling);
         }
 
         let mut domains: Vec<ColumnValue> = Vec::new();
@@ -484,12 +638,22 @@ impl TileProducer for UnionProducer {
                     input.release(TileGuard::Function(FunctionGuard::Domain(pred)));
                 }
             }
-            // A **flat** union has one flat domain (not per-variant tags), so a
-            // released prefix over it forwards to every arm — each arm holds a
-            // disjoint subset of those positions and ignores the rest.
-            TileGuard::Function(FunctionGuard::Domain(pred)) if self.flat => {
+            // A **flat** union has one flat domain (not per-variant tags), so a released
+            // region over it forwards to every arm — each arm holds a disjoint subset of
+            // it and ignores the rest. That holds whatever shape the region takes: a
+            // prefix of the positions, the `Codomain` half of a nested release, or the
+            // `Or` of the two that `to_guard` emits for a collection of collections.
+            // The arms share the flat domain's keys and may hold their values in different
+            // representations, so a release reaches each arm's values only whole.
+            g if self.flat => {
+                let levels = self.tiling().levels();
                 for input in &mut self.inputs {
-                    input.release(TileGuard::Function(FunctionGuard::Domain(pred.clone())));
+                    let guard = crate::interpreter::tiling::through_shared_levels(
+                        g.clone(),
+                        levels,
+                        input.tiling(),
+                    );
+                    input.release(guard);
                 }
             }
             other => panic!("UnionProducer::release_impl: unexpected guard {other:?}"),
@@ -817,6 +981,7 @@ mod tests {
             // Tagged, not flat-merged: the assertions below read per-arm
             // variants off a `ColumnValue::Union` domain.
             flat: false,
+            level: CurryLevel::OUTERMOST,
         };
 
         // Release arm 0 in full, leaving arm 1 live.
@@ -887,6 +1052,7 @@ mod tests {
         );
 
         let producer = UnionProducer {
+            level: CurryLevel::OUTERMOST,
             base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
             inputs: vec![
                 Box::new(SpyProducer {
@@ -1009,6 +1175,66 @@ mod tests {
         assert!(
             !domain_predicate.contains_path(&[Value::UInt(1), Value::UInt(8)]),
             "arm B's row 1 is open, yet the merged inner level calls [1, 8] complete: {merged:?}"
+        );
+    }
+
+    /// Beneath a standing level, a row one arm has not reached stays open: that arm may
+    /// still deliver keys under it, whatever the arm that holds the row says.
+    #[test]
+    fn a_flat_union_keeps_a_row_open_that_one_arm_has_not_reached() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        let uint = || Extent::Base(BaseType::UInt);
+        let tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        // Arm 0 holds row 0 whole (key 0 under it) and calls every row complete.
+        let arm0 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        // Arm 1 has reached no row yet and calls nothing complete.
+        let arm1 = tiling.empty_tile();
+        let mut producer = UnionProducer {
+            base: ProducerBase::new(UnionProducer::alloc_id(), &tiling),
+            level: CurryLevel::new(1),
+            inputs: vec![
+                Box::new(TestTileProducer::new(arm0, tiling.clone())),
+                Box::new(TestTileProducer::new(arm1, tiling.clone())),
+            ],
+            flat: true,
+        };
+        let out = producer.get(tiling.universal_guard());
+        let Tile::DataFunction {
+            domain_predicate: rows,
+            codomain,
+            ..
+        } = &out
+        else {
+            panic!("a flat union tiles as a collection, got {out:?}")
+        };
+        assert!(
+            !rows.contains(&Value::UInt(0)),
+            "row 0 is open while arm 1 has not reached it: {rows:?}"
+        );
+        let Tile::DataFunction {
+            domain_predicate: keys,
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("the merged level is a collection, got {codomain:?}")
+        };
+        assert!(
+            !keys.contains_path(&[Value::UInt(0), Value::UInt(5)]),
+            "arm 1 may still deliver key 5 under row 0, so (0, 5) is not complete: {keys:?}"
         );
     }
 }

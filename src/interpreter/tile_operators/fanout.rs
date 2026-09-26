@@ -8,7 +8,7 @@ use super::*;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
-        Consumer, Scheduler,
+        Consumer, Position, Scheduler,
         scheduler::{SharedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
     },
     pretty_graph::VizOptions,
@@ -92,7 +92,7 @@ struct FanOutShared {
     /// last release.
     ///
     /// [`released`]: FanOutShared::released
-    released_position: Option<usize>,
+    released_position: Option<Position>,
     /// Each subscriber's slot number, parallel to [`release_guards`] and
     /// [`consumers`].
     ///
@@ -237,6 +237,7 @@ impl FanOut {
     /// cyclic-mode overhead.  If a branch of this fan-out ends up
     /// feeding back into its own input (e.g. a store recurrence closing
     /// through the fan-out), use [`FanOut::new_cyclic`] instead.
+    ///
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         Self::new_with_reentrancy(input, None)
     }
@@ -372,7 +373,7 @@ impl FanOut {
     }
 
     /// The last position this fan-out's subscribers have collectively released,
-    /// for an output that is a function of a `UInt` position domain.
+    /// for an output that is a function of a position domain.
     ///
     /// What a version keeping this fan-out has to know in order to place a
     /// recurrence over it. The producer beneath it will offer positions above
@@ -385,8 +386,8 @@ impl FanOut {
     /// iteration is not one of those cases: the position it got to is retained
     /// past the universal release that closed it
     /// ([`FanOutShared::released_position`]).
-    pub fn released_position(&self) -> Option<usize> {
-        self.shared.borrow().released_position
+    pub fn released_position(&self) -> Option<Position> {
+        self.shared.borrow().released_position.clone()
     }
 
     /// Reopen this fan-out for a fresh set of branches, keeping the inner
@@ -740,6 +741,11 @@ impl TileProducer for FanOutProducer {
         // re-deliver data that a consumer has already released.
         let index = self.index();
         let accumulated = shared.release_guards[index].union(&obsolete_guard);
+        trace!(
+            "{} branch {index} accumulate {:?} + {obsolete_guard:?} = {accumulated:?}",
+            self.name(),
+            shared.release_guards[index]
+        );
         shared.release_guards[index] = accumulated;
         // Only live subscribers constrain the release. A subscriber whose
         // producer has been dropped never releases again, so counting its guard
@@ -750,7 +756,12 @@ impl TileProducer for FanOutProducer {
             .fold(self.tiling().universal_guard(), |acc, i| {
                 acc.intersect(&shared.release_guards[i])
             });
-        trace!("{} releasing: {intersection:?}", self.name());
+        trace!(
+            "{} releasing: {intersection:?} from branches {:?} live {:?}",
+            self.name(),
+            shared.release_guards,
+            shared.live_indices().collect::<Vec<_>>()
+        );
         // The match is total for a fan-out a recurrence reads, rather than a
         // shape test with a fallthrough. Every function tiling's empty and
         // universal guards are `Function(Domain(_))` (`Tiling::empty_guard`,
@@ -766,7 +777,7 @@ impl TileProducer for FanOutProducer {
         if let TileGuard::Function(FunctionGuard::Domain(pred)) = &intersection
             && let Some(position) = pred.max_released_position()
         {
-            shared.released_position = shared.released_position.max(Some(position));
+            shared.released_position = shared.released_position.clone().max(Some(position));
         }
         shared.released = intersection.clone();
         // In cyclic mode the inner producer can be temporarily taken out
@@ -827,7 +838,7 @@ impl TileOperator for Memo {
             ),
             input: self.input.subscribe(
                 intent_guard,
-                notified.consumer(forwarding_consumer(&consumer)),
+                notified.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
                 scheduler,
             ),
             cached_tile: self.tiling().empty_tile(),

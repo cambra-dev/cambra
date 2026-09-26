@@ -609,6 +609,8 @@ fn a_correlated_comprehension_nests_without_an_aggregate() {
                     Predicate::False,
                     BitSet::new(),
                 )),
+                // Every `q` key is complete, and a complete key is complete at every depth
+                // beneath it, so this level has nothing further to state.
                 Predicate::False,
                 BitSet::new(),
             )),

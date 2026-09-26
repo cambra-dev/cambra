@@ -336,6 +336,7 @@ struct Entry {
 enum EntryValue {
     Key,
     Value(Option<Value>),
+    Frontier(Option<crate::interpreter::Position>),
     Row(Tile),
 }
 
@@ -411,9 +412,72 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                         (label.to_vec(), path.clone()),
                         Entry {
                             value: EntryValue::Value(Some(column.index_at(row))),
-                            complete: level > 0 && above.contains_path(path),
+                            // A value at the root is the whole answer once it has arrived:
+                            // a scalar holds no more than one.
+                            complete: match level {
+                                0 => true,
+                                _ => above.contains_path(path),
+                            },
                         },
                     );
+                }
+            }
+            // A store's row is what it answers: its frontier, each key's seed, and each
+            // key's value at every position it has decided. Its changelog is only how it
+            // answers — reclaiming a released prefix keeps every carry source a live
+            // position folds to, so the answers outside what was released do not move.
+            Tile::Store { .. } => {
+                use crate::interpreter::commit_operator::{
+                    store_decided_positions, store_frontier, store_seed_value, store_value_at,
+                };
+                use crate::interpreter::operator_conversion::store_key;
+                for (row, path) in rows.iter().enumerate() {
+                    let Some(path) = path else { continue };
+                    let one = tile.select_rows(&[row]);
+                    // A store's seed is fixed for its whole life and a decided position's
+                    // value never changes, so both are final wherever the store stands; its
+                    // frontier only moves forward, which `assert_complete_region_unchanged`
+                    // checks on its own.
+                    let complete = true;
+                    let entry = |value: EntryValue| Entry { value, complete };
+                    let at_label = |name: &str| {
+                        let mut l = label.to_vec();
+                        l.push(name.to_string());
+                        l
+                    };
+                    entries.insert(
+                        (at_label("frontier"), path.clone()),
+                        Entry {
+                            value: EntryValue::Frontier(store_frontier(&one)),
+                            complete: false,
+                        },
+                    );
+                    let Tile::Store { decided, .. } = &one else {
+                        unreachable!("a store's rows are stores")
+                    };
+                    let positions = store_decided_positions(decided, 0);
+                    let names: Vec<String> = one.store_keys().cloned().collect();
+                    for name in names {
+                        let key = store_key(&name, Value::Unit);
+                        // A store waiting for its seed has none yet; once it has one it
+                        // keeps it.
+                        let seed = store_seed_value(&one, &key);
+                        entries.insert(
+                            (at_label(&format!("seed.{name}")), path.clone()),
+                            Entry {
+                                complete: seed.is_some(),
+                                value: EntryValue::Value(seed),
+                            },
+                        );
+                        for position in &positions {
+                            let mut at = path.clone();
+                            at.push(position.value().clone());
+                            entries.insert(
+                                (at_label(&name), at),
+                                entry(EntryValue::Value(store_value_at(&one, position, &key))),
+                            );
+                        }
+                    }
                 }
             }
             // An aggregation is one accumulator per row, compared row by row. Beneath no
@@ -444,6 +508,19 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
         &mut entries,
     );
     (nodes, entries)
+}
+
+/// Whether `guard` releases the root value under record fields `label` whole.
+fn released_whole(guard: &TileGuard, label: &[String]) -> bool {
+    match guard {
+        g if g.is_universal() => true,
+        TileGuard::Or(arms) => arms.iter().any(|arm| released_whole(arm, label)),
+        TileGuard::Record(fields) => label
+            .split_first()
+            .and_then(|(field, rest)| fields.get(field).map(|g| released_whole(g, rest)))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// The paths reaching collection level `level` under record fields `label` that `guard`
@@ -502,8 +579,11 @@ pub(crate) fn assert_complete_region_unchanged(
              complete, and now calls only {kept:?} complete"
         );
     }
-    let is_released = |label: &Vec<String>, path: &Vec<Value>| {
-        !path.is_empty() && released_at(released, label, path.len() - 1).contains_path(path)
+    // A root value is released by a release naming it whole, through the record fields that
+    // reach it; a path beneath the root by one naming it.
+    let is_released = |label: &Vec<String>, path: &Vec<Value>| match path.len() {
+        0 => released_whole(released, label),
+        n => released_at(released, label, n - 1).contains_path(path),
     };
     // A release lets a region leave the output, and nothing more: what a producer still
     // holds beneath a complete path, or adds beneath one, is checked whether or not a
@@ -523,6 +603,25 @@ pub(crate) fn assert_complete_region_unchanged(
                 now.map(|n| &n.value)
             ),
         }
+    }
+    // A store's frontier only moves forward: a position it has decided stays decided.
+    for (key, entry) in &last_entries {
+        let (
+            EntryValue::Frontier(Some(then)),
+            Some(Entry {
+                value: EntryValue::Frontier(now),
+                ..
+            }),
+        ) = (&entry.value, result_entries.get(key))
+        else {
+            continue;
+        };
+        assert!(
+            now.as_ref().is_some_and(|now| now >= then),
+            "{name} moved the frontier of {:?} at {:?} back: {then:?} then {now:?}",
+            key.0,
+            key.1
+        );
     }
     for (label, path) in result_entries.keys() {
         if last_entries.contains_key(&(label.clone(), path.clone())) || path.is_empty() {

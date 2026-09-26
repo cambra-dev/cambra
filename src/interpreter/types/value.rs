@@ -309,6 +309,145 @@ impl PartialOrd for Value {
     }
 }
 
+/// A value standing at a **position** of some ordered domain: a commit-clock tick, an
+/// iteration position of a loop extent, or a nested loop's `(outer, inner)` pair.
+///
+/// A domain's positions are values of one type, and [`Value`]'s comparison is total
+/// within a type — lexicographic over a record's sorted fields, so a pair orders the way
+/// the nest that produced it runs. This wrapper is that comparison as an [`Ord`], which is
+/// what an ordered map keyed by position needs. Comparing positions of two different
+/// domains panics, naming the store or stream whose domain is not one domain.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Position(Value);
+
+impl Position {
+    /// The position at `value`.
+    pub fn new(value: Value) -> Self {
+        Position(value)
+    }
+
+    /// The position's value, for the columns and predicates that carry it.
+    pub fn value(&self) -> &Value {
+        &self.0
+    }
+
+    /// The position's value, consuming it — what a predicate or column key takes by value.
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl From<Value> for Position {
+    fn from(v: Value) -> Self {
+        Position(v)
+    }
+}
+
+/// Two positions of one domain, compared.
+///
+/// Panics where they are not of one domain, naming both: an ordered map keyed by position
+/// rests on the comparison being total, so a pair that does not compare is a store or
+/// stream whose domain is two domains rather than one.
+fn compare_positions(a: &Value, b: &Value) -> Ordering {
+    a.partial_cmp(b).unwrap_or_else(|| {
+        panic!(
+            "positions of one domain compare, so `{a}` and `{b}` are not positions of \
+             the same domain"
+        )
+    })
+}
+
+impl Ord for Position {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_positions(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for Position {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The **path** to a position inside a nested carrier: one component per collection level
+/// above the store, then the position within it.
+///
+/// A flat carrier's path is one component. A nested one adds its enclosing row, and a
+/// carrier beneath a standing level adds that too — so depth lives in the path's length
+/// and nowhere in the code that handles it.
+///
+/// A path, rather than an `(enclosing, inner)` [`Value`] record, because the nesting says
+/// which store a position belongs to, so the position does not have to, and
+/// a tile keyed or guarded by a path names it as levels rather than as a product domain.
+///
+/// Paths of one carrier have one component per level, so they are the same length and
+/// order lexicographically, each component compared as a [`Position`] of its own level.
+/// This is **drive order**, which is not the order a release guard reads a path in: a
+/// guard names a region, one arm per level, and asks whether it covers the path
+/// (`TileGuard::covers_path`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub struct Path(Vec<Value>);
+
+impl Path {
+    /// The position within the store this path reaches, and the rows leading to it.
+    ///
+    /// `None` for an empty path, which names no store and so no position.
+    pub fn split_position(&self) -> Option<(&[Value], &Value)> {
+        self.0.split_last().map(|(pos, rows)| (rows, pos))
+    }
+
+    /// This path with `component` appended — one level deeper.
+    pub fn then(&self, component: Value) -> Path {
+        let mut next = self.0.clone();
+        next.push(component);
+        Path(next)
+    }
+}
+
+impl From<Vec<Value>> for Path {
+    fn from(components: Vec<Value>) -> Self {
+        Path(components)
+    }
+}
+
+impl std::ops::Deref for Path {
+    type Target = [Value];
+    fn deref(&self) -> &[Value] {
+        &self.0
+    }
+}
+
+impl Ord for Path {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (a, b) in self.0.iter().zip(&other.0) {
+            match compare_positions(a, b) {
+                Ordering::Equal => continue,
+                unequal => return unequal,
+            }
+        }
+        self.0.len().cmp(&other.0.len())
+    }
+}
+
+impl PartialOrd for Path {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for Path {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = self.0.iter().map(Value::to_string).collect();
+        write!(f, "{}", parts.join("/"))
+    }
+}
+
+impl std::fmt::Display for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

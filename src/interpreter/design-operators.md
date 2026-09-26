@@ -205,16 +205,20 @@ keys it admits under them, an unqualified one as `(True, self)`, so one rule ser
 
 A level's `domain_predicate` names whole paths from its tile's root. An operator that takes a
 row's group out to work on it alone reads the group's statements over the group's own paths, and
-one that puts a group back under a different row restates what the group carries:
+one that puts a group back under a different row, or changes the levels around it, restates what
+the group carries:
 
 | Move | Restatement |
 |------|-------------|
 | Take row 𝑟's group out (`Tile::group_at`) | `within(𝑟)`, or `True` where the level above calls 𝑟 complete |
 | Place a group under row 𝑟 (`Tile::regroup_beneath`) | `beneath(𝑟)` |
 | Attach a column of groups to the rows 𝑅 it stands under | `qualified_by(𝑅)`; `Tile::qualify_codomain_by_keys` for a column under one row's keys |
+| Insert a level before a path component | `with_level_inserted` |
+| Merge two levels into one keyed by pairs | `with_levels_paired`, and `with_levels_unpaired` for a release handed back |
 
-`Tile::map_level_predicates` applies one to every level of a chain, through record fields. A
-group placed without restating names paths under other rows, which the check in
+`Tile::map_level_predicates` applies one to every level of a chain, through record fields, and
+`TileGuard::map_level_predicates` to every level a guard names. A group placed without
+restating names paths under other rows, which the check in
 [The completeness contract](#the-completeness-contract) reports as a change to a complete path.
 
 ### Boxes and prefixes
@@ -235,8 +239,10 @@ the enclosing path and the key. One algebra serves both (`BoxShape` in `tiling/p
 A **prefix** of a lexicographic order is a staircase of boxes: `≤ (𝑎, 𝑏)` is
 `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. `domain_prefix` builds one across levels, one qualified arm per
 level, and `Predicate::at_or_below` builds one across a record key's fields. An interval is
-never built over record values, so a record key has only the box algebra, and a prefix meets a
-per-field region under the same rules as any two boxes.
+never built over record values, so a record key has only the box algebra. A level keyed by a
+nested loop's `(outer, inner)` pairs is released as a prefix, and a cartesian product's keys are
+stated per field, because its factors grow independently; the two meet under the same rules as
+any two boxes.
 
 `subsumes` is exact. A union on the left may cover a box that no single arm covers, so where no
 arm answers alone it asks whether `other ∖ self` is empty. Exactness rests on each region having
@@ -262,6 +268,30 @@ so a component that destructures instead of reading its own level reads `domain`
 keys are complete; the rows an operator groups by, and their completeness, belong to
 `CurryLevel::enclosing`. At depth two the enclosing level is the outermost one, so reading
 the wrong one gives the same answer there and a different one at depth three and below.
+
+**Completeness is downward-closed.** A key a level calls complete is complete at every depth
+beneath it, so an element is final as soon as *some* level on its path calls that prefix
+final. An operator that reduces one group per row — `MapAggregate` is the case — therefore
+asks every level on the path rather than the outermost alone. Asking the outermost is sound
+only while the statement says the same of every row: under a nested carrier the enclosing rows
+stay open for as long as the drive runs, while the row being run is decided, so an aggregate
+inside the nest would never settle.
+
+Operators split into two families by what they replace at their level:
+
+- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`. Their
+  tiling is `with_values_at(input, level, new_values)` and the producer writes
+  `*values_at_mut(level)`. Nothing is grouped, so nothing is split per row. A member that
+  *reads* the rows above it takes them from the level they sit at rather than from the top,
+  because a standing level answers for every carrier beneath it and not for those rows.
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`,
+  `StoreDenseRead`. Each takes the level apart one row of the level above at a time and puts
+  it back: `Tile::per_group`, which derives the empty level from the operator's own output
+  tiling so a row that has been reached by nothing still answers at the right shape. Operands
+  pulled from their own branches need not hold the same rows, nor hold them at the same
+  positions, so an operator with several finds each row in the others by its path
+  (`Tile::rows_by_path`). A union's standing rows are its arms' together, each arm holding its
+  own share.
 
 ### CCL types vs. tilings
 
@@ -316,6 +346,20 @@ way; an operator putting a value into a column asks it, a column having nowhere 
 `Extent::holds_a_collection` asks whether a type contains a collection at all, which a column of
 maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
 and `materialize_collections` turns this form back into maps where one value is required.
+
+A pair an operator *forms* follows the same rule, and states it at construction. `Product`
+pairs each row's element with the keys under it: where the element is a plain value the pair rides
+materialized in one column, and where it carries a level — a nest whose elements are collections — the
+pair is a `Tiling::Record` whose `_0` keeps its levels. `Uncurry` reads the rule from the other end:
+it flattens two levels into a pair-keyed one and leaves the values it finds exactly as they are,
+because materializing a level-carrying value is what has no column to go in.
+
+**A variant's payload is the one place a collection rides as a value.** An arm holds one cell per
+position, so `VariantWrap` materializes the collection into it (at the level the payload's own type
+names, not the input's innermost) and `VariantProject` opens it back into levels. The round trip is
+what carries a feed out of a nest: the enclosing decision's tap holds the inner loop's whole tap
+collection, materialized on the way in and opened on the way out, and the channel flattens the two
+levels to the positions the feed appended at.
 
 ---
 
@@ -419,7 +463,7 @@ provenance row resolve an operator against the expression it came from
 `post-conversion` pane. It is built by walking the operators from the program's outputs, not
 recorded while they are constructed. The walk runs in `compile_program` between conversion and the
 subscribe loop, which is the only window where it is total: `subscribe` takes every `CycleSlot` and
-every store's `init_ops`, so an operator asked for its inputs afterwards answers without them.
+every store's keyed inputs, so an operator asked for its inputs afterwards answers without them.
 
 `TileOperator::visit_inputs` is the single statement of what an operator holds, and it has two
 readers: the graph walk, and `TileOperator::inspect`, which renders an operator's children from the
@@ -489,7 +533,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapExtractAggregate` | `DataFunction(extent → Aggregation)` | `DataFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `DataFunction(D, Aggregation)`, producing `DataFunction(D, Scalar)`. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::branch()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across branches. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose branches feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other branch is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
 | `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Only release builds then skip the upstream pull — a `Memo` sits above most scalar producers, so short-circuiting in debug would shield every one of them from the release-contract check. A `Memo` is also the one operator wired to `Notified`: while its input has not notified it and its cache is non-empty, the cache is the answer and no pull goes below, in every build. A drained input is exempt, which is what leaves the debug probe above intact. |
-| `ExtractFinal` | two inputs: `source` (`DataFunction(D → Scalar(T))`) and `default` (`Scalar(T')` for any `T'` that `T` includes) | `Scalar(T)` | Extracts the final codomain value of `source` once it signals terminal.  When `source` is terminal but emits zero values (e.g. a mutation loop whose body ran zero times because its iteration source was empty), emits the `default` scalar's value instead — keeping post-loop accumulators total.  Every emission is built at the **declared** extent `T`, not from the extracted value alone: a variant value carries only its own tag, so a column built from it would be width-narrower than `T` whenever the collapsed alternatives carry more tags between them — which is also why the `default` need only be *included in* `T` rather than equal to it (a conditional's trailing arm carries its tag and not its siblings').  Returns an empty scalar before `source` is terminal.  On the first terminal pull it releases both `source` and `default` universally — a final-consumer signal that propagates back through `FanOut`/`Memo`/mutation-loop bodies to the underlying data source. |
+| `ExtractFinal` | two inputs: `source`, a collection per row of `rows` levels (`DataFunction(D → Scalar(T))` with none), and `default`, one value per row (`Scalar(T')` with none, for any `T'` that `T` includes); `default` is absent for a source declared total | the default's rows over `Scalar(T)`; `Scalar(T)` with no rows | The value at each collection's highest position once the source closes it, or the row's `default` where the collection holds no position — which keeps post-loop accumulators total when the loop ran nothing. Every emission is built at the **declared** extent `T`, not from the extracted value alone: a variant value carries only its own tag, so a column built from it would be width-narrower than `T` whenever the collapsed alternatives carry more tags between them — which is also why the `default` need only be *included in* `T` rather than equal to it (a conditional's trailing arm carries its tag and not its siblings'). See [*`ExtractFinal` reduces at any depth*](#extractfinal-reduces-at-any-depth) for rows, completion and release. |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → Scalar(C))` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))` | Merges N function operators into one by forming the discriminated union of their domains, over a codomain the **caller declares**. The domain keeps every arm apart — which arm a row came from is what `final_or_default` dispatches on. The codomain does the opposite: the arms are alternative values at one row, so it is their **join** — and that join already exists. A union node is typed `D ⤇ V` with `V` the arms' join as inference computed it, in the full type lattice; op-conversion reads `V` off the node and passes its extent in. Re-deriving it from the operand tilings meant a second join in `Extent`'s lattice, which has variant and range rules but **no record rule**, so two arms at different record widths came out as an anonymous positional sum where the type layer said `{a: Int}` — a shape no row holds and nothing downstream can project. Arms that *do* agree on a tiling keep it verbatim, since a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express; that is the one thing still read off the operands. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. |
 | `VariantProject` | Scrutinee: `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | `DataFunction(UInt → Scalar(Pᵢ))` for a bare scrutinee (implicit `0..N` keys), or `DataFunction(D → Scalar(Pᵢ))` for a stream scrutinee (the real `D` keys preserved) | **Sum elimination — the read-dual of `VariantWrap`.** Projects the arm named `tag` out of a tagged-union stream, *restricting to the sub-domain of rows carrying that tag* and yielding that arm's payload column, keyed by the original `UInt` position. A tag the scrutinee does not carry yields an **empty** projection rather than an error — that is what makes a width-subtype scrutinee, and so a `match` arm the scrutinee can never reach, inert instead of ill-formed. **Restrict and project are one op**: a [`UnionArm`] stores its rows alongside its payloads, so reading the arm *is* the tag restriction — there is no separate boolean `Restrict` step and no tag-discriminating `Predicate` (a domain-`Restrict` could not express it: the tag lives in the scrutinee's codomain, not its domain). Emitted by `lambda_elim` for a scrutinee-`Case`; consumed as a bare `Builtin::VariantProject(tag)` composed onto the fed scrutinee. |
@@ -504,11 +548,68 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 ---
 
+### `ExtractFinal` reduces at any depth
+
+`ExtractFinal` reduces each collection its source holds to the value at its highest position,
+or to a default where the collection holds none. It takes `rows`, the number of collection
+levels standing above the reductions, and that number is the only thing that varies with
+depth. With none it is one reduction over the whole source; with one or more it is a
+reduction per row of the innermost. Three constructors build it:
+
+- `ExtractFinal::new` is `final_or_default(stream, default)` over a stream, with no rows.
+- `ExtractFinal::without_default` is the same over a source declared total, a tag partition
+  that always covers exactly one position, so no default is invented.
+- `ExtractFinal::per_row` is a nested loop's trailing read: the inner accumulator's history
+  per enclosing row, falling back to the seed that row began with.
+
+A `mut` loop's own trailing read is not among them. With no rows above it, that read is a
+`StoreFinalRead` (see [Reads](#reads)).
+
+#### A per-row reduction takes its rows from its default
+
+The rows a per-row reduction answers are the default's, not the source's. A nested carrier's
+history is sparse over them: a row whose inner loop ran no position has no group in the source
+at all, because the store opens a row when it decides a position there. The default holds one
+value per row by construction, being a morphism of the enclosing writer's parameter, and that
+value is the row's answer. Pairing source and default into one collection first would lose
+those rows, since `Zip` keeps only the rows both operands hold. Op-conversion therefore builds
+the operator from the two legs of the `⟨source, default⟩ ▷ zip ≫ final_or_default` chain
+rather than from the zip.
+
+A row is answerable where the source has closed its group. The output's predicate at the rows
+level is the default's met with the source's closure, widened by the rows already answered, so
+the output never calls a row complete that the operator is not answering. The source's
+statement leads that union because only it can say `True`: an enumeration of answered rows
+never can, and a consumer waiting for the whole collection to close would wait forever on one.
+
+A row's final is computed when its group closes and held until the operator's own consumer
+releases the row. That release is also when the operator releases the row of its source, so
+the held answer is never consulted after the source lets the row go.
+
+#### What differs at depth zero
+
+Three statements read differently at depth zero, and the operator states each rather than
+branching on shape:
+
+- **A group is closed** where the level above it says so. With rows, that is the innermost row
+  level naming the row's key. With none there is no key to ask about, and the statement is the
+  source's own terminality: a source over a tagged union domain is terminal with a `Union`
+  predicate admitting every arm, and asking that predicate about the empty path answers no.
+- **The rows are the default's** with rows above; with none there is one reduction, at the
+  path that names the tile.
+- **The default is pulled where it is needed.** With rows it is the row set, so every pull
+  needs it. With none it is the fallback for a source that ran nothing, and pulling it before
+  that is known would drive an input the reduction may never read.
+
+A reduction with no rows retires on a universal release, releasing both inputs. Once it has
+answered it releases its source in full, and before that it releases the source below the
+highest position seen, since only the last one is wanted.
+
 ## The commit operator (`interpreter/commit_operator.rs`)
 
-The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
+The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic commit-time clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
-- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ {key: value}`, held as per-tick write sets with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
+- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `Position ⇀ {key: value}`, held as one changelog per key. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
@@ -524,8 +625,8 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   forwarding `domain_predicate`.
 
   **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the item finished" — only the release of its **newest live row** is the ack, exactly as a release from the body alone is not one.
-- **`StoreFinalRead` / `StoreFinalReadProducer`** — the **terminal read** of a commit key: `Scalar(V)`, the key's carried value at the position its own writers finish, or the store's tick-0 seed if no commit wrote it. It samples through the same `store_current` as `AsOf` and differs only in what fixes the position — a trigger's arrival there, the store's closure here — so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. A universal release retires it and releases the store branch; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
-- **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream `CommitTs ⇀ V` out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
+- **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: `Scalar(V)`, the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_or_default` over an induction accumulator's own history. It samples through the same `store_current` as `AsOf` and differs only in what fixes the position — a trigger's arrival there, the store's closure here — so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. A universal release retires it and releases the store branch; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
+- **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream, commit time ⇀ `V`, out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
 - **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the cross-endpoint read. Given a `trigger` stream (the positions to sample at, e.g. an HTTP request stream) and the store, it latches the store's current value for each trigger position the first time that position is observed — indexed by the *trigger*, not the commit clock. Reading several mutable variables latches them all from one store render, so a multi-variable read is one snapshot. The dual of the changelog store's own driver: the store latches a private accumulator per *source* step, `AsOf` latches the store per *trigger* step.
 
 A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` carrier serves both engines.
@@ -573,7 +674,7 @@ The **terminal** read is a different term, not a different classification of thi
 
 ### Bounding a long-lived store
 
-Three release paths keep a store that never ends from growing without bound. The writer's proposal stream is an **offset window**: committed prefixes are compacted away, and superseded proposals are dropped. The engine's `gc_released_prefix` reclaims released committed versions below the frontier while keeping each key's latest write — this is the load-bearing GC, because the per-consumer `FanOut` view folds the changelog whole, which makes `Tile::Store`'s `remove_guarded` a no-op (a released tick is not a deletable position). And `AsOf` releases the store fan *below* its latest decided tick — a future trigger only ever needs the latest-as-of-its-time — which is what lets `CommitProducer` reclaim a live store's superseded history.
+Three release paths keep a store that never ends from growing without bound. The writer's proposal stream is an **offset window**: committed prefixes are compacted away, and superseded proposals are dropped. The engine's `gc_released_prefix` reclaims released committed versions below the frontier while keeping the carry source a live position still reads — this is the load-bearing GC, because the per-consumer `FanOut` view folds the changelog whole, which makes `Tile::Store`'s `remove_guarded` a no-op (a released tick is not a deletable position). And `AsOf` releases the store fan *below* its latest decided tick — a future trigger only ever needs the latest-as-of-its-time — which is what lets `CommitProducer` reclaim a live store's superseded history.
 
 ---
 
@@ -624,6 +725,33 @@ than by a second list agreeing.  The pass walks the AST inserting
 *applying* zero or more `restrict(p)` filter steps to it (one per refinement
 layer) — `iterate ▷ (p ▷ restrict) ▷ …`, application rather than composition.
 Op-conversion never has to invent an iteration source on its own.
+
+### The level a node is converted at
+
+Every node is converted at a `CurryLevel`: how many levels of its input are the iteration it is
+lifted over, rather than part of the element it takes. The AST around the node sets it
+(`OpConversionContext::level`), and no operator's level is read off a tiling, because a tiling
+cannot tell a level the node iterates from a level inside the element it takes. Over grouped rows,
+`(sum(g), max(g))` and `(g, [s.qty for s in g])` both pair at the groups' keys, while their arms
+carry one level and two.
+
+| Node | Converts its children at |
+|---|---|
+| a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
+| `map(𝑓)` | 𝑓 one level in |
+| `map_filter(𝑞)` | 𝑞 one level in: it asks of each key of each element collection |
+| an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
+| `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
+| a top-level carrier | its body at level 1, over the store's own domain |
+| a nested carrier | its source and its seed (over the flattened pairs) at the carrier's level, its body one level in |
+| every other node, composition included | the level it is converted at |
+
+The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
+pairs at it, and so does a product morphism with no input, at the domains its type is curried
+over. `MapResult` applies at it, `MapFilter` filters the element collections there, and a
+per-row `ExtractFinal` reduces the rows above it. A composed `VariantWrap` wraps at it, and an applied one at its payload's root level.
+A fed copairing merges one level above it, and a nested carrier leaves standing the levels above
+its own row, one fewer than it.
 
 ### Iteration sources
 
@@ -685,18 +813,20 @@ lookup.  It is recorded once at the let-bind site rather than re-derived at each
 use, because the tile-level information needed to disambiguate is already gone
 by Var-lookup time.
 
-(There is a known limitation with multi-depth iterations — see the
-TODO(nested-mutation) comment on `BindingKind` for the planned generalisation.)
+Which iteration a binding is aligned to is `LetBinding::depth`. A reference made in a deeper
+iteration reads a tile keyed by one it is not running over, so it is spread over the keys beneath
+each of the binding's rows first (`lift_into_iteration`).
 
 ### Fan-out and sharing
 
-Three arms share an input across multiple downstream consumers:
+Four arms share an input across multiple downstream consumers:
 
 - **`Apply(_, Zip)` with `Tuple` / `Record` arguments** fans the input out to
   each tuple / record element; the elements get `Some(fan_out_branch)` and
   combine via [`zip_arms_at`] (function-tiled arms) or [`MakeRecord`] (scalar arms).
   The 2-arm Zip-with-const fast path skips the fan-out and emits a single
-  `MapResultToConst` instead. A **store-read arm** (`__hist.k`) is a *leaf*
+  `MapResultToConst` instead. A **store-read arm** (`__hist.k`, or a nested store's
+  `__hist ≫ .k`, one history per enclosing row) is a *leaf*
   source over its own domain, so it is converted with **no** input (rather than
   the fanned branch, which it would reject); `zip_arms_at` co-aligns it with the
   input-driven arms by domain position. This is the cross-domain co-iteration a
@@ -707,10 +837,17 @@ Three arms share an input across multiple downstream consumers:
 - **`Let { bound_expr, body }`** fans the parent input into both the bound
   expression and the body (described above).
 
+- **A nested carrier** shares its enclosing drive, its per-row source, its pairs and
+  each seed between several readers, and each of those fans sits on a `Memo`: a
+  `FanOut` passes every branch's pull to its input, which without the cache is
+  recomputed once per reader per lap. None of these fans' releases is read as a
+  drive's progress, which is what keeps a `Memo` off an iteration source.
+
 - **Induction writer bodies** (the realization of a recognized `Transact` over a
   concrete iteration extent) fan-out the cyclic prev-accumulator stream and the
-  body output (via `FanOut::new_cyclic`); see *Induction stores as a changelog*
-  (`InductionStore` / `StoreDenseRead`) below for the full structure.
+  body output (via `FanOut::new_cyclic`); see
+  [*Induction stores as a changelog*](#induction-stores-as-a-changelog-inductionstore-and-storedenseread)
+  below for the full structure.
 
 ### Aggregates, sinks, and the program root
 
@@ -718,7 +855,8 @@ The pipeline always bottoms out at one of three consumer shapes:
 
 1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
    `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), FinalOrDefault)`
-   (compiles to `ExtractFinal`).
+   (compiles to `ExtractFinal`, or to `StoreFinalRead` over an induction accumulator's own
+   history).
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`
    at `compile_program`.
@@ -743,8 +881,11 @@ Compiling it is the pairing. [`Product`] gives each outer row a group holding th
 domain, one level deeper than the outer collection — a collection per row — and `𝑔` then compiles over
 that like any other morphism over a stream, its result inheriting the grouping.
 The inner source does not mention the outer binder, so every row iterates the same domain and
-the pairing is a cartesian product. A source that differs per row is the same output shape
-from a different builder ([Where a collection is materialized](#where-a-collection-is-materialized)),
+the pairing is a cartesian product (`Product::shared_at`). While the inner side is still
+arriving, each row is paired with the elements it holds so far and left open: no row is complete
+until the inner side is, since every row can gain its next element. Every row reads the whole
+inner side, so it is released only when everything is. A source that differs per row is the same
+operator's per-row form (`Product::per_row_at`, [Where a collection is materialized](#where-a-collection-is-materialized)),
 where the per-row collection arrives as a value rather than being selected by the binder.
 
 Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
@@ -812,13 +953,19 @@ Two consumers still take the materialized shape, and both are cases where nothin
 the keys: `CheckedLookup` searches the bindings of the row's own value, and `Sole` and
 `Drain` fold a collection whole, so the element they yield is the collection itself.
 
-A **transaction writer body's parameter record** opens the same way, so a collection-valued
-read reaches the body as a level it can iterate (`commit_operator.rs`'s `body_input_tiling`).
-Its *writes* go the other way: a store write is one value per key, so a keyed write's
-`insert` takes the level, at any depth, and the payload materializes where it becomes the
-decision's value (`FunctionDef::apply_tile`, `materialize_collections`). The written value
-reopens into the shape the collection's values take, so the rebuilt level is one gather over
-the collection's entries followed by the written ones.
+A **writer body's parameter record** opens its read slots the same way, so a collection-valued
+read reaches the body as a level it can iterate (`commit_operator.rs`'s `body_input_tiling`). Its
+**item** slot has nothing to open: the drive holds each row as a one-row slice of the source tile
+and runs the slices together, so that slot's tiling is the source's own (`source_item_tiling`,
+`column_of_rows`). Deriving it from the item's extent instead reads a record of columns as one
+column of records, which is a store read's rule and not a source's.
+
+A body's writes go the other way: a store write is one value per key, so a keyed write's `insert`
+takes the level, at any depth, and the payload materializes where it becomes the decision's value
+(`FunctionDef::apply_tile`, `materialize_collections`). The written value reopens into the shape
+the collection's values take, so the rebuilt level is one gather over the collection's entries
+followed by the written ones. An accumulator's seed and the stand-in an absent snapshot slot takes
+are values for the same reason, read out of the row their producer delivered (`materialized_row`).
 
 **A per-row collection is complete as soon as its row arrives.** A map value carries its own
 keys, so nothing waits on a domain closing to know the group is whole. A producer opening one
@@ -837,192 +984,253 @@ open, and releases the whole ones by their own outermost key.
 
 ## Induction stores as a changelog: `InductionStore` and `StoreDenseRead`
 
-An induction store (a `mut`-loop accumulator, possibly with a conditional write and/or a
-reply feed) is the **degenerate no-conflict dual of the commit store**, and shares its
-machinery: it is a [`Tile::Store`] changelog driven by iteration *position* instead of by
-concurrent proposals. Op-conversion (`build_induction_store_single`) routes **every**
-induction store here — plain, conditional, or feed-carrying, over a finite (list) *or* an
-async (`DataSource`) extent. An induction store is always **single-writer**: recognition
-folds a conditional write to one carry-complete writer (`writes = Case[ĝ → w; true →
-snapshot]`), so there is no multi-writer group and one realization serves every induction
-store.
+An induction store is the recurrence a `mut` loop compiles to: a [`Tile::Store`] changelog
+driven by iteration position rather than by concurrent proposals, and so the no-conflict dual of
+the commit store, sharing its engine. Op-conversion (`build_induction_store_single`) routes every
+induction store here — plain, conditional or feed-carrying, over a finite (list) or an async
+(`DataSource`) extent. An induction store has exactly one writer: recognition folds a
+conditional write into one carry-complete writer (`writes = Case[ĝ → w; true → snapshot]`), so
+one realization serves them all.
 
-**Compound (tuple/record) accumulators.** A mutable variable holds one `Value`, so a tuple/record
-accumulator is stored *boxed* — a `Scalar(Record)` codomain (one column of record values) —
-while a tuple/record *literal* compiles to a struct-of-arrays `Record` tiling (a column per
-field). The two representations meet at the mutable variable boundaries and are reconciled there with
-the existing `scalar_tile_to_column_value` (box: `Tile::Record` → `ColumnValue::Records`) and
-its inverse `column_value_to_tile` (unbox to a declared tiling shape): the `InductionStore`
-init seed (`read_initial_scalar`), the conditional-write decision merge (`flat_merge`), and
-the scalar-final read (`ExtractFinal`, which matches on *extent* not tiling shape). So a
-compound accumulator folds, reads-its-own-writes, carries, and conditionally writes like a
-scalar one. The **commit store** shares this: a `Mut[(int, int), Txn]` / `Mut[{x: int}, Txn]`
-transactional mutable variable threads through the same `read_initial_scalar` seed and value-Case
-decision merge, so unconditional, conditional (deny), `if`/`else`, record, and mixed
-scalar+compound multi-key stores all commit correctly. (Enabling the transactional form needed
-only the tuple/record *type annotation* syntax in `lower_type_annotation` — the store
-machinery was already compound-ready.)
+Nothing here distinguishes a finite source from a streaming one. The tiling protocol treats a
+finite source as a stream that happens to terminate, and the memory bound a never-terminating
+loop needs comes from [reclaiming the changelog](#reclaiming-the-changelog), which runs the same
+way over both.
 
-**Nothing in the substrate distinguishes a finite source from a streaming one.** The tiling
-protocol treats a finite source as a stream that happens to terminate — comprehensions,
-joins, aggregates and the changelog induction store all run over a literal list *and* a
-`DataSource` through one graph (monotonic tile growth + pull-until-the-frontier-stalls). The
-one thing the distinction would still buy is a memory bound on a never-terminating loop; see
-[*Remaining: the never-terminating bound*](#remaining-the-never-terminating-bound).
+### The store
 
-**`InductionDriver` / `InductionStore` — the position-driven recurrence.** The two halves
-of one loop, wired as a cycle: store → body → driver → `FanOut::new_cyclic(store)`.
+`InductionStore` holds one `CommitEngine` per open store. An engine records four things: the
+**seed**, the value every key stands at before any change; a **changelog** per key, holding the
+positions that wrote it; the **domain**, the positions it has decided; and the **frontier**, the
+watermark every position at or below has been decided through. A position a key's changelog omits
+is a **carry** for that key: decided, and holding its latest earlier value. The frontier bounds the
+domain without being one of its positions, because a reclaim trims the domain and a store resuming
+its predecessor's run is decided through positions it never ran. The rendered `Tile::Store` holds
+the seed, the domain and the frontier per row, so projecting one row of a nested carrier is the
+ordinary row retain. The seed is the
+base of the step function rather than a point of its domain, because a changelog is keyed by the
+positions writes land at and no position stands below the first. A fold that finds no change at
+or below the position it asks about resolves to the seed.
 
-The **store** owns a `CommitEngine` seeded at tick 0 with the accumulators' inits (so the
-changelog is self-describing — a read below the first *iteration* change folds to the seed).
-It consumes the body's `` {`commit{writes} | `abort} `` decisions (`body_decision_at` decodes
-the union tag) in **ascending position order** from its decided watermark, and `step`s the
-engine: a `` `commit `` position appends a change (tick `pos + 1`), an `` `abort `` (a failed
-guard) is a **carry** (no change; the value inherits). It closes its frontier when the
-decision stream goes terminal.
+A store opens on the pull its seed arrives, not at subscribe. A seed is ordinary dataflow: `b :=
+a` after a loop over `a` settles once that loop reaches its final position, which takes as many
+pulls as it has positions. The store reads its seed streams at the head of every `get`, and
+`Engines::store_at` opens the engine at the first value they carry. Until then the store renders
+an undecided frontier and the driver holds its first position back.
 
-Positions are `UInt` throughout — the engine's ticks are them, and `build_induction_store` refuses
-a source whose extent is not position-indexed rather than letting a product domain reach the driver,
-which drops a non-`UInt` key silently.
+The store consumes the body's `` {`commit{writes} | `abort} `` decisions (`decision_at_index`
+decodes the tag) in ascending position order from its decided watermark and `step`s the engine.
+A `` `commit `` position appends a change there; an `` `abort `` position, a failed guard, is a
+carry. The store closes its frontier when the decision stream goes terminal.
 
-Ascending rather than contiguous, because the positions are the *source's*. A restricted loop
-source (`for l in [x for x in xs if p(x)]`) delivers a subset of its extent's positions and
-the recurrence runs over exactly those, so the watermark is a lower bound on the next position
-rather than the position itself, and the ticks a filtered-out position would have occupied are
-never occupied. The alternative — iterating the extent densely and gating the write — was not
-taken: the domain the pipeline hands the store is the refined extent, and a store that
-disagreed with it would have to recover the filter the type already carries.
+That last rule is an obligation on the body chain. The driver owns the source and closes its
+body-input tile, so the store learns the loop is over only if every operator between the two
+forwards `domain_predicate`. An operator that renders a decision column under a hardcoded
+non-terminal predicate leaves the loop running forever with the right values in it: a hang, not
+a wrong answer. The store asserts the converse — a terminal decision stream it has not fully
+consumed — but cannot assert this one, because a body that never goes terminal is
+indistinguishable from one that is not done yet.
 
-That last clause is an **obligation on the body chain**, and worth stating because it is
-easy to violate without noticing. The driver owns the source and closes its body-input tile,
-so the store learns the loop is over only if every operator between the two forwards
-`domain_predicate`. An operator that
-renders a decision column but hardcodes a non-terminal predicate leaves the loop running
-forever with the right values in it — a hang, not a wrong answer. The store asserts the
-matching property (a terminal decision stream it has not fully consumed) but cannot assert
-this one, since "the body never went terminal" is indistinguishable from "the body is not
-done yet".
+Positions are the source's keys, each a `Position` ordered within its domain, so a `mut` loop
+over a map runs with the map's keys as its positions. They are ascending but not contiguous. A restricted source (`for l in [x for x in xs if p(x)]`) delivers a subset of its
+extent's positions and the recurrence runs over exactly those, so the watermark bounds the next
+position from below rather than naming it. Iterating the extent densely and gating the write
+would need the store to recover a filter the source's refined extent already carries. A product
+source, keyed by a record, is refused: its readers release it per factor where a drive releases
+a prefix, and the guard algebra has no meet between the two
+(`induction_domain_releases_as_a_prefix`).
 
-The **driver** owns the iteration source and produces the body's `(prev…, item)` input. It
-holds no part of the recurrence, and reads the store on two axes. The frontier is a **tick**
-cursor: `step` advances the watermark unconditionally (so a carry decides its position without
-appending a change), and a frontier equal to `emitted_through + 1` says every emitted position
-has been decided and the next may go. The previous accumulator is that key's value *at* the
-frontier (`store_value_at`, one fold per read key — folding *at* the tick the predecessor's
-decision occupies, which is what the recurrence means, rather than taking the key's latest
-write). What the driver does keep is the **item** cursor `emitted_through`, because a
-restricted source's positions are sparser than its extent's and the frontier therefore does
-not name one; the next position to iterate is the smallest delivered position above it. An
-emitted row is otherwise a pure function of the store tile and the source tile, with nothing
-cached that could drift. It decodes the source
-into `(absolute position, item)` pairs (`decode_source_positioned`), since an async source's
-domain arrives *unordered* and *compacts* as its consumed prefix is released; it reclaims
-that prefix incrementally and releases the whole source (`True`) once the loop is done. It
-also releases the changelog through the frontier — the store's keep-latest GC preserves each
-key's latest write inside a released prefix, so the fold is never stranded, and without it
-the store's `FanOut`-intersected watermark could never advance past the cycle branch.
+### The driver
 
-**One position advances per outer pull**, because the cyclic `FanOut` serves a snapshot
-taken before the traversal began: a position decided *during* a pull is not visible until
-the next. This is a property of the cycle, not of the split — the store's producer is on
-the stack for the whole traversal, so no arrangement of driver, body and store can refresh
-the memo mid-pull. It is the rate every cyclic operator here runs at, and the driver re-arms
-on the wakeup queue while a position remains to feed.
+`InductionDriver` owns the iteration source and produces the body's `(prev…, item)` input. It
+holds no part of the recurrence and reads the store on two axes:
 
-A pull-per-position means a long loop re-renders its changelog many times. That is a
-**retention** problem, not a rate problem: the fix is a `Memo` in front of the store's
-readers, caching the rendered tile and letting a reader release its consumed prefix early so
-`gc_released_prefix` bounds what each render covers. Letting the store publish its
-freshly-rendered tile into its own cyclic fan's memo, so the driver sees the position it just
-decided, would buy a multi-position driver by inverting `get`'s direction — a change to the
-model in exchange for a caching improvement, and not one to make.
+- The **frontier** is a position cursor. `step` advances the watermark whether or not the
+  position wrote anything, so a frontier equal to `emitted_through` says every emitted position
+  is decided and the next may go.
+- The **previous accumulator** is the key's value at the frontier (`store_value_now`): the value
+  after the predecessor iteration's position, which is what the recurrence means.
 
-There is one writer over the *full* source: a conditional write's carry positions produce no
-change rather than a synthesized same-value write on a complement leg, which is what keeps a
-restricted-source multi-leg realization's cyclic-convergence desync from arising.
+What the driver keeps is `emitted_through`, the item cursor, because a restricted source's
+positions are sparser than its extent's and the frontier does not name the next one. The next
+position is the smallest delivered path above it. An emitted row is otherwise a function of the
+store tile and the source tile. The driver decodes the source into `(path, item)` pairs
+(`decode_source_paths`), since an async source's domain arrives unordered and compacts as its
+consumed prefix is released.
 
-**`StoreDenseRead` — the dense changelog read.** A `__hist.k` read folds the changelog at
-*every* position of the loop extent → `Fun(D, V)`: an `IterateExtent(D)` trigger supplies
-the domain positions (a live enumeration — over a `DataSource` it re-reads the arrived keys
-each pull, so it spans live arrivals — and it aligns via `zip_arms_at` with any co-iterated
-source over the same `D`), and each position `p` reads tick `p + 1` via `store_value_at`
-(which scans changes ≤ that tick — **independent of the store frontier**, so a carry
-position inherits the latest earlier write and a leading carry folds to the tick-0 seed).
-The trigger's positions are **sorted ascending** before folding: an async domain arrives in
-arbitrary order, but the output domain must be position-ordered so that the **scalar-final**
-read — `ExtractFinal` over this dense stream, i.e. the *final column* — is the highest loop
-position (the final accumulator), not an arbitrary mid-loop value. (A **co-iterated** read —
-an accumulator threaded into another store, e.g. `for r in …: cnt += 1; with begin(): store
-:= store + cnt` — aligns by domain *value* via `zip_arms_at`, so ordering is immaterial there;
-sorting is correct for both.) One reader serves both shapes, and a downstream release of loop
-positions is forwarded to the trigger so the source is reclaimed. Reading by fold rather
-than by indexed projection is what unifies induction reads with transactional-variable reads.
+A **nested drive** is the same driver at a deeper path, carrying two additions in `NestedDrive`.
+It **reseeds** at each enclosing row: a boundary is a position whose enclosing components differ
+from the last one emitted, and there the previous accumulator comes from the accumulator's
+reseed stream rather than from the store. It **passes the enclosing parameter through**, because
+parameter elimination gave the body `((ᴘ, Pos), slots)`, and rewriting that would leave each
+inner level's own type stale. At depth zero both vanish: the only boundary is the first position,
+where the store already holds its seed.
 
-The trigger enumerates the loop **extent**, which for a restricted source is wider than the
-set of positions the recurrence ran at. That needs no special case: a position the filter
-excluded occupies no tick, so `store_value_at` folds it to the latest write below it — the
-accumulator's value as of that position, which is what a history over the extent means. A
-scalar-final read still lands on the last iterated write, and a tap (`carry_forward: false`)
-still appears only at the positions that fired.
+A nested drive states which rows at each level are complete, and a row is complete once the
+source will put no more positions under it and the store has folded every position it did. The
+first half is the source's statement, which the drive accumulates across pulls: the source may
+stop stating a row once the drive has released it, and the store can fold the row's last
+position after that release. The second half reads the frontier: under the enclosing path the
+frontier is inside, the rows before the frontier's are folded, and the frontier's own row once
+every position under it is at or below the frontier. That counts the positions the drive has
+emitted as well as those the source still holds, because an emitted position is released back to
+the source before the store decides it.
 
-Folding by position keeps the read independent of the store's own length — the positions
-come from the trigger, the values from the fold. And the trailing-carry undercount that
-once lurked in `Tile::len`/`store_frontier` is now closed at the source: a `Tile::Store`
-carries terminality on a separate `terminal` flag and always keeps its numeric watermark as
-`frontier = at_or_below(w)` (never a `True` that discards `w`), so `len`/`store_frontier`
-read `w` directly — spanning a trailing run of carries — instead of reconstructing it from
-the latest *change* tick.
+### One carrier at every depth
 
-**Reply feeds ride the changelog as taps.** A feed inside the loop (`out << e`) rides the
-writer decision as a `__to_<defer>` field, exactly as a commit writer's reply tap does. Op-
-conversion appends each tap as a write-only changelog key (after the accumulator keys), the
-producer applies the decision's `tap_fired` gate (a `` `fired `` tap joins the position's delta, an
-`` `idle `` one is omitted — the tag mechanism shared with the commit store), and a
-`__to_<defer>` read is a **non-carry** `StoreDenseRead` (`carry_forward: false`): for each loop
-position it reads the tap **only if that position's delta actually wrote it**
-(`store_delta_at`), so the feed's per-position stream spans exactly the fired positions. A
-**conditional feed** (`if p: out << e`) is the same shape — the letrec phase makes its guard path the
-tap's `` `fired `` condition and folds that path into the `commit` gate so a feed-only position still
-appends a change carrying the tap. Because the driver is
-position-sorted, the tap stream is position-ordered even over an async source — which is the
-property that matters, since an async domain arrives in arbitrary order and a tap read off
-arrival order would scramble the feed.
+`Engines` is a tree with one node per collection level above the stores and an engine at each
+leaf. A loop inside one loop has one level, a loop inside two has two, and a loop on its own has
+none and is reached at the empty path. The depth lives in the tree, so the code walking it has no
+depth-specific case:
 
-<a id="remaining-the-never-terminating-bound"></a>
-**Bounding a never-terminating loop (keep-latest changelog GC).** The changelog is bounded
-the same way the commit store's is: a reader's release drives GC, and `StoreDenseRead`
-forwards a store release derived **purely from the consumer's release** — never from who the
-consumer is. A release of loop positions `≤ P` is a promise never to request them again, so
-`StoreDenseRead::release_impl` computes what the store no longer needs:
-- A **tap** read (`carry_forward: false`) reads only tick `p + 1`'s delta at position `p` (no
-  back-reference), so positions `≤ P` make ticks `≤ P + 1` dead.
-- A **carry** read (`carry_forward: true`) reads the latest write `≤` each position's tick. The
-  earliest still-needed position is `P + 1` (reading tick `P + 2`); its **carry source** is the
-  latest write to the key at a tick `≤ P + 2`, and the carry source only moves *forward* for
-  later positions. So every tick strictly below that carry source is dead for all future
-  positions — `StoreDenseRead` forwards a store release of `≤ carry_source − 1`.
+- `render_carrier_tile` walks the tree, and `store_tile` assembles a run of engines into one
+  `Tile::Store` whose per-key changelogs group CSR-wise by store.
+- `decided_paths` reads a body's decisions as paths, one component per level, in drive order, and
+  `open_at` opens the store a path names.
+- `domain_prefix` spells what a drive has consumed as one arm per level.
 
-The store sits behind a `FanOut`, so `InductionStoreProducer::release_impl` receives the
-**intersection** over every reader and calls `CommitEngine::gc_released_prefix`, which drops the
-superseded entries in the released prefix but **keeps each key's latest write**. Because a carry
-read never releases *at or above* its carry source, keep-latest GC never drops a live carry
-source — so the existing keep-global-latest GC suffices; no per-frontier retention is needed.
-This bounds the changelog for *any* carry consumer (co-iterated or scalar-final) without the
-producer knowing which it is.
+At depth zero each of these is its one-component case.
 
-The driver's own release runs the other way — outward, to the iteration source. `InductionStore`
-reclaims the consumed prefix incrementally as `processed` advances, and releases the source in
-full once it is complete and every arrived position is decided. That ends the driver: a drained
-store serves the accumulated changelog, which is already the whole answer.
+### One position per pull
 
-Keep-latest is also what makes the driver sound despite reading the changelog it writes:
-`read_as_of(processed)` folds to the latest write ≤ `processed`, which GC never drops, so the
-recurrence is never stranded (the delicate part — a naive GC that dropped the latest produced
-the `30`-then-`10` failure a probe once hit). Retention is therefore **O(keys) + the slowest
-reader's lag**, independent of the number of positions processed. A **scalar-final**
-`ExtractFinal` drives its own bound: on each non-terminal pull it needs only the highest-domain
-value, so it releases `[0, max)` incrementally — the same release path bounds the changelog even
-though it never emits until (if ever) the source terminates.
+The cyclic `FanOut` serves a snapshot taken before the traversal began, so a position decided
+during a pull is not visible until the next. The store's producer is on the stack for the whole
+traversal, so no arrangement of driver, body and store refreshes the memo mid-pull. The driver
+wakes its consumer when a pull emits a row or states a level complete further, and the store
+wakes its readers whenever its output changes
+([The notification contract](#the-notification-contract)). Neither wakes itself while waiting,
+so a stuck nest is quiescent rather than busy.
+
+Each pull renders the retained changelog, so the cost of a pull follows retention, which
+[reclamation](#reclaiming-the-changelog) bounds. Having the store publish its freshly rendered
+tile into its own fan's memo, so the driver sees the position it just decided, would allow a
+multi-position driver, but it inverts `get`'s direction, and is not done.
+
+### Reads
+
+**`StoreDenseRead`** folds one key's changelog at every position the store decided, producing
+`Fun(D, V)`. The positions are the store's own domain, not an enumeration of the loop extent, so
+a restricted source's read spans the positions the recurrence ran at. They are ascending by
+construction, which a co-iterated read needs to align by domain value through `zip_arms_at`. The
+fold is one ascending pass (`fold_changelog_key_ascending`) and reads the changelog rather than
+the frontier, so a carry position takes the latest earlier write and a leading carry takes the
+seed. A **carry** read (`carry_forward: true`, an accumulator) resolves at every position; a
+**tap** read (`carry_forward: false`) appears only at the positions whose own change wrote the
+key (`store_delta_at`).
+
+Under rows the read produces the same shape per enclosing row: one history per row, each folded
+against that row's own store, so a position that writes nothing resolves to the value its row
+began with rather than the previous row's last write. A row's positions at or below its frontier
+are decided, so the read states them complete beneath that row rather than waiting for the row
+to close.
+
+The trailing read of an accumulator, `final_or_default(history, init)`, takes one of two
+operators by depth:
+
+- **With no rows above**, it is a `StoreFinalRead`: the key's value once the store has settled,
+  sampled from the store rather than reduced from a stream. A store resuming mid-fold has not
+  decided its predecessor's positions, so a reduction over its history would find nothing and
+  answer with the declared init instead of the value carried in.
+- **Under rows**, it is [`ExtractFinal`](#extractfinal-reduces-at-any-depth) per row over the
+  dense read, falling back to each row's seed.
+
+A co-iterated read (`for r in …: cnt += 1; with begin(): store := store + cnt`) consumes the
+dense read directly.
+
+A `Tile::Store` carries terminality on its `terminal` flag and keeps its watermark as `frontier =
+at_or_below(w)`, never a `True` that discards `w`, so `store_frontier` reads `w` directly and a
+trailing run of carries is counted.
+
+### Reply feeds
+
+A feed inside the loop (`out << e`) rides the writer decision as a `__to_<defer>` field, as a
+commit writer's reply tap does. Op-conversion appends each tap as a write-only changelog key after
+the accumulator keys, and the store applies the decision's `tap_fired` gate: a `` `fired `` tap
+joins the position's change, an `` `idle `` one is omitted. A `__to_<defer>` read is a tap
+`StoreDenseRead`, so the feed's stream spans exactly the fired positions. A conditional feed (`if
+p: out << e`) has the same shape: the letrec phase makes its guard the tap's `` `fired ``
+condition and folds it into the `commit` gate, so a position that only feeds still appends a
+change carrying the tap. Because the driver runs in position order, the tap stream is
+position-ordered even over an async source, whose domain arrives in arbitrary order.
+
+### Compound accumulators
+
+A mutable variable holds one `Value`, so a tuple or record accumulator is stored materialized, as a
+`Scalar(Record)` codomain, while a tuple or record literal compiles to a struct-of-arrays `Record`
+tiling. The two meet at the mutable variable's boundaries, where `scalar_tile_to_column_value`
+materializes and `column_value_to_tile` opens a value into a declared tiling. Three sites do this:
+the seed decode (`seed_value`, reading a tile's row as the one value a store holds), the
+conditional-write decision merge (`flat_merge`), and the trailing read. A compound accumulator
+therefore folds, reads its own writes, carries and writes conditionally as a scalar one does. The
+commit store shares all three, so a `Mut((Int, Int), Txn)` or `Mut({x: Int}, Txn)` threads
+through the same seed decode and decision merge.
+
+### Reclaiming the changelog
+
+A carrier reclaims its changelog as it runs, at any depth. Each reader releases what its consumer
+has taken; the drive releases through the frontier; the `FanOut` in front of the store meets the
+branches; and `InductionStoreProducer::release_impl` hands the meet to
+`CommitEngine::gc_released_prefix`, one store at a time. The meet cannot advance past a branch that
+has released nothing, so a reader holding its branch until it retires holds every version of every
+key for the length of the run. The flat trailing read therefore releases as it goes:
+`StoreFinalRead` releases through the frontier on every pull, and `ExtractFinal` over a stream
+releases below the highest position it has seen.
+
+Measured over a 90-position flat loop: 4 retained changelog entries with the reads releasing, and
+180 without. Over `for x in [1..30]: for y in [1, 2]: total += x * y`: 2 open stores holding 3
+changelog entries and 3 decided positions, against 30 stores holding 60 of each without the rules
+below. Retention is O(keys) plus the slowest reader's lag, independent of how many positions have
+run and of how many rows.
+
+**A reader forwards the region it was released, unchanged.** It computes no bound of its own,
+because the rules below make which versions a later fold can reach the store's question, and the
+store is the side that holds the answer. A release naming a row of a read names the same row of
+the carrier, since the two tilings agree on every level above the store, so one forward serves
+either depth.
+
+**A reclaim keeps the carry source a live position reads.** For each key the entry kept from the
+released prefix is its latest write at or below the boundary, and it is kept only where some
+position can still fold back to it:
+
+- where the key has no write above the boundary, since every later position reads this entry,
+  including positions the store has not run yet; or
+- where the earliest live position lies below the key's next write above the boundary.
+
+Otherwise every live position reads a write of its own and the entry goes. Keeping each key's
+latest write overall instead is wrong: a key written at positions 1 and 5 and released through 3
+still answers position 4 from the write at 1, and without it position 4 folds back to the seed, a
+value the recurrence never held there. The drive and `StoreFinalRead` both release through the
+frontier and then fold at it, which the first case keeps safe.
+
+**A reclaim trims the domain and leaves the frontier.** A release says a position will not be read
+at again, not that the store never ran it, and where each row has got to is its own entry of the
+store's frontier. A frontier recovered from the domain instead — the highest decided position —
+reads a finished row whose positions were all reclaimed as one that never started, and the drive
+above it never learns it can move on.
+
+**A row the meet names whole leaves the engine tree and the render together.** The drive's
+release names every row before the one it is running whole (`domain_prefix`), and a per-row
+`ExtractFinal` releases a row of its dense read once its own consumer has taken the row's final.
+Where every branch names a row, so does the meet, and `Engines::remove_covered` drops that row in
+the same release that reclaims the rest. The next render therefore cannot rebuild what was
+released, which `TileProducer::get` asserts against. The row's watermark goes with it, since
+nothing is left to ask where that store got to.
+
+The driver's own release runs outward, to the iteration source. It reclaims the consumed prefix as
+`emitted_through` advances and releases the source in full once the source is complete and every
+delivered position has been emitted, which ends the driver.
+
+**A nested carrier's pair-keyed inputs release as the drive passes them.** The enclosing
+parameter (`pairs`) and each accumulator's reseed are streams keyed by the body's
+`(enclosing, position)` pairs. The driver reads them only at positions past its cursor, so it
+releases each through `emitted_through`; the store reads a row's seed only to open that row, so it
+releases its seed streams through the path it has decided. Both name the region as a prefix of the
+pair-keyed domain, `domain_prefix` over the path with its last two components composed back into
+the pair, which `Predicate::at_or_below` spells as a staircase over the pair's fields. The seed and
+reseed streams are one stream behind a `FanOut`, so either consumer holding its branch would pin
+the pair stream, and the operators pairing it (`Uncurry`, `Product`) would re-deliver the
+whole run on every pull. `Uncurry` releases an outer key where a pair release covers that key's
+whole inner collection, under whatever standing rows qualify it.
 
 ## Open Challenges
 

@@ -1016,3 +1016,15 @@ fn a_tuple_of_folds_pairs_at_the_group() {
         ),
     );
 }
+
+/// A filter inside each group, over elements that hold a collection of their own: the filter
+/// takes the group's own level, and each element's collection stays whole beneath it. The
+/// group `a > 1` keeps `a = 2` and `a = 3`, whose `xs` sum to 6 and 9; the other group's only
+/// element fails the filter.
+#[test]
+fn a_per_group_filter_keeps_each_elements_collection() {
+    check_scalar(
+        "sum([sum([sum(s.xs) for s in g if s.q > 1]) for g in groupby([(k=a > 1, q=a, xs=[a * j for j in [1, 2]]) for a in [1, 2, 3]], \\x -> x.k)])",
+        Value::Int(15),
+    );
+}

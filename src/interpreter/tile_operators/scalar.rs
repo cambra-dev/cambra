@@ -260,8 +260,11 @@ pub struct VariantWrap {
     tag: FieldKey,
     /// Per-variant extents of the full union; `input` feeds the `tag` arm.
     variant_extents: TagMap<Extent>,
-    /// Output tiling — `Scalar(Union)` for a scalar payload, or
-    /// `DataFunction { D ⇒ Scalar(Union) }` for a payload stream.
+    /// The levels the payload stream sits under, which the wrap leaves standing. `0` for
+    /// a bare payload value, `1` for an ordinary collection of them, and one more for each
+    /// enclosing level a nested recurrence's body runs under.
+    level: CurryLevel,
+    /// Output tiling — the input's levels above `level`, over `Scalar(Union)`.
     base: OperatorBase,
 }
 
@@ -271,28 +274,41 @@ impl VariantWrap {
     /// payload's: a `Scalar` payload yields `Scalar(Union)`; a payload *stream*
     /// `DataFunction { D ⇒ Scalar(_) }` yields `DataFunction { D ⇒
     /// Scalar(Union) }` (the wrap is element-wise over the codomain).
-    pub fn new(
+    pub fn new_at(
         input: Box<dyn TileOperator>,
         tag: FieldKey,
         variant_extents: TagMap<Extent>,
+        level: CurryLevel,
     ) -> Self {
         assert!(
             variant_extents.get(&tag).is_some(),
             "VariantWrap: tag `{tag}` is not an arm of the union being constructed"
         );
         let union_ext = Extent::Union(variant_extents.clone());
-        let tiling = match input.tiling() {
-            Tiling::DataFunction { domain, .. } => {
-                Tiling::data_function(domain.clone(), Tiling::Scalar(union_ext))
-            }
-            _ => Tiling::Scalar(union_ext),
-        };
+        // The levels above `level` stand and the payload at it becomes one union column.
+        // The depth is the caller's to state: a collection of payloads and a payload that is
+        // itself a collection are both `Tile::DataFunction`, so only the type separates them,
+        // and reading one level by hand would drop the rest of a nested body's.
+        let tiling = with_values_at(input.tiling(), level, Tiling::Scalar(union_ext));
         Self {
             base: OperatorBase::new(tiling),
             input,
             tag,
             variant_extents,
+            level,
         }
+    }
+}
+
+/// How many collection levels a guard reaches through before it names a value.
+///
+/// A guard shallower than an operator's level names only the levels that operator
+/// leaves standing, so it crosses unchanged.
+fn guard_depth(g: &TileGuard) -> usize {
+    match g {
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => 1 + guard_depth(inner),
+        TileGuard::Or(arms) => arms.iter().map(guard_depth).max().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -341,6 +357,7 @@ impl TileOperator for VariantWrap {
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(VariantWrapProducer {
             base: ProducerBase::new(VariantWrapProducer::alloc_id(), self.tiling()),
+            level: self.level,
             input,
             tag: self.tag.clone(),
             variant_extents: self.variant_extents.clone(),
@@ -349,6 +366,8 @@ impl TileOperator for VariantWrap {
 }
 
 struct VariantWrapProducer {
+    /// See [`VariantWrap::level`].
+    level: CurryLevel,
     base: ProducerBase,
     /// The subscribed payload producer.
     input: Box<dyn TileProducer>,
@@ -374,11 +393,7 @@ impl TileProducer for VariantWrapProducer {
         //
         // Either way the payload becomes a value: an arm rides its row as one, so a payload
         // carrying a collection materializes here rather than staying a level.
-        let slot = if self.tiling().is_data_function() {
-            tile.values_at_mut(CurryLevel::new(1))
-        } else {
-            &mut tile
-        };
+        let slot = tile.values_at_mut(self.level);
         let payload =
             materialize_collections(std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0))));
         *slot = Tile::Scalar(wrap_variant_column(
@@ -399,12 +414,11 @@ impl TileProducer for VariantWrapProducer {
         let upstream_guard = match obsolete_guard {
             g if g.is_empty() => self.input.tiling().empty_guard(),
             g if g.is_universal() => self.input.tiling().universal_guard(),
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            // A codomain guard is shaped against the *wrapped* union extent, not
-            // the payload's, so it cannot be forwarded as-is; no consumer builds
-            // one over a variant today.
+            // Any guard that stays inside the **standing** levels names structure the
+            // wrap left untouched, so it forwards verbatim. Only one that reaches the
+            // wrapped level is shaped against the union extent rather than the payload's,
+            // and nothing builds one of those.
+            g if guard_depth(&g) < self.level.index() => g,
             g => todo!("Unimplemented guard in VariantWrapProducer: {g:?}"),
         };
         self.input.release(upstream_guard);
@@ -467,6 +481,13 @@ pub struct VariantProject {
     /// alongside the tiling so an empty result can be built at the right column
     /// shape without destructuring it back out.
     payload_extent: Extent,
+    /// The level the union sits at, and `None` for a bare `Scalar(Union)` scrutinee. The
+    /// levels above it stand: a projection rebuilds its keys from the rows it keeps, which
+    /// has no meaning across a grouping, so each enclosing row is projected on its own.
+    level: Option<CurryLevel>,
+    /// The projected level, empty — what an enclosing row the scrutinee has not reached
+    /// contributes to the regrouped result.
+    empty_level: Option<Tile>,
     /// Output tiling — `DataFunction { <scrutinee domain> ⇒ the `tag` arm }`.
     base: OperatorBase,
 }
@@ -495,21 +516,32 @@ impl VariantProject {
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(payload_extent.clone()),
             ),
-            t @ Tiling::DataFunction { codomain, .. } => {
+            t @ Tiling::DataFunction { .. } => {
                 assert!(
-                    matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_))),
-                    "VariantProject: a scrutinee must have a Scalar(Union) codomain, got \
-                     {codomain:?}"
+                    matches!(t.deepest_values(), Tiling::Scalar(Extent::Union(_))),
+                    "VariantProject: a scrutinee's values must be a Scalar(Union), got {t:?}"
                 );
-                change_tiling_result(t, |_| Tiling::Scalar(payload_extent.clone()))
+                // The payload carries its own levels where it is a collection: an arm
+                // holding one is opened for its consumer rather than left a map in a cell
+                // ([`Tiling::from_extent`]).
+                change_tiling_result(t, |_| Tiling::from_extent(&payload_extent))
             }
             other => panic!("VariantProject: a scrutinee must be a union, got {other:?}"),
         };
+        // The level the union sits at — the **scrutinee's** innermost, not the output's,
+        // which a collection payload opens one deeper. The levels above it stand: a
+        // projection rebuilds its own keys from the rows it keeps, which has no meaning
+        // across a grouping, so a scrutinee under standing levels is projected one
+        // enclosing row at a time ([`Tile::regroup_beneath`]).
+        let level = CurryLevel::innermost_of(input.tiling());
+        let empty_level = level.map(|l| tiling.values_at(l).empty_at_no_rows());
         Self {
             base: OperatorBase::new(tiling),
             input,
             tag,
             payload_extent,
+            level,
+            empty_level,
         }
     }
 }
@@ -539,6 +571,8 @@ impl TileOperator for VariantProject {
             input,
             tag: self.tag.clone(),
             payload_extent: self.payload_extent.clone(),
+            level: self.level,
+            empty_level: self.empty_level.clone(),
         })
     }
 
@@ -564,6 +598,28 @@ struct VariantProjectProducer {
     /// of the wrong kind (the untyped `Variants` catch-all rather than, say,
     /// `Ints`) fails the like-for-like concatenation a downstream merge does.
     payload_extent: Extent,
+    level: Option<CurryLevel>,
+    empty_level: Option<Tile>,
+}
+
+impl VariantProjectProducer {
+    /// The payloads of the scrutinee's rows carrying the tag.
+    fn project(&mut self) -> Tile {
+        let tile = self.input.get(self.input.tiling().universal_guard());
+        // Under standing levels the projection runs one enclosing row at a time: its keys
+        // are the rows it keeps, and which rows those are is a fact about one group.
+        if let (Some(level), Some(empty)) = (self.level, self.empty_level.as_ref())
+            && level != CurryLevel::OUTERMOST
+        {
+            return tile.regroup_beneath(level, empty.clone(), &mut |row| match tile
+                .group_at(level, row)
+            {
+                Some(group) => self.project_level(group.into_owned()),
+                None => empty.clone(),
+            });
+        }
+        self.project_level(tile)
+    }
 }
 
 impl TileProducer for VariantProjectProducer {
@@ -574,7 +630,62 @@ impl TileProducer for VariantProjectProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let tile = self.input.get(self.input.tiling().universal_guard());
+        let mut out = self.project();
+        // Part of a payload released names no part of the scrutinee, so the scrutinee keeps
+        // the row and the payload is projected again on the next pull (`release_impl`);
+        // what the consumer let go is taken back out here.
+        if !self.base.obsolete_guard.is_empty() {
+            out.remove_guarded(self.base.obsolete_guard.clone());
+        }
+        out
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // A **domain** release passes straight through. This producer's output domain is the
+        // scrutinee's own keys at the rows carrying `tag` (`get_impl` gathers them from the
+        // scrutinee's domain column), so a released output key names a scrutinee key
+        // directly. The sibling projections of one `match` share that scrutinee through a
+        // `FanOut`, whose `release_impl` intersects the branches' guards, so a key reaches
+        // the scrutinee only once *every* arm is done with it — this arm releasing a key it
+        // did not carry does not take it from the arm that did.
+        //
+        // A bare `Scalar(Union)` scrutinee has no domain column — `get_impl` supplies the
+        // positions themselves — so it takes no domain guard and falls to the whole-tile
+        // case below.
+        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard
+            && matches!(self.input.tiling(), Tiling::DataFunction { .. })
+        {
+            self.input.release(obsolete_guard);
+            return;
+        }
+        // Beneath standing levels the keys are the scrutinee's too, down to its values; the
+        // payload beneath them is not the scrutinee's variant, so only a release of all of it
+        // reaches the scrutinee's values.
+        if matches!(self.input.tiling(), Tiling::DataFunction { .. })
+            && !obsolete_guard.is_universal()
+            && !obsolete_guard.is_empty()
+        {
+            let input = self.input.tiling();
+            let guard = crate::interpreter::tiling::through_shared_levels(
+                obsolete_guard,
+                input.levels(),
+                input,
+            );
+            self.input.release(guard);
+            return;
+        }
+        // Anything else is all-or-nothing: there is no other sub-region of the scrutinee
+        // this producer could stop requesting.
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
+            self.input.release(self.input.tiling().universal_guard());
+        }
+    }
+}
+
+impl VariantProjectProducer {
+    /// One level of the scrutinee projected: the keys carrying `tag`, against their
+    /// payloads.
+    fn project_level(&self, tile: Tile) -> Tile {
         // The scrutinee's own domain keys (explicit for a union *stream*, so the
         // projected payload co-iterates by key with the outer element) and its
         // union codomain. A bare `Scalar(Union)` has an implicit `0..N` domain,
@@ -639,37 +750,17 @@ impl TileProducer for VariantProjectProducer {
             // declared payload extent.
             None => ColumnValue::from_values(Vec::new(), &self.payload_extent),
         };
-        Tile::data_function(
+        // The payload is opened the way every other materialized value is
+        // ([`Tiling::from_extent`]), so a collection riding an arm reaches its consumer as
+        // a level rather than as a map in a cell it would have to open first.
+        let mut out = Tile::data_function(
             out_domain,
-            Box::new(Tile::Scalar(out_codomain)),
+            Box::new(open_collections(&out_codomain, &self.payload_extent)),
             domain_predicate,
             BitSet::new(),
-        )
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // A **domain** release passes straight through. This producer's output domain is the
-        // scrutinee's own keys at the rows carrying `tag` (`get_impl` gathers them from the
-        // scrutinee's domain column), so a released output key names a scrutinee key
-        // directly. The sibling projections of one `match` share that scrutinee through a
-        // `FanOut`, whose `release_impl` intersects the branches' guards, so a key reaches
-        // the scrutinee only once *every* arm is done with it — this arm releasing a key it
-        // did not carry does not take it from the arm that did.
-        //
-        // A bare `Scalar(Union)` scrutinee has no domain column — `get_impl` supplies the
-        // positions themselves — so it takes no domain guard and falls to the whole-tile
-        // case below.
-        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard
-            && matches!(self.input.tiling(), Tiling::DataFunction { .. })
-        {
-            self.input.release(obsolete_guard);
-            return;
-        }
-        // Anything else is all-or-nothing: there is no other sub-region of the scrutinee
-        // this producer could stop requesting.
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.input.release(self.input.tiling().universal_guard());
-        }
+        );
+        out.qualify_codomain_by_keys();
+        out
     }
 }
 
@@ -1121,7 +1212,7 @@ mod tests {
         );
 
         // ⟨outer, x.decision ≫ variant_project(`commit)⟩ ▷ zip — the Zip joins
-        // the full outer stream with the tag-restricted payload on shared keys.
+        // the full outer collection with the tag-restricted payload on shared keys.
         let ops: Vec<Box<dyn TileOperator>> = vec![
             Box::new(FixedOp {
                 tile: outer_tile,
@@ -1199,6 +1290,8 @@ mod tests {
             input: Box::new(spy),
             tag: FieldKey::Index(0),
             payload_extent: Extent::Base(BaseType::Int),
+            level: CurryLevel::innermost_of(&out_tiling),
+            empty_level: None,
         };
 
         let prefix = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
@@ -1243,6 +1336,7 @@ mod tests {
             )]))),
         );
         let mut producer = VariantWrapProducer {
+            level: CurryLevel::new(1),
             base: ProducerBase::new(VariantWrapProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
             tag: commit.clone(),

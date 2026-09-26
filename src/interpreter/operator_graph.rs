@@ -8,7 +8,7 @@
 //!
 //! The walk runs between conversion and the subscribe loop, which is the only
 //! window in which it is total. `subscribe` takes every [`CycleSlot`] and every
-//! store's `init_ops`, so an operator asked for its inputs after that answers
+//! store's keyed inputs, so an operator asked for its inputs after that answers
 //! without them.
 //!
 //! An edge is a **subscription**: the consumer holds the operator the edge names
@@ -79,7 +79,7 @@ pub enum EdgeRole {
     Named(&'static str),
     /// A position in a `Vec` of inputs, as `Zip` and `UnionOperator` have.
     Positional(usize),
-    /// A store key, as both stores' `init_ops` are keyed by.
+    /// A store key, as a store's keyed inputs are.
     StoreKey(String),
 }
 
@@ -128,7 +128,7 @@ pub(crate) fn value_at<'a>(index: usize, op: &'a dyn TileOperator) -> InputEdgeS
     }
 }
 
-/// An owned input keyed by a store key, as both stores' `init_ops` are.
+/// An owned input keyed by a store key, as a store's per-key seeds are.
 pub(crate) fn value_keyed<'a>(
     key: impl Into<String>,
     op: &'a dyn TileOperator,
@@ -397,7 +397,7 @@ impl BoundarySession {
     /// Walk `outputs` into the graph, ending the session.
     ///
     /// Runs before `subscribe`, which is what makes the walk total: `subscribe`
-    /// takes every [`CycleSlot`] and every store's `init_ops`, so an operator
+    /// takes every [`CycleSlot`] and every store's keyed inputs, so an operator
     /// asked for its inputs afterwards would answer without them.
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot

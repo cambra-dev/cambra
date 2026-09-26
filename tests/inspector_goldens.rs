@@ -555,19 +555,15 @@ fn a_source_read_descends_from_an_iteration_of_that_source() {
     }
 }
 
-/// **A store folding over a source's domain iterates the source a second time.**
+/// **A store folding over a source's domain reads its final value from the store.**
 ///
 /// `source_accumulator` loops over `stdin()` and accumulates into a mutable
-/// variable, so the loop's induction extent is the source's own domain and the
-/// accumulator read compiles to a `StoreDenseRead` whose trigger iterates that
-/// extent. Two `IterateExtent`s over stdin's domain are therefore roots of the
-/// graph: the one the value read descends from, and the store's trigger.
-///
-/// The gallery's other source programs iterate a source only where they read
-/// its values, so this is the one that pins an iteration of a source standing
-/// apart from any value read.
+/// variable, so the loop's induction extent is the source's own domain. The
+/// trailing read of the accumulator is a `StoreFinalRead` over the store itself,
+/// so the source is iterated once, by the chain that reads its values, and no
+/// second iteration of it triggers the read.
 #[test]
-fn a_store_over_a_source_domain_iterates_the_source_twice() {
+fn a_store_over_a_source_domain_reads_its_final_value_from_the_store() {
     let nodes = operator_nodes("source_accumulator");
     let over_stdin: Vec<&Value> = nodes
         .iter()
@@ -580,31 +576,22 @@ fn a_store_over_a_source_domain_iterates_the_source_twice() {
         .collect();
     assert_eq!(
         over_stdin.len(),
-        2,
-        "one `IterateExtent` heads the chain that reads stdin's values and one \
-         triggers the `StoreDenseRead`; got {over_stdin:?}"
+        1,
+        "one `IterateExtent` heads the chain that reads stdin's values; got {over_stdin:?}"
     );
-    for it in &over_stdin {
-        assert_eq!(
-            it["inputs"].as_array().map(Vec::len),
-            Some(0),
-            "an `IterateExtent` holds no input, so it is a root: {it:?}"
-        );
-    }
-
-    let trigger_ids: Vec<u64> = nodes
-        .iter()
-        .filter(|n| n["label"] == "StoreDenseRead")
-        .flat_map(|n| n["inputs"].as_array().expect("inputs is an array"))
-        .filter(|e| e["role"]["name"] == "trigger")
-        .filter_map(|e| e["subscribed"].as_u64())
-        .collect();
+    assert_eq!(
+        over_stdin[0]["inputs"].as_array().map(Vec::len),
+        Some(0),
+        "an `IterateExtent` holds no input, so it is a root: {:?}",
+        over_stdin[0]
+    );
     assert!(
-        over_stdin
-            .iter()
-            .any(|it| trigger_ids.contains(&it["nodeId"].as_u64().expect("nodeId is a number"))),
-        "one of the two iterations is the `StoreDenseRead`'s trigger; triggers are \
-         {trigger_ids:?}"
+        nodes.iter().any(|n| n["label"] == "StoreFinalRead"),
+        "the accumulator's trailing read is a `StoreFinalRead`"
+    );
+    assert!(
+        !nodes.iter().any(|n| n["label"] == "StoreDenseRead"),
+        "no dense read re-iterates the source"
     );
 }
 
