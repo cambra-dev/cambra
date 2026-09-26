@@ -1782,6 +1782,22 @@ fn convert_impl_inner(
                     rest = &after[1..];
                     continue;
                 }
+                // `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose` — each row's own collection `𝑆` composed with
+                // `𝑔` at that row, which is what a generator over a sum that reads its
+                // enclosing scope eliminates to.
+                if let [next, ..] = after
+                    && as_builtin(next) == Some(Builtin::Compose)
+                    && let Some((source, curried)) = zip_pair(elem)
+                    && let TypedExprNode::Apply {
+                        argument: morphism,
+                        function,
+                    } = &curried.node
+                    && as_builtin(function) == Some(Builtin::Curry)
+                {
+                    result = Some(compose_per_row(source, morphism, result.take(), ctx)?);
+                    rest = &after[1..];
+                    continue;
+                }
                 result = Some(convert_impl(elem, result.take(), ctx)?);
                 rest = after;
             }
@@ -5551,6 +5567,40 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
         [source, default] => Some((source, default)),
         _ => None,
     }
+}
+
+/// `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose` over the rows `input`: at each row `𝑥`, the collection
+/// `𝑆(𝑥)` with `𝑔(𝑥, 𝑣)` in place of each value `𝑣` (`src/ccl/design/optimization.md`, "A
+/// generator over a sum composes with its source").
+///
+/// [`Product::per_row_values_at`] pairs each row with the values of its own collection, keyed
+/// by that collection's keys, and `𝑔` runs once per pair over the level that adds.
+fn compose_per_row(
+    source: &Expr,
+    morphism: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let rows = expect_input(input, "compose")?;
+    let fan = Rc::new(FanOut::new(Box::new(Memo::new(rows))));
+    let collections = convert_impl(source, Some(fan.branch()), ctx)?;
+    let paired = ctx.level();
+    match collections.tiling().values_at(paired) {
+        Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level() => {}
+        other => {
+            return Err(ConversionError::Unsupported(format!(
+                "composing a function with each row's own collection pairs the row with the \
+                 collection's values, which a column can hold only when they carry no level; \
+                 got {other}"
+            )));
+        }
+    }
+    let pairs = Box::new(Product::per_row_values_at(
+        fan.branch(),
+        collections,
+        paired,
+    ));
+    convert_lifted(morphism, Some(pairs), ctx)
 }
 
 /// The per-row reduction `⟨source, default⟩ ▷ zip ≫ final_or_default`, built from its two

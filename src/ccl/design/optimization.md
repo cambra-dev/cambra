@@ -140,8 +140,9 @@ inner lambda is the element function `𝑓`, over the source's values, which car
 
 Where `𝑓` reads nothing from the enclosing scope, elimination leaves
 `⟨𝑆, 𝑓 ▷ const⟩ ▷ zip ≫ compose`, which `simplify` rewrites to `𝑆 ≫ map(𝑓)`, or to `𝑆` where `𝑓`
-is `id`. Where `𝑓` reads the enclosing scope, the `curry` over `(𝑋, 𝑉)` needs each row paired with
-its own collection's values, which operator conversion does not build yet.
+is `id`. Where `𝑓` reads the enclosing scope, elimination leaves `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose`
+with `𝑔` over `(𝑋, 𝑉)`, and operator conversion pairs each row with the values of its own
+collection (`Product::per_row_values_at`) and runs `𝑔` over the pairs.
 
 #### A pair naming a sum's witness is refused
 

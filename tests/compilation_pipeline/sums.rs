@@ -241,6 +241,21 @@ fn a_comprehension_over_a_witness_domained_collection_composes_with_it() {
     );
 }
 
+/// A correlated comprehension over a witness-domained collection: the inner comprehension
+/// iterates the outer row and reads it again, so each row's collection is composed with a
+/// function of that row. `[1, 2]` gives `3 + 4` and `[3, 4, 5]` gives `8 + 9 + 10`.
+#[test]
+fn a_correlated_comprehension_over_a_witness_domained_collection() {
+    check_scalar(
+        indoc! {r"
+            def f(xs: List(List(Int))):
+                sum([sum([v + max(r) for v in r]) for r in xs])
+            f(box([box([1,2]), box([3,4,5])]))
+        "},
+        Value::Int(34),
+    );
+}
+
 /// **A `for` loop over a collection whose domain is the witness is not implemented.**
 ///
 /// A loop over the collection binds its accumulator's history over the collection's own

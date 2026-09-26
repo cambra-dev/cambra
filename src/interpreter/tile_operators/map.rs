@@ -546,7 +546,11 @@ impl MapResultProducer {
             input_tile.values_at_mut(level),
             Tile::Scalar(ColumnValue::Units(0)),
         );
-        *input_tile.values_at_mut(level) = if arguments.holds_a_level()
+        *input_tile.values_at_mut(level) = if arguments.rows() == 0 {
+            // No argument to apply the function to, which a universal release may already
+            // have emptied, so the result is empty whatever the function is.
+            self.tiling().values_at(level).empty_at_no_rows()
+        } else if arguments.holds_a_level()
             && let Tile::Scalar(f) = &function_tile
             && let Some(Value::ComputableFunction(f)) = f.as_single()
         {

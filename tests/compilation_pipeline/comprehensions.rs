@@ -287,6 +287,56 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
     );
 }
 
+/// A comprehension over a transactional collection read whose element function also reads
+/// the loop binder: each transaction's collection is composed with a function of that
+/// transaction's row (`src/ccl/design/optimization.md`, "A generator over a sum composes with
+/// its source").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// `{a: 1}` summed as `1 + r` for `r` in 1, 2.
+#[case::store_read(
+    indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                n := n + sum([v + r for v in m])
+        await_final(n)
+    "#},
+    5
+)]
+// `{a: 1, b: 10}` after the write, summed as `(1 + r) + (10 + r)`.
+#[case::after_a_keyed_write(
+    indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                m["b"] := 10
+                n := n + sum([v + r for v in m])
+        await_final(n)
+    "#},
+    28
+)]
+// `{x: 1, y: 2}` summed as `(1 + r) + (2 + r)` for `r` in 1, 2, 3.
+#[case::record_field(
+    indoc! {r#"
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + sum([v + r for v in s.b])
+        await_final(n)
+    "#},
+    21
+)]
+fn a_comprehension_over_a_transactional_map_reads_its_enclosing_scope(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
+}
+
 /// A collection-valued field of a transactional record, iterated inside a transaction.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
