@@ -98,6 +98,13 @@ them. A source window's `nodeIds` keep naming the first version's `IterateExtent
 iteration, those ids name a node whose probe detached at teardown. A source first read by the new
 version ships with empty `nodeIds`.
 
+A branch is not followed either. The panes and anchors describe `main`'s first version, and every
+branch's producers hold the same `ProbeSlot`, because every branch subscribes under the one
+`Scheduler` ([program-evolution.md](../ccl/design/program-evolution.md#the-branch-table)). An
+operator another branch built and `main` does not hold mints a `NodeId` the snapshot does not
+contain, so its entries arrive in every probe frame and match no pane node, as a rebuilt
+operator's do.
+
 Following a reload means republishing the snapshot and the anchors with the version, and telling a
 reader which version a frame belongs to. Neither is implemented.
 

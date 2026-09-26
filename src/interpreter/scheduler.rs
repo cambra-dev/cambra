@@ -111,6 +111,9 @@ pub struct Scheduler {
     source_handles: HashMap<String, SourceHandle>,
     wakeups: WakeupQueue,
     probes: ProbeSlot,
+    /// The source readers registered under each subscription still in progress,
+    /// innermost last — see [`begin_source_readers`](Self::begin_source_readers).
+    reader_frames: Vec<Vec<String>>,
 }
 
 type SourceHandle = (
@@ -142,6 +145,46 @@ impl Scheduler {
     /// ambient state.
     pub fn probes(&self) -> &ProbeSlot {
         &self.probes
+    }
+
+    /// Open a frame recording every producer that registers with a data source
+    /// until the matching [`end_source_readers`](Self::end_source_readers).
+    ///
+    /// A source reader is attributed to whatever subscribed it, so the branch
+    /// table can say which producers a branch holds: a fan-out records the
+    /// readers its input chain registered, and a compilation the readers its
+    /// outputs registered (`src/ccl/design/program-evolution.md`, "Routes across
+    /// branches"). Frames nest, because a fan-out's input is subscribed from
+    /// inside a compilation's.
+    pub fn begin_source_readers(&mut self) {
+        self.reader_frames.push(Vec::new());
+    }
+
+    /// Close the innermost frame and return the readers registered in it.
+    ///
+    /// The readers are also added to the enclosing frame, so a frame's record
+    /// covers every reader registered below it, including those under a nested
+    /// fan-out.
+    pub fn end_source_readers(&mut self) -> Vec<String> {
+        let readers = self
+            .reader_frames
+            .pop()
+            .expect("`end_source_readers` closes a frame `begin_source_readers` opened");
+        if let Some(outer) = self.reader_frames.last_mut() {
+            outer.extend(readers.iter().cloned());
+        }
+        readers
+    }
+
+    /// Record that the producer named `producer` registered with a data source.
+    ///
+    /// A registration outside every frame is attributed to nothing. Only a
+    /// subscription made outside a compilation does that, which a test that
+    /// subscribes an operator by hand is.
+    pub fn note_source_reader(&mut self, producer: String) {
+        if let Some(frame) = self.reader_frames.last_mut() {
+            frame.push(producer);
+        }
     }
 
     /// Register `consumer` to be notified when `handle` has new data.

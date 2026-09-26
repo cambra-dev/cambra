@@ -1,76 +1,65 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc, thread, time::Duration};
+use std::{collections::HashMap, thread, time::Duration};
 
 use cambra::{
     ccl::{
-        context::{GlobalContext, ReuseTally, eprint_errors},
+        context::{GlobalContext, eprint_errors},
         provenance::NodeId,
     },
-    chl_parser::SourceMap,
-    control_port::{ControlPort, ControlReply, ControlRequest},
+    control_port::{ControlPort, service},
     inspector_server::{live::LiveChannel, serve_compiled},
     interpreter::{
         ColumnValue, Consumer, Scheduler,
         operator_graph::source_nodes,
-        tile_operators::{FunctionGuard, Tile, TileGuard},
+        tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
         value_probe::{
             ProbeSlot, ProbeTable, ROWS_PER_READING, SourceWindow, render_source_window,
             window_tail,
         },
     },
-    live_program::{LiveProgram, render_unreadable},
+    live_program::LiveProgram,
 };
 use log::debug;
 
 /// Service at most one pending control request.
 ///
 /// One request per call rather than draining the queue: an accepted `/reload`
-/// replaces the program, so the requests behind it would be answered against a
-/// version that no longer exists.
+/// replaces a branch's version, so the requests behind it would be answered
+/// against a version that no longer exists.
 fn poll_control(
     control: Option<&ControlPort>,
     ctx: &mut GlobalContext,
     live: &mut LiveProgram,
     main_consumer: &dyn Fn() -> Box<dyn Consumer>,
-    new_data: &Rc<RefCell<bool>>,
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
-    // The posted text arrived over the control port and need not match any file
-    // on disk, so its diagnostics label it `<new>` rather than a path.
-    const POSTED: &str = "<new>";
-    let reply = match message.request() {
-        ControlRequest::Diff { code, phase } => {
-            let sources = SourceMap::single(POSTED, code.as_str());
-            match live.diff_against(ctx, &sources, *phase) {
-                Ok(report) => ControlReply::ok(format!(
-                    "{}{}",
-                    report.diff,
-                    render_unreadable(&report.unreadable)
-                )),
-                Err(e) => ControlReply::rejected(e.render(&sources)),
-            }
-        }
-        ControlRequest::Reload { code } => {
-            let sources = SourceMap::single(POSTED, code.as_str());
-            // A rebuilt operator's producer takes the scheduler's probe slot
-            // when it is built, as the first compile's did.
-            match live.reload(ctx, &sources, main_consumer) {
-                Ok(report) => {
-                    // The new graph has subscribed but nothing has pulled it, so arm
-                    // the driver for one pass.
-                    *new_data.borrow_mut() = true;
-                    let ReuseTally { kept, bound } = report.reuse;
-                    ControlReply::ok(format!(
-                        "reloaded: {kept}/{bound} operators kept\n\n{}{}",
-                        report.diff,
-                        render_unreadable(&report.unreadable),
-                    ))
-                }
-                Err(e) => ControlReply::rejected(e.render(&sources)),
-            }
-        }
-    };
+    let reply = service(message.request(), ctx, live, main_consumer);
     message.answer(reply);
+}
+
+/// Pull one branch's `main` output once, print what it delivered, and answer
+/// whether it has now finished.
+///
+/// The root's value prints as `Got value: …` and every other branch's as
+/// `Got value from <branch>: …` (`src/ccl/design/program-evolution.md`, "A
+/// reload changes no other branch").
+fn pull_main(branch: &str, is_root: bool, producer: &mut dyn TileProducer) -> bool {
+    debug!("Main calling get on {branch}");
+    let tile = producer.get(producer.tiling().universal_guard());
+
+    let release_guard = release_guard_for(&tile);
+    debug!("Main releasing with {release_guard:?}");
+    let done = release_guard.is_universal();
+    producer.release(release_guard);
+    // Producers can return empty tiles, but still have more data.
+    if !tile_is_empty(&tile) || done {
+        if is_root {
+            println!("Got value: {tile:#?}");
+        } else {
+            println!("Got value from {branch}: {tile:#?}");
+        }
+    }
+    done
 }
 
 /// Runs a Cambra program from a source string.
@@ -85,22 +74,20 @@ fn run_program(
     inspect_port: Option<u16>,
     control_port: Option<u16>,
 ) -> Result<(), ()> {
-    let new_data = Rc::new(RefCell::new(false));
-    let flag = new_data.clone();
-    let main_consumer = move || -> Box<dyn Consumer> {
-        let flag = flag.clone();
-        Box::new(move || {
+    // Each branch's `main` consumer marks that branch as having something to
+    // pull ([`LiveProgram::pull_mains`]); the driver polls those marks, so the
+    // wake itself carries nothing.
+    let main_consumer = || -> Box<dyn Consumer> {
+        Box::new(|| {
             debug!("Main loop received notification");
-            *flag.borrow_mut() = true;
         })
     };
 
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single(src_name, code);
-    let mut live = match LiveProgram::start(&mut ctx, &sources, &main_consumer) {
+    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
-            eprint_errors(&errs, &sources);
+            eprint_errors(&errs, src_name, code);
             return Err(());
         }
     };
@@ -132,89 +119,36 @@ fn run_program(
         }
     };
 
-    // Drive the `main` output (if any) until it signals a universal release.
-    // For sink-only programs this loop is skipped entirely.
-    while live.has_main() {
-        // Serviced once per pull and then for as long as the program waits. A
-        // swap sits between two pulls, so a source delivering without pause must
-        // not be able to starve the control port of its turn.
-        loop {
-            poll_control(
-                control.as_ref(),
-                &mut ctx,
-                &mut live,
-                &main_consumer,
-                &new_data,
-            );
-            if *new_data.borrow() {
-                break;
-            }
-            ctx.scheduler().check_for_notifications();
-        }
-        *new_data.borrow_mut() = false;
-
-        // Re-read the producer each pass: a reload between pulls replaces it.
-        let Some(producer) = live.main_producer_mut() else {
-            break;
-        };
-        debug!("Main calling get");
-        // Sampled before the pull, not after. A `Memo` releases its input from
-        // inside `get_impl`, so the release cascade reaches the source buffer
-        // partway through the driver's own `get` — sampling afterwards reads a
-        // buffer the pull already drained. Before it, the pass's arrivals are
-        // present and nothing has taken delivery.
+    // Pull every branch's `main` output until each has released everything,
+    // and keep the scheduler running until every branch's sinks signal
+    // completion. Long-lived servers (e.g. `http_serve`) never signal, so for
+    // them this loop runs until the process exits. The control port is serviced
+    // once per pass: a swap sits between two pulls, so a source delivering
+    // without pause must not be able to starve it of its turn.
+    loop {
+        poll_control(control.as_ref(), &mut ctx, &mut live, &main_consumer);
+        // Sampled between the poll and the delivery. The poll takes this pass's
+        // arrivals into the source buffers; the delivery is where a sink pulls
+        // them, and both the delivery and a `main` pull are where a `Memo`
+        // releases its input from inside `get_impl`. A window read before the
+        // poll misses the arrivals, and one read after the delivery or the pull
+        // reports what the pass consumed.
+        let delivery = ctx.scheduler().poll_sources();
         let sources = match inspection.as_mut() {
             Some(inspection) => inspection.before_pull(ctx.scheduler()),
             None => Vec::new(),
         };
-        let tile = producer.get(producer.tiling().universal_guard());
+        ctx.scheduler().deliver(delivery);
+        live.pull_mains(pull_main);
         if let Some(inspection) = inspection.as_mut() {
             inspection.publish(&sources);
         }
-
-        let release_guard = release_guard_for(&tile);
-        debug!("Main releasing with {release_guard:?}");
-        let done = release_guard.is_universal();
-        producer.release(release_guard);
-        // Producers can return empty tiles, but still have more data.
-        let is_empty = tile_is_empty(&tile);
-        if !is_empty || done {
-            println!("Got value: {tile:#?}");
-        }
-        if done {
+        if live.finished() {
             break;
         }
-    }
-
-    // If there are sinks, keep the scheduler running until they all signal
-    // completion.  Long-lived servers (e.g. http_serve) never signal, so this
-    // loop runs until the process exits.
-    if live.program().sinks().next().is_some() {
-        loop {
-            // Sampled between the poll and the delivery. The poll takes this
-            // pass's arrivals into the source buffers; the delivery is where a
-            // sink pulls them and a `Memo` releases its input from inside
-            // `get_impl`. A window read before the poll misses the arrivals,
-            // and one read after the delivery reports what the pass consumed.
-            let delivery = ctx.scheduler().poll_sources();
-            let sources = match inspection.as_mut() {
-                Some(inspection) => inspection.before_pull(ctx.scheduler()),
-                None => Vec::new(),
-            };
-            ctx.scheduler().deliver(delivery);
-            if let Some(inspection) = inspection.as_mut() {
-                inspection.publish(&sources);
-            }
-            poll_control(
-                control.as_ref(),
-                &mut ctx,
-                &mut live,
-                &main_consumer,
-                &new_data,
-            );
-            if live.done().try_recv().is_ok() {
-                break;
-            }
+        // A `main` output is pulled as soon as it is notified, so while one is
+        // running the loop spins; a sink program is woken by its sources.
+        if !live.any_main_running() {
             // TODO we shouldn't need to sleep here; we should come up with a better interface
             // for check_for_notifications
             thread::sleep(Duration::from_millis(10));
@@ -314,7 +248,7 @@ impl Inspection {
     /// Publish a frame if some probe took a reading that carried rows since the
     /// last publish.
     ///
-    /// The sink loop polls on a 10ms timer, and a poll that delivers nothing
+    /// The driver polls on a 10ms timer, and a poll that delivers nothing
     /// still takes an empty reading from every producer it pulls. Gating on
     /// every reading would broadcast an unchanged frame a hundred times a
     /// second, each paired with a window sampled on a pass that carried
@@ -394,8 +328,8 @@ const DEFAULT_CONTROL_PORT: u16 = 8081;
 /// `--inspect-only` is the not.
 enum Mode {
     /// Run the program. With an inspect port, serve its panes and stream the
-    /// values flowing through its operators; with a control port, accept
-    /// `/diff` and `/reload` against the running program.
+    /// values flowing through its operators; with a control port, accept the
+    /// branch verbs against the running program (`src/control_port.rs`).
     Run {
         inspect_port: Option<u16>,
         control_port: Option<u16>,

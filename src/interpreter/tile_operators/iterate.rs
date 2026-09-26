@@ -80,6 +80,7 @@ impl TileOperator for IterateExtent {
             // a false predicate.  This way the sources knows about all producers that read it
             //before execution starts.
             release_extent(&mut producer.extent, &Predicate::False, &name);
+            scheduler.note_source_reader(name);
         }
 
         producer
