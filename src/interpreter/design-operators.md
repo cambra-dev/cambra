@@ -746,8 +746,9 @@ while their arms carry one level and two.
 | `map(𝑓)` | 𝑓 one level in |
 | an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
 | `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
-| a top-level `Transact` | its body at level 1, over the store's own domain |
-| a nested `Transact` | its source and its seed (over the flattened pairs) at the `Transact`'s level, its body one level in |
+| `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose` | 𝑆 at the level it is converted at, over the rows; 𝑔 one level in, over the iteration `Product` appends |
+| a top-level carrier | its body at level 1, over the store's own domain |
+| a nested carrier | its source and its seed (over the flattened pairs) at the carrier's level, its body one level in |
 | every other node, composition included | the level it is converted at |
 
 The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
@@ -901,6 +902,11 @@ inner side, so it is released only when everything is. A source that differs per
 output shape from a different builder
 ([Where a collection is materialized](#where-a-collection-is-materialized)), where the per-row
 collection arrives as a value rather than being selected by the binder.
+`Product::per_row_values_at` pairs each row with its own collection's values, where
+`Product::per_row_at` pairs it with the keys, and keeps the keys as the paired level. It compiles
+`⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose`, the shape a generator over a sum takes when its element
+function reads the enclosing scope (`src/ccl/design/optimization.md`, "A generator over a sum
+composes with its source").
 
 Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
 comprehension is aggregated, and a comprehension that yields a collection per row leaves the
