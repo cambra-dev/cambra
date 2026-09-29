@@ -641,10 +641,9 @@ impl UncurryProducer {
     /// The input guard a release of the paired level names.
     ///
     /// Standing levels are untouched by the pairing, so a guard naming one passes through
-    /// and the guard beneath it is split. At the paired level itself, a pair release
-    /// reaches the input's outer key only where it covers that key's **whole** inner
-    /// collection — a partial group leaves the outer key still live. A pair arm qualified by
-    /// the standing rows above it releases its outer keys under those same rows.
+    /// and the guard beneath it is split. At the paired level itself a pair names one inner
+    /// key under one outer key, so a release of pairs is exactly a release of those inner
+    /// keys, under the standing rows that qualify it.
     fn split_pair_guard(&self, guard: TileGuard, level: CurryLevel) -> TileGuard {
         match guard {
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -673,30 +672,19 @@ impl UncurryProducer {
                     FunctionGuard::Codomain(Box::new(inner)),
                 ))))
             }
+            // Keys of the paired level: pairs, which name the input's outer and inner keys
+            // together. Split back, each names one inner key under one outer key, so the
+            // region is a release of the input's inner level. One naming every inner key of
+            // an outer key names that key whole, and the canonical form the release takes
+            // (`TileGuard::flatten_or`) spells it as the outer key.
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                let pair_fields = HashMap::from([(tuple_field(0), ()), (tuple_field(1), ())]);
-                let arms = |p: &Predicate| -> Vec<Predicate> {
-                    match p {
-                        Predicate::Or(arms) => arms.clone(),
-                        one => vec![one.clone()],
-                    }
-                };
-                let mut domain_guard = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
-                for arm in arms(&pred) {
-                    let (enclosing, pairs) = arm.split_qualification();
-                    for pair in arms(pairs) {
-                        let mut split_preds = pair.split_record(&pair_fields);
-                        let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
-                        let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
-                        if inner_pred.is_true() {
-                            domain_guard =
-                                domain_guard.union(&TileGuard::Function(FunctionGuard::Domain(
-                                    Predicate::qualified(enclosing.clone(), outer_pred),
-                                )));
-                        }
-                    }
-                }
-                domain_guard
+                let at = self.level.index();
+                let fields = (tuple_field(0), tuple_field(1));
+                let pairs =
+                    pred.with_levels_unpaired(at, at, (fields.0.as_str(), fields.1.as_str()));
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                    FunctionGuard::Domain(pairs),
+                ))))
             }
             // Each arm names its own region, so each splits on its own.
             TileGuard::Or(arms) => arms
@@ -1587,8 +1575,9 @@ mod tests {
     /// A release of the paired level beneath a standing level arrives as a path prefix
     /// (`domain_prefix`): the standing rows before the running one whole, and under the
     /// running one a staircase over the pair's fields. Each arm splits on its own, and a
-    /// pair arm qualified by its standing row releases outer keys under that row only, and
-    /// only those whose inner collection it covers whole.
+    /// pair arm qualified by its standing row releases under that row only: outer keys whose
+    /// inner collection it covers whole, and the inner keys it names of the outer key it
+    /// does not.
     #[test]
     fn uncurry_splits_a_pair_prefix_beneath_a_standing_level() {
         let uint = || Extent::Base(BaseType::UInt);
@@ -1623,14 +1612,25 @@ mod tests {
         ]));
         let released = domain_prefix(vec![Value::UInt(1), pair]);
         let domain = |p: Predicate| TileGuard::Function(FunctionGuard::Domain(p));
-        let expected = domain(Predicate::below(Value::UInt(1))).union(&TileGuard::Function(
-            FunctionGuard::Codomain(Box::new(domain(Predicate::qualified(
+        let codomain = |g: TileGuard| TileGuard::Function(FunctionGuard::Codomain(Box::new(g)));
+        // Rows before 1 whole; under row 1, outer keys before 2 whole, and under outer key 2
+        // the inner keys through 0.
+        let expected = TileGuard::flatten_or(vec![
+            domain(Predicate::below(Value::UInt(1))),
+            codomain(domain(Predicate::qualified(
                 Predicate::point(Value::UInt(1)),
                 Predicate::below(Value::UInt(2)),
+            ))),
+            codomain(codomain(domain(Predicate::qualified(
+                Predicate::qualified(
+                    Predicate::point(Value::UInt(1)),
+                    Predicate::point(Value::UInt(2)),
+                ),
+                Predicate::at_or_below(Value::UInt(0)),
             )))),
-        ));
+        ]);
         assert_eq!(
-            uncurry.split_pair_guard(released, CurryLevel::new(1)),
+            TileGuard::flatten_or(vec![uncurry.split_pair_guard(released, CurryLevel::new(1))]),
             expected
         );
     }
@@ -1714,10 +1714,10 @@ mod tests {
         );
     }
 
-    /// An input holding a level beneath the predicate's is masked at the predicate's depth:
-    /// each dropped key takes its group of the level below with it.
+    /// An input holding a level beneath the masked one is masked at the filter's level, not
+    /// its innermost: each dropped key takes its group of the level below with it.
     #[test]
-    fn a_predicate_masks_the_level_at_its_own_depth() {
+    fn a_filter_masks_its_own_level_above_deeper_ones() {
         let input = outer(level(
             &[0, 2],
             &[10, 20, 10, 30],
@@ -1735,6 +1735,49 @@ mod tests {
                 level(&[0, 2], &[5, 6, 8, 9], Tile::Scalar(uints(&[1, 2, 5, 6]))),
             )),
         );
+    }
+
+    /// A release of some pairs under an outer key reaches the input as those inner keys under
+    /// that key, and leaves the outer key live.
+    #[test]
+    fn uncurry_forwards_a_partial_group_release_as_its_inner_keys() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let input_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::Scalar(uint())),
+        );
+        let pair_extent = Extent::Record(
+            [(tuple_field(0), uint()), (tuple_field(1), uint())]
+                .into_iter()
+                .collect(),
+        );
+        let output_tiling = Tiling::data_function(pair_extent, Tiling::Scalar(uint()));
+        let mut uncurry = UncurryProducer {
+            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            input: Box::new(TestTileProducer::new(
+                input_tiling.empty_at_no_rows(),
+                input_tiling,
+            )),
+            level: CurryLevel::OUTERMOST,
+            empty_pair: output_tiling.empty_at_no_rows(),
+        };
+        let pair = Value::Record(HashMap::from([
+            (tuple_field(0), Value::UInt(0)),
+            (tuple_field(1), Value::UInt(1)),
+        ]));
+        uncurry.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(pair),
+        )));
+        let upstream = uncurry.input.obsolete_guard();
+        assert!(
+            upstream.covers_path(&[Value::UInt(0), Value::UInt(1)]),
+            "{upstream:?}"
+        );
+        assert!(
+            !upstream.covers_path(&[Value::UInt(0), Value::UInt(0)]),
+            "{upstream:?}"
+        );
+        assert!(!upstream.covers_path(&[Value::UInt(0)]), "{upstream:?}");
     }
 
     #[test]
