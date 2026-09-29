@@ -1404,37 +1404,28 @@ fn elim_lambda_impl(
         // enclosing parameter; a history whose type does would be a dependent function,
         // which these references would not say.
         TypedExprNode::LetRec { bindings, body } => {
-            let eliminate_defs = |ctx: &mut ElimContext, hist_tys: &[Type]| {
-                let calls: Vec<(Name, Expr)> = bindings
-                    .iter()
-                    .zip(hist_tys)
-                    .map(|((b, _), hist_ty)| {
-                        let call = Expr::apply(
-                            Expr::var(param).with_ty(param_ty.clone()),
-                            Expr::var(&b.name).with_ty(hist_ty.clone()),
-                        )
-                        .with_ty(hist_ty.codomain().unwrap_or(Type::Hole));
-                        (b.name.clone(), call)
-                    })
-                    .collect();
-                let defs = bindings
-                    .iter()
-                    .map(|(_, def)| {
-                        let mut def = def.clone_preserving_ids();
-                        for (name, call) in &calls {
-                            def = substitute(def, name, call);
-                        }
-                        elim_lambda_kinded(ctx, param, param_ty, def, fun_kind.clone())
-                    })
-                    .collect::<Result<Vec<_>, LambdaElimError>>()?;
-                Ok::<_, LambdaElimError>((defs, calls))
-            };
-
-            let provisional: Vec<Type> = bindings
+            let calls: Vec<(Name, Expr)> = bindings
                 .iter()
-                .map(|(b, _)| Type::fun(param_ty.clone(), b.ty.clone()))
+                .map(|(b, _)| {
+                    let hist_ty = Type::fun(param_ty.clone(), b.ty.clone());
+                    let call = Expr::apply(
+                        Expr::var(param).with_ty(param_ty.clone()),
+                        Expr::var(&b.name).with_ty(hist_ty),
+                    )
+                    .with_ty(b.ty.clone());
+                    (b.name.clone(), call)
+                })
                 .collect();
-            let (defs, calls) = eliminate_defs(ctx, &provisional)?;
+            let defs = bindings
+                .iter()
+                .map(|(_, def)| {
+                    let mut def = def.clone_preserving_ids();
+                    for (name, call) in &calls {
+                        def = substitute(def, name, call);
+                    }
+                    elim_lambda_kinded(ctx, param, param_ty, def, fun_kind.clone())
+                })
+                .collect::<Result<Vec<_>, LambdaElimError>>()?;
 
             let new_bindings = bindings
                 .iter()
