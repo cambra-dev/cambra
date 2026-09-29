@@ -1303,8 +1303,9 @@ pair-keyed domain, `domain_prefix` over the path with its last two components co
 the pair, which `Predicate::at_or_below` spells as a staircase over the pair's fields. The seed and
 reseed streams are one stream behind a `FanOut`, so either consumer holding its branch would pin
 the pair stream, and the operators pairing it (`Uncurry`, `Product`) would re-deliver the
-whole run on every pull. `Uncurry` releases an outer key where a pair release covers that key's
-whole inner collection, under whatever standing rows qualify it.
+whole run on every pull. `Uncurry` forwards a release of pairs as the inner keys they name under
+their outer keys, under whatever standing rows qualify it, so the row being run is reclaimed as it
+goes rather than when it finishes.
 
 ## Open Challenges
 
