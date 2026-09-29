@@ -73,11 +73,11 @@ One level is the base case, so an operator that appends a level is closed under 
 output. `Tiling::append_level` is the same step on the static shape.
 
 The appended level is whole for every parent it names, since a caller appends only once it holds
-each group entire. A one-level tile's keys therefore become final, each now holding a whole group
-where it held one value. A deeper tile's outermost keys own groups of the levels already beneath
-them, which a later tile can add to, because `merge` matches a key both sides hold and merges
-their groups. Such a tile keeps the completeness it arrived with. Removals ride through level for
-level, and the appended level has removed nothing.
+each group entire. The innermost level's keys therefore become final, each now holding a whole
+group, and beneath standing levels each is named by its path. The levels above keep the
+completeness they arrived with: a later tile can add to their groups, because `merge` matches a
+key both sides hold and merges their groups. Removals ride through level for level, and the
+appended level has removed nothing.
 
 Tiles representing collections (`DataFunction`) support logical deletes by storing a `BitSet` of
 deleted values. These are set by filtering operators like `Restrict` and compacted away by stateful
@@ -221,16 +221,20 @@ into the enclosing paths it is qualified by and the keys it admits under them, a
 
 A level's `domain_predicate` names whole paths from its tile's root. An operator that takes a
 row's group out to work on it alone reads the group's statements over the group's own paths, and
-one that puts a group back under a different row restates what the group carries:
+one that puts a group back under a different row, or changes the levels around it, restates what
+the group carries:
 
 | Move | Restatement |
 |------|-------------|
 | Take row 𝑟's group out (`Tile::group_at`) | `within(𝑟)`, or `True` where the level above calls 𝑟 complete |
 | Place a group under row 𝑟 (`Tile::regroup_beneath`) | `beneath(𝑟)` |
 | Attach a column of groups to the rows 𝑅 it stands under | `qualified_by(𝑅)`; `Tile::qualify_codomain_by_keys` for a column under one row's keys |
+| Insert a level before a path component | `with_level_inserted` |
+| Merge two levels into one keyed by pairs | `with_levels_paired`, and `with_levels_unpaired` for a release handed back |
 
-`Tile::map_level_predicates` applies one to every level of a chain, through record fields. A
-group placed without restating names paths under other rows, which the check in
+`Tile::map_level_predicates` applies one to every level of a chain, through record fields, and
+`TileGuard::map_level_predicates` to every level a guard names. A group placed without
+restating names paths under other rows, which the check in
 [The completeness contract](#the-completeness-contract) reports as a change to a complete path.
 
 ### Componentwise predicates and prefixes
@@ -278,6 +282,28 @@ so a component that destructures instead of reading its own level reads `domain`
 keys are complete; the rows an operator groups by, and their completeness, belong to
 `CurryLevel::enclosing`. At depth two the enclosing level is the outermost one, so reading
 the wrong one gives the same answer there and a different one at depth three and below.
+
+**Completeness is downward-closed.** A key a level calls complete is complete at every depth
+beneath it, so an element is final as soon as *some* level on its path calls that prefix
+final. An operator that reduces one group per row — `MapAggregate` is the case — therefore
+asks every level on the path rather than the outermost alone. Asking the outermost is sound
+only while the statement says the same of every row: under a nested carrier the enclosing rows
+stay open for as long as the drive runs, while the row being run is decided, so an aggregate
+inside the nest would never settle.
+
+Operators split into two families by what they replace at their level:
+
+- **Replacing the values beneath it** — `Zip`, `VariantWrap`. Their tiling is
+  `with_values_at(input, level, new_values)` and the producer writes `*values_at_mut(level)`.
+  Nothing is grouped, so nothing is split per row.
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`. Each takes
+  the level apart one row of the level above at a time and puts it back with
+  `Tile::regroup_beneath`, handing it the empty level its own output tiling derives
+  (`Tile::per_group` derives it on the call), so a row that has been reached by nothing still
+  answers at the right shape. Operands pulled from their own branches need not hold the same rows,
+  nor hold them at the same positions, so an operator with several finds each row in the others by
+  its path (`Tile::rows_by_path`). A union's standing rows are its arms' together, each arm holding
+  its own share.
 
 ### CCL types vs. tilings
 
@@ -333,6 +359,17 @@ way; an operator putting a value into a column asks it, a column having nowhere 
 maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
 and `materialize_collections` turns this form back into maps where one value is required.
 
+A pair an operator *forms* follows the same rule, and states it at construction. `Product` pairs
+each row's element with the keys under it: where the element is a plain value the pair rides
+materialized in one column, and where it carries a level — a nest whose elements are collections —
+the pair is a `Tiling::Record` whose `_0` keeps its levels. `Uncurry` reads the rule from the other
+end: it flattens two levels into a pair-keyed one and leaves the values it finds exactly as they
+are, because materializing a level-carrying value is what has no column to go in.
+
+**A variant's payload is the one place a collection rides as a value.** An arm holds one cell per
+position, so `VariantWrap` materializes the collection into it (at the level the payload's own type
+names, not the input's innermost) and `VariantProject` opens it back into levels.
+
 ---
 
 ## The release contract
@@ -348,8 +385,9 @@ An operator must therefore **reject a guard it cannot honor rather than ignore i
 A keyless field's cell beneath a level goes with its key. A record tile's fields stand over
 the same rows, so a tile cannot hold a row without its cell. A release naming the cell under an
 open key is recorded, and the producer returns the cell until the key is released
-(`Tile::remove_guarded`). No consumer can have dropped the cell while it holds the row, so
-the value it receives again is one it already has, matched by key.
+(`Tile::remove_guarded`), so a consumer still holding the row receives the cell again, a value
+it already has. A consumer that can take that repeat may release the key later. `Memo` cannot:
+see [A `Memo` releases everything it takes](#a-memo-releases-everything-it-takes).
 
 ### Guard operations are exact
 
@@ -359,8 +397,10 @@ representation cannot spell is a gap in the guard algebra. The fix is a spelling
 then the operation fails loudly (`todo!`, `unimplemented!`). It never answers a smaller region,
 and never a larger one.
 
-A consumer may release less than it has finished with, since what it releases is its own promise.
-An operator computing a guard from the guards it received has no such choice:
+A consumer may release less than it has finished with, since what it releases is its own promise,
+provided it can take the unreleased data again ([A `Memo` releases everything it
+takes](#a-memo-releases-everything-it-takes)). An operator computing a guard from the guards it
+received has no such choice:
 
 - An understated guard fails to forward a release the operator could make, which strands upstream
   state. A `FanOut` forwards the meet of its branches, so one understated meet blocks
@@ -369,6 +409,20 @@ An operator computing a guard from the guards it received has no such choice:
 - Either one is a different region from then on. `TileProducer::release` compares the spelling of
   the accumulated guard to decide whether a release added anything, and every later union and
   meet is computed from that spelling.
+
+### A `Memo` releases everything it takes
+
+`Memo` merges every delivery into its cache, and a merge takes each position once: a position
+delivered again is rejected by `Tile::merge`, whether or not the two values agree. So `Memo`
+releases, with `Tile::to_guard`, everything it merges. What that release leaves are the keys of
+open groups, which grow by key, and join-shaped values, an aggregation's accumulator or a store,
+which combine. A scalar cell left there is one the input will deliver again, and debug builds
+report it where `Memo` takes it (`Tile::holds_a_plain_value`).
+
+`to_guard` meets this by naming, by its whole path, every key whose level calls it complete, so a
+scalar cell beside a collection goes with its key once that key is complete. A cell under a key
+that is still open cannot be named without its key (the keyless-field rule above), so a `Memo`
+over such a row is a gap the check reports.
 
 ## The completeness contract
 
@@ -643,6 +697,36 @@ than by a second list agreeing.  The pass walks the AST inserting
 layer) — `iterate ▷ (p ▷ restrict) ▷ …`, application rather than composition.
 Op-conversion never has to invent an iteration source on its own.
 
+### The level a node is converted at
+
+Every node is converted at a `CurryLevel`: how many levels of its input are the iteration it is
+lifted over, rather than part of the element it takes. The AST around the node sets it
+(`OpConversionContext::level`). A tiling cannot tell a level the node iterates from a level inside
+the element it takes, so the operators listed below this table take their level from here. Over
+grouped rows, `(sum(g), max(g))` and `(g, [s.qty for s in g])` both pair at the groups' keys,
+while their arms carry one level and two.
+
+| Node | Converts its children at |
+|---|---|
+| a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
+| `map(𝑓)` | 𝑓 one level in |
+| `map_filter(𝑞)` | 𝑞 one level in: it asks of each key of each element collection |
+| an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
+| `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
+| a top-level carrier | its body at level 1, over the store's own domain |
+| every other node, composition included | the level it is converted at |
+
+The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
+pairs at it, and so does a product morphism with no input, at the domains its type is curried
+over. `MapResult` applies at it, and `MapFilter` filters the element collections there. A
+composed `VariantWrap` wraps at it, and an applied one at its payload's root level. A fed
+copairing merges one level above it.
+
+Two operators read their level off their input's tiling. `VariantProject` projects at the level
+holding its scrutinee's union column, which is always the deepest: an arm holds its payload as one
+materialized cell, so no level sits beneath a union. `MapAggregate` folds the innermost
+collection its input holds.
+
 ### Iteration sources
 
 After planning, the only ways op-conversion learns about an iteration are via
@@ -761,8 +845,11 @@ Compiling it is the pairing. [`Product`] gives each outer row a group holding th
 domain, one level deeper than the outer collection — a collection per row — and `𝑔` then compiles over
 that like any other morphism over a stream, its result inheriting the grouping.
 The inner source does not mention the outer binder, so every row iterates the same domain and
-the pairing is a cartesian product. A source that differs per row is the same output shape
-from a different builder
+the pairing is a cartesian product (`Product::shared_at`). While the inner side is still
+arriving, each row is paired with the elements it holds so far and left open: no row is complete
+until the inner side is, since every row can gain its next element. Every row reads the whole
+inner side, so it is released only when everything is. A source that differs per row is the same
+output shape from a different builder
 ([Where a collection is materialized](#where-a-collection-is-materialized)), where the per-row
 collection arrives as a value rather than being selected by the binder.
 
