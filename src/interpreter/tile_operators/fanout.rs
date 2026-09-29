@@ -8,7 +8,7 @@ use super::*;
 use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
-        Consumer, Scheduler,
+        Consumer, Position, Scheduler,
         scheduler::{SharedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
     },
     pretty_graph::VizOptions,
@@ -92,7 +92,7 @@ struct FanOutShared {
     /// last release.
     ///
     /// [`released`]: FanOutShared::released
-    released_position: Option<usize>,
+    released_position: Option<Position>,
     /// Each subscriber's slot number, parallel to [`release_guards`] and
     /// [`consumers`].
     ///
@@ -372,7 +372,7 @@ impl FanOut {
     }
 
     /// The last position this fan-out's subscribers have collectively released,
-    /// for an output that is a function of a `UInt` position domain.
+    /// for an output that is a function of a position domain.
     ///
     /// What a version keeping this fan-out has to know in order to place a
     /// recurrence over it. The producer beneath it will offer positions above
@@ -385,8 +385,8 @@ impl FanOut {
     /// iteration is not one of those cases: the position it got to is retained
     /// past the universal release that closed it
     /// ([`FanOutShared::released_position`]).
-    pub fn released_position(&self) -> Option<usize> {
-        self.shared.borrow().released_position
+    pub fn released_position(&self) -> Option<Position> {
+        self.shared.borrow().released_position.clone()
     }
 
     /// Reopen this fan-out for a fresh set of branches, keeping the inner
@@ -776,7 +776,7 @@ impl TileProducer for FanOutProducer {
         if let TileGuard::Function(FunctionGuard::Domain(pred)) = &intersection
             && let Some(position) = pred.max_released_position()
         {
-            shared.released_position = shared.released_position.max(Some(position));
+            shared.released_position = shared.released_position.clone().max(Some(position));
         }
         shared.released = intersection.clone();
         // In cyclic mode the inner producer can be temporarily taken out
