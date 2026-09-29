@@ -3564,34 +3564,6 @@ fn build_commit_store(
     })
 }
 
-/// Whether a `mut` loop over `extent` can express the releases its readers make.
-///
-/// A store releases a prefix of its domain as a **bound**, `at_or_below(p)`, because its
-/// positions are ordered and a consumer takes them in order. A **product** source — a
-/// comprehension over two sources, keyed by a record — releases per factor,
-/// `Predicate::Record{…}`, because shrinking one factor alone would drop pairs the other
-/// has not yet offered. Both describe subsets of one domain, but the guard algebra has no
-/// meet between them: `Predicate::union` has no arm for the pair and `split_record` cannot
-/// decompose a bound. So a drive and its readers releasing against one product domain
-/// cannot be reconciled.
-///
-/// A filtered source needs no case of its own: [`OpConversionContext::extent_of`] strips
-/// refinements at every level, so a restricted loop source arrives here as the extent it
-/// restricts.
-fn induction_domain_releases_as_a_prefix(extent: &Extent) -> bool {
-    !matches!(extent, Extent::Record(_))
-}
-
-/// Whether a prefix of `extent`'s positions has a predicate spelling, which the drive and
-/// its readers release through the frontier by (`domain_prefix`, `Predicate::at_or_below`).
-///
-/// A union key does not: its prefix is the tags ordered before the bound's tag whole, part
-/// of that tag, and none of the tags after it, where a union predicate states one `rest` for
-/// every tag it does not name (`src/interpreter/design-operators.md`, "Predicate").
-fn induction_domain_has_prefixes(extent: &Extent) -> bool {
-    !matches!(extent, Extent::Union(_))
-}
-
 /// A mutable variable's identity across versions of a program.
 ///
 /// The spelling carries the meaning and the index only disambiguates, because a
@@ -4493,22 +4465,6 @@ resolves to the other's value",
         ))
     })?;
     let induction_extent = ctx.extent_of(&strip_refinements(&raw_domain))?;
-    if !induction_domain_releases_as_a_prefix(&induction_extent) {
-        return Err(ConversionError::Unsupported(format!(
-            "a `mut` loop's source must have a domain its readers can release a prefix \
-             of, but this one is indexed by `{raw_domain}` — a comprehension over two \
-             sources (`[e for x in xs for y in ys]`) has a product domain, whose factors \
-             release independently"
-        )));
-    }
-    if !induction_domain_has_prefixes(&induction_extent) {
-        return Err(ConversionError::Unsupported(format!(
-            "a `mut` loop's source must have a domain whose prefixes a release can name, \
-             but this one is indexed by `{raw_domain}` — a concatenation (`xs ++ ys`) is \
-             keyed by a tagged union of its parts' positions, and a prefix of a union key \
-             has no predicate spelling"
-        )));
-    }
     // Where this store's recurrence starts, which is wherever its source still
     // offers positions. A source this version keeps has passed some of them
     // already; a freshly-built iteration over a data source resumes after the

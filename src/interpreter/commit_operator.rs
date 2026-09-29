@@ -71,7 +71,29 @@ use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_k
 use crate::interpreter::tile_operators::{
     OperatorBase, column_of_rows, impl_operator_base, impl_producer_base, stored_value_tile,
 };
-use crate::interpreter::tiling::{domain_prefix, running_frontier, store_frontier_rows};
+use crate::interpreter::tiling::{
+    domain_prefix_over, row_watermark, running_frontier, store_frontier_rows,
+};
+
+/// The domains of `tiling`'s levels, outermost first, down to and including a store's
+/// positions: what a path through a carrier or its source runs through.
+fn carrier_levels(tiling: &Tiling) -> Vec<Extent> {
+    let mut levels = Vec::new();
+    let mut at = tiling;
+    loop {
+        match at {
+            Tiling::DataFunction { domain, codomain } => {
+                levels.push(domain.clone());
+                at = codomain;
+            }
+            Tiling::Store { domain, .. } => {
+                levels.push(domain.clone());
+                return levels;
+            }
+            _ => return levels,
+        }
+    }
+}
 
 /// A transaction proposal, evaluated against a snapshot.
 ///
@@ -460,9 +482,9 @@ impl CommitEngine {
     /// engine that has not stepped yet. It is `at_or_below(w)` even when the latest
     /// position(s) carried no write, so a trailing run of carries stays decided — a
     /// changelog is sparse but the frontier is not.
-    fn frontier_predicate(&self) -> Predicate {
+    fn frontier_predicate(&self, domain: &Extent) -> Predicate {
         match self.decided_watermark() {
-            Some(w) => Predicate::at_or_below(w.value().clone()),
+            Some(w) => Predicate::at_or_below_in(w.value().clone(), domain),
             None => Predicate::False,
         }
     }
@@ -649,9 +671,9 @@ fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Til
     // own predicate is one statement for the whole level, so it says what the store still
     // running has decided — the only open one, the drive being sequential — and each row's
     // watermark is its own entry of `frontier`.
-    let open_frontier = engines
-        .last()
-        .map_or(Predicate::False, |engine| engine.frontier_predicate());
+    let open_frontier = engines.last().map_or(Predicate::False, |engine| {
+        engine.frontier_predicate(&domain)
+    });
     let mut seed_fields = HashMap::with_capacity(logs.len());
     let state = logs
         .into_iter()
@@ -973,14 +995,6 @@ fn is_whole_value(tile: &Tile) -> bool {
     }
 }
 
-/// The watermark `w` of a row's frontier predicate `at_or_below(w)` (the decode behind
-/// [`store_frontier`]). Terminality is a separate flag rather than a `True` frontier that
-/// would discard `w`, so the watermark reads directly and counts trailing carries. `None`
-/// for a row decided through nothing.
-fn frontier_from_domain(domain_predicate: &Predicate) -> Option<Position> {
-    domain_predicate.as_at_or_below().map(Position::new)
-}
-
 // ── Step-function reads over a `Tile::Store` changelog ────────────────────────
 //
 // A `Tile::Store` is its seed and its changelogs: key `k`'s holds the positions that
@@ -997,12 +1011,18 @@ fn frontier_from_domain(domain_predicate: &Predicate) -> Option<Position> {
 /// if `tile` is not a [`Tile::Store`] or that row is undecided. A store with no change at all is
 /// decided wherever its frontier says: the changelog is sparse, so an empty one is a
 /// run of carries over the seed rather than an absence of decisions.
-/// Mirrors [`frontier_from_domain`]: `at_or_below(w)` reads the watermark directly.
+///
+/// The watermark is read off the frontier's own entry rather than decoded from the predicate
+/// `at_or_below(w)` would state: over a record or a union position that predicate is a
+/// staircase, with no single bound to read back.
 pub fn store_frontier(tile: &Tile) -> Option<Position> {
     let Tile::Store { frontier, .. } = tile else {
         return None;
     };
-    frontier_from_domain(&running_frontier(frontier))
+    match frontier.rows() {
+        0 => None,
+        rows => row_watermark(frontier, rows - 1).map(Position::new),
+    }
 }
 
 /// `key`'s value as of position `t`: the latest change at a position `≤ t` whose delta
@@ -2397,7 +2417,7 @@ impl InductionStoreProducer {
     /// instead would claim that prefix in *every* row, including rows that have delivered
     /// nothing — and a release is a promise never to ask again.
     fn consumed_guard(&self, decided: &Path) -> TileGuard {
-        domain_prefix(decided.to_vec())
+        domain_prefix_over(decided.to_vec(), &carrier_levels(self.tiling()))
     }
 
     /// The path this carrier has decided through: the last row it opened at each level,
@@ -3050,10 +3070,9 @@ impl TileProducer for StoreFinalReadProducer {
         // release the `FanOut`'s meet cannot advance past this branch until the read retires,
         // which holds every version of every key for the length of the loop.
         if let Some(frontier) = store_frontier(&store) {
+            let levels = carrier_levels(self.store_producer.tiling());
             self.store_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::at_or_below(frontier.into_value()),
-                )));
+                .release(domain_prefix_over(vec![frontier.into_value()], &levels));
         }
         let settled = match &store {
             Tile::Store {
@@ -3889,7 +3908,7 @@ impl DriverWindow {
         self.highest_pushed
             .as_ref()
             .map_or(Predicate::False, |position| {
-                Predicate::at_or_below(position.value().clone())
+                Predicate::at_or_below_in(position.value().clone(), &self.domain)
             })
     }
 
@@ -4140,6 +4159,7 @@ impl TileOperator for InductionDriver {
             // arrival.
             source_released_through: self.resumed_after.clone().map(one_component),
             source_fully_released: false,
+            source_complete: Predicate::False,
             stated: None,
         })
     }
@@ -4180,6 +4200,10 @@ struct InductionDriverProducer {
     /// finished — the finite loop's `get_released_predicate() == True`
     /// end-state; issued once.
     source_fully_released: bool,
+    /// What the source has called complete of its positions, accumulated across pulls. A
+    /// complete position stays complete, but the source may stop saying so once this driver
+    /// has released it.
+    source_complete: Predicate,
     /// What the last pull stated complete of its positions, or `None` before the first. A
     /// pull that states more has changed its output, and wakes its consumer as an emission
     /// does.
@@ -4202,7 +4226,7 @@ impl InductionDriverProducer {
     /// Reclaim the prefix this drive has consumed, in the store's changelog and in the
     /// source, and close the source once the drive is over.
     ///
-    /// Both releases name a **path prefix** ([`domain_prefix`]), which for a drive with no
+    /// Both releases name a **path prefix** ([`domain_prefix_over`]), which for a drive with no
     /// rows above it is the watermark: everything up to the frontier.
     fn reclaim_consumed(&mut self, frontier: Option<&Path>, done: bool) {
         // The drive only ever folds at the *frontier*, and the store's GC preserves the
@@ -4211,8 +4235,9 @@ impl InductionDriverProducer {
         // `FanOut`-intersected release watermark could never advance past this cycle
         // branch and the changelog would grow with the loop.
         if let Some(frontier) = frontier {
+            let levels = carrier_levels(self.store_producer.tiling());
             self.store_producer
-                .release(domain_prefix(frontier.to_vec()));
+                .release(domain_prefix_over(frontier.to_vec(), &levels));
         }
         // The source prefix this drive has consumed. It only ever reads the position it is
         // about to emit and never re-reads an earlier one.
@@ -4222,8 +4247,9 @@ impl InductionDriverProducer {
                 .as_ref()
                 .is_some_and(|r| *r >= through)
         {
+            let levels = carrier_levels(self.source_producer.tiling());
             self.source_producer
-                .release(domain_prefix(through.to_vec()));
+                .release(domain_prefix_over(through.to_vec(), &levels));
             self.source_released_through = Some(through);
         }
         if done && !self.source_fully_released {
@@ -4260,10 +4286,10 @@ impl TileProducer for InductionDriverProducer {
         // collection carries its own levels beneath the position, so the path length is
         // the drive's own statement rather than a count of the source's levels.
         let by_path: HashMap<Path, Tile> = decode_source_paths(&src, 1).into_iter().collect();
-        // Invariant: a source delivers its positions in **ascending order** — a position
-        // at or below one already emitted never arrives later. The driver takes the
-        // smallest delivered path above its cursor and never looks back, so a late arrival
-        // below the cursor would be dropped in silence. A path at or below the cursor is
+        // Invariant: no path at or below the cursor arrives after the drive has passed it.
+        // The source may deliver in any order. The drive holds this by emitting a position
+        // only once the source calls every path before it complete (`waits` below), and
+        // nothing is added beneath a complete path. A path at or below the cursor is
         // still legitimate *here*: the release is what removes the consumed prefix, and
         // the source is free to honour it a pull late. The domain need not be contiguous —
         // a restricted source (`for l in [x for x in xs if p(x)]`) delivers a subset of
@@ -4285,6 +4311,13 @@ impl TileProducer for InductionDriverProducer {
                 ks
             }
         );
+        // What the source has called complete of its positions, accumulated across pulls.
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = src.values_at(CurryLevel::new(0))
+        {
+            self.source_complete = self.source_complete.union(domain_predicate);
+        }
         let store = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -4323,10 +4356,19 @@ impl TileProducer for InductionDriverProducer {
                 "a store that has decided a position carries every accumulator's value, \
                  so a carrying read of it resolves"
             );
-            if let (Some(snapshot), Some(item)) = (snapshot, by_path.get(&pos)) {
-                let (_, at) = pos
-                    .split_position()
-                    .unwrap_or_else(|| unreachable!("a delivered path names a position"));
+            let (_, at) = pos
+                .split_position()
+                .unwrap_or_else(|| unreachable!("a delivered path names a position"));
+            // Passing a position is final: the drive never looks back, so a position arriving
+            // below the cursor would be dropped. A source need not deliver in the drive's
+            // order. A product or a concatenation with a streamed part delivers a later
+            // position before an earlier one. So a position goes only once no position before
+            // it can still arrive, which is the source calling every such position complete.
+            // The drive waits on the positions before this one and on nothing after it.
+            let waits = !self
+                .source_complete
+                .subsumes(&Predicate::below_in(at.clone(), &self.window.domain));
+            if !waits && let (Some(snapshot), Some(item)) = (snapshot, by_path.get(&pos)) {
                 let position = Position::new(at.clone());
                 self.window
                     .push(snapshot, item.clone(), position.clone(), position);
@@ -4337,10 +4379,10 @@ impl TileProducer for InductionDriverProducer {
 
         // Every position of a complete source has been emitted: the body input is final,
         // and that terminality propagates through the body's decision stream to close the
-        // carrier's frontier. Positions arrive in ascending order, so "no delivered path
-        // above the cursor" means "there is no next" — the question a restricted source
-        // needs asked, since the position one past the cursor may simply not be in its
-        // domain.
+        // carrier's frontier. A complete source holds every path it will ever deliver, so
+        // "no delivered path above the cursor" means "there is no next" — the question a
+        // restricted source needs asked, since the position one past the cursor may simply
+        // not be in its domain.
         //
         // Not "and the store has decided them all", though the store owes a decision on
         // whatever was emitted this pull. The store is this drive's caller — it pulls the
@@ -4715,11 +4757,17 @@ impl TileProducer for TransactDriverProducer {
             // source's own release state this drive's progress record, so a
             // replacement drive is offered what this one did not finish and
             // nothing it did — see `src/ccl/design/program-evolution.md`,
-            // "Where a producer registering now starts".
+            // "Where a producer registering now starts". The prefix is spelled over the
+            // source's positions, which a concatenation keys by a union.
+            let Tiling::DataFunction {
+                domain: positions, ..
+            } = self.source_producer.tiling()
+            else {
+                unreachable!("a transaction source is a collection of items")
+            };
+            let prefix = Predicate::at_or_below_in(finished.into_value(), positions);
             self.source_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::at_or_below(finished.into_value()),
-                )));
+                .release(TileGuard::Function(FunctionGuard::Domain(prefix)));
         }
         self.window.acknowledge(pred);
         self.debug_assert_window_invariants();

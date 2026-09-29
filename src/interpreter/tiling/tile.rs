@@ -1897,8 +1897,8 @@ impl Tile {
             }
         }
         let head = domain.index_at(last);
-        // A prefix of a union domain names the tags ordered before the head's whole, which a
-        // union predicate cannot say (`Predicate::at_or_below`), so there is none to give.
+        // A prefix of a union domain names every tag of the domain (`Predicate::at_or_below_in`),
+        // and a tile holds only the tags of the keys it has, so there is none to give.
         if matches!(head, Value::Union { .. }) {
             return None;
         }
