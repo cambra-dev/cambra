@@ -1425,3 +1425,45 @@ fn a_collection_per_row_released_as_it_is_read() {
         "closing the source completes every row and delivers nothing new"
     );
 }
+
+/// A `mut` loop runs its positions in order over a source that delivers them out of order.
+/// A product or a concatenation with a streamed part delivers a later position before an
+/// earlier one: `(1, 0)` before `(0, 1)` when the inner factor streams, `1(0)` before
+/// `0(1)` when the first part does. The drive emits a position only once the source calls
+/// every path before it complete, so each case folds every position, in order.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::inner_factor_streams(
+    indoc::indoc! {r"
+        n := 0
+        for l in [x + y for x in [1, 2] for y in source1()]:
+            n := n * 100 + l
+        n
+    "},
+    2030304
+)]
+#[case::outer_factor_streams(
+    indoc::indoc! {r"
+        n := 0
+        for l in [x + y for x in source1() for y in [10, 20]]:
+            n := n * 100 + l
+        n
+    "},
+    11211222
+)]
+#[case::first_part_streams(
+    indoc::indoc! {r"
+        n := 0
+        for l in source1() ++ [100]:
+            n := n * 1000 + l
+        n
+    "},
+    1002100
+)]
+fn a_mut_loop_runs_in_order_over_positions_that_arrive_out_of_order(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}

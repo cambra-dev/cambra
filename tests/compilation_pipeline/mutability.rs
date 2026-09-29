@@ -1792,89 +1792,96 @@ acc",
     );
 }
 
-/// A `mut` loop over a **product** domain is rejected at op-conversion, at every
-/// spelling: let-bound, inline, joined, and over a source. A comprehension across
-/// two sources is keyed by `(i, j)`, and the induction recurrence is sequenced by
-/// `UInt` position end to end — the driver pairs items with `UInt` domain keys,
-/// `CommitEngine` ticks are positions, and `StoreDenseRead` folds tick `p + 1`.
-///
-/// Pinned because the failure is otherwise silent-adjacent. The driver's decode
-/// (`decode_source_positioned`) drops a non-`UInt` key rather than failing on it,
-/// so an unguarded product domain is an empty position set, which the driver reads
-/// as an exhausted source: a loop that runs zero times. What stopped that before
-/// this check was a tile-shape panic and an `unreachable!` further downstream —
-/// loud, but neither names the construct and neither is guaranteed to be reached
-/// first.
+/// A `mut` loop over a **product** domain runs its positions in pair order, at every
+/// spelling: let-bound, inline, and joined. Its positions are records, and the drive and its
+/// readers release what they have consumed as a staircase over the fields
+/// (`Predicate::at_or_below`). A loop over a **map** is the one-field case: its positions are
+/// keys, released as bounds like any other ([`a_mut_loop_over_a_map_carries_its_accumulator`]).
 #[rstest]
-#[case(
+#[case::let_bound(
     indoc! {r#"
         xs = [1, 2]
         ys = [10, 20]
         prod = [x + y for x in xs for y in ys]
         n := 0
         for l in prod:
-            n := n + 1
+            n := n + l
         n
-    "#}
+    "#},
+    66
 )]
-#[case(
+#[case::inline(
     indoc! {r#"
         xs = [1, 2]
         ys = [10, 20]
         n := 0
         for l in [x + y for x in xs for y in ys]:
-            n := n + 1
+            n := n + l
         n
-    "#}
+    "#},
+    66
 )]
-// The join spelling. Its domain is *refined* as well as a product, and it is the
-// case that reaches this check only because the filtered-source fix lets it past
-// the post-planning `typecheck`.
-#[case(
+// The join spelling, whose domain is refined as well as a product.
+#[case::joined(
     indoc! {r#"
         xs = [1, 2, 3]
         ys = [2, 3, 4]
         n := 0
         for l in [x for x in xs for y in ys if x == y]:
-            n := n + 1
+            n := n + l
         n
-    "#}
+    "#},
+    5
 )]
-// One side a live source: the product is `([0, 1], source(stdin))`, so neither
-// factor being a `UIntRange` is what decides it.
-#[case(
+// Order-dependent: the drive runs `(1, 3) (1, 4) (2, 3) (2, 4)`.
+#[case::in_pair_order(
     indoc! {r#"
-        xs = ["a", "b"]
-        n := 0
-        for l in [x + y for x in xs for y in stdin()]:
-            n := n + 1
-        n
-    "#}
+        acc := 0
+        for d in [x * 10 + y for x in [1, 2] for y in [3, 4]]:
+            acc := acc * 100 + d
+        acc
+    "#},
+    13142324
 )]
-fn a_mut_loop_over_a_product_domain_is_rejected(#[case] code: &str) {
-    expect_compile_error(code, "whose factors release independently");
+fn a_mut_loop_over_a_product_domain_runs_in_pair_order(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
 
-/// A `mut` loop over a **concatenation** is rejected at op-conversion, inline and
-/// let-bound. `xs ++ ys` is keyed by a tagged union of its parts' positions, and the drive
-/// releases what it has consumed as a prefix of its positions, which a union key has no
-/// predicate spelling for.
+/// A `mut` loop over a **concatenation** runs each part's positions in turn, inline and
+/// let-bound. `xs ++ ys` is keyed by a tagged union of its parts' positions, whose prefix
+/// takes every part before the bound's whole (`Predicate::at_or_below_in`).
 #[rstest]
-#[case(indoc! {r#"
-    acc := 0
-    for v in [1, 2] ++ [3]:
-        acc += v
-    acc
-"#})]
-#[case(indoc! {r#"
-    acc := 0
-    xs = [1, 2] ++ [3]
-    for v in xs:
-        acc += v
-    acc
-"#})]
-fn a_mut_loop_over_a_concatenation_is_rejected(#[case] code: &str) {
-    expect_compile_error(code, "a prefix of a union key has no predicate spelling");
+#[case::inline(
+    indoc! {r#"
+        acc := 0
+        for v in [1, 2] ++ [3]:
+            acc += v
+        acc
+    "#},
+    6
+)]
+#[case::let_bound(
+    indoc! {r#"
+        acc := 0
+        xs = [1, 2] ++ [3]
+        for v in xs:
+            acc += v
+        acc
+    "#},
+    6
+)]
+// Order-dependent, over three parts.
+#[case::in_part_order(
+    indoc! {r#"
+        acc := 0
+        for v in [1, 2] ++ [3] ++ [4, 5]:
+            acc := acc * 10 + v
+        acc
+    "#},
+    12345
+)]
+fn a_mut_loop_over_a_concatenation_runs_in_part_order(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
 
 /// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where

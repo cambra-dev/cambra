@@ -177,7 +177,7 @@ signal in tiles and as a region specifier in guards.
 | `Record(fields)` | A componentwise predicate over a record key: one predicate per field, with AND semantics. |
 | `Or(arms)` | A union of componentwise predicates no two of which join into one componentwise predicate, as `flatten_or` leaves it; three or more arms can still cover one componentwise predicate. Arms are always flat (no nested `Or`). |
 | `Qualified { enclosing, here }` | A key of an inner level **under the enclosing path that reaches it**: admits `(k₀ … k_d)` when `(k₀ … k_{d-1})` satisfies `enclosing` and `k_d` satisfies `here`. Built through `Predicate::qualified`, which drops the arm where `enclosing` admits everything. |
-| `Union { tags, rest }` | A predicate over a union-typed extent (`Extent::Union`): one predicate per named tag, and `rest` (`True` or `False`) for every tag it does not name. A value `Union { tag, inner }` satisfies it iff the predicate for `tag`, its own or `rest`, admits `inner`. A predicate need not name every tag of its domain: a column names only the tags it holds, which width subtyping makes fewer than its extent's, and a point names one. Built through `Predicate::tagged`, whose canonical form names no tag that says what `rest` does; `Predicate::over_every_tag` builds one from the whole tag set, which is `True` when every tag is. Used as the domain predicate on tiles emitted by `UnionProducer`, and split by `UnionProducer::release_impl` to forward each tag's predicate to the upstream input for that tag. |
+| `Union { tags, rest }` | A predicate over a union-typed extent (`Extent::Union`): one predicate per named tag, and `rest` (`True` or `False`) for every tag it does not name. A value `Union { tag, inner }` satisfies it iff the predicate for `tag`, its own or `rest`, admits `inner`. A predicate need not name every tag of its domain: a column names only the tags it holds, which width subtyping makes fewer than its extent's, and a point names one. Built through `Predicate::tagged`, whose canonical form names no tag that says what `rest` does; `Predicate::over_every_tag` builds one from the whole tag set, which is `True` when every tag is. Used as the domain predicate on tiles emitted by a tagged `UnionProducer`, and split by `UnionProducer::release_impl` to forward each tag's predicate to the upstream input for that tag. A flat union's domain is the one its arms share, which may itself be union-keyed, so its release forwards whole. |
 
 `Predicate::intersect()`, `union()`, `minus()`, and `subsumes()` are defined between any two
 predicates over one domain, and refuse two predicates over different domains.
@@ -189,8 +189,11 @@ A `Union` predicate in canonical form names only tags that differ from `rest`, s
 answers `None` for it; universality over a union domain is spelled `True`. The set operations
 (`intersect`, `minus`, `union`, `subsumes`) apply tag by tag over every tag either side names,
 reading an unnamed tag as its side's `rest`, and combine the two `rest`s the same way. A prefix
-of a union domain (`at_or_below` of a union value) has no spelling: it would need the tags
-ordered before the bound whole and those after it empty, which one `rest` cannot say.
+of a union domain takes the tags ordered before the bound whole and those after it not at all,
+which one `rest` cannot say, so it names every tag and needs the domain to name them from
+(`Predicate::at_or_below_in`,
+[Componentwise predicates and prefixes](#componentwise-predicates-and-prefixes)). `at_or_below`
+panics on a union value.
 
 ### Qualified predicates
 
@@ -257,6 +260,12 @@ A **prefix** of a lexicographic order is a staircase of componentwise predicates
 level, and `Predicate::at_or_below` builds one across a record key's fields. An interval is never built over
 record values, so a record key has only the componentwise algebra, and a prefix meets a per-field
 region under the same rules as any two componentwise predicates.
+
+A union key `𝑡(𝑣)` is ordered by its tag, then within the tag, so its prefix is every tag before
+`𝑡` whole, `𝑣`'s own prefix under `𝑡`, and no tag after. `Predicate::at_or_below_in` and
+`below_in` build it over the key's domain, which names the tags, and a record key's fields
+recurse with their own domains. `domain_prefix_over` passes each level's domain, which is how
+a loop over a concatenation releases what it has consumed.
 
 `subsumes` is exact. A union on the left may cover a componentwise predicate that no single arm
 covers, so where no arm answers alone it asks whether `other ∖ self` is empty. Exactness rests on
@@ -1011,9 +1020,8 @@ that holds no decision. Without that the frontier would move only at surviving p
 filtered row after the last survivor would never be decided, so a read of the store over the
 loop's extent would never emit or release it. Iterating the extent densely and gating the write
 would need the store to recover a filter the source's refined extent already carries. A product
-source, keyed by a record, is refused: its readers release it per factor where a drive releases a
-prefix, and the guard algebra has no meet between the two
-(`induction_domain_releases_as_a_prefix`).
+source is keyed by a record and a concatenation by a union, so a loop over a product runs its pairs
+in lexicographic order and one over a concatenation runs each part in turn.
 
 ### The driver
 
@@ -1028,7 +1036,11 @@ holds no part of the recurrence and reads the store on two axes:
 
 What the driver keeps is `emitted_through`, the item cursor, because a restricted source's
 positions are sparser than its extent's and the frontier does not name the next one. The next
-position is the smallest delivered path above it. An emitted row is otherwise a function of the
+position is the smallest delivered path above it, and it goes only once the source calls every
+path before it complete. A source need not deliver in the drive's order: a product or a
+concatenation with a streamed part delivers a later position before an earlier one. The drive
+never looks back, so a path arriving below the cursor would be dropped. It waits on the paths
+before the next position and on nothing after it. An emitted row is otherwise a function of the
 store tile and the source tile. The driver decodes the source into `(path, item)` pairs
 (`decode_source_paths`), since an async source's domain arrives unordered and compacts as its
 consumed prefix is released.
