@@ -2648,16 +2648,20 @@ impl TileProducer for InductionStoreProducer {
         // Undecided is a **path**, not a position: an inner position repeats across rows,
         // so only the path says which decision is meant. `decided_paths` is in drive order,
         // so the first past the cursor is the lowest.
-        let through = self.decided_path();
-        let undecided = decided_paths(&body_tile)
-            .into_iter()
-            .map(|(path, _)| path)
-            .find(|path| through.as_ref().is_none_or(|d| path > d));
-        debug_assert!(
-            !body_tile.is_terminal() || undecided.is_none(),
-            "induction store: the body's decision stream is terminal but still decides \
-             {undecided:?}, past the watermark {through:?}"
-        );
+        // The walk re-reads every decision, so it runs where the assertion does.
+        #[cfg(debug_assertions)]
+        {
+            let through = self.decided_path();
+            let undecided = decided_paths(&body_tile)
+                .into_iter()
+                .map(|(path, _)| path)
+                .find(|path| through.as_ref().is_none_or(|d| path > d));
+            debug_assert!(
+                !body_tile.is_terminal() || undecided.is_none(),
+                "induction store: the body's decision stream is terminal but still decides \
+                 {undecided:?}, past the watermark {through:?}"
+            );
+        }
         self.notifier.notify_if_changed(self.render_store())
     }
 

@@ -1855,6 +1855,28 @@ fn a_mut_loop_over_a_product_domain_is_rejected(#[case] code: &str) {
     expect_compile_error(code, "whose factors release independently");
 }
 
+/// A `mut` loop over a **concatenation** is rejected at op-conversion, inline and
+/// let-bound. `xs ++ ys` is keyed by a tagged union of its parts' positions, and the drive
+/// releases what it has consumed as a prefix of its positions, which a union key has no
+/// predicate spelling for.
+#[rstest]
+#[case(indoc! {r#"
+    acc := 0
+    for v in [1, 2] ++ [3]:
+        acc += v
+    acc
+"#})]
+#[case(indoc! {r#"
+    acc := 0
+    xs = [1, 2] ++ [3]
+    for v in xs:
+        acc += v
+    acc
+"#})]
+fn a_mut_loop_over_a_concatenation_is_rejected(#[case] code: &str) {
+    expect_compile_error(code, "a prefix of a union key has no predicate spelling");
+}
+
 /// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where
 /// the mutable variable genuinely crosses a function boundary. Pinned because `emit_let`
 /// now reads through an initializer that is a mutable variable, and widening that to argument

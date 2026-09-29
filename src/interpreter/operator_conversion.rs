@@ -3582,6 +3582,16 @@ fn induction_domain_releases_as_a_prefix(extent: &Extent) -> bool {
     !matches!(extent, Extent::Record(_))
 }
 
+/// Whether a prefix of `extent`'s positions has a predicate spelling, which the drive and
+/// its readers release through the frontier by (`domain_prefix`, `Predicate::at_or_below`).
+///
+/// A union key does not: its prefix is the tags ordered before the bound's tag whole, part
+/// of that tag, and none of the tags after it, where a union predicate states one `rest` for
+/// every tag it does not name (`src/interpreter/design-operators.md`, "Predicate").
+fn induction_domain_has_prefixes(extent: &Extent) -> bool {
+    !matches!(extent, Extent::Union(_))
+}
+
 /// A mutable variable's identity across versions of a program.
 ///
 /// The spelling carries the meaning and the index only disambiguates, because a
@@ -4489,6 +4499,14 @@ resolves to the other's value",
              of, but this one is indexed by `{raw_domain}` — a comprehension over two \
              sources (`[e for x in xs for y in ys]`) has a product domain, whose factors \
              release independently"
+        )));
+    }
+    if !induction_domain_has_prefixes(&induction_extent) {
+        return Err(ConversionError::Unsupported(format!(
+            "a `mut` loop's source must have a domain whose prefixes a release can name, \
+             but this one is indexed by `{raw_domain}` — a concatenation (`xs ++ ys`) is \
+             keyed by a tagged union of its parts' positions, and a prefix of a union key \
+             has no predicate spelling"
         )));
     }
     // Where this store's recurrence starts, which is wherever its source still
