@@ -4031,11 +4031,11 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
 /// the case that rebuild is for. `base` is read by the accumulator's init and by
 /// the trailing read's default, so a completed fold leaves both done with it and
 /// the `Memo` under it drops what it held.
-/// `p` is new in the replacement, so its init is compiled rather than seeded from
-/// a carried value, and compiling it reaches `base`. Keeping `base` there hands
-/// the store a branch that answers empty, and `InductionStore::subscribe` drains
-/// an init op to a scalar — so the reload panics with `init op for accumulator
-/// \`p(()) produced an empty scalar` instead of installing.
+/// `p` is new in the replacement, so its seed is compiled rather than taken from a
+/// carried value, and compiling it reaches `base`. Keeping `base` there hands the store a
+/// branch that answers empty, and a store opens only once its seed carries a value — so
+/// `p`'s store never opens and the loop stalls with the accumulator absent instead of
+/// folding.
 ///
 /// The iteration input at the same node is kept in the same reload, released in
 /// full and correctly so: it is reused for the position it reached, not for what

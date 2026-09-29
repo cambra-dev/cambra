@@ -229,9 +229,22 @@ impl Tiling {
             // and no key closed — a writer that has not been pulled yet may still
             // write any of them. The key space is the record's, so it is present from
             // the start even though nothing has been written.
-            Tiling::Store { .. } => Tile::Store {
-                state: Box::new(self.store_state().empty_at_rows(1)),
-                frontier: Predicate::False,
+            // Vectorized like every other tile: a flat store stands at one row, and a
+            // nested carrier's collection of them at one per enclosing row.
+            Tiling::Store { domain, codomain } => Tile::Store {
+                state: Box::new(self.store_state().empty_at_rows(rows)),
+                seed: Box::new(codomain.empty_at_rows(rows)),
+                decided: Box::new(Tile::grouped(
+                    ColumnValue::UInts(vec![0; rows]),
+                    ColumnValue::from_values(Vec::new(), domain),
+                    Box::new(Tile::Scalar(ColumnValue::Units(0))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                frontier: Box::new(super::store_frontier_rows(
+                    std::iter::repeat_n(None, rows),
+                    domain,
+                )),
                 terminal: false,
                 closed_keys: Vec::new(),
             },

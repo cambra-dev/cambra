@@ -1697,11 +1697,11 @@ fn trailing_hidden_writer_loop_compiles() {
 // ---------------------------------------------------------------------------
 // Compound (tuple / record) mutable variables
 //
-// A mutable variable holds one `Value`, so a tuple/record accumulator is a boxed
-// `Scalar(Record)` in the changelog, while a tuple/record *literal* compiles to
+// A mutable variable holds one `Value`, so a tuple/record accumulator is a materialized
+// `Scalar(Record)` in the changelog, while a tuple/record literal compiles to
 // a struct-of-arrays `Record` tiling. The two representations are reconciled at
-// the mutable variable boundaries (`read_initial_scalar` seeding, `flat_merge` decision
-// values, `ExtractFinal` extent-match) via `scalar_tile_to_column_value` /
+// the mutable variable boundaries (`seed_value` seeding, `flat_merge` decision
+// values, `ExtractFinal` extent-match) via `materialize_collections` /
 // `column_value_to_tile`. These pin that a compound induction accumulator folds,
 // reads-its-own-writes, and carries correctly.
 // ---------------------------------------------------------------------------
@@ -1852,7 +1852,7 @@ acc",
     "#}
 )]
 fn a_mut_loop_over_a_product_domain_is_rejected(#[case] code: &str) {
-    expect_compile_error(code, "must be indexed by iteration position");
+    expect_compile_error(code, "whose factors release independently");
 }
 
 /// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where
@@ -2916,6 +2916,132 @@ fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[cas
     use cambra::ccl::symbolic::symbolic;
     let planned = compile_to(code, Phase::Planning).expect("the nest plans");
     assert_eq!(symbolic(&planned), expected.trim_end());
+}
+
+// ---------------------------------------------------------------------------
+// A loop's iteration domain
+// ---------------------------------------------------------------------------
+//
+// A `mut` loop runs at its source's own keys, so a map drives one as a list does. A
+// `groupby` does not yet, for a reason that arises before its domain is reached. Each case
+// names the comprehension over the same collection, which compiles.
+
+/// A `mut` loop over a **map**, whose keys are its positions. The store records the
+/// positions it was driven at — `"a"` then `"b"` — and folds the accumulator over them,
+/// so a domain that cannot be enumerated from its type is a loop like any other.
+/// `sum([v for v in m])` over the same map answers 3 as well.
+#[test]
+fn a_mut_loop_over_a_map_carries_its_accumulator() {
+    check_scalar(
+        indoc! {r#"
+            m = map([("a", 1), ("b", 2)])
+            total := 0
+            for v in m:
+                total += v
+            total
+        "#},
+        cambra::interpreter::Value::Int(3),
+    );
+}
+
+/// A `mut` loop over a **`groupby`**, which fails earlier and louder than the map: the
+/// partition's key binder escapes into an open bound during inference rather than
+/// reaching the domain check at all. Recorded beside the map case because both are "a
+/// loop over a collection whose domain is not a position", and only one of them says
+/// so. Answers 150 when both are lifted.
+#[test]
+fn a_mut_loop_over_a_groupby_escapes_its_key_binder() {
+    check_compile_error(
+        indoc! {r#"
+            sales = [(region="west", amount=100), (region="east", amount=50)]
+            total := 0
+            for g in groupby(sales, \r -> r.region):
+                total += sum([s.amount for s in g])
+            total
+        "#},
+        "is free in the lower bound",
+    );
+}
+
+/// A second loop's accumulator seeded from the first loop's result, over a source long
+/// enough that the seed takes many pulls to settle.
+///
+/// A seed is ordinary dataflow: it settles over as many pulls as the loop feeding it takes
+/// positions, and the pull it settles on is the one that opens the store. Reading it at
+/// subscribe would bound a program by how much its seed's input can deliver before the
+/// runtime has started; the cases straddle eight positions to catch a read bounded there.
+#[rstest]
+#[case::seven(7, 28 + 100)]
+#[case::eight(8, 36 + 100)]
+#[case::twenty(20, 210 + 100)]
+fn a_later_accumulator_seeds_from_a_long_loops_result(#[case] n: i64, #[case] expected: i64) {
+    let items = (1..=n)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                a := 0
+                for x in [{items}]:
+                    a += x
+                b := a
+                for y in [100]:
+                    b += y
+                b
+            "#},
+            items = items,
+        ),
+        cambra::interpreter::Value::Int(expected),
+    );
+}
+
+/// A loop that runs no position answers with its seed, however many pulls the seed takes
+/// to settle: the body is done on the first pull, and the store still has to read the seed
+/// it answers with.
+#[rstest]
+#[case::filtered_empty("[z for z in [1, 2] if z > 5]")]
+#[case::contradictory_filters("[z for z in [1, 2] if z > 5 if z < 0]")]
+fn a_loop_that_runs_no_position_answers_with_a_late_seed(#[case] source: &str) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                a := 0
+                for x in [1, 2, 3]:
+                    a += x
+                b := a
+                for y in {source}:
+                    b += y
+                b
+            "#},
+            source = source,
+        ),
+        cambra::interpreter::Value::Int(6),
+    );
+}
+
+/// Two accumulators in one loop whose seeds settle on different pulls.
+///
+/// `b` seeds from a loop that takes many pulls to reach its final; `c` seeds from a
+/// literal, which is there on the first. A store holds one value per key before any
+/// position, so it cannot open until every key has one — opening on the first seed to
+/// arrive leaves the slow one with no value at all, and nothing asks again.
+#[test]
+fn a_store_waits_for_every_accumulators_seed() {
+    check_scalar(
+        indoc! {r#"
+            a := 0
+            for x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                a += x
+            b := a
+            c := 100
+            for y in [1, 2]:
+                b += y
+                c += y
+            b + c
+        "#},
+        cambra::interpreter::Value::Int(58 + 103),
+    );
 }
 
 /// An inner loop whose only statement is a call that writes nothing is dropped, as a flat

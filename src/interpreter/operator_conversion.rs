@@ -21,6 +21,7 @@ use crate::{
         Extent,
         FuncBinding,
         FunctionDef,
+        Position,
         Predicate,
         Tile,
         UnaryOpKind,
@@ -31,7 +32,7 @@ use crate::{
         commit_operator::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
-            store_frontier, store_value_at,
+            full_store_tiling, store_value_now,
         },
         operator_graph::{record_kept_operators, record_sink},
         tile_operators::{
@@ -313,9 +314,9 @@ enum StoreReadKind {
     Commit,
     /// An induction store backed by an [`InductionStore`] over a [`Tile::Store`]
     /// changelog: a read is a [`StoreDenseRead`] folding the changelog at every
-    /// position of the loop extent (`StoreReadInfo::induction_extent`) into the
-    /// dense history `D ⇀ V` — the changelog counterpart of `Induction`'s
-    /// `__hist.k`, serving both scalar-final and co-iterated reads.
+    /// position the store decided into the dense history `D ⇀ V` — the changelog
+    /// counterpart of `Induction`'s `__hist.k`, which a co-iterated read consumes. The
+    /// trailing read samples the store instead ([`StoreFinalRead`]).
     InductionChangelog,
 }
 
@@ -381,10 +382,6 @@ struct StoreReadInfo {
     keys: HashMap<String, KeyReadInfo>,
     /// Which engine backs the store (selects the read projection).
     kind: StoreReadKind,
-    /// The loop extent `D` an [`InductionChangelog`](StoreReadKind::InductionChangelog)
-    /// read enumerates (its [`StoreDenseRead`] trigger). `None` for a `commit` or
-    /// dense `Induction` store.
-    induction_extent: Option<Extent>,
 }
 
 /// Compilation context for tile compilation.
@@ -615,7 +612,9 @@ impl Recorded {
 /// has decided.
 struct IterationInput {
     op: Box<dyn TileOperator>,
-    first_position: usize,
+    /// The last position a predecessor drive reached over this input, or `None`
+    /// where it offers everything from the beginning. A drive resumes after it.
+    resumed_after: Option<Position>,
 }
 
 /// How much of the previous version's graph a compilation kept.
@@ -979,11 +978,11 @@ records one and the only site a `Transact` reaches"
     /// rather than refusing: the elements are gone, so folding from here is all
     /// that is left, and the source does not say whether it was meant.
     ///
-    /// `fresh_start` is where a freshly-built iteration begins, and the caller
-    /// picks it. An induction store passes [`source_start`], which is `0` for a
-    /// collection and a source's carried release for a source; a commit store
-    /// passes `0` throughout, because its drive attempts the lowest position the
-    /// source still offers rather than the one it is based at
+    /// `fresh_start` is what a freshly-built iteration resumes after, and the caller
+    /// picks it. An induction store passes [`source_start`], which is `None` for a
+    /// collection and a source's carried release for a source; a commit store passes
+    /// `None` throughout, because its drive attempts the lowest position the source
+    /// still offers rather than the one it is based at
     /// ([`TransactDriver`](crate::interpreter::commit_operator::TransactDriver)).
     ///
     /// Two things differ from [`bind_let`](Self::bind_let):
@@ -997,7 +996,7 @@ records one and the only site a `Transact` reaches"
     fn iteration_input(
         &mut self,
         term: &Expr,
-        fresh_start: usize,
+        fresh_start: Option<Position>,
         continues: bool,
         build: impl FnOnce(&mut Self) -> Result<Box<dyn TileOperator>, ConversionError>,
     ) -> Result<IterationInput, ConversionError> {
@@ -1024,12 +1023,12 @@ records one and the only site a `Transact` reaches"
                 // than carried alongside the values: what a recurrence may start
                 // on is a property of the input it reads, and the input is right
                 // here.
-                let first_position = released.map_or(fresh_start, |p| p + 1);
-                trace!("keeping iteration operator: first_position={first_position}");
+                let resumed_after = released.or(fresh_start.clone());
+                trace!("keeping iteration operator: resumed_after={resumed_after:?}");
                 self.record(node, kept);
                 return Ok(IterationInput {
                     op: fan.branch(),
-                    first_position,
+                    resumed_after,
                 });
             }
         }
@@ -1038,7 +1037,7 @@ records one and the only site a `Transact` reaches"
         self.record(node, Recorded::Operator(fan.clone()));
         Ok(IterationInput {
             op: fan.branch(),
-            first_position: fresh_start,
+            resumed_after: fresh_start,
         })
     }
 
@@ -1294,8 +1293,11 @@ in it has a correspondent",
                     .previous(source.node_id())
                     .and_then(|prev| self.minted.entries.get(&prev))
                     .and_then(|entry| entry.fan().released_position());
-                let begins = match kept {
-                    Some(released) => released + 1,
+                let begins = match kept.as_ref().map(Position::value) {
+                    // A stream index is what an element count is reported in; a loop
+                    // over any other domain has no prefix of elements to be missing.
+                    Some(Value::UInt(released)) => released + 1,
+                    Some(_) => continue,
                     // Read off the input's own domain rather than the store's,
                     // because the two store kinds are told this differently and
                     // both read the same elements. An induction drive is based at
@@ -1305,7 +1307,11 @@ in it has a correspondent",
                     None => source
                         .ty
                         .domain()
-                        .map_or(0, |d| source_start(&strip_refinements(&d), self)),
+                        .and_then(|d| source_start(&strip_refinements(&d), self))
+                        .map_or(0, |p| match p.into_value() {
+                            Value::UInt(n) => n + 1,
+                            _ => 0,
+                        }),
                 };
                 if begins == 0 {
                     continue;
@@ -1346,14 +1352,12 @@ in it has a correspondent",
                 );
                 continue;
             };
-            // No frontier means no position has been decided, so there is no
-            // accumulated value to hand over and nothing is lost by starting the
-            // replacement at its init.
-            let Some(frontier) = store_frontier(&tile) else {
-                continue;
-            };
+            // What each variable *is*, which is its value at the decided frontier or
+            // its seed where the store has decided nothing. A store that has run no
+            // position still holds a value to hand on: its own init, or — for one
+            // this version already resumed — the value the version before it left.
             for (path, key) in info.carried_keys() {
-                if let Some(value) = store_value_at(&tile, frontier, &key.runtime_key) {
+                if let Some(value) = store_value_now(&tile, &key.runtime_key) {
                     let prior = out.insert(path.clone(), value);
                     debug_assert!(
                         prior.is_none(),
@@ -2099,6 +2103,24 @@ fn convert_impl_inner(
         {
             expect_no_input(input, "final_or_default")?;
             match &argument.node {
+                // Over an **induction accumulator's own history**, the final value is a
+                // read of the store rather than a reduction of a stream: the store holds
+                // it at its frontier, and where the loop ran no position at all it holds
+                // the seed — which is the variable's init, or the value a retired
+                // version handed over, so the default has nothing left to supply. Taking
+                // it from the store is also what keeps a resumed loop honest: the
+                // positions its predecessor decided are not its own domain, so a stream
+                // over them would be empty and the default would answer with the
+                // declared init instead of the value carried in.
+                TypedExprNode::Tuple(elts)
+                    if elts.len() == 2
+                        && let Some((store, field)) = as_store_read(&elts[0], ctx)
+                        && ctx
+                            .lookup_store(&store)
+                            .is_some_and(|info| info.kind == StoreReadKind::InductionChangelog) =>
+                {
+                    convert_store_settled_read(&store, &field, ctx)
+                }
                 TypedExprNode::Tuple(elts) if elts.len() == 2 => {
                     let stream_op = convert_impl(&elts[0], None, ctx)?;
                     let default_op = convert_impl(&elts[1], None, ctx)?;
@@ -3334,32 +3356,9 @@ fn build_commit_store(
     }
     let key_extent = store_key_extent(key_arms);
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
-    // Per scalar key, an acyclic init operator seeding its tick-0 value (a literal
-    // init is the trivial op; a computed init drains to its scalar).
-    let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    // Whether this store continues a recurrence the retired version was running.
-    // A store whose seed summarizes positions has folded them already, so its
-    // drive resumes above them; one whose seed summarizes none needs its source
-    // from the beginning.
-    //
-    // Two ways a seed summarizes positions, and the identity of the variable is
-    // only the first. A variable that carries its own value is the ordinary
-    // reload. A variable seeded from a `@LoadFrom` is the other: its identity is
-    // new, so it carries nothing, while the value it starts at is one the retired
-    // version folded positions into. Asking only the identity would send such a
-    // store back over an input it has already counted.
-    //
-    // Answered for the store rather than for each key, because one store drives
-    // one position sequence: a key added beside one that resumes begins wherever
-    // that store resumes, and folding the two over different prefixes of one
-    // drive is not a thing the store can do.
-    let continues = paths
-        .iter()
-        .any(|path| ctx.inherited.mutable_state.contains_key(path))
-        || keys
-            .iter()
-            .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
-
+    // Per scalar key, the stream giving its seed, the value it holds before any commit (a
+    // literal init is a constant; a computed init streams to its value).
+    let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     // The store-wide per-commit value extent types a *proposal's* read and write set
     // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
     // the extent must describe them all: for a heterogeneous multi-key store
@@ -3375,21 +3374,21 @@ fn build_commit_store(
         if !value_extents.contains(&key_value_extent) {
             value_extents.push(key_value_extent.clone());
         }
-        // Seed tick 0 from the value the retired version left this variable
-        // holding, or from the key's (literal or computed) init op when this
+        // Seed the key from the value the retired version left this variable
+        // holding, or from the key's (literal or computed) init when this
         // version introduces it. Rebuilding a commit store therefore changes how
         // a transaction decides without discarding what it has committed — the
         // same rule the induction path follows, and the reason state is keyed by
         // variable rather than by store.
         let carried = ctx.inherited.mutable_state.get(&paths[i]);
-        let init_op: Box<dyn TileOperator> = match carried {
+        let seed_op: Box<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming transactional {field} from the retired version's value");
                 Box::new(Constant::new(carried.clone(), key_value_extent.clone()))
             }
             None => convert_impl(&k.init, None, ctx)?,
         };
-        init_ops.push((runtime_key.clone(), init_op));
+        seed_ops.push((runtime_key.clone(), seed_op));
         let prior = keys_map.insert(
             field,
             KeyReadInfo {
@@ -3445,7 +3444,7 @@ fn build_commit_store(
         }
     }
 
-    let commit = CommitOperator::with_init_ops(init_ops, store_values, writer_write_keys);
+    let commit = CommitOperator::with_seed_ops(seed_ops, store_values, writer_write_keys);
     let setters: Vec<_> = (0..writers.len())
         .map(|k| commit.writer_input_setter(k))
         .collect();
@@ -3472,8 +3471,8 @@ fn build_commit_store(
         // comparison, where the induction drive's window would stall.
         let IterationInput {
             op: source_op,
-            first_position: drive_resume,
-        } = ctx.iteration_input(&w.source, 0, continues, |ctx| {
+            resumed_after: drive_resume,
+        } = ctx.iteration_input(&w.source, None, continues, |ctx| {
             convert_impl(&w.source, None, ctx)
         })?;
         // The body's input is the driver's tile, `(snap_{k₀}, …, item)`; the
@@ -3503,15 +3502,17 @@ fn build_commit_store(
         // Two branches of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver advances its item cursor on the release
         // *intersection*, so a body's consume-release cannot advance it past an
-        // attempt still in flight.
+        // attempt still in flight — and so this is the one fan whose input is **not**
+        // memoized. A `Memo` releases its input as soon as it caches, which reaches the
+        // driver as an ack for an attempt no branch has finished.
         let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
         // The body runs over the store's own domain, whatever the `Transact` sits in.
         let body_op = convert_at(&w.body, Some(driver_fan.branch()), CurryLevel::new(1), ctx)?;
         // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
-        // `Fun(Txn, V)` value-stream off the shared log. A tap takes no `init_op` —
-        // it has no tick-0 value, so its stream starts at the first reply.
+        // `Fun(Txn, V)` value-stream off the shared log. A tap takes no seed op —
+        // it has no seed, so its stream starts at the first reply.
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
         let mut tap_fields: Vec<String> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
@@ -3558,22 +3559,27 @@ fn build_commit_store(
         fan: store_fan,
         keys: keys_map,
         kind: StoreReadKind::Commit,
-        induction_extent: None,
         // Set by `bind_store`, which is what knows the store's identity.
         site: ContentHash(0),
     })
 }
 
-/// Whether `extent` enumerates `UInt` positions, the only shape the induction
-/// recurrence can sequence.
+/// Whether a `mut` loop over `extent` can express the releases its readers make.
 ///
-/// A filtered source needs no case of its own: [`OpConversionContext::extent_of`]
-/// strips refinements at every level, so a restricted loop source arrives here as
-/// the extent it restricts. [`Extent::Restricted`] cannot arrive at all — nothing
-/// outside `extent.rs` constructs one, and iterating one panics
-/// ([`crate::interpreter::tile_operators::IterateExtent`]).
-fn induction_extent_is_positional(extent: &Extent) -> bool {
-    matches!(extent, Extent::UIntRange(_) | Extent::DataSourceDomain(_))
+/// A store releases a prefix of its domain as a **bound**, `at_or_below(p)`, because its
+/// positions are ordered and a consumer takes them in order. A **product** source — a
+/// comprehension over two sources, keyed by a record — releases per factor,
+/// `Predicate::Record{…}`, because shrinking one factor alone would drop pairs the other
+/// has not yet offered. Both describe subsets of one domain, but the guard algebra has no
+/// meet between them: `Predicate::union` has no arm for the pair and `split_record` cannot
+/// decompose a bound. So a drive and its readers releasing against one product domain
+/// cannot be reconciled.
+///
+/// A filtered source needs no case of its own: [`OpConversionContext::extent_of`] strips
+/// refinements at every level, so a restricted loop source arrives here as the extent it
+/// restricts.
+fn induction_domain_releases_as_a_prefix(extent: &Extent) -> bool {
+    !matches!(extent, Extent::Record(_))
 }
 
 /// A mutable variable's identity across versions of a program.
@@ -3637,15 +3643,20 @@ impl std::fmt::Display for VarPath {
     }
 }
 
-/// The first position the source `domain` names will offer a producer registering
-/// now, or `0` for a domain that is not a source.
-fn source_start(domain: &Type, ctx: &OpConversionContext) -> usize {
+/// What a drive over the source `domain` names, registering now, resumes after: the index
+/// below the first one the source will offer it, or `None` where it is offered everything
+/// from the start, as it always is over a domain that is not a source.
+fn source_start(domain: &Type, ctx: &OpConversionContext) -> Option<Position> {
     let Type::DataSource(name) = domain else {
-        return 0;
+        return None;
     };
-    ctx.sources.get(name).map_or(0, |source| {
+    // A stream buffer names the next index it offers, so what a drive over it
+    // resumes after is the one below. A collection offers every position it has, so
+    // a drive over one resumes after nothing.
+    let next = ctx.sources.get(name).map_or(0, |source| {
         source.borrow().first_position_for_a_new_producer()
-    })
+    });
+    next.checked_sub(1).map(|p| Position::new(Value::UInt(p)))
 }
 
 /// The variable `site` declares in the new version, when that is not `path`.
@@ -4290,6 +4301,83 @@ fn build_induction_store(
     build_induction_store_single(keys, w, domain, paths, ctx)
 }
 
+/// The parts of a carrier's store that come from its writer site: the read keys' extents,
+/// the write keys, the reply-tap fields, and the per-key state tiling.
+///
+/// A tap is a write-only changelog key appended after the accumulators — a per-position
+/// event rather than a carried mutable variable (`carried: None`), holding
+/// `` {`fired{𝑉} | `idle} `` and omitted from the delta where it is `` `idle ``. `keys_map`
+/// arrives holding the accumulators and leaves holding the taps beside them.
+fn carrier_store_parts(
+    w: &WriterSite,
+    taps: Vec<(String, Type)>,
+    keys_map: &mut HashMap<String, KeyReadInfo>,
+    ctx: &mut OpConversionContext,
+) -> Result<CarrierStoreParts, ConversionError> {
+    let read_extents: Vec<Extent> = w
+        .read_keys
+        .iter()
+        .map(|rk| {
+            keys_map
+                .get(&rk.field_key())
+                .map(|info| info.value_extent.clone())
+                .ok_or_else(|| {
+                    ConversionError::Unsupported(format!("read key {rk} is not a store key"))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut write_keys: Vec<Value> = w
+        .write_keys
+        .iter()
+        .map(|n| store_key(&n.field_key(), Value::Unit))
+        .collect();
+    let mut tap_fields: Vec<String> = Vec::new();
+    for (field, tap_ty) in taps {
+        let value_extent = ctx.extent_of(&tap_ty)?;
+        let runtime_key = store_key(&field, Value::Unit);
+        write_keys.push(runtime_key.clone());
+        let prior = keys_map.insert(
+            field.clone(),
+            KeyReadInfo {
+                carried: None, // a tap fires only at its own position
+                runtime_key,
+                value_extent,
+            },
+        );
+        // A tap is minted into the double-underscore namespace
+        // ([`Name::defer_tap_field`]), so it cannot be an accumulator's spelling;
+        // this catches two taps landing on one field.
+        debug_assert!(
+            prior.is_none(),
+            "two of this store's keys are labeled `{field}`, so one read resolves \
+to the other's value",
+        );
+        tap_fields.push(field);
+    }
+    let store_values = keys_map
+        .iter()
+        .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
+        .collect();
+    Ok(CarrierStoreParts {
+        read_extents,
+        write_keys,
+        tap_fields,
+        store_values,
+    })
+}
+
+/// What [`carrier_store_parts`] assembles.
+struct CarrierStoreParts {
+    /// Per read key, the extent its value has — in body-parameter order.
+    read_extents: Vec<Extent>,
+    /// Keys written, in decision-`writes` order: the accumulators, then the tap keys.
+    write_keys: Vec<Value>,
+    /// The reply-tap fields, appended to each write set.
+    tap_fields: Vec<String>,
+    /// The store's state, one field per key.
+    store_values: HashMap<String, Tiling>,
+}
+
 /// Build a single-writer induction store as a position-driven [`InductionStore`]
 /// over a [`Tile::Store`] changelog, wired as a cycle through a
 /// `FanOut::new_cyclic`: the store consumes the body's decisions, and an
@@ -4297,9 +4385,9 @@ fn build_induction_store(
 /// `(prev…, item)` input. Mirrors [`build_commit_store`]'s writer setup, but
 /// driven by iteration position — one writer, no conflict, no retry. Reads
 /// mutable variable as [`StoreReadKind::InductionChangelog`]:
-/// each `__hist.k` folds the changelog densely over the loop extent via
-/// [`StoreDenseRead`], serving both a scalar-final read (`ExtractFinal` over it)
-/// and a co-iterated read (the dense `Fun(D, V)` itself).
+/// each `__hist.k` folds the changelog at every position the store decided via
+/// [`StoreDenseRead`], the dense `Fun(D, V)` a co-iterated read consumes; the trailing
+/// read is [`StoreFinalRead`].
 fn build_induction_store_single(
     keys: &[TransactKey],
     w: &WriterSite,
@@ -4334,11 +4422,11 @@ fn build_induction_store_single(
             .iter()
             .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
 
-    // Each accumulator becomes a mutable variable key: its init op (the fold default, read
-    // once at subscribe) plus a dense-read entry carrying the init as the
-    // leading-carry fold default.
+    // Each accumulator becomes a mutable variable key: its seed op (its value before any
+    // position, read per pull until it settles) plus a dense-read entry carrying that
+    // value as the leading-carry fold default.
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
-    let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
+    let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
         let rk = store_key(&field, Value::Unit);
@@ -4349,23 +4437,23 @@ fn build_induction_store_single(
         // discarding what it had accumulated, which is what distinguishes
         // swapping the logic from recomputing the program.
         let carried = ctx.inherited.mutable_state.get(&paths[i]);
-        let init_op: Box<dyn TileOperator> = match carried {
+        let seed_op: Box<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming {field} from the retired version's value");
                 Box::new(Constant::new(carried.clone(), value_extent.clone()))
             }
             None => convert_impl(&k.init, None, ctx)?,
         };
-        init_ops.push((rk.clone(), init_op));
+        seed_ops.push((rk.clone(), seed_op));
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
                 // An accumulator persists across positions. A literal init is the
                 // leading-carry fold default; a *conditional* single-writer loop
                 // does have leading carries (positions before the first
-                // committing write), and those read the accumulator's seed,
-                // supplied by the tick-0 init in `CommitEngine::new(inits)` — not
-                // this default, which anchors a computed-init empty fold.
+                // committing write), and those read the accumulator's seed, which the
+                // store holds beside its changelog — not this default, which anchors a
+                // computed-init empty fold.
                 carried: Some(paths[i].clone()),
                 runtime_key: rk,
                 value_extent,
@@ -4395,95 +4483,45 @@ resolves to the other's value",
         ))
     })?;
     let induction_extent = ctx.extent_of(&strip_refinements(&raw_domain))?;
-    // The recurrence is sequenced by `UInt` position end to end: the driver pairs
-    // items with `UInt` domain keys, `CommitEngine` ticks are positions, and
-    // `StoreDenseRead` folds tick `p + 1` at each. A product domain (a
-    // comprehension over two sources, whose keys are `(i, j)` records) satisfies
-    // none of that. Rejected here rather than deeper, because the deeper failures
-    // are a tile-shape panic and an `unreachable!` in the dense read, and because
-    // the driver's own decode drops a non-`UInt` key silently — an empty position
-    // set reads to it as an exhausted source, so an unguarded product domain is a
-    // loop that runs zero times rather than one that fails.
-    if !induction_extent_is_positional(&induction_extent) {
+    if !induction_domain_releases_as_a_prefix(&induction_extent) {
         return Err(ConversionError::Unsupported(format!(
-            "a `mut` loop's source must be indexed by iteration position, but this \
-             one is indexed by `{raw_domain}` — a comprehension over two sources \
-             (`[e for x in xs for y in ys]`) has a product domain, which the \
-             induction recurrence cannot sequence"
+            "a `mut` loop's source must have a domain its readers can release a prefix \
+             of, but this one is indexed by `{raw_domain}` — a comprehension over two \
+             sources (`[e for x in xs for y in ys]`) has a product domain, whose factors \
+             release independently"
         )));
     }
     // Where this store's recurrence starts, which is wherever its source still
     // offers positions. A source this version keeps has passed some of them
-    // already; a freshly-built iteration over a data source starts at the release
-    // that source carried forward ([`source_start`]), and one over a collection at
-    // `0`.
+    // already; a freshly-built iteration over a data source resumes after the
+    // release that source carried forward ([`source_start`]), and one over a
+    // collection after nothing.
     //
-    // Both the store's seed tick and the drive's window base come from this: a
-    // store based below every position its input will offer waits for an element
+    // Both the store's decided frontier and the drive's window base come from this:
+    // a store based below every position its input will offer waits for an element
     // that is not coming.
     let IterationInput {
         op: source_op,
-        first_position: resume_at,
+        resumed_after,
     } = ctx.iteration_input(&w.source, source_start(&domain, ctx), continues, |ctx| {
         convert_impl(&w.source, None, ctx)
     })?;
-    let read_extents: Vec<Extent> = w
-        .read_keys
-        .iter()
-        .map(|rk| {
-            keys_map
-                .get(&rk.field_key())
-                .map(|info| info.value_extent.clone())
-                .ok_or_else(|| {
-                    ConversionError::Unsupported(format!(
-                        "induction read key {rk} is not a store key"
-                    ))
-                })
-        })
-        .collect::<Result<_, _>>()?;
-    // A reply (`out << e`) rides this loop body as `__to_<defer>` decision taps —
-    // the same shape a commit writer carries (see `build_commit_store`). Each tap
-    // becomes a write-only changelog key (appended after the accumulator keys), so
-    // its per-position value rides the committing change and is read back densely.
-    // A tap is a per-position event, not a carried mutable variable (`carried:
-    // None`): it appears only at the position that fired it. A tap holds
-    // `` {`fired{𝑉} | `idle} ``, and the producer omits an `` `idle `` one from the
-    // delta.
-    let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
-    let mut tap_fields: Vec<String> = Vec::new();
-    for (field, tap_ty) in taps {
-        let tap_value_extent = ctx.extent_of(&tap_ty)?;
-        write_keys.push(store_key(&field, Value::Unit));
-        let prior = keys_map.insert(
-            field.clone(),
-            KeyReadInfo {
-                carried: None, // a tap fires only at its own position
-                runtime_key: store_key(&field, Value::Unit),
-                value_extent: tap_value_extent,
-            },
-        );
-        // A tap is minted into the double-underscore namespace
-        // ([`Name::defer_tap_field`]), so it cannot be an accumulator's spelling;
-        // this catches two taps landing on one field.
-        debug_assert!(
-            prior.is_none(),
-            "two of this store's keys are labeled `{field}`, so one read resolves \
-to the other's value",
-        );
-        tap_fields.push(field);
-    }
+    // A reply (`out << e`) rides this loop body as `__to_<defer>` decision taps — the same
+    // shape a commit writer carries (see `build_commit_store`) — so the write keys, the tap
+    // fields and the per-key state come from the shared assembly.
+    let parts = carrier_store_parts(w, taps, &mut keys_map, ctx)?;
 
     // As in `build_commit_store`: the store, its fan branches and its driver are
     // all minted after the writer's own subexpressions have been converted, so
     // they attribute to the writer rather than to the enclosing binding.
     let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
-    // The store's state, one field per key — accumulators and taps alike, each a scalar of
-    // its own value extent.
-    let store_values: HashMap<String, Tiling> = keys_map
-        .iter()
-        .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
-        .collect();
-    let store = InductionStore::new(init_ops, write_keys, tap_fields, store_values, resume_at);
+    let store = InductionStore::new(
+        seed_ops,
+        parts.write_keys,
+        parts.tap_fields,
+        full_store_tiling(induction_extent.clone(), parts.store_values),
+        resumed_after.clone(),
+    );
     let set_body = store.body_input_setter();
     // Cyclic: the driver reads this store's changelog back to recover each
     // position's previous accumulator, so one fan branch feeds the cycle and the
@@ -4495,9 +4533,10 @@ to the other's value",
         fan.recurrence_branch(),
         source_op,
         w.read_keys.iter().map(runtime_key).collect(),
-        read_extents,
+        parts.read_extents,
         item_extent,
-        resume_at,
+        induction_extent.clone(),
+        resumed_after,
     );
     // The body runs over the store's own domain, whatever the `Transact` sits in.
     set_body(convert_at(
@@ -4510,7 +4549,6 @@ to the other's value",
         fan,
         keys: keys_map,
         kind: StoreReadKind::InductionChangelog,
-        induction_extent: Some(induction_extent),
         // Set by `bind_store`, which is what knows the store's identity.
         site: ContentHash(0),
     })
@@ -4611,9 +4649,9 @@ fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> 
 /// Compile a surface `await_final(x)` — a [`Builtin::FinalRead`] naming `x`'s history
 /// binding — as a [`StoreFinalRead`] over the store branch.
 ///
-/// A commit store only: an induction accumulator's trailing read is a genuine reduction
-/// over its dense per-position stream, because a loop ends positionally rather than by a
-/// key's writers draining, and `transact_phase` never mints a `FinalRead` for one.
+/// A commit store only: `transact_phase` never mints a `FinalRead` for an induction
+/// accumulator, whose trailing read is `final_or_default` over its history. That reaches
+/// the same [`convert_store_settled_read`] from `final_or_default`'s applied arm.
 fn convert_store_final_read(
     store_name: &Name,
     field: &str,
@@ -4628,6 +4666,22 @@ fn convert_store_final_read(
              read is only minted for a `Mut(V, Txn)` key"
         )));
     }
+    convert_store_settled_read(store_name, field, ctx)
+}
+
+/// A key's value once its store has settled — [`StoreFinalRead`] over the store fan.
+///
+/// Shared by the two terminal reads, which differ in what mints them and not in what
+/// they sample: a surface `await_final` on a `Txn` key, and `final_or_default` over an
+/// induction accumulator's own history.
+fn convert_store_settled_read(
+    store_name: &Name,
+    field: &str,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let info = ctx.lookup_store(store_name).ok_or_else(|| {
+        ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
+    })?;
     let key = info.keys.get(field).ok_or_else(|| {
         ConversionError::Unsupported(format!("unknown key {field} on store {store_name}"))
     })?;
@@ -4651,7 +4705,7 @@ fn convert_store_read(
     field: &str,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let (fan, kind, induction_extent, key) = {
+    let (fan, kind, key) = {
         let info = ctx.lookup_store(store_name).ok_or_else(|| {
             ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
         })?;
@@ -4662,44 +4716,27 @@ fn convert_store_read(
                 k.carry_forward(),
             )
         });
-        (
-            info.fan.clone(),
-            info.kind,
-            info.induction_extent.clone(),
-            key,
-        )
+        (info.fan.clone(), info.kind, key)
     };
     match (kind, key) {
-        // A `Txn` store key as a [`StoreValueStream`] over the commit-log map,
-        // keyed by `runtime_key`. A **history** read carries a mutable variable's
-        // value forward across ticks that wrote other keys (a reply tap already
-        // emits only at its write tick). A **completion** read never carries: it
-        // wants the key's last *write*, and the un-carried stream is the one that
-        // closes when this key's writers drain instead of when the whole store
-        // does — which is what makes `await_final(x)` independent of a store-mate
-        // still committing. `final_or_default(stream, init)` then reduces it with
-        // `ExtractFinal`, supplying the seed when the key was never written.
+        // A `Txn` store key as a [`StoreValueStream`] over the commit log, keyed by
+        // `runtime_key`. The key's registration fixes `carry_forward`: a mutable
+        // variable holds its value across ticks that wrote other keys, and a reply tap
+        // appears only at the tick that wrote it.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => Ok(Box::new(
             StoreValueStream::new(fan.branch(), runtime_key, value_extent, carry_forward),
         )),
-        // An `InductionChangelog` key read off the changelog, folded at every
-        // position of the loop extent via [`StoreDenseRead`] (an `IterateExtent(D)`
-        // trigger + the store branch). An **accumulator** (`carry_forward: true`)
-        // is dense `D ⇀ V` — every position folds the latest write ≤ it (leading
-        // carries fold to the tick-0 seed); `recognize` wraps a scalar read in
-        // `final_or_default` → `ExtractFinal`, a co-iterated read consumes the dense
-        // function directly. A **reply tap** (`carry_forward: false`) is the feed's
-        // per-position value stream: only the positions where the tap fired
-        // (its value present in that position's changelog delta), keyed by loop
-        // position — the same `Fun(D, V)` the sink reads.
+        // An `InductionChangelog` key read off the changelog by [`StoreDenseRead`],
+        // folded at every position the store decided. An **accumulator**
+        // (`carry_forward: true`) is dense `D ⇀ V`: every position folds the latest write
+        // ≤ it, and a leading carry folds to the store's seed. A co-iterated read consumes
+        // it directly; a trailing scalar read never reaches here, since `final_or_default`
+        // over the accumulator's own history compiles to `StoreFinalRead`. A **reply tap**
+        // (`carry_forward: false`) is the feed's per-position value stream: only the
+        // positions where the tap fired, keyed by loop position — the same `Fun(D, V)` the
+        // sink reads.
         (StoreReadKind::InductionChangelog, Some((runtime_key, value_extent, carry_forward))) => {
-            let extent = induction_extent.ok_or_else(|| {
-                ConversionError::Unsupported(format!(
-                    "induction-changelog store {store_name} has no loop extent"
-                ))
-            })?;
             Ok(Box::new(StoreDenseRead::new(
-                Box::new(IterateExtent::new(extent)),
                 fan.branch(),
                 runtime_key,
                 value_extent,

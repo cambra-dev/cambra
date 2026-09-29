@@ -336,6 +336,7 @@ struct Entry {
 enum EntryValue {
     Key,
     Value(Option<Value>),
+    Frontier(Option<crate::interpreter::Position>),
     Row(Tile),
 }
 
@@ -418,6 +419,64 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                             },
                         },
                     );
+                }
+            }
+            // A store's row is what it answers: its frontier, each key's seed, and each
+            // key's value at every position it has decided. Its changelog is only how it
+            // answers — reclaiming a released prefix keeps every carry source a live
+            // position folds to, so the answers outside what was released do not move.
+            Tile::Store { .. } => {
+                use crate::interpreter::commit_operator::{
+                    store_decided_positions, store_frontier, store_seed_value, store_value_at,
+                };
+                use crate::interpreter::operator_conversion::store_key;
+                for (row, path) in rows.iter().enumerate() {
+                    let Some(path) = path else { continue };
+                    let one = tile.select_rows(&[row]);
+                    // A store's seed is fixed for its whole life and a decided position's
+                    // value never changes, so both are final wherever the store stands; its
+                    // frontier only moves forward, which `assert_complete_region_unchanged`
+                    // checks on its own.
+                    let complete = true;
+                    let entry = |value: EntryValue| Entry { value, complete };
+                    let at_label = |name: &str| {
+                        let mut l = label.to_vec();
+                        l.push(name.to_string());
+                        l
+                    };
+                    entries.insert(
+                        (at_label("frontier"), path.clone()),
+                        Entry {
+                            value: EntryValue::Frontier(store_frontier(&one)),
+                            complete: false,
+                        },
+                    );
+                    let Tile::Store { decided, .. } = &one else {
+                        unreachable!("a store's rows are stores")
+                    };
+                    let positions = store_decided_positions(decided, 0);
+                    let names: Vec<String> = one.store_keys().cloned().collect();
+                    for name in names {
+                        let key = store_key(&name, Value::Unit);
+                        // A store waiting for its seed has none yet; once it has one it
+                        // keeps it.
+                        let seed = store_seed_value(&one, &key);
+                        entries.insert(
+                            (at_label(&format!("seed.{name}")), path.clone()),
+                            Entry {
+                                complete: seed.is_some(),
+                                value: EntryValue::Value(seed),
+                            },
+                        );
+                        for position in &positions {
+                            let mut at = path.clone();
+                            at.push(position.value().clone());
+                            entries.insert(
+                                (at_label(&name), at),
+                                entry(EntryValue::Value(store_value_at(&one, position, &key))),
+                            );
+                        }
+                    }
                 }
             }
             // An aggregation is one accumulator per row, compared row by row. Beneath no
@@ -542,6 +601,25 @@ pub(crate) fn assert_complete_region_unchanged(
                 now.map(|n| &n.value)
             ),
         }
+    }
+    // A store's frontier only moves forward: a position it has decided stays decided.
+    for (key, entry) in &last_entries {
+        let (
+            EntryValue::Frontier(Some(then)),
+            Some(Entry {
+                value: EntryValue::Frontier(now),
+                ..
+            }),
+        ) = (&entry.value, result_entries.get(key))
+        else {
+            continue;
+        };
+        assert!(
+            now.as_ref().is_some_and(|now| now >= then),
+            "{name} moved the frontier of {:?} at {:?} back: {then:?} then {now:?}",
+            key.0,
+            key.1
+        );
     }
     for (label, path) in result_entries.keys() {
         if last_entries.contains_key(&(label.clone(), path.clone())) || path.is_empty() {

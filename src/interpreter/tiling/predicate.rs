@@ -13,7 +13,7 @@ use intervalsets::{
 
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
-    interpreter::{ColumnValue, Extent, Tile, UnionArm, Value, transform_hashmap_values},
+    interpreter::{ColumnValue, Extent, Position, Tile, UnionArm, Value, transform_hashmap_values},
 };
 
 /// Whether two predicates admit the same values, whatever each is spelled as.
@@ -224,21 +224,18 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    /// The largest position this predicate covers, for a prefix-style release of
-    /// a monotone `UInt` domain — a commit clock or an iteration's positions.
+    /// The largest position this predicate covers, for a prefix-style release of a
+    /// monotone domain — a commit clock or an iteration's positions.
     ///
-    /// `None` for a predicate with no concrete upper bound (`True`, `False`,
-    /// non-`UInt`). `True` is the terminal release, after which the consumer
-    /// pulls no more, so there is no position to advance past.
-    pub fn max_released_position(&self) -> Option<usize> {
+    /// `None` for a predicate with no concrete upper bound (`True`, `False`). `True` is
+    /// the terminal release, after which the consumer pulls no more, so there is no
+    /// position to advance past.
+    pub fn max_released_position(&self) -> Option<Position> {
         match self {
             Predicate::Intervals(iset) => iset
                 .intervals()
                 .iter()
-                .filter_map(|iv| match iv.rval() {
-                    Some(&Value::UInt(k)) => Some(k),
-                    _ => None,
-                })
+                .filter_map(|iv| iv.rval().cloned().map(Position::new))
                 .max(),
             Predicate::Or(arms) => arms
                 .iter()
