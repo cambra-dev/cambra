@@ -1332,16 +1332,33 @@ fn a_nest_over_a_streamed_source_runs_as_the_source_arrives(
     assert_eq!(innermost_ints(&tile), last, "once the source closes");
 }
 
-/// A nest summed at both levels answers once the source closes, the earliest a scalar sum
-/// can say it is whole.
+/// A nest totalled at both levels, by a loop over a source nested in a loop over a list or by
+/// the comprehension form of the same pairing, answers once the source closes: the earliest a
+/// scalar total can say it is whole.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
-fn a_summed_nest_over_a_streamed_source_answers_at_the_close() {
-    let tile = run_in_batches(
-        "sum([sum([y * x for y in source1()]) for x in [1, 2]])",
-        &[(&[(0, 1)], 0), (&[(1, 2)], 1)],
-    );
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![9])));
+#[case::inner_source(indoc! {r"
+    total := 0
+    for x in [1, 2]:
+        for y in source1():
+            total += x * y
+    total
+"}, 9)]
+#[case::bound_outside(indoc! {r"
+    ys = source1()
+    total := 0
+    for x in [1]:
+        for y in ys:
+            total += x * y
+    total
+"}, 3)]
+#[case::comprehension("sum([sum([y * x for y in source1()]) for x in [1, 2]])", 9)]
+fn a_totalled_nest_over_a_streamed_source_answers_at_the_close(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
 /// A collection per row paired against a streamed source keeps each row's values as they

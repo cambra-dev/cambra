@@ -411,7 +411,8 @@ for i in [1, 2, 3]:
 acc"#,
     Tile::Scalar(ColumnValue::Ints(vec![12]))
 )]
-#[ignore] // TODO support nested loops with mutations.
+// A nested loop's accumulator is carried through both levels, so the overwrite reads what
+// the position before it left whichever level that position sat at: 0 →11→32→44→66.
 #[case(
     r#"
 x := 0
@@ -419,7 +420,7 @@ for i in [1, 2]:
     for j in [10, 20]:
         x := x + i + j
 x"#,
-    Tile::Scalar(ColumnValue::Ints(vec![33]))
+    Tile::Scalar(ColumnValue::Ints(vec![66]))
 )]
 // A **conditional feed** riding an accumulator loop: the `o << i` fires only on
 // the guard's route, so the tap stream carries just the fired positions (loop
@@ -535,7 +536,9 @@ o"#,
         o"#},
     Tile::data_function(ColumnValue::UInts(vec![2, 3, 4]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 7, 12]))), Predicate::True, BitSet::new())
 )]
-#[ignore] // TODO support nested loops with mutations.
+// The same nest with a feed after the write. A `<<` appends at the site it is written, so
+// the channel is keyed by the **position pair** the nest names — one value per innermost
+// position rather than one per outer group.
 #[case(
     r#"
 x := 0
@@ -545,7 +548,18 @@ for i in [1, 2]:
         x := x + i + j
         o << x
 o"#,
-    Tile::Scalar(ColumnValue::Strings(vec!["TODO".into()]))
+    Tile::data_function(
+        ColumnValue::Records(HashMap::from([
+            ("_0".to_string(), ColumnValue::from_uints(vec![0, 0, 1, 1])),
+            ("_1".to_string(), ColumnValue::from_uints(vec![0, 1, 0, 1])),
+        ])),
+        Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 32, 44, 66]))),
+        Predicate::Record(HashMap::from([
+            ("_0".to_string(), Predicate::True),
+            ("_1".to_string(), Predicate::True),
+        ])),
+        BitSet::new(),
+    )
 )]
 fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -1792,6 +1806,12 @@ acc",
     );
 }
 
+// A nested `for` compiles to a nested recurrence — one inner carrier per position of the
+// loop around it — and `tests/compilation_pipeline/nested_loops.rs` is where that lives.
+// A `:=` *between* the loops is the case this file's sequential-mutable-variable
+// reasoning turns on, and it is pinned there as
+// `a_mutable_variable_may_be_introduced_between_the_loops`.
+
 /// A `mut` loop over a **product** domain runs its positions in pair order, at every
 /// spelling: let-bound, inline, and joined. Its positions are records, and the drive and its
 /// readers release what they have consumed as a staircase over the fields
@@ -2809,96 +2829,6 @@ cnt
 "#},
         Value::Int(3),
     )
-}
-
-/// The nested shapes lowering and planning accept, pinned where op-conversion stops them
-/// until nested `Transact`s are realized: each compiles through every pass before it. A nested
-/// `for` that writes a mutable variable compiles to a `Transact` per enclosing position, and
-/// op-conversion builds one engine per `Transact`.
-#[rstest]
-#[case::inner_writes_an_outer_accumulator(indoc! {r#"
-    s := 0
-    for x in [1, 2]:
-        for y in [10, 20]:
-            s += y
-    s
-"#})]
-// The inner loop writes a variable the body introduced, and never reads it.
-#[case::inner_writes_without_reading(indoc! {r#"
-    t := 0
-    for i in [1, 2]:
-        y := 0
-        for j in [10, 20]:
-            y := j
-        t += y
-    t
-"#})]
-#[case::depth_three(indoc! {r#"
-    s := 0
-    for x in [1, 2]:
-        for y in [10, 20]:
-            for z in [100, 200]:
-                s += x + y + z
-    s
-"#})]
-// A `yield` in the inner loop feeds the generator the enclosing loop is in.
-#[case::a_yield_in_the_inner_loop(indoc! {r#"
-    def g(xs):
-        acc := 0
-        for x in xs:
-            for y in [10, 20]:
-                acc += y * x
-                yield acc
-    sum(g([1, 2]))
-"#})]
-// Each branch introduces its own `y`, and each branch's inner loop accumulates it.
-#[case::the_same_name_introduced_in_both_branches(indoc! {r#"
-    t := 0
-    for i in [1, 2]:
-        if i > 1:
-            y := 0
-            for k in [10, 20]:
-                y += k
-            t += y
-        else:
-            y := 100
-            for k in [1]:
-                y += k
-            t += y
-    t
-"#})]
-// A pass-by-reference writer on a variable the body introduced.
-#[case::a_writer_call_on_a_body_introduced_variable(indoc! {r#"
-    def bump(c: Mut(Int)):
-        c += 1
-    t := 0
-    for i in [1, 2]:
-        y := i
-        for k in [10, 20]:
-            bump(y)
-        t += y
-    t
-"#})]
-#[case::two_sibling_inner_loops(indoc! {r#"
-    s := 0
-    for x in [1, 2]:
-        for y in [10, 20]:
-            s += y
-        for z in [100]:
-            s += z
-    s
-"#})]
-#[case::writes_before_and_after_an_inner_loop(indoc! {r#"
-    s := 0
-    for x in [1, 2]:
-        s += x
-        for y in [10, 20]:
-            s += y
-        s += 1000
-    s
-"#})]
-fn nested_shapes_reach_realization(#[case] code: &str) {
-    expect_compile_error(code, "only a top-level `Transact` is realized");
 }
 
 /// The planned tree of a nest. The inner loop is a `transact under` the `(enclosing,
