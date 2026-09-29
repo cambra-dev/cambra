@@ -338,6 +338,16 @@ impl Predicate {
         })
     }
 
+    /// A [`Record`](Self::Record) componentwise predicate over `fields`, in canonical form: a field
+    /// admitting nothing makes the componentwise predicate admit nothing ([`Componentwise`]).
+    pub(crate) fn record(fields: HashMap<String, Predicate>) -> Predicate {
+        let mut names: Vec<String> = fields.keys().cloned().collect();
+        names.sort();
+        let mut fields = fields;
+        let components = names.iter().map(|n| fields.remove(n).unwrap()).collect();
+        Componentwise::Record(names).build(components)
+    }
+
     /// [`Qualified`](Self::Qualified) in canonical form.
     ///
     /// An `enclosing` that admits everything says nothing, so the arm is dropped and
@@ -862,6 +872,118 @@ impl Predicate {
                 };
                 Predicate::qualified(enclosing, unqualified.clone())
             }
+        }
+    }
+
+    /// This predicate, over the paths reaching level `level`, restated after a level is
+    /// inserted before component `at` (`at ≤ level`): every path gains a component there,
+    /// and the statement admits anything in it.
+    ///
+    /// What an operator owes the values it moves beneath a new level: a statement that
+    /// named a path by its first `at` components still has to, and an unqualified one — read
+    /// against a path's last component alone — reads the same either way.
+    pub(crate) fn with_level_inserted(&self, level: usize, at: usize) -> Predicate {
+        match self {
+            Predicate::Or(arms) => arms
+                .iter()
+                .map(|arm| arm.with_level_inserted(level, at))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+            Predicate::Qualified { enclosing, here } => {
+                let enclosing = match at == level {
+                    true => Predicate::qualified((**enclosing).clone(), Predicate::True),
+                    false => enclosing.with_level_inserted(level - 1, at),
+                };
+                Predicate::qualified(enclosing, (**here).clone())
+            }
+            unqualified => unqualified.clone(),
+        }
+    }
+
+    /// This predicate, over the paths reaching level `level`, restated after components
+    /// `at` and `at + 1` (`at < level`) merge into one pair record `{fields.0: …, fields.1: …}`.
+    ///
+    /// What an operator owes the values beneath two levels it merges into one keyed by
+    /// pairs: a statement naming the outer and inner keys separately now names the pair.
+    pub(crate) fn with_levels_paired(
+        &self,
+        level: usize,
+        at: usize,
+        fields: (&str, &str),
+    ) -> Predicate {
+        match self {
+            Predicate::Or(arms) => arms
+                .iter()
+                .map(|arm| arm.with_levels_paired(level, at, fields))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+            _ if at + 1 == level => {
+                // The last two components merge: this level's keys pair with the level
+                // above's, which is the enclosing statement's last component.
+                let (enclosing, here) = self.split_qualification();
+                let (above, outer) = enclosing.split_qualification();
+                Predicate::qualified(
+                    above.clone(),
+                    Predicate::record(HashMap::from([
+                        (fields.0.to_string(), outer.clone()),
+                        (fields.1.to_string(), here.clone()),
+                    ])),
+                )
+            }
+            Predicate::Qualified { enclosing, here } => Predicate::qualified(
+                enclosing.with_levels_paired(level - 1, at, fields),
+                (**here).clone(),
+            ),
+            unqualified => unqualified.clone(),
+        }
+    }
+
+    /// This predicate, over the paths reaching level `level`, restated after component `at`
+    /// (`at ≤ level`), a pair record `{fields.0: …, fields.1: …}`, splits into two components.
+    /// The inverse of [`with_levels_paired`](Self::with_levels_paired).
+    ///
+    /// What an operator owes a region named over the pairs when it hands the region back to
+    /// the two levels the pairs were formed from: a release of paired keys, or of what stands
+    /// beneath them.
+    pub(crate) fn with_levels_unpaired(
+        &self,
+        level: usize,
+        at: usize,
+        fields: (&str, &str),
+    ) -> Predicate {
+        match self {
+            Predicate::Or(arms) => arms
+                .iter()
+                .map(|arm| arm.with_levels_unpaired(level, at, fields))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+            _ if at == level => {
+                // The last component is the pair: its outer half extends the enclosing path, and
+                // its inner half is the component that now comes last. A union of componentwise
+                // predicates over pairs — a prefix over the pairs is a staircase of them — splits
+                // one componentwise predicate at a time, since unpairing is one-to-one.
+                let (enclosing, here) = self.split_qualification();
+                let halves =
+                    HashMap::from([(fields.0.to_string(), ()), (fields.1.to_string(), ())]);
+                let arms = match here {
+                    Predicate::Or(arms) => arms.clone(),
+                    one => vec![one.clone()],
+                };
+                arms.iter()
+                    .map(|pair| {
+                        let mut split = pair.split_record(&halves);
+                        Predicate::qualified(
+                            Predicate::qualified(
+                                enclosing.clone(),
+                                split.remove(fields.0).unwrap(),
+                            ),
+                            split.remove(fields.1).unwrap(),
+                        )
+                    })
+                    .fold(Predicate::False, |all, one| all.union(&one))
+            }
+            Predicate::Qualified { enclosing, here } => Predicate::qualified(
+                enclosing.with_levels_unpaired(level - 1, at, fields),
+                (**here).clone(),
+            ),
+            unqualified => unqualified.clone(),
         }
     }
 
