@@ -691,13 +691,11 @@ fn a_correlated_comprehension_nests_to_any_depth(#[case] program: &str, #[case] 
 }
 
 /// A correlated comprehension whose **outer row is itself a collection**, a `groupby` group.
-/// `Product` appends its level beneath the innermost level of the tile it is handed, and a
-/// group's own elements are such a level, so the pairing lands beneath them and the product
-/// reaches `BinOp(*)` one level too deep. Pinned as it fails. The groups are `[1]`, `[2, 3]`
-/// and `[4]`, so it answers `3 × (1 + 5 + 4)` = 30.
+/// `Product` pairs at the level op-conversion gives it, so the pairing lands beneath the
+/// group rather than beneath the group's own elements. The groups are `[1]`, `[2, 3]` and
+/// `[4]`, so it answers `3 × (1 + 5 + 4)` = 30.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "a level reaching it is a shape error")]
 fn a_correlated_comprehension_over_collection_valued_rows() {
     check_scalar(
         indoc! {r"

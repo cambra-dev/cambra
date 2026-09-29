@@ -550,7 +550,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
-| `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the input's level at the predicate's innermost depth, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` and `map_filter` both compile to it. <br>TODO the function form can probably be replaced by Restrict |
+| `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the keys at the level op-conversion states ([The level a node is converted at](#the-level-a-node-is-converted-at)), which is the predicate's innermost level, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` and `map_filter` both compile to it. <br>TODO the function form can probably be replaced by Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `DataFunction(A → *)` | Same as input | Filters a function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
 | `Aggregate` | `DataFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `DataFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile. Constructed with an `only_terminal` flag: when `true` it emits only once the aggregation is marked terminal (the `only_terminal: false` path is currently `todo!()`). |
@@ -718,9 +718,11 @@ while their arms carry one level and two.
 
 The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
 pairs at it, and so does a product morphism with no input, at the domains its type is curried
-over. `MapResult` applies at it, and `MapFilter` filters the element collections there. A
-composed `VariantWrap` wraps at it, and an applied one at its payload's root level. A fed
-copairing merges one level above it.
+over. `MapResult` applies at it. `Filter` masks the keys one level above it: under a
+`filter_values` those are the keys its elements stand at, and a `map_filter`, which is a
+`filter_values` one level in, masks the keys of each element collection. A composed
+`VariantWrap` wraps at it, and an applied one at its payload's root level. A fed copairing
+merges one level above it.
 
 Two operators read their level off their input's tiling. `VariantProject` projects at the level
 holding its scrutinee's union column, which is always the deepest: an arm holds its payload as one
