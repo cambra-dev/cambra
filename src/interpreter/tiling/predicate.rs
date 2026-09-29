@@ -2640,16 +2640,22 @@ mod tests {
     // subsumes every arm.
     #[test]
     fn subsumes_or_any_arm_suffices() {
-        // Or([≤3, ≤10]) ⊇ ≤5 because the ≤10 arm already covers it.
-        let or_pred =
-            Predicate::at_or_below(Value::UInt(3)).union(&Predicate::at_or_below(Value::UInt(10)));
-        // union of two at_or_below bounds collapses to just at_or_below(10), so
-        // construct an Or via Record union to exercise the Or path.
-        let arm_a = record_pred(&[("x", Predicate::at_or_below(Value::UInt(10)))]);
-        let arm_b = record_pred(&[("x", Predicate::at_or_below(Value::UInt(3)))]);
-        let or_rec = arm_a.union(&arm_b); // Or([arm_a, arm_b]) simplified to [arm_a]
-        let target = record_pred(&[("x", Predicate::at_or_below(Value::UInt(5)))]);
-        assert!(or_pred.subsumes(&Predicate::at_or_below(Value::UInt(5))));
+        // Two boxes differing in both fields, and neither inside the other, stay two arms.
+        let arm_a = record_pred(&[
+            ("x", Predicate::at_or_below(Value::UInt(10))),
+            ("y", Predicate::at_or_below(Value::UInt(10))),
+        ]);
+        let arm_b = record_pred(&[("x", uint_intervals(&[20])), ("y", uint_intervals(&[20]))]);
+        let or_rec = arm_a.union(&arm_b);
+        assert!(
+            matches!(&or_rec, Predicate::Or(arms) if arms.len() == 2),
+            "{or_rec:?}"
+        );
+        // The first arm covers the target on its own.
+        let target = record_pred(&[
+            ("x", Predicate::at_or_below(Value::UInt(5))),
+            ("y", Predicate::at_or_below(Value::UInt(5))),
+        ]);
         assert!(or_rec.subsumes(&target));
     }
 

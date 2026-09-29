@@ -85,6 +85,19 @@ struct ConverseProducer {
     held: Vec<(Value, Value)>,
 }
 
+impl ConverseProducer {
+    /// The keys of the held input rows `guard` covers. An input row stands at exactly one
+    /// output path, under its own value, so it is released where that path is: under a
+    /// released group, or named beneath one.
+    fn held_rows_covered(&self, guard: &TileGuard) -> Vec<Value> {
+        self.held
+            .iter()
+            .filter(|(value, key)| guard.covers_path(&[value.clone(), key.clone()]))
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
+}
+
 /// Sort row indices by typed key, detect group boundaries, and assemble the nested tile
 /// for [`ConverseProducer`].
 ///
@@ -273,9 +286,20 @@ impl TileProducer for ConverseProducer {
         };
         // A group can be released while the input still grows, since `release_impl` frees
         // only the rows held; a row arriving later with a released value would otherwise
-        // put the group back into a region the consumer has let go.
+        // put the group back into a region the consumer has let go. That row is released
+        // upstream on the pull that first holds it: the release reached `release_impl`
+        // before the row arrived, so nothing else frees it.
         if !self.base.obsolete_guard.is_empty() {
-            out.remove_guarded(self.base.obsolete_guard.clone());
+            let released = self.base.obsolete_guard.clone();
+            let late = self.held_rows_covered(&released);
+            if !late.is_empty() {
+                let rows = late.into_iter().fold(Predicate::False, |all, key| {
+                    all.union(&Predicate::point(key))
+                });
+                self.input
+                    .release(TileGuard::Function(FunctionGuard::Domain(rows)));
+            }
+            out.remove_guarded(released);
         }
         out
     }
@@ -285,14 +309,7 @@ impl TileProducer for ConverseProducer {
             g if g.is_universal() => {
                 return self.input.release(self.input.tiling().universal_guard());
             }
-            // An input row stands at exactly one output path, under its own value, so it is
-            // released where that path is: under a released group, or named beneath one.
-            ref g => self
-                .held
-                .iter()
-                .filter(|(value, key)| g.covers_path(&[value.clone(), key.clone()]))
-                .map(|(_, key)| key.clone())
-                .collect::<Vec<_>>(),
+            ref g => self.held_rows_covered(g),
         };
         // A statement beneath the groups that names no group says the same under every one, so it
         // releases the input rows it names whether or not they have arrived.
@@ -1697,7 +1714,7 @@ mod tests {
     }
 
     /// A released group stays released: a row the input delivers later with that group's
-    /// value does not put the group back.
+    /// value does not put the group back, and the input is released of that row.
     #[test]
     fn a_released_group_is_not_redelivered_when_a_row_joins_it() {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
@@ -1734,6 +1751,13 @@ mod tests {
             panic!("converse yields a collection: {out:?}")
         };
         assert_eq!(domain, &ColumnValue::Ints(vec![20]), "{out:?}");
+        // The release of group 10 reached `release_impl` before row 1 arrived, so the pull
+        // that first holds row 1 is what releases it, and row 2's group is still live.
+        let upstream = producer.input.obsolete_guard();
+        assert!(
+            upstream.covers_path(&[Value::Int(1)]) && !upstream.covers_path(&[Value::Int(2)]),
+            "{upstream:?}"
+        );
     }
 
     /// Basic converse: `{0→10, 1→20, 2→10}` groups by codomain value.
