@@ -559,6 +559,10 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
 | `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead` |
+%%%%%%% diff from: mztsntnu c7ca87aa "Address review (#254 round 2)" (parents of rebased revision)
+\\\\\\\        to: vyktnzwl eda5b0ab "Realize a nested `for` loop's recurrence as one induction store per enclosing row" (rebased revision)
+-| `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. Over an induction accumulator's own history it compiles to `StoreFinalRead`, which samples the settled store; over any other stream, to `ExtractFinal`. A `Txn` history's final is `final_read`, a different term |
++| `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. Over an induction accumulator's own history it compiles to `StoreFinalRead`, which samples the settled store, and per enclosing row of a nested loop to `ExtractFinal`; over any other stream, to `ExtractFinal`. A `Txn` history's final is `final_read`, a different term |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_read` over the mutable variable's history binding, which compiles to `StoreFinalRead`. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
@@ -1003,8 +1007,8 @@ causal matcher (`letrec::check_letrec_causal`).
   `(prev…, item)` input, taking the next position from the decided frontier and the previous
   accumulator from the value at it. The accumulator crosses between them as a tile, one position
   per pull. `StoreDenseRead` folds the changelog at every decided position into the dense
-  `𝐷 ⇀ 𝑉` history a co-iterated read consumes; the trailing read is `StoreFinalRead`. One
-  writer, over a finite or async domain.
+  `𝐷 ⇀ 𝑉` history a co-iterated read consumes; the trailing read is `StoreFinalRead`, or
+  `ExtractFinal` per row under a nest. One writer, over a finite or async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ {key: value}`, one changelog per key. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
