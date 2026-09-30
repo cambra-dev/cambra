@@ -997,26 +997,30 @@ impl Tile {
     /// the base case and each append gives another — which is what lets correlated
     /// comprehensions nest to any depth.
     ///
-    /// **Every group the level names is whole.** A key's group is one contiguous run of the
-    /// level below, so no later tile can add to it: [`Tile::merge`] runs whole subtrees
-    /// together under new keys and never reaches inside an existing group. A caller holding
-    /// part of a group has nothing to append yet. The outermost `domain_predicate` follows
-    /// from that — every key present is final together with every level beneath it, unioned
-    /// with the region the arriving tile already called final.
+    /// **Every group the level names is whole**: a caller appends a level only once it holds
+    /// each group entire. What that makes complete depends on the depth of the arriving tile.
+    /// A one-level tile's keys each held one value and now each hold a whole group, so every
+    /// key present is final, unioned with the region the tile already called final. A deeper
+    /// tile's outermost keys own groups of the levels already beneath them, and a later tile
+    /// can still add to those: [`Tile::merge`] matches a key both sides hold and merges the
+    /// two groups. So a deeper tile keeps the outermost `domain_predicate` it arrived with.
     pub fn append_level(mut self, level: impl FnOnce(Tile) -> Tile) -> Tile {
         let Tile::DataFunction {
             domain,
             domain_predicate,
+            codomain,
             ..
         } = &mut self
         else {
             panic!("append_level expects a collection tile, got {self:?}")
         };
-        *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+        if !codomain.is_data_function() {
+            *domain_predicate = domain_predicate.union(&Predicate::from_column_value(domain));
+        }
         let slot = self.deepest_values_mut();
         let built = level(std::mem::replace(slot, Tile::Record(HashMap::new())));
         // The appended level states nothing complete and has removed nothing: terminality
-        // rides the outermost `domain_predicate` updated above, and a level that has just
+        // rides the outermost `domain_predicate` settled above, and a level that has just
         // been built cannot have had a key taken from it.
         assert!(
             matches!(
@@ -2732,6 +2736,30 @@ mod tests {
             domain_predicate.contains(&Value::Int(7)) && domain_predicate.contains(&Value::Int(8))
         );
         assert!(!domain_predicate.contains(&Value::Int(9)));
+    }
+
+    /// A deeper tile's outermost keys own groups a later tile can still add to, so appending
+    /// beneath them leaves them as final as the arriving tile said.
+    #[test]
+    fn append_level_beneath_a_deeper_tile_keeps_its_completeness() {
+        let mut two_levels =
+            fn_int(vec![7, 8], vec![70, 80], Predicate::False).append_level(two_keys_per_parent);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut two_levels
+        else {
+            panic!("appending a level leaves a collection, got {two_levels:?}")
+        };
+        // The groups beneath 7 and 8 are still open.
+        *domain_predicate = Predicate::False;
+        let three_levels = two_levels.append_level(two_keys_per_parent);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &three_levels
+        else {
+            panic!("appending a level leaves a collection, got {three_levels:?}")
+        };
+        assert_eq!(*domain_predicate, Predicate::False);
     }
 
     #[test]
