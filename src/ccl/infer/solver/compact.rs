@@ -519,10 +519,6 @@ impl CompactType {
 /// nothing, and compaction has already folded a variable's bounds into the atoms beside it.
 /// [`denoted_domains`] reads the same position and takes that reading, so both agree on which
 /// positions denote a domain at all.
-///
-/// Excluding one reads as a rejection at the join and as something else at the meet, where
-/// [`CompactTypeKind::merge`] filters candidates: dropping one leaves a kind admitting nothing,
-/// which propagates as a plausible ⊥ rather than failing ([`Type::sum_over`]).
 fn denotes_a_uint_range(ct: &CompactType) -> bool {
     let o = ct.occupied();
     o.atoms == 1
@@ -2544,6 +2540,28 @@ mod tests {
         };
         let merged = CompactType::merge(true, data_fun(refined()), data_fun(refined()));
         assert_eq!(merged.fun.expect("fun slot present").kind, KindPin::Data);
+    }
+
+    /// A variable beside a single range atom still denotes that range, and a variable alone
+    /// denotes nothing. The join over `UIntRanges` is where the difference shows: the
+    /// candidate is admitted, so the kind stays `UIntRanges` rather than rising to the
+    /// universe.
+    #[test]
+    fn a_variable_beside_a_range_atom_denotes_the_range() {
+        let range_and_var = CompactType {
+            vars: BTreeSet::from([InferVarId(0)]),
+            ..CompactType::from_atom(AtomKey::UIntRange(2))
+        };
+        assert!(denotes_a_uint_range(&range_and_var));
+        assert!(!denotes_a_uint_range(&CompactType::from_var(InferVarId(0))));
+        assert!(matches!(
+            CompactTypeKind::merge(
+                true,
+                CompactTypeKind::Enumerated(vec![range_and_var]),
+                CompactTypeKind::UIntRanges,
+            ),
+            CompactTypeKind::UIntRanges
+        ));
     }
 
     /// Compact merge at positive polarity unions tags.

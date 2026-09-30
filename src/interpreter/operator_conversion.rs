@@ -1439,7 +1439,7 @@ identities is not distinguishing them",
                         Some(held) => {
                             return Err(ConversionError::Unsupported(format!(
                                 "a sum over candidates whose keys have no common type \
-                                 ({held:?} and {keys:?}) has no domain bound: {ty}"
+                                 ({held} and {keys}) has no domain bound: {ty}"
                             )));
                         }
                     }
@@ -2326,28 +2326,14 @@ fn convert_impl_inner(
             let input = expect_input(input, &format!("Builtin({})", b.name()))?;
             match b {
                 Builtin::Id => Ok(input),
-                // Entering a **described** sum is the identity at runtime. A sum's value is
-                // a domain paired with a collection over it, and a collection carries its
-                // own domain — so a described witness is recoverable from the value and
-                // nothing represents it separately (`src/ccl/design/mutability.md`, "A
-                // mutable collection's key set varies with the position").
-                //
-                // Only a described kind goes through here. A box over two or more listed
-                // candidates records a choice the value cannot answer, and realization
-                // leaves it standing for the arm below to reject by name; a box over one is
-                // erased before op-conversion (`src/ccl/planning/conditionals.rs`).
-                Builtin::Box
-                    if expr
-                        .ty
-                        .codomain()
-                        .and_then(|c| {
-                            c.witness_kind()
-                                .map(|k| !matches!(k, crate::ccl::TypeKind::Enumerated(_)))
-                        })
-                        .unwrap_or(false) =>
-                {
-                    Ok(input)
-                }
+                // Entering a sum is the identity at runtime. A sum's value is a domain paired
+                // with a collection over it, and a collection carries its own domain, so the
+                // witness is recoverable from the value and nothing represents it separately
+                // (`src/ccl/design/mutability.md`, "A mutable collection's key set varies with
+                // the position"). Planning erases a `box` over one candidate and leaves standing
+                // one whose witness the value carries, described or listed
+                // (`src/ccl/planning/conditionals.rs`, `binds_an_undetermined_witness`).
+                Builtin::Box => Ok(input),
                 // `insert(m, k, v)` — pointwise over the zipped `(collection, key, value)`
                 // triple, one map in and one map out, the same shape a binop takes over its
                 // pair. The output extent is the node's own codomain: a keyed sum's extent
@@ -2483,12 +2469,6 @@ fn convert_impl_inner(
                         TagMap::from_arms(variant_extents),
                     )))
                 }
-                // `box` has no runtime content — it introduces the sum at the type level, so
-                // the collection it re-views is the collection it is handed. Planning leaves
-                // the introduction standing where the witness is the value's to carry
-                // (`src/ccl/planning/conditionals.rs`, `binds_an_undetermined_witness`), which
-                // is how one reaches here at all.
-                Builtin::Box => Ok(input),
                 b if let Some(op) = builtin_to_binop(b.clone()) => apply_binop(input, op),
                 b if let Some(op) = builtin_to_unaryop(b.clone()) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
@@ -2731,6 +2711,20 @@ fn compile_list_fn(
     Ok(Box::new(Constant::collection(tile, tiling)))
 }
 
+/// `expr` with a `box` around it removed. `box` has no runtime content: at the element
+/// position of a jagged collection it states the one candidate the element is, while the
+/// position binds a witness over all of them.
+fn without_box(expr: &Expr) -> &Expr {
+    match &expr.node {
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
+        {
+            argument
+        }
+        _ => expr,
+    }
+}
+
 /// The tile a list literal's elements denote, one row per element, and its tiling.
 ///
 /// Recursion is on the element **extent**, not on the values. A collection element
@@ -2742,19 +2736,7 @@ fn compile_list_fn(
 /// The base case is one entry per element, so `list_levels(&[], e)` is the empty tile at
 /// this extent and needs no case of its own.
 fn list_levels(elts: &[&Expr], elt_extent: &Extent) -> Result<(Tile, Tiling), ConversionError> {
-    // A boxed literal is that literal, `box` having no runtime content: it states the one
-    // candidate this element is, and the position binds a witness over all of them.
-    let unboxed: Vec<&Expr> = elts
-        .iter()
-        .map(|elt| match &elt.node {
-            TypedExprNode::Apply { argument, function }
-                if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
-            {
-                argument.as_ref()
-            }
-            _ => *elt,
-        })
-        .collect();
+    let unboxed: Vec<&Expr> = elts.iter().map(|elt| without_box(elt)).collect();
     let elts: &[&Expr] = &unboxed;
     match elt_extent {
         // A collection element: its own keys are the level below, and the elements' tables
@@ -2999,13 +2981,10 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
                 })
                 .collect::<Result<Vec<_>, ConversionError>>()?,
         )),
-        // A boxed constant is that constant, `box` having no runtime content. This is the
-        // element position of a jagged nested collection, where each element states the one
-        // candidate it is and the position binds a witness over all of them.
-        TypedExprNode::Apply { argument, function }
+        TypedExprNode::Apply { function, .. }
             if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
         {
-            expr_to_value(argument)
+            expr_to_value(without_box(expr))
         }
         // The element may well *be* a constant and still arrive here: what reaches this
         // point is what constant folding declined. Saying only "is a computation" reads as

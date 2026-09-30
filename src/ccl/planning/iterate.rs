@@ -65,12 +65,12 @@ use super::*;
 /// planner bug.
 pub(crate) fn insert_iterate_markers(
     expr: &mut Expr,
-    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
-    insert_iterate_recurse(expr, discharged);
+    insert_iterate_recurse(expr, realized);
     // In addition to any deeper iteration sites materialised by the
     // recursion, the program root itself may also be an iteration site.
-    wrap_with_iterate(expr, discharged, "root");
+    wrap_with_iterate(expr, realized, "root");
 }
 
 /// Recursively walks `expr` and materializes every iteration site that
@@ -102,7 +102,7 @@ pub(crate) fn insert_iterate_markers(
 /// root is reached.
 pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
-    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
     // A list literal's elements are **values**: op-conversion evaluates each with
     // `expr_to_value` and compiles none of them, so nothing inside one is an iteration
@@ -124,21 +124,21 @@ pub(super) fn insert_iterate_recurse(
         match &mut argument.node {
             TypedExprNode::Tuple(elts) => {
                 for elt in elts.iter_mut() {
-                    insert_iterate_recurse(elt, discharged);
+                    insert_iterate_recurse(elt, realized);
                 }
             }
             TypedExprNode::Record(fields) => {
                 for (_, field) in fields.iter_mut() {
-                    insert_iterate_recurse(field, discharged);
+                    insert_iterate_recurse(field, realized);
                 }
             }
-            _ => insert_iterate_recurse(argument, discharged),
+            _ => insert_iterate_recurse(argument, realized),
         }
-        insert_iterate_recurse(function, discharged);
+        insert_iterate_recurse(function, realized);
         return;
     }
 
-    expr.walk_children_mut(|child| insert_iterate_recurse(child, discharged));
+    expr.walk_children_mut(|child| insert_iterate_recurse(child, realized));
     // Read before the match takes `expr.node` mutably. A `Data` domain is one the
     // runtime sweeps, which is what makes a node an iteration site rather than a
     // morphism waiting for an input.
@@ -164,10 +164,10 @@ pub(super) fn insert_iterate_recurse(
             match &mut argument.node {
                 TypedExprNode::Tuple(elts) => {
                     if let Some(stream) = elts.first_mut() {
-                        wrap_with_iterate(stream, discharged, "asof-stream");
+                        wrap_with_iterate(stream, realized, "asof-stream");
                     }
                 }
-                _ => wrap_with_iterate(argument, discharged, "final-or-default"),
+                _ => wrap_with_iterate(argument, realized, "final-or-default"),
             }
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
@@ -183,7 +183,7 @@ pub(super) fn insert_iterate_recurse(
             if let TypedExprNode::Tuple(elts) = &mut argument.node
                 && let Some(trigger) = elts.first_mut()
             {
-                wrap_with_iterate(trigger, discharged, "asof-trigger");
+                wrap_with_iterate(trigger, realized, "asof-trigger");
             }
         }
         // `Copair`'s function form: argument is `Tuple(ops...)`
@@ -194,7 +194,7 @@ pub(super) fn insert_iterate_recurse(
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node {
                 for elt in elts.iter_mut() {
-                    wrap_with_iterate(elt, discharged, "zip-field");
+                    wrap_with_iterate(elt, realized, "zip-field");
                 }
             }
         }
@@ -212,7 +212,7 @@ pub(super) fn insert_iterate_recurse(
             if is_collection =>
         {
             for operand in operands.iter_mut() {
-                wrap_with_iterate(operand, discharged, "copair-operand");
+                wrap_with_iterate(operand, realized, "copair-operand");
             }
         }
         // The **checked lookup**'s collection is compiled with `input=None` (`𝑐 ▷ lookup?`
@@ -224,21 +224,21 @@ pub(super) fn insert_iterate_recurse(
                 TypedExprNode::Builtin(Builtin::LookupChecked)
             ) =>
         {
-            wrap_with_iterate(argument, discharged, "checked-lookup-collection");
+            wrap_with_iterate(argument, realized, "checked-lookup-collection");
         }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.
         TypedExprNode::Apply { argument, function }
             if is_internalising_builtin_function(function) =>
         {
-            wrap_with_iterate(argument, discharged, "internalising-builtin");
+            wrap_with_iterate(argument, realized, "internalising-builtin");
         }
         // Each transaction writer's source is iterated internally by the
         // mutable variable engine (the induction store for an accumulator); op-conversion
         // compiles it with `input=None`, so wrap it like a loop source.
         TypedExprNode::Transact { writers, .. } => {
             for w in writers.iter_mut() {
-                wrap_with_iterate(&mut w.source, discharged, "transact-source");
+                wrap_with_iterate(&mut w.source, realized, "transact-source");
             }
         }
         // A product's components — and a program's outputs, which are the same
@@ -247,12 +247,12 @@ pub(super) fn insert_iterate_recurse(
         // collection — see [`mark_component_source`].
         TypedExprNode::Tuple(elts) => {
             for elt in elts.iter_mut() {
-                mark_component_source(elt, discharged);
+                mark_component_source(elt, realized);
             }
         }
         TypedExprNode::Record(fields) => {
             for (_, field) in fields.iter_mut() {
-                mark_component_source(field, discharged);
+                mark_component_source(field, realized);
             }
         }
         _ => {}
@@ -274,10 +274,10 @@ pub(super) fn insert_iterate_recurse(
 /// component carries a name, so the rule is one rule.
 fn mark_component_source(
     component: &mut Expr,
-    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
     if component.ty.is_collection() {
-        wrap_with_iterate(component, discharged, "product-component-source");
+        wrap_with_iterate(component, realized, "product-component-source");
     }
 }
 
@@ -350,7 +350,7 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
 /// report. Every caller names its own; there is no unlabelled one.
 pub(super) fn wrap_with_iterate(
     expr: &mut Expr,
-    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
     site: &str,
 ) {
     // `Let` nodes pass input through to both children — op-conversion's
@@ -376,9 +376,9 @@ pub(super) fn wrap_with_iterate(
         // for that eager compilation — #232 tracks making iteration
         // use-driven so a dead binding is dropped rather than wrapped.
         if matches!(&bound_expr.ty, Type::Fun { .. }) {
-            wrap_with_iterate(bound_expr, discharged, site);
+            wrap_with_iterate(bound_expr, realized, site);
         }
-        wrap_with_iterate(body, discharged, site);
+        wrap_with_iterate(body, realized, site);
         return;
     }
     if is_iteration_bearing(expr) {
@@ -417,7 +417,7 @@ pub(super) fn wrap_with_iterate(
         //
         // Emitting a chain here would restrict a second time, over a witness with no
         // extent.
-        if all_witnesses_realized(&domain_ty, discharged) {
+        if all_witnesses_realized(&domain_ty, realized) {
             return;
         }
         // Otherwise the witness is the value's to carry, and iterating one is what has no
@@ -588,10 +588,10 @@ fn head_of(expr: &Expr) -> &Expr {
 /// extent — one realized and one not is still a witness short.
 fn all_witnesses_realized(
     domain: &Type,
-    discharged: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) -> bool {
     let named = crate::ccl::ty::free_witness_refs(domain, &[]);
-    !named.is_empty() && named.iter().all(|w| discharged.contains(w))
+    !named.is_empty() && named.iter().all(|w| realized.contains(w))
 }
 
 /// Returns `true` if `expr` (or the first element of `expr` if it's a

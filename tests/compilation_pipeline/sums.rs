@@ -217,6 +217,60 @@ fn a_filter_over_a_box_that_already_carries_one() {
     "sum([max(r) for r in ([box([1, 2]), box([3, 4, 5])] ++ [box([6])])])",
     Value::Int(13)
 )]
+// An empty row is a candidate like any other. `max` over the row sums answers 3, where
+// flattening answers 2.
+#[case("max([sum(r) for r in [box([]), box([1, 2])]])", Value::Int(3))]
+// A single row is a join over one candidate, so the witness is determined and erases.
+#[case("sum([max(r) for r in [box([1, 2])]])", Value::Int(2))]
+// **A filter over the outer collection** reads the collection at the index inside its
+// predicate, so the predicate holds its own copy of each `box`. That copy stands at the same
+// element position as the term's and is kept with it.
+#[case(
+    "sum([max(r) for r in [box([1, 2]), box([3, 4, 5])] if max(r) > 2])",
+    Value::Int(5)
+)]
+// **Inside a tuple**, whose fields are each handed their own element type, and so as the
+// values of a `map`, which takes its entries as a list of pairs.
+#[case(
+    r#"sum([max(p.1) for p in [("a", box([1])), ("b", box([2, 3]))]])"#,
+    Value::Int(4)
+)]
+#[case(
+    indoc! {r#"
+        m = map([("a", box([1])), ("b", box([2, 3]))])
+        sum([max(r) for r in m])
+    "#},
+    Value::Int(4)
+)]
+// **Through a mutable variable and a feed**, which merge their writes into one variable. Each
+// write here is a whole list literal, so its elements stand at the literal's element position.
+#[case(
+    indoc! {r"
+        xs := [box([1])]
+        xs = [box([1]), box([2, 3])]
+        sum([max(r) for r in xs])
+    "},
+    Value::Int(4)
+)]
+#[case(
+    indoc! {r"
+        x = defer()
+        x <<= [box([1]), box([2, 3])]
+        sum([max(r) for r in x])
+    "},
+    Value::Int(4)
+)]
+// **A filter over each row**, whose refinement reads the row and so narrows each row's own
+// domain, which is a candidate of the element position's witness. Unfiltered, these answer 15
+// and 7.
+#[case(
+    "sum([sum([v for v in r if v > 1]) for r in [box([1, 2]), box([3, 4, 5])]])",
+    Value::Int(14)
+)]
+#[case(
+    "sum([max([v for v in r if v < 4]) for r in [box([1, 2]), box([3, 4, 5])]])",
+    Value::Int(5)
+)]
 fn a_jagged_nested_collection_is_consumed_at_each_rows_own_domain(
     #[case] code: &str,
     #[case] expected: Value,
@@ -241,26 +295,97 @@ fn a_comprehension_over_a_witness_domained_collection_composes_with_it() {
     );
 }
 
-/// **A `for` loop over a collection whose domain is the witness is not implemented.**
-///
-/// A loop over the collection binds its accumulator's history over the collection's own
-/// domain, which is the witness — so the binding sits outside the scope of the binder
-/// its domain names, and inference's post-letrec witness-scope check fires before
-/// op-conversion is reached. What the loop needs is an iteration source that takes the
-/// collection as an input and emits the domain the value holds.
+/// **A `let`-bound row reaches a jagged position written in place.** Inlining moves a
+/// `let`-bound list element into the literal that reads it, so the `box` stands where the row
+/// is merged and planning keeps it there. Through a list literal and through a copair arm:
+/// `2 + 5`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {r"
+    x = box([1, 2])
+    sum([max(r) for r in [x, box([3, 4, 5])]])
+"})]
+#[case(indoc! {r"
+    x = box([1, 2])
+    sum([max(r) for r in [x] ++ [box([3, 4, 5])]])
+"})]
+fn a_let_bound_row_at_a_jagged_position_is_read_in_place(#[case] code: &str) {
+    check_scalar(code, Value::Int(7));
+}
+
+/// **A row read from a mutable variable is rejected by name** at a jagged position. Its `box`
+/// is erased where the variable is introduced, while the position merging it keeps the sum, so
+/// the row stands fixed before it reaches the list.
 #[test]
-#[cfg_attr(
-    not(debug_assertions),
-    ignore = "the message is from inference's debug-only witness-scope check"
-)]
-fn iterating_a_witness_domained_collection_in_a_loop_is_unimplemented() {
+fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
     check_compile_error(
         indoc! {r"
-            total := 0
-            for xs in box([box([1]), box([2, 3])]):
-                total += 1
-            total
+            x := box([1, 2])
+            y = x
+            sum([max(r) for r in [y, box([3, 4, 5])]])
         "},
-        "free witness reference",
+        "a row read from a mutable variable",
+    );
+}
+
+/// **Rows at differing domains merged by two appends or by a keyed write do not compile.**
+/// Neither site hands its rows a demand the way a list literal does
+/// (`src/ccl/planning/conditionals.rs`, `child_demand`). These pin the failures as they stand:
+/// two `<<` appends fail the free-witness check in a debug build and the post-planning type
+/// check in a release one, and the keyed write fails group-by recognition's type check.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::two_appends(
+    indoc! {r"
+        x = defer()
+        x << box([1])
+        x << box([2, 3])
+        sum([sum(r) for r in x])
+    "},
+    if cfg!(debug_assertions) { "free witness reference" } else { "post-planning produced an invalid tree" }
+)]
+#[case::keyed_write(
+    indoc! {r#"
+        m: Mut(Map(String, List(Int)), Txn) := box(map([("a", box([1]))]))
+        with begin():
+            m["b"] := box([2, 3])
+        sum([max(r) for r in await_final(m)])
+    "#},
+    "Bad group expr"
+)]
+fn jagged_rows_merged_by_appends_or_a_keyed_write_do_not_compile(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    check_compile_error(code, needle);
+}
+
+/// **A `for` loop over a collection whose type is a sum is rejected by name**, in every build.
+///
+/// A loop's history is a function over its source's domain, and a sum's domain is the witness
+/// the sum binds, so the history would name a witness outside its binder
+/// (`src/ccl/design/collections.md`, "Compiling a conditional collection"). The first case's
+/// outer domain is an undetermined witness, the `UIntRanges` a `List(𝑇)` annotation binds. The
+/// second's is determined: planning would erase it, but only after the loop's history is
+/// typed.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(indoc! {r"
+    xs: List(List(Int)) = box([box([1]), box([2, 3])])
+    total := 0
+    for r in xs:
+        total += 1
+    total
+"})]
+#[case(indoc! {r"
+    total := 0
+    for x in box([1, 2]):
+        total += x
+    total
+"})]
+fn a_loop_over_a_sum_is_unsupported(#[case] code: &str) {
+    check_compile_error(
+        code,
+        "a `for` loop over a collection whose type is a sum is not supported yet",
     );
 }
