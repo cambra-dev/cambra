@@ -477,18 +477,19 @@ impl TileProducer for ExtractFinalProducer {
                 // this a never-terminating loop pins the whole changelog waiting for a
                 // terminal that never comes. Positions ascend, so the highest is the last
                 // live one, whatever the loop's domain is: a map-domain loop's positions are
-                // its keys. A union key has no prefix spelling ([`Predicate::below`]), so
-                // those positions wait for the whole release instead.
+                // its keys. The bound is spelled over the domain, which a union key's prefix
+                // needs to name the tags before it ([`Predicate::below_in`]).
                 if let Tile::DataFunction {
                     domain, deleted, ..
                 } = &source
+                    && let Tiling::DataFunction {
+                        domain: positions, ..
+                    } = &source_tiling
                     && let Some(last) = (0..domain.len()).rev().find(|i| !deleted.contains(*i))
-                    && let highest = domain.index_at(last)
-                    && !matches!(highest, Value::Union { .. })
                 {
                     self.source
                         .release(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::below(highest),
+                            Predicate::below_in(domain.index_at(last), positions),
                         )));
                 }
                 return self.tiling().empty_tile();

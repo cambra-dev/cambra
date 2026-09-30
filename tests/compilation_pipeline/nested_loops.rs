@@ -6,13 +6,13 @@
 //! level (seed from the enclosing accumulator's previous value, write back the inner
 //! final), and a case that needs its own rule says the representation is wrong.
 //!
-//! Every case states the value it must answer, including the five that do not compile
+//! Every case states the value it must answer, including the six that do not compile
 //! yet, because computing a value afterwards would let the implementation choose its own.
-//! Those five **pin the error they reach** rather than being ignored: a pinned failure
+//! Those six **pin the error they reach** rather than being ignored: a pinned failure
 //! catches a change in how a case fails, which an ignored one cannot.
 //!
-//! Two of the five are the nest's own — a `with begin():` inside one has no commit site
-//! the carrier keys. The other three are not about nesting at all, and each gives the
+//! Two of the six are the nest's own — a `with begin():` inside one has no commit site
+//! the carrier keys. The other four are not about nesting at all, and each gives the
 //! program without a nested loop that fails the same way.
 
 use std::time::Duration;
@@ -314,8 +314,52 @@ fn a_nested_loop_carries_any_write_law(#[case] program: &str, #[case] total: i64
     "#},
     90
 )]
+// A concatenation as the outer source, whose rows are keyed by a tagged union: the rows run
+// in part order, 10, 20, then 20, 40.
+#[case::concatenation_outer_source(
+    indoc! {r"
+        total := 0
+        for x in [1] ++ [2]:
+            for y in [10, 20]:
+                total := total * 100 + x * y
+        total
+    "},
+    10202040
+)]
+// A product as the inner source, whose positions are records.
+#[case::product_inner_source(
+    indoc! {r"
+        total := 0
+        for x in [1, 2]:
+            for y in [a + b for a in [1] for b in [9, 19]]:
+                total := total * 100 + x * y
+        total
+    "},
+    10202040
+)]
 fn a_nested_loop_composes_with_collections(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
+}
+
+/// A concatenation as the inner source. Answers 10202040 once it compiles.
+///
+/// The inner source is read once per outer row, so the `++` is read at a projected index
+/// beside the outer generator: a fed copairing, which op-conversion rejects by name. The
+/// program without a nest is `an_inline_union_generator_beside_a_second_generator` in
+/// `scalars_collections.rs`. A concatenation as the outer source runs
+/// ([`a_nested_loop_composes_with_collections`]).
+#[test]
+fn a_concatenation_as_the_inner_source_needs_a_fed_copairing() {
+    check_compile_error(
+        indoc! {r"
+            total := 0
+            for x in [1, 2]:
+                for y in [10] ++ [20]:
+                    total := total * 100 + x * y
+            total
+        "},
+        "a fed copairing",
+    );
 }
 
 /// A record field as the inner source, where the rows' fields hold collections of
