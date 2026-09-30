@@ -132,7 +132,7 @@ impl CompileError {
     /// [`render_errors`].
     pub fn render(&self, sources: &SourceMap) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        match self.rendering(report_config(false)) {
+        match self.rendering(false) {
             Rendering::Report(report) => report
                 .write(sources, &mut buf)
                 .expect("ariadne write should not fail on Vec<u8>"),
@@ -147,7 +147,7 @@ impl CompileError {
     /// `sources`; the other variants emit the plain `error: …` line
     /// [`Self::render`] does.
     pub fn eprint(&self, sources: &SourceMap) {
-        match self.rendering(report_config(true)) {
+        match self.rendering(true) {
             Rendering::Report(report) => report
                 .eprint(sources)
                 .expect("ariadne eprint should not fail on stderr"),
@@ -155,14 +155,14 @@ impl CompileError {
         }
     }
 
-    fn rendering(&self, config: ariadne::Config) -> Rendering {
+    fn rendering(&self, color: bool) -> Rendering {
         match self {
-            CompileError::Parse(e) => Rendering::Report(e.to_report_with_config(config)),
-            CompileError::Lower(e) => Rendering::Report(e.to_report_with_config(config)),
+            CompileError::Parse(e) => Rendering::Report(e.to_report(color)),
+            CompileError::Lower(e) => Rendering::Report(e.to_report(color)),
             CompileError::Infer {
                 error,
                 span: Some(span),
-            } => Rendering::Report(infer_report(error, *span, config)),
+            } => Rendering::Report(infer_report(error, *span, color)),
             CompileError::ChannelizeDefers(e) => {
                 Rendering::Line(format!("error: deferred collection: {e}\n"))
             }
@@ -191,17 +191,13 @@ enum Rendering {
 ///
 /// Mirrors the parse/lower report builders: the `Debug` impl of [`InferError`]
 /// is already the human-readable message, used as both the report title and the
-/// label. Colour is governed by `config` (off for [`CompileError::render`], on
+/// label. Colour is governed by `color` (off for [`CompileError::render`], on
 /// for [`CompileError::eprint`]), matching the other arms' conventions.
-fn infer_report(
-    error: &InferError,
-    span: Span,
-    config: ariadne::Config,
-) -> ariadne::Report<'static, Span> {
+fn infer_report(error: &InferError, span: Span, color: bool) -> ariadne::Report<'static, Span> {
     use ariadne::{Color, Label, Report, ReportKind};
     let message = format!("{error:?}");
     Report::build(ReportKind::Error, span.file, span.start)
-        .with_config(config)
+        .with_config(report_config(color))
         .with_message("type inference error")
         .with_label(
             Label::new(span)
@@ -2529,6 +2525,17 @@ Error: lowering error
             "blame must land on a node enclosing the conflict, never the whole program \
              and never nothing",
         );
+    }
+
+    /// A diagnostic after a multi-byte character names the column of its own
+    /// text: `1 and 2` starts at byte 11 but is the 11th character, and ariadne
+    /// reading the offset as a character index would report column 12.
+    #[test]
+    fn a_diagnostic_after_a_multibyte_character_names_its_column() {
+        let code = "s = (\"é\", 1 and 2)\ns\n";
+        let sources = SourceMap::single("<test>", code);
+        let out = render_errors(&compile_err(&sources), &sources);
+        assert!(out.contains("<test>:1:11"), "{out}");
     }
 
     /// Terminal rendering: a span-carrying inference error renders

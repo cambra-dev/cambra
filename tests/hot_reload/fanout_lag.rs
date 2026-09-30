@@ -18,7 +18,6 @@
 //! replace the pinned value with the correct one and rename the test to state the
 //! behavior it then pins.
 
-use cambra::chl_parser::SourceMap;
 use indoc::indoc;
 
 use cambra::{
@@ -27,7 +26,7 @@ use cambra::{
     live_program::LiveProgram,
 };
 
-use crate::harness::stdin_across_reload;
+use crate::harness::{OneFile, stdin_across_reload};
 use crate::serving::no_main;
 
 const ITEMS: &str = r#"["a", "b", "c", "d", "e", "f", "g", "h"]"#;
@@ -104,22 +103,14 @@ fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) 
 /// edited, drive to the end, and return everything `main` emitted.
 fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(
-        &mut ctx,
-        &SourceMap::single("<test>", feed(ITEMS, reads_n, "")),
-        &no_main,
-    )
-    .expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main)
+        .expect("v1 compiles");
     let mut all = Vec::new();
     for _ in 0..pulls {
         all.extend(pull(&mut ctx, &mut live).0);
     }
-    live.reload(
-        &mut ctx,
-        &SourceMap::single("<test>", feed(ITEMS, reads_n, "!")),
-        &no_main,
-    )
-    .expect("only the second writer changed");
+    live.reload_text(&mut ctx, &feed(ITEMS, reads_n, "!"), &no_main)
+        .expect("only the second writer changed");
     for _ in 0..100 {
         let (emitted, done) = pull(&mut ctx, &mut live);
         all.extend(emitted);
@@ -323,23 +314,15 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
     let mut changed = Vec::new();
     for pulls in 0..=10 {
         let mut ctx = GlobalContext::default();
-        let mut live = LiveProgram::start(
-            &mut ctx,
-            &SourceMap::single("<test>", fold("", "n")),
-            &no_main,
-        )
-        .expect("compiles");
+        let mut live =
+            LiveProgram::start_text(&mut ctx, &fold("", "n"), &no_main).expect("compiles");
         for _ in 0..pulls {
             let producer = live.main_producer_mut().expect("the value is `n`");
             let _ = producer.get(producer.tiling().universal_guard());
             ctx.scheduler().check_for_notifications();
         }
-        live.reload(
-            &mut ctx,
-            &SourceMap::single("<test>", fold(added, r#"n + "|" + p"#)),
-            &no_main,
-        )
-        .expect("a loop over a list literal is a collection this version can build again");
+        live.reload_text(&mut ctx, &fold(added, r#"n + "|" + p"#), &no_main)
+            .expect("a loop over a list literal is a collection this version can build again");
         let value = drive_to_terminal(&mut ctx, &mut live);
         // The added loop folds `items` from the element the kept fold is on.
         let pinned = match pulls {

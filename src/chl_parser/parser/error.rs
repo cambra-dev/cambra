@@ -23,7 +23,7 @@
 
 use std::fmt;
 
-use ariadne::{Color, Config, Label, Report, ReportKind};
+use ariadne::{Color, Label, Report, ReportKind};
 use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::chl_parser::ast::Span;
@@ -211,7 +211,7 @@ impl<T> ParseResult<T> {
     pub fn render_errors(&self, sources: &SourceMap) -> String {
         let mut buf: Vec<u8> = Vec::new();
         for err in &self.errors {
-            err.to_report_with_config(report_config(false))
+            err.to_report(false)
                 .write(sources, &mut buf)
                 .expect("ariadne write should not fail on Vec<u8>");
         }
@@ -221,7 +221,7 @@ impl<T> ParseResult<T> {
     /// Print every error to stderr via ariadne with colour.
     pub fn eprint_errors(&self, sources: &SourceMap) {
         for err in &self.errors {
-            err.to_report()
+            err.to_report(true)
                 .eprint(sources)
                 .expect("ariadne eprint should not fail on stderr");
         }
@@ -256,16 +256,12 @@ impl ParseError {
         }
     }
 
-    /// Build an ariadne [`Report`] with default (colour-on) configuration.
-    pub fn to_report(&self) -> Report<'static, Span> {
-        self.to_report_with_config(report_config(true))
-    }
-
-    /// Build an ariadne [`Report`] using the supplied [`Config`]. Used by
-    /// [`ParseResult::render_errors`] to disable colour for snapshot-style
-    /// output; interactive callers should use [`Self::to_report`] (or
-    /// [`ParseResult::eprint_errors`]) for the coloured default.
-    pub fn to_report_with_config(&self, config: Config) -> Report<'static, Span> {
+    /// Build an ariadne [`Report`], coloured when `color` is set.
+    /// [`ParseResult::render_errors`] turns colour off for snapshot-style
+    /// output; [`ParseResult::eprint_errors`] turns it on. Every other setting
+    /// is [`report_config`]'s, so the report reads the span's offsets as bytes.
+    pub fn to_report(&self, color: bool) -> Report<'static, Span> {
+        let config = report_config(color);
         match self {
             ParseError::Lex(e) => {
                 let (span, msg): (Span, &'static str) = match e {

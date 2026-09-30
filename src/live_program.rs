@@ -41,6 +41,7 @@ use std::sync::mpsc;
 use crate::ccl::{
     context::{
         CompileError, CompiledProgram, GlobalContext, Phase, compile_program, compile_replacement,
+        render_errors,
     },
     diff::diff,
 };
@@ -204,13 +205,30 @@ impl LiveProgram {
     /// [`ReloadReport`] rather than this string, so that a reply carrying both
     /// neither says the report twice nor compiles the planned tree twice to
     /// derive it.
+    ///
+    /// Every error returned renders against `sources`, as the callers render
+    /// them. Recompiling the running version could fail too, and its errors'
+    /// spans name files of [`Self::sources`], whose [`FileId`]s mean nothing in
+    /// `sources`: rendered there they would point into the wrong text, or at no
+    /// file at all. So those are rendered here, against their own map, and
+    /// returned as one spanless error.
+    ///
+    /// [`FileId`]: crate::chl_parser::FileId
     fn difference(
         &self,
         ctx: &GlobalContext,
         sources: &SourceMap,
         phase: Phase,
     ) -> Result<Option<String>, Vec<CompileError>> {
-        let old = ctx.sources_and_sinks().compile_to(self.sources(), phase)?;
+        let old = ctx
+            .sources_and_sinks()
+            .compile_to(self.sources(), phase)
+            .map_err(|errs| {
+                vec![CompileError::Unsupported(format!(
+                    "the running version no longer compiles:\n{}",
+                    render_errors(&errs, self.sources())
+                ))]
+            })?;
         let new = ctx.sources_and_sinks().compile_to(sources, phase)?;
         let d = diff(&old, &new);
         if d.is_identical() {

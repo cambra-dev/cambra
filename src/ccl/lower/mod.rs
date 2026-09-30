@@ -177,17 +177,13 @@ impl LoweringError {
         }
     }
 
-    /// Build an ariadne [`Report`](ariadne::Report) with default (colour-on)
-    /// configuration.
-    pub fn to_report(&self) -> ariadne::Report<'static, Span> {
-        self.to_report_with_config(report_config(true))
-    }
-
-    /// Build an ariadne [`Report`](ariadne::Report) using the supplied
-    /// [`Config`](ariadne::Config). Use this to disable colour for snapshot
-    /// or log output; interactive callers should use [`Self::to_report`].
-    pub fn to_report_with_config(&self, config: ariadne::Config) -> ariadne::Report<'static, Span> {
+    /// Build an ariadne [`Report`](ariadne::Report), coloured when `color` is
+    /// set. Colour off suits snapshot or log output; interactive callers want
+    /// it on. Every other setting is [`report_config`]'s, so the report reads
+    /// the span's offsets as bytes.
+    pub fn to_report(&self, color: bool) -> ariadne::Report<'static, Span> {
         use ariadne::{Color, Label, Report, ReportKind};
+        let config = report_config(color);
         match self {
             LoweringError::Unsupported { span, message } => {
                 Report::build(ReportKind::Error, span.file, span.start)

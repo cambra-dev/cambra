@@ -48,9 +48,12 @@ fn poll_control(
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
+    // A new version is the running root with new text, so its diagnostics name
+    // the root's path, and after a reload so does the running program.
+    let root = live.sources().path(live.sources().root()).to_owned();
     let reply = match message.request() {
         ControlRequest::Diff { code, phase } => {
-            let sources = SourceMap::single("<new>", code.as_str());
+            let sources = SourceMap::single(root, code.as_str());
             match live.diff_against(ctx, &sources, *phase) {
                 Ok(report) => ControlReply::ok(format!(
                     "{}{}",
@@ -61,7 +64,7 @@ fn poll_control(
             }
         }
         ControlRequest::Reload { code } => {
-            let sources = SourceMap::single("<new>", code.as_str());
+            let sources = SourceMap::single(root, code.as_str());
             match live.reload(ctx, &sources, main_consumer) {
                 Ok(report) => {
                     // The new graph has subscribed but nothing has pulled it, so arm

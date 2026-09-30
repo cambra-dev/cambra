@@ -87,8 +87,9 @@ impl SourceMap {
 ///
 /// A [`Span`](super::ast::Span) holds byte offsets, and ariadne reads offsets
 /// as character indices unless told otherwise, which misplaces every label
-/// after a multi-byte character.
-pub fn report_config(color: bool) -> ariadne::Config {
+/// after a multi-byte character. The report builders apply it themselves and
+/// take only the colour, so no caller can build a report without it.
+pub(crate) fn report_config(color: bool) -> ariadne::Config {
     ariadne::Config::default()
         .with_color(color)
         .with_index_type(ariadne::IndexType::Byte)
