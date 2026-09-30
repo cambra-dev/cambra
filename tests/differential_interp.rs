@@ -545,10 +545,9 @@ fn a_terminal_read_in_a_conditional_test() {
     "#});
 }
 
-/// The same read against a threshold only the final value, 97, fails to clear: the seed, 100,
-/// and the value between the commits, 99, both clear it. So the two sides agree on the other
-/// branch only when the predicate reads the final value, and a dropped predicate disagrees
-/// too.
+/// The same read with threshold 98: the seed (100) and the value between the commits (99)
+/// clear it, and the final value (97) does not. So the two sides agree on the other branch only
+/// when the predicate reads the final value, and a dropped predicate disagrees too.
 #[test]
 fn a_terminal_read_in_a_conditional_test_not_taken() {
     agree(indoc! {r#"

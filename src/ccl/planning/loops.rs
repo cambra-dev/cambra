@@ -15,8 +15,7 @@ use crate::ccl::{
     Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
     TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{
-        PredMemo, commit_payload_ty, count_free, is_free, is_free_in_type,
-        walk_refined_predicates_mut,
+        PredMemo, commit_payload_ty, count_free, is_free_in_type, walk_refined_predicates_mut,
     },
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, tvar},
@@ -562,9 +561,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     }
 
     // The substitution reaches type slots too: a conditional's test refines the branch
-    // domain, so a transactional read in the test lands in that refinement's predicate. It
-    // leaves every subtree that mentions none of the bindings untouched, so a predicate away
-    // from a read is not rebuilt.
+    // domain, so a transactional read in the test lands in that refinement's predicate.
     let hist = Name::fresh("__hist");
     let env: HashMap<Name, Expr> = read_map
         .iter()
@@ -597,21 +594,24 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
 ///
 /// Reaches the snapshots inside refinement predicates too, and rebuilds only a predicate that
 /// mentions `__hist`. Answers whether it changed anything.
+///
+/// The predicate branch has no known producer: `rewrite_as_of_reads` places a snapshot at the
+/// reply it feeds, outside any conditional's test. It is there because the substitution before
+/// it puts `__hist` wherever a read was, predicates included, so a snapshot literal in a
+/// predicate would otherwise reach op-conversion uncollapsed.
 fn collapse_snapshot_sources(
     e: &mut Expr,
     hist: &Name,
     hist_ty: &Type,
     memo: &PredMemo<()>,
 ) -> bool {
-    if !is_free(hist, e) {
-        return false;
-    }
     let mut changed = false;
     if let TypedExprNode::Apply { argument, function } = &mut e.node
         && matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOf))
         && let TypedExprNode::Tuple(elts) = &mut argument.node
         && let [_, source] = elts.as_mut_slice()
         && let TypedExprNode::Record(fields) = &source.node
+        && !fields.is_empty()
         && fields.iter().all(|(f, v)| {
             matches!(&v.node,
                 TypedExprNode::Apply { argument: sv, function: proj }
