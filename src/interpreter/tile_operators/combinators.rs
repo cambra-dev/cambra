@@ -1123,10 +1123,17 @@ impl TileOperator for Product {
 /// `outer`'s rows paired against an inner side that has not delivered its domain yet: no
 /// groups at all.
 ///
-/// A group is the whole inner domain, so one built before the inner side is terminal could
-/// still gain elements — and a group that can grow is what the layout cannot hold
-/// ([`Tile::append_level`]). Emitting no rows claims nothing about them, which is why the
-/// region is `False` rather than whatever `outer` has decided.
+/// A group is the whole inner domain, and [`Tile::append_level`] calls a one-level outer's
+/// keys final beneath the groups it is handed, so a group built before the inner side is
+/// terminal would claim a row finished with elements still to come. Emitting no rows claims
+/// nothing about them, which is why the region is `False` rather than whatever `outer` has
+/// decided.
+///
+/// **This is a limitation of reading the inner domain once, not of the pairing.** A
+/// correlated comprehension whose inner source never becomes terminal, such as a live
+/// source or a transaction store, produces no rows at all. Pairing each row with the inner
+/// side as it streams lifts it: every group grows with the inner side, and each outer row's
+/// completeness is stated as both sides' together.
 ///
 /// An inner side that is terminal and empty is a different fact: every row is present and
 /// pairs with nothing.
@@ -1171,11 +1178,10 @@ struct ProductProducer {
     inner: Box<dyn TileProducer>,
     /// The inner_domain, kept after the inner collection has delivered all of them.
     ///
-    /// **Every group holds the whole domain**, so a row cannot be emitted until the inner
-    /// side is complete — a group built from a prefix would claim a row finished with
-    /// elements still to come. The inner side of a correlated comprehension is closed over
-    /// the outer binder, so it is the same stream for every row and reading it once is all
-    /// this needs.
+    /// Every group holds the whole domain, so a row is not emitted until the inner side is
+    /// complete ([`unpaired_rows`]). The inner side of a correlated comprehension is closed
+    /// over the outer binder, so it is the same stream for every row and one reading serves
+    /// all of them.
     inner_domain: Option<ColumnValue>,
 }
 
@@ -1202,9 +1208,9 @@ impl TileProducer for ProductProducer {
             return unpaired_rows(&outer_tile);
         };
         let width = inner_domain.len();
-        // Every group is the whole inner domain, so a row is complete as soon as it
-        // arrives — the group [`Tile::append_level`] needs whole. An inner domain that is
-        // terminal and empty pairs every row with nothing, which equal starts carry.
+        // Every group is the whole inner domain, which is the whole group
+        // [`Tile::append_level`] needs. An inner domain that is terminal and empty pairs every
+        // row with nothing, which equal starts carry.
         let mut tile = outer_tile.append_level(|codomain| {
             let outer = scalar_tile_to_column_value(codomain);
             let rows = outer.len();

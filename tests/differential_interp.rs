@@ -166,24 +166,14 @@ fn a_groupby_rollup() {
     "#});
 }
 
-/// A comprehension inside a loop that reads the loop variable does not convert (the
-/// correlated case). Pinned at the compiler's error.
+/// A comprehension inside a loop that reads the loop variable: the correlated case.
 #[test]
-fn a_correlated_comprehension_does_not_compile() {
-    let source = indoc! {r#"
+fn a_correlated_comprehension() {
+    agree(indoc! {r#"
         out = test_sink()
         for x in [1, 2, 3]:
             out << sum([y * x for y in [1, 2]])
-    "#};
-    // The interpreter has no trouble with it; the compiler is what stops.
-    assert_eq!(interpreted(source).to_string(), "[3, 6, 9]");
-    match run_compiled(source) {
-        Compiled::Rejected(err) => assert!(
-            err.contains("non-combinator curry"),
-            "expected the curry conversion error, got: {err}"
-        ),
-        other => panic!("expected the compiler to reject a correlated comprehension, got {other}"),
-    }
+    "#});
 }
 
 #[test]

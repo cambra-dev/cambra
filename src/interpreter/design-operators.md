@@ -72,11 +72,12 @@ out of that tile's codomain: `Product` repeats each row's value across the group
 One level is the base case, so an operator that appends a level is closed under its own
 output. `Tiling::append_level` is the same step on the static shape.
 
-The appended level is whole for every parent it names. A parent's keys occupy one contiguous run
-of the level below and `merge` concatenates levels rather than reaching inside a group, so no
-later tile adds to a group. The tile therefore calls every key present final together with the
-level just built, and removals ride through level for level — the appended level has removed
-nothing.
+The appended level is whole for every parent it names, since a caller appends only once it holds
+each group entire. A one-level tile's keys therefore become final, each now holding a whole group
+where it held one value. A deeper tile's outermost keys own groups of the levels already beneath
+them, which a later tile can add to, because `merge` matches a key both sides hold and merges
+their groups. Such a tile keeps the completeness it arrived with. Removals ride through level for
+level, and the appended level has removed nothing.
 
 Tiles representing collections (`DataFunction`) support logical deletes by storing a `BitSet` of
 deleted values. These are set by filtering operators like `Restrict` and compacted away by stateful

@@ -608,10 +608,8 @@ fn a_correlated_comprehension_runs_inside_a_transaction(
     );
 }
 
-/// Correlated nesting at **depth three and four**, which the two-level curried tiling could
-/// not hold: pairing produced a two-level tile and consumed a one-level one, so the operator
-/// was not closed under its own output. A function tile carries one offsets array per level
-/// now, so a pairing appends a level and an aggregate collapses one
+/// Correlated nesting at **depth three and four**. Each pairing appends one level and each
+/// aggregate removes one, so a comprehension nested 𝑛 deep pairs 𝑛−1 times and folds 𝑛 times
 /// (`src/interpreter/design-operators.md`, "A correlated inner comprehension").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -643,6 +641,24 @@ fn a_correlated_comprehension_runs_inside_a_transaction(
 )]
 fn a_correlated_comprehension_nests_to_any_depth(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
+}
+
+/// A correlated comprehension whose **outer row is itself a collection**, a `groupby` group.
+/// `Product` appends its level beneath the innermost level of the tile it is handed, and a
+/// group's own elements are such a level, so the pairing lands beneath them and the product
+/// reaches `BinOp(*)` one level too deep. Pinned as it fails. The groups are `[1]`, `[2, 3]`
+/// and `[4]`, so it answers `3 × (1 + 5 + 4)` = 30.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "a level reaching it is a shape error")]
+fn a_correlated_comprehension_over_collection_valued_rows() {
+    check_scalar(
+        indoc! {r"
+            g = groupby([1, 2, 3, 4], \v -> v // 2)
+            sum([sum([x * sum(v) for x in [1, 2]]) for v in g])
+        "},
+        Value::Int(30),
+    );
 }
 
 /// Nesting **with no aggregate at any level**: three comprehensions leave three domain
