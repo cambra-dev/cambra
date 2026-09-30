@@ -1490,3 +1490,37 @@ fn a_mut_loop_runs_in_order_over_positions_that_arrive_out_of_order(
     let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
+
+/// A **correlated lookup into a streamed collection**: each row's group of keys waits on a
+/// collection that decides none of them until its source closes, across pulls that deliver
+/// batches in between. The map is built whole at the close, so every key is undecided until
+/// then, and `3` is decided present or absent by what the batches delivered. A group answered
+/// in part is `CheckedLookup`'s unit tests' (`tile_operators/lookup.rs`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::decided_at_close(false, 30)]
+#[case::delivered_later(true, 39)]
+fn a_correlated_lookup_answers_the_keys_its_collection_has_decided(
+    #[case] deliver_five: bool,
+    #[case] expected: i64,
+) {
+    let code = indoc::indoc! {r"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        m = map([(x, x) for x in source1()])
+        sum([sum([or_zero(m[k]?) * r for k in [10, 3]]) for r in [1, 2]])
+    "};
+    let first: (&[(usize, i64)], usize) = (&[(0, 10)], 0);
+    let second: (&[(usize, i64)], usize) = (&[(5, 3)], 5);
+    let batches = if deliver_five {
+        vec![first, second]
+    } else {
+        vec![first]
+    };
+    let tile = run_in_batches(code, &batches);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
