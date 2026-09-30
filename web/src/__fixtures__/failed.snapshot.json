@@ -10,6 +10,7 @@
       "stage": "infer",
       "message": "Type mismatch for BinOp: expected Bool, found Int",
       "span": {
+        "file": 0,
         "start": 0,
         "end": 7
       }

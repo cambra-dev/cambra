@@ -27,18 +27,21 @@
 
 use smol_str::SmolStr;
 
-/// Byte-offset span into the source text.
+pub use super::source_map::FileId;
+
+/// A byte range in one source file.
 ///
-/// Half-open: `start..end` covers bytes `start, start+1, …, end-1`.
+/// Half-open: `start..end` covers bytes `start, start+1, …, end-1` of the file
+/// `file` names. Offsets count from the start of that file, so editing one file
+/// moves no span in another.
 ///
-/// # Why byte offsets, not file/line/col
+/// # Why byte offsets, not line/col
 ///
 /// - **Composition is integer arithmetic.** Span joins, ordering, and
 ///   containment checks are `min` / `max` / `<=`. Line/col representations
 ///   need a same-line vs. different-line special case at every site.
-/// - **AST stays cheap.** Two `usize`s, no allocations, `Copy`. Spans
-///   appear on every node; file/line/col would be 3-4× the size and need
-///   string interning for the file name.
+/// - **AST stays cheap.** A [`FileId`] and two `usize`s, no allocations,
+///   `Copy`.
 /// - **Single source of truth.** Line/col is derivable from offset + the
 ///   source text via a one-time newline-index scan and an `O(log n)`
 ///   binary search. Storing line/col alongside risks drift; offsets only
@@ -46,25 +49,35 @@ use smol_str::SmolStr;
 ///
 /// The render-time tradeoff — needing the source text + a newline index to
 /// turn `42` into "line 5, column 12" — is paid only when emitting
-/// diagnostics, and ariadne / LSP / editor jump-to-location all want
-/// offsets natively anyway.
-// Wire shape (inspector): `{ "start": N, "end": N }` — byte offsets, exactly
-// what the `/api/snapshot` schema specifies. The field names are already
-// lowercase single words, so no `rename_all` is needed.
+/// diagnostics, through the [`SourceMap`](super::source_map::SourceMap) the
+/// `file` indexes.
+// Wire shape (inspector): `{ "file": N, "start": N, "end": N }` — the file's
+// index and byte offsets, exactly what the `/api/snapshot` schema specifies.
+// The field names are already lowercase single words, so no `rename_all` is
+// needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Span {
+    pub file: FileId,
     pub start: usize,
     pub end: usize,
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+    pub fn new(file: FileId, start: usize, end: usize) -> Self {
+        Self { file, start, end }
     }
 
     /// Span covering both `self` and `other` (and any text between them).
+    ///
+    /// Both spans lie in one file: no text lies between two files, so a join
+    /// across them has no meaning.
     pub fn join(self, other: Span) -> Span {
+        debug_assert_eq!(
+            self.file, other.file,
+            "Span::join of spans in two files: {self:?} and {other:?}"
+        );
         Span {
+            file: self.file,
             start: self.start.min(other.start),
             end: self.end.max(other.end),
         }
@@ -75,12 +88,6 @@ impl Span {
     }
 }
 
-impl From<std::ops::Range<usize>> for Span {
-    fn from(r: std::ops::Range<usize>) -> Self {
-        Span::new(r.start, r.end)
-    }
-}
-
 impl From<Span> for std::ops::Range<usize> {
     fn from(s: Span) -> Self {
         s.as_range()
@@ -88,7 +95,11 @@ impl From<Span> for std::ops::Range<usize> {
 }
 
 /// Compact user-facing rendering: `start..end`. Used by chumsky's `Rich`
-/// error formatter via its `S: Display` bound.
+/// error formatter via its `S: Display` bound, and by [`ParseError`]'s
+/// one-line `Display`, which describes an error in a file the reader already
+/// knows.
+///
+/// [`ParseError`]: super::parser::ParseError
 impl std::fmt::Display for Span {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}..{}", self.start, self.end)
@@ -97,16 +108,39 @@ impl std::fmt::Display for Span {
 
 /// Implement `chumsky::span::Span` so our AST's `Span` can be used as the
 /// span type in the chumsky parser without copying spans through a separate
-/// representation.
+/// representation. The context is the file: chumsky builds every span it
+/// derives from the end-of-input span's context, so the file the parser was
+/// handed reaches every node.
 impl chumsky::span::Span for Span {
-    type Context = ();
+    type Context = FileId;
     type Offset = usize;
 
-    fn new(_context: (), range: std::ops::Range<usize>) -> Self {
-        Span::new(range.start, range.end)
+    fn new(file: FileId, range: std::ops::Range<usize>) -> Self {
+        Span::new(file, range.start, range.end)
     }
 
-    fn context(&self) {}
+    fn context(&self) -> FileId {
+        self.file
+    }
+
+    fn start(&self) -> usize {
+        self.start
+    }
+
+    fn end(&self) -> usize {
+        self.end
+    }
+}
+
+/// Implement `ariadne::Span` so a diagnostic labels a [`Span`] directly, and a
+/// report's labels may lie in several files: ariadne fetches each label's file
+/// from the [`SourceMap`](super::source_map::SourceMap) by its [`FileId`].
+impl ariadne::Span for Span {
+    type SourceId = FileId;
+
+    fn source(&self) -> &FileId {
+        &self.file
+    }
 
     fn start(&self) -> usize {
         self.start
@@ -137,6 +171,8 @@ impl<T> Spanned<T> {
 /// A complete CHL source file: a sequence of top-level statements.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
+    /// The file the module was parsed from. Every span in `body` lies in it.
+    pub file: FileId,
     pub body: Vec<Spanned<Stmt>>,
 }
 

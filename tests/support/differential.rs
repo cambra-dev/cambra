@@ -40,7 +40,8 @@ pub fn run_compiled(source: &str) -> Compiled {
     let mut ctx = GlobalContext::default();
     let sink = ctx.register_test_sink("out");
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let program = match compile_program(&mut ctx, source, consumer) {
+    let sources = cambra::chl_parser::SourceMap::single("<test>", source);
+    let program = match compile_program(&mut ctx, &sources, consumer) {
         Ok(p) => p,
         Err(errs) => return Compiled::Rejected(format!("{errs:?}")),
     };

@@ -35,7 +35,8 @@ fn writer_size(code: &str) -> usize {
         e.walk_children(|c| n += size(c));
         n
     }
-    size(&compile_to(code, Phase::Letrec).expect("the program compiles"))
+    let sources = cambra::chl_parser::SourceMap::single("<test>", code);
+    size(&compile_to(&sources, Phase::Letrec).expect("the program compiles"))
 }
 
 /// The chain lengths the bound compares. A regression is exponential in the

@@ -61,6 +61,7 @@
 //! }
 //! ```
 
+use cambra::chl_parser::SourceMap;
 use std::{
     cell::RefCell,
     io::Write,
@@ -258,8 +259,8 @@ pub(crate) fn run_to_tile(source: &str) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled =
-        compile_program(&mut ctx, source, consumer).unwrap_or_render("<test>", source);
+    let sources = SourceMap::single("<test>", source);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     ctx.scheduler().check_for_notifications();
     assert!(
         *notified.borrow(),

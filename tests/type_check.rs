@@ -11,6 +11,7 @@
 //!   → Type          (test assertion here)
 //! ```
 
+use cambra::chl_parser::FileId;
 use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
@@ -81,8 +82,8 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
 /// the same uid. Inferring a source-spelled tree asks those rules a question the
 /// product never asks, and shadowing — which uniquify removes — is exactly what
 /// makes the answer differ.
-fn lower_uniquified(stmts: &[chl_ast::Spanned<chl_ast::Stmt>], lctx: &mut LoweringContext) -> Expr {
-    let expr = lower_stmts(stmts, lctx)
+fn lower_uniquified(module: &chl_ast::Module, lctx: &mut LoweringContext) -> Expr {
+    let expr = lower_stmts(module, lctx)
         .into_result()
         .expect("lowering failed");
     uniquify::run(expr)
@@ -159,12 +160,11 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
         .expect_err("expected inference error")
 }
 
-/// Parse a CHL module string into its statement list.
-fn parse_module(code: &str) -> Vec<chl_ast::Spanned<chl_ast::Stmt>> {
-    chl_parser::parse_module(code)
+/// Parse a CHL module string, the root of its own one-file map.
+fn parse_module(code: &str) -> chl_ast::Module {
+    chl_parser::parse_module(FileId::ROOT, code)
         .into_result()
         .expect("Failed to parse module")
-        .body
 }
 
 /// Convenience alias for `Type::Base(BaseType::Int)`.

@@ -296,7 +296,8 @@ fn collection(entries: Vec<(Value, Value)>) -> Result<Collection, Error> {
 
 /// Run `source`, answering what each sink observed.
 pub fn run(source: &str) -> Result<Observations, Error> {
-    let module = chl_parser::parse_module(source)
+    let root = chl_parser::FileId::ROOT;
+    let module = chl_parser::parse_module(root, source)
         .into_result()
         .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
     let mut feed_sites = BTreeMap::new();

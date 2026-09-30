@@ -6,7 +6,7 @@ import type { Definition, IrNode } from "./types";
 function node(
   nodeId: number,
   label: string,
-  span: { start: number; end: number } | null,
+  span: { file: number; start: number; end: number } | null,
   type: string,
   children: { id: number; predicate: boolean }[] = [],
 ): IrNode {
@@ -30,15 +30,15 @@ function node(
 //       dup-deep  #5 [6,7)   (depth 2)  <- innermost, wins ties
 const value = (id: number) => ({ id, predicate: false });
 const nodes: IrNode[] = [
-  node(1, "Root", { start: 0, end: 10 }, "Int", [value(2), { id: 4, predicate: false }]),
-  node(2, "Inner", { start: 2, end: 5 }, "Int", [value(3)]),
-  node(3, "Leaf", { start: 3, end: 4 }, "Int"),
-  node(4, "DupShallow", { start: 6, end: 7 }, "Int", [value(5)]),
-  node(5, "DupDeep", { start: 6, end: 7 }, "Bool"),
+  node(1, "Root", { file: 0, start: 0, end: 10 }, "Int", [value(2), { id: 4, predicate: false }]),
+  node(2, "Inner", { file: 0, start: 2, end: 5 }, "Int", [value(3)]),
+  node(3, "Leaf", { file: 0, start: 3, end: 4 }, "Int"),
+  node(4, "DupShallow", { file: 0, start: 6, end: 7 }, "Int", [value(5)]),
+  node(5, "DupDeep", { file: 0, start: 6, end: 7 }, "Bool"),
 ];
 
 const definitions: Definition[] = [
-  { useSpan: { start: 8, end: 9 }, defSpan: { start: 0, end: 1 }, name: "x" },
+  { useSpan: { file: 0, start: 8, end: 9 }, defSpan: { file: 0, start: 0, end: 1 }, name: "x" },
 ];
 
 const idx = buildIndices(1, nodes, definitions, "");
@@ -117,10 +117,10 @@ describe("nodesInRange: containment is decided on visible text", () => {
   //             0      6       13
   // `block:\n  body\n` is [6, 20): the trailing newline is the 19th byte.
   const nodes: IrNode[] = [
-    node(60, "Root", { start: 0, end: 20 }, "Unit", [value(61), value(62)]),
-    node(61, "Assign", { start: 0, end: 5 }, "Int"),
-    node(62, "Block", { start: 6, end: 20 }, "Unit", [value(63)]),
-    node(63, "Body", { start: 15, end: 19 }, "Unit"),
+    node(60, "Root", { file: 0, start: 0, end: 20 }, "Unit", [value(61), value(62)]),
+    node(61, "Assign", { file: 0, start: 0, end: 5 }, "Int"),
+    node(62, "Block", { file: 0, start: 6, end: 20 }, "Unit", [value(63)]),
+    node(63, "Body", { file: 0, start: 15, end: 19 }, "Unit"),
   ];
   const t = buildIndices(60, nodes, [], text);
 
@@ -192,8 +192,8 @@ describe("nodesInRange: visible extents are measured in bytes", () => {
   const bodyEnd = bytes(text.indexOf("body") + 4);
 
   const nodes: IrNode[] = [
-    node(70, "Block", { start: blockStart, end: blockEnd }, "Unit", [value(71)]),
-    node(71, "Body", { start: bodyStart, end: bodyEnd }, "Unit"),
+    node(70, "Block", { file: 0, start: blockStart, end: blockEnd }, "Unit", [value(71)]),
+    node(71, "Body", { file: 0, start: bodyStart, end: bodyEnd }, "Unit"),
   ];
   const t = buildIndices(70, nodes, [], text);
 
@@ -256,13 +256,13 @@ describe("growing a selection never un-selects anything", () => {
   // the cases that happened to expose it.
   const text = "dup = \\x -> (x, x)\na = dup(1)\nb = dup(2 == 2)\na\n";
   const nodes: IrNode[] = [
-    node(80, "Let(dup)", { start: 0, end: 18 }, "_", [value(81)]),
-    node(81, "Lambda(x)", { start: 6, end: 18 }, "_", [value(82)]),
-    node(82, "Tuple", { start: 13, end: 18 }, "_"),
-    node(83, "Let(a)", { start: 19, end: 29 }, "_", [value(84)]),
-    node(84, "Apply", { start: 23, end: 29 }, "_", [value(85), value(86)]),
-    node(85, "Var(dup)", { start: 23, end: 26 }, "_"),
-    node(86, "Lit(Int(1))", { start: 27, end: 28 }, "_"),
+    node(80, "Let(dup)", { file: 0, start: 0, end: 18 }, "_", [value(81)]),
+    node(81, "Lambda(x)", { file: 0, start: 6, end: 18 }, "_", [value(82)]),
+    node(82, "Tuple", { file: 0, start: 13, end: 18 }, "_"),
+    node(83, "Let(a)", { file: 0, start: 19, end: 29 }, "_", [value(84)]),
+    node(84, "Apply", { file: 0, start: 23, end: 29 }, "_", [value(85), value(86)]),
+    node(85, "Var(dup)", { file: 0, start: 23, end: 26 }, "_"),
+    node(86, "Lit(Int(1))", { file: 0, start: 27, end: 28 }, "_"),
   ];
   const m = buildIndices(80, nodes, [], text);
 
@@ -311,13 +311,13 @@ describe("nodesInRange: predicate interiors are not seeds", () => {
   // tree draws no row for them, so a range over the literal must name the
   // literal and nothing else.
   const withPred: IrNode[] = [
-    node(20, "Root", { start: 0, end: 6 }, "Int", [
+    node(20, "Root", { file: 0, start: 0, end: 6 }, "Int", [
       { id: 21, predicate: false },
       { id: 22, predicate: true },
     ]),
-    node(21, "Lit(Int(1))", { start: 4, end: 5 }, "Int@1", [{ id: 22, predicate: true }]),
-    node(22, "BinOp(Eq)", { start: 4, end: 5 }, "Bool", [{ id: 23, predicate: false }]),
-    node(23, "Lit(Int(1))", { start: 4, end: 5 }, "Int@1"),
+    node(21, "Lit(Int(1))", { file: 0, start: 4, end: 5 }, "Int@1", [{ id: 22, predicate: true }]),
+    node(22, "BinOp(Eq)", { file: 0, start: 4, end: 5 }, "Bool", [{ id: 23, predicate: false }]),
+    node(23, "Lit(Int(1))", { file: 0, start: 4, end: 5 }, "Int@1"),
   ];
   const p = buildIndices(20, withPred, [], "");
 
@@ -343,8 +343,8 @@ describe("tightestNodeAt: a synthesized unit is not what a click means", () => {
   // so it ties the `ExprStmt` that owns the statement on width and wins on
   // depth. A click on `if` then answers with a node the reader never wrote.
   const withUnit: IrNode[] = [
-    node(40, "ExprStmt", { start: 10, end: 30 }, "Unit", [value(41)]),
-    node(41, "Lit(Unit)", { start: 10, end: 30 }, "Unit"),
+    node(40, "ExprStmt", { file: 0, start: 10, end: 30 }, "Unit", [value(41)]),
+    node(41, "Lit(Unit)", { file: 0, start: 10, end: 30 }, "Unit"),
   ];
   const u = buildIndices(40, withUnit, [], "");
 
@@ -355,7 +355,7 @@ describe("tightestNodeAt: a synthesized unit is not what a click means", () => {
   it("still answers with the unit when nothing else covers the offset", () => {
     // A preference, not an exclusion: a unit that is the only candidate is
     // still the answer, so an explicitly written one stays reachable.
-    const only = buildIndices(41, [node(41, "Lit(Unit)", { start: 2, end: 4 }, "Unit")], [], "");
+    const only = buildIndices(41, [node(41, "Lit(Unit)", { file: 0, start: 2, end: 4 }, "Unit")], [], "");
     expect(only.tightestNodeAt(3)).toBe(41);
   });
 
@@ -370,8 +370,8 @@ describe("tightestNodeAt: a synthesized unit is not what a click means", () => {
     const mixed = buildIndices(
       50,
       [
-        node(50, "ExprStmt", { start: 0, end: 20 }, "Unit", [value(51)]),
-        node(51, "Lit(Unit)", { start: 5, end: 7 }, "Unit"),
+        node(50, "ExprStmt", { file: 0, start: 0, end: 20 }, "Unit", [value(51)]),
+        node(51, "Lit(Unit)", { file: 0, start: 5, end: 7 }, "Unit"),
       ],
       [],
       "",

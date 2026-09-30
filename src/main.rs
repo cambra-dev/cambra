@@ -5,6 +5,7 @@ use cambra::{
         context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
         provenance::NodeId,
     },
+    chl_parser::SourceMap,
     control_port::{ControlPort, ControlReply, ControlRequest},
     inspector_server::{live::LiveChannel, serve_compiled},
     interpreter::{
@@ -34,19 +35,26 @@ fn poll_control(
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
+    // The posted text arrived over the control port and need not match any file
+    // on disk, so its diagnostics label it `<new>` rather than a path.
+    const POSTED: &str = "<new>";
     let reply = match message.request() {
-        ControlRequest::Diff { code, phase } => match live.diff_against(ctx, code, *phase) {
-            Ok(report) => ControlReply::ok(format!(
-                "{}{}",
-                report.diff,
-                render_unreadable(&report.unreadable)
-            )),
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
-        },
+        ControlRequest::Diff { code, phase } => {
+            let sources = SourceMap::single(POSTED, code.as_str());
+            match live.diff_against(ctx, &sources, *phase) {
+                Ok(report) => ControlReply::ok(format!(
+                    "{}{}",
+                    report.diff,
+                    render_unreadable(&report.unreadable)
+                )),
+                Err(errs) => ControlReply::rejected(render_errors(&errs, &sources)),
+            }
+        }
         ControlRequest::Reload { code } => {
+            let sources = SourceMap::single(POSTED, code.as_str());
             // A rebuilt operator's producer takes the scheduler's probe slot
             // when it is built, as the first compile's did.
-            match live.reload(ctx, code, main_consumer) {
+            match live.reload(ctx, &sources, main_consumer) {
                 Ok(report) => {
                     // The new graph has subscribed but nothing has pulled it, so arm
                     // the driver for one pass.
@@ -58,7 +66,7 @@ fn poll_control(
                         render_unreadable(&report.unreadable),
                     ))
                 }
-                Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
+                Err(errs) => ControlReply::rejected(render_errors(&errs, &sources)),
             }
         }
     };
@@ -88,10 +96,11 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
-    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
+    let sources = SourceMap::single(src_name, code);
+    let mut live = match LiveProgram::start(&mut ctx, &sources, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
-            eprint_errors(&errs, src_name, code);
+            eprint_errors(&errs, &sources);
             return Err(());
         }
     };

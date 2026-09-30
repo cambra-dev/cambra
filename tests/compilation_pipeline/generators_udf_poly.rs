@@ -2,6 +2,7 @@
 //! polymorphic UDF chains (monomorphization through wrappers, diamonds, and
 //! triple chains), plus nested generator functions.
 
+use cambra::chl_parser::SourceMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -282,7 +283,7 @@ fn inference_error_sites(code: &str) -> Vec<Option<String>> {
     use cambra::ccl::context::CompileError;
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let Err(errs) = compile_program(&mut ctx, code, consumer) else {
+    let Err(errs) = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer) else {
         panic!("expected a compile error, but the program compiled");
     };
     errs.iter()
@@ -480,7 +481,7 @@ fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
         f = \x -> [x for z in [1, 2]]
         f
     "};
-    let result = compile_program(&mut ctx, code, consumer);
+    let result = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer);
     let Err(errs) = result else {
         panic!("ambiguous (never-exercised) generic must fail with a diagnostic");
     };

@@ -1433,6 +1433,10 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
 fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[case] expected: &str) {
     use cambra::ccl::context::{Phase, compile_to};
     use cambra::ccl::symbolic::symbolic;
-    let planned = compile_to(code, Phase::Planning).expect("the nest plans");
+    let planned = compile_to(
+        &cambra::chl_parser::SourceMap::single("<test>", code),
+        Phase::Planning,
+    )
+    .expect("the nest plans");
     assert_eq!(symbolic(&planned), expected.trim_end());
 }

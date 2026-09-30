@@ -60,8 +60,8 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
-    CompClause, Comprehension, Expr, IfBranch, KindAnnotation, Lit, MatchArm, MatchPattern, Module,
-    Param, PayloadPattern, RecordField, Requirement, Span, Spanned, Stmt, TypeAnnotation,
+    CompClause, Comprehension, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm, MatchPattern,
+    Module, Param, PayloadPattern, RecordField, Requirement, Span, Spanned, Stmt, TypeAnnotation,
     TypeParam, UnaryOp, VariantPayload,
 };
 use crate::lexer::{self, Token};
@@ -75,13 +75,14 @@ mod error;
 pub use error::ParseResult;
 pub use error::*;
 
-/// Parse a CHL module: a sequence of top-level statements.
+/// Parse `source`, the text of `file`, as a CHL module: a sequence of
+/// top-level statements. Every span in the result lies in `file`.
 ///
 /// Returns a [`ParseResult`] carrying both the (possibly partial) AST and
 /// the list of all parser errors. See [`ParseResult`] for the recovery
 /// semantics.
-pub fn parse_module(source: &str) -> ParseResult<Module> {
-    let tokens = match lexer::tokenize(source) {
+pub fn parse_module(file: FileId, source: &str) -> ParseResult<Module> {
+    let tokens = match lexer::tokenize(file, source) {
         Ok(t) => t,
         Err(e) => {
             return ParseResult {
@@ -90,24 +91,24 @@ pub fn parse_module(source: &str) -> ParseResult<Module> {
             };
         }
     };
-    let eof = Span::new(source.len(), source.len());
+    let eof = Span::new(file, source.len(), source.len());
     let input = tokens.as_slice().map(eof, |(t, s)| (t, s));
     let (out, errs) = module_parser().parse(input).into_output_errors();
     ParseResult {
-        value: out,
+        value: out.map(|body| Module { file, body }),
         errors: collect_errors(errs),
     }
 }
 
-/// Parse a single CHL expression. Used by the lowering tests that build
+/// Parse `source`, the text of `file`, as a single CHL expression. Used by the lowering tests that build
 /// expressions in isolation; the parser still consumes the layout-resolved
 /// token stream so `lambda` bodies and other multi-line forms work.
 ///
 /// Recovery is in effect here too: a bracketed sub-expression with a syntax
 /// error produces an [`Expr::Error`] node rather than aborting the whole
 /// parse.
-pub fn parse_expression(source: &str) -> ParseResult<Spanned<Expr>> {
-    let tokens = match lexer::tokenize(source) {
+pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>> {
+    let tokens = match lexer::tokenize(file, source) {
         Ok(t) => t,
         Err(e) => {
             return ParseResult {
@@ -116,7 +117,7 @@ pub fn parse_expression(source: &str) -> ParseResult<Spanned<Expr>> {
             };
         }
     };
-    let eof = Span::new(source.len(), source.len());
+    let eof = Span::new(file, source.len(), source.len());
     let input = tokens.as_slice().map(eof, |(t, s)| (t, s));
     let parser = expression()
         .then_ignore(just(Token::Newline).repeated())
@@ -1156,7 +1157,7 @@ enum PostfixOp {
 // Statement parser
 // ---------------------------------------------------------------------------
 
-fn module_parser<'src, I>() -> impl Parser<'src, I, Module, PErr<'src>> + Clone
+fn module_parser<'src, I>() -> impl Parser<'src, I, Vec<Spanned<Stmt>>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
 {
@@ -1171,7 +1172,6 @@ where
                 .collect::<Vec<_>>(),
         )
         .then_ignore(end())
-        .map(|body| Module { body })
 }
 
 fn statement<'src, I>() -> impl Parser<'src, I, Spanned<Stmt>, PErr<'src>> + Clone
@@ -1902,10 +1902,21 @@ fn expr_to_assign_target(spanned: Spanned<Expr>) -> Result<Spanned<AssignTarget>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileId;
     use indoc::{formatdoc, indoc};
 
+    /// Parse `src` as a module, the root of its own one-file map.
+    fn parse_mod(src: &str) -> ParseResult<Module> {
+        parse_module(FileId::ROOT, src)
+    }
+
+    /// Parse `src` as an expression, the root of its own one-file map.
+    fn parse_expr(src: &str) -> ParseResult<Spanned<Expr>> {
+        parse_expression(FileId::ROOT, src)
+    }
+
     fn parse_e(src: &str) -> Spanned<Expr> {
-        parse_expression(src)
+        parse_expr(src)
             .into_result()
             .unwrap_or_else(|errs| panic!("parse errors: {errs:#?}"))
     }
@@ -1980,9 +1991,7 @@ mod tests {
     #[test]
     fn a_lambda_else_branch_is_refused() {
         assert!(
-            parse_expression(r"a if c else \x -> x")
-                .into_result()
-                .is_err(),
+            parse_expr(r"a if c else \x -> x").into_result().is_err(),
             "a lambda is above the ternary, so it cannot be an else-branch"
         );
     }
@@ -2006,7 +2015,7 @@ mod tests {
     /// A chain of arrows reports the chain rather than the token after the second pair.
     #[test]
     fn a_pair_does_not_chain() {
-        let errs = parse_expression("a -> b -> c")
+        let errs = parse_expr("a -> b -> c")
             .into_result()
             .expect_err("`->` does not chain");
         assert!(
@@ -2017,7 +2026,7 @@ mod tests {
     }
 
     fn parse_m(src: &str) -> Module {
-        parse_module(src)
+        parse_mod(src)
             .into_result()
             .unwrap_or_else(|errs| panic!("parse errors: {errs:#?}"))
     }
@@ -2157,7 +2166,7 @@ mod tests {
         assert!(matches!(parse_e("{x: 1, y: 2}").node, Expr::BraceRecord(_)));
         // Expression-key braces are not a valid type — a map is `[k -> v]`.
         assert!(
-            !parse_expression(r#"{"name": "alice"}"#).errors.is_empty(),
+            !parse_expr(r#"{"name": "alice"}"#).errors.is_empty(),
             "expression-key braces should be a parse error"
         );
     }
@@ -2207,7 +2216,7 @@ mod tests {
         // `where` refines one base type; a comma-separated list or a `field: T`
         // item in front of `where` has no base-type reading.
         for src in ["{Int, Bool where _ != 0}", "{a: Int where _ != 0}"] {
-            let result = parse_expression(src);
+            let result = parse_expr(src);
             assert!(
                 !result.errors.is_empty(),
                 "expected `{src}` to be rejected (refinement base is a single type)"
@@ -2281,7 +2290,7 @@ mod tests {
     fn comma_free_one_element_brace_is_an_error() {
         // `{T}` has no reading left: braces in type position are always a
         // product, never grouping, and a one-element product is `{T,}`.
-        let result = parse_expression("{Int}");
+        let result = parse_expr("{Int}");
         assert!(
             !result.errors.is_empty(),
             "expected `{{Int}}` to be rejected"
@@ -2300,23 +2309,23 @@ mod tests {
         // A one-arm variant type: comma-free and accepted, because the backtick
         // already marks the form and no one-tuple reading competes.
         assert!(
-            parse_expression("{`a}").errors.is_empty(),
+            parse_expr("{`a}").errors.is_empty(),
             "a one-arm variant type needs no trailing comma"
         );
         assert!(
-            parse_expression("{`a{Int} | `b}").errors.is_empty(),
+            parse_expr("{`a{Int} | `b}").errors.is_empty(),
             "a `|`-chain of arms is one comma-free item"
         );
         // A tag's field list is not a standalone product type either, so its one
         // positional field carries no comma: `` `some{Int} ``, not `` `some{Int,} ``.
         assert!(
-            parse_expression("`some{Int}").errors.is_empty(),
+            parse_expr("`some{Int}").errors.is_empty(),
             "a tag's one positional field needs no trailing comma"
         );
         // The rule still applies to a genuine standalone product, nested or not.
-        assert!(!parse_expression("{Int}").errors.is_empty());
+        assert!(!parse_expr("{Int}").errors.is_empty());
         assert!(
-            !parse_expression("{`a{Int}, {Bool}}").errors.is_empty(),
+            !parse_expr("{`a{Int}, {Bool}}").errors.is_empty(),
             "a comma-free `{{Bool}}` is still a product with no comma to say so"
         );
     }
@@ -2325,7 +2334,7 @@ mod tests {
     fn mixed_brace_entries_are_an_error() {
         // A brace literal mixing `key: value` entries with bare expressions is
         // neither a record nor a tuple type.
-        let result = parse_expression("{a: 1, b}");
+        let result = parse_expr("{a: 1, b}");
         assert!(
             !result.errors.is_empty(),
             "expected a parse error for a mixed brace literal"
@@ -2430,7 +2439,7 @@ mod tests {
     /// `a -> b -> c` is rejected rather than nested.
     #[test]
     fn pair_arrow_does_not_chain() {
-        assert!(parse_expression("1 -> 2 -> 3").into_result().is_err());
+        assert!(parse_expr("1 -> 2 -> 3").into_result().is_err());
     }
 
     /// The first `->` closes the binder list and the rest is the body
@@ -2592,7 +2601,7 @@ mod tests {
         // `m[k]? := v` asks to write at a key that may be absent. A write is what
         // makes a key present, so the checked form has nothing to mean on the left
         // and is refused in target position rather than at lowering.
-        let r = parse_module("m[k]? := 1\n");
+        let r = parse_mod("m[k]? := 1\n");
         assert!(
             !r.errors.is_empty(),
             "expected parse error for a checked subscript in target position"
@@ -2603,7 +2612,7 @@ mod tests {
     fn assign_to_non_binding_is_parse_error() {
         // `1 + 2 = x` — the LHS isn't a valid binding pattern; the parser
         // must surface this rather than handing a malformed target to lowering.
-        let r = parse_module("1 + 2 = x\n");
+        let r = parse_mod("1 + 2 = x\n");
         assert!(
             !r.errors.is_empty(),
             "expected parse error for non-binding assignment LHS"
@@ -2649,7 +2658,7 @@ mod tests {
     /// decorator, which is what supplies the value.
     #[test]
     fn a_bare_annotation_is_still_a_parse_error() {
-        let r = parse_module("x: Int\n");
+        let r = parse_mod("x: Int\n");
         assert!(
             !r.errors.is_empty(),
             "a declaration with no value and no decorator is a parse error"
@@ -2707,7 +2716,7 @@ mod tests {
     /// takes from its initializer, so the two do not combine.
     #[test]
     fn an_opaque_assignment_takes_no_annotation() {
-        let result = parse_module("x: Int ^= 0\n");
+        let result = parse_mod("x: Int ^= 0\n");
         assert!(
             !result.errors.is_empty(),
             "expected `x: Int ^= 0` to be rejected"
@@ -2867,7 +2876,7 @@ mod tests {
         // Doubling the braces writes the payload's brackets twice; there is one
         // spelling, and each rejection names it.
         for src in ["`some{{Int,}}", "`some{{a: Int}}", "`some{{Int, Bool}}"] {
-            let result = parse_expression(src);
+            let result = parse_expr(src);
             assert!(!result.errors.is_empty(), "expected {src} to be rejected");
             assert!(
                 result.errors[0].to_string().contains("payload's braces"),
@@ -2961,7 +2970,7 @@ mod tests {
     /// statement is what the parser is in, and it wants indented arms.
     #[test]
     fn oneline_match_outside_a_bracket_is_rejected() {
-        let result = parse_module("x = match v: case `a: 1 case `b: 2");
+        let result = parse_mod("x = match v: case `a: 1 case `b: 2");
         assert!(
             !result.errors.is_empty(),
             "an unbracketed one-line `match` has no reading"
@@ -2973,7 +2982,7 @@ mod tests {
     /// reading would leave the outer `match` no way to spell a later arm.
     #[test]
     fn nested_oneline_match_needs_its_own_bracket() {
-        let bare = parse_module("x = (match v: case `a(w): match w: case `p: 1 case `b: 0)");
+        let bare = parse_mod("x = (match v: case `a(w): match w: case `p: 1 case `b: 0)");
         assert!(
             !bare.errors.is_empty(),
             "an unbracketed nested one-line `match` has no reading"
@@ -3015,7 +3024,7 @@ mod tests {
             "x: {Int where match _: case `a: True} = 1",
             "x = [y for y in match v: case `a: [1]]",
         ] {
-            let result = parse_module(src);
+            let result = parse_mod(src);
             assert!(
                 result.errors.is_empty(),
                 "expected `{src}` to parse, got {:#?}",
@@ -3030,7 +3039,7 @@ mod tests {
     /// different token streams (`lexer.rs`, `Level::Pending`).
     #[test]
     fn a_chain_at_the_statement_column_is_rejected() {
-        let result = parse_module(indoc! {"
+        let result = parse_mod(indoc! {"
             x = if c:
                 1
             else:
@@ -3083,7 +3092,7 @@ mod tests {
                     else:
                         2
                 x"};
-            let result = parse_module(&src);
+            let result = parse_mod(&src);
             assert!(
                 result.errors.is_empty(),
                 "expected `x {op} <block>` to parse, got {:#?}",
@@ -3153,7 +3162,7 @@ mod tests {
     /// The custom message of the first parse error, for the rejections the grammar
     /// raises itself.
     fn custom_error(src: &str) -> String {
-        let errors = parse_module(src).errors;
+        let errors = parse_mod(src).errors;
         errors
             .iter()
             .find_map(|e| match e {
@@ -3257,7 +3266,7 @@ mod tests {
 
     #[test]
     fn requires_is_a_keyword() {
-        assert!(!parse_module("requires = 1").errors.is_empty());
+        assert!(!parse_mod("requires = 1").errors.is_empty());
     }
 
     #[test]
@@ -3327,6 +3336,6 @@ mod tests {
 
     #[test]
     fn forall_is_a_keyword() {
-        assert!(!parse_module("forall = 1").errors.is_empty());
+        assert!(!parse_mod("forall = 1").errors.is_empty());
     }
 }
