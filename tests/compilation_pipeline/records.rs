@@ -15,6 +15,7 @@ use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
     sort_function_by_domain, tuple_field,
 };
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -39,6 +40,162 @@ use crate::helpers::*;
 #[case(r#"r = (name="bob", score=99); r.name"#, Value::String("bob".into()))]
 fn test_records(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Records — calling a function held in a field
+// ---------------------------------------------------------------------------
+
+// `r.f(x)` calls the function a record holds. The inliner resolves each call to the
+// function the field names, whether the record is bound, passed as an argument, or
+// returned from a call (`src/ccl/design/optimization.md`, "Functions held in products").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::bound_record(
+    indoc! {"
+        def inc(x):
+            x + 1
+        r = (f=inc, k=10)
+        r.f(r.k)
+    "},
+    Value::Int(11),
+)]
+#[case::field_bound_before_the_call(
+    indoc! {"
+        def inc(x):
+            x + 1
+        r = (f=inc, k=10)
+        g = r.f
+        g(r.k)
+    "},
+    Value::Int(11),
+)]
+#[case::lambda_field(r"r = (f=\x -> x * 2,); r.f(21)", Value::Int(42))]
+#[case::multi_argument_field(
+    indoc! {"
+        def add(x, y):
+            x + y
+        r = (f=add,)
+        r.f(3, 4)
+    "},
+    Value::Int(7),
+)]
+#[case::field_capturing_a_binding(
+    indoc! {"
+        k = 100
+        def addk(x):
+            x + k
+        r = (f=addk,)
+        r.f(1)
+    "},
+    Value::Int(101),
+)]
+#[case::record_passed_as_an_argument(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def apply_to(m, v):
+            m.f(v) + m.k
+        apply_to((f=inc, k=10), 1)
+    "},
+    Value::Int(12),
+)]
+#[case::two_records_one_consumer(
+    indoc! {"
+        def a(x):
+            x + 1
+        def b(x):
+            x * 10
+        def apply_to(m, v):
+            m.f(v)
+        apply_to((f=a,), 5) + apply_to((f=b,), 5)
+    "},
+    Value::Int(56),
+)]
+#[case::generic_member(
+    indoc! {"
+        def ident(x):
+            x
+        def apply_to(m):
+            m.id(1)
+        apply_to((id=ident,))
+    "},
+    Value::Int(1),
+)]
+#[case::lambda_in_a_record_argument(
+    indoc! {r"
+        def apply_to(m, v):
+            m.f(v)
+        apply_to((f=\x -> x * 3,), 7)
+    "},
+    Value::Int(21),
+)]
+#[case::nested_record(
+    indoc! {"
+        def inc(x):
+            x + 1
+        r = (inner=(f=inc,), k=2)
+        r.inner.f(r.k)
+    "},
+    Value::Int(3),
+)]
+#[case::record_returned_by_a_call(
+    indoc! {r"
+        def mk(n):
+            (f=\y -> y + n, n=n)
+        m = mk(5)
+        m.f(m.n)
+    "},
+    Value::Int(10),
+)]
+#[case::field_called_in_a_comprehension(
+    indoc! {"
+        def inc(x):
+            x + 1
+        r = (f=inc,)
+        sum([r.f(x) for x in [1, 2, 3]])
+    "},
+    Value::Int(9),
+)]
+#[case::record_holding_a_function_and_a_collection(
+    indoc! {"
+        def inc(x):
+            x + 1
+        r = (f=inc, xs=[x * 2 for x in [1, 2, 3]])
+        sum([r.f(x) for x in r.xs]) + sum(r.xs)
+    "},
+    Value::Int(27),
+)]
+#[case::tuple_component(
+    indoc! {"
+        def inc(x):
+            x + 1
+        t = (inc, 41)
+        t.0(t.1)
+    "},
+    Value::Int(42),
+)]
+fn test_record_field_call(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A `Mut`-parameter function held in a field is refused. A field's call is tupled, and a
+/// `Mut`-parameter `def` is curried so that its parameter stays a named binder, so the call
+/// does not match the function's type. Pinned so a change to either shape surfaces here.
+#[test]
+fn a_mut_parameter_function_called_through_a_field_is_refused() {
+    check_compile_error(
+        indoc! {"
+            cnt := 0
+            def bump(c: Mut(Int), n):
+                c += n
+            r = (f=bump,)
+            for x in [1, 2, 3]:
+                r.f(cnt, x)
+            cnt
+        "},
+        "Type mismatch for Apply",
+    );
 }
 
 // ---------------------------------------------------------------------------
