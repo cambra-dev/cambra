@@ -576,8 +576,8 @@ fn assert_operator_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64
     }
 }
 
-/// Assert a node's `spans`: every entry a `{start, end}` pair, each one once,
-/// narrowest first. Same channel and same meaning on both node shapes.
+/// Assert a node's `spans`: every entry a `{file, start, end}` triple, each one
+/// once, narrowest first. Same channel and same meaning on both node shapes.
 fn assert_spans(v: &Value, at: &str) {
     let spans = v["spans"]
         .as_array()
@@ -585,6 +585,9 @@ fn assert_spans(v: &Value, at: &str) {
     let mut widths = Vec::with_capacity(spans.len());
     let mut seen_spans = std::collections::HashSet::new();
     for (i, sp) in spans.iter().enumerate() {
+        let file = sp["file"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{at}.spans[{i}].file is a number"));
         let start = sp["start"]
             .as_u64()
             .unwrap_or_else(|| panic!("{at}.spans[{i}].start is a number"));
@@ -592,8 +595,8 @@ fn assert_spans(v: &Value, at: &str) {
             .as_u64()
             .unwrap_or_else(|| panic!("{at}.spans[{i}].end is a number"));
         assert!(
-            seen_spans.insert((start, end)),
-            "{at}.spans[{i}] repeats span {start}..{end}"
+            seen_spans.insert((file, start, end)),
+            "{at}.spans[{i}] repeats span {start}..{end} of file {file}"
         );
         widths.push(end.saturating_sub(start));
     }

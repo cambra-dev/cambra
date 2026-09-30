@@ -43,6 +43,7 @@
 use std::io;
 
 use crate::ccl::context::{GlobalContext, compile_program};
+use crate::chl_parser::SourceMap;
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::interpreter::Consumer;
 
@@ -74,7 +75,7 @@ struct Bodies {
 fn build_bodies(code: &str, name: &str) -> Bodies {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    match compile_program(&mut ctx, code, consumer) {
+    match compile_program(&mut ctx, &SourceMap::single(name, code), consumer) {
         Ok(compiled) => Bodies {
             snapshot: snapshot_json(&compiled, name),
             diagnostics: diagnostics_body(&[]),
@@ -119,7 +120,7 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
 pub fn snapshot_body_pretty(code: &str, name: &str) -> String {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    match compile_program(&mut ctx, code, consumer) {
+    match compile_program(&mut ctx, &SourceMap::single(name, code), consumer) {
         Ok(compiled) => snapshot_json_pretty(&compiled, name),
         Err(errors) => serde_json::to_string_pretty(&InspectorPayload::degraded(
             name,

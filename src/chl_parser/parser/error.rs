@@ -23,11 +23,12 @@
 
 use std::fmt;
 
-use ariadne::{Color, Config, Label, Report, ReportKind, Source};
+use ariadne::{Color, Config, Label, Report, ReportKind};
 use chumsky::error::{Rich, RichPattern, RichReason};
 
 use crate::chl_parser::ast::Span;
 use crate::chl_parser::lexer::{LexError, Token};
+use crate::chl_parser::source_map::{SourceMap, report_config};
 
 /// Errors produced by [`parse_module`](super::parse_module) /
 /// [`parse_expression`](super::parse_expression).
@@ -188,22 +189,16 @@ impl<T> ParseResult<T> {
         if !self.errors.is_empty() {
             Err(self.errors)
         } else {
-            self.value.ok_or_else(|| {
-                vec![ParseError::Parse(ParseErrorInfo {
-                    span: Span::new(0, 0),
-                    custom: None,
-                    found: None,
-                    expected: vec![],
-                    context: vec![],
-                })]
-            })
+            Ok(self
+                .value
+                .expect("a parse that reported no errors produced a value"))
         }
     }
 
     /// Render every error as an ariadne report and return the combined
     /// output as a plain-ASCII string (ANSI colour codes stripped).
-    /// `src_name` is the file/source identifier shown in the report
-    /// header; `src` is the original source text.
+    /// `sources` holds the file the errors' spans lie in; the report header
+    /// shows its path.
     ///
     /// Each [`ParseError::Parse`] becomes one [`Report`] with a red
     /// primary label at the failure span plus one yellow secondary label
@@ -213,27 +208,27 @@ impl<T> ParseResult<T> {
     ///
     /// For interactive use, prefer [`Self::eprint_errors`] which writes directly
     /// to stderr with colour.
-    pub fn render_errors(&self, src_name: &str, src: &str) -> String {
+    pub fn render_errors(&self, sources: &SourceMap) -> String {
         let mut buf: Vec<u8> = Vec::new();
         for err in &self.errors {
-            err.to_report_with_config(src_name, Config::default().with_color(false))
-                .write((src_name, Source::from(src)), &mut buf)
+            err.to_report_with_config(report_config(false))
+                .write(sources, &mut buf)
                 .expect("ariadne write should not fail on Vec<u8>");
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
 
     /// Print every error to stderr via ariadne with colour.
-    pub fn eprint_errors(&self, src_name: &str, src: &str) {
+    pub fn eprint_errors(&self, sources: &SourceMap) {
         for err in &self.errors {
-            err.to_report(src_name)
-                .eprint((src_name, Source::from(src)))
+            err.to_report()
+                .eprint(sources)
                 .expect("ariadne eprint should not fail on stderr");
         }
     }
 }
 
-/// A byte range for an ariadne [`Label`], normalized so `start <= end`.
+/// A span for an ariadne [`Label`], normalized so `start <= end`.
 ///
 /// ariadne panics ("Label start is after its end") on an inverted range, and
 /// chumsky hands us one for the `.as_context()` spans of an error raised by
@@ -243,8 +238,8 @@ impl<T> ParseResult<T> {
 /// carries no extent, only a position, so collapse it to an empty span at the
 /// context's start — that still points the "while parsing …" note at the right
 /// place instead of aborting the whole report.
-fn label_range(span: Span) -> std::ops::Range<usize> {
-    span.start..span.end.max(span.start)
+fn label_span(span: Span) -> Span {
+    Span::new(span.file, span.start, span.end.max(span.start))
 }
 
 impl ParseError {
@@ -262,22 +257,15 @@ impl ParseError {
     }
 
     /// Build an ariadne [`Report`] with default (colour-on) configuration.
-    pub fn to_report<'a>(
-        &self,
-        src_name: &'a str,
-    ) -> Report<'a, (&'a str, std::ops::Range<usize>)> {
-        self.to_report_with_config(src_name, Config::default())
+    pub fn to_report(&self) -> Report<'static, Span> {
+        self.to_report_with_config(report_config(true))
     }
 
     /// Build an ariadne [`Report`] using the supplied [`Config`]. Used by
     /// [`ParseResult::render_errors`] to disable colour for snapshot-style
     /// output; interactive callers should use [`Self::to_report`] (or
     /// [`ParseResult::eprint_errors`]) for the coloured default.
-    pub fn to_report_with_config<'a>(
-        &self,
-        src_name: &'a str,
-        config: Config,
-    ) -> Report<'a, (&'a str, std::ops::Range<usize>)> {
+    pub fn to_report_with_config(&self, config: Config) -> Report<'static, Span> {
         match self {
             ParseError::Lex(e) => {
                 let (span, msg): (Span, &'static str) = match e {
@@ -288,22 +276,22 @@ impl ParseError {
                     }
                     LexError::InconsistentIndent { span } => (*span, "inconsistent indentation"),
                 };
-                Report::build(ReportKind::Error, src_name, span.start)
+                Report::build(ReportKind::Error, span.file, span.start)
                     .with_config(config)
                     .with_message("lex error")
                     .with_label(
-                        Label::new((src_name, label_range(span)))
+                        Label::new(label_span(span))
                             .with_message(msg)
                             .with_color(Color::Red),
                     )
                     .finish()
             }
             ParseError::Parse(info) => {
-                let mut report = Report::build(ReportKind::Error, src_name, info.span.start)
+                let mut report = Report::build(ReportKind::Error, info.span.file, info.span.start)
                     .with_config(config)
                     .with_message("parse error")
                     .with_label(
-                        Label::new((src_name, label_range(info.span)))
+                        Label::new(label_span(info.span))
                             .with_message(primary_label_message(info))
                             .with_color(Color::Red),
                     );
@@ -311,7 +299,7 @@ impl ParseError {
                 // unwinds; reverse so the report reads outside-in.
                 for (label, span) in info.context.iter().rev() {
                     report = report.with_label(
-                        Label::new((src_name, label_range(*span)))
+                        Label::new(label_span(*span))
                             .with_message(format!("while parsing {label}"))
                             .with_color(Color::Yellow),
                     );

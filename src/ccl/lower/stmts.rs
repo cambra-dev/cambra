@@ -24,17 +24,18 @@ use crate::{
 /// The sink-bindings record-wrap from the original `lower_stmts` is still
 /// applied around the recovered tree.
 pub(super) fn lower_stmts_recovering(
-    stmts: &[Spanned<ChlStmt>],
+    module: &ChlModule,
     ctx: &mut LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> Option<Expr> {
+    let stmts = &module.body[..];
     if stmts.is_empty() {
         // Defensive catch-all for callers that bypass [`compile_program`]'s
         // empty-program short-circuit (which emits a properly-spanned error).
         // We cannot synthesise a meaningful span here because we don't see the
         // source string — the file's only feature is its emptiness.
         errors.push(LoweringError::unsupported(
-            Span::new(0, 0),
+            Span::new(module.file, 0, 0),
             "empty program: file contains no top-level statements",
         ));
         return None;
@@ -2783,16 +2784,24 @@ x";
         // final bare expression (spans bytes 6..11). The source-byte offsets are
         // load-bearing: the test asserts the exact origin span of each node.
         let src = "x = 1\nx + 2\n";
-        let stmts = parse_module(src);
-        assert_eq!(stmts[0].span, Span::new(0, 5), "stmt `x = 1` span");
-        let final_expr_span = stmts[1].span;
-        assert_eq!(final_expr_span, Span::new(6, 11), "expr `x + 2` span");
+        let module = parse_module(src);
+        assert_eq!(
+            module.body[0].span,
+            Span::new(module.file, 0, 5),
+            "stmt `x = 1` span"
+        );
+        let final_expr_span = module.body[1].span;
+        assert_eq!(
+            final_expr_span,
+            Span::new(module.file, 6, 11),
+            "expr `x + 2` span"
+        );
 
         // Install the always-on lowering session, lower, then fold the log into
         // the lowering projection — the same handoff `compile_program` runs.
         let mut ctx = LoweringContext::default();
         let session = LoweringSession::install();
-        let lowered = lower_stmts(&stmts, &mut ctx)
+        let lowered = lower_stmts(&module, &mut ctx)
             .into_result()
             .expect("lowering succeeds");
         let log = session.into_log();
@@ -2825,12 +2834,12 @@ x";
             root_attr.rewritten.label, "lower.image",
             "it is still an image of source text, not manufactured plumbing"
         );
-        assert_eq!(root_attr.spans, vec![Span::new(0, 5)]);
+        assert_eq!(root_attr.spans, vec![Span::new(module.file, 0, 5)]);
 
         // The bound expression `1` is tagged with the RHS literal's span.
         assert_eq!(
             seed.get(&bound_expr.node_id()).map(|a| a.spans.as_slice()),
-            Some(&[Span::new(4, 5)][..]),
+            Some(&[Span::new(module.file, 4, 5)][..]),
             "bound `1` traces to its literal span"
         );
 

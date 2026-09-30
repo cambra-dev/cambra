@@ -5,6 +5,7 @@
 //! thread, verifying that the computed responses are delivered back to the
 //! caller.
 
+use cambra::chl_parser::SourceMap;
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -136,7 +137,8 @@ fn test_http_serve_echo() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     // Send one POST request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -162,7 +164,8 @@ fn test_http_serve_const() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     // Send one GET request from a background thread and collect the response.
     let (tx, rx) = mpsc::channel::<String>();
@@ -190,7 +193,8 @@ fn test_http_serve_two_sequential_requests() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     // Send two requests sequentially; each blocks until the server responds.
     let (tx, rx) = mpsc::channel::<Vec<String>>();
@@ -225,7 +229,8 @@ fn test_http_serve_two_paths() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     // Send requests sequentially: each http_post/http_get blocks until the
     // server responds, so the second request is only sent after the first
@@ -261,7 +266,8 @@ fn test_http_serve_two_paths_shared_outer_let() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || {
@@ -290,7 +296,8 @@ fn test_http_serve_echo_with_outer_let() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
@@ -313,11 +320,10 @@ fn test_http_serve_in_if_branch_is_error() {
          \t\tresponses << req\n"
     );
     let mut ctx = LoweringContext::default();
-    let stmts = chl_parser::parse_module(&code)
+    let module = chl_parser::parse_module(SourceMap::single("<test>", &code).root(), &code)
         .into_result()
-        .expect("parse failed")
-        .body;
-    let result = lower_stmts(&stmts, &mut ctx);
+        .expect("parse failed");
+    let result = lower_stmts(&module, &mut ctx);
     assert!(
         result
             .errors
@@ -340,11 +346,10 @@ fn test_http_serve_in_function_body_is_error() {
          handler()\n"
     );
     let mut ctx = LoweringContext::default();
-    let stmts = chl_parser::parse_module(&code)
+    let module = chl_parser::parse_module(SourceMap::single("<test>", &code).root(), &code)
         .into_result()
-        .expect("parse failed")
-        .body;
-    let result = lower_stmts(&stmts, &mut ctx);
+        .expect("parse failed");
+    let result = lower_stmts(&module, &mut ctx);
     assert!(
         result
             .errors
@@ -368,7 +373,8 @@ fn test_http_serve_wrong_path_gets_404() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     // Send to a path that doesn't match — expect a 404 status line.
     let request = format!(
@@ -404,7 +410,8 @@ fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
     "#};
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+    let sources = SourceMap::single("<test>", &code);
+    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
 
     let (tx, rx) = mpsc::channel::<(String, TcpStream)>();
     thread::spawn(move || {

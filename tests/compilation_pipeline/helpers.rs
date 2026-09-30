@@ -26,6 +26,7 @@
 //! thread-CPU time too — ratio ≈ 1.00 — so a CPU-time bound buys nothing over wall.)
 //! Most tests get 10s; the three heaviest compiles get 30s.
 
+use cambra::chl_parser::SourceMap;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -57,7 +58,8 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(ctx, &sources, consumer).unwrap_or_render(&sources);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     let producer = compiled

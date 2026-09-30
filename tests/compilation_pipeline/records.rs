@@ -1,6 +1,7 @@
 //! Records: literals, computed fields, field access, records inside list
 //! comprehensions, and joins producing record outputs.
 
+use cambra::chl_parser::SourceMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -238,7 +239,8 @@ fn test_datasource_named_record_join() {
         *notified_clone.borrow_mut() = true;
     });
     let code = "[(x.label, y.label) for x in src1() for y in src2() if x.id == y.id]";
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());

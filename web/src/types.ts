@@ -5,6 +5,7 @@
 // allows null (degraded payloads).
 
 export interface Span {
+  file: number;
   start: number;
   end: number;
 }

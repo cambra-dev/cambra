@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
 use crate::chl_parser;
+use crate::chl_parser::ast::Span;
 use crate::chl_parser::parser::ParseError;
+use crate::chl_parser::source_map::{SourceMap, report_config};
 use log::debug;
 
 use crate::{
@@ -99,7 +101,7 @@ pub enum CompileError {
         /// The underlying inference error (its `Debug` impl is the human message).
         error: InferError,
         /// The resolved source span, when known.
-        span: Option<chl_parser::ast::Span>,
+        span: Option<Span>,
     },
     /// Lambda elimination failed.
     LambdaElim(lambda_elim::LambdaElimError),
@@ -120,88 +122,69 @@ impl CompileError {
     /// - [`CompileError::Parse`], [`CompileError::Lower`], and a
     ///   span-carrying [`CompileError::Infer`] are rendered via ariadne with
     ///   colour disabled (gutter, source line, underlines, labels — all in
-    ///   Unicode box-drawing). Suitable for panic messages, log files,
+    ///   Unicode box-drawing), against `sources`, the map of the compilation
+    ///   that produced the error. Suitable for panic messages, log files,
     ///   snapshots, or piping through grep.
     /// - The remaining variants (and a spanless `Infer`) render as plain
     ///   `error: …` lines.
     ///
     /// To render a whole [`Vec<CompileError>`] from `compile_program`, use
     /// [`render_errors`].
-    pub fn render(&self, src_name: &str, src: &str) -> String {
+    pub fn render(&self, sources: &SourceMap) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        match self {
-            CompileError::Parse(e) => {
-                e.to_report_with_config(src_name, ariadne::Config::default().with_color(false))
-                    .write((src_name, ariadne::Source::from(src)), &mut buf)
-                    .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::Lower(e) => {
-                e.to_report_with_config(src_name, ariadne::Config::default().with_color(false))
-                    .write((src_name, ariadne::Source::from(src)), &mut buf)
-                    .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::ChannelizeDefers(e) => {
-                buf.extend_from_slice(format!("error: deferred collection: {e}\n").as_bytes());
-            }
-            CompileError::Infer {
-                error,
-                span: Some(span),
-            } => {
-                infer_report(
-                    error,
-                    *span,
-                    src_name,
-                    ariadne::Config::default().with_color(false),
-                )
-                .write((src_name, ariadne::Source::from(src)), &mut buf)
-                .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::Infer { error, span: None } => {
-                buf.extend_from_slice(format!("error: type inference: {error:?}\n").as_bytes());
-            }
-            CompileError::LambdaElim(e) => {
-                buf.extend_from_slice(format!("error: lambda elimination: {e:?}\n").as_bytes());
-            }
-            CompileError::Conversion(e) => {
-                buf.extend_from_slice(
-                    format!("error: operator-graph conversion: {e:?}\n").as_bytes(),
-                );
-            }
-            CompileError::Unsupported(msg) => {
-                buf.extend_from_slice(format!("error: {msg}\n").as_bytes());
-            }
+        match self.rendering(report_config(false)) {
+            Rendering::Report(report) => report
+                .write(sources, &mut buf)
+                .expect("ariadne write should not fail on Vec<u8>"),
+            Rendering::Line(line) => buf.extend_from_slice(line.as_bytes()),
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
 
     /// Print this single error to stderr.
     ///
-    /// [`CompileError::Parse`] and [`CompileError::Lower`] use ariadne's
-    /// coloured `eprint`; the other variants emit a plain `error: …` line
-    /// via [`Self::render`].
-    pub fn eprint(&self, src_name: &str, src: &str) {
+    /// A span-carrying error uses ariadne's coloured `eprint` against
+    /// `sources`; the other variants emit the plain `error: …` line
+    /// [`Self::render`] does.
+    pub fn eprint(&self, sources: &SourceMap) {
+        match self.rendering(report_config(true)) {
+            Rendering::Report(report) => report
+                .eprint(sources)
+                .expect("ariadne eprint should not fail on stderr"),
+            Rendering::Line(line) => eprint!("{line}"),
+        }
+    }
+
+    fn rendering(&self, config: ariadne::Config) -> Rendering {
         match self {
-            CompileError::Parse(e) => {
-                e.to_report(src_name)
-                    .eprint((src_name, ariadne::Source::from(src)))
-                    .expect("ariadne eprint should not fail on stderr");
-            }
-            CompileError::Lower(e) => {
-                e.to_report(src_name)
-                    .eprint((src_name, ariadne::Source::from(src)))
-                    .expect("ariadne eprint should not fail on stderr");
-            }
+            CompileError::Parse(e) => Rendering::Report(e.to_report_with_config(config)),
+            CompileError::Lower(e) => Rendering::Report(e.to_report_with_config(config)),
             CompileError::Infer {
                 error,
                 span: Some(span),
-            } => {
-                infer_report(error, *span, src_name, ariadne::Config::default())
-                    .eprint((src_name, ariadne::Source::from(src)))
-                    .expect("ariadne eprint should not fail on stderr");
+            } => Rendering::Report(infer_report(error, *span, config)),
+            CompileError::ChannelizeDefers(e) => {
+                Rendering::Line(format!("error: deferred collection: {e}\n"))
             }
-            other => eprint!("{}", other.render(src_name, src)),
+            CompileError::Infer { error, span: None } => {
+                Rendering::Line(format!("error: type inference: {error:?}\n"))
+            }
+            CompileError::LambdaElim(e) => {
+                Rendering::Line(format!("error: lambda elimination: {e:?}\n"))
+            }
+            CompileError::Conversion(e) => {
+                Rendering::Line(format!("error: operator-graph conversion: {e:?}\n"))
+            }
+            CompileError::Unsupported(msg) => Rendering::Line(format!("error: {msg}\n")),
         }
     }
+}
+
+/// How one [`CompileError`] renders: an ariadne report when it carries a span,
+/// a plain `error: …` line when it does not.
+enum Rendering {
+    Report(ariadne::Report<'static, Span>),
+    Line(String),
 }
 
 /// Build an ariadne report for an inference error pinned to a source span.
@@ -210,39 +193,38 @@ impl CompileError {
 /// is already the human-readable message, used as both the report title and the
 /// label. Colour is governed by `config` (off for [`CompileError::render`], on
 /// for [`CompileError::eprint`]), matching the other arms' conventions.
-fn infer_report<'a>(
+fn infer_report(
     error: &InferError,
-    span: chl_parser::ast::Span,
-    src_name: &'a str,
+    span: Span,
     config: ariadne::Config,
-) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+) -> ariadne::Report<'static, Span> {
     use ariadne::{Color, Label, Report, ReportKind};
     let message = format!("{error:?}");
-    Report::build(ReportKind::Error, src_name, span.start)
+    Report::build(ReportKind::Error, span.file, span.start)
         .with_config(config)
         .with_message("type inference error")
         .with_label(
-            Label::new((src_name, span.into()))
+            Label::new(span)
                 .with_message(message)
                 .with_color(Color::Red),
         )
         .finish()
 }
 
-/// Render every error in `errs` and concatenate the output.
-pub fn render_errors(errs: &[CompileError], src_name: &str, src: &str) -> String {
+/// Render every error in `errs` against `sources` and concatenate the output.
+pub fn render_errors(errs: &[CompileError], sources: &SourceMap) -> String {
     let mut s = String::new();
     for e in errs {
-        s.push_str(&e.render(src_name, src));
+        s.push_str(&e.render(sources));
     }
     s
 }
 
-/// Print every error in `errs` to stderr (coloured ariadne output for parse
-/// errors, plain `error: …` lines for the rest).
-pub fn eprint_errors(errs: &[CompileError], src_name: &str, src: &str) {
+/// Print every error in `errs` to stderr (coloured ariadne output for errors
+/// with a span, plain `error: …` lines for the rest).
+pub fn eprint_errors(errs: &[CompileError], sources: &SourceMap) {
     for e in errs {
-        e.eprint(src_name, src);
+        e.eprint(sources);
     }
 }
 
@@ -333,18 +315,19 @@ impl<T, E: IntoCompileErrors> CompileErrsExt<T> for Result<T, E> {
 ///
 /// ```ignore
 /// use cambra::ccl::context::{compile_program, CompileResultExt};
-/// let compiled = compile_program(&mut ctx, code, consumer)
-///     .unwrap_or_render("<test>", code);
+/// let sources = SourceMap::single("<test>", code);
+/// let compiled = compile_program(&mut ctx, &sources, consumer)
+///     .unwrap_or_render(&sources);
 /// ```
 pub trait CompileResultExt<T> {
     /// Return `Ok` payload, or render every error via [`render_errors`] and
     /// panic with the rendering bundled into the panic message (so the
     /// output is captured by cargo test alongside the failing test).
-    fn unwrap_or_render(self, src_name: &str, src: &str) -> T;
+    fn unwrap_or_render(self, sources: &SourceMap) -> T;
 }
 
 impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
-    fn unwrap_or_render(self, src_name: &str, src: &str) -> T {
+    fn unwrap_or_render(self, sources: &SourceMap) -> T {
         self.unwrap_or_else(|errs| {
             // Bundle the rendered output into the panic message rather than
             // writing to stderr directly: ariadne's `eprint` writes raw to
@@ -353,10 +336,7 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
             // test's output block. Putting them in the panic message means
             // cargo test groups them with the test's `---- TEST stdout ----`
             // section as expected.
-            panic!(
-                "compilation failed:\n{}",
-                render_errors(&errs, src_name, src)
-            )
+            panic!("compilation failed:\n{}", render_errors(&errs, sources))
         })
     }
 }
@@ -519,19 +499,19 @@ impl SourceSinkRegistry {
         lowering
     }
 
-    /// Compile `code` through `phase` against these sources and sinks, without
-    /// touching the running program — see [`compile_to_in`] for why that is safe
-    /// to do while it is serving.
-    pub fn compile_to(&self, code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
+    /// Compile the root of `sources` through `phase` against these sources and
+    /// sinks, without touching the running program — see [`compile_to_in`] for
+    /// why that is safe to do while it is serving.
+    pub fn compile_to(&self, sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
         let mut lowering = self.seed_lowering_context();
         // Answering a question must not change what the program serves, so a route
         // this registry does not hold is named rather than opened.
         lowering.inherit_endpoints_only();
-        compile_to_in(lowering, code, phase)
+        compile_to_in(lowering, sources, phase)
     }
 
-    /// Compile `code` through `phase`, binding any port this registry does not
-    /// hold and keeping the listener.
+    /// Compile the root of `sources` through `phase`, binding any port this
+    /// registry does not hold and keeping the listener.
     ///
     /// The listener and nothing else: a route is registered by the compile that
     /// installs the version, so a version refused after this one leaves none
@@ -552,11 +532,11 @@ impl SourceSinkRegistry {
     /// [`release_unrouted_ports`](Self::release_unrouted_ports).
     pub fn compile_to_opening(
         &mut self,
-        code: &str,
+        sources: &SourceMap,
         phase: Phase,
     ) -> Result<Expr, Vec<CompileError>> {
         let mut scratch = GlobalContext::scratch(self.seed_lowering_context());
-        let compiled = run_frontend(&mut scratch, code, phase, &[], false);
+        let compiled = run_frontend(&mut scratch, sources, phase, &[], false);
         // Taken from the scratch *registry*, because `run_frontend` has already
         // folded the pass's listeners into it. Taken whether or not the compile
         // succeeded, so a half-lowered pass leaves no listener owned by a context
@@ -909,15 +889,15 @@ pub struct CompiledProgram {
     /// switches off attribution, and the graph is the `post-conversion` pane's
     /// content, held like the trees beside it.
     pub operator_graph: OperatorGraph,
-    /// The original program source text, retained verbatim.
+    /// Every file the program was compiled from, retained verbatim.
     ///
-    /// Inspector queries need the source string to produce snippets (`hover`'s
-    /// `snippet` = `source[span]`) and to serve the snapshot wire's
-    /// `source.text`. Every
-    /// span-keyed projection above (the [`lowering_projection`](Self::lowering_projection), the surface AST's
-    /// spans) is a byte offset *into this string*, so retaining it is what makes
-    /// those offsets resolvable to text. Cheap (one program's source).
-    pub source: String,
+    /// Inspector queries need the source text to produce snippets (`hover`'s
+    /// `snippet` = the text under a span) and to serve the snapshot wire's
+    /// `source.text`. Every span-keyed projection above (the
+    /// [`lowering_projection`](Self::lowering_projection), the surface AST's
+    /// spans) names a file of this map and a byte range of its text, so
+    /// retaining it is what makes those spans resolvable to text.
+    pub sources: SourceMap,
 }
 
 impl CompiledProgram {
@@ -1606,7 +1586,7 @@ fn at_phase_output(
 /// recorder scopes. Nothing else about the two callers differs.
 fn run_frontend(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     stop: Phase,
     capture: &[Phase],
     record: bool,
@@ -1625,7 +1605,9 @@ fn run_frontend(
     // below; every early return drops it, clearing the slot.
     let table_session = record.then(TableSession::install);
 
-    let parse_result = chl_parser::parse_module(code);
+    let root = sources.root();
+    let code = sources.text(root);
+    let parse_result = chl_parser::parse_module(root, code);
     errors.extend(parse_result.errors.into_iter().map(CompileError::Parse));
     let Some(module) = parse_result.value else {
         return Err(errors);
@@ -1637,7 +1619,7 @@ fn run_frontend(
     // callers of `lower_stmts` that don't go through this path.)
     if module.body.is_empty() {
         errors.push(CompileError::Lower(LoweringError::unsupported(
-            chl_parser::ast::Span::new(0, code.len()),
+            Span::new(root, 0, code.len()),
             "empty program: file contains no top-level statements",
         )));
         return Err(errors);
@@ -1649,7 +1631,7 @@ fn run_frontend(
     // `LoweringLog`, folded once at the handoff below into the always-on lowering
     // projection. It must fully drain before the first phase (`Infer`) session opens.
     let lowering_session = LoweringSession::install();
-    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
+    let lower_result = lower_stmts(&module, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -2030,7 +2012,8 @@ fn run_passes(
     Ok(join_planned)
 }
 
-/// Compile `code` through `phase`, ready to pass to [`crate::ccl::diff::diff`].
+/// Compile the root of `sources` through `phase`, ready to pass to
+/// [`crate::ccl::diff::diff`].
 ///
 /// Runs [`run_frontend`] — the same phases and the same checks
 /// [`compile_program`] runs — stopping at `phase`'s output rather than
@@ -2040,12 +2023,12 @@ fn run_passes(
 /// Every phase output is a consistent tree (each has a wall after it), so any
 /// `Phase` is a legal stop. Which ones answer which question — and which ones a
 /// diff should be taken at — is `src/ccl/design/diffing.md`, "Which phase to diff".
-pub fn compile_to(code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
-    compile_to_in(GlobalContext::new().lowering, code, phase)
+pub fn compile_to(sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
+    compile_to_in(GlobalContext::new().lowering, sources, phase)
 }
 
-/// Compile `code` through `phase` against an already-open source/sink set,
-/// without touching the running program.
+/// Compile the root of `sources` through `phase` against an already-open
+/// source/sink set, without touching the running program.
 ///
 /// Runs the same [`run_frontend`] every other entry point runs, over a
 /// [`GlobalContext::scratch`] whose lowering registry is seeded and whose other
@@ -2056,14 +2039,15 @@ pub fn compile_to(code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
 /// running program already holds and fail.
 fn compile_to_in(
     lowering: LoweringContext,
-    code: &str,
+    sources: &SourceMap,
     phase: Phase,
 ) -> Result<Expr, Vec<CompileError>> {
     let mut ctx = GlobalContext::scratch(lowering);
-    Ok(run_frontend(&mut ctx, code, phase, &[], false)?.expr)
+    Ok(run_frontend(&mut ctx, sources, phase, &[], false)?.expr)
 }
 
-/// Compile a CHL program and return its operator graph plus subscribed outputs.
+/// Compile the root of `sources` as a CHL program and return its operator graph
+/// plus subscribed outputs.
 ///
 /// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
 /// per "output" of the program:
@@ -2078,13 +2062,13 @@ fn compile_to_in(
 ///   returning.
 pub fn compile_program(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, code, main_consumer, None)
+    compile_version(ctx, sources, main_consumer, None)
 }
 
-/// Compile `code` as the version replacing `previous`, keeping whichever of the
+/// Compile `sources` as the version replacing `previous`, keeping whichever of the
 /// running graph's operators compute what this version's tree still asks for.
 ///
 /// `previous` is the tree the running graph was built from
@@ -2095,16 +2079,16 @@ pub fn compile_program(
 /// [`GlobalContext::retire_version`](GlobalContext::retire_version).
 pub fn compile_replacement(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     main_consumer: Box<dyn Consumer>,
     previous: &Expr,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, code, main_consumer, Some(previous))
+    compile_version(ctx, sources, main_consumer, Some(previous))
 }
 
 fn compile_version(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     main_consumer: Box<dyn Consumer>,
     previous: Option<&Expr>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
@@ -2128,7 +2112,7 @@ fn compile_version(
         sink_bindings: sink_bindings_registry,
         lowering_projection,
         table_session,
-    } = run_frontend(ctx, code, Phase::Planning, &PANES, true)?;
+    } = run_frontend(ctx, sources, Phase::Planning, &PANES, true)?;
     // A route the registry holds and this version did not bind is one the version
     // stopped serving. Retire it, or it keeps matching requests and buffering them
     // for a reader that no longer exists. A no-op for a first compilation, whose
@@ -2301,7 +2285,7 @@ fn compile_version(
         post_lambda_elim_ir,
         provenance_table,
         operator_graph,
-        source: code.to_string(),
+        sources: sources.clone(),
     };
 
     // Every compile its own gate — see `provenance_gate_every_compile` for why this
@@ -2323,10 +2307,10 @@ mod tests {
     /// Driver that runs `compile_program` for an error-only test, returning
     /// the collected error list. Discards the program — these tests only
     /// care about which errors surface.
-    fn compile_err(code: &str) -> Vec<CompileError> {
+    fn compile_err(sources: &SourceMap) -> Vec<CompileError> {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        match compile_program(&mut ctx, code, consumer) {
+        match compile_program(&mut ctx, sources, consumer) {
             Ok(_) => panic!("expected compile error, got success"),
             Err(errs) => errs,
         }
@@ -2336,7 +2320,7 @@ mod tests {
     fn compile_ok(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, code, consumer).expect("compiles")
+        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).expect("compiles")
     }
 
     /// Lowering's own recording overhead, measured rather than gated.
@@ -2376,8 +2360,9 @@ x = 1 +
 y = {a: 1}
 y
 ";
-        let errs = compile_err(code);
-        let out = render_errors(&errs, "<test>", code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let out = render_errors(&errs, &sources);
         let expected = "\
 Error: parse error
    ╭─[<test>:1:8]
@@ -2425,7 +2410,8 @@ Error: lowering error
     #[test]
     fn infer_error_carries_resolved_span() {
         let code = "1 and 2\n";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -2456,7 +2442,8 @@ Error: lowering error
     #[test]
     fn coalesce_error_carries_resolved_span() {
         let code = "1 + \"a\"\n";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -2480,7 +2467,8 @@ Error: lowering error
     #[test]
     fn unbound_variable_carries_resolved_span() {
         let code = "y\n";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -2491,7 +2479,7 @@ Error: lowering error
         assert!(matches!(error, InferError::UnboundVariable(_)));
         assert_eq!(
             span,
-            Some(chl_parser::ast::Span::new(0, 1)),
+            Some(Span::new(sources.root(), 0, 1)),
             "the use of `y` spans byte offsets 0..1"
         );
     }
@@ -2521,7 +2509,8 @@ Error: lowering error
         "\\a, b -> (a + 1, a + \"s\")"
     )]
     fn unsatisfiable_operand_carries_resolved_span(#[case] code: &str, #[case] expected: &str) {
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -2548,8 +2537,9 @@ Error: lowering error
     #[test]
     fn infer_error_renders_with_source_context() {
         let code = "1 and 2\n";
-        let errs = compile_err(code);
-        let out = render_errors(&errs, "<test>", code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let out = render_errors(&errs, &sources);
         assert!(
             !out.contains("error: type inference:"),
             "span-carrying infer error must not use the plain-text fallback; got:\n{out}"
@@ -2576,7 +2566,8 @@ x = (1 +)
 y = {a: 1}
 y
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let has_parse = errs.iter().any(|e| matches!(e, CompileError::Parse(_)));
         let has_lower = errs.iter().any(|e| matches!(e, CompileError::Lower(_)));
         assert!(
@@ -2594,7 +2585,8 @@ x = 1 +
 y = 2 *
 1
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let parse_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Parse(_)))
@@ -2615,7 +2607,8 @@ x = {a: 1}
 y = {b: 2}
 y
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let lower_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Lower(_)))
@@ -2635,7 +2628,8 @@ y
 x = (1 +)
 1
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let lower_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Lower(_)))

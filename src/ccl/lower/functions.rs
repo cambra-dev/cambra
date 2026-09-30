@@ -548,17 +548,17 @@ in add"
         // `def add(a, b):` newline `    a + a + b` newline `add(1, 2)` newline.
         // The two `a` occurrences sit at distinct source spans; `b` at a third.
         let src = "def add(a, b):\n    a + a + b\nadd(1, 2)\n";
-        let a1 = Span::new(19, 20);
-        let a2 = Span::new(23, 24);
-        let b = Span::new(27, 28);
+        let module = parse_module(src);
+        let a1 = Span::new(module.file, 19, 20);
+        let a2 = Span::new(module.file, 23, 24);
+        let b = Span::new(module.file, 27, 28);
         // The declarations, in `def add(a, b)`.
-        let decl_a = Span::new(8, 9);
-        let decl_b = Span::new(11, 12);
+        let decl_a = Span::new(module.file, 8, 9);
+        let decl_b = Span::new(module.file, 11, 12);
 
-        let stmts = parse_module(src);
         let mut ctx = LoweringContext::default();
         let session = LoweringSession::install();
-        let ccl = lower_stmts(&stmts, &mut ctx)
+        let ccl = lower_stmts(&module, &mut ctx)
             .into_result()
             .expect("lowering failed");
         let log = session.into_log();

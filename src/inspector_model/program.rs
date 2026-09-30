@@ -19,6 +19,7 @@ use crate::ccl::Expr;
 use crate::ccl::context::{CompiledProgram, Phase};
 use crate::ccl::panes::{PANES, PaneKind};
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
+use crate::chl_parser::SourceMap;
 use crate::interpreter::operator_graph::OperatorGraph;
 
 /// The pane use→binder resolution runs over: the lowered, uniquified tree before
@@ -61,8 +62,9 @@ pub(super) struct PaneProjection<'a> {
 ///
 /// [`build_payload`]: Self::build_payload
 pub struct InspectedProgram<'a> {
-    /// The original program source text (the payload's `source.text`).
-    source: &'a str,
+    /// Every file the program was compiled from. The root's text is the
+    /// payload's `source.text`.
+    sources: &'a SourceMap,
     /// The panes in order (upstream → downstream): pre-inference,
     /// post-inference, post-channelize, ….
     panes: Vec<PaneProjection<'a>>,
@@ -179,7 +181,7 @@ impl<'a> InspectedProgram<'a> {
             })
             .collect();
         InspectedProgram {
-            source: &compiled.source,
+            sources: &compiled.sources,
             panes,
             // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
             // already one shorter than its projections, in the same order.
@@ -202,7 +204,7 @@ impl<'a> InspectedProgram<'a> {
     #[cfg(test)]
     pub(super) fn from_parts(
         pane: &'static str,
-        source: &'a str,
+        sources: &'a SourceMap,
         ir: &'a Expr,
         projection: SourceProjection,
     ) -> Self {
@@ -214,7 +216,7 @@ impl<'a> InspectedProgram<'a> {
             projection,
         )];
         InspectedProgram {
-            source,
+            sources,
             panes,
             pane_maps: Vec::new(),
         }
@@ -231,9 +233,9 @@ impl<'a> InspectedProgram<'a> {
         &self.pane_maps
     }
 
-    /// The program's source text (the payload's `source.text`).
+    /// The root file's text (the payload's `source.text`).
     pub(super) fn source_text(&self) -> &str {
-        self.source
+        self.sources.text(self.sources.root())
     }
 
     /// The source-level name index (for the payload's `definitions`).
@@ -255,7 +257,7 @@ impl<'a> InspectedProgram<'a> {
             .content
             .ir()
             .unwrap_or_else(|| unreachable!("{DEFINITIONS_PANE} is an IR pane"));
-        super::definitions::definitions(ir, &pane.projection, self.source)
+        super::definitions::definitions(ir, &pane.projection, self.sources)
     }
 }
 
@@ -273,7 +275,8 @@ mod tests {
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, code, consumer).expect("program compiles")
+        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles")
     }
 
     /// The specialization-wrapper `Let`s that `coalesce_generalized_let`

@@ -783,6 +783,7 @@ mod tests {
     use super::*;
     use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
     use crate::ccl::panes::PANES;
+    use crate::chl_parser::SourceMap;
     use crate::interpreter::Consumer;
     use indoc::indoc;
     use std::collections::{HashMap, HashSet};
@@ -790,17 +791,20 @@ mod tests {
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, code, consumer).expect("program compiles")
+        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles")
     }
 
-    /// The span of the `n`-th (0-based) byte occurrence of `needle` in `code`.
+    /// The span of the `n`-th (0-based) byte occurrence of `needle` in `code`,
+    /// in the root file of the map [`compile`] builds for `code`.
     fn nth_span(code: &str, needle: &str, n: usize) -> Span {
         let start = code
             .match_indices(needle)
             .nth(n)
             .unwrap_or_else(|| panic!("occurrence {n} of {needle:?} not found"))
             .0;
-        Span::new(start, start + needle.len())
+        let file = SourceMap::single("<test>", code).root();
+        Span::new(file, start, start + needle.len())
     }
 
     /// Programs whose shapes reach the payload's moving parts: a comprehension
@@ -1001,7 +1005,8 @@ mod tests {
     /// this is what says what that join is checked against.
     #[test]
     fn wire_spans_orders_narrowest_first_and_dedups() {
-        let span = |start: usize, end: usize| Span { start, end };
+        let file = SourceMap::single("<test>", "").root();
+        let span = |start: usize, end: usize| Span::new(file, start, end);
 
         // The observed regression: `inner_join`'s operator nodes carried the
         // 99-byte comprehension ahead of the 32-byte record it contains, so
@@ -1146,7 +1151,11 @@ mod tests {
         // `x * 2` is the root of a lowered source expression, so its rewrite tag
         // null-compresses; it carries its own span and its inferred type.
         let mul = node_named(pane, "BinOp(Arithmetic(Mul))");
-        assert_eq!(mul.spans, [Span::new(24, 29)], "the span of `x * 2`");
+        assert_eq!(
+            mul.spans,
+            [Span::new(prog.sources.root(), 24, 29)],
+            "the span of `x * 2`"
+        );
         assert_eq!(mul.ty, "Int");
         assert!(
             mul.rewritten.is_none(),
@@ -1458,7 +1467,7 @@ mod tests {
         let code = "x = (1 + \n";
         let compiled = compile_program(
             &mut GlobalContext::default(),
-            code,
+            &SourceMap::single("<test>", code),
             Box::new(|| {}) as Box<dyn Consumer>,
         );
         let Err(errors) = compiled else {
@@ -1498,14 +1507,15 @@ mod tests {
         use crate::ccl::lower::LoweringError;
         use crate::chl_parser::ast::Span;
 
+        let file = SourceMap::single("<test>", "").root();
         let error = crate::ccl::context::CompileError::Lower(LoweringError::unsupported(
-            Span::new(3, 7),
+            Span::new(file, 3, 7),
             "generators are not supported here",
         ));
         let diagnostic = Diagnostic::from_compile_error(&error);
         assert_eq!(diagnostic.stage, "lower");
         assert_eq!(diagnostic.message, "generators are not supported here");
-        assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
+        assert_eq!(diagnostic.span, Some(Span::new(file, 3, 7)));
     }
 
     /// Every node of every pane carries an attribution, so `spans` and
@@ -1545,7 +1555,7 @@ mod tests {
     fn a_degraded_payload_carries_diagnostics_and_no_panes() {
         let compiled = compile_program(
             &mut GlobalContext::default(),
-            "z + 1\n",
+            &SourceMap::single("<test>", "z + 1\n"),
             Box::new(|| {}) as Box<dyn Consumer>,
         );
         let Err(errors) = compiled else {
@@ -1878,7 +1888,7 @@ max(totals)
         let panes = prog.materialize_panes();
         let payload = InspectedProgram::from_parts(
             "post-channelize",
-            &prog.source,
+            &prog.sources,
             &prog.post_channelize_ir,
             panes.projection("post-channelize").clone(),
         )

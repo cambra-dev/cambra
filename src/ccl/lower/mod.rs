@@ -85,9 +85,12 @@ use crate::{
         Branch, Expr, Lit, Type, TypedExprNode,
         provenance::{Nature, RewriteLabel},
     },
-    chl_parser::ast::{
-        Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
-        VariantPayload as ChlVariantPayload,
+    chl_parser::{
+        ast::{
+            Expr as ChlExpr, Lit as ChlLit, Module as ChlModule, RecordField, Span, Spanned,
+            Stmt as ChlStmt, VariantPayload as ChlVariantPayload,
+        },
+        source_map::report_config,
     },
     interpreter::{
         DataSink, DataSourceDomainExtentImpl,
@@ -176,29 +179,22 @@ impl LoweringError {
 
     /// Build an ariadne [`Report`](ariadne::Report) with default (colour-on)
     /// configuration.
-    pub fn to_report<'a>(
-        &self,
-        src_name: &'a str,
-    ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
-        self.to_report_with_config(src_name, ariadne::Config::default())
+    pub fn to_report(&self) -> ariadne::Report<'static, Span> {
+        self.to_report_with_config(report_config(true))
     }
 
     /// Build an ariadne [`Report`](ariadne::Report) using the supplied
     /// [`Config`](ariadne::Config). Use this to disable colour for snapshot
     /// or log output; interactive callers should use [`Self::to_report`].
-    pub fn to_report_with_config<'a>(
-        &self,
-        src_name: &'a str,
-        config: ariadne::Config,
-    ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+    pub fn to_report_with_config(&self, config: ariadne::Config) -> ariadne::Report<'static, Span> {
         use ariadne::{Color, Label, Report, ReportKind};
         match self {
             LoweringError::Unsupported { span, message } => {
-                Report::build(ReportKind::Error, src_name, span.start)
+                Report::build(ReportKind::Error, span.file, span.start)
                     .with_config(config)
                     .with_message("lowering error")
                     .with_label(
-                        Label::new((src_name, (*span).into()))
+                        Label::new(*span)
                             .with_message(message)
                             .with_color(Color::Red),
                     )
@@ -1133,7 +1129,7 @@ fn lower_expr_inner(
     }
 }
 
-/// Lower a block of CHL statements to a nested CCL expression.
+/// Lower a CHL module's top-level statements to a nested CCL expression.
 ///
 /// All statements except the last must be simple name assignments
 /// (`x = expr`), annotated assignments (`x: T = expr`), augmented
@@ -1152,9 +1148,9 @@ fn lower_expr_inner(
 /// [`crate::ccl::channelize`] resolves to the computed response morphism.
 /// `channelize` removes all `Feed` nodes and then collapses the `ExprStmt` to
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
-pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
+pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
     let mut errors: Vec<LoweringError> = Vec::new();
-    let value = lower_stmts_recovering(stmts, ctx, &mut errors);
+    let value = lower_stmts_recovering(module, ctx, &mut errors);
     LoweringResult { value, errors }
 }
 
@@ -1168,13 +1164,17 @@ pub(crate) mod test_helpers {
             Type,
             lower::{LoweringContext, LoweringError, lower_stmts},
         },
-        chl_parser::ast::{Expr as ChlExpr, Spanned, Stmt as ChlStmt},
+        chl_parser::{
+            SourceMap,
+            ast::{Expr as ChlExpr, Module as ChlModule, Spanned},
+        },
         interpreter::DataSourceDomainExtentImpl,
     };
 
-    /// Parse a CHL expression and return the AST node.
+    /// Parse a CHL expression, the root of its own one-file map, and return the
+    /// AST node.
     pub(crate) fn parse_expr(code: &str) -> Spanned<ChlExpr> {
-        crate::chl_parser::parse_expression(code)
+        crate::chl_parser::parse_expression(SourceMap::single("<test>", code).root(), code)
             .into_result()
             .expect("Failed to parse expression")
     }
@@ -1189,12 +1189,18 @@ pub(crate) mod test_helpers {
         )))
     }
 
-    /// Parse a CHL module and return the statement list.
-    pub(crate) fn parse_module(code: &str) -> Vec<Spanned<ChlStmt>> {
-        crate::chl_parser::parse_module(code)
+    /// Parse a CHL module, the root of its own one-file map, keeping its errors.
+    pub(crate) fn parse_module_result(
+        code: &str,
+    ) -> crate::chl_parser::parser::ParseResult<ChlModule> {
+        crate::chl_parser::parse_module(SourceMap::single("<test>", code).root(), code)
+    }
+
+    /// Parse a CHL module, the root of its own one-file map.
+    pub(crate) fn parse_module(code: &str) -> ChlModule {
+        crate::chl_parser::parse_module(SourceMap::single("<test>", code).root(), code)
             .into_result()
             .expect("Failed to parse module")
-            .body
     }
 
     /// Lower `stmts`, expect exactly one lowering error, and return it.
@@ -1202,8 +1208,8 @@ pub(crate) mod test_helpers {
     /// Test-only convenience: most negative-path tests want to check the
     /// single error they expect against a pattern, so we unpack the `Vec`
     /// here once instead of at every call site.
-    pub(crate) fn expect_one_lowering_error(stmts: &[Spanned<ChlStmt>]) -> LoweringError {
-        let errs = lower_stmts(stmts, &mut LoweringContext::default())
+    pub(crate) fn expect_one_lowering_error(module: &ChlModule) -> LoweringError {
+        let errs = lower_stmts(module, &mut LoweringContext::default())
             .into_result()
             .expect_err("expected lowering error");
         assert_eq!(
@@ -1235,7 +1241,7 @@ mod tests {
             "x = 0\nx.field += 1\nx",
         ];
         for code in cases {
-            let result = crate::chl_parser::parse_module(code);
+            let result = super::test_helpers::parse_module_result(code);
             assert!(
                 !result.errors.is_empty(),
                 "expected parse error for:\n{code}"
@@ -1250,11 +1256,9 @@ mod tests {
     #[test]
     fn a_subscript_target_is_rejected_by_every_form_but_mut_assign() {
         for code in ["x = [1]\nx[0] += 1\nx", "x = [1]\nx[0] = 1\nx"] {
-            let module = crate::chl_parser::parse_module(code)
-                .into_result()
-                .expect("a subscript target parses");
+            let module = super::test_helpers::parse_module(code);
             let mut ctx = super::LoweringContext::default();
-            let errs = super::lower_stmts(&module.body, &mut ctx)
+            let errs = super::lower_stmts(&module, &mut ctx)
                 .into_result()
                 .expect_err("expected a lowering error");
             assert!(

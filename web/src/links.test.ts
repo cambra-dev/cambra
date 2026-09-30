@@ -25,15 +25,15 @@ function pane(id: string, spans: Record<number, Span | null>): PaneInfo {
 }
 
 const channelize = pane("post-channelize", {
-  1: { start: 0, end: 10 },
-  2: { start: 2, end: 5 },
-  3: { start: 6, end: 7 },
+  1: { file: 0, start: 0, end: 10 },
+  2: { file: 0, start: 2, end: 5 },
+  3: { file: 0, start: 6, end: 7 },
 });
 const infer = pane("post-inference", {
-  1: { start: 0, end: 10 },
-  3: { start: 6, end: 7 },
-  4: { start: 2, end: 5 },
-  5: { start: 2, end: 5 },
+  1: { file: 0, start: 0, end: 10 },
+  3: { file: 0, start: 6, end: 7 },
+  4: { file: 0, start: 2, end: 5 },
+  5: { file: 0, start: 2, end: 5 },
 });
 
 const graph = buildLinkGraph(

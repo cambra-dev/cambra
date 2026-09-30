@@ -54,6 +54,7 @@ use std::collections::HashMap;
 use crate::ccl::names::Uid;
 use crate::ccl::provenance::SourceProjection;
 use crate::ccl::{Expr, Name, TypedExprNode};
+use crate::chl_parser::SourceMap;
 use crate::chl_parser::ast::Span;
 
 /// One resolved use→binder pair: a name occurrence, the binder's source site,
@@ -75,13 +76,13 @@ pub(super) struct Definition {
 pub(super) fn definitions(
     tree: &Expr,
     projection: &SourceProjection,
-    source: &str,
+    sources: &SourceMap,
 ) -> Vec<Definition> {
     let mut sites: HashMap<Uid, Span> = HashMap::new();
     collect_binder_sites(tree, projection, &mut sites);
 
     let mut out = Vec::new();
-    collect_uses(tree, projection, source, &sites, &mut out);
+    collect_uses(tree, projection, sources, &sites, &mut out);
     out
 }
 
@@ -127,7 +128,7 @@ fn node_span(expr: &Expr, projection: &SourceProjection) -> Option<Span> {
 fn collect_uses(
     expr: &Expr,
     projection: &SourceProjection,
-    source: &str,
+    sources: &SourceMap,
     sites: &HashMap<Uid, Span>,
     out: &mut Vec<Definition>,
 ) {
@@ -154,7 +155,7 @@ fn collect_uses(
             if is_uncurry
                 && let (Some(use_span), Some(def_span)) =
                     (node_span(expr, projection), node_span(function, projection))
-                && let Some(name) = source.get(def_span.start..def_span.end)
+                && let Some(name) = sources.text(def_span.file).get(def_span.as_range())
             {
                 out.push(Definition {
                     use_span,
@@ -165,12 +166,13 @@ fn collect_uses(
         }
         _ => {}
     }
-    expr.walk_children(|c| collect_uses(c, projection, source, sites, out));
+    expr.walk_children(|c| collect_uses(c, projection, sources, sites, out));
 }
 
 #[cfg(test)]
 mod tests {
     use crate::ccl::context::{GlobalContext, compile_program};
+    use crate::chl_parser::SourceMap;
     use crate::inspector_model::InspectedProgram;
     use crate::interpreter::Consumer;
     use indoc::indoc;
@@ -180,7 +182,8 @@ mod tests {
     fn resolved(code: &str) -> Vec<(String, String, String)> {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
+        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles");
         InspectedProgram::new(&compiled)
             .definitions()
             .into_iter()
@@ -260,7 +263,8 @@ mod tests {
         let code = "x = 1\nx = x + 1\nx\n";
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
+        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles");
         let defs = InspectedProgram::new(&compiled).definitions();
 
         // The `x` on the right of `x = x + 1` (offset 10) reads the *first* `x`

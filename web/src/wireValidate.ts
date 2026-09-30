@@ -162,6 +162,7 @@ function arr(v: unknown, path: string): unknown[] {
 
 function validateSpan(v: unknown, path: string): Span {
   const o = obj(v, path);
+  num(o.file, `${path}.file`);
   num(o.start, `${path}.start`);
   num(o.end, `${path}.end`);
   return v as Span;
@@ -212,7 +213,7 @@ function validateSpans(v: unknown, path: string): void {
   let previousExtent = -1;
   const seen = new Set<string>();
   spans.forEach((sp, i) => {
-    const key = `${sp.start}:${sp.end}`;
+    const key = `${sp.file}:${sp.start}:${sp.end}`;
     if (seen.has(key)) {
       throw new WireError(`${path}.spans[${i}]`, "a span not already on this node", sp);
     }

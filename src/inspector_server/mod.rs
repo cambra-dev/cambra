@@ -65,6 +65,7 @@ mod tests {
     use super::wire_check::assert_snapshot_shape;
     use super::*;
     use crate::ccl::context::{GlobalContext, compile_program};
+    use crate::chl_parser::SourceMap;
 
     use crate::interpreter::Consumer;
     use indoc::indoc;
@@ -81,7 +82,8 @@ mod tests {
     fn snapshot_value(code: &str, name: &str) -> Value {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
+        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles");
         serde_json::from_str(&snapshot_json(&compiled, name)).expect("payload is valid JSON")
     }
 
@@ -239,7 +241,8 @@ mod tests {
         "#};
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
+        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles");
 
         let json = snapshot_json(&compiled, "poly.chl");
         let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
@@ -280,7 +283,8 @@ mod tests {
         "#};
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, code, consumer).expect("program compiles");
+        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles");
 
         let json = snapshot_json(&compiled, "udf.chl");
         let v: Value = serde_json::from_str(&json).expect("payload is valid JSON");
