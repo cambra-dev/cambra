@@ -564,8 +564,9 @@ pub enum Builtin {
     /// `by_commit_time : (𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` — one `with
     /// begin():` site's commit records, keyed by the commit time each carries rather than by
     /// the iteration that produced it. A site's records carry distinct times, so the re-keying
-    /// is a function. A denied iteration's record has a time too; the tap's
-    /// ``variant_project(`commit)`` drops it.
+    /// is a function. A denied iteration's record has a time too in the model, where
+    /// `begin_<site>` is injective over iterations; the engine allocates no tick for it. The
+    /// tap's ``variant_project(`commit)`` drops it.
     ///
     /// Heads each in-block reply tap [`crate::ccl::transact_phase`] binds, which types a reply
     /// `Txn ⤇ 𝑉`, keyed as the store serves it. Minted after inference with its type stamped,

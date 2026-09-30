@@ -700,6 +700,30 @@ fn progress_feed_grant_deny() {
     assert_eq!(tile, commit_stream(&[1], &[30]));
 }
 
+/// Replies from two `with begin():` sites join into one channel whose arms are each keyed by
+/// commit time, so both arms' keys have type `Txn`.
+#[test]
+fn reply_union_over_two_sites_is_keyed_by_commit_time() {
+    let mut ctx = GlobalContext::default();
+    let (ast, _) = run_pipeline_with_ctx(
+        &mut ctx,
+        indoc! {r#"
+            out = defer()
+            pool: Mut(Int, Txn) := 100
+            for r in [10, 20]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+                        out << pool
+            with begin():
+                pool := pool - 5
+                out << pool
+            out
+        "#},
+    );
+    assert_eq!(ast.ty.to_string(), "(Txn | Txn ⤇ Int)");
+}
+
 // ---------------------------------------------------------------------------
 // Value types: a transactional mutable variable holds any base value, not just int
 // ---------------------------------------------------------------------------

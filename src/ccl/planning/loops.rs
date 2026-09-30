@@ -423,6 +423,18 @@ fn tap_field(def: &Expr) -> String {
     let TypedExprNode::Compose(elts) = &def.node else {
         panic!("letrec recognition: tap binding is not a composition");
     };
+    // The history record's tap field is typed `Txn ⤇ …`, which holds only if the tap reads
+    // its site's commit records through `by_commit_time`.
+    debug_assert!(
+        matches!(
+            elts.first().map(|e| &e.node),
+            Some(TypedExprNode::Apply { function, .. })
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::ByCommitTime))
+        ),
+        "letrec recognition: a tap is keyed by commit time, so its binding must start with \
+         `commits_j ▷ by_commit_time`: {}",
+        symbolic(def)
+    );
     match elts.last().map(|e| &e.node) {
         Some(TypedExprNode::Proj(ProjKey::Field(f))) => f.clone(),
         _ => panic!("letrec recognition: tap binding does not end in a field projection"),
@@ -649,7 +661,7 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
     // Op-conversion builds a commit store for a `Txn` domain and an induction store for any
-    // other, so an induction group over a `Txn` domain (a loop over an in-block reply
+    // other, so an induction group over a `Txn` domain (e.g. a loop over an in-block reply
     // channel) would be built as the wrong store.
     assert!(
         !matches!(domain_ty, Type::Txn),

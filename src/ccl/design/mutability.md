@@ -105,13 +105,13 @@ kinds of variable:
   is a per-site builtin `begin_<site> : 𝐼 ⇒ Txn` mapping the site's iteration index to the
   transaction's position in the commit order.
 
-Feeds — the **append-only** form of mutability — are realized as the letrec's **outputs**: the
-body of the letrec is a record of channels (one field per defer/sink), each a function over its
-contributing loop's domain, or over `Txn` for a feed inside a `with begin():` block, free to
-reference the letrec's bindings. (They are outputs by *realization*, not by nature: `<<` is impure
-surface mutation like `:=`, discharged into a pure history by the same eliminator — it is only the
-*append* merge law, with no carry-forward, that lets a feed be a plain output rather than a cyclic
-binding.)
+Feeds, the **append-only** form of mutability, are realized as the letrec's **outputs**. The body
+of the letrec is a record of channels, one field per defer or sink. Each channel is a function over
+its contributing loop's domain, or over `Txn` for a feed inside a `with begin():` block, and may
+reference the letrec's bindings. A feed is an output by realization, not by nature: `<<`, like `:=`,
+is surface mutation rather than a purely functional representation, and the same eliminator
+discharges both into a pure history. The append merge law has no carry-forward, and that is what
+lets a feed be a plain output rather than a cyclic binding.
 
 ### A mutable variable read is an explicit operation
 
@@ -546,7 +546,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⤇ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too; the tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
+| `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Over a `Txn` history it is only ever the surface [`await_final`](#await_final)'s read — a fed-out read is an `as_of_read`, a different term |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_or_default` over the mutable variable's history binding. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
