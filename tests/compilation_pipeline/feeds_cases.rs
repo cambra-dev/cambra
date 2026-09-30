@@ -947,6 +947,23 @@ x
     )
 }
 
+/// TODO: Support mut reads in refined ops used with feeds.
+#[test]
+fn refined_read_used_with_feed() {
+    check_compile_error(
+        indoc! {r#"
+x := 0
+o = defer()
+for p in [1, 2, 3]:
+    y = x ^+ 1
+    o << y
+    x += 1
+o
+        "#},
+        "open bound recorded",
+    )
+}
+
 #[test]
 fn let_binding_into_feed() {
     check_scalar(

@@ -1385,6 +1385,8 @@ before it as well. That is what admits a write to a mutable variable declared ou
 states the same rule tree-wide, seeding its root scope with every opaque binder the tree holds
 (`check_scope_valid`).
 
+TODO: Opaque binders are exempt from the invariant check at record time, and so escapes of opaque binders currently surface later.
+
 A binder carrying a definiens stays out of that set, its reference being discharged rather than
 carried. A `for` target carries neither, so a contribution naming one still fails the check.
 
