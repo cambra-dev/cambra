@@ -395,8 +395,9 @@ pub struct SourceSinkRegistry {
     shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
     /// Test sinks a test holds a handle on, by binding name.
     ///
-    /// Registry state rather than per-pass state because every compilation seeds its
-    /// lowering from the registry, and the handle is minted before the first one.
+    /// Registry state rather than per-pass state because a sink outlives a version, as a
+    /// route's reply sink does: a replacement version writes to the sink its predecessor
+    /// wrote to, so what the sink holds accumulates across a reload.
     #[cfg(any(test, feature = "test-helpers"))]
     test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 }
@@ -737,6 +738,12 @@ impl GlobalContext {
     /// A test reads a sink after the program runs but needs the handle before the program
     /// is compiled, so the handle is minted here rather than during lowering. Lowering
     /// refuses a `test_sink()` whose name was never registered.
+    ///
+    /// Every compilation against this context binds the same sink. A reload's replacement
+    /// resumes where its predecessor stopped, so the sink holds each version's writes over
+    /// the positions that version handled. Two programs compiled here without a reload
+    /// between them both write the whole of their output to it, and the keys they share
+    /// collide.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn register_test_sink(
         &mut self,

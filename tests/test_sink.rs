@@ -12,7 +12,8 @@ use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::interpreter::{
     BaseType, Consumer, Extent, Predicate, SinkReadError, TestDataSource, Value,
 };
-use indoc::indoc;
+use cambra::live_program::LiveProgram;
+use indoc::{formatdoc, indoc};
 
 /// Run `source` to completion and answer what it wrote to each named sink.
 ///
@@ -163,17 +164,18 @@ fn a_collection_of_records() {
     );
 }
 
-/// A record whose components differ in depth — one a collection, one a scalar — does not
-/// compile: `FanIn::new_at` requires every operand to be a collection at the ambient level
-/// and panics otherwise. Pinned at the panic it reaches.
+/// A record whose components differ in depth, one a collection and one a scalar, reads back
+/// with each component at its own depth.
 #[test]
-#[should_panic(expected = "FanIn pairs collections over")]
-fn a_record_holding_a_collection_does_not_compile() {
-    observe_one(indoc! {r#"
+fn a_record_holding_a_collection() {
+    let v = observe_one(indoc! {r#"
         out = test_sink()
         out << (xs=[1, 2], n=3)
-    "#})
-    .expect("a value");
+    "#});
+    assert_eq!(
+        format!("{}", v.expect("a value")),
+        "Function [ () -> {n: 3, xs: Function [ 1, 2 ]} ]"
+    );
 }
 
 /// A comprehension whose elements are themselves collections does not convert. Pinned at
@@ -285,6 +287,11 @@ fn test_sink_outside_the_top_level_is_rejected() {
     for x in [1, 2]:
         out = test_sink()
         out << x
+    0
+"#})]
+#[case::loop_body_without_a_feed(indoc! {r#"
+    for x in [1, 2]:
+        out = test_sink()
     0
 "#})]
 #[case::with_block(indoc! {r#"
@@ -507,5 +514,76 @@ fn a_sink_accumulates_across_two_deliveries() {
         format!("{}", sink.value().expect("a value")),
         "Function [ 10, 20 ]",
         "both deliveries are in the accumulated value"
+    );
+}
+
+/// A test sink outlives a reload, as any sink does: the replacement keeps writing to it, so it
+/// holds what each version wrote over the positions that version handled.
+#[test]
+fn a_sink_accumulates_across_a_reload() {
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "nums",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let sink = ctx.register_test_sink("out");
+    let consumer = || -> Box<dyn Consumer> { Box::new(|| {}) };
+    let version = |factor: i64| {
+        formatdoc! {r#"
+            out = test_sink()
+            for x in nums():
+                out << x * {factor}
+        "#}
+    };
+    let pump = |ctx: &mut GlobalContext| {
+        for _ in 0..200 {
+            ctx.scheduler().check_for_notifications();
+        }
+    };
+
+    let mut live = LiveProgram::start(&mut ctx, &version(10), &consumer).expect("v1 compiles");
+    src.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(1)),
+        (Value::UInt(1), Value::Int(2)),
+    ]);
+    src.borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::UInt(1)));
+    pump(&mut ctx);
+
+    live.reload(&mut ctx, &version(100), &consumer)
+        .expect("v2 replaces v1");
+    src.borrow_mut().add_data(&[
+        (Value::UInt(2), Value::Int(3)),
+        (Value::UInt(3), Value::Int(4)),
+    ]);
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    let mut completed = false;
+    for _ in 0..200 {
+        ctx.scheduler().check_for_notifications();
+        if live.done().try_recv().is_ok() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the replacement did not complete within 200 pulls"
+    );
+
+    // The value is a function of its keys, so its bindings compare in key order.
+    let Value::Function(bindings) = sink.value().expect("a value") else {
+        panic!("a collection feed reads as a function")
+    };
+    let mut bindings: Vec<String> = bindings
+        .iter()
+        .map(|b| format!("{} -> {}", b.input, b.output))
+        .collect();
+    bindings.sort();
+    assert_eq!(
+        bindings,
+        ["u0 -> 10", "u1 -> 20", "u2 -> 300", "u3 -> 400"],
+        "the sink holds v1's writes and then v2's"
     );
 }

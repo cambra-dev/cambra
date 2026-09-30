@@ -18,7 +18,7 @@ Limitations (current):
 - Only plain string request/response bodies; no headers, status codes, or streaming.
 - `Content-Type` is always `text/html; charset=utf-8`.
 - No TLS/HTTPS.
-- Only top-level assignments are detected; `http_serve` in nested scopes is not supported.
+- `http_serve` is refused in every block other than the top-level one.
 
 ---
 

@@ -44,6 +44,9 @@ impl std::fmt::Display for SinkReadError {
 /// successive tiles carry disjoint parts of one value and this accumulates them with
 /// [`Tile::merge`], the tiling's own combining operation. `merge` validates its result only
 /// in a debug build, so [`Self::value`] validates the accumulated tile before reading it.
+///
+/// A sink outlives a version, so a reload's replacement keeps writing to the same one and it
+/// accumulates across the reload (`a_sink_accumulates_across_a_reload`).
 #[derive(Default)]
 pub struct TestSink {
     // shared-state-ok: the I/O boundary, not the operator graph. A sink is a

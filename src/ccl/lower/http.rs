@@ -1,78 +1,178 @@
-//! `http_serve` recognition: detecting the
-//! `requests, responses = http_serve(port, method, path)` shape and extracting
-//! its tuple targets and string-literal arguments.
+//! `http_serve`: recognizing `requests, responses = http_serve(port, method, path)`, and
+//! lowering it to a `Source` binding and a `Defer` binding whose sink is the route's reply
+//! sink.
 //!
-//! The actual wiring (creating the [`HttpServerDataSource`], registering the
-//! sink, and emitting the `Source`/`Defer` `Let` pair) lives inline in
-//! [`lower_middle_stmt`](super::lower_middle_stmt); these helpers only classify
-//! and destructure the statement.
+//! [`sink_declaration`](super::sink_declaration) recognizes the statement through
+//! [`http_serve_decl`], and [`lower_middle_stmt`](super::lower_middle_stmt) lowers it through
+//! [`lower_http_serve`] at the top level only.
 
 use super::*;
-use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Lit as ChlLit, Spanned};
+use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Lit as ChlLit, Span, Spanned};
+use crate::interpreter::HttpServerDataSource;
 
-/// Returns `true` when `target` is a 2-element name tuple and `value` is a
-/// call to `http_serve` with exactly 3 string-literal arguments.
-pub(super) fn is_http_serve_tuple_assign(
+/// `requests, responses = http_serve(port, method, path)`, with its names and string-literal
+/// arguments read off.
+pub(super) struct HttpServeDecl {
+    requests: String,
+    responses: String,
+    port: String,
+    method: String,
+    path: String,
+}
+
+/// The declaration, when `target` is a 2-element name tuple and `value` is a call to
+/// `http_serve` with exactly 3 string-literal arguments.
+pub(super) fn http_serve_decl(
     target: &Spanned<AssignTarget>,
     value: &Spanned<ChlExpr>,
-) -> bool {
+) -> Option<HttpServeDecl> {
     let AssignTarget::Tuple(elts) = &target.node else {
-        return false;
+        return None;
     };
-    if elts.len() != 2 {
-        return false;
-    }
-    if !elts.iter().all(|e| matches!(e.node, AssignTarget::Name(_))) {
-        return false;
-    }
+    let [requests, responses] = elts.as_slice() else {
+        return None;
+    };
+    let (AssignTarget::Name(requests), AssignTarget::Name(responses)) =
+        (&requests.node, &responses.node)
+    else {
+        return None;
+    };
     let ChlExpr::Call { func, args } = &value.node else {
-        return false;
+        return None;
     };
-    if args.len() != 3 {
-        return false;
+    if !matches!(&func.node, ChlExpr::Name(id) if id == "http_serve") {
+        return None;
     }
-    matches!(&func.node, ChlExpr::Name(id) if id == "http_serve")
-        && args
-            .iter()
-            .all(|a| matches!(&a.node, ChlExpr::Lit(ChlLit::String(_))))
+    let [port, method, path] = args.as_slice() else {
+        return None;
+    };
+    let string = |a: &Spanned<ChlExpr>| match &a.node {
+        ChlExpr::Lit(ChlLit::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    Some(HttpServeDecl {
+        requests: requests.to_string(),
+        responses: responses.to_string(),
+        port: string(port)?,
+        method: string(method)?,
+        path: string(path)?,
+    })
 }
 
-/// Extract `(requests_var, responses_var)` from a 2-element name tuple target.
-pub(super) fn extract_http_serve_names(
-    target: &Spanned<AssignTarget>,
-) -> Result<(String, String), LoweringError> {
-    let AssignTarget::Tuple(elts) = &target.node else {
+/// Lower an `http_serve` declaration at `span`, whose arguments sit at `args_span`, in front
+/// of `body`:
+///
+/// ```text
+/// let <requests> = Source("__http_requests_N") in
+/// let <responses> = Defer in
+/// <body>
+/// ```
+// TODO we shouldn't need to special-case this.  Instead, we should support multi-return
+// in general.
+pub(super) fn lower_http_serve(
+    decl: HttpServeDecl,
+    span: Span,
+    args_span: Span,
+    body: Expr,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let HttpServeDecl {
+        requests,
+        responses,
+        port,
+        method,
+        path,
+    } = decl;
+    // Create and register the source now; the caller drains new_sources
+    // via take_new_sources() after lower_stmts returns, before type inference.
+    let port_u16: u16 = port.parse().map_err(|_| {
+        LoweringError::unsupported(
+            args_span,
+            format!("http_serve port must be a u16, got {port:?}"),
+        )
+    })?;
+    let source_name = http_requests_source_name(&port, &method, &path);
+    if !ctx.http_routes_this_pass.insert(source_name.clone()) {
         return Err(LoweringError::unsupported(
-            target.span,
-            "http_serve target must be a 2-tuple",
+            args_span,
+            format!("duplicate http_serve registration: port={port}, method={method}, path={path}"),
         ));
+    }
+    // A name a source already answers to and no route holds would be
+    // overwritten by the insert below. `http_requests_source_name`
+    // mints from the address, and no other source is named that way, so
+    // the only collision this could be is a route's own — caught above.
+    debug_assert!(
+        ctx.http_routes.contains_key(&source_name) || !ctx.sources.contains_key(&source_name),
+        "http_serve source name {source_name} is already a source that is not a route",
+    );
+    // Bind an already-open route, or open a new one. A route the
+    // source/sink registry already holds is *inherited*: reusing its
+    // `HttpServerDataSource` keeps the listener, the routing-table entry
+    // and the requests buffered behind it, which is what lets a
+    // replacement version of the program pick up where this one left
+    // off. A route it does not hold is opened, whether this is the
+    // program's first version or a replacement — a version that adds an
+    // endpoint serves it as soon as the swap completes.
+    let sink: Arc<dyn DataSink> = match ctx.http_routes.get(&source_name) {
+        Some(existing) => existing.sink.clone(),
+        None if ctx.endpoints == Endpoints::Inherited => {
+            let source_obj = Rc::new(RefCell::new(UnopenedRoute::new(source_name.clone())));
+            ctx.sources.insert(source_name.clone(), source_obj);
+            Arc::new(UnopenedRouteSink)
+        }
+        None => {
+            // Share one tiny_http::Server per port across all http_serve routes.
+            if let std::collections::hash_map::Entry::Vacant(e) = ctx.shared_servers.entry(port_u16)
+            {
+                let server = SharedHttpServer::new(port_u16).map_err(|e| {
+                    LoweringError::unsupported(
+                        args_span,
+                        format!("http_serve: failed to bind port {port_u16}: {e}"),
+                    )
+                })?;
+                e.insert(Arc::new(server));
+            }
+            let server = ctx.shared_servers[&port_u16].clone();
+            let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
+                &server,
+                method.clone(),
+                path.clone(),
+                source_name.clone(),
+            )));
+            let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
+            ctx.sources.insert(source_name.clone(), source_obj);
+            ctx.http_routes.insert(
+                source_name.clone(),
+                LoweredRoute {
+                    sink: sink.clone(),
+                    port: port_u16,
+                    method: method.clone(),
+                    path: path.clone(),
+                },
+            );
+            sink
+        }
     };
-    let extract = |t: &Spanned<AssignTarget>| match &t.node {
-        AssignTarget::Name(id) => Ok(id.as_str().to_string()),
-        _ => Err(LoweringError::unsupported(
-            t.span,
-            "http_serve tuple elements must be simple names",
-        )),
-    };
-    Ok((extract(&elts[0])?, extract(&elts[1])?))
-}
-
-/// Extract `(port, method, path)` string literals from the `http_serve(...)` call.
-pub(super) fn extract_http_serve_args(
-    value: &Spanned<ChlExpr>,
-) -> Result<(String, String, String), LoweringError> {
-    let ChlExpr::Call { args, .. } = &value.node else {
-        return Err(LoweringError::unsupported(
-            value.span,
-            "expected http_serve call",
-        ));
-    };
-    let extract = |expr: &Spanned<ChlExpr>| match &expr.node {
-        ChlExpr::Lit(ChlLit::String(s)) => Ok(s.clone()),
-        _ => Err(LoweringError::unsupported(
-            expr.span,
-            "http_serve arguments must be string literals",
-        )),
-    };
-    Ok((extract(&args[0])?, extract(&args[1])?, extract(&args[2])?))
+    let requests_expr = ctx.tag_machinery(
+        Expr::new(TypedExprNode::Source(source_name.clone())),
+        span,
+        "lower.http_serve",
+    );
+    // The responses binding is a plain Defer; the sink is registered by
+    // binding name so the scheduler can subscribe it independently.
+    let responses_expr =
+        ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
+    ctx.register_sink_binding(responses.clone(), sink, span)?;
+    // The outer `requests` binding images the assignment statement (the
+    // real source construct); the inner `responses` Defer let, the
+    // Source node, and the Defer are manufactured plumbing of the
+    // http_serve expansion.
+    let inner_let = ctx.tag_machinery(
+        Expr::let_bind(responses, responses_expr, body),
+        span,
+        "lower.http_serve",
+    );
+    let let_expr = Expr::let_bind(requests, requests_expr, inner_let);
+    Ok(ctx.tag_image(let_expr, span))
 }

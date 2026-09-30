@@ -384,8 +384,7 @@ fn lower_for_body_stmts_scoped(
                 value,
                 transparency,
             } => {
-                #[cfg(any(test, feature = "test-helpers"))]
-                refuse_nested_test_sink(target, value, stmt.span)?;
+                refuse_nested_sink(target, value, stmt.span)?;
                 let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
@@ -1101,6 +1100,7 @@ fn lower_loop_body_chain_scoped(
                 value,
                 transparency,
             } => {
+                refuse_nested_sink(target, value, stmt.span)?;
                 let name = extract_name_target(target, "assignment")?;
                 check_mut_write_context(&name, stmt.span, ctx)?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;

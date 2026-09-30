@@ -64,14 +64,16 @@
 //! This pass is split across several submodules, all re-exported here so that
 //! the historical `crate::ccl::lower::…` paths continue to resolve:
 //!
-//! - [`stmts`] — statement-block lowering (`Let` chains, `if`/`else`, the
-//!   `http_serve` tuple-assign wiring, mutation-loop dispatch).
+//! - [`stmts`] — statement-block lowering (`Let` chains, `if`/`else`, sink-declaration
+//!   dispatch, mutation-loop dispatch).
 //! - [`exprs`] — per-[`ChlExpr`] expression lowering (binops, comparisons,
 //!   boolean ops, calls, unary ops, feeds, defines, constants).
 //! - [`functions`] — lambda / `def` / parameter lowering (uncurrying).
 //! - [`loops`] — `for`-loop, generator, and mutation-accumulation-loop lowering.
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
-//! - [`http`] — `http_serve` recognition predicates.
+//! - [`sinks`] — recognizing a sink-declaring statement, and refusing one outside the
+//!   top-level block.
+//! - [`http`] — `http_serve` recognition and lowering.
 
 use std::{
     cell::RefCell,
@@ -100,6 +102,7 @@ mod exprs;
 mod functions;
 mod http;
 mod loops;
+mod sinks;
 mod stmts;
 #[cfg(any(test, feature = "test-helpers"))]
 mod test_sink;
@@ -120,6 +123,7 @@ use exprs::*;
 use functions::*;
 use http::*;
 use loops::*;
+use sinks::*;
 use stmts::*;
 #[cfg(any(test, feature = "test-helpers"))]
 use test_sink::*;

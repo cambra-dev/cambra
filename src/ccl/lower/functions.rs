@@ -430,7 +430,7 @@ pub(super) fn lower_function_body(
         .cloned()
         .collect();
 
-    // http_serve is not permitted inside function bodies.
+    // A sink declaration is not permitted inside function bodies.
     let body_result = ctx.with_shadowed(shadowed_params, |ctx| {
         lower_stmts_inner(body, &outer_bindings, ctx, false)
     });

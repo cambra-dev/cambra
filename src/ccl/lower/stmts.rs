@@ -1,7 +1,7 @@
-//! Statement-block lowering: `Let` chains, `if`/`else`, the `http_serve`
-//! tuple-assign wiring, and mutation-loop dispatch.
+//! Statement-block lowering: `Let` chains, `if`/`else`, sink-declaration dispatch, and
+//! mutation-loop dispatch.
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
+use std::{collections::HashSet, rc::Rc};
 
 use super::*;
 use crate::{
@@ -13,7 +13,6 @@ use crate::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
         Spanned, Stmt as ChlStmt, TypeAnnotation,
     },
-    interpreter::{DataSink, HttpServerDataSource, http_server::SharedHttpServer},
 };
 
 /// Top-level statement-iteration with per-statement error recovery.
@@ -527,147 +526,19 @@ pub(super) fn lower_middle_stmt(
     is_top_level: bool,
 ) -> Result<Expr, LoweringError> {
     match &stmt.node {
-        // `out = test_sink()` — a `Defer` channel that is also a program output. The
-        // binding name is the sink's name, so the sink record's field for it is the name
-        // the program already wrote to.
-        #[cfg(any(test, feature = "test-helpers"))]
-        ChlStmt::Assign { target, value, .. } if let Some(name) = test_sink_name(target, value) => {
+        // A statement that declares a sink binds a name the program's sink record reads, so it
+        // is lowered only here, at the top level.
+        ChlStmt::Assign { target, value, .. }
+            if let Some(decl) = sink_declaration(target, value) =>
+        {
             if !is_top_level {
-                return Err(test_sink_not_top_level(stmt.span));
+                return Err(sink_not_top_level(&decl, stmt.span));
             }
-            // A sink nothing registered has no reader, so writing to it would drop the
-            // program's output without a trace.
-            let Some(sink) = ctx.test_sinks.get(&name).cloned() else {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    format!("no test sink is registered under `{name}`"),
-                ));
-            };
-            ctx.register_sink_binding(name.clone(), sink, stmt.span)?;
-            let defer = ctx.tag_machinery(
-                Expr::new(TypedExprNode::Defer),
-                stmt.span,
-                "lower.test_sink",
-            );
-            Ok(ctx.tag_image(Expr::let_bind(name, defer, body), stmt.span))
-        }
-        // Special case: `requests, responses = http_serve(port, method, path)`.
-        //
-        // Lowers to:
-        //   let <requests> = Source("__http_requests_N") in
-        //   let <responses> = Defer              in
-        //   <body>
-        // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
-        // in general.
-        ChlStmt::Assign { target, value, .. } if is_http_serve_tuple_assign(target, value) => {
-            if !is_top_level {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    "http_serve is only supported at the top level of a program, \
-                     not inside an if/else branch or function body",
-                ));
+            match decl {
+                #[cfg(any(test, feature = "test-helpers"))]
+                SinkDecl::Test { name } => lower_test_sink(name, stmt.span, body, ctx),
+                SinkDecl::Http(decl) => lower_http_serve(decl, stmt.span, value.span, body, ctx),
             }
-            let (req_name, resp_name) = extract_http_serve_names(target)?;
-            let (port, method, path) = extract_http_serve_args(value)?;
-            // Create and register the source now; the caller drains new_sources
-            // via take_new_sources() after lower_stmts returns, before type inference.
-            let port_u16: u16 = port.parse().map_err(|_| {
-                LoweringError::unsupported(
-                    value.span,
-                    format!("http_serve port must be a u16, got {port:?}"),
-                )
-            })?;
-            let source_name = http_requests_source_name(&port, &method, &path);
-            if !ctx.http_routes_this_pass.insert(source_name.clone()) {
-                return Err(LoweringError::unsupported(
-                    value.span,
-                    format!(
-                        "duplicate http_serve registration: port={port}, method={method}, path={path}"
-                    ),
-                ));
-            }
-            // A name a source already answers to and no route holds would be
-            // overwritten by the insert below. `http_requests_source_name`
-            // mints from the address, and no other source is named that way, so
-            // the only collision this could be is a route's own — caught above.
-            debug_assert!(
-                ctx.http_routes.contains_key(&source_name)
-                    || !ctx.sources.contains_key(&source_name),
-                "http_serve source name {source_name} is already a source that is not a route",
-            );
-            // Bind an already-open route, or open a new one. A route the
-            // source/sink registry already holds is *inherited*: reusing its
-            // `HttpServerDataSource` keeps the listener, the routing-table entry
-            // and the requests buffered behind it, which is what lets a
-            // replacement version of the program pick up where this one left
-            // off. A route it does not hold is opened, whether this is the
-            // program's first version or a replacement — a version that adds an
-            // endpoint serves it as soon as the swap completes.
-            let sink: Arc<dyn DataSink> = match ctx.http_routes.get(&source_name) {
-                Some(existing) => existing.sink.clone(),
-                None if ctx.endpoints == Endpoints::Inherited => {
-                    let source_obj = Rc::new(RefCell::new(UnopenedRoute::new(source_name.clone())));
-                    ctx.sources.insert(source_name.clone(), source_obj);
-                    Arc::new(UnopenedRouteSink)
-                }
-                None => {
-                    // Share one tiny_http::Server per port across all http_serve routes.
-                    if let std::collections::hash_map::Entry::Vacant(e) =
-                        ctx.shared_servers.entry(port_u16)
-                    {
-                        let server = SharedHttpServer::new(port_u16).map_err(|e| {
-                            LoweringError::unsupported(
-                                value.span,
-                                format!("http_serve: failed to bind port {port_u16}: {e}"),
-                            )
-                        })?;
-                        e.insert(Arc::new(server));
-                    }
-                    let server = ctx.shared_servers[&port_u16].clone();
-                    let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
-                        &server,
-                        method.clone(),
-                        path.clone(),
-                        source_name.clone(),
-                    )));
-                    let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
-                    ctx.sources.insert(source_name.clone(), source_obj);
-                    ctx.http_routes.insert(
-                        source_name.clone(),
-                        LoweredRoute {
-                            sink: sink.clone(),
-                            port: port_u16,
-                            method: method.clone(),
-                            path: path.clone(),
-                        },
-                    );
-                    sink
-                }
-            };
-            let requests_expr = ctx.tag_machinery(
-                Expr::new(TypedExprNode::Source(source_name.clone())),
-                stmt.span,
-                "lower.http_serve",
-            );
-            // The responses binding is a plain Defer; the sink is registered by
-            // binding name so the scheduler can subscribe it independently.
-            let responses_expr = ctx.tag_machinery(
-                Expr::new(TypedExprNode::Defer),
-                stmt.span,
-                "lower.http_serve",
-            );
-            ctx.register_sink_binding(resp_name.clone(), sink, stmt.span)?;
-            // The outer `requests` binding images the assignment statement (the
-            // real source construct); the inner `responses` Defer let, the
-            // Source node, and the Defer are manufactured plumbing of the
-            // http_serve expansion.
-            let inner_let = ctx.tag_machinery(
-                Expr::let_bind(resp_name, responses_expr, body),
-                stmt.span,
-                "lower.http_serve",
-            );
-            let let_expr = Expr::let_bind(req_name, requests_expr, inner_let);
-            Ok(ctx.tag_image(let_expr, stmt.span))
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // mutable write (the mutation operators are `:=` and `+=`), so even a
@@ -1059,7 +930,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
 /// Returns the name when the target is an [`AssignTarget::Name`], or
 /// [`LoweringError::Unsupported`] for tuple-destructuring patterns (which
 /// lowering does not yet support — the `http_serve` 2-tuple case is handled
-/// separately via [`extract_http_serve_names`]).
+/// separately via [`sink_declaration`]).
 pub(super) fn extract_name_target(
     target: &Spanned<AssignTarget>,
     context: &str,
@@ -1820,18 +1691,11 @@ fn sink_rebindings(stmts: &[Spanned<ChlStmt>], ctx: &LoweringContext) -> Vec<Low
             _ => {}
         }
     }
-    fn declares_a_sink(target: &Spanned<AssignTarget>, value: &Spanned<ChlExpr>) -> bool {
-        #[cfg(any(test, feature = "test-helpers"))]
-        if test_sink_name(target, value).is_some() {
-            return true;
-        }
-        is_http_serve_tuple_assign(target, value)
-    }
     let mut errors = Vec::new();
     for stmt in stmts {
         let mut bound = Vec::new();
         match &stmt.node {
-            ChlStmt::Assign { target, value, .. } if declares_a_sink(target, value) => {}
+            ChlStmt::Assign { target, value, .. } if sink_declaration(target, value).is_some() => {}
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
@@ -2268,7 +2132,7 @@ pub(super) fn lower_if(
             "if without else is not supported as a value-returning expression",
         ));
     };
-    // http_serve is not permitted inside if/else arms.
+    // A sink declaration is not permitted inside if/else arms.
     let mut out_branches = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
         let guard = lower_expr(&branch.cond, ctx)?;
