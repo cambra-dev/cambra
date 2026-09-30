@@ -7,7 +7,7 @@ use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, Name, Type};
+use crate::ccl::{Expr, Name, Type, TypedBinding};
 
 /// The operations a typing rule needs from its surrounding pass.
 ///
@@ -118,6 +118,10 @@ pub(super) trait Typing {
     /// Run `f` with `name: ty` bound *monomorphically* in the lexical scope
     /// (lambda params, pattern/loop binders), restoring the scope afterward on
     /// both the success and error paths.
+    ///
+    /// Emit resolves a name against this scope; Check does not — its entry is
+    /// what a refinement query under the binder assumes about the name
+    /// (`src/ccl/design/type-inference.md`, "The scope a query runs in").
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized;
@@ -140,7 +144,7 @@ pub(super) trait Typing {
     /// Emit generalizes `bound_ty` at the current level into a polymorphic
     /// scheme (so each use site instantiates fresh quantified variables);
     /// otherwise it binds monomorphically (shared). Check ignores `generalize`
-    /// and simply runs `f`.
+    /// and binds the name at `bound_ty` like any other binder.
     fn scoped_let<R>(
         &mut self,
         name: &Name,
@@ -165,7 +169,12 @@ pub(super) trait Typing {
     /// rebuilt terms would escape coalesce unresolved. Check re-runs the
     /// discharge so its reconstruction matches the recorded (closed) node type
     /// under structural predicate equality.
-    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
+    ///
+    /// An [opaque](crate::ccl::BindingTransparency::Opaque) binder has no
+    /// discharge to record: it carries no definiens, so its type is lifted with
+    /// the binder's name still in it, and the binder's own type is what a later
+    /// query learns about that name.
+    fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type;
 
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this records the **one-way** obligation `inferred <: ann` —

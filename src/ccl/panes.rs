@@ -195,7 +195,7 @@ pub(crate) const PANES: [PaneSpec; 7] = [
     PaneSpec {
         name: "post-inference",
         content: PaneKind::Ir,
-        phases: &[Phase::Infer],
+        phases: &[Phase::Anf, Phase::MutRead, Phase::Infer],
         gated: true,
     },
     PaneSpec {
@@ -986,9 +986,12 @@ mod tests {
     ///
     /// A phase that rewrites *nothing* on a given program records nothing, which
     /// is the preserve case and correct (most of the corpus preserves end to
-    /// end), so the fixture is one that drives three of the five: the
+    /// end), so the fixture is one that drives the mutability phases: the
     /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
     /// a `LetRec`, and `channelize` rewrites.
+    ///
+    /// The list is sorted by phase name rather than pipeline order, so it reads
+    /// as a set and a new phase lands where its spelling puts it.
     #[test]
     fn a_rewriting_phase_tags_its_rows_with_itself() {
         let (_, code) = corpus()
@@ -1001,12 +1004,15 @@ mod tests {
         assert_eq!(
             recorded,
             vec![
+                Phase::Anf,
                 Phase::AsOfRead,
                 Phase::Channelize,
                 Phase::Convert,
                 Phase::Infer,
+                Phase::Inline,
                 Phase::LambdaElim,
                 Phase::Letrec,
+                Phase::MutRead,
                 Phase::Planning,
                 Phase::Transact
             ],

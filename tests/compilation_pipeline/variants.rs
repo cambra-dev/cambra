@@ -1261,6 +1261,22 @@ xs = [`a(`b(4))]
 sum([unwrap(m) for m in xs])",
     Value::Int(4)
 )]
+// Two levels of nesting: A-normalization names each payload, so the element holds
+// a chain of two bindings and the flattening has to reach both.
+#[case(
+    r"
+def unwrap(m):
+    match m:
+        case `a(i):
+            match i:
+                case `b(j):
+                    match j:
+                        case `c(v):
+                            v
+xs = [`a(`b(`c(4)))]
+sum([unwrap(m) for m in xs])",
+    Value::Int(4)
+)]
 fn test_list_literal_of_variants(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

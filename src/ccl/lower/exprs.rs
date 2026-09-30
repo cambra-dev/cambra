@@ -7,13 +7,13 @@ use std::rc::Rc;
 use super::*;
 use crate::{
     ccl::{
-        AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit,
-        LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Builtin,
+        CompareKind, Expr, Lit, LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
     },
     chl_parser::ast::{
-        AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, Expr as ChlExpr, Lit as ChlLit,
-        Span, Spanned, UnaryOp,
+        AssignTarget, AugOp, BinOp as ChlBinOp, BindingTransparency as ChlTransparency, BoolOp,
+        CmpOp, Expr as ChlExpr, Lit as ChlLit, Span, Spanned, UnaryOp,
     },
 };
 
@@ -656,6 +656,15 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
         ChlBinOp::CollectionUnion => unreachable!(
             "ChlBinOp::CollectionUnion is handled directly in lower_binop and never reaches this function"
         ),
+    }
+}
+
+/// Map a CHL [`ChlTransparency`] to its CCL [`BindingTransparency`] counterpart
+/// — `x = e` binds transparently, `x ^= e` opaquely.
+pub(super) fn binding_transparency(transparency: ChlTransparency) -> BindingTransparency {
+    match transparency {
+        ChlTransparency::Transparent => BindingTransparency::Transparent,
+        ChlTransparency::Opaque => BindingTransparency::Opaque,
     }
 }
 

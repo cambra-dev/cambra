@@ -76,8 +76,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
-    HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
+    BaseType, BindingTransparency, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS,
+    F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
+    WriterSite,
     ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
     mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
     provenance,
@@ -660,6 +661,10 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // Push the binding into the branches first, the same normalization the
     // letrec phase applies through `flatten_spine`.
     let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
+    // A statement whose effect is a `Let` hides that binding from the rest of
+    // the spine, which is where this phase places the store carriers that read
+    // it. Lift it onto the spine first.
+    let expr = crate::ccl::mut_elim::lift_bindings_out_of_effect_position(expr);
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
@@ -1359,11 +1364,26 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
 /// carry-forward), so it never reaches here.
 fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr>) {
     let mut lifted = Vec::new();
-    let txn_block = partition_spine(block, txn_mut_vars, &mut lifted);
+    let mut env = HashMap::new();
+    let txn_block = partition_spine(block, txn_mut_vars, &mut lifted, &mut env);
     (txn_block, lifted)
 }
 
-fn partition_spine(expr: Expr, txn_mut_vars: &HashSet<Name>, lifted: &mut Vec<Expr>) -> Expr {
+/// `env` carries the block spine's own `let` bindings, so a lifted write leaves
+/// with the values it reads *inlined* rather than naming binders it is being
+/// moved away from. The lift makes the write a sibling of the block on the
+/// enclosing loop, where a block-spine binder is out of scope — and
+/// A-normalization puts every compound written value behind one of those
+/// binders (`cnt := cnt + 1` arrives as `let __anf = cnt + 1 in cnt := __anf`).
+/// Inlining is the model the mutability phases already use for a written value
+/// (`crate::ccl::mut_elim`'s read-your-writes environment), for the same
+/// reason: a value lifted out of a scope has to be self-contained.
+fn partition_spine(
+    expr: Expr,
+    txn_mut_vars: &HashSet<Name>,
+    lifted: &mut Vec<Expr>,
+    env: &mut HashMap<Name, Expr>,
+) -> Expr {
     let Expr {
         node,
         ty,
@@ -1373,11 +1393,11 @@ fn partition_spine(expr: Expr, txn_mut_vars: &HashSet<Name>, lifted: &mut Vec<Ex
     match node {
         TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_mut_vars.contains(name)) =>
         {
-            lifted.push(*effect);
-            partition_spine(*body, txn_mut_vars, lifted)
+            lifted.push(Subst::discharge_env_in_place(*effect, env));
+            partition_spine(*body, txn_mut_vars, lifted, env)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
-            let body = partition_spine(*body, txn_mut_vars, lifted);
+            let body = partition_spine(*body, txn_mut_vars, lifted, env);
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
@@ -1393,7 +1413,14 @@ fn partition_spine(expr: Expr, txn_mut_vars: &HashSet<Name>, lifted: &mut Vec<Ex
             bound_expr,
             body,
         } => {
-            let body = partition_spine(*body, txn_mut_vars, lifted);
+            // The binding stays on the block spine — the transactional remainder
+            // may read it too — and also enters `env`, so a write lifted past it
+            // carries its value instead of its name.
+            env.insert(
+                binding.name.clone(),
+                Subst::discharge_env_in_place(bound_expr.as_ref().clone(), env),
+            );
+            let body = partition_spine(*body, txn_mut_vars, lifted, env);
             Expr {
                 node: TypedExprNode::Let {
                     binding,
@@ -2563,6 +2590,7 @@ fn binding(name: Name, ty: Type) -> TypedBinding {
         name,
         ty,
         user_annotation: None,
+        transparency: BindingTransparency::Transparent,
     }
 }
 

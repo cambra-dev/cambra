@@ -64,6 +64,8 @@ const PANE_WINDOWS: [(&str, &str); 6] = [
 /// on purpose: this is what the wire carries, not what the enum spells.
 const ALLOWED_VIA: &[&str] = &[
     "Lower",
+    "Anf",
+    "MutRead",
     "Infer",
     "Inline",
     "Transact",

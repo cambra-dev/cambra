@@ -112,6 +112,13 @@ pub enum SyntheticKind {
     /// The fresh binder the solver mints for a dependent application's
     /// expected Pi type (`(__arg: d) ⇒ result`), discharged to the argument.
     SolverArg,
+    /// An administrative binding minted by A-normalization
+    /// ([`crate::ccl::anf`]) to name a compound sub-expression that ANF
+    /// requires be atomic in its position.
+    AnfTemp,
+    /// A binding minted by [`crate::ccl::mut_read`] naming the value a block's
+    /// mutable-variable reads denote over one segment.
+    MutRead,
 }
 
 impl SyntheticKind {
@@ -124,6 +131,8 @@ impl SyntheticKind {
             SyntheticKind::Mono(_) => "__mono",
             SyntheticKind::FloatedDefer => "__floated",
             SyntheticKind::SolverArg => "__arg",
+            SyntheticKind::AnfTemp => "__anf",
+            SyntheticKind::MutRead => "__read",
         }
     }
 }
@@ -293,6 +302,32 @@ impl Name {
     /// (`(__arg: d) ⇒ result`, discharged to the argument).
     pub fn solver_arg() -> Self {
         Self::synthetic(SyntheticKind::SolverArg)
+    }
+
+    /// A-normalization's fresh binder for a compound sub-expression hoisted
+    /// out of a position ANF requires be atomic.
+    pub fn anf_temp() -> Self {
+        Self::synthetic(SyntheticKind::AnfTemp)
+    }
+
+    /// The binder naming the value a block's mutable-variable reads denote over
+    /// one segment ([`crate::ccl::mut_read`]).
+    pub fn mut_read() -> Self {
+        Self::synthetic(SyntheticKind::MutRead)
+    }
+
+    /// Is this the binder [`crate::ccl::mut_read`] mints for a read segment?
+    ///
+    /// Asked by [`crate::ccl::mut_read::unbind`], which substitutes one back
+    /// past the write that ended its segment.
+    pub fn is_mut_read(&self) -> bool {
+        matches!(
+            self,
+            Name::Synthetic {
+                kind: SyntheticKind::MutRead,
+                ..
+            }
+        )
     }
 
     /// The display spelling. Total over every variant; never use it for an

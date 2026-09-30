@@ -778,8 +778,8 @@ impl Subst {
 
             Lambda { param, body } => {
                 // Domain refinements ride the param's *type* (a
-                // `Type::Refinement`); those predicates are substituted by
-                // `apply_type`, not here.
+                // `Type::Refinement`); `apply_binder_types` rewrites that slot
+                // below, under the unrestricted substitution.
                 let (param_name, inner) = self.under_binder(&param.name, body);
                 let body = Box::new(inner.apply_expr(body));
                 let mut param = param.clone();
@@ -854,12 +854,15 @@ impl Subst {
                 }
             }
 
-            // No binders introduced: recurse structurally into child terms.
+            // No binder *crossing* to guard: recurse structurally into child
+            // terms. `MutDecl` lands here and does declare a binder, so the
+            // binder-type slots are rewritten on the way out like everywhere else.
             _ => {
                 let mut child = e.clone();
                 child.map_children(|c| self.apply_expr(&c));
                 child.ty = self.apply_type(&e.ty);
                 child.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
+                self.apply_binder_types(&mut child);
                 return child;
             }
         };
@@ -875,7 +878,31 @@ impl Subst {
         // transport, so it wants its own change.
         let mut out = TypedExpr::new(node).with_ty(self.apply_type(&e.ty));
         out.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
+        self.apply_binder_types(&mut out);
         out
+    }
+
+    /// Rewrite every declared binder type `e` carries, under the **unrestricted**
+    /// substitution.
+    ///
+    /// A binder does not bind in its own type, so that slot reads the enclosing
+    /// scope and the binder crossings guarding the children do not apply to it.
+    /// It is a type slot of its own — a refinement there holds its own predicate
+    /// `Rc`, distinct from the one on the matching position of `e.ty` — so
+    /// rewriting only `e.ty` leaves a discharged binder free in a predicate that
+    /// is still reachable. The in-place mode reaches the same slots through
+    /// [`Expr::walk_type_slots_mut`]; this is transport mode's half of that
+    /// contract, and the two must stay in step.
+    fn apply_binder_types(&self, e: &mut TypedExpr) {
+        if self.is_id() {
+            return;
+        }
+        e.walk_binders_mut(|b| {
+            b.ty = self.apply_type(&b.ty);
+            if let Some(annotation) = &b.user_annotation {
+                b.user_annotation = Some(self.apply_type(annotation));
+            }
+        });
     }
 
     /// Rewrite a `Feed`/`Define` handle use (see the `Feed` arm above for
@@ -2708,6 +2735,36 @@ mod rewrite_tests {
         assert!(
             Rc::ptr_eq(&rd.predicate, &rc.predicate),
             "both occurrences that shared one term are re-pointed at one rebuild"
+        );
+    }
+
+    // Transport mode reaches a binder's *declared* type, not only the matching
+    // position of the node's own type. The two slots hold separate predicate
+    // `Rc`s, so rewriting one leaves the other naming a binder the discharge has
+    // removed from scope — which `force_refinement`'s scope-validity assertion
+    // catches at the next substitution that reads it.
+    #[test]
+    fn transport_discharges_a_binder_s_declared_type() {
+        let refined =
+            Type::refined_one(Type::Hole, Refinement::born(Rc::new(gt(var("k"), int(0)))));
+        let e = TypedExpr::lambda("p", refined, var("p"));
+
+        let out = Subst::discharge("k", int(5)).apply_expr(&e);
+
+        let TypedExprNode::Lambda { param, .. } = &out.node else {
+            panic!("lambda preserved");
+        };
+        let [r] = param.ty.refinements() else {
+            panic!("param refinement preserved");
+        };
+        assert_eq!(
+            *r.predicate,
+            gt(int(5), int(0)),
+            "the param's declared type carries the discharge"
+        );
+        assert!(
+            !is_free(&Name::from("k"), &out),
+            "no discharged binder survives anywhere in the rebuilt node"
         );
     }
 

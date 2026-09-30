@@ -66,9 +66,13 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    Expr, Lit, Name, Refinement, Type, TypedExprNode,
-    ccl_utils::{PredMemo, is_free, walk_refined_predicates_mut},
+    BindingTransparency, Expr, Lit, Name, Refinement, Type, TypedExprNode,
+    ccl_utils::{
+        PredMemo, count_free, free_names_in_value, is_free, spelled_in_a_type,
+        walk_refined_predicates_mut,
+    },
     lambda_elim::substitute,
+    names::SyntheticKind,
     provenance,
 };
 
@@ -92,7 +96,8 @@ use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
-    inline_impl(expr)
+    let expr = inline_impl(expr);
+    inline_list_element_reads(expr, &PredMemo::new()).0
 }
 
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.
@@ -179,9 +184,303 @@ fn is_mut_written(name: &Name, expr: &Expr) -> bool {
     }
 }
 
+/// Whether `definiens` reads a mutable variable that `body` writes.
+///
+/// A read moved past a write reports the variable's value at the wrong position:
+/// in `x := 1; a = x; x += 4; [a, 2]` the element is `1`, the value when `a` was
+/// bound, not `5`. This asks [`is_mut_written`]'s question over every name the
+/// moved expression reads, where the alias rewrite asks it about the one name it
+/// renames. Conservative in the same way: a write anywhere in `body` blocks the
+/// move, even where every element position precedes it.
+fn reads_a_variable_written_in(definiens: &Expr, body: &Expr) -> bool {
+    free_names_in_value(definiens)
+        .iter()
+        .any(|name| is_mut_written(name, body))
+}
+
+/// Move every `Let`-bound definiens read in a list element into that element,
+/// everywhere in `expr` — its term tree and the refinement predicates riding its
+/// type slots alike. Reports whether anything moved.
+///
+/// A list literal's elements are a value position. Op-conversion compiles the
+/// whole literal to one table read at graph-build time, so an element is
+/// sequenced against nothing and a binding read there can be moved into it. The
+/// moved element need not be a constant: op-conversion accepts only constant
+/// formers in the position, and a non-constant one reaches that rejection spelled
+/// as the computation it is rather than as the binder that held it.
+/// [`flatten_anf_bindings`] first substitutes away the bindings A-normalization
+/// left inside what moves, so a nested constant arrives as the value former it
+/// denotes rather than as a `Let` chain building one.
+///
+/// A predicate carries its own copy of the `Let` chain it describes, so the
+/// rewrite reaches both copies or neither. A comprehension's source rides the
+/// cast-target refinement as well as the term, and rewriting one alone leaves the
+/// node's type describing a collection its value no longer is, which the
+/// `post-inline` check reports as a domain mismatch. Descending into a predicate
+/// with this same function is what keeps the two in step: the predicate's copy
+/// binds the name rather than reading it, so [`is_free`] cannot see it and the
+/// one-name mirror in [`inline_in_type_predicates`] skips it.
+///
+/// This runs as a second walk rather than an arm of [`inline_impl`] for that
+/// reason — the predicate copy needs the whole rewrite, not a substitution of one
+/// name.
+fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
+    let mut moved = false;
+
+    expr.walk_type_slots_mut(|ty| {
+        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
+            let (rewritten, pred_moved) = inline_list_element_reads(old, memo);
+            *pred = rewritten;
+            moved |= pred_moved;
+            // An unchanged predicate is reported as such, so it keeps its origin
+            // `Rc` and stays pointer-shared with its occurrences on other nodes
+            // rather than being reallocated at each one this walk passes.
+            pred_moved
+        });
+    });
+
+    expr.map_children(|child| {
+        let (child, child_moved) = inline_list_element_reads(child, memo);
+        moved |= child_moved;
+        child
+    });
+
+    let Expr {
+        node,
+        ty,
+        user_annotation,
+        node_id,
+    } = expr;
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = node
+    else {
+        return (
+            Expr {
+                node,
+                ty,
+                user_annotation,
+                node_id,
+            },
+            moved,
+        );
+    };
+
+    // A binder some type spells is left alone, for [`inline_impl`]'s reason: a
+    // type lifted past an opaque binder keeps the binder rather than its
+    // definiens, so moving the definiens out would leave those types naming a
+    // value no longer bound there.
+    let spelled = binding.transparency == BindingTransparency::Opaque
+        && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
+            || spelled_in_a_type(&body, &binding.name));
+
+    let (body, here) = if spelled || reads_a_variable_written_in(&bound_expr, &body) {
+        (*body, false)
+    } else {
+        let _g = provenance::enter(
+            node_id,
+            "inline.list_element",
+            provenance::Nature::Machinery,
+        );
+        move_into_list_elements(*body, &binding.name, &bound_expr)
+    };
+
+    // Drop the `Let` only when this rewrite moved the definiens and left no reader
+    // behind: it now stands at each element position, so the binding would compile
+    // a copy nothing reads. `here` is what makes this a relocation rather than
+    // dead-binding elimination — a binding no one reads and nothing moved still
+    // holds the only copy of its definiens, and dropping it would discard that
+    // expression along with whatever it does.
+    if here && !is_free(&binding.name, &body) {
+        return (body, true);
+    }
+    (
+        Expr {
+            node: TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body: Box::new(body),
+            },
+            ty,
+            user_annotation,
+            node_id,
+        },
+        moved || here,
+    )
+}
+
+/// Replace every list element of `body` that reads `name` with `definiens`,
+/// reporting whether any did.
+///
+/// An occurrence in any other position is left alone, so a binding read both in a
+/// list and elsewhere keeps its `Let` and gains a copy at the element. A binding
+/// read at several element positions is copied to each, duplicating the definiens
+/// — the trade [`inline_and_beta_reduce`] makes for a UDF body.
+///
+/// Each replacement takes the occurrence's own `NodeId` and freshens its interior
+/// ([`Expr::clone_at`]), the move the substitution engine's compound arm makes for
+/// the same reason: the copy denotes what the occurrence denoted, so N reads give
+/// N distinct roots rather than N aliases of one (`src/ccl/design/provenance.md`,
+/// "Duplication"). Each copy is flattened where it lands
+/// ([`flatten_anf_bindings`]).
+///
+/// Type slots are not walked here. [`inline_list_element_reads`] reaches a
+/// predicate's own list literals by recursing into the predicate, which handles
+/// the `Let` that copy carries rather than the read this replaces.
+///
+/// Shadowing needs no tracking: uniquify gives every binder its own identity, so
+/// `name` is not re-bound under the `Let` that binds it. [`inline_and_beta_reduce`]
+/// rests on the same property.
+fn move_into_list_elements(mut body: Expr, name: &Name, definiens: &Expr) -> (Expr, bool) {
+    let mut moved = false;
+    if let TypedExprNode::List(elts) = &mut body.node {
+        for elt in elts.iter_mut() {
+            if matches!(&elt.node, TypedExprNode::Var(read) if read == name) {
+                *elt = flatten_anf_bindings(definiens.clone_at(elt.node_id()));
+                moved = true;
+            }
+        }
+    }
+    body.map_children(|child| {
+        let (child, child_moved) = move_into_list_elements(child, name, definiens);
+        moved |= child_moved;
+        child
+    });
+    (body, moved)
+}
+
+/// Substitute an A-normalization temp into its one use, so an element holds the
+/// value former it denotes rather than a `Let` chain building one. Bottom-up, so a
+/// chain collapses from the inside out.
+///
+/// A-normalization names every compound sub-value, a variant payload included, so
+/// ``[`a(`b(4))]`` reaches this pass as ``let __anf = `b(4) in `a(__anf)`` once
+/// [`move_into_list_elements`] has placed the binding at the element.
+/// Op-conversion evaluates an element at graph-build time and reads only the
+/// constant formers (`operator_conversion`'s `expr_to_value`), which a binding
+/// between the element and its constructor is not.
+///
+/// The position is one bound on the rewrite — the caller applies it to what it
+/// moves, so a binding anywhere else keeps its `Let` — and three conditions are
+/// the rest:
+///
+/// - **A [`SyntheticKind::AnfTemp`] binder.** A binding a consumer recognizes — a
+///   source, a recurrence carrier — is recognized by its binding, and substituting
+///   one away strands that consumer.
+/// - **One occurrence**, counting a refinement predicate's as well
+///   ([`count_free`]), which makes the rewrite a move rather than a copy.
+/// - **No read of a variable the body writes** ([`reads_a_variable_written_in`]),
+///   for its reason: the definiens moves past whatever the body writes.
+///
+/// An element that is a computation rather than a constant is left standing as
+/// the computation it is, which is what op-conversion reports.
+fn flatten_anf_bindings(mut elt: Expr) -> Expr {
+    elt.map_children(flatten_anf_bindings);
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &elt.node
+    else {
+        return elt;
+    };
+    if !matches!(
+        binding.name,
+        Name::Synthetic {
+            kind: SyntheticKind::AnfTemp,
+            ..
+        }
+    ) || count_free(&binding.name, body) != 1
+        || reads_a_variable_written_in(bound_expr, body)
+    {
+        return elt;
+    }
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = elt.node
+    else {
+        unreachable!("matched above");
+    };
+    substitute(*body, &binding.name, &bound_expr)
+}
+
 // ---------------------------------------------------------------------------
 // Tree walk
 // ---------------------------------------------------------------------------
+
+/// Replace the single `Var(name)` occurrence in `body`'s **term** with
+/// `definiens`, verbatim — ids and all.
+///
+/// The caller has established that `name` occurs exactly once. The second
+/// result is the definiens, handed back when that occurrence is not in the
+/// term — which leaves it inside a refinement predicate, an `Rc` this walk does
+/// not rebuild.
+fn move_single_occurrence(mut body: Expr, name: &Name, definiens: Expr) -> (Expr, Option<Expr>) {
+    if matches!(&body.node, TypedExprNode::Var(n) if n == name) {
+        return (definiens, None);
+    }
+    let mut carried = Some(definiens);
+    body.map_children(|child| match carried.take() {
+        Some(d) => {
+            let (child, unplaced) = move_single_occurrence(child, name, d);
+            carried = unplaced;
+            child
+        }
+        None => child,
+    });
+    (body, carried)
+}
+
+/// Does `name`'s occurrence sit directly as an element of a value former — a
+/// `Tuple`, `Record` or `List`?
+///
+/// The one position the rewrite above leaves alone. A former's elements are
+/// read *by position* downstream: the diff pairs a tuple's elements against the
+/// other version's to localize an edit to the elements that moved
+/// (`crate::ccl::diff`), and a named element is what makes that pairing a
+/// `Var`-to-`Var` correspondence rather than a whole-recurrence rewrite.
+fn stands_in_a_value_former(name: &Name, body: &Expr) -> bool {
+    let holds = |elts: &[Expr]| {
+        elts.iter()
+            .any(|e| matches!(&e.node, TypedExprNode::Var(n) if n == name))
+    };
+    let here = match &body.node {
+        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) => holds(elts),
+        TypedExprNode::Record(fields) => fields
+            .iter()
+            .any(|(_, e)| matches!(&e.node, TypedExprNode::Var(n) if n == name)),
+        _ => false,
+    };
+    here || body.any_child(|c| stands_in_a_value_former(name, c))
+}
+
+/// Does `e` build a product — a tuple or a record — once its own
+/// A-normalization bindings are flattened away?
+///
+/// ANF names each element as well as the former, so a call's tupled argument
+/// list arrives as a chain: `let __anf = ["p", "q"] in (__anf, "x")`. The
+/// chain is what [`flatten_anf_bindings`] collapses; this is the test for
+/// whether collapsing it yields a former worth substituting.
+fn anf_chain_builds_a_product(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Tuple(_) | TypedExprNode::Record(_) | TypedExprNode::List(_) => true,
+        TypedExprNode::Let { binding, body, .. } => {
+            matches!(
+                binding.name,
+                Name::Synthetic {
+                    kind: SyntheticKind::AnfTemp,
+                    ..
+                }
+            ) && anf_chain_builds_a_product(body)
+        }
+        _ => false,
+    }
+}
 
 /// Recursively inline `Let` bindings that pass [`should_inline`], beta-reducing
 /// each call site as the substitution produces it.
@@ -230,7 +529,19 @@ fn inline_impl(expr: Expr) -> Expr {
             // (the value when `y` is bound), not `5` (the post-write value). A
             // mutable write is a `MutWrite`, not a `let`, so `is_let_bound` alone
             // misses it (writes stopped being `let` shadows in mutability v2).
-            if let TypedExprNode::Var(repl_name) = &bound_expr.node
+            //
+            // A binder some type spells is never dropped, by either rewrite
+            // below: a type lifted past an opaque binder keeps the binder rather
+            // than its definiens (`crate::ccl::BindingTransparency`), so
+            // collapsing the binding would leave those types naming a binder the
+            // tree no longer holds. Only an opaque binder can be in that
+            // position — a transparent one was discharged at inference.
+            let binder_spelled_in_a_type = binding.transparency == BindingTransparency::Opaque
+                && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
+                    || spelled_in_a_type(&body, &binding.name));
+
+            if !binder_spelled_in_a_type
+                && let TypedExprNode::Var(repl_name) = &bound_expr.node
                 && !is_let_bound(repl_name, &body)
                 && !is_mut_written(repl_name, &body)
             {
@@ -241,7 +552,93 @@ fn inline_impl(expr: Expr) -> Expr {
                 return substitute(body, &binding.name, &bound_expr);
             }
 
-            if should_inline(&bound_expr.ty) {
+            // **An A-normalization temp naming a product former.** ANF names
+            // every compound sub-expression so inference meets only atomic
+            // operands, and a call's tupled argument list is one of them:
+            // `f(xs, 10)` reaches this pass as `let __anf = (xs, 10) in …
+            // __anf.0 … __anf.1 …`. Op-conversion reads a projection's operand
+            // structurally — it compiles `(xs, 10) ▷ .0` to `xs` and has no arm
+            // for a `Var` standing where the tuple does — so the binding has to
+            // go before it gets there. Substituting restores exactly the shape
+            // beta-reduction produced before the temp stood between the
+            // projection and the former it projects.
+            //
+            // Bounded to an [`SyntheticKind::AnfTemp`] binder and a product
+            // former: a binding a consumer recognizes is recognized *by* its
+            // binding, and a collection former's binding is what planning hangs
+            // an iteration marker on.
+            // **An A-normalization temp read once.** The temp exists to give
+            // inference an atomic operand, and a binding read once is no
+            // sharing. Two later passes read the binding as one:
+            // op-conversion compiles every binding as a memo its readers fan
+            // out of, so `1 + 2 + 3` keeps a `FanOut` for a value nothing
+            // shares; and `lambda_elim`'s let-in-lambda rule lifts the definiens
+            // as a `const` at the *name*, turning `box(𝑐) ▷ const` into
+            // `𝑐 ▷ const ≫ box` — a `box` composed as a morphism, which
+            // op-conversion has no arm for.
+            //
+            // The three conditions are [`flatten_anf_bindings`]': an `AnfTemp`
+            // binder, one occurrence (a refinement predicate's counted), and no
+            // read of a variable the body writes.
+            if !binder_spelled_in_a_type
+                && matches!(
+                    binding.name,
+                    Name::Synthetic {
+                        kind: SyntheticKind::AnfTemp,
+                        ..
+                    }
+                )
+                && count_free(&binding.name, &body) == 1
+                && !reads_a_variable_written_in(&bound_expr, &body)
+                && !stands_in_a_value_former(&binding.name, &body)
+            {
+                let _g =
+                    provenance::enter(node_id, "inline.anf_temp", provenance::Nature::Machinery);
+                // Moved, not substituted: the definiens keeps its own ids, so
+                // the node a source span indexes is still there afterwards.
+                // `Subst`'s discharge re-roots the replacement at the
+                // occurrence and freshens its interior, which is right for a
+                // *copy* (one template, several use sites) and wrong for the
+                // single occurrence this rewrite is guarded on.
+                let (body, unplaced) = move_single_occurrence(body, &binding.name, bound_expr);
+                // A definiens handed back is one whose only occurrence sits
+                // inside a refinement predicate, an `Rc` no term walk rebuilds.
+                // Leave the binding standing.
+                return match unplaced {
+                    None => inline_impl(body),
+                    Some(bound_expr) => Expr {
+                        node_id,
+                        node: TypedExprNode::Let {
+                            binding,
+                            bound_expr: Box::new(bound_expr),
+                            body: Box::new(body),
+                        },
+                        ty,
+                        user_annotation,
+                    },
+                };
+            }
+
+            if !binder_spelled_in_a_type
+                && matches!(
+                    binding.name,
+                    Name::Synthetic {
+                        kind: SyntheticKind::AnfTemp,
+                        ..
+                    }
+                )
+                && anf_chain_builds_a_product(&bound_expr)
+            {
+                let _g =
+                    provenance::enter(node_id, "inline.anf_product", provenance::Nature::Machinery);
+                // Flattened first: the chain's own bindings would otherwise ride
+                // the substitution and land between the projection and the
+                // former again, one level in.
+                let former = flatten_anf_bindings(bound_expr);
+                return inline_impl(substitute(body, &binding.name, &former));
+            }
+
+            if !binder_spelled_in_a_type && should_inline(&bound_expr.ty) {
                 // Substitute the bound Lambda at every free occurrence of the
                 // binding name in the body, beta-reducing at each call site.
                 //

@@ -48,6 +48,24 @@ pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Typ
     acc.unwrap_or_else(|| lit(empty))
 }
 
+/// Whether `name` is spelled in the type of `expr` or of any node under it.
+///
+/// A type above `expr` can only have taken the name through `expr`'s own type,
+/// so a name absent here is absent from every type in the tree.
+///
+/// The question a pass asks before dropping an opaque binder: a type lifted past
+/// one keeps the binder rather than its definiens
+/// ([`BindingTransparency`](crate::ccl::BindingTransparency)), so a binding some
+/// type spells has a reader the term does not show.
+pub(crate) fn spelled_in_a_type(expr: &Expr, name: &Name) -> bool {
+    if crate::ccl::subst::type_free_vars(&expr.ty).contains(name) {
+        return true;
+    }
+    let mut found = false;
+    expr.walk_children(|c| found = found || spelled_in_a_type(c, name));
+    found
+}
+
 /// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write, and
 /// of the `true` arm a `match` without a `case _:` gains.
 pub(crate) fn unit_expr() -> Expr {
