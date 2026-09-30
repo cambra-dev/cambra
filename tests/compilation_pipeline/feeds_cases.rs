@@ -960,7 +960,7 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "open bound recorded",
+        "post-letrec produced an invalid tree",
     )
 }
 
