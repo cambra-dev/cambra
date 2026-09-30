@@ -5,7 +5,7 @@ use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::{
     interpreter::{
-        BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
+        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Scheduler, Value,
         forwarding_consumer, shared_consumer,
     },
     pretty_graph::VizOptions,
@@ -67,6 +67,29 @@ impl MapResult {
             function,
         }
     }
+}
+
+/// The values an application yields, given the function's values and, per output row, the
+/// entries of the function that row's argument matched.
+///
+/// Applying at a key yields that key's values. Where those values are a level, the key's
+/// group becomes a level of the output and several matched entries run together; where they
+/// are a record over the function's own rows, the key names one row of it and there is
+/// nothing to group.
+fn gather_applied(values: &Tile, groups: &[Vec<usize>]) -> Tile {
+    if values.is_data_function() {
+        return values.regroup_rows(groups);
+    }
+    let rows: Vec<usize> = groups.iter().flatten().copied().collect();
+    // `MapResultProducer::get_impl` withholds every argument outside the function's
+    // `domain_predicate` before applying it. An argument inside the predicate that the
+    // function does not hold lies outside its domain, which the argument's type excludes.
+    assert_eq!(
+        rows.len(),
+        groups.len(),
+        "a function whose values are a record answers each argument with exactly one row"
+    );
+    values.select_rows(&rows)
 }
 
 /// Substitute `result` for the outermost value `fn_domain` accepts.
@@ -177,9 +200,10 @@ impl TileProducer for MapResultProducer {
         input_tile.compact();
         let function_tile = self.function.get(self.function.tiling().universal_guard());
 
-        // A function whose values are themselves a collection needs special-case handling.
-        // The shape is read through a borrow so a one-level operand does not move the tile
-        // out of the fall-through path below.
+        // A function whose values are themselves a collection needs special-case handling:
+        // the application adds a level, so it rebuilds the tile around it rather than
+        // replacing its values. The shape is read through a borrow so a one-level operand
+        // does not move the tile out of the fall-through path below.
         let function_is_nested = matches!(&function_tile, Tile::DataFunction { codomain, .. } if codomain.is_data_function());
         if function_is_nested
             && let Tile::DataFunction {
@@ -189,75 +213,41 @@ impl TileProducer for MapResultProducer {
                 ..
             } = function_tile
         {
-            // A function operand is the two-level lookup a keyed collection presents; a
-            // deeper function reaches this operator as data, not here.
-            let Tile::DataFunction {
-                domain: f_inner_keys,
-                codomain: f_codomain,
-                ..
-            } = f_groups.as_ref()
-            else {
-                unreachable!("function_is_nested matched a collection of collections")
-            };
-            let f_codomain = scalar_tile_to_column_value((**f_codomain).clone());
-            // For `A ⤇ B ⤇ C`, the inner keys are B and the values C.
-            let Tiling::DataFunction {
-                codomain: f_groups_tiling,
-                ..
-            } = &f_tiling
-            else {
-                panic!("Expected a collection tiling for a collection tile")
-            };
-            let Tiling::DataFunction {
-                domain: f_inner_key_extent,
-                codomain: c_tiling,
-            } = f_groups_tiling.as_ref()
-            else {
-                panic!("Expected a nested collection tiling for a nested collection tile")
-            };
-            let (f_inner_key_extent, f_codomain_extent) =
-                (f_inner_key_extent.clone(), c_tiling.extent());
+            // The function's levels below the one this application consumes become further
+            // levels of the output, so the operand may be a keyed collection of any depth.
 
-            // A **scalar** input is a single-key lookup — `groupby(c, k)(v)`. It is
-            // the walk below at one key, yielding that key's group directly rather
-            // than a family of groups keyed by the input's domain.
+            // A **scalar** input is a single-key lookup — `groupby(c, k)(v)`. It is the walk
+            // below at one key, yielding that key's subtree directly rather than a family of
+            // them keyed by the input's domain.
             if let Tile::Scalar(key_col) = input_tile {
-                let mut out_domain = ColumnValue::from_values(Vec::new(), &f_inner_key_extent);
-                let mut out_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
-                // A key absent from a **settled** grouping is a genuinely empty
-                // group; one absent from an unsettled grouping is simply not
-                // answered yet. Only `domain_predicate` separates those, which is
-                // the same thing the stream case's incomplete-domain set records.
+                // A key absent from a **settled** grouping is a genuinely empty group; one
+                // absent from an unsettled grouping is simply not answered yet. Only
+                // `domain_predicate` separates those, which is the same thing the stream
+                // case's incomplete-domain set records.
                 let key = (key_col.len() == 1).then(|| key_col.index_at(0));
                 let settled = key.as_ref().is_some_and(|k| f_domain_predicate.contains(k));
-                if let Some(k) = key.filter(|_| settled) {
-                    for f_idx in 0..f_domain.len() {
-                        if f_domain.index_at(f_idx) != k {
-                            continue;
-                        }
-                        let (group_start, group_end) = f_groups.row_run(f_idx);
-                        for g in group_start..group_end {
-                            out_domain.append(ColumnValue::from_values(
-                                vec![f_inner_keys.index_at(g)],
-                                &f_inner_key_extent,
-                            ));
-                            out_codomain.append(ColumnValue::from_values(
-                                vec![f_codomain.index_at(g)],
-                                &f_codomain_extent,
-                            ));
-                        }
-                    }
-                }
-                return Tile::data_function(
-                    out_domain,
-                    Box::new(Tile::Scalar(out_codomain)),
-                    if settled {
+                let rows: Vec<usize> = match key.filter(|_| settled) {
+                    Some(k) => (0..f_domain.len())
+                        .filter(|&i| f_domain.index_at(i) == k)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                // One group: with no level above, the matching keys' groups run together
+                // into the collection this application yields.
+                let mut out = gather_applied(&f_groups, &[rows]);
+                // A collection result answers for its own keys; a record one is a row of
+                // the function's values and carries whatever its fields carry.
+                if let Tile::DataFunction {
+                    domain_predicate, ..
+                } = &mut out
+                {
+                    *domain_predicate = if settled {
                         Predicate::True
                     } else {
                         Predicate::False
-                    },
-                    BitSet::new(),
-                );
+                    };
+                }
+                return out;
             }
 
             let Tile::DataFunction {
@@ -270,14 +260,12 @@ impl TileProducer for MapResultProducer {
                 panic!("Expected a collection tile");
             };
 
-            // Extract codomain values. For a Scalar codomain, get the ColumnValue directly.
-            // For other types, need to handle appropriately.
             let codomain_values = match *input_codomain {
                 Tile::Scalar(ref cv) => cv.clone(),
                 _ => panic!("MapResult with Function only supports Scalar codomains"),
             };
 
-            // Sort domain to ensure consistent ordering
+            // Sort the domain so the output's outermost level is ordered.
             let mut sort_indices: Vec<usize> = (0..domain.len()).collect();
             sort_indices.sort_by(|&a, &b| {
                 domain
@@ -285,87 +273,48 @@ impl TileProducer for MapResultProducer {
                     .partial_cmp(&domain.index_at(b))
                     .expect("Cannot compare keys values")
             });
-
-            // Reorder domain and codomain by sort indices
             let sorted_domain =
                 domain.select_indices(sort_indices.iter().cloned(), sort_indices.len());
             let sorted_codomain_values =
                 codomain_values.select_indices(sort_indices.iter().cloned(), sort_indices.len());
 
-            // For each element in sorted domain, find the corresponding codomain value,
-            // then look up that codomain value in f_domain to get f_inner_keys and f_codomain values.
-            // TODO this is doing filtering implicitly here, but we should do it in a separate step.
-            // in order to do this we need to be able to construct a filter based on the presence of domain
-            // elements in another function, and we don't have that capability yet.
-            let domain_extent = i_tiling.domain_extent().unwrap();
-            let mut new_domain = ColumnValue::from_values(Vec::new(), &domain_extent);
-            let mut new_offsets =
-                ColumnValue::from_values(Vec::new(), &Extent::Base(BaseType::UInt));
-            let mut new_inner_keys = ColumnValue::from_values(Vec::new(), &f_inner_key_extent);
-            let mut new_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
-            // Collects `input`` keys values whose Function mapping is incomplete.
-            // More precisely, this is the set of domain values of `input` such that the corresponding
-            // codomain value does not satisfy the the domain_predicate of `function`.
-            let mut incomplete_domain = ColumnValue::from_values(Vec::new(), &domain_extent);
-
-            // Build an index from f_domain values to their first and last indices.
-            // This avoids O(n*m) lookup by allowing O(1) range retrieval per value.
-            let mut f_domain_index: HashMap<Value, (usize, usize)> = HashMap::new();
-            for f_idx in 0..f_domain.len() {
-                let val = f_domain.index_at(f_idx);
-                f_domain_index
-                    .entry(val.clone())
-                    .and_modify(|(_, last)| *last = f_idx)
-                    .or_insert((f_idx, f_idx));
+            // Index the function's outermost level so each row costs one lookup. A value may
+            // repeat, and every one of its entries contributes its subtree.
+            let mut f_index: HashMap<Value, Vec<usize>> = HashMap::new();
+            for i in 0..f_domain.len() {
+                f_index.entry(f_domain.index_at(i)).or_default().push(i);
             }
 
-            let mut current_offset = 0usize;
-            for i in 0..sorted_domain.len() {
-                let domain_value = sorted_domain.index_at(i);
-                let codomain_value = sorted_codomain_values.index_at(i);
+            let domain_extent = i_tiling.domain_extent().unwrap();
+            let mut kept_rows: Vec<usize> = Vec::new();
+            // One group per kept row: its value's entries in the function, whose groups run
+            // together under it.
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            // Input domain values whose mapping the function has not answered: its
+            // `domain_predicate` is false for the corresponding input codomain value.
+            let mut incomplete_domain = ColumnValue::from_values(Vec::new(), &domain_extent);
 
-                // A domain value maps to an incomplete value when the domain_predicate of the
-                // `function` is false for the corresponding input codomain value.
+            for i in 0..sorted_domain.len() {
+                let codomain_value = sorted_codomain_values.index_at(i);
                 if !f_domain_predicate.contains(&codomain_value) {
                     incomplete_domain.append(ColumnValue::from_values(
-                        vec![domain_value.clone()],
+                        vec![sorted_domain.index_at(i)],
                         &domain_extent,
                     ));
                 }
 
-                // Look up index range for this codomain_value in O(1) time.
-                if let Some(&(first, last)) = f_domain_index.get(&codomain_value) {
-                    // Record this domain element and its starting offset
-                    new_domain.append(ColumnValue::from_values(vec![domain_value], &domain_extent));
-                    new_offsets.append(ColumnValue::from_values(
-                        vec![Value::UInt(current_offset)],
-                        &Extent::Base(BaseType::UInt),
-                    ));
-
-                    // Collect f_inner_keys and f_codomain elements for this codomain value
-                    for f_idx in first..=last {
-                        let (group_start, group_end) = f_groups.row_run(f_idx);
-
-                        // Append the group's inner keys and values
-                        for group_idx in group_start..group_end {
-                            new_inner_keys.append(ColumnValue::from_values(
-                                vec![f_inner_keys.index_at(group_idx)],
-                                &f_inner_key_extent,
-                            ));
-                            new_codomain.append(ColumnValue::from_values(
-                                vec![f_codomain.index_at(group_idx)],
-                                &f_codomain_extent,
-                            ));
-                            current_offset += 1;
-                        }
-                    }
+                if let Some(entries) = f_index.get(&codomain_value) {
+                    kept_rows.push(i);
+                    groups.push(entries.clone());
                 }
             }
 
-            // The output domain_predicate is the input's predicate minus the input domain values
-            // for which the Function's mapping is not yet complete.
-            // We should exlude the obsolete portion of the domain from this logic since we don't
-            // have sufficient info to reason about that region.
+            let new_domain =
+                sorted_domain.select_indices(kept_rows.iter().copied(), kept_rows.len());
+
+            // The output predicate is the input's minus the values the function has not
+            // answered. The obsolete region is excluded: there is not enough here to reason
+            // about a region the consumer has already taken.
             let domain_obsolete = match self.input.obsolete_guard() {
                 g if g.is_universal() => Predicate::True,
                 TileGuard::Function(FunctionGuard::Domain(p)) => p.clone(),
@@ -374,16 +323,9 @@ impl TileProducer for MapResultProducer {
             let incomplete_predicate =
                 Predicate::from_column_value(&incomplete_domain).minus(&domain_obsolete);
             let output_domain_predicate = domain_predicate.minus(&incomplete_predicate);
-            // Build the new collection with a filtered keys and a transformed values.
             return Tile::data_function(
                 new_domain,
-                Box::new(Tile::grouped(
-                    new_offsets,
-                    new_inner_keys,
-                    Box::new(Tile::Scalar(new_codomain)),
-                    Predicate::True,
-                    BitSet::new(),
-                )),
+                Box::new(gather_applied(&f_groups, &groups)),
                 output_domain_predicate,
                 BitSet::new(),
             );
@@ -393,8 +335,19 @@ impl TileProducer for MapResultProducer {
         // `domain_predicate` separates a key the function will never answer from one it has
         // not answered yet. A key whose argument the function has not answered is withheld —
         // dropped from this tile, and subtracted from its predicate — so the consumer pulls
-        // again once the function has it. The nested branch above draws the same distinction
+        // again once the function has it. A whole value is withheld whole, as no rows, which
+        // is a value not known yet. The nested branch above draws the same distinction
         // through `incomplete_domain`.
+        if let Tile::DataFunction {
+            domain_predicate: f_domain_predicate,
+            ..
+        } = &function_tile
+            && let Tile::Scalar(argument) = &input_tile
+            && argument.len() == 1
+            && !f_domain_predicate.contains(&argument.index_at(0))
+        {
+            input_tile = Tile::Scalar(argument.select_indices(std::iter::empty(), 0));
+        }
         if let Tile::DataFunction {
             domain_predicate: f_domain_predicate,
             ..
@@ -441,6 +394,51 @@ impl TileProducer for MapResultProducer {
                 *domain_predicate =
                     domain_predicate.minus(&Predicate::from_column_value(&withheld));
             }
+        }
+
+        // A function whose values hold a level under a record cannot be applied through a
+        // column, which has nowhere to put one. The arguments name rows of the function's
+        // values, so the application gathers those rows and puts them where the argument
+        // column was — at whatever depth the input carries it, unlike the level-valued case
+        // above, which adds a level and so rebuilds the tile around it.
+        if let Tile::DataFunction {
+            domain: f_keys,
+            codomain: f_values,
+            ..
+        } = &function_tile
+            && f_values.holds_a_level()
+        {
+            let Tile::Scalar(arguments) = input_tile.deepest_values() else {
+                panic!(
+                    "MapResult over a function expects a scalar argument column, got {:?}",
+                    input_tile.deepest_values()
+                )
+            };
+            let rows: HashMap<Value, usize> =
+                (0..f_keys.len()).map(|i| (f_keys.index_at(i), i)).collect();
+            let groups: Vec<Vec<usize>> = (0..arguments.len())
+                .map(|i| {
+                    rows.get(&arguments.index_at(i))
+                        .copied()
+                        .into_iter()
+                        .collect()
+                })
+                .collect();
+            let gathered = gather_applied(f_values, &groups);
+            *input_tile.deepest_values_mut() = gathered;
+            return input_tile;
+        }
+
+        // An argument carrying a level cannot be boxed into a column, so a computable
+        // function that takes one is applied to the tile instead ([`FunctionDef::apply_tile`]
+        // — `insert`, whose collection operand reaches it opened).
+        if input_tile.deepest_values().holds_a_level()
+            && let Tile::Scalar(f) = &function_tile
+            && let Some(Value::ComputableFunction(f)) = f.as_single()
+        {
+            return map_tile_result(input_tile, move |values| {
+                f.apply_tile(values, f_domain_extent)
+            });
         }
 
         // Standard logic for non-Function outputs
@@ -834,6 +832,8 @@ impl TileProducer for MapResultWithSourceProducer {
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
+    use bit_set::BitSet;
+
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
 
     /// Build a `MapResultProducer` whose `function` operand records its releases.

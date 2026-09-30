@@ -457,8 +457,8 @@ impl TileProducer for MakeRecordProducer {
     }
 }
 
-/// Pick one field out of a **product value**: the eliminator for [`MakeRecord`], handing
-/// back that field's tile.
+/// Pick one field out of a **product value**, or one component out of a record codomain:
+/// the eliminator for [`MakeRecord`], handing back that field's tile.
 ///
 /// The `RecordField` application is the other projection, and it reads a record one row
 /// at a time, so every field must fit in a column. See

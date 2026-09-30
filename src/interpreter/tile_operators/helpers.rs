@@ -14,46 +14,69 @@ use crate::interpreter::{
     ColumnValue, Extent, FuncBinding, Value, bindings_are_list, transform_hashmap_values,
 };
 
-/// A column of map values, one per row, as the tile those collections form
-/// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
+/// A column of values as the tile [`Tiling::from_extent`] gives `extent`: each map value
+/// opened into its row's group, at every depth, and a record holding one as a record of its
+/// fields' tiles (`src/interpreter/design-operators.md`, "A collection inside a value stays a
+/// tile"). The inverse of [`materialize_collections`].
 ///
 /// A store holds one value per key per tick, so a collection-valued variable is read out of
 /// it as a column of maps.
 ///
 /// Keys are sorted within each row, which is the invariant
 /// [`Tile::DataFunction`](crate::interpreter::Tile::DataFunction) states of its `keys`.
-pub(crate) fn open_row_collections(
-    cells: &ColumnValue,
-    key_extent: &Extent,
-    value_extent: &Extent,
-) -> Tile {
-    let mut starts = Vec::with_capacity(cells.len());
-    let mut keys: Vec<Value> = Vec::new();
-    let mut values: Vec<Value> = Vec::new();
-    for row in 0..cells.len() {
-        starts.push(keys.len());
-        let cell = cells.index_at(row);
-        let Value::Function(mut bindings) = cell else {
-            panic!("a collection-valued cell holds a map, got {cell:?}")
-        };
-        bindings.sort_by(|a, b| {
-            a.input
-                .partial_cmp(&b.input)
-                .expect("a collection's keys are one extent's values, so they compare")
-        });
-        for binding in bindings {
-            keys.push(binding.input);
-            values.push(binding.output);
+pub(crate) fn open_collections(cells: &ColumnValue, extent: &Extent) -> Tile {
+    match extent {
+        Extent::Function { domain, codomain } => {
+            let mut starts = Vec::with_capacity(cells.len());
+            let mut keys: Vec<Value> = Vec::new();
+            let mut values: Vec<Value> = Vec::new();
+            for row in 0..cells.len() {
+                starts.push(keys.len());
+                let cell = cells.index_at(row);
+                let Value::Function(mut bindings) = cell else {
+                    panic!("a collection-valued cell holds a map, got {cell:?}")
+                };
+                bindings.sort_by(|a, b| {
+                    a.input
+                        .partial_cmp(&b.input)
+                        .expect("a collection's keys are one extent's values, so they compare")
+                });
+                for binding in bindings {
+                    keys.push(binding.input);
+                    values.push(binding.output);
+                }
+            }
+            Tile::grouped(
+                ColumnValue::UInts(starts),
+                ColumnValue::from_values(keys, domain),
+                Box::new(open_collections(
+                    &ColumnValue::from_values(values, codomain),
+                    codomain,
+                )),
+                // The row's whole map arrives at once, so nothing more is coming under these
+                // keys.
+                Predicate::True,
+                bit_set::BitSet::new(),
+            )
         }
+        Extent::Record(fields) if extent.holds_a_collection() => {
+            let ColumnValue::Records(columns) = cells else {
+                panic!("a record-valued column holds one column per field, got {cells:?}")
+            };
+            Tile::Record(
+                fields
+                    .iter()
+                    .map(|(name, field_extent)| {
+                        let column = columns.get(name).unwrap_or_else(|| {
+                            panic!("a record-valued column is missing field {name}")
+                        });
+                        (name.clone(), open_collections(column, field_extent))
+                    })
+                    .collect(),
+            )
+        }
+        _ => Tile::Scalar(cells.clone()),
     }
-    Tile::grouped(
-        ColumnValue::UInts(starts),
-        ColumnValue::from_values(keys, key_extent),
-        Box::new(Tile::Scalar(ColumnValue::from_values(values, value_extent))),
-        // The row's whole map arrives at once, so nothing more is coming under these keys.
-        Predicate::True,
-        bit_set::BitSet::new(),
-    )
 }
 
 /// Repeat a whole value's tile `len` times along the domain axis.
@@ -164,7 +187,7 @@ pub(crate) fn apply_function_tile(
 }
 /// A tile as a column, turning each collection it holds into one map value per row, for the
 /// places one value is required: a variant's payload rides its arm as one, and a store write
-/// is one value per key. The inverse of [`open_row_collections`].
+/// is one value per key. The inverse of [`open_collections`].
 ///
 /// Distinct from [`scalar_tile_to_column_value`], which refuses a collection held as a tile:
 /// boxing one is a defect wherever the tile was the point, so the two are separate functions
@@ -177,25 +200,21 @@ pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
                 .map(|(name, field)| (name, materialize_collections(field)))
                 .collect(),
         ),
-        Tile::DataFunction {
-            row_starts,
-            domain,
-            codomain,
-            deleted,
-            ..
-        } => {
+        tile @ Tile::DataFunction { .. } => {
+            let runs: Vec<(usize, usize)> = tile.row_runs().collect();
+            let Tile::DataFunction {
+                domain,
+                codomain,
+                deleted,
+                ..
+            } = tile
+            else {
+                unreachable!("matched as a collection")
+            };
             let inner = materialize_collections(*codomain);
-            let starts: Vec<usize> = (0..row_starts.len())
-                .map(|r| match row_starts.index_at(r) {
-                    Value::UInt(u) => u,
-                    other => panic!("a collection's row starts are UInts, got {other:?}"),
-                })
-                .collect();
             ColumnValue::Variants(
-                (0..starts.len())
-                    .map(|r| {
-                        let from = starts[r];
-                        let to = starts.get(r + 1).copied().unwrap_or(domain.len());
+                runs.into_iter()
+                    .map(|(from, to)| {
                         Value::Function(
                             (from..to)
                                 .filter(|i| !deleted.contains(*i))
@@ -342,5 +361,115 @@ pub(crate) fn extract_predicate(pred: &Predicate, path: &[TilePathStep]) -> Pred
             }
         }
         _ => todo!("We don't support correlated function preds yet"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+
+    fn map_value(bindings: Vec<(Value, Value)>) -> Value {
+        Value::Function(
+            bindings
+                .into_iter()
+                .map(|(input, output)| FuncBinding { input, output })
+                .collect(),
+        )
+    }
+
+    fn list_value(elements: &[i64]) -> Value {
+        map_value(
+            elements
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (Value::UInt(i), Value::Int(*e)))
+                .collect(),
+        )
+    }
+
+    fn function(domain: Extent, codomain: Extent) -> Extent {
+        Extent::Function {
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// Opens `cells` at `extent`, checks the tile against [`Tiling::from_extent`], and checks
+    /// that [`materialize_collections`] gives the cells back.
+    fn open_checked(cells: &ColumnValue, extent: &Extent) -> Tile {
+        let tile = open_collections(cells, extent);
+        assert!(
+            tile.check_from(&Tiling::from_extent(extent)),
+            "{tile:?} is not a tile of {extent}"
+        );
+        assert_eq!(&materialize_collections(tile.clone()), cells);
+        tile
+    }
+
+    /// A collection whose values are collections opens a level per nesting:
+    /// `Map(String, List(Int))` is two levels over the integers, not one level over a column
+    /// of lists.
+    #[test]
+    fn open_collections_opens_every_level() {
+        let list = function(Extent::Base(BaseType::UInt), Extent::Base(BaseType::Int));
+        let extent = function(Extent::Base(BaseType::String), list);
+        let cells = ColumnValue::Variants(vec![
+            map_value(vec![
+                (Value::String("a".into()), list_value(&[1, 2])),
+                (Value::String("b".into()), list_value(&[3])),
+            ]),
+            map_value(vec![(Value::String("a".into()), list_value(&[4]))]),
+        ]);
+        let Tile::DataFunction {
+            row_starts,
+            codomain,
+            ..
+        } = open_checked(&cells, &extent)
+        else {
+            panic!("a collection opens to a level")
+        };
+        assert_eq!(row_starts, ColumnValue::UInts(vec![0, 2]));
+        let Tile::DataFunction {
+            row_starts,
+            codomain,
+            ..
+        } = *codomain
+        else {
+            panic!("a collection's collection values open to a level")
+        };
+        assert_eq!(row_starts, ColumnValue::UInts(vec![0, 2, 3]));
+        assert_eq!(*codomain, Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4])));
+    }
+
+    /// A record holding a collection opens into a record of its fields' tiles, the collection
+    /// field a level and the scalar field a column.
+    #[test]
+    fn open_collections_opens_a_record_field() {
+        let extent = Extent::Record(HashMap::from([
+            ("a".to_string(), Extent::Base(BaseType::Int)),
+            (
+                "b".to_string(),
+                function(Extent::Base(BaseType::String), Extent::Base(BaseType::Int)),
+            ),
+        ]));
+        let cells = ColumnValue::Records(HashMap::from([
+            ("a".to_string(), ColumnValue::Ints(vec![5, 6])),
+            (
+                "b".to_string(),
+                ColumnValue::Variants(vec![
+                    map_value(vec![(Value::String("x".into()), Value::Int(1))]),
+                    map_value(vec![
+                        (Value::String("x".into()), Value::Int(2)),
+                        (Value::String("y".into()), Value::Int(3)),
+                    ]),
+                ]),
+            ),
+        ]));
+        let Tile::Record(fields) = open_checked(&cells, &extent) else {
+            panic!("a record holding a collection opens to a record of tiles")
+        };
+        assert_eq!(fields["a"], Tile::Scalar(ColumnValue::Ints(vec![5, 6])));
+        assert!(fields["b"].is_data_function());
     }
 }

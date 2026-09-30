@@ -118,6 +118,14 @@ A mutable variable mention that denotes its **value** is dereffed by the rule th
 (`infer::emit::emit_value_read`), not by the subtyping relation. `Mut(𝑉) <: 𝑉` is not a
 subtyping fact.
 
+Two positions read for a reason of their own rather than by asking for a value operand, and
+both are how a mutable **collection** is read as a collection. A **function position** reads,
+because a handle is not a function and applying a collection is what puts one there — a
+comprehension's generator source is its own function, applied at each position. And a node
+under a **user annotation that is not itself a handle** reads, because an annotation names the
+value at its position; `emit_let` already applies that rule before it matches its annotation
+forms, which is what leaves `_` needing no case of its own.
+
 The handle survives in exactly **three** positions, and the second-class discipline is what
 makes them enumerable: rule 1 forces a `Mut`-typed value to be a bare `Var` and rule 2
 keeps `Mut` out of every composite, so a parent always knows whether the operand it is

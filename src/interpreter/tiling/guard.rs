@@ -496,7 +496,7 @@ mod tests {
         assert!(!TileGuard::Or(vec![upto(1), upto(2)]).is_universal());
     }
 
-    // ── FunctionGuard::intersect ───────────────────────────────────────────────
+    // ── FunctionGuard::intersect ───────────────────────────────────
 
     #[test]
     fn function_guard_intersect_empty_dominates() {

@@ -71,8 +71,8 @@ Tiles representing collections (`DataFunction`) support logical deletes by stori
 deleted values. These are set by filtering operators like `Restrict` and compacted away by stateful
 operators like `Memo` and aggregation. A `DataFunction` carries **one set per domain level**, so a bit
 names a position in that level's own column and a removed group and a removed entry are different
-bits rather than one bit read two ways. Every producer today removes at the innermost level, a
-group going by way of its entries, which is where `Tile::retain_keys` reads.
+bits rather than one bit read two ways. A producer marks the level its removals name: the filters
+mark the innermost, a group going by way of its entries, which is where `Tile::retain_keys` reads.
 
 An empty group and a removed key are different tiles: the first is two equal `row_starts`, which
 `Tile::DataFunction`'s `row_starts` field states, and the second is a `deleted` bit at the key's own
@@ -201,8 +201,8 @@ is required, as in a variant's payload and a store write.
 and its static counterpart `Tiling::holds_a_level`, asks whether a tile holds a collection this
 way; an operator putting a value into a column asks it, a column having nowhere to put one.
 `Extent::holds_a_collection` asks whether a type contains a collection at all, which a column of
-maps answers yes too. `open_row_collections` turns a column of maps into this form, and
-`materialize_collections` turns this form back into maps where one value is required.
+maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
+and `materialize_collections` turns this form back into maps where one value is required.
 
 ---
 
@@ -301,7 +301,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
-| `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::collection` | Produces a fixed `Value`. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
+| `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::from_bindings`, any tiling from `Constant::collection` | Produces a fixed tile. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
 | `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
 | `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
@@ -540,6 +540,50 @@ The pipeline always bottoms out at one of three consumer shapes:
 In all three cases planning has ensured every iteration site has an explicit
 `iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
 what to emit based only on its own AST shape and the input flowing in.
+
+### Where a collection is materialized
+
+A collection reaches an operator in one of two shapes. A **streamed** one carries its keys in
+a domain column, one row per key, and is what every consumer that iterates a collection reads.
+A **materialized** one is a single map value, a binding list carrying its own keys, which is
+what a column holds: a column has one value per row, and a level is not a value.
+
+A producer that knows its values hold a collection hands out the level instead of the cell,
+rather than leaving an adapter to open it downstream. Three do:
+
+- A **list literal** builds the table it denotes, recursing on the element extent: a
+  collection element contributes its own keys as the level below, and a record element
+  holding a collection contributes one sub-tile per field (`list_levels`).
+- A **store read** opens each position's stored value the same way, at every depth, so a
+  collection-valued key reads as a collection per position rather than a map per position
+  (`read_tiling` / `read_tile`, through `open_collections`).
+- A **record field** of either keeps the tiling its own term produced, so a projection out
+  of it is a tile operation (`SelectField`) rather than a column one.
+
+Two consumers still take the materialized shape, and both are cases where nothing would read
+the keys: `CheckedLookup` searches the bindings of the row's own value, and `Sole` and
+`Drain` fold a collection whole, so the element they yield is the collection itself.
+
+A **transaction writer body's parameter record** opens the same way, so a collection-valued
+read reaches the body as a level it can iterate (`commit_operator.rs`'s `body_input_tiling`).
+Its *writes* go the other way: a store write is one value per key, so a keyed write's
+`insert` takes the level, at any depth, and the payload materializes where it becomes the
+decision's value (`FunctionDef::apply_tile`, `materialize_collections`). The written value
+reopens into the shape the collection's values take, so the rebuilt level is one gather over
+the collection's entries followed by the written ones.
+
+**A per-row collection is complete as soon as its row arrives.** A map value carries its own
+keys, so nothing waits on a domain closing to know the group is whole. A producer opening one
+says so by naming the rows it delivers in its `domain_predicate`. `MapAggregate` marks each
+accumulator terminal where the predicate names its key, rather than reading the predicate as
+one bool for the whole domain; without that, an aggregate over a live store holds every row
+open forever.
+
+**Its keys repeat across rows.** Two commits of one map carry the same keys, which a nested
+tile permits: `validate_tile` asks for uniqueness within a group and no more. A codomain
+guard names keys and not the group they sit in, so releasing one would release it in every
+other row. `Tile::to_guard` therefore names keys only for the groups its predicate leaves
+open, and releases the whole ones by their own outermost key.
 
 ---
 
