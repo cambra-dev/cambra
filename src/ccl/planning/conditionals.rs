@@ -38,9 +38,12 @@ use crate::ccl::{
 
 /// Rewrite every collection-valued value-`Case` in `expr` into its gated union, and erase
 /// every sum whose witness is **determined** — from the types as well as the terms.
+///
+/// Fails, as an unsupported program, on a jagged collection whose row reaches it through a
+/// binding ([`reject_rows_fixed_elsewhere`]).
 pub(super) fn realize_conditional_collections(
     expr: &mut Expr,
-) -> std::collections::HashSet<crate::ccl::ty::WitnessId> {
+) -> Result<std::collections::HashSet<crate::ccl::ty::WitnessId>, String> {
     let mut erased = std::collections::HashMap::new();
     let mut discharged = std::collections::HashSet::new();
     let mut kept = std::collections::HashSet::new();
@@ -82,9 +85,64 @@ pub(super) fn realize_conditional_collections(
     // its assertion would contradict the term it asserts over.
     // **What the term half declined to erase, the type half must decline too.** Realization
     // consumed one set and [`unbox`] left the other standing; both are sums that survive.
+    //
+    // One set for the whole expression, because survival is a fact about a witness rather
+    // than about a position: a binder is minted once, where its sum is built
+    // ([`crate::ccl::ty::Witness::mint`]), and every type slot naming it describes that one
+    // sum. Keeping it at one slot and collapsing it at another would give one value two
+    // types. A witness erased at its `box` and kept where the row lands is a row fixed
+    // before it reached the position that merges it — the case [`reject_rows_fixed_elsewhere`]
+    // names — reached through a binding the collapse below cannot see past, so it is refused
+    // the same way.
+    if erased.keys().any(|w| kept.contains(w)) {
+        return Err(ROW_FIXED_ELSEWHERE.to_string());
+    }
     let survives: std::collections::HashSet<_> = discharged.union(&kept).copied().collect();
     collapse_determined_sums(expr, &survives);
-    discharged
+    reject_rows_fixed_elsewhere(expr)?;
+    Ok(discharged)
+}
+
+/// Why a row reaching a jagged position from elsewhere is refused.
+const ROW_FIXED_ELSEWHERE: &str = "a collection whose rows have different domains takes each \
+    row as a `box(…)` written in place; a row bound or computed elsewhere is not supported yet";
+
+/// Reject a row whose sum collapsed away while the position holding it kept one.
+///
+/// The decision to keep a `box` is made where the `box` is written ([`unbox`]), so a row
+/// that reaches a jagged position through a binding — `x = box([1, 2])` and then
+/// `[x, box([3, 4, 5])]` — was erased at the binding, where its one candidate is the whole
+/// position. Its type is then a bare collection standing where the list's element type is a
+/// sum, and the two are incomparable. The list literal and each copair or disjoint-join arm
+/// are the positions that merge rows this way ([`child_demand`]).
+fn reject_rows_fixed_elsewhere(expr: &Expr) -> Result<(), String> {
+    let binds_a_witness = |ty: Option<Type>| ty.is_some_and(|t| t.witness_kind().is_some());
+    let rows: &[Expr] = match &expr.node {
+        TypedExprNode::List(elts) if binds_a_witness(expr.ty.codomain()) => elts,
+        TypedExprNode::Copair(arms) | TypedExprNode::DisjointJoin(arms)
+            if binds_a_witness(expr.ty.codomain()) =>
+        {
+            arms
+        }
+        _ => &[],
+    };
+    let row_ty = |row: &Expr| match &expr.node {
+        TypedExprNode::List(_) => Some(row.ty.clone()),
+        _ => row.ty.codomain(),
+    };
+    if let Some(row) = rows.iter().find(|row| !binds_a_witness(row_ty(row))) {
+        return Err(format!(
+            "{ROW_FIXED_ELSEWHERE}: `{}`",
+            crate::ccl::symbolic::symbolic(row)
+        ));
+    }
+    let mut result = Ok(());
+    expr.walk_children(|child| {
+        if result.is_ok() {
+            result = reject_rows_fixed_elsewhere(child);
+        }
+    });
+    result
 }
 
 /// Give every consumer of a conditional collection binding its own copy of it, dropping the
@@ -157,8 +215,8 @@ fn undetermined_witness(ty: &Type) -> bool {
 ///
 /// A position says something extra exactly where inference made **several terms lower bounds of
 /// one variable**: the variable's merge is what the position holds, and each term states only
-/// its own contribution. Every such site in `emit.rs` needs an arm here, and the three that can
-/// put a sum at the merged position are:
+/// its own contribution. The arms here are the sites whose merged position is a term this walk
+/// reaches:
 ///
 /// - **A list literal's elements** (`emit_list`). The whole element type flows into one
 ///   variable, sum and all, so that position binds a witness over every candidate that reached
@@ -177,6 +235,11 @@ fn undetermined_witness(ty: &Type) -> bool {
 /// `emit_case` merges its branches the same way and needs no arm: realization consumes a
 /// collection-valued `Case` before this walk reaches it. Every other position types its child by
 /// the child's own term.
+///
+/// The mutable writes and feeds merge terms into one variable as well, and have no arm. A `:=`
+/// overwrite and a `<<=` feed of jagged rows compile, since each writes a whole list literal
+/// whose elements this walk reaches. Two `<<` appends of rows at differing domains and a keyed
+/// write of one do not compile; `tests/compilation_pipeline/sums.rs` pins both failures.
 fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
     match &expr.node {
         TypedExprNode::Apply { function, .. }
@@ -264,11 +327,13 @@ fn realize_and_unbox(
             kept.insert(*w.id());
         }
     }
-    // **A record names each field separately**, so its fields share no one demand the way an
-    // arm list does and [`child_demand`] has none to give them. `transact_phase`'s write set is
-    // the standing case: `(m: 𝑣)` is typed by the mutable variable's *declared* value type, so a
-    // `Mut(List(𝑇), Txn)` write states the one candidate it is at a field bound over
-    // `UIntRanges`.
+    // **A record or a tuple names each field separately**, so its fields share no one demand
+    // the way an arm list does and [`child_demand`] has none to give them; each field is handed
+    // its own. `transact_phase`'s write set is the standing record case: `(m: 𝑣)` is typed by
+    // the mutable variable's *declared* value type, so a `Mut(List(𝑇), Txn)` write states the
+    // one candidate it is at a field bound over `UIntRanges`. A tuple's is a row of a list
+    // literal of pairs, `[("a", box([1])), ("b", box([2, 3]))]`, whose element type is a tuple
+    // with a sum in it — the shape `map` takes its entries in.
     let record_fields = match effective.peel_refinements() {
         Type::Record(fs) if matches!(expr.node, TypedExprNode::Record(_)) => Some(fs.clone()),
         _ => None,
@@ -284,6 +349,21 @@ fn realize_and_unbox(
                 .map(|(_, t)| t.clone());
             changed |=
                 realize_and_unbox(child, erased, memo, in_predicate, discharged, field, kept);
+        }
+    } else if let (Type::Tuple(elt_tys), TypedExprNode::Tuple(elts)) =
+        (effective.peel_refinements(), &mut expr.node)
+        && elt_tys.len() == elts.len()
+    {
+        for (child, ty) in elts.iter_mut().zip(elt_tys) {
+            changed |= realize_and_unbox(
+                child,
+                erased,
+                memo,
+                in_predicate,
+                discharged,
+                Some(ty.clone()),
+                kept,
+            );
         }
     } else {
         expr.walk_children_mut(|child| {
@@ -874,6 +954,11 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
     let mut erased = std::collections::HashMap::new();
     let mut kept = std::collections::HashSet::new();
     go(&mut arm, &mut erased, None, &mut kept);
+    // The disjointness [`realize_conditional_collections`] checks, for the same reason.
+    debug_assert!(
+        erased.keys().all(|w| !kept.contains(w)),
+        "a witness `unbox` erased at one position of an arm was kept at another"
+    );
     if !erased.is_empty() {
         instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new());
     }
@@ -1266,7 +1351,7 @@ mod tests {
         let mut expr =
             Expr::new(TypedExprNode::Var(Name::from("site"))).with_ty(Type::data_fun(ty, int));
 
-        realize_conditional_collections(&mut expr);
+        realize_conditional_collections(&mut expr).expect("no jagged rows here");
 
         let Type::Fun { domain, .. } = &expr.ty else {
             panic!("expected a function type, got {}", expr.ty);
@@ -1331,7 +1416,7 @@ mod tests {
         let body_fun = Type::data_fun(witness.clone(), int.clone());
         let mut expr = Expr::new(case).with_ty(body_fun.clone());
 
-        realize_conditional_collections(&mut expr);
+        realize_conditional_collections(&mut expr).expect("no jagged rows here");
 
         assert_eq!(
             expr.ty, body_fun,

@@ -582,9 +582,21 @@ keys from the witness's kind rather than enumerating them.
 
 Materializing does not yet give an **iteration site** over such a collection. Every site starts
 from `IterateExtent` over an extent read off the type, and a bound is not something to
-enumerate, so a witness reaching one is reported as unimplemented. A comprehension over the
-collection needs no site, since its generator composes with the collection
+enumerate. A site that reaches op-conversion over one is rejected there by name, in `extent_of`'s
+`WitnessRef` arm. A comprehension over the collection needs no site, since its generator composes
+with the collection
 ([optimization.md](optimization.md#a-generator-over-a-sum-composes-with-its-source)).
+
+A `for` loop over a sum never reaches op-conversion. Its history is a function over the source's
+domain, and a sum's domain is a reference to the witness the sum binds, so the history would
+name the witness outside its binder. `mut_elim::check_no_loop_over_a_sum` rejects such a loop by
+name before the history is built. The rejection covers a determined sum too, because planning
+erases one only after the history is typed.
+
+**A row keeps its `box` only where the `box` is written.** `unbox` decides from the position the
+introduction fills, so a row bound by a `let` is erased at the binding, where its one candidate
+is the whole position. At a jagged position it then stands as a bare collection where the
+element type is a sum, and `reject_rows_fixed_elsewhere` rejects the program by name.
 
 **One realization per site, at the node whose type carries the choice**: the outermost `Σ`
 binding the witness. Arms sharing a domain form no Σ at all, and substituting the arm for

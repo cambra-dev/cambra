@@ -191,7 +191,8 @@ rewrites, in the order `run` performs them:
 
 1. **Conditional-collection realization** (`conditionals::realize_conditional_collections`) — a
    `Case` over collections becomes the gated union every later step then treats as an ordinary
-   collection.
+   collection. A jagged collection's row that reaches it through a binding is unsupported, and
+   `run` returns the error.
 2. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises
    the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒
    V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the
@@ -210,20 +211,23 @@ rewrites, in the order `run` performs them:
    predicate is normalized tree-wide to point-free form, reaching the consumer contracts that sit
    outside any iteration site.
 6. **Per-group filter insertion** (`insert_map_filters`) — a refinement riding an inner collection's
-   domain becomes a `map_filter`.
+   domain becomes a `map_filter`. A narrowing it cannot materialize is rejected
+   (`reject_unmaterialized_narrowings`), since op-conversion would compile the site without its
+   filter.
 
 Hash-join planning is the *specialised* strategy at an iteration site; the uniform iterate-then-restricts chain is the default.
 
 The full pipeline inside `run`:
 
 ```
-let discharged = realize_conditional_collections(&mut expr);
+let discharged = realize_conditional_collections(&mut expr)?;
 recognize_groupby_sites(&mut expr);
 let mut expr = simplify(expr);
 fold_constants(&mut expr);
 insert_iterate_markers(&mut expr, &discharged);
 compile_refinement_predicates(&mut expr, &PredMemo::new());
 insert_map_filters(&mut expr);
+reject_unmaterialized_narrowings(&expr)?;
 simplify(expr)
 ```
 

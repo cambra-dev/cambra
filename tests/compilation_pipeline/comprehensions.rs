@@ -212,6 +212,58 @@ fn a_filter_over_a_same_domain_conditional_does_not_compile() {
     );
 }
 
+/// A **filtered inner comprehension over the outer row**, which the filter narrows.
+///
+/// The inner source is the outer binder, so the filter's refinement reads it, and
+/// `lambda_elim` moves it onto the pair the curried morphism takes. The narrowing then lives
+/// only in the curry's type. A bare element (`v for v in r`) reduces that curry to `map(id)`,
+/// and an element function (`v * 2`) to `map(𝑔)`, the control that kept its filter all
+/// along. Unfiltered, these answer 10, 20 and 10.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::bare_element("sum([sum([v for v in r if v > 1]) for r in [[1, 2], [3, 4]]])", 9)]
+#[case::element_function(
+    "sum([sum([v * 2 for v in r if v > 1]) for r in [[1, 2], [3, 4]]])",
+    18
+)]
+#[case::over_a_group(
+    indoc! {r"
+        g = groupby([1, 2, 3, 4], \v -> v // 2)
+        sum([sum([x for x in grp if x > 1]) for grp in g])
+    "},
+    9
+)]
+fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A filtered inner comprehension over a **projection of the outer row** does not compile.
+/// The filter reads the row while the collection it narrows is the projection, and no type
+/// relates the two, so the post-elimination type check rejects the program. Pinned as it
+/// fails; it answers 9.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_filtered_inner_comprehension_over_a_projected_row_does_not_compile() {
+    check_compile_error(
+        "sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
+        "post-lambda-elim produced an invalid tree",
+    );
+}
+
+/// The same with **no outer aggregate**, so the narrowed collection per row is the answer's
+/// row: `[1, 2]` keeps `2`, and `[3, 4]` keeps both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_filtered_inner_comprehension_per_row_without_an_outer_aggregate() {
+    check_tile(
+        "[sum([v for v in r if v > 1]) for r in [[1, 2], [3, 4]]]",
+        make_int_list(&[2, 7]),
+    );
+}
+
 /// A **let-bound filtered comprehension, filtered again.** Recorded above as a shape that
 /// panicked with `no entry found for key`; it compiles now, and the pair with
 /// `test_filtered_comprehension_over_a_filtered_literal` below keeps both placements of the

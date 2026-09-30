@@ -2516,10 +2516,11 @@ from](#where-the-candidates-come-from)).
   ([optimization.md](optimization.md#a-generator-over-a-sum-composes-with-its-source)). What is
   left is the **iteration source** for every other site, a `for` loop's driver among them: each
   starts from `IterateExtent` over an extent read off the type, and a bound is not something to
-  enumerate. What it needs is a source taking the
-  collection as an input and emitting the domain the tile holds — not the `Type::DataSource` →
-  `Extent::DataSourceDomain` shape, since a collection is not a source and registers with no
-  scheduler.
+  enumerate. A `for` loop over any sum is rejected by name before its history is built
+  (`src/ccl/design/collections.md`, "Compiling a conditional collection"). What the sites need
+  is a source taking the collection as an input and emitting the domain the tile holds, not the
+  `Type::DataSource` → `Extent::DataSourceDomain` shape, since a collection is not a source and
+  registers with no scheduler.
 
   Consuming a **heterogeneous** sum (`Σ (𝑇 : [Int, String]). 𝑇`) additionally needs the
   consumer valid at every candidate, which for a genuine dispatch is a trait bound. The
