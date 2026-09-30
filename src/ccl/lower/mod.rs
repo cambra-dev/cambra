@@ -854,6 +854,12 @@ impl LoweringContext {
     pub(super) fn fresh_ignored_payload(&mut self) -> String {
         self.mint_synthetic_id("__match_payload")
     }
+
+    /// Mint a unique `__callee_N` name for a lambda written in call position,
+    /// which lowering binds before calling (`lower::exprs::lower_expression_call`).
+    pub(super) fn fresh_callee_name(&mut self) -> String {
+        self.mint_synthetic_id("__callee")
+    }
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a

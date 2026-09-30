@@ -7,6 +7,7 @@ use std::time::Duration;
 use bit_set::BitSet;
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
+use indoc::indoc;
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -23,6 +24,100 @@ use crate::helpers::*;
 #[case("def add(x, y):\n    x + y\nadd(3, 4)", Value::Int(7))]
 fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// A function passed as an argument reaches its call. In a multi-argument function the
+// parameter is a component of the argument tuple, so the call's callee is a projection of
+// that tuple until the inliner folds it (`src/ccl/design/optimization.md`, "Functions held
+// in products"). Each multi-argument case panicked at run time before the fold.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::sole_parameter(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def use(h):
+            h(1)
+        use(inc)
+    "},
+    Value::Int(2),
+)]
+#[case::function_first(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def use(h, v):
+            h(v)
+        use(inc, 1)
+    "},
+    Value::Int(2),
+)]
+#[case::function_second(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def use(v, h):
+            h(v)
+        use(1, inc)
+    "},
+    Value::Int(2),
+)]
+#[case::lambda_argument(
+    indoc! {r"
+        def use(h, v):
+            h(v)
+        use(\x -> x + 1, 1)
+    "},
+    Value::Int(2),
+)]
+#[case::two_functions(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def dbl(x):
+            x * 2
+        def use(f, g):
+            g(f(3))
+        use(inc, dbl)
+    "},
+    Value::Int(8),
+)]
+fn test_function_passed_as_an_argument(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A callee may be an expression that names its function statically: the result of a
+// call, or a lambda.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::curried_chain(
+    indoc! {r"
+        def add(x):
+            \y -> x + y
+        add(1)(2)
+    "},
+    Value::Int(3),
+)]
+#[case::lambda_in_call_position(r"(\x -> x + 1)(41)", Value::Int(42))]
+fn test_expression_callee(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A callee that chooses its function at run time is refused at lowering: a function has
+/// no run-time value to choose between.
+#[test]
+fn a_callee_chosen_by_a_conditional_is_refused() {
+    check_compile_error(
+        indoc! {"
+            def inc(x):
+                x + 1
+            def dbl(x):
+                x * 2
+            c = True
+            (inc if c else dbl)(5)
+        "},
+        "a called expression must name its function statically",
+    );
 }
 
 // A polymorphic UDF applied at two *distinct* argument types in the same

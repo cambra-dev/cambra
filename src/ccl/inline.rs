@@ -66,8 +66,8 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    Expr, Lit, Name, Refinement, Type, TypedExprNode,
-    ccl_utils::{PredMemo, is_free, walk_refined_predicates_mut},
+    Expr, Lit, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
+    ccl_utils::{PredMemo, count_free, is_free, walk_refined_predicates_mut},
     lambda_elim::substitute,
     provenance,
 };
@@ -89,7 +89,8 @@ use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
 /// left intact.
 ///
 /// Literal tuple projections that arise from uncurried multi-arg call sites
-/// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
+/// are folded here only when the tuple holds a capability
+/// ([`fold_product_projection`]); `crate::ccl::simplify` folds the rest as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
     inline_impl(expr)
@@ -117,6 +118,224 @@ fn should_inline(bound_ty: &Type) -> bool {
         Type::Fun { fun_kind, .. } => !matches!(fun_kind, crate::ccl::ty::FunKind::Data(..)),
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Functions held in products
+// ---------------------------------------------------------------------------
+
+/// Whether a value of type `ty` holds a capability: it is one, or it is a tuple or
+/// record with a component that holds one.
+///
+/// A tile carries values, not closures, so a function held in a product has no
+/// runtime representation. The inliner takes such a product apart until each
+/// function it holds sits in call position (`src/ccl/design/optimization.md`,
+/// "Functions held in products").
+fn holds_capability(ty: &Type) -> bool {
+    match ty {
+        Type::Tuple(elts) => elts.iter().any(holds_capability),
+        Type::Record(fields) => fields.iter().any(|(_, t)| holds_capability(t)),
+        Type::Refinement(base, _) => holds_capability(base),
+        ty => should_inline(ty),
+    }
+}
+
+/// The components of a tuple or record literal, keyed by the projection that reads
+/// each; `None` for any other node.
+fn product_components(expr: &Expr) -> Option<Vec<(ProjKey, &Expr)>> {
+    match &expr.node {
+        TypedExprNode::Tuple(elts) => Some(
+            elts.iter()
+                .enumerate()
+                .map(|(i, e)| (ProjKey::Index(i), e))
+                .collect(),
+        ),
+        TypedExprNode::Record(fields) => Some(
+            fields
+                .iter()
+                .map(|(k, e)| (ProjKey::Field(k.clone()), e))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `expr` is a tuple or record literal with a component that holds a
+/// capability. The components' own types decide, since those are what each
+/// projection of the literal would carry.
+fn product_holds_capability(expr: &Expr) -> bool {
+    product_components(expr)
+        .is_some_and(|components| components.iter().any(|(_, e)| holds_capability(&e.ty)))
+}
+
+/// Take `expr` apart into its components, in order.
+///
+/// Callers have established with [`product_components`] that `expr` is a tuple or
+/// record literal.
+fn into_product_components(expr: Expr) -> Vec<(ProjKey, Expr)> {
+    match expr.node {
+        TypedExprNode::Tuple(elts) => elts
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (ProjKey::Index(i), e))
+            .collect(),
+        TypedExprNode::Record(fields) => fields
+            .into_iter()
+            .map(|(k, e)| (ProjKey::Field(k), e))
+            .collect(),
+        other => unreachable!("into_product_components: not a product literal: {other:?}"),
+    }
+}
+
+/// `(𝑎₀, …, 𝑎ₙ).𝑖 ⟹ 𝑎ᵢ`, and the same for a record literal's field, where the literal
+/// holds a capability.
+///
+/// A literal is folded whichever component the projection reads. Folding only the
+/// components that hold a capability would leave `(f=𝑔, k=1).k` with the function
+/// `𝑔` still inside it. A literal holding only data is left for `simplify`'s
+/// `try_literal_tuple_projection`, which folds it after lambda elimination.
+///
+/// The fold mints nothing: the component keeps its own id, and the `Apply`, the
+/// `Proj`, and the other components die.
+fn fold_product_projection(expr: Expr) -> Expr {
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return expr;
+    };
+    let TypedExprNode::Proj(key) = &function.node else {
+        return expr;
+    };
+    if !product_holds_capability(argument)
+        || !product_components(argument).is_some_and(|cs| cs.iter().any(|(k, _)| k == key))
+    {
+        return expr;
+    }
+    let TypedExprNode::Apply { argument, function } = expr.node else {
+        unreachable!()
+    };
+    let TypedExprNode::Proj(key) = function.node else {
+        unreachable!()
+    };
+    into_product_components(*argument)
+        .into_iter()
+        .find_map(|(k, e)| (k == key).then_some(e))
+        .expect("the projected component was found above")
+}
+
+/// Whether `expr` is a projection, `𝑝 ▷ .𝑘`.
+fn is_projection(expr: &Expr) -> bool {
+    matches!(&expr.node, TypedExprNode::Apply { function, .. }
+        if matches!(function.node, TypedExprNode::Proj(_)))
+}
+
+/// Whether `expr` is a call whose callee is a lambda, `𝑎 ▷ (λ 𝑥 → body)`.
+fn calls_a_lambda(expr: &Expr) -> bool {
+    matches!(&expr.node, TypedExprNode::Apply { function, .. }
+        if matches!(function.node, TypedExprNode::Lambda { .. }))
+}
+
+/// Beta-reduce `𝑎 ▷ (λ 𝑥 → body)` where the lambda reached call position by
+/// [`fold_product_projection`]: the callee was a projection of a product that held
+/// it, as in `use(\x -> x + 1, 1)` once `use`'s body reads its parameters.
+///
+/// The caller checks that the callee was a projection before its children were
+/// inlined, which is what tells a folded lambda from one written in call position.
+/// The inliner leaves the latter for `lambda_elim`, whose comprehension and scalar
+/// shapes depend on it (`src/ccl/design/optimization.md`, "Substitution and
+/// beta-reduction"). The caller has also checked [`calls_a_lambda`].
+fn beta_reduce_folded_call(expr: Expr) -> Expr {
+    let node_id = expr.node_id();
+    let TypedExprNode::Apply { function, argument } = expr.node else {
+        unreachable!("beta_reduce_folded_call: not a call")
+    };
+    let TypedExprNode::Lambda { param, body } = function.node else {
+        unreachable!("beta_reduce_folded_call: the callee is not a lambda")
+    };
+    beta_reduce(
+        node_id,
+        param,
+        *body,
+        *argument,
+        "a lambda held in a product",
+    )
+}
+
+/// Whether every free occurrence of `name` in `expr` is the argument of a
+/// projection, `name ▷ .𝑘`, in the main tree.
+///
+/// A projection is the one use [`split_product_let`] can rewrite. [`count_free`]
+/// also counts occurrences inside type slots, so an occurrence in a refinement
+/// predicate makes the counts differ and the product stays bound.
+fn only_projected(name: &Name, expr: &Expr) -> bool {
+    fn projections(name: &Name, expr: &Expr) -> usize {
+        match &expr.node {
+            TypedExprNode::Apply { argument, function }
+                if matches!(&argument.node, TypedExprNode::Var(n) if n == name)
+                    && matches!(function.node, TypedExprNode::Proj(_)) =>
+            {
+                1
+            }
+            _ => {
+                let mut n = 0;
+                expr.walk_children(|c| n += projections(name, c));
+                n
+            }
+        }
+    }
+    count_free(name, expr) == projections(name, expr)
+}
+
+/// `let 𝑟 = (𝑘₀=𝑎₀, …) in body ⟹ let 𝑐₀ = 𝑎₀ in … body[𝑟.𝑘ᵢ ↦ 𝑐ᵢ]`, for a product that
+/// holds a capability and is used only through projections ([`only_projected`]).
+///
+/// Each component is then a binding of its own type: a function inlines to its
+/// calls, and a collection stays bound once, so no component is recomputed per
+/// use. Called under the `inline.split` recording on the `Let` it replaces. Each
+/// rewritten projection opens its own recording, so the `Var` that replaces it
+/// is attributed to that use rather than to the binding.
+fn split_product_let(name: &Name, product: Expr, body: Expr) -> Expr {
+    fn replace(expr: Expr, name: &Name, binders: &[(ProjKey, Name)]) -> Expr {
+        let target = match &expr.node {
+            TypedExprNode::Apply { argument, function } => match (&argument.node, &function.node) {
+                (TypedExprNode::Var(n), TypedExprNode::Proj(key)) if n == name => binders
+                    .iter()
+                    .find_map(|(k, binder)| (k == key).then(|| binder.clone())),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(binder) = target {
+            let _g = provenance::enter(
+                expr.node_id(),
+                "inline.split",
+                provenance::Nature::Machinery,
+            );
+            let mut var = Expr::var(binder).with_ty(expr.ty);
+            var.user_annotation = expr.user_annotation;
+            return var;
+        }
+        let mut expr = expr;
+        expr.map_children(|c| replace(c, name, binders));
+        expr
+    }
+
+    let components = into_product_components(product);
+    let binders: Vec<(ProjKey, Name)> = components
+        .iter()
+        .map(|(k, _)| (k.clone(), Name::component()))
+        .collect();
+    let body = replace(body, name, &binders);
+    components
+        .into_iter()
+        .zip(binders)
+        .rev()
+        .fold(body, |body, ((_, component), (_, binder))| {
+            let binding = TypedBinding {
+                name: binder,
+                ty: component.ty.clone(),
+                user_annotation: None,
+            };
+            Expr::let_in(binding, component, body)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +435,17 @@ fn inline_impl(expr: Expr) -> Expr {
             let bound_expr = inline_impl(*bound_expr);
             let body = inline_impl(*body);
 
+            // A product holding a function is bound one component at a time, so each
+            // component inlines, or stays shared, on its own type.
+            if product_holds_capability(&bound_expr) && only_projected(&binding.name, &body) {
+                let split = {
+                    let _g =
+                        provenance::enter(node_id, "inline.split", provenance::Nature::Machinery);
+                    split_product_let(&binding.name, bound_expr, body)
+                };
+                return inline_impl(split);
+            }
+
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
             // and drop the Let.  This must run before lambda_elim so that the
             // let-in-lambda rule never wraps such aliases in `const(x)`.
@@ -291,6 +521,10 @@ fn inline_impl(expr: Expr) -> Expr {
         // All remaining variants: pure structural recursion, carrying the input
         // id (a Preserve).  Atoms have no children, so this is a no-op for them.
         node => {
+            let calls_a_projection = matches!(
+                &node,
+                TypedExprNode::Apply { function, .. } if is_projection(function)
+            );
             let mut expr = Expr {
                 node_id,
                 node,
@@ -298,7 +532,10 @@ fn inline_impl(expr: Expr) -> Expr {
                 user_annotation,
             };
             expr.map_children(inline_impl);
-            return expr;
+            if calls_a_projection && calls_a_lambda(&expr) {
+                return inline_impl(beta_reduce_folded_call(expr));
+            }
+            return fold_product_projection(expr);
         }
     };
 
@@ -369,43 +606,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         let function = inline_and_beta_reduce(*function, name, lambda, memo);
         match function.node {
             TypedExprNode::Lambda { param, body } => {
-                // A domain refinement on this outer lambda encodes a precondition
-                // `P(arg)` that beta reduction must not lose. Such refinements ride
-                // the param's *type* (a `Type::Refinement` introduced by `cast`, or
-                // the singleton a literal carries), copied into `param.ty` by
-                // coalesce's `refresh_lambda_param_slot`.
-                //
-                // Substitution **discharges** the precondition when the argument's
-                // own type already entails it: `P` then holds of the term replacing
-                // the binder, so dropping it from a type that no longer has a binder
-                // to describe loses nothing. That is the ordinary case for a literal
-                // argument — `{Int | __elem == 5}` is entailed by `5`'s own type,
-                // trivially.
-                //
-                // What is *not* safe is a precondition the argument does not
-                // establish; that needs a principled lift (a `restrict(pred)` guard
-                // around the substituted body) rather than a silent drop. A hard
-                // assert, not `debug_assert`: this reads a live post-inference data
-                // path, and a release build proceeding past it would miscompile to
-                // wrong results rather than fail.
-                assert!(
-                    refinement_discharged_by(&argument.ty, &param.ty),
-                    "inline_and_beta_reduce: outer lambda for `{name}` has parameter \
-                     type {} which the argument type {} does not entail; beta reduction \
-                     would silently drop the precondition. This needs a `restrict` lift, \
-                     not a substitution.",
-                    param.ty,
-                    argument.ty
-                );
-                // Beta reduction, recorded against the `Apply` node it
-                // collapses. It needs no `RecordingGuard::also_consumes`: the
-                // `Apply` and the `Lambda` both vanish, and neither has to be
-                // named, because the boundary difference reports both. The
-                // promoted `body` keeps its own id and is its own self-edge, and
-                // the substituted argument's copies arrive through `on_copy` as
-                // copies of the argument's own interior, which is what they are.
-                let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
-                return substitute(*body, &param.name, &argument);
+                return beta_reduce(node_id, param, *body, argument, name);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
@@ -520,6 +721,53 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         ty,
         user_annotation,
     }
+}
+
+/// Beta-reduce `argument ▷ (λ param → body)`, the `Apply` numbered `node_id`.
+/// `callee` names the function the lambda came from, for the assertion message.
+fn beta_reduce(
+    node_id: provenance::NodeId,
+    param: TypedBinding,
+    body: Expr,
+    argument: Expr,
+    callee: impl std::fmt::Display,
+) -> Expr {
+    // A domain refinement on this outer lambda encodes a precondition
+    // `P(arg)` that beta reduction must not lose. Such refinements ride
+    // the param's *type* (a `Type::Refinement` introduced by `cast`, or
+    // the singleton a literal carries), copied into `param.ty` by
+    // coalesce's `refresh_lambda_param_slot`.
+    //
+    // Substitution **discharges** the precondition when the argument's
+    // own type already entails it: `P` then holds of the term replacing
+    // the binder, so dropping it from a type that no longer has a binder
+    // to describe loses nothing. That is the ordinary case for a literal
+    // argument — `{Int | __elem == 5}` is entailed by `5`'s own type,
+    // trivially.
+    //
+    // What is *not* safe is a precondition the argument does not
+    // establish; that needs a principled lift (a `restrict(pred)` guard
+    // around the substituted body) rather than a silent drop. A hard
+    // assert, not `debug_assert`: this reads a live post-inference data
+    // path, and a release build proceeding past it would miscompile to
+    // wrong results rather than fail.
+    assert!(
+        refinement_discharged_by(&argument.ty, &param.ty),
+        "inline: outer lambda for `{callee}` has parameter type {} which the \
+             argument type {} does not entail; beta reduction would silently drop \
+             the precondition. This needs a `restrict` lift, not a substitution.",
+        param.ty,
+        argument.ty
+    );
+    // Beta reduction, recorded against the `Apply` node it
+    // collapses. It needs no `RecordingGuard::also_consumes`: the
+    // `Apply` and the `Lambda` both vanish, and neither has to be
+    // named, because the boundary difference reports both. The
+    // promoted `body` keeps its own id and is its own self-edge, and
+    // the substituted argument's copies arrive through `on_copy` as
+    // copies of the argument's own interior, which is what they are.
+    let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
+    substitute(body, &param.name, &argument)
 }
 
 /// Run [`inline_and_beta_reduce`] on every refinement predicate embedded in
@@ -1307,7 +1555,7 @@ mod tests {
         let udf_ty = fn_ty(arg_pair_ty.clone(), list.clone());
 
         // body: λ __iter_record → __iter_record ▷ __arg_pair.0 ▷ (λ x → x)
-        let proj0 = TypedExpr::new(TypedExprNode::Proj(crate::ccl::ProjKey::Index(0)))
+        let proj0 = TypedExpr::new(TypedExprNode::Proj(ProjKey::Index(0)))
             .with_ty(fn_ty(arg_pair_ty.clone(), list.clone()));
         let pair_proj = TypedExpr::apply(
             TypedExpr::var("__arg_pair").with_ty(arg_pair_ty.clone()),
@@ -1403,7 +1651,7 @@ mod tests {
         let udf_ty = fn_ty(pair_ty.clone(), int.clone());
 
         // __pair.0: Apply(argument: Var("__pair"), function: Proj(0))
-        let proj0 = TypedExpr::new(TypedExprNode::Proj(crate::ccl::ProjKey::Index(0)))
+        let proj0 = TypedExpr::new(TypedExprNode::Proj(ProjKey::Index(0)))
             .with_ty(fn_ty(pair_ty.clone(), int.clone()));
         let pair_proj0 = TypedExpr::new(TypedExprNode::Apply {
             argument: Box::new(TypedExpr::var("__pair").with_ty(pair_ty.clone())),
@@ -1412,7 +1660,7 @@ mod tests {
         .with_ty(int.clone());
 
         // __pair.1: Apply(argument: Var("__pair"), function: Proj(1))
-        let proj1 = TypedExpr::new(TypedExprNode::Proj(crate::ccl::ProjKey::Index(1)))
+        let proj1 = TypedExpr::new(TypedExprNode::Proj(ProjKey::Index(1)))
             .with_ty(fn_ty(pair_ty.clone(), int.clone()));
         let pair_proj1 = TypedExpr::new(TypedExprNode::Apply {
             argument: Box::new(TypedExpr::var("__pair").with_ty(pair_ty.clone())),

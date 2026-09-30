@@ -47,13 +47,41 @@ on the type side, where generalizing a collection is
 
 At each call site, substitution is paired with beta-reduction of the outer user-parameter lambda. Apply chains terminating in `Var(name)` participate in beta-reduction; unrelated `Apply(arg, Lambda)` patterns elsewhere in the tree are left intact so list-comprehension bodies and scalar BinOp desugaring keep the structure `lambda_elim` + `simplify` expect.
 
-Multi-arg call-site bodies contain `Apply(Tuple(…), Proj(Index(i)))` (from the uncurried `__arg_pair.i` references). Those literal-tuple projections are folded later by `simplify::try_literal_tuple_projection`; this pass leaves them in place.
+Multi-arg call-site bodies contain `Apply(Tuple(…), Proj(Index(i)))` (from the uncurried `__arg_pair.i` references). A tuple that holds a function is folded here ([Functions held in products](#functions-held-in-products)). Every other literal-tuple projection is folded later by `simplify::try_literal_tuple_projection`.
 
 After beta-reducing a UDF call, `inline_impl` is re-applied to the result so that any newly-created `Let` bindings (e.g. from a defer-returning argument) are also processed by the alias-inlining and lift steps.
 
+### Functions held in products
+
+A tuple or record that holds a function has no tile, because a tile carries values and not
+functions. The inliner takes such a product apart until each function it holds sits in call
+position, where it inlines as a let-bound one does. A product **holds a capability** when one of its
+components is a capability or is itself a product holding one (`holds_capability`).
+
+Two rewrites do it:
+
+- **A projection of a literal is folded.** `(𝑎₀, …, 𝑎ₙ).𝑖` becomes `𝑎ᵢ`, and likewise a record
+  literal's field, when the literal holds a capability (`fold_product_projection`). The literal is
+  folded whichever component is read: folding only the function components would leave
+  `(f=𝑔, k=1).k` with `𝑔` inside it. This is how a function passed to a multi-argument function
+  reaches its call, since the parameter is a component of the argument tuple.
+- **A let-bound literal is split.** `let 𝑟 = (𝑘₀=𝑎₀, …) in body` becomes one `let` per component,
+  with each `𝑟.𝑘ᵢ` in the body replaced by that component's binder (`split_product_let`). A
+  function component then inlines, and a collection component stays bound once, so nothing is
+  recomputed per use. The split applies only when every use of `𝑟` is a projection. A whole use,
+  such as `𝑟` placed in a list, leaves the binding as it is.
+
+A lambda that reaches call position through a fold, as in `use(\x -> x + 1, 1)`, is beta-reduced
+there (`beta_reduce_folded_call`). A lambda written in call position is not this case: lowering binds
+it first (`lower::exprs::lower_expression_call`), so it inlines as a let-bound lambda, and an
+anonymous `Apply(arg, Lambda)` that no fold produced is left for `lambda_elim`.
+
+A product whose functions no rewrite reaches, such as one chosen by a conditional, still holds a
+function after inlining, and compilation fails in planning or at operator conversion.
+
 ### Limitations
 
-- **A curried function that is never fully applied** (`add: (Int => (Int => Int)) = \x -> \y -> x + y` then `add`): `should_inline` inlines `add` because its type is a capability, but with no call site to beta-reduce against, the outer lambda survives, lambda-elim emits `add ▷ curry`, and operator conversion rejects it (`found input for non-combinator curry`). The residue carries no eta redex, so `try_exponential_eta` does not reach it. The annotation is load-bearing — unannotated, the program is ambiguous and inference rejects it first. The `curry` is not the whole story: `add(1)` reaches operator conversion without one and still fails, panicking on the first `get` with "Attempted to iterate on infinite Extent: Int" — the scalar-UDF case above, at the program's result. A tile carries values, not closures, and a compute function has no data behind it to materialize, so neither spelling has a tile to produce. Binding each application (`x = add(1)` then `x(2)`) collapses both layers and works; the chained spelling `add(1)(2)` is a separate lowering restriction, since `lower_call` takes only a named callee. A curried *data* function is unaffected: planning builds `groupby`'s partition from `converse`, and it materialises as a `DataFunction` tile.
+- **A curried function that is never fully applied** (`add: (Int => (Int => Int)) = \x -> \y -> x + y` then `add`): `should_inline` inlines `add` because its type is a capability, but with no call site to beta-reduce against, the outer lambda survives, lambda-elim emits `add ▷ curry`, and operator conversion rejects it (`found input for non-combinator curry`). The residue carries no eta redex, so `try_exponential_eta` does not reach it. The annotation is load-bearing — unannotated, the program is ambiguous and inference rejects it first. The `curry` is not the whole story: `add(1)` reaches operator conversion without one and still fails, panicking on the first `get` with "Attempted to iterate on infinite Extent: Int" — the scalar-UDF case above, at the program's result. A tile carries values, not closures, and a compute function has no data behind it to materialize, so neither spelling has a tile to produce. Binding each application (`x = add(1)` then `x(2)`) collapses both layers and works, and so does the chained spelling `add(1)(2)`. A curried *data* function is unaffected: planning builds `groupby`'s partition from `converse`, and it materialises as a `DataFunction` tile.
 - **Collection UDFs** (domain `UIntRange` or `DataSource`): not inlined; they compile correctly via `Memo + FanOut` and benefit from sharing.
 - **Body duplication**: a UDF called N times has its body duplicated N times in the operator graph. Acceptable for now; only collection-typed UDFs warrant caching.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
