@@ -2519,6 +2519,7 @@ fn run_passes(
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
         return Ok(expr);
     }
+    inline::check_calls_resolved(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
 
     // Transactional slice of the unified phase: rewrite every `with begin():`
     // writer of a `Mut(_, Txn)` mutable variable into a `get_prev_txn`-guarded `LetRec`

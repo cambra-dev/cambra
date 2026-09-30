@@ -39,6 +39,10 @@ pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
 /// `Function`-kind builtin nor a registered source returns [`LoweringError::Unsupported`]; this
 /// includes `begin()`, `test_sink()`, and `http_serve()` outside the statement that recognizes
 /// them.
+///
+/// A callee that is an expression rather than a name — `(r.f)(x)`, a field of a
+/// record — is ordinary application of the function value it evaluates to
+/// ([`lower_expression_call`]).
 pub(super) fn lower_call(
     func: &Spanned<ChlExpr>,
     args: &[Spanned<ChlExpr>],
@@ -83,12 +87,7 @@ pub(super) fn lower_call(
             }
             return lower_application(member.name.raw(), func.span, args, ctx);
         }
-        _ => {
-            return Err(LoweringError::unsupported(
-                func.span,
-                "only named function calls are supported",
-            ));
-        }
+        _ => return lower_expression_call(func, args, ctx),
     };
 
     let builtin = SurfaceBuiltin::from_name(name);
@@ -411,16 +410,91 @@ fn lower_curried_call(
     Ok(acc)
 }
 
-/// The function `callee` names, written at `func_span`, applied to `args`, a
-/// non-empty argument list, as an ordinary call.
+/// Lower a call whose callee is an expression rather than a name.
 ///
-/// One argument applies directly, `f(a)` → `Apply(a, f)`. Several are tupled and
-/// applied once, `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`, which pairs with
-/// the uncurried multi-argument lambda lowering in [`lower_lambda`] so that a
-/// syntactic multi-argument function compiles without a `curry` combinator. Every
-/// argument is an ordinary value, so it lowers through `lower_expr`, where the
-/// out-of-block transactional read gate applies. Only a `Mut`-parameter callee
-/// accepts a bare mutable variable, and its call does not come here.
+/// Three callee shapes are accepted: a field (`(r.f)(x)`), a call (`add(1)(2)`), and a
+/// lambda (`(\x -> x + 1)(41)`). Any other callee expression, such as `(f if c else g)(x)`
+/// or `fs[i](x)`, is refused here. An accepted callee may still reach a function chosen
+/// from run-time data, as `pick(c)(5)` does when `pick` returns `inc if c else dbl`; the
+/// inliner leaves that call unresolved, and `inline::check_calls_resolved` refuses it
+/// (`src/ccl/design/optimization.md`, "Functions held in products").
+///
+/// Builtins, sources, and the curried call shape of a `Mut`-parameter `def` are
+/// all decided by the callee's spelling, so none of them applies here: the
+/// arguments are tupled as a named call's are. A `Mut`-parameter function reached
+/// through a field is therefore called with a tuple its curried type does not
+/// accept, and inference refuses the call.
+fn lower_expression_call(
+    func: &Spanned<ChlExpr>,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &func.node {
+        ChlExpr::Attribute { .. } | ChlExpr::Call { .. } | ChlExpr::Lambda { .. } => {}
+        _ => {
+            return Err(LoweringError::unsupported(
+                func.span,
+                "a called expression must be a name, a field (`(r.f)(x)`), a call \
+                 (`f(x)(y)`), or a lambda",
+            ));
+        }
+    }
+    if args.is_empty() {
+        return Err(LoweringError::unsupported(
+            func.span,
+            "a function takes at least one argument, so a call needs one",
+        ));
+    }
+    if matches!(func.node, ChlExpr::Lambda { .. }) {
+        // `(\x -> e)(a)` is `f = \x -> e; f(a)`: binding the lambda makes it a
+        // let-bound capability, which the inliner substitutes and beta-reduces.
+        // Left in call position, the lambda would reach `lambda_elim` unreduced.
+        let callee_name = ctx.fresh_callee_name();
+        let lambda = lower_expr(func, ctx)?;
+        let call = apply_to_args(args, ctx, |ctx| {
+            Ok(ctx.tag_machinery(
+                Expr::var(callee_name.clone()),
+                func.span,
+                "lower.lambda_call",
+            ))
+        })?;
+        // The call is no longer the expression's root, which `lower_expr` tags, so
+        // it is recorded here.
+        let call = ctx.tag_machinery(call, func.span, "lower.lambda_call");
+        let bound = Expr::let_bind(callee_name, lambda, call);
+        return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
+    }
+    apply_to_args(args, ctx, |ctx| lower_expr(func, ctx))
+}
+
+/// Apply the callee `callee` builds to a call's arguments: `f(a)` → `a ▷ f`, and
+/// `f(a, b, …)` → `(a, b, …) ▷ f`. The arguments lower first.
+///
+/// The tupled form pairs with the uncurried multi-arg lambda lowering in
+/// [`lower_lambda`], so syntactic multi-arg functions compile without any
+/// `curry` combinator appearing in the tree. Every argument is an ordinary
+/// value, so it lowers through `lower_expr`, where the out-of-block
+/// transactional read gate applies. (Only a `Mut`-param callee, applied by
+/// [`lower_curried_call`], accepts a bare mutable variable and bypasses the gate.)
+fn apply_to_args(
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+    callee: impl FnOnce(&mut LoweringContext) -> Result<Expr, LoweringError>,
+) -> Result<Expr, LoweringError> {
+    if let [arg] = args {
+        let arg = lower_expr(arg, ctx)?;
+        return Ok(Expr::apply(arg, callee(ctx)?));
+    }
+    let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
+    // The tuple is manufactured packing: there is no tuple in the source call.
+    let args_span = args[0].span.join(args[args.len() - 1].span);
+    let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
+    Ok(Expr::apply(arg_tuple, callee(ctx)?))
+}
+
+/// The function `callee` names, written at `func_span`, applied to `args`, a
+/// non-empty argument list, as an ordinary call ([`apply_to_args`]). The callee
+/// images the function the user named.
 pub(super) fn lower_application(
     callee: Name,
     func_span: Span,
@@ -428,20 +502,10 @@ pub(super) fn lower_application(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     debug_assert!(!args.is_empty(), "an ordinary call has an argument");
-    if args.len() == 1 {
-        let arg = lower_expr(&args[0], ctx)?;
+    apply_to_args(args, ctx, |ctx| {
         let callee = ctx.reference(callee, func_span);
-        let callee = ctx.tag_image(callee, func_span);
-        return Ok(Expr::apply(arg, callee));
-    }
-    let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-    // The tuple is manufactured packing (there is no tuple in the source call);
-    // the callee images the function the user named.
-    let args_span = args[0].span.join(args[args.len() - 1].span);
-    let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-    let callee = ctx.reference(callee, func_span);
-    let callee = ctx.tag_image(callee, func_span);
-    Ok(Expr::apply(arg_tuple, callee))
+        Ok(ctx.tag_image(callee, func_span))
+    })
 }
 
 /// A lowered term that lowering places at more than one position.
