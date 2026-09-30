@@ -19,7 +19,7 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::{
-    ccl::{Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
+    ccl::{BindingTransparency, Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
     chl_parser::ast::{AssignTarget, Expr as ChlExpr, IfBranch, Span, Spanned, Stmt as ChlStmt},
 };
 
@@ -121,6 +121,7 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
             name: iter_var.into(),
             ty: Type::Hole,
             user_annotation: None,
+            transparency: BindingTransparency::Transparent,
         },
         iter: Box::new(source),
         body: Box::new(block),
@@ -253,8 +254,14 @@ fn lower_tx_block_scoped(
             // a silent no-op shadow that dies at block end, so reject it and point
             // at `:=`. (A genuine local shadowing the mutable variable's name is fine.)
             // A type alias binds nothing, so the chain passes through unchanged.
-            ChlStmt::Assign { target, value } if type_alias_decl(target, value).is_some() => chain,
-            ChlStmt::Assign { target, value } => {
+            ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
+                chain
+            }
+            ChlStmt::Assign {
+                target,
+                value,
+                transparency,
+            } => {
                 let name = extract_name_target(target, "assignment")?;
                 if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {
                     return Err(LoweringError::unsupported(
@@ -266,7 +273,10 @@ fn lower_tx_block_scoped(
                     ));
                 }
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                ctx.tag_image(Expr::let_bind(name, val, chain), stmt.span)
+                ctx.tag_image(
+                    Expr::let_bind_with(name, val, chain, binding_transparency(*transparency)),
+                    stmt.span,
+                )
             }
             // `if cond: <writes>` — a conditional (deny) write. The no-else
             // branch is the deny: `commit = false` for the whole transaction.

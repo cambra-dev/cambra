@@ -58,6 +58,31 @@ lowering when run manually — that's the point.  Each row's Notes cell names it
 blocker; [Known issues](#known-issues-surfaced-by-these-programs) carries the
 ones that are bugs rather than missing features.
 
+## Timing a compile
+
+`gallery_compile_timing` (`tests/programs/compile_timing.rs`) compiles every `.cambra` file in the
+gallery and prints a row per program: its source lines and the fastest of N compiles. The timed
+region is `compile_program` alone — evaluation, where the rest of a gallery test's wall clock
+goes, sits outside it. The driver asserts nothing and is `#[ignore]`d, so an ordinary
+`cargo test` never pays for it.
+
+```bash
+cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+```
+
+Release is the configuration whose numbers mean anything. `CAMBRA_PERF_REPS` sets the repetition
+count (default 3) and `CAMBRA_TIMING_ONLY` narrows the run to the labels containing a substring,
+which is how one program gets timed without the rest of the gallery's noise:
+
+```bash
+CAMBRA_TIMING_ONLY=storefront CAMBRA_PERF_REPS=9 \
+  cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+```
+
+Rows run slowest first. A `🚧 blocked` program has no compile time, so it sits at the bottom with
+the position where it stops. The module doc carries the rest: what a sink program's row includes,
+and the interleaved recipe for measuring provenance capture against the same corpus.
+
 ## Adding to this table
 
 When you add a program under [`tests/programs/`](../tests/programs/), add a

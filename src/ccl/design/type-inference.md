@@ -190,6 +190,10 @@ def identity(x):
   fallback existed. The encoded fragment is over surface-syntax predicate shapes, and
   `lambda_elim` rewrites every predicate point-free, so no check at or after that pass reaches
   the fallback at all — the reach is inference and `inline`.
+* **SMT-supported post-inference checks.** Some but not all
+  post-inference checks use SMT checking. Post-planning checks only
+  use structural equality, and will need an SMT encoding for
+  point-free expressions in order to upgrade to SMT.
 
 *(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
@@ -471,6 +475,8 @@ Inference runs once, up front. But the pipeline re-checks types repeatedly *afte
 * **`CheckCtx`** — the post-inference check (`infer::check`). The *same* rules run, but the hooks now *verify* rather than *solve*: `subexpr` returns the child's already-recorded `child.ty` (what inference decided) instead of re-deriving it, `require_sub` confirms a relation the solver should already have established, and a final **reconcile** step checks the rule's reconstructed type against the node's recorded type.
 
 So the two passes share one description of the language's structure; they differ only in whether a rule's obligations are *emitted as constraints* or *checked against the recorded solution*. Adding or changing a structural rule updates both at once. Both contexts treat refinements strictly and identically; see §4 for how the check stays refinement-aware (adjacency flow checks *and* the reconcile) and why the passes that introduce refined types must keep each node reconstructable.
+
+Currently, post-*planning* checks default to structural equality. Using SMT to match the previous-phase checks will require SMT encoding for point-free expressions.
 
 ---
 
@@ -1021,10 +1027,10 @@ change the answer — a contradictory binder proves the entailment outright — 
 declaration per binder on a query that names two. A product's fields are not enumerated either,
 for the same reason.
 
-Two environments implement the lookup, and a third suppresses the query:
+Three environments implement the lookup, and a fourth suppresses the query:
 
-- **Emission** passes its lexical scope (`InferCtx`'s `ScopeStack`), through
-  `constrain_subtype_in`. It is the only one that answers a lookup. A binder's slot
+- **Emission** passes its lexical scope (`InferCtx`'s `ScopeStack`) plus the opaque binders it has
+  recorded, through `constrain_subtype_in`. A binder's slot
   mid-emission is an inference variable, so the scheme body is resolved before it can be read
   as a fact — `value_type`, the compact → simplify → coalesce pipeline with the
   opposite-polarity fallback suppressed. The positive reading is what makes the assumption
@@ -1034,16 +1040,21 @@ Two environments implement the lookup, and a third suppresses the query:
   is on the variable's bounds, and unresolved the binder has no sort at all. A generalized
   binder's quantified variables stay uninstantiated; a polytype has no sort, so it is dropped
   rather than assumed wrong.
-- **`NoScope`** is the empty environment, what every caller outside emission supplies:
-  `constrain_subtype_under` (the post-inference check resolves no names, so it holds no binder
-  types) and `inline`'s discharge check, which runs over a tree whose binders it does not hold.
+- **The post-inference check** builds its own Γ from the tree it walks (`CheckCtx`'s `scopes`
+  and `opaque_binders`) and passes it through `constrain_subtype_in` and
+  `constrain_subtype_under_in`. A binder is bound at the type its own rule hands
+  `Typing::scoped`, resolved — a fact about every value reaching it, because the binding site is
+  held to it by the edge that rule draws. Nothing here resolves a name: a `Var` node's recorded
+  type is trusted, and a name Γ does not bind leaves the query an assumption short rather than
+  reporting an error.
+- **`NoScope`** is the empty environment: `inline`'s discharge check, which runs over a tree
+  whose binders it does not hold, and any probe over types built outside a program.
   An empty scope only weakens what the fallback can prove, so it can reject what emission
   admitted and never the reverse.
-- **`SkipSmtScope`** decides a deficit structurally, raising no query at all.
-  `constrain_subtype` supplies it, so the post-pass tree check reaches the fallback through
-  `constrain_subtype_under` and not through `Typing::constrain`. That split is caller policy
-  riding the scope trait rather than a third environment; the `ScopeEnv::is_skip_smt` doc names
-  the shape it wants instead.
+- **`SkipSmtScope`** decides a deficit structurally, raising no query at all, and
+  `constrain_subtype` supplies it — so a caller reaches the fallback by naming a scope. That
+  split is caller policy riding the scope trait rather than a fourth environment; the
+  `ScopeEnv::is_skip_smt` doc names the shape it wants instead.
 
 Dropping is the discipline throughout: a path with no sort, a predicate body outside the
 fragment, a name two binders disagree about. An assumption left out weakens the antecedent and
@@ -1102,7 +1113,16 @@ runtime, so the reversed pass reuses the binaries the ordinary one built.
 
 A refinement is **required**, so `constrain_subtype` is strict for *concrete* bases: an unrefined concrete value does **not** flow into a refined position (`T ⊀ {T | p}`), and `{T | q} ⊀ {T | p}`. The one subtlety is the `S₂ ⊆ S₁ ∪ refinements(b₁)` clause: when the subtype side's base `b₁` is an **inference variable**, it can still acquire the deficit `S₂ \ S₁`, so the solver flows `b₁ <: {b₂ | S₂ \ S₁}` onto the variable rather than rejecting (the refinement analog of how the record/function arms thread structure through a variable base; it fails later iff the variable resolves to a concrete base lacking those refinements). This is what lets a value that is *already* refined be cast to acquire a further refinement — `{D | p} ⇒ V <: {?a | q} ⇒ V` records `?a <: {D | p}`, so the position carries both `p` and `q` (nested list-comprehension filters). Acquiring a refinement on a *concrete* value is still an *explicit* operation, not subsumption: the explicit `Cast` node from [PR #218](https://github.com/cambra-dev/Cambra/pull/218) (an upcast — `value <: target` — written `cast({D | r} ⇒ V, value)`) makes refinement-acquisition explicit, and the interpreter compiles a refinement on a **collection domain** to a runtime `Restrict`/`Filter` at the iteration boundary (the `Iterate`/`Restrict` arms of `operator_conversion`, where `extent_of` strips the domain refinement into a `Restrict`). The predicate `Expr` of each refinement is inferred/coalesced like any other sub-tree (annotation-borne predicates via `emit_annotation_predicates` / `coalesce_type_predicates`).
 
-**Refinements in the post-inference check.** The post-inference structural check (`infer::check`, reimplemented on the same structural rules as emission via the `Typing` trait — see §2, *The post-inference check*) is **strict and refinement-aware throughout** — it does not strip refinements before its width-subtyping checks. It runs `constrain_subtype` in two places, both fully refinement-aware:
+**Refinements in the post-inference check.** The post-inference structural check (`infer::check`,
+reimplemented on the same structural rules as emission via the `Typing` trait — see §2, *The
+post-inference check*) is **strict and refinement-aware throughout** — it does not strip refinements
+before its width-subtyping checks. It runs the solver's subtyping relation in two places, both fully
+refinement-aware, and both in the Γ the walk builds from the tree ([The scope a query runs
+in](#the-scope-a-query-runs-in)), so a refinement deficit reaches the semantic fallback there as it
+does during emission. `x: Mut({Int where _ >= 0}) := 0` with a write `x := x ^+ 1` is the case that
+needs it: the seed types `Int@0`, the write types `{Int | __elem == __read ^+ 1}`, and neither
+matches the declaration structurally — `0 >= 0` admits the seed, and `__read ^+ 1 >= 0` follows from
+the type the read's opaque binder is bound at. The two places:
 
 * **Adjacency rules** (a `Compose` link's `prev_cod <: next_dom`, an `Apply`'s argument-vs-domain) check *refinement flow*: feeding an unrefined producer into a refinement consumer is rejected (`T ⊀ {T | p}`), exactly as the solver is. There is **no cast escape** — a producer must already carry the refinement its consumer demands. A `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because join planning surfaces the iterated / join-satisfying domain on the *producing* morphism's codomain, so the upstream genuinely supplies `{D | r}` (see the reconstructability bullets below). The producer's refinement and the cast's contract are typically re-minted as distinct predicate terms, so the adjacency relies on the structural-predicate match above.
 * **The reconcile** (a node's rule-reconstructed type vs the type inference recorded on it) is the plain strict `rule <: recorded` subtype check, refinements included (the recorded type may be a width-wider supertype — e.g. an annotation). A rule that rebuilds a node's type from its children rebuilds its refinements too, so a recorded refinement the reconstruction lacks is a real disagreement about the node — and in practice it is one specific bug: a **merge point that took one input's refinement** instead of the join of all of them (see the merge law above). Comparing modulo refinements here — stripping both sides, or a refinement-blind relation — is the *only* thing that hides that class, and this is the check best placed to catch it. Keeping it strict is what forced each merge point to join.
@@ -1354,6 +1374,22 @@ the bound is recorded, and it is a lookup, since uniquify gives every binding si
 violation names the variable and the reference and fails. Every build enforces it: a release
 compile rejects what a debug compile rejects.
 
+An opaque binder is in every telescope of the walk, whatever the lexical position. It carries no
+definiens, so a type lifted past it keeps the name and the name outlives its scope ([`let` binders
+and scope exit](#let-binders-and-scope-exit)). The telescope therefore holds an opaque set shared by
+every variable the walk mints, and entering the binder adds to it, reaching the variables minted
+before it as well. That is what admits a write to a mutable variable declared outside the binder:
+`x := 0` mints the value variable under an empty telescope, and `x := x ^+ 1` contributes
+`{Int | __elem == __read ^+ 1}` over the read binder minted inside
+(`src/ccl/design/mutability.md`, "A read is named while inference runs"). The end-of-inference check
+states the same rule tree-wide, seeding its root scope with every opaque binder the tree holds
+(`check_scope_valid`).
+
+TODO: Opaque binders are exempt from the invariant check at record time, and so escapes of opaque binders currently surface later.
+
+A binder carrying a definiens stays out of that set, its reference being discharged rather than
+carried. A `for` target carries neither, so a contribution naming one still fails the check.
+
 Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
 and the pass-boundary re-derivations that check what a pass produced. A re-derivation walks a tree
 where a pass has erased term binders, and the refinements it meets still name them. The dependent
@@ -1433,6 +1469,11 @@ the binding discharges the reference to the definiens. No re-addressing is neede
 is its telescope entry's address, so the name-keyed discharge already speaks in entries. A Pi entry
 has no definiens, and lifting past one abstracts instead of discharging.
 
+An opaque entry (`x ^= e`) has no definiens either, and lifting past one does neither: the name
+stays in the lifted type, and what it means there is the type the binder was bound at, recorded when
+the binder is entered (`InferCtx::opaque_binders`) and read by every later refinement query. Entry
+rather than exit, because a bound naming the binder is recorded inside its scope.
+
 Emission records the lift, and cannot perform it: the body's type is an inference variable there,
 whose refinements sit in its bounds rather than in the type. `InferCtx::close_let_type` mints the
 `let` node's type outside the binder and records the body's type on its lower edge under `[𝑥 ↦ 𝑣]`,
@@ -1440,6 +1481,32 @@ a suspended discharge read as an application. Every bound naming `𝑥` then cro
 discharges the name, and β fires at coalesce. Returning the body's variable verbatim instead lets a
 refinement over `𝑥` reach the enclosing lambda's codomain, which is minted outside the binder and
 so trips the record-time closure check at the first call site that reads the codomain.
+
+#### A lambda's codomain drops the body's opaque binders
+
+An opaque binder the body introduced stands for one value per call, so a refinement naming it says
+nothing about the function's result: it would relate the results of `f(1)` and `f(2)` through one
+`r`. `Typing::close_body_type` drops such a refinement and reports the base type, a supertype, so
+every result the function produces still inhabits the codomain. A binder still in lexical scope
+where the lambda's rule runs was introduced outside the body and denotes one value for the whole
+function, so it stays; what is dropped are the binders whose scope closed inside the body.
+
+Emission drops on a second variable rather than on the body's own, so the body node keeps the type
+its own rule gave it. `body_ty <: codomain` is an ordinary edge, so what reaches the body's type
+still reaches the codomain, call-site bounds included, and the edge's closure deposits the body's
+concrete lower bounds on the codomain variable directly, following variable-to-variable edges on the
+way. The refinements to drop therefore sit on that variable's own lower bounds, and no later arrival
+can name one: a refinement naming an opaque binder is recorded where the binder is in scope, which
+is inside the body the rule has just finished emitting.
+
+That variable is minted under the lambda's parameter binder, where the codomain stands: the Pi binds
+the parameter in the codomain, so a body refinement naming the parameter closes against the
+variable's telescope. Minting it after the parameter's scope closes leaves the parameter out of that
+telescope, and the same refinement is then an open bound on it.
+
+A demand on the codomain is met by what flows out of the body rather than narrowing a variable
+inside it. `def f(x) => 𝑇` with an unannotated `x` whose body introduces an opaque binder bounds `x`
+from its call sites alone; a conflict with `𝑇` surfaces when those bounds reach the codomain.
 
 #### Discharge is application
 

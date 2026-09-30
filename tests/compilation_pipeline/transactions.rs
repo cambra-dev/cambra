@@ -522,6 +522,10 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 /// A value whose declared type holds a sum enters that sum through `box` wherever the sum sits:
 /// a record field or a tuple component, of a seed written as a literal or bound first, or of a
 /// write (`mut_elim::view_values_at_value_type`).
+///
+/// Every map here holds two keys. A one-key map gives its key domain a second refinement and does
+/// not compile; that shape is pinned in
+/// [`a_one_key_map_inside_a_product_does_not_compile`].
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::record_seed(
@@ -560,16 +564,55 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 )]
 #[case::record_write(
     indoc! {r#"
-        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1)])))
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
         for r in [1, 2, 3]:
             with begin():
-                s := (a=s.a + 1, b=box(map([("z", 3)])))
+                s := (a=s.a + 1, b=box(map([("z", 3), ("w", 4)])))
         await_final(s).a
     "#},
     8
 )]
 fn a_sum_inside_a_product_enters_its_declared_sum(#[case] code: &str, #[case] expected: i64) {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// The same shape over a **one-key** map does not compile: the map's key domain acquires a second
+/// refinement, and the two places that spell that domain disagree about it.
+///
+/// A one-element list literal's element type keeps the literal's singleton refinement, so the key
+/// morphism `λ __map_kv → __map_kv.0` has codomain `String@"x"` and `present_key_domain` bases the
+/// key domain on it: `{String | __elem == "x", __elem ▷ (([("x", 1)] ≫ .0) ▷ collection_contains)}`.
+/// `box_intro` shares one variable between its parameter's domain and its sum's sole candidate
+/// (`src/ccl/infer/schemes.rs`), so the two are one type. The inferred node has them differing —
+/// the candidate carries the `collection_contains` conjunct alone — which is the defect this pins.
+/// A map of two or more keys joins its key types to the bare `String`, leaving the two spellings
+/// equal and the disagreement unobservable.
+///
+/// The `box` between them reads neither: entering a sum makes the argument's domain the witness.
+/// A-normalization binds the seed's boxed field first, so `view_at_value_type` meets a `Let` rather
+/// than a record literal and takes the `spell_out_product` path, which writes the candidate
+/// spelling onto a `__seed` binder. Realization then erases the single-candidate box and leaves
+/// that binder at the concrete collection type, while `plan_loops` stamps the `converse` chain it
+/// rebuilds at the group-by head's domain, the two-conjunct one. A collection's domain is
+/// invariant, so the post-planning `typecheck` rejects the pair.
+///
+/// Either consumer could strip the singleton, and either would leave `box`'s shared variable
+/// holding two types. The fix belongs on the instantiation.
+// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether the
+// gap closed, regressed, or went away, and nothing runs ignored tests here.
+#[test]
+#[should_panic(expected = "post-planning produced an invalid tree: [Type mismatch")]
+fn a_one_key_map_inside_a_product_does_not_compile() {
+    check_tile(
+        indoc! {r#"
+            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1)])))
+            for r in [1, 2, 3]:
+                with begin():
+                    s := (a=s.a + 1, b=box(map([("z", 3)])))
+            await_final(s).a
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![8])),
+    );
 }
 
 /// A whole-variable write of a boxed collection enters the variable's declared sum, as its
@@ -2500,6 +2543,53 @@ fn guarded_induction_write_in_mixed_block_rejected() {
     );
 }
 
+/// An induction write inside a mixed block whose value reads a binding made
+/// before a write the lift crosses is rejected. `partition_spine` lifts
+/// `cnt2 := cnt2 + y` onto the enclosing loop carrying `y`'s definiens, which
+/// would put `y`'s read of `cnt` after `cnt := cnt + 1` and report 10, 20, 30
+/// instead of 0, 10, 20. A dedicated pre-check
+/// (`check_no_induction_write_reading_past_a_write`) catches it.
+#[test]
+fn induction_write_reading_past_a_lifted_write_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
+            cnt2: Mut(Int) := 0
+            for r in [10, 20, 30]:
+                with begin():
+                    store := store + r
+                    y = cnt * 10
+                    cnt := cnt + 1
+                    cnt2 := cnt2 + y
+            cnt2
+        "#},
+        "reads a value bound before `cnt` was written in the same block",
+    );
+}
+
+/// The same rejection through a **key**: a lifted keyed write's key rides the
+/// discharge the value does, so `k`, bound before `cnt := cnt + 10`, would key
+/// the write at 15 and 25 rather than 5 and 15.
+#[test]
+fn induction_keyed_write_reading_past_a_lifted_write_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 5
+            m: Mut(Map(Int, Int)) := box(map([(0, 0)]))
+            for x in [1, 2]:
+                with begin():
+                    store := store + x
+                    k = cnt
+                    cnt := cnt + 10
+                    m[k] := x
+            m
+        "#},
+        "reads a value bound before `cnt` was written in the same block",
+    );
+}
+
 /// C3: a write to a transactional mutable variable *outside* any `with begin():` block
 /// is rejected (write-side mirror of the read gate). Otherwise it becomes a plain
 /// sequential `let` shadow that silently hides every committed value.
@@ -2737,6 +2827,82 @@ fn mixed_txn_and_induction_write_inside_block_store_accumulates() {
                     store := store + r
                     cnt := cnt + 1
             await_final(store)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![60])),
+    );
+}
+
+/// The block that lifts `cnt := cnt + 1` keeps no read of `cnt`. A-normalization
+/// binds the read (`let __anf ^= cnt in cnt := __anf + 1`) and the lift carries
+/// that value out with the write, so leaving the binding behind would make the
+/// transactional remainder claim a read it no longer makes, and
+/// `fold_cross_domain_loops` would fold every loop writing `cnt` into a
+/// cross-domain letrec for an accumulator no commit decision reads.
+/// `partition_spine` drops the binding instead. `cnt` counts 2 in-block
+/// increments and 2 from the sibling loop.
+#[test]
+fn induction_write_in_block_leaves_no_read_of_its_accumulator() {
+    check_tile(
+        indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
+            for r in [1, 2]:
+                with begin():
+                    store := store + r
+                    cnt := cnt + 1
+            for y in [3, 4]:
+                cnt := cnt + 1
+            cnt
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![4])),
+    );
+}
+
+/// The same drop with the sibling loop's own `with begin():` block: each loop
+/// lifts a write to the shared `cnt`, and neither block reads it. Both folds
+/// name the one accumulator, so a stale read-binding leaves `cnt` free at the
+/// top and `splice_stores`' escape check reports it. `store` accumulates
+/// 1 + 2 + 3 + 4 = 10.
+#[test]
+fn two_txn_loops_lifting_writes_to_one_accumulator() {
+    check_tile(
+        indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
+            for r in [1, 2]:
+                with begin():
+                    store := store + r
+                    cnt := cnt + 1
+            for y in [3, 4]:
+                with begin():
+                    store := store + y
+                    cnt := cnt + 1
+            await_final(store)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![10])),
+    );
+}
+
+/// The lift preserves the relative order of the writes it moves, so a value bound
+/// after the write it reads travels unchanged. `y` is bound after `cnt := cnt + 1`,
+/// so it reads the post-increment `cnt` at the lift destination just as it did in
+/// the block, and `cnt2` accumulates 10 + 20 + 30 = 60.
+/// `induction_write_reading_past_a_lifted_write_rejected` is the same program with
+/// that binding before the write.
+#[test]
+fn induction_write_reads_a_binding_made_after_the_write() {
+    check_tile(
+        indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            cnt: Mut(Int) := 0
+            cnt2: Mut(Int) := 0
+            for r in [10, 20, 30]:
+                with begin():
+                    store := store + r
+                    cnt := cnt + 1
+                    y = cnt * 10
+                    cnt2 := cnt2 + y
+            cnt2
         "#},
         Tile::Scalar(ColumnValue::Ints(vec![60])),
     );

@@ -13,14 +13,14 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Name, channelize,
+        Expr, Name, anf, channelize,
         infer::{
             InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
             check_pre_channelize, infer, typecheck,
         },
         inline, lambda_elim,
         lower::{LoweredRoute, LoweringContext, LoweringError, lower_stmts},
-        mut_elim,
+        mut_elim, mut_read,
         panes::gate_leaks,
         planning,
         provenance::{
@@ -814,19 +814,24 @@ pub struct CompiledProgram {
     pub lowering_projection: SourceProjection,
     /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
     /// pre-monomorphization) pane, captured right after `uniquify` and before
-    /// `infer`.
+    /// `anf`.
     ///
-    /// It is the same tree `infer` consumes: source-shaped (lambdas intact,
-    /// Defer/Feed/Define still present) and **untyped** — every node's `ty` is a
-    /// `Hole`/`Infer`. The inspector renders those holes; the resolved downstream
-    /// type is stitched in from [`post_inference_ir`](Self::post_inference_ir) via
-    /// shared/remapped `NodeId`s.
+    /// It is source-shaped (lambdas intact, Defer/Feed/Define still present),
+    /// **un-A-normalized** (compound terms still sit in operand position), and
+    /// **untyped** — every node's `ty` is a `Hole`/`Infer`. The inspector renders
+    /// those holes; the resolved downstream type is stitched in from
+    /// [`post_inference_ir`](Self::post_inference_ir) via shared/remapped
+    /// `NodeId`s.
+    ///
+    /// The snapshot sits above `anf` rather than below it so its ids resolve
+    /// against the [`lowering_projection`](Self::lowering_projection), which
+    /// covers what lowering produced and nothing `anf` mints. The `Let`/`Var`
+    /// pairs `anf` names are explained instead by the pane pair below, whose
+    /// phase set carries [`Phase::Anf`] alongside [`Phase::Infer`].
     ///
     /// Monomorphization runs *inside* `infer`, freshening cloned ids, so this
-    /// snapshot holds the pre-mono **originals**; every ordinary node keeps its
-    /// id identical across the pair. Its ids resolve against the
-    /// [`lowering_projection`](Self::lowering_projection) (they are the pre-mono originals, keyed by lowering's
-    /// directly-lowered attributions).
+    /// snapshot holds the pre-mono **originals**; every ordinary node that
+    /// survives `anf` keeps its id identical across the pair.
     pub pre_inference_ir: Expr,
     /// The post-inference IR snapshot — the program inspector's anchor.
     ///
@@ -963,6 +968,17 @@ pub enum Phase {
     /// constructed**: `uniquify` preserves every node id, so it has nothing to
     /// record. The variant exists so the axis covers every phase.
     Uniquify,
+    /// A-normalization ([`crate::ccl::anf`]): naming every compound
+    /// sub-expression via a fresh `Let`, so only atomic terms occupy operand
+    /// positions from here on. Runs on the α-uniquified pre-inference tree,
+    /// so this is the phase that mints the new `Let`/`Var` nodes it needs.
+    Anf,
+    /// Read naming ([`crate::ccl::mut_read`]): binding the value each block's
+    /// mutable-variable reads denote to an immutable variable, one per read
+    /// segment. Runs on the A-normalized pre-inference tree, adopting the
+    /// binding A-normalization already gave each read it could move and minting
+    /// one for the position it could not.
+    MutRead,
     /// Type inference ([`crate::ccl::infer`]): the phase that bridges the
     /// pre-inference and post-inference panes. Monomorphization is what mints
     /// inside it — cloning a generalized definition's subtree once per distinct
@@ -1247,9 +1263,11 @@ const PROVENANCE_GATE_ENV: &str = "CAMBRA_PROVENANCE_GATE";
 /// [`provenance_predicates_live`].
 const PROVENANCE_PREDICATES_ENV: &str = "CAMBRA_PROVENANCE_PREDICATES";
 
-/// Repetition count for the ignored perf driver. Test-only — the driver is a
+/// Repetition count for the ignored perf drivers. Test-only — the driver is a
 /// `#[test]`, so the name is dead in a lib build; it lives here rather than
 /// beside its reader so that adding a fifth switch means editing one block.
+/// `tests/programs/compile_timing.rs` reads the same variable and spells the
+/// name itself, this constant not existing in the build it links against.
 #[cfg(test)]
 pub(crate) const PERF_REPS_ENV: &str = "CAMBRA_PERF_REPS";
 
@@ -1522,7 +1540,7 @@ fn check_mut_rules(expr: &Expr) -> Result<(), Vec<CompileError>> {
     check_mut_write_targets(expr).map_err(|errs| errs.into_compile_errors())
 }
 
-/// The transact phase's four rejections, run on the inlined, typed tree before
+/// The transact phase's five rejections, run on the inlined, typed tree before
 /// [`transact_phase::run`] strips the sites they inspect.
 ///
 /// - `check_no_nested_transactions` — a transactional writer reaching a `with
@@ -1535,6 +1553,10 @@ fn check_mut_rules(expr: &Expr) -> Result<(), Vec<CompileError>> {
 ///   inside a committing block (`balance := …; if p: cnt += 1`) is not liftable
 ///   and would be silently dropped from the decision record. A debug-only assert
 ///   would miss it in release.
+/// - `check_no_induction_write_reading_past_a_write` — an induction write whose
+///   value reads a block binding made before a write the lift would cross. The
+///   lifted write carries that binding's definiens, so the read would land past
+///   the write and report the wrong value.
 /// - `check_await_final_linearity` — `await_final` consumes its mutable variable:
 ///   no mention may follow its await. A statement-order rule lowering cannot see,
 ///   since it builds its chain right-to-left, and a callee's mention only becomes
@@ -1547,6 +1569,8 @@ fn check_transact_rejections(
     transact_phase::check_no_nested_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_induction_only_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_guarded_induction_write_in_block(expr, txn_mut_vars)
+        .map_err(reject)?;
+    transact_phase::check_no_induction_write_reading_past_a_write(expr, txn_mut_vars)
         .map_err(reject)?;
     transact_phase::check_await_final_linearity(expr).map_err(reject)
 }
@@ -1760,6 +1784,31 @@ fn run_passes(
         return Ok(expr);
     }
 
+    // A-normalize before inference so every downstream pass, inference
+    // included, sees only atomic terms in operand position — and so every
+    // mutable-variable read is named where it is performed, which is what keeps
+    // a hoist from overtaking it. `recorded` is needed here (unlike `Uniquify`,
+    // which mints nothing) because this pass mints the `Let`/`Var` nodes it
+    // introduces.
+    expr = recorded(capture_provenance, Phase::Anf, || anf::run(expr));
+    debug!("A-normalized:\n{}", symbolic(&expr));
+    if at_phase_output(Phase::Anf, &expr, stop, capture, panes) {
+        return Ok(expr);
+    }
+
+    // Name each block's mutable-variable reads, so no operand's refinement
+    // mentions a mutable variable (`src/ccl/mut_read.rs`). Runs on the
+    // A-normalized tree — where every read that pass could move already sits at
+    // a binding this one seals — and before inference, which is what refines an
+    // operand by the term that computed it. `recorded` because the pass mints
+    // the `Let`/`Var` nodes it introduces for the one position left, a
+    // value-position `match`'s scrutinee.
+    expr = recorded(capture_provenance, Phase::MutRead, || mut_read::run(expr));
+    debug!("Mutable reads named:\n{}", symbolic(&expr));
+    if at_phase_output(Phase::MutRead, &expr, stop, capture, panes) {
+        return Ok(expr);
+    }
+
     // Mutable variable every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
@@ -1789,9 +1838,16 @@ fn run_passes(
     // an id the projection doesn't cover (a node minted after lowering, e.g. by
     // monomorphization) degrades to a span-less diagnostic.
     if let Err(errors) = infer_outcome {
+        // A refinement in a message names the binder a mutable variable's read
+        // was given rather than the variable, which is machinery no program
+        // mentions. Respell it here, where the tree still carries the bindings
+        // (`mut_read::unbind` erases them below) and nothing types the error's
+        // types again.
+        let respelling = mut_read::read_respelling(&expr);
         return Err(errors
             .into_iter()
-            .map(|located| {
+            .map(|mut located| {
+                located.error.map_types(&|ty| respelling.apply_type(ty));
                 let span = lowering_projection
                     .get(&located.node_id)
                     .and_then(|attr| attr.spans.first().copied());
@@ -1820,6 +1876,15 @@ fn run_passes(
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
     check_mut_rules(&expr)?;
+
+    // Give each named read its position back, now that inference has run and no
+    // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
+    // Before the pane below, so one phase sits on one side of it; before
+    // `inline`, which moves uses and would make the substitution unsound; and
+    // after the discipline checks, which read the tree the user wrote.
+    expr = recorded(capture_provenance, Phase::MutRead, || {
+        mut_read::unbind(expr)
+    });
 
     // Enforce that every `:=` / `+=` write targets a mutable variable (a write is
     // never a shadowing rebind of an immutable). Post-inference so binder types

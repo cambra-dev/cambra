@@ -3,19 +3,22 @@
 // ---------------------------------------------------------------------------
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
 };
-use crate::ccl::infer_var::{Telescope, TelescopeWalk};
+use crate::ccl::infer_var::{InferVarId, Telescope, TelescopeWalk};
 use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, Level, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{
+    BindingTransparency, Expr, InferVar, Level, Lit, Name, Refinement, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
+};
 use crate::util::ScopeStack;
 
 use super::emit::emit_node;
@@ -175,6 +178,40 @@ pub(super) struct InferCtx {
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
     telescope: Telescope,
+    /// What each [opaque](crate::ccl::BindingTransparency::Opaque) binder was
+    /// bound at, kept past the binder's scope.
+    ///
+    /// A type lifted past such a binder keeps the name (`close_let_type`), so a
+    /// query about that type outside the scope needs the binder's own
+    /// refinements to decide it — `{Int | __elem == a ^+ x1}` entails
+    /// `{Int | __elem >= 0}` only given `x1 >= 0`. Entries accumulate and are
+    /// never removed: a uniquified name denotes one binding, so the fact it
+    /// records stays true.
+    opaque_binders: HashMap<Name, Type>,
+}
+
+/// The environment a solver query runs in: the lexical scope at the query,
+/// plus every opaque binder recorded so far.
+///
+/// Both halves answer one question — what is known about a name a predicate
+/// reads — and the scope stack answers it only while the binder is open, which
+/// is not where an opaque binder's uses are decided. Built per query from
+/// [`InferCtx`]'s two fields, so the borrow stays disjoint from the constraint
+/// cache the same call mutates.
+pub(super) struct SolverScope<'a> {
+    scopes: &'a ScopeStack<Name, Binding>,
+    opaque_binders: &'a HashMap<Name, Type>,
+}
+
+impl ScopeEnv for SolverScope<'_> {
+    fn binder_type(&self, name: &Name) -> Option<Type> {
+        self.scopes
+            .binder_type(name)
+            .or_else(|| self.opaque_binders.get(name).and_then(value_type))
+    }
+    fn is_skip_smt(&self) -> bool {
+        false
+    }
 }
 
 impl InferCtx {
@@ -192,6 +229,7 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             telescope: Telescope::empty(),
+            opaque_binders: HashMap::new(),
         }
     }
 
@@ -228,7 +266,7 @@ impl InferCtx {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable, at
             // the current lexical position (it carries the live telescope).
-            Type::Hole => Type::Infer(crate::ccl::InferVar::fresh_in(self.level, telescope)),
+            Type::Hole => Type::Infer(InferVar::fresh_in(self.level, telescope)),
             // A `SharedHole` means "infer this, and it is the same one as that":
             // the *first* occurrence of an id mints the variable and every later
             // one reuses it. That identity is the entire mechanism — it is how a
@@ -238,9 +276,7 @@ impl InferCtx {
                 .shared_holes
                 .borrow_mut()
                 .entry(*id)
-                .or_insert_with(|| {
-                    Type::Infer(crate::ccl::InferVar::fresh_in(self.level, telescope))
-                })
+                .or_insert_with(|| Type::Infer(InferVar::fresh_in(self.level, telescope)))
                 .clone(),
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
@@ -262,7 +298,7 @@ impl InferCtx {
                 )
             }
             Type::BoundedHole(bound) => {
-                let v = Type::Infer(crate::ccl::InferVar::fresh_in(self.level, telescope));
+                let v = Type::Infer(InferVar::fresh_in(self.level, telescope));
                 let bound = self.normalize_annotation_in(bound, telescope);
                 // A **local** cache, not `self.cache`: this method takes `&self`,
                 // and the memo exists only to break recursion on cyclic bounds.
@@ -399,7 +435,7 @@ impl Typing for InferCtx {
     }
 
     fn fresh(&mut self) -> Type {
-        Type::Infer(crate::ccl::InferVar::fresh_in(self.level, &self.telescope))
+        Type::Infer(InferVar::fresh_in(self.level, &self.telescope))
     }
 
     fn instantiate(&mut self, scheme: &PolyScheme) -> Type {
@@ -479,7 +515,11 @@ impl Typing for InferCtx {
         sup: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
-        constrain_subtype_in(sub, sup, &mut self.cache, &self.scopes)
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+        };
+        constrain_subtype_in(sub, sup, &mut self.cache, &scope)
             .map_err(|e| self.raise(map_constrain_err(e, &at())))
     }
 
@@ -519,11 +559,21 @@ impl Typing for InferCtx {
 
     fn scoped_let<R>(
         &mut self,
-        name: &Name,
-        bound_ty: &Type,
+        binding: &TypedBinding,
         generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        let (name, bound_ty) = (&binding.name, &binding.ty);
+        // An opaque binder carries no definiens, so a type lifted past it keeps
+        // the name (`close_let_type`) and what the name means there is the type
+        // it is bound at — a fact with no scope, recorded once here. Recorded on
+        // entry rather than on exit because a bound naming it is recorded
+        // *inside* the scope, on a variable that may have been minted outside
+        // (see [`Telescope`]).
+        if binding.transparency == BindingTransparency::Opaque {
+            self.telescope.enter_opaque(name);
+            self.opaque_binders.insert(name.clone(), bound_ty.clone());
+        }
         // Generalize at the current (outer) level: any variable in `bound_ty`
         // whose level exceeds `self.level` was minted inside the RHS and is
         // universally quantified; `instantiate` freshens it per use site.
@@ -551,7 +601,8 @@ impl Typing for InferCtx {
         r
     }
 
-    fn close_let_type(&mut self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
+        let name = &binding.name;
         // Lifting the body's type past the binder is an application: a `let`
         // telescope entry carries its definiens, so the lift discharges
         // `[name ↦ bound_expr]` (`src/ccl/design/type-inference.md`, "`let`
@@ -582,6 +633,15 @@ impl Typing for InferCtx {
         ) {
             return body_ty;
         }
+        // An opaque binder is the second exception, and for the reverse reason:
+        // it carries no definiens to discharge, so the name stays in the lifted
+        // type. What it means there is the type it was bound at, which outlives
+        // the scope as a standing fact ([`Self::opaque_binders`], recorded by
+        // `scoped_let` on the way in) — that is how a refinement over the binder
+        // is still decided once the binder's scope has closed.
+        if binding.transparency == BindingTransparency::Opaque {
+            return body_ty;
+        }
         let lifted = self.fresh();
         let Type::Infer(v) = &lifted else {
             unreachable!("fresh() yields a Type::Infer var");
@@ -593,6 +653,43 @@ impl Typing for InferCtx {
         crate::ccl::infer_var::enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         lifted
+    }
+
+    fn close_body_type(&mut self, body_ty: Type) -> Result<Type, LocatedInferError> {
+        let escaped = super::typing::escaped_opaque_binders(&self.opaque_binders, |n| {
+            self.scopes.lookup(n).is_some()
+        });
+        // The overwhelmingly common case: the walk has entered no opaque binder
+        // whose scope has since closed, so there is nothing a codomain could
+        // carry out of one and nothing to look for.
+        if escaped.is_empty() {
+            return Ok(body_ty);
+        }
+        if !reaches_escaped(&body_ty, &escaped, &mut HashSet::new()) {
+            return Ok(body_ty);
+        }
+        // Emit's body type is a variable whose refinements arrive as bounds, so
+        // the drop is performed on a *separate* variable: the body node keeps the
+        // type its own rule gave it, and the codomain is the weakened reading of
+        // it. `body_ty <: lifted` is the ordinary edge, so everything that reaches
+        // the body's type still reaches the codomain — including what arrives
+        // after this rule runs, from the function's call sites.
+        let lifted = self.fresh();
+        self.require_sub(&body_ty, &lifted, &|| "lambda body".to_string())?;
+        let Type::Infer(v) = &lifted else {
+            unreachable!("fresh() yields a Type::Infer var");
+        };
+        // The edge's closure deposits the body's *concrete* lower bounds directly
+        // here, following variable-to-variable edges on the way, so the
+        // refinements to drop are on this variable's own lower bounds. Complete
+        // because a refinement naming one of `escaped` can only be recorded where
+        // the binder is in scope, which is inside the body this rule has just
+        // finished emitting: no later arrival can name one.
+        for bound in v.bounds.borrow_mut().lower_mut() {
+            bound.ty =
+                crate::ccl::ccl_utils::drop_refinements_naming(&bound.ty, &|n| escaped.contains(n));
+        }
+        Ok(lifted)
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
@@ -675,14 +772,16 @@ impl Typing for InferCtx {
         // below read this one snapshot, so each shows what was inferred rather than the
         // partially modified state a failed `constrain_subtype` leaves behind.
         let inferred_ty = coalesce_for_error(inferred);
-        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &self.scopes).map_err(
-            |_| {
-                self.raise(InferError::AnnotationMismatch {
-                    annotation: ann.clone(),
-                    inferred: inferred_ty.clone(),
-                })
-            },
-        )?;
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+        };
+        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).map_err(|_| {
+            self.raise(InferError::AnnotationMismatch {
+                annotation: ann.clone(),
+                inferred: inferred_ty.clone(),
+            })
+        })?;
         // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
         // above is contravariant in the domain, so it leaves the shared variable *below*
         // every domain annotated with it: a common lower bound, which orders each domain
@@ -711,14 +810,16 @@ impl Typing for InferCtx {
             } = inferred.peel_refinements()
             && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
         {
-            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &self.scopes).map_err(
-                |_| {
-                    self.raise(InferError::AnnotationMismatch {
-                        annotation: ann.clone(),
-                        inferred: inferred_ty,
-                    })
-                },
-            )?;
+            let scope = SolverScope {
+                scopes: &self.scopes,
+                opaque_binders: &self.opaque_binders,
+            };
+            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).map_err(|_| {
+                self.raise(InferError::AnnotationMismatch {
+                    annotation: ann.clone(),
+                    inferred: inferred_ty,
+                })
+            })?;
         }
         Ok(ann_simple)
     }
@@ -870,6 +971,41 @@ impl Typing for InferCtx {
             None => codomain.clone(),
         }
     }
+}
+
+/// Whether a refinement naming one of `escaped` can reach a position typed `ty`.
+///
+/// Not a question about `ty` alone: an unresolved variable carries its
+/// refinements as lower bounds rather than in the type, and a variable-to-variable
+/// edge puts them a step further away still. The walk follows those edges, with
+/// `seen` breaking the cycles a constraint graph has.
+fn reaches_escaped(ty: &Type, escaped: &BTreeSet<Name>, seen: &mut HashSet<InferVarId>) -> bool {
+    if crate::ccl::subst::type_free_vars(ty)
+        .iter()
+        .any(|n| escaped.contains(n))
+    {
+        return true;
+    }
+    let mut found = false;
+    for_each_infer(ty, &mut |v| {
+        if found || !seen.insert(v.uid) {
+            return;
+        }
+        let lows = Rc::clone(v.bounds.borrow().lower());
+        found = lows.iter().any(|b| reaches_escaped(&b.ty, escaped, seen));
+    });
+    found
+}
+
+/// Visit every [`Type::Infer`] leaf of `ty`, refinement-predicate type slots
+/// excluded — a predicate's own slots restate what the refinement holding them
+/// says (`crate::ccl::infer::strip`), so following them adds no reachable bound.
+fn for_each_infer(ty: &Type, f: &mut impl FnMut(&Rc<InferVar>)) {
+    if let Type::Infer(v) = ty {
+        f(v);
+        return;
+    }
+    ty.walk_children(|child| for_each_infer(child, f));
 }
 
 #[cfg(test)]

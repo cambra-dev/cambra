@@ -759,16 +759,31 @@ pub(super) fn emit_lambda<C: Typing>(
     // function returning a `Mut`, whose reference would escape to where its writer set
     // is no longer statically known. Dereffing here would silently accept that program
     // by turning the escape into a read.
-    let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| ctx.subexpr(body))?;
-    // …and the same reason it is not dereffed here is why the *reported* codomain is
-    // what the body denotes rather than what its root node happens to be stamped with.
-    // A statement's type is its continuation's, and `emit_expr_stmt` derefs it; without
-    // this, inserting a statement before the escape hides the handle from rule 2 —
-    // `λ c → (c += 1; c)` would pass where `λ c → c` is rejected.
-    let body_ty = match denoted_expr(body).ty.mut_value_type() {
-        Some(_) => denoted_expr(body).ty.clone(),
-        None => body_ty,
-    };
+    //
+    // The body's closing runs under the binder, where the codomain stands. The Pi
+    // below binds the parameter in the codomain, so a refinement naming the
+    // parameter closes against the telescope of the variable Emit's closing mints.
+    // Minting it after the scope pops leaves the parameter out of that telescope,
+    // and the body bound naming it is an open bound there
+    // (`infer_var::enforce_bound_scope`). See `src/ccl/design/type-inference.md`,
+    // "A lambda's codomain drops the body's opaque binders".
+    let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| {
+        let body_ty = ctx.subexpr(body)?;
+        // …and the same reason it is not dereffed here is why the *reported* codomain is
+        // what the body denotes rather than what its root node happens to be stamped with.
+        // A statement's type is its continuation's, and `emit_expr_stmt` derefs it; without
+        // this, inserting a statement before the escape hides the handle from rule 2 —
+        // `λ c → (c += 1; c)` would pass where `λ c → c` is rejected.
+        let body_ty = match denoted_expr(body).ty.mut_value_type() {
+            Some(_) => denoted_expr(body).ty.clone(),
+            None => body_ty,
+        };
+        // An opaque binder the body introduced stands for one value per call, so a
+        // refinement naming it says nothing about the function's result and is
+        // dropped here (`Typing::close_body_type`). This is the lift out of the
+        // body's scope, the counterpart of a `let`'s `close_let_type`.
+        ctx.close_body_type(body_ty)
+    })?;
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the
@@ -1813,13 +1828,11 @@ pub(super) fn emit_let<C: Typing>(
     // mutability checks to read `user_annotation` as a proxy for it.
     binding.ty = scheme_ty.clone();
     let generalize = ctx.is_generalizable(bound_expr);
-    let body_ty = ctx.scoped_let(&binding.name, &scheme_ty, generalize, |ctx| {
-        ctx.subexpr(body)
-    })?;
+    let body_ty = ctx.scoped_let(binding, generalize, |ctx| ctx.subexpr(body))?;
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
     // story.
-    Ok(ctx.close_let_type(&binding.name, bound_expr, body_ty))
+    Ok(ctx.close_let_type(binding, bound_expr, body_ty))
 }
 
 /// Run `f` with every `(name, ty)` pair bound monomorphically, innermost-last
@@ -1915,7 +1928,15 @@ pub(super) fn emit_mut_decl<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx))?;
-    let history = ctx.normalize(&binding.ty);
+    let mut history = ctx.normalize(&binding.ty);
+    // The declared value type's predicates are terms, and the binder's slot is what
+    // carries them to the post-inference wall — an untyped one surfaces there as
+    // `UnresolvedInfer` on the predicate's own nodes (see
+    // `emit_annotation_predicates`). A mutable variable declares its refinement on the
+    // binder rather than in a `user_annotation`, so this is the only place that types it.
+    // Routed through the mode for the reason `emit_lambda`'s call is: Check trusts a
+    // resolved predicate.
+    ctx.type_annotation_predicates(&mut history)?;
     debug_assert!(
         history.mut_value_type().is_some(),
         "a MutDecl binder must be an Overwrite history, got {history}"

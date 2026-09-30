@@ -300,3 +300,44 @@ fn a_trailing_pass_leaves_the_statement_above_it_as_the_value() {
 fn a_transaction_of_nothing_but_pass_has_no_footprint(#[case] code: &str) {
     check_compile_error(code, "must do something");
 }
+
+// ---------------------------------------------------------------------------
+// Opaque bindings (`^=`)
+// ---------------------------------------------------------------------------
+
+/// `^=` binds and evaluates exactly as `=` does — the two differ in what a type
+/// reads in the binder's place, not in what the program computes.
+#[rstest]
+#[case(
+    indoc! {r#"
+        x = 5
+        y ^= x
+        y ^+ y
+    "#},
+    Value::Int(10)
+)]
+#[case(
+    indoc! {r#"
+        r = (a=7, b=9)
+        v ^= r.a
+        v + 1
+    "#},
+    Value::Int(8)
+)]
+fn an_opaque_binding_evaluates_as_a_plain_one(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// An opaque binding no type spells is inlined like any other. The binder is
+/// kept only where a type still names it — a function binding that reaches
+/// planning un-inlined is an iteration site the engine has no collection for.
+#[test]
+fn an_opaque_binding_no_type_names_is_still_inlined() {
+    check_scalar(
+        indoc! {r#"
+            f ^= \x -> x + 1
+            f(1)
+        "#},
+        Value::Int(2),
+    );
+}

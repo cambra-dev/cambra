@@ -2803,15 +2803,22 @@ mod tests {
                 !r.is_identical(),
                 "a swapped pair of registers is a change at {phase:?}:\n{r}"
             );
-            // The swap is one site — the tuple — rather than the whole
-            // recurrence: the two reads pair with their counterparts and move.
+            // The swap localizes to the two swapped positions rather than the
+            // whole recurrence: the two reads pair with their counterparts and
+            // move. A-normalization names each read above the tuple, and
+            // `inline::stands_in_a_value_former` keeps those names standing at
+            // the element positions for this pairing, so the two sites are the
+            // tuple's `AnfTemp` `Var`s, each resolving to the other version's
+            // binder.
             let sites = r.divergences();
             assert!(
                 matches!(
                     sites.as_slice(),
-                    [Divergence::Changed(m)] if matches!(m.dst.node, TypedExprNode::Tuple(_))
+                    [Divergence::Changed(a), Divergence::Changed(b)]
+                        if matches!(a.dst.node, TypedExprNode::Var(_))
+                            && matches!(b.dst.node, TypedExprNode::Var(_))
                 ),
-                "at {phase:?} the swap must localize to the tuple:\n{r}",
+                "at {phase:?} the swap must localize to the tuple's elements:\n{r}",
             );
             // And the tuple itself is not offered for reuse: its two elements
             // returned swapped values.

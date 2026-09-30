@@ -9,9 +9,14 @@
 //! Cargo collects every `mod.rs`'s `#[test]` items into this one integration
 //! test binary (`cargo test --test programs`).
 //!
+//! `compile_timing.rs` is the gallery's ignored compile-time driver rather than
+//! a program: it discovers the `.cambra` files itself, so a new program needs
+//! no line there.
+//!
 //! For the human-facing gallery, see `docs/demo-programs.md`.
 
 mod common;
+mod compile_timing;
 #[path = "../support/serving.rs"]
 mod serving;
 
