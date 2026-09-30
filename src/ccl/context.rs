@@ -1799,10 +1799,10 @@ fn run_passes(
     // Name each block's mutable-variable reads, so no operand's refinement
     // mentions a mutable variable (`src/ccl/mut_read.rs`). Runs on the
     // A-normalized tree — where every read that pass could move already sits at
-    // an opaque binding this one adopts — and before inference, which is what
-    // refines an operand by the term that computed it. `recorded` because the
-    // pass mints the `Let`/`Var` nodes it introduces for the one position left,
-    // a value-position `match`'s scrutinee.
+    // a binding this one seals — and before inference, which is what refines an
+    // operand by the term that computed it. `recorded` because the pass mints
+    // the `Let`/`Var` nodes it introduces for the one position left, a
+    // value-position `match`'s scrutinee.
     expr = recorded(capture_provenance, Phase::MutRead, || mut_read::run(expr));
     debug!("Mutable reads named:\n{}", symbolic(&expr));
     if at_phase_output(Phase::MutRead, &expr, stop, capture, panes) {

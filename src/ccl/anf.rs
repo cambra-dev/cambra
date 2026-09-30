@@ -46,20 +46,19 @@
 //! writes beside it. Which names are mutable is answered syntactically, by
 //! [`crate::ccl::mut_scope`], since inference has not run.
 //!
-//! **The binding is opaque.** A transparent binder carries its definiens, so a
-//! type lifted out of the binding's scope reads the mutable variable back in
-//! the binder's place — a type naming a variable that has no single value for
-//! it to refer to (`crate::ccl::mut_read`, "Why a read gets a name"). Opacity
-//! is also what puts the binder in the telescope of a contribution that names
-//! it, and a mutable variable's own writes are contributions of that shape.
+//! **Whether the binding is opaque is [`crate::ccl::mut_read`]'s to say.** That
+//! pass cuts a block into read segments at its writes and seals one binding per
+//! segment, so opacity is a property of the segment rather than of the read: a
+//! binding sealed here would open a segment at every hoisted read.
 //!
 //! **A chain holding one is flattened onto the statement spine** ([`peel`]).
 //! [`normalize`] seals the bindings an operand needed around that operand, and
 //! an enclosing hoist nests the seal inside its own definiens, where the outer
-//! binding's type names a binder bound strictly inside the term it types. A
-//! transparent binder is discharged at that boundary and an opaque one is not,
-//! so a chain holding a read is peeled and re-sealed one level out while every
-//! other chain keeps its nesting.
+//! binding's type names a binder bound strictly inside the term it types. An
+//! ordinary chain survives that nesting, a transparent binder being discharged
+//! into the types leaving its scope. The binding `mut_read` seals is opaque and
+//! is not discharged, so a chain holding a read is peeled and re-sealed one
+//! level out.
 //!
 //! A **handle** position holds the variable rather than its value, so the
 //! mention there is not a read and stays where it stands
@@ -160,7 +159,7 @@
 //! before that substitution exists.
 
 use crate::ccl::{
-    BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
+    Branch, Expr, Name, TypedBinding, TypedExprNode,
     mut_scope::{Muts, is_mut_var, under_param, with},
     provenance::{self, Nature},
 };
@@ -515,23 +514,12 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
 /// wrap around its own reconstruction (via [`let_chain`]), plus the atomic
 /// term to use in `e`'s original position.
 fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
-    let (mut binds, core) = peel(normalize(e, muts));
+    let (mut binds, core) = peel(normalize(e, muts), muts);
     if is_atomic(&core, muts) {
         return (binds, core);
     }
     let name = Name::anf_temp();
-    let mut binding = TypedBinding::new_unannotated(name.clone());
-    // A binding naming a **read** is opaque, for the reason
-    // [`crate::ccl::mut_read`]'s is: a transparent binder carries its
-    // definiens, so a type lifted out of this binding's scope reads the mutable
-    // variable back in the binder's place — a type naming a variable with no
-    // single value for it to refer to, which is what naming the read was for.
-    // It is also what puts the binder in the telescope of a contribution that
-    // names it (`src/ccl/design/type-inference.md`, "The invariant"), and a
-    // mutable variable's own writes are contributions of exactly that shape.
-    if is_mut_var(&core, muts) {
-        binding.transparency = BindingTransparency::Opaque;
-    }
+    let binding = TypedBinding::new_unannotated(name.clone());
     let var_ref = Expr::var(name);
     binds.push((binding, core));
     (binds, var_ref)
@@ -553,15 +541,14 @@ fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// Only a chain holding a read is peeled, and then all of it: peeling a
 /// *subset* would move a read across a sibling binding that may write, which is
 /// the mis-ordering this pass is sequencing the read to avoid. A chain of
-/// ordinary hoists keeps its nesting, where a transparent binder is discharged
-/// into the types leaving its scope and a refinement stays written in closed
-/// terms.
+/// ordinary hoists keeps its nesting, where every binder is discharged into the
+/// types leaving its scope and a refinement stays written in closed terms.
 ///
 /// Only this pass's own binders are peeled ([`Name::is_anf_temp`]). A `let` the
 /// program wrote, or a statement spine in a value position, is a block of its
 /// own whose writes belong where they stand.
-fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
-    if !seals_a_read(&e) {
+fn peel(mut e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
+    if !seals_a_read(&e, muts) {
         return (Vec::new(), e);
     }
     let mut binds = Vec::new();
@@ -741,16 +728,20 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
     }
 }
 
-/// Does the chain this pass sealed at the root of `e` hold a read — an opaque
-/// binding, which [`atomize`] mints for a mutable-variable read and for nothing
-/// else?
-fn seals_a_read(e: &Expr) -> bool {
+/// Does the chain this pass sealed at the root of `e` hold a read — a binding
+/// whose definiens is a bare reference to a mutable variable?
+fn seals_a_read(e: &Expr, muts: &Muts) -> bool {
     let mut cursor = e;
-    while let TypedExprNode::Let { binding, body, .. } = &cursor.node {
+    while let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &cursor.node
+    {
         if !binding.name.is_anf_temp() {
             return false;
         }
-        if binding.transparency == BindingTransparency::Opaque {
+        if is_mut_var(bound_expr, muts) {
             return true;
         }
         cursor = body;
@@ -1003,14 +994,12 @@ mod tests {
             Expr::tuple(vec![Expr::var(x.clone()), call]),
         ));
         let s = symbolic(&out);
-        // `^=` is the opaque binding: a type lifted out of the read's scope
-        // keeps the binder rather than reading `x` back in its place.
         assert!(
-            s.contains("__anf ^= x") && s.contains("(__anf, __anf)"),
+            s.contains("__anf = x") && s.contains("(__anf, __anf)"),
             "the read is named ahead of the call: {s}"
         );
         assert!(
-            s.find("^= x").unwrap() < s.find("▷ f").unwrap(),
+            s.find("= x").unwrap() < s.find("▷ f").unwrap(),
             "the read is performed before the call: {s}"
         );
     }

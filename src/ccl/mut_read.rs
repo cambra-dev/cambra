@@ -20,18 +20,27 @@
 //! let __read ^= m in let n = match __read { `ping(s) → s; `close(_) → 0 } in n
 //! ```
 //!
-//! Every use of a segment's binder precedes the write that ended the segment.
-//! That is what [`unbind`] substitutes back on, and it holds of the tree this
-//! pass produces and of no later one.
+//! Every use of a binder this pass **mints** precedes the write that ended its
+//! segment. That is what [`unbind`] substitutes back on, and it holds of the
+//! tree this pass produces and of no later one.
 //!
 //! # A read A-normalization already named
 //!
 //! A-normalization hoists a read out of every value position it can move one
-//! out of, into an opaque binding at the read's source position, so that a
-//! hoist beside it does not overtake it (`crate::ccl::anf`, "A mutable-variable
-//! read is not atomic"). Such a binding is a read-segment binding already, and
-//! [`spine`] adopts it — opening the segment on the binder that is there rather
-//! than naming the same read a second time inside it.
+//! out of, into a binding at the read's source position, so that a hoist beside
+//! it does not overtake it (`crate::ccl::anf`, "A mutable-variable read is not
+//! atomic"). [`spine`] seals the one standing at a segment's first read, making
+//! it that segment's binder, and drops a later read's binding as an alias of
+//! the binder already open. The hoisted bindings divide nothing: a segment ends
+//! at a write.
+//!
+//! **A sealed binding stays a binding.** Replacing it with one of this pass's
+//! own would put its uses under [`unbind`], and a use A-normalization hoisted
+//! out of a value position can stand after the write that ended the segment —
+//! `(x, g(x))`, where `g` writes through a `Mut` parameter, hoists the call and
+//! leaves the element reading `x` after it. Substituted back there, the element
+//! reads the written value. The hoisted binding is what holds the read at its
+//! source position, so [`unbind`] leaves it alone ([`Name::is_mut_read`]).
 //!
 //! What is left to mint for is the one value position A-normalization leaves in
 //! place: a value-position `match`'s **scrutinee**, whose naming would carry a
@@ -165,20 +174,27 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
     let rebuild = rebuilder(&expr);
     match expr.node {
         TypedExprNode::Let {
-            binding,
+            mut binding,
             bound_expr,
             body,
         } => {
-            // A-normalization sequences a read at its own opaque binding
-            // (`crate::ccl::anf`, "A mutable-variable read is not atomic"),
-            // which is a read-segment binding already: it opens the segment
-            // rather than being named a second time inside it. The mention is
-            // the read this binding holds, so it ends no segment either.
-            if is_mut_var(&bound_expr, muts) && binding.transparency == BindingTransparency::Opaque
-            {
+            // A-normalization has already put a binding at this read's source
+            // position (`crate::ccl::anf`, "A mutable-variable read is not
+            // atomic"), and that binding is what holds the read there — it
+            // stays. The segment's first read makes it the segment binder by
+            // sealing it; a later read in the same segment names the value the
+            // open binder already holds, so its binding is an alias and drops
+            // out. Either way the mention is the read this binding holds, so it
+            // ends no segment.
+            if binding.name.is_anf_temp() && is_mut_var(&bound_expr, muts) {
                 let TypedExprNode::Var(source) = &bound_expr.node else {
                     unreachable!("is_mut_var matched a Var")
                 };
+                if let Some(open_binder) = open.get(source).cloned() {
+                    let body = spine(*body, muts, open);
+                    return substitute(body, &binding.name, &Expr::var(open_binder));
+                }
+                binding.transparency = BindingTransparency::Opaque;
                 open.insert(source.clone(), binding.name.clone());
                 let body = spine(*body, muts, open);
                 return rebuild(TypedExprNode::Let {
@@ -505,6 +521,11 @@ fn respell(expr: &Expr, muts: &Muts, out: &mut Subst) {
 /// precedes that write, which holds of the tree this pass produced and of no
 /// later one: `inline` moves uses — collapsing `y = __read` puts a use wherever
 /// `y` stood, including past the write — so the same rewrite there is unsound.
+///
+/// **Only the binders this pass minted.** A binding A-normalization hoisted and
+/// [`run`] sealed holds its read at that read's source position, and its uses
+/// carry no such ordering (module docs, "A read A-normalization already
+/// named"); [`Name::is_mut_read`] is what separates the two.
 pub fn unbind(expr: Expr) -> Expr {
     let root_id = expr.node_id();
     let _g = provenance::enter(root_id, "mut_read.unbind", Nature::Machinery);
@@ -605,6 +626,28 @@ mod tests {
         let s = symbolic(&out);
         assert_eq!(s.matches("__read ^= x").count(), 1, "one binding: {s}");
         assert!(s.contains("__read + __read"), "both reads named: {s}");
+    }
+
+    /// Two reads A-normalization hoisted in one segment share one binder: the
+    /// first binding is sealed and the second drops out as an alias of it.
+    #[test]
+    fn hoisted_reads_in_one_segment_share_a_binder() {
+        let x = Name::fresh("x");
+        let (first, second) = (Name::anf_temp(), Name::anf_temp());
+        let body = Expr::let_in(
+            TypedBinding::new_unannotated(first.clone()),
+            Expr::var(x.clone()),
+            Expr::let_in(
+                TypedBinding::new_unannotated(second.clone()),
+                Expr::var(x.clone()),
+                Expr::tuple(vec![Expr::var(first), Expr::var(second)]),
+            ),
+        );
+        let out = run(accumulator(&x, body));
+        let s = symbolic(&out);
+        assert_eq!(s.matches("^= x").count(), 1, "one binding: {s}");
+        assert!(s.contains("(__anf, __anf)"), "both reads named: {s}");
+        assert!(!s.contains("__read"), "no binder is minted: {s}");
     }
 
     /// A block's terminal read stays a bare reference — the position rule 2 and
