@@ -659,28 +659,16 @@ fn two_feed_sites_tag_their_keys() {
     "#});
 }
 
-/// Aggregating a mutable collection that a keyed write has touched panics in `Aggregate`
-/// with `expected a collection, got Scalar(Variants([]))`. Minimised: the same store
-/// aggregates fine with no write, and a plain map literal aggregates fine, so the keyed
-/// write is what breaks it. Pinned at the interpreter's answer and the compiler's panic.
+/// Aggregating a mutable collection that a keyed write has touched.
 #[test]
-#[should_panic(expected = "Aggregate expected a collection")]
-fn aggregating_a_keyed_written_store_panics() {
-    let source = indoc! {r#"
+fn aggregating_a_keyed_written_store() {
+    agree(indoc! {r#"
         m: Mut(Map(String, Int)) := box(map([("a", 1)]))
         for k in ["b", "c"]:
             m[k] := 9
         out = test_sink()
         out << sum(m)
-    "#};
-    assert_eq!(
-        interpreted(source),
-        Value::Collection(Collection::from_entries(vec![(
-            Value::Unit,
-            Value::Int(19)
-        )]))
-    );
-    compiled(source);
+    "#});
 }
 
 /// The same store, aggregated without a keyed write, agrees.

@@ -23,6 +23,10 @@ pub enum Value {
         payload: Box<Value>,
     },
     Collection(Collection),
+    /// A value that depends on a channel whose contents are not complete yet, on a pass of
+    /// evaluation before the one [`crate::run`] answers from (see [`crate::eval`]). It
+    /// absorbs: every value computed from it is pending, so no other value holds one.
+    Pending,
 }
 
 /// A key-to-value map. Keys are unique; order is not part of the value.
@@ -221,6 +225,7 @@ fn total_cmp(a: &Value, b: &Value) -> Ordering {
             Value::Record(_) => 4,
             Value::Variant { .. } => 5,
             Value::Collection(_) => 6,
+            Value::Pending => 8,
         }
     }
     match (a, b) {
@@ -254,6 +259,7 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Unit => write!(f, "()"),
             Value::CommitTime(t) => write!(f, "t{t}"),
+            Value::Pending => write!(f, "?"),
             Value::Record(fields) => {
                 let mut sorted = fields.clone();
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));

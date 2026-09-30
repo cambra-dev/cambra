@@ -2,6 +2,26 @@
 //!
 //! A trailing bare expression is evaluated and observed by nothing: a program's observable is
 //! its sinks.
+//!
+//! # Passes
+//!
+//! A read of a channel denotes its whole collection, which evaluation in program order may not
+//! have built yet: a feed that runs later, such as one in a function called later, is part of
+//! it. So a program runs in passes, each in program order.
+//!
+//! - A pass answers a read of a channel an earlier pass completed with that channel's final
+//!   contents, and a read of any other channel with [`Value::Pending`].
+//! - Pending absorbs. A value computed from a pending one is pending, a write of one leaves the
+//!   variable pending for every later read, and a branch, arm, loop body or operand whose
+//!   running depends on one runs speculatively: every effect it has is pending, since it may
+//!   not happen.
+//! - At the end of a pass, a channel with no pending contribution is complete, and the next
+//!   pass reads its final contents.
+//!
+//! The pass that reads no incomplete channel is the program's answer. A pass that completes no
+//! channel leaves every remaining read depending on its own channel's contents, a cycle, and is
+//! refused. A read of a mutable variable sees the latest write before it in program order on
+//! every pass, so the order a pass runs in is the program's own.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,6 +59,11 @@ struct MutCell {
     /// Sequenced by `Txn` rather than by an induction extent, which decides where a read
     /// of it is determinate (`docs/chl-spec.md`, "8.3 Reads").
     txn: bool,
+    /// The cell's creation order among all cells, so a loop can tell a cell it outlives from
+    /// one an iteration made.
+    born: u64,
+    /// The `with` block that has written this `Txn` cell, by its source position.
+    writer_site: Option<usize>,
 }
 
 /// What a name is bound to. Every binding form lives in [`Interp::scopes`], so a function
@@ -71,12 +96,17 @@ struct Function {
 /// A block that neither writes nor replies is a denial and takes no commit time; `wrote`
 /// records whether it wrote.
 struct TxnFrame {
+    /// The block's source position, which identifies it as a writer of a `Txn` cell.
+    site: usize,
     wrote: bool,
     /// The mutable variables the block writes anywhere in its body. A read of a `Txn`
     /// variable the block does not write is an as-of read.
     writes: BTreeSet<String>,
     /// Replies fed inside the block, held until the block commits and its commit time is known.
     replies: Vec<(String, usize, Value)>,
+    /// Whether the block wrote or replied speculatively, which leaves whether it commits
+    /// undecided.
+    uncertain: bool,
 }
 
 /// An open channel: what `defer()` or `test_sink()` made.
@@ -99,9 +129,18 @@ struct Channel {
     /// tagged by which one. The tagging is a property of the program text, so a site that
     /// never fires still counts.
     sites: Vec<usize>,
-    /// Every `<<=` naming this channel. A read before one has run is refused like a read
-    /// before a feed.
-    define_sites: Vec<usize>,
+}
+
+impl Channel {
+    /// The channel's contents, if this pass made them final: no contribution is pending.
+    fn complete(&self) -> Option<Result<Value, Error>> {
+        let pending = matches!(self.defined, Some(Value::Pending))
+            || self
+                .fed
+                .iter()
+                .any(|(_, k, v)| matches!(k, Value::Pending) || matches!(v, Value::Pending));
+        (!pending).then(|| channel_value(self))
+    }
 }
 
 pub(crate) struct Interp {
@@ -112,39 +151,69 @@ pub(crate) struct Interp {
     observed: BTreeSet<String>,
     /// Feed sites per channel name, collected from the program text before it runs.
     feed_sites: BTreeMap<String, Vec<usize>>,
-    /// `<<=` sites per channel name, collected the same way.
-    define_sites: BTreeMap<String, Vec<usize>>,
     /// The values a generator has yielded, while one is running.
     yielded: Option<Vec<(Value, Value)>>,
     /// The commit times transaction blocks have taken. They are dense and 1-based: a block
     /// that denies takes none, so they count commits rather than blocks.
     commit_time: i64,
+    /// Whether [`Self::commit_time`] is the count: false once a block whose commit is
+    /// undecided has run, after which every commit time is pending.
+    clock_known: bool,
+    /// The final contents of each channel an earlier pass completed.
+    finals: BTreeMap<String, Value>,
+    /// The channels this pass read before they were complete.
+    waited_on: BTreeSet<String>,
+    /// How many enclosing constructs run speculatively.
+    speculating: usize,
+    /// [`Self::speculating`] where the running function was entered: a `return` above it is
+    /// under a speculative branch of the function's own, so whether it leaves is undecided.
+    speculating_at_call: usize,
+    /// Why this pass lost track of an effect: a speculative construct failed partway, so what
+    /// it would have done after the failure is unknown.
+    lost: Option<Error>,
     /// The block in progress, while one is.
     txn: Option<TxnFrame>,
-    /// For each feed or `<<=` site, the source position where the top-level statement
-    /// enclosing it ends: the point past which that site contributes nothing more.
-    feed_done_at: BTreeMap<usize, usize>,
     /// The keys of the loops enclosing the current statement, outermost first.
     loop_keys: Vec<Value>,
+    /// How many mutable cells the program has made, which stamps each cell's
+    /// [`MutCell::born`].
+    cells_made: u64,
+    /// One watch per running loop over a collection not keyed by position, innermost last.
+    order_watches: Vec<OrderWatch>,
+}
+
+/// A loop over a collection not keyed by position, whose iteration order is not defined
+/// (`docs/chl-spec.md`, "Accumulator iteration order is not yet defined [Open]").
+///
+/// An iteration's effects that outlive it make the loop's result depend on that order: a write
+/// to a cell made before the loop began, and a commit, which takes the next commit time. The
+/// watch records whether any happened, however the body reached them, through a call included.
+struct OrderWatch {
+    /// [`Interp::cells_made`] when the loop began: a cell born earlier outlives the loop.
+    cells_before: u64,
+    /// Whether an iteration has had an effect that outlives it.
+    moved: bool,
 }
 
 impl Interp {
-    fn new(
-        feed_sites: BTreeMap<String, Vec<usize>>,
-        define_sites: BTreeMap<String, Vec<usize>>,
-        feed_done_at: BTreeMap<usize, usize>,
-    ) -> Self {
+    fn new(feed_sites: BTreeMap<String, Vec<usize>>, finals: BTreeMap<String, Value>) -> Self {
         Self {
             scopes: vec![Vec::new()],
             channels: BTreeMap::new(),
             observed: BTreeSet::new(),
             feed_sites,
-            define_sites,
             yielded: None,
             commit_time: 0,
+            clock_known: true,
+            finals,
+            waited_on: BTreeSet::new(),
+            speculating: 0,
+            speculating_at_call: 0,
+            lost: None,
             txn: None,
-            feed_done_at,
             loop_keys: Vec::new(),
+            cells_made: 0,
+            order_watches: Vec::new(),
         }
     }
 
@@ -181,11 +250,32 @@ impl Interp {
     fn site_key(&self) -> Value {
         tuple_key(&self.loop_keys)
     }
+
+    /// Run `f` speculatively: whether it runs at all depends on a pending value.
+    fn speculate<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.speculating += 1;
+        let out = f(self);
+        self.speculating -= 1;
+        out
+    }
+
+    /// Record that a speculative construct failed, keeping the first reason.
+    fn lose(&mut self, why: Error) {
+        self.lost.get_or_insert(why);
+    }
+}
+
+/// Whether any of `values` is pending, which makes a value built from them pending.
+fn any_pending<'a>(values: impl IntoIterator<Item = &'a Value>) -> bool {
+    values.into_iter().any(|v| matches!(v, Value::Pending))
 }
 
 /// Unit for no key, the key itself for one, and the tuple of them for several — the
 /// iteration domain of a site under that many loops.
 fn tuple_key(keys: &[Value]) -> Value {
+    if any_pending(keys) {
+        return Value::Pending;
+    }
     match keys {
         [] => Value::Unit,
         [k] => k.clone(),
@@ -208,38 +298,57 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     let module = chl_parser::parse_module(source)
         .into_result()
         .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
-    let (mut feed_sites, mut define_sites) = (BTreeMap::new(), BTreeMap::new());
-    collect_feed_sites(&module.body, &mut feed_sites, &mut define_sites);
-    let mut feed_done_at = BTreeMap::new();
-    for stmt in &module.body {
-        let (mut feeds, mut defines) = (BTreeMap::new(), BTreeMap::new());
-        collect_feed_sites(std::slice::from_ref(stmt), &mut feeds, &mut defines);
-        for site in feeds.into_values().chain(defines.into_values()).flatten() {
-            feed_done_at.insert(site, stmt.span.end);
+    let mut feed_sites = BTreeMap::new();
+    collect_feed_sites(&module.body, &mut feed_sites);
+
+    // Each pass completes at least one channel or ends the run, so there is at most one pass per
+    // channel, plus the last.
+    let mut finals: BTreeMap<String, Value> = BTreeMap::new();
+    loop {
+        let mut interp = Interp::new(feed_sites.clone(), finals.clone());
+        // A failure outside speculation is on the path the program takes, whatever a later
+        // pass would read, so it is the program's.
+        interp.exec_block(&module.body)?;
+        if interp.waited_on.is_empty() {
+            debug_assert!(
+                finals.iter().all(|(n, v)| interp.channels[n]
+                    .complete()
+                    .and_then(Result::ok)
+                    .as_ref()
+                    == Some(v)),
+                "a channel's final contents are what the last pass built"
+            );
+            return interp
+                .channels
+                .iter()
+                .filter(|(name, _)| interp.observed.contains(*name))
+                .map(|(name, channel)| Ok((name.clone(), channel_value(channel)?)))
+                .collect();
         }
+        if let Some(why) = interp.lost {
+            return err(format!(
+                "{why}, in code that runs only if a channel still being built has particular \
+                 contents, so its effects could not be followed, which is not judgeable"
+            ));
+        }
+        let mut completed = Vec::new();
+        for (name, channel) in &interp.channels {
+            if !finals.contains_key(name)
+                && let Some(value) = channel.complete()
+            {
+                completed.push((name.clone(), value?));
+            }
+        }
+        if completed.is_empty() {
+            let waited: Vec<String> = interp.waited_on.iter().map(|n| format!("`{n}`")).collect();
+            return err(format!(
+                "no read of {} can be answered: the contents of each depend on a read of one \
+                 of them, a cycle, which is not judgeable",
+                waited.join(", ")
+            ));
+        }
+        finals.extend(completed);
     }
-
-    // Two `with` sites writing one variable commit in an order the program does not determine
-    // (`docs/chl-spec.md`, "8.5 Ordering and concurrency"), so every read and reply downstream
-    // of them has more than one right answer.
-    let mut writers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    collect_with_writes(&module.body, &mut writers);
-    if let Some((name, _)) = writers.iter().find(|(_, sites)| sites.len() > 1) {
-        return err(format!(
-            "`{name}` is written by more than one `with` block, whose commit order is not \
-             determined, which is not judgeable"
-        ));
-    }
-
-    let mut interp = Interp::new(feed_sites, define_sites, feed_done_at);
-    interp.exec_block(&module.body)?;
-
-    interp
-        .channels
-        .iter()
-        .filter(|(name, _)| interp.observed.contains(*name))
-        .map(|(name, channel)| Ok((name.clone(), channel_value(channel)?)))
-        .collect()
 }
 
 /// Whether a walk enters a `def` or lambda body. Its statements run where it is called
@@ -374,45 +483,17 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
     }
 }
 
-/// Every `<<` site in `body` into `feeds` and every `<<=` site into `defines`, by the
-/// channel name each names, in source order.
-fn collect_feed_sites(
-    body: &[Spanned<Stmt>],
-    feeds: &mut BTreeMap<String, Vec<usize>>,
-    defines: &mut BTreeMap<String, Vec<usize>>,
-) {
-    for_each_stmt(body, Bodies::Enter, &mut |s| match &s.node {
-        Stmt::Expr(e) => {
-            if let Expr::Feed { target, value } = &e.node
-                && let Expr::Name(n) = &target.node
-            {
-                feeds
-                    .entry(n.to_string())
-                    .or_default()
-                    .push(value.span.start);
-            }
-        }
-        Stmt::Define { target, value } => {
-            if let AssignTarget::Name(n) = &target.node {
-                defines
-                    .entry(n.to_string())
-                    .or_default()
-                    .push(value.span.start);
-            }
-        }
-        _ => {}
-    });
-}
-
-/// The `with` sites that write each variable, by the site's source position.
-fn collect_with_writes(body: &[Spanned<Stmt>], out: &mut BTreeMap<String, Vec<usize>>) {
+/// Every `<<` site in `body` into `feeds`, by the channel name each names, in source order.
+fn collect_feed_sites(body: &[Spanned<Stmt>], feeds: &mut BTreeMap<String, Vec<usize>>) {
     for_each_stmt(body, Bodies::Enter, &mut |s| {
-        if let Stmt::With { body, .. } = &s.node {
-            let mut names = BTreeSet::new();
-            written_names(body, &mut names);
-            for n in names {
-                out.entry(n).or_default().push(s.span.start);
-            }
+        if let Stmt::Expr(e) = &s.node
+            && let Expr::Feed { target, value } = &e.node
+            && let Expr::Name(n) = &target.node
+        {
+            feeds
+                .entry(n.to_string())
+                .or_default()
+                .push(value.span.start);
         }
     });
 }
@@ -443,12 +524,6 @@ fn runs_any(body: &[Spanned<Stmt>], pred: impl Fn(&Stmt) -> bool) -> bool {
     found
 }
 
-/// Whether `body` holds a `with begin():` block, whose commits a loop around it takes in
-/// its iteration order.
-fn contains_with(body: &[Spanned<Stmt>]) -> bool {
-    runs_any(body, |s| matches!(s, Stmt::With { .. }))
-}
-
 /// Whether an annotation sequences its mutable variable by `Txn`: `Mut(V, Txn)`.
 fn is_txn_annotation(annotation: &TypeAnnotation) -> bool {
     matches!(&annotation.ty.node, Expr::Call { func, args }
@@ -471,10 +546,35 @@ impl Interp {
         Ok(None)
     }
 
+    /// Run one statement. While speculating, a failure is not the program's, since the
+    /// statement may not run at all, so the pass records that it lost the statement's effects.
+    /// A `return` under a speculative branch of its own function is lost the same way: whether
+    /// the function leaves there is undecided.
     fn exec(&mut self, stmt: &Spanned<Stmt>) -> Result<Option<Value>, Error> {
+        let ran = self.exec_stmt(stmt);
+        if self.speculating == 0 {
+            return ran;
+        }
+        match ran {
+            Err(why) => {
+                self.lose(why);
+                Ok(None)
+            }
+            Ok(Some(_)) if self.speculating > self.speculating_at_call => {
+                self.lose(Error(
+                    "a `return` whose branch depends on a channel still being built".into(),
+                ));
+                Ok(None)
+            }
+            ran => ran,
+        }
+    }
+
+    fn exec_stmt(&mut self, stmt: &Spanned<Stmt>) -> Result<Option<Value>, Error> {
         match &stmt.node {
-            // `out = test_sink()` declares a sink; any other assignment binds a value.
-            Stmt::Assign { target, value } => {
+            // `out = test_sink()` declares a sink; any other assignment binds a value. An
+            // opaque binding (`^=`) binds the same value, since its opacity only affects typing.
+            Stmt::Assign { target, value, .. } => {
                 let name = name_of(target)?;
                 let is_sink = is_zero_arg_call(&value.node, "test_sink");
                 if is_sink || is_zero_arg_call(&value.node, "defer") {
@@ -485,12 +585,10 @@ impl Interp {
                         ));
                     }
                     let sites = self.feed_sites.get(&name).cloned().unwrap_or_default();
-                    let define_sites = self.define_sites.get(&name).cloned().unwrap_or_default();
                     self.channels.insert(
                         name.clone(),
                         Channel {
                             sites,
-                            define_sites,
                             ..Channel::default()
                         },
                     );
@@ -526,10 +624,16 @@ impl Interp {
                 let v = self.eval(value)?;
                 match &target.node {
                     AssignTarget::Name(n) => match self.mut_cell(n) {
-                        Some(cell) => self.write(&cell, v),
+                        Some(cell) => self.write(n, &cell, v)?,
                         None => {
                             let txn = annotation.as_ref().is_some_and(is_txn_annotation);
-                            let cell = Rc::new(RefCell::new(MutCell { value: v, txn }));
+                            self.cells_made += 1;
+                            let cell = Rc::new(RefCell::new(MutCell {
+                                value: v,
+                                txn,
+                                born: self.cells_made,
+                                writer_site: None,
+                            }));
                             self.bind(n.to_string(), Slot::Mut(cell));
                         }
                     },
@@ -541,7 +645,12 @@ impl Interp {
                         let Some(cell) = self.mut_cell(n) else {
                             return err(format!("`{n}` is not a mutable variable"));
                         };
-                        let Value::Collection(c) = cell.borrow().value.clone() else {
+                        let current = cell.borrow().value.clone();
+                        if any_pending([&key, &v, &current]) {
+                            self.write(n, &cell, Value::Pending)?;
+                            return Ok(None);
+                        }
+                        let Value::Collection(c) = current else {
                             return err(format!("`{n}` is not a mutable collection"));
                         };
                         // Last write wins per key, in place; a key not yet present is added.
@@ -550,7 +659,7 @@ impl Interp {
                             Some(entry) => entry.1 = v,
                             None => entries.push((key, v)),
                         }
-                        self.write(&cell, Value::Collection(collection(entries)?));
+                        self.write(n, &cell, Value::Collection(collection(entries)?))?;
                     }
                     other => return err(format!("unsupported write target: {other:?}")),
                 }
@@ -576,7 +685,7 @@ impl Interp {
                     current,
                     rhs,
                 )?;
-                self.write(&cell, updated);
+                self.write(&name, &cell, updated)?;
                 Ok(None)
             }
 
@@ -585,18 +694,27 @@ impl Interp {
             Stmt::Define { target, value } => {
                 let name = name_of(target)?;
                 let v = self.eval(value)?;
-                let is_channel = matches!(self.slot(&name), Some(Slot::Chan));
-                match self.channels.get_mut(&name).filter(|_| is_channel) {
-                    Some(channel) => {
-                        if channel.defined.is_some() || !channel.sites.is_empty() {
-                            return err(format!(
-                                "`{name}` is defined twice, or both fed and defined"
-                            ));
-                        }
-                        channel.defined = Some(v);
-                    }
-                    None => self.bind(name, Slot::Val(v)),
+                if !matches!(self.slot(&name), Some(Slot::Chan)) {
+                    self.bind(name, Slot::Val(v));
+                    return Ok(None);
                 }
+                let speculating = self.speculating > 0;
+                let channel = self
+                    .channels
+                    .get_mut(&name)
+                    .expect("a channel slot names an open channel");
+                // A `<<=` that may not run, or one after one that may not have, leaves the
+                // channel's value undecided rather than defined twice.
+                if speculating || matches!(channel.defined, Some(Value::Pending)) {
+                    channel.defined = Some(Value::Pending);
+                    return Ok(None);
+                }
+                if channel.defined.is_some() || !channel.sites.is_empty() {
+                    return err(format!(
+                        "`{name}` is defined twice, or both fed and defined"
+                    ));
+                }
+                channel.defined = Some(v);
                 Ok(None)
             }
 
@@ -607,21 +725,36 @@ impl Interp {
                 branches,
                 else_body,
             } => match self.select_branch(branches, else_body)? {
-                Some(body) => self.scoped(|me| me.exec_block(&body)),
-                None => Ok(None),
+                Taken::Body(body) => self.scoped(|me| me.exec_block(&body)),
+                Taken::Nothing => Ok(None),
+                Taken::Undecided(bodies) => self.speculate(|me| {
+                    for body in &bodies {
+                        me.scoped(|me| me.exec_block(body))?;
+                    }
+                    Ok(None)
+                }),
             },
 
             // Tag dispatch: the first arm whose tag matches, or a wildcard arm.
-            Stmt::Match { scrutinee, arms } => {
-                let (bound, body) = self.match_arm(scrutinee, arms)?;
-                let body = body.to_vec();
-                self.scoped(|me| {
+            Stmt::Match { scrutinee, arms } => match self.match_arm(scrutinee, arms)? {
+                Chosen::Arm(bound, body) => self.scoped(|me| {
                     if let Some((n, v)) = bound {
                         me.bind(n, Slot::Val(v));
                     }
-                    me.exec_block(&body)
-                })
-            }
+                    me.exec_block(body)
+                }),
+                Chosen::Undecided(arms) => self.speculate(|me| {
+                    for (bound, body) in arms {
+                        me.scoped(|me| {
+                            if let Some(n) = bound {
+                                me.bind(n, Slot::Val(Value::Pending));
+                            }
+                            me.exec_block(body)
+                        })?;
+                    }
+                    Ok(None)
+                }),
+            },
 
             Stmt::FunctionDef {
                 name, params, body, ..
@@ -654,47 +787,69 @@ impl Interp {
                     other => return err(format!("unsupported loop target: {other:?}")),
                 };
                 let source = self.eval(iter)?;
+                // A pending collection has pending keys and elements, so the body runs once,
+                // speculatively, over a pending element under a pending key.
+                if matches!(source, Value::Pending) {
+                    return self.speculate(|me| {
+                        me.loop_keys.push(Value::Pending);
+                        let ran = me.scoped(|me| {
+                            me.bind(name, Slot::Val(Value::Pending));
+                            me.exec_block(body)
+                        });
+                        me.loop_keys.pop();
+                        ran.map(|_| None)
+                    });
+                }
                 let Value::Collection(c) = source else {
                     return err("a `for` loop iterates a collection");
                 };
-                // A body that accumulates, or holds a block whose commits take the loop's
-                // order, may depend on the iteration order, which is `[Open]`
-                // (`docs/chl-spec.md`, "Accumulator iteration order is not yet defined
-                // [Open]"). Both sides run a list in index order, so such a loop runs over
-                // integer keys ascending and is refused over any other key. The compiler
-                // refuses one over an integer-keyed collection that is not a list, so that
-                // answer is never compared.
-                let mut written = BTreeSet::new();
-                written_names(body, &mut written);
-                let accumulates = written.iter().any(|n| self.mut_cell(n).is_some());
+                // Iteration order is `[Open]` (`docs/chl-spec.md`, "Accumulator iteration order
+                // is not yet defined [Open]"). Both sides run a list in index order, so a loop
+                // runs over integer keys ascending. Over any other key it runs under an
+                // [`OrderWatch`], and is refused if an iteration had an effect that outlives
+                // it, or returned while another iteration might have returned first. The
+                // compiler refuses an accumulating loop over an integer-keyed collection that
+                // is not a list, so that answer is never compared.
                 let mut entries = c.entries().to_vec();
-                if accumulates || contains_with(body) {
-                    if !entries.iter().all(|(k, _)| matches!(k, Value::Int(_))) {
+                let positional = entries.iter().all(|(k, _)| matches!(k, Value::Int(_)));
+                if positional {
+                    entries.sort_by_key(|(k, _)| match k {
+                        Value::Int(i) => *i,
+                        _ => unreachable!("checked above"),
+                    });
+                } else {
+                    self.order_watches.push(OrderWatch {
+                        cells_before: self.cells_made,
+                        moved: false,
+                    });
+                }
+                let several = entries.len() > 1;
+                let mut ran = Ok(None);
+                for (key, elem) in entries {
+                    // The loop's key extends the feed site's key: a contribution from inside
+                    // this body lands under the position its element came from.
+                    self.loop_keys.push(key);
+                    ran = self.scoped(|me| {
+                        me.bind(name.clone(), Slot::Val(elem));
+                        me.exec_block(body)
+                    });
+                    self.loop_keys.pop();
+                    if !matches!(ran, Ok(None)) {
+                        break;
+                    }
+                }
+                if !positional {
+                    let watch = self.order_watches.pop().expect("pushed above");
+                    let returned_early = several && matches!(ran, Ok(Some(_)));
+                    if ran.is_ok() && (watch.moved || returned_early) {
                         return err(
                             "a loop whose result may depend on its iteration order iterates a \
                              collection not keyed by position, whose order is not defined, \
                              which is not judgeable",
                         );
                     }
-                    entries.sort_by_key(|(k, _)| match k {
-                        Value::Int(i) => *i,
-                        _ => unreachable!("checked above"),
-                    });
                 }
-                for (key, elem) in entries {
-                    // The loop's key extends the feed site's key: a contribution from inside
-                    // this body lands under the position its element came from.
-                    self.loop_keys.push(key);
-                    let returned = self.scoped(|me| {
-                        me.bind(name.clone(), Slot::Val(elem));
-                        me.exec_block(body)
-                    });
-                    self.loop_keys.pop();
-                    if let Some(v) = returned? {
-                        return Ok(Some(v));
-                    }
-                }
-                Ok(None)
+                ran
             }
 
             Stmt::Expr(e) => {
@@ -710,6 +865,12 @@ impl Interp {
                     }
                     let key = self.site_key();
                     let v = self.eval(inner)?;
+                    // A yield that may not run leaves the generator's collection undecided.
+                    let v = if self.speculating > 0 {
+                        Value::Pending
+                    } else {
+                        v
+                    };
                     self.yielded.as_mut().expect("checked").push((key, v));
                     return Ok(None);
                 }
@@ -735,26 +896,43 @@ impl Interp {
                 let mut writes = BTreeSet::new();
                 written_names(body, &mut writes);
                 self.txn = Some(TxnFrame {
+                    site: stmt.span.start,
                     wrote: false,
                     writes,
                     replies: Vec::new(),
+                    uncertain: false,
                 });
                 let outcome = self.scoped(|me| me.exec_block(body));
                 let frame = self.txn.take().expect("installed above");
                 outcome?;
 
+                // A block that may or may not commit leaves every later commit time undecided,
+                // and its own replies may not happen.
+                if frame.uncertain {
+                    self.clock_known = false;
+                    for (channel, site, _) in frame.replies {
+                        self.contribute(&channel)
+                            .push((site, Value::Pending, Value::Pending));
+                    }
+                    return Ok(None);
+                }
                 if !frame.wrote && frame.replies.is_empty() {
                     // Denied: no write, no reply, no commit time.
                     return Ok(None);
                 }
                 self.commit_time += 1;
-                let at = Value::CommitTime(self.commit_time);
+                // A commit takes the next commit time, so a loop around it takes its commits
+                // in iteration order.
+                for watch in &mut self.order_watches {
+                    watch.moved = true;
+                }
+                let at = if self.clock_known {
+                    Value::CommitTime(self.commit_time)
+                } else {
+                    Value::Pending
+                };
                 for (channel, site, value) in frame.replies {
-                    self.channels
-                        .get_mut(&channel)
-                        .expect("a reply names an open channel")
-                        .fed
-                        .push((site, at.clone(), value));
+                    self.contribute(&channel).push((site, at.clone(), value));
                 }
                 Ok(None)
             }
@@ -787,11 +965,51 @@ impl Interp {
             .collect()
     }
 
-    fn write(&mut self, cell: &Rc<RefCell<MutCell>>, value: Value) {
-        cell.borrow_mut().value = value;
+    /// Write `value` to the cell `name` resolves to.
+    ///
+    /// Two `with` blocks writing one `Txn` variable commit in an order the program does not
+    /// determine (`docs/chl-spec.md`, "8.5 Ordering and concurrency"), so every read and reply
+    /// downstream of them has more than one right answer, and the second block's write is
+    /// refused.
+    fn write(
+        &mut self,
+        name: &str,
+        cell: &Rc<RefCell<MutCell>>,
+        value: Value,
+    ) -> Result<(), Error> {
+        // A write that may not happen leaves the variable's value undecided for every later
+        // read, and the block around it undecided about whether it commits.
+        if self.speculating > 0 {
+            cell.borrow_mut().value = Value::Pending;
+            if let Some(frame) = self.txn.as_mut() {
+                frame.uncertain = true;
+            }
+            return Ok(());
+        }
+        let mut c = cell.borrow_mut();
+        if c.txn
+            && let Some(frame) = &self.txn
+        {
+            match c.writer_site {
+                Some(site) if site != frame.site => {
+                    return err(format!(
+                        "`{name}` is written by more than one `with` block, whose commit order \
+                         is not determined, which is not judgeable"
+                    ));
+                }
+                _ => c.writer_site = Some(frame.site),
+            }
+        }
+        c.value = value;
+        for watch in &mut self.order_watches {
+            if c.born <= watch.cells_before {
+                watch.moved = true;
+            }
+        }
         if let Some(frame) = self.txn.as_mut() {
             frame.wrote = true;
         }
+        Ok(())
     }
 
     /// Read a mutable variable where `docs/chl-spec.md`, "8.3 Reads" makes the read
@@ -815,20 +1033,38 @@ impl Interp {
     }
 
     /// The body an `if`/`elif`/`else` chain selects, if any.
+    ///
+    /// A pending condition leaves undecided which of its branch and every later one runs. The
+    /// later conditions are evaluated speculatively, for their effects.
     fn select_branch(
         &mut self,
         branches: &[IfBranch],
         else_body: &Option<Vec<Spanned<Stmt>>>,
-    ) -> Result<Option<Vec<Spanned<Stmt>>>, Error> {
-        for branch in branches {
-            let Value::Bool(taken) = self.eval(&branch.cond)? else {
-                return err("an `if` condition is a boolean");
-            };
-            if taken {
-                return Ok(Some(branch.body.clone()));
+    ) -> Result<Taken, Error> {
+        for (i, branch) in branches.iter().enumerate() {
+            match self.eval(&branch.cond)? {
+                Value::Bool(true) => return Ok(Taken::Body(branch.body.clone())),
+                Value::Bool(false) => {}
+                Value::Pending => {
+                    let rest = &branches[i..];
+                    self.speculate(|me| {
+                        for later in &rest[1..] {
+                            me.eval(&later.cond)?;
+                        }
+                        Ok::<_, Error>(())
+                    })?;
+                    let mut bodies: Vec<Vec<Spanned<Stmt>>> =
+                        rest.iter().map(|b| b.body.clone()).collect();
+                    bodies.extend(else_body.clone());
+                    return Ok(Taken::Undecided(bodies));
+                }
+                _ => return err("an `if` condition is a boolean"),
             }
         }
-        Ok(else_body.clone())
+        Ok(match else_body {
+            Some(body) => Taken::Body(body.clone()),
+            None => Taken::Nothing,
+        })
     }
 
     fn feed(&mut self, target: &Spanned<Expr>, value: &Spanned<Expr>) -> Result<(), Error> {
@@ -840,6 +1076,13 @@ impl Interp {
             return err(format!("`{name}` is not a channel"));
         }
         let contributed = self.eval(value)?;
+        // A contribution that may not happen is pending whatever its value.
+        let speculating = self.speculating > 0;
+        let contributed = if speculating {
+            Value::Pending
+        } else {
+            contributed
+        };
         // The feed's source position identifies the site: two `<<` in one program are two
         // places whatever they write.
         let site = value.span.start;
@@ -848,16 +1091,30 @@ impl Interp {
             // the iteration that produced it. The commit time is not known until the block
             // commits, so the reply waits here.
             frame.replies.push((name, site, contributed));
+            frame.uncertain |= speculating;
             return Ok(());
         }
         let key = self.site_key();
-        self.channels
-            .get_mut(&name)
-            .expect("checked above")
-            .fed
-            .push((site, key, contributed));
+        self.contribute(&name).push((site, key, contributed));
         Ok(())
     }
+
+    /// The contributions of the open channel `name`.
+    fn contribute(&mut self, name: &str) -> &mut Vec<(usize, Value, Value)> {
+        &mut self
+            .channels
+            .get_mut(name)
+            .expect("a contribution names an open channel")
+            .fed
+    }
+}
+
+/// What an `if`/`elif`/`else` chain selects.
+enum Taken {
+    Body(Vec<Spanned<Stmt>>),
+    Nothing,
+    /// A condition is pending, so any of these bodies may run.
+    Undecided(Vec<Vec<Spanned<Stmt>>>),
 }
 
 impl Interp {
@@ -904,49 +1161,75 @@ impl Interp {
         effects_denote_unit: bool,
     ) -> Result<Value, Error> {
         match &stmt.node {
-            Stmt::Match { scrutinee, arms } => {
-                let (bound, body) = self.match_arm(scrutinee, arms)?;
-                let body = body.to_vec();
-                self.scoped(|me| {
+            Stmt::Match { scrutinee, arms } => match self.match_arm(scrutinee, arms)? {
+                Chosen::Arm(bound, body) => self.scoped(|me| {
                     if let Some((n, v)) = bound {
                         me.bind(n, Slot::Val(v));
                     }
-                    me.block_value(&body, effects_denote_unit)
-                })
-            }
+                    me.block_value(body, effects_denote_unit)
+                }),
+                Chosen::Undecided(arms) => self.speculate(|me| {
+                    for (bound, body) in arms {
+                        me.scoped(|me| {
+                            if let Some(n) = bound {
+                                me.bind(n, Slot::Val(Value::Pending));
+                            }
+                            me.block_value(body, effects_denote_unit)
+                        })?;
+                    }
+                    Ok(Value::Pending)
+                }),
+            },
             Stmt::If {
                 branches,
                 else_body,
             } => match self.select_branch(branches, else_body)? {
-                Some(body) => self.scoped(|me| me.block_value(&body, effects_denote_unit)),
-                None => err("an `if` with no `else` denotes no value"),
+                Taken::Body(body) => self.scoped(|me| me.block_value(&body, effects_denote_unit)),
+                Taken::Nothing => err("an `if` with no `else` denotes no value"),
+                Taken::Undecided(bodies) => self.speculate(|me| {
+                    for body in &bodies {
+                        me.scoped(|me| me.block_value(body, effects_denote_unit))?;
+                    }
+                    Ok(Value::Pending)
+                }),
             },
             other => err(format!("{other:?} in expression position")),
         }
     }
 
-    /// The arm a `match` selects, with its payload bound.
+    /// The arm a `match` selects, with its payload bound. A pending scrutinee leaves every arm
+    /// possible.
     fn match_arm<'a>(
         &mut self,
         scrutinee: &Spanned<Expr>,
         arms: &'a [chl_parser::ast::MatchArm],
-    ) -> Result<Selected<'a>, Error> {
+    ) -> Result<Chosen<'a>, Error> {
+        let binder = |arm: &chl_parser::ast::MatchArm| match &arm.pattern {
+            Some(pattern) => match &pattern.payload {
+                PayloadPattern::Named(n) => Some(n.to_string()),
+                PayloadPattern::Ignored | PayloadPattern::Absent => None,
+            },
+            None => None,
+        };
         let v = self.eval(scrutinee)?;
+        if matches!(v, Value::Pending) {
+            return Ok(Chosen::Undecided(
+                arms.iter()
+                    .map(|arm| (binder(arm), &arm.body[..]))
+                    .collect(),
+            ));
+        }
         let Value::Variant { tag, payload } = v else {
             return err("`match` dispatches on a variant");
         };
         for arm in arms {
-            let Some(pattern) = &arm.pattern else {
-                return Ok((None, &arm.body));
-            };
-            if pattern.tag.as_str() != tag {
+            if let Some(pattern) = &arm.pattern
+                && pattern.tag.as_str() != tag
+            {
                 continue;
             }
-            let bound = match &pattern.payload {
-                PayloadPattern::Named(n) => Some((n.to_string(), (*payload).clone())),
-                PayloadPattern::Ignored | PayloadPattern::Absent => None,
-            };
-            return Ok((bound, &arm.body));
+            let bound = binder(arm).map(|n| (n, (*payload).clone()));
+            return Ok(Chosen::Arm(bound, &arm.body));
         }
         err(format!("no `match` arm for tag `{tag}"))
     }
@@ -981,8 +1264,13 @@ fn channel_value(channel: &Channel) -> Result<Value, Error> {
     Ok(Value::Collection(collection(entries)?))
 }
 
-/// The arm a `match` chose: the payload it binds, if any, and the body to run.
-type Selected<'a> = (Option<(String, Value)>, &'a [Spanned<Stmt>]);
+/// What a `match` selects.
+enum Chosen<'a> {
+    /// The arm that runs: the payload it binds, if any, and its body.
+    Arm(Option<(String, Value)>, &'a [Spanned<Stmt>]),
+    /// The scrutinee is pending, so any arm may run: each arm's binder, if any, and body.
+    Undecided(Vec<(Option<String>, &'a [Spanned<Stmt>])>),
+}
 
 /// The single name an assignment target binds.
 fn name_of(target: &Spanned<AssignTarget>) -> Result<String, Error> {
@@ -1006,7 +1294,19 @@ fn contains_yield(body: &[Spanned<Stmt>]) -> bool {
 }
 
 impl Interp {
+    /// Evaluate `e`. While speculating, a failure is not the program's, since `e` may not run
+    /// at all, so it answers pending and the pass records that it lost `e`'s effects.
     fn eval(&mut self, e: &Spanned<Expr>) -> Result<Value, Error> {
+        match self.eval_expr(e) {
+            Err(why) if self.speculating > 0 => {
+                self.lose(why);
+                Ok(Value::Pending)
+            }
+            evaluated => evaluated,
+        }
+    }
+
+    fn eval_expr(&mut self, e: &Spanned<Expr>) -> Result<Value, Error> {
         match &e.node {
             Expr::Lit(Lit::Int(i)) => Ok(Value::Int(*i)),
             Expr::Lit(Lit::String(s)) => Ok(Value::Str(s.clone())),
@@ -1018,24 +1318,15 @@ impl Interp {
                     let cell = cell.clone();
                     self.read_mut(n, &cell)
                 }
-                // The read denotes the whole collection, which evaluation in program order has
-                // not built while a feed or `<<=` to it is still to run.
-                Some(Slot::Chan) => {
-                    let channel = &self.channels[n.as_str()];
-                    if let Some(site) =
-                        channel.sites.iter().chain(&channel.define_sites).find(|s| {
-                            self.feed_done_at
-                                .get(s)
-                                .is_none_or(|end| *end > e.span.start)
-                        })
-                    {
-                        return err(format!(
-                            "`{n}` is read before its feed or define at {site} has run, and \
-                             the read denotes the whole collection"
-                        ));
+                // The read denotes the whole collection: its final contents once an earlier pass
+                // completed it, and pending until then.
+                Some(Slot::Chan) => match self.finals.get(n.as_str()) {
+                    Some(v) => Ok(v.clone()),
+                    None => {
+                        self.waited_on.insert(n.to_string());
+                        Ok(Value::Pending)
                     }
-                    channel_value(channel)
-                }
+                },
                 Some(Slot::Fn(_)) => err(format!("`{n}` is a function, which is not a value")),
                 None => err(format!("unbound name: {n}")),
             },
@@ -1045,6 +1336,9 @@ impl Interp {
                 for it in items {
                     out.push(self.eval(it)?);
                 }
+                if any_pending(&out) {
+                    return Ok(Value::Pending);
+                }
                 Ok(Value::Collection(Collection::from_list(out)))
             }
 
@@ -1053,11 +1347,17 @@ impl Interp {
                 for f in fields {
                     out.push((f.name.to_string(), self.eval(&f.value)?));
                 }
+                if any_pending(out.iter().map(|(_, v)| v)) {
+                    return Ok(Value::Pending);
+                }
                 Ok(Value::Record(out))
             }
 
             Expr::Attribute { target, attr, .. } => {
                 let v = self.eval(target)?;
+                if matches!(v, Value::Pending) {
+                    return Ok(Value::Pending);
+                }
                 let Value::Record(fields) = v else {
                     return err(format!("field access `.{attr}` on a non-record"));
                 };
@@ -1079,6 +1379,9 @@ impl Interp {
                     Some(VariantPayload::Term(inner)) => self.eval(inner)?,
                     Some(p) => return err(format!("unsupported variant payload: {p:?}")),
                 };
+                if matches!(inner, Value::Pending) {
+                    return Ok(Value::Pending);
+                }
                 Ok(Value::Variant {
                     tag: tag.to_string(),
                     payload: Box::new(inner),
@@ -1088,6 +1391,7 @@ impl Interp {
             Expr::UnaryOp { op, operand } => {
                 let v = self.eval(operand)?;
                 match (op, v) {
+                    (_, Value::Pending) => Ok(Value::Pending),
                     (UnaryOp::Neg, Value::Int(i)) => i
                         .checked_neg()
                         .map(Value::Int)
@@ -1108,13 +1412,23 @@ impl Interp {
                 comparators,
             } => {
                 let mut prev = self.eval(left)?;
-                for (op, rhs) in ops.iter().zip(comparators) {
+                for (i, (op, rhs)) in ops.iter().zip(comparators).enumerate() {
                     let next = self.eval(rhs)?;
-                    let Value::Bool(held) = compare(*op, prev, next.clone())? else {
-                        return err("a comparison answers a boolean");
-                    };
-                    if !held {
-                        return Ok(Value::Bool(false));
+                    match compare(*op, prev, next.clone())? {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) => return Ok(Value::Bool(false)),
+                        // Whether the chain stops here is undecided, so the comparands after
+                        // it run speculatively.
+                        Value::Pending => {
+                            self.speculate(|me| {
+                                for later in &comparators[i + 1..] {
+                                    me.eval(later)?;
+                                }
+                                Ok::<_, Error>(())
+                            })?;
+                            return Ok(Value::Pending);
+                        }
+                        _ => return err("a comparison answers a boolean"),
                     }
                     prev = next;
                 }
@@ -1124,9 +1438,20 @@ impl Interp {
             // Short-circuiting, so an operand past the decisive one is never evaluated.
             Expr::BoolOp { op, operands } => {
                 let mut last = matches!(op, BoolOp::And);
-                for operand in operands {
-                    let Value::Bool(b) = self.eval(operand)? else {
-                        return err("a boolean operator takes booleans");
+                for (i, operand) in operands.iter().enumerate() {
+                    let b = match self.eval(operand)? {
+                        Value::Bool(b) => b,
+                        // Whether the operands after it run is undecided.
+                        Value::Pending => {
+                            self.speculate(|me| {
+                                for later in &operands[i + 1..] {
+                                    me.eval(later)?;
+                                }
+                                Ok::<_, Error>(())
+                            })?;
+                            return Ok(Value::Pending);
+                        }
+                        _ => return err("a boolean operator takes booleans"),
                     };
                     last = b;
                     match op {
@@ -1143,8 +1468,16 @@ impl Interp {
                 then_expr,
                 else_expr,
             } => {
-                let Value::Bool(c) = self.eval(cond)? else {
-                    return err("a conditional's test is a boolean");
+                let c = match self.eval(cond)? {
+                    Value::Bool(c) => c,
+                    Value::Pending => {
+                        self.speculate(|me| {
+                            me.eval(then_expr)?;
+                            me.eval(else_expr)
+                        })?;
+                        return Ok(Value::Pending);
+                    }
+                    _ => return err("a conditional's test is a boolean"),
                 };
                 if c {
                     self.eval(then_expr)
@@ -1156,6 +1489,9 @@ impl Interp {
             Expr::ListComp(comp) => {
                 let mut out = Vec::new();
                 self.comprehend(&comp.clauses, &comp.element, &mut Vec::new(), &mut out)?;
+                if any_pending(out.iter().flat_map(|(k, v)| [k, v])) {
+                    return Ok(Value::Pending);
+                }
                 Ok(Value::Collection(collection(out)?))
             }
 
@@ -1165,6 +1501,9 @@ impl Interp {
                 let mut fields = Vec::with_capacity(items.len());
                 for (i, it) in items.iter().enumerate() {
                     fields.push((format!("_{i}"), self.eval(it)?));
+                }
+                if any_pending(fields.iter().map(|(_, v)| v)) {
+                    return Ok(Value::Pending);
                 }
                 Ok(Value::Record(fields))
             }
@@ -1179,6 +1518,9 @@ impl Interp {
             } => {
                 let t = self.eval(target)?;
                 let k = self.eval(index)?;
+                if any_pending([&t, &k]) {
+                    return Ok(Value::Pending);
+                }
                 match t {
                     Value::Collection(c) => {
                         let found = c.entries().iter().find(|(key, _)| *key == k);
@@ -1253,8 +1595,10 @@ impl Interp {
             // A map is written as its entries; `box` marks a value as a whole rather than
             // a collection to iterate, which changes nothing about what it is.
             ("map", 1) => {
-                let Value::Collection(pairs) = self.eval(&args[0])? else {
-                    return err("`map` takes a collection of pairs");
+                let pairs = match self.eval(&args[0])? {
+                    Value::Collection(pairs) => pairs,
+                    Value::Pending => return Ok(Value::Pending),
+                    _ => return err("`map` takes a collection of pairs"),
                 };
                 let mut entries = Vec::with_capacity(pairs.len());
                 for (_, pair) in pairs.entries() {
@@ -1276,8 +1620,10 @@ impl Interp {
             ("box", 1) => self.eval(&args[0]),
 
             ("max", 1) => {
-                let Value::Collection(c) = self.eval(&args[0])? else {
-                    return err("`max` takes a collection");
+                let c = match self.eval(&args[0])? {
+                    Value::Collection(c) => c,
+                    Value::Pending => return Ok(Value::Pending),
+                    _ => return err("`max` takes a collection"),
                 };
                 let mut best: Option<i64> = None;
                 for (_, v) in c.entries() {
@@ -1291,8 +1637,10 @@ impl Interp {
             }
 
             ("sum", 1) => {
-                let Value::Collection(c) = self.eval(&args[0])? else {
-                    return err("`sum` takes a collection");
+                let c = match self.eval(&args[0])? {
+                    Value::Collection(c) => c,
+                    Value::Pending => return Ok(Value::Pending),
+                    _ => return err("`sum` takes a collection"),
                 };
                 let mut total = Value::Int(0);
                 for (_, v) in c.entries() {
@@ -1307,12 +1655,22 @@ impl Interp {
             // `groupby(xs, f)` is keyed by the group key, and each group holds its members
             // under the keys they had in `xs`.
             ("groupby", 2) => {
-                let Value::Collection(c) = self.eval(&args[0])? else {
-                    return err("`groupby` takes a collection");
+                let c = match self.eval(&args[0])? {
+                    Value::Collection(c) => c,
+                    // The key function runs over elements that are pending, so it runs once,
+                    // speculatively, for its effects.
+                    Value::Pending => {
+                        self.speculate(|me| me.apply(&args[1], Value::Pending))?;
+                        return Ok(Value::Pending);
+                    }
+                    _ => return err("`groupby` takes a collection"),
                 };
                 let mut groups: Vec<(Value, Vec<(Value, Value)>)> = Vec::new();
                 for (key, elem) in c.entries().to_vec() {
                     let gk = self.apply(&args[1], elem.clone())?;
+                    if matches!(gk, Value::Pending) {
+                        return Ok(Value::Pending);
+                    }
                     match groups.iter_mut().find(|(k, _)| *k == gk) {
                         Some((_, members)) => members.push((key, elem)),
                         None => groups.push((gk, vec![(key, elem)])),
@@ -1364,6 +1722,9 @@ impl Interp {
         let mut env = function.env.clone();
         env.push(params);
         let caller = std::mem::replace(&mut self.scopes, env);
+        // The function's own branches decide whether its `return`s run.
+        let caller_speculating_at =
+            std::mem::replace(&mut self.speculating_at_call, self.speculating);
         let outcome = if contains_yield(&function.body) {
             // A generator denotes the collection of what it yielded, keyed by its own
             // loops' positions.
@@ -1373,11 +1734,17 @@ impl Interp {
             let collected =
                 std::mem::replace(&mut self.yielded, outer_yielded).expect("installed above");
             self.loop_keys = outer_keys;
-            ran.and_then(|_| collection(collected).map(Value::Collection))
+            ran.and_then(|_| {
+                if any_pending(collected.iter().flat_map(|(k, v)| [k, v])) {
+                    return Ok(Value::Pending);
+                }
+                collection(collected).map(Value::Collection)
+            })
         } else {
             self.block_value(&function.body, true)
         };
         self.scopes = caller;
+        self.speculating_at_call = caller_speculating_at;
         outcome
     }
 
@@ -1413,22 +1780,41 @@ impl Interp {
                 out.push((tuple_key(keys), v));
                 Ok(())
             }
-            Some((CompClause::If(guard), rest)) => {
-                let Value::Bool(keep) = self.eval(guard)? else {
-                    return err("a comprehension guard is a boolean");
-                };
-                if keep {
-                    self.comprehend(rest, element, keys, out)?;
+            Some((CompClause::If(guard), rest)) => match self.eval(guard)? {
+                Value::Bool(true) => self.comprehend(rest, element, keys, out),
+                Value::Bool(false) => Ok(()),
+                // Whether this binding survives is undecided, so the rest runs speculatively
+                // and its entry is pending.
+                Value::Pending => {
+                    self.speculate(|me| me.comprehend(rest, element, keys, out))?;
+                    out.push((Value::Pending, Value::Pending));
+                    Ok(())
                 }
-                Ok(())
-            }
+                _ => err("a comprehension guard is a boolean"),
+            },
             Some((CompClause::For { target, iter }, rest)) => {
                 let name = match &target.node {
                     AssignTarget::Name(n) => n.to_string(),
                     other => return err(format!("unsupported comprehension target: {other:?}")),
                 };
-                let Value::Collection(c) = self.eval(iter)? else {
-                    return err("a comprehension iterates a collection");
+                let c = match self.eval(iter)? {
+                    Value::Collection(c) => c,
+                    // A pending source has pending bindings, so the rest runs once,
+                    // speculatively, over a pending one.
+                    Value::Pending => {
+                        keys.push(Value::Pending);
+                        let walked = self.speculate(|me| {
+                            me.scoped(|me| {
+                                me.bind(name.clone(), Slot::Val(Value::Pending));
+                                me.comprehend(rest, element, keys, out)
+                            })
+                        });
+                        keys.pop();
+                        walked?;
+                        out.push((Value::Pending, Value::Pending));
+                        return Ok(());
+                    }
+                    _ => return err("a comprehension iterates a collection"),
                 };
                 for (key, elem) in c.entries().to_vec() {
                     keys.push(key);
@@ -1456,6 +1842,9 @@ fn floor_div(a: i64, b: i64) -> Option<i64> {
 /// Apply a binary operator. An overflow or a division by zero is an [`Error`]: the spec leaves
 /// it undefined (`docs/chl-spec.md`, "Partiality is not yet defined [Open]").
 fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
+    if any_pending([&l, &r]) {
+        return Ok(Value::Pending);
+    }
     let int = |v: Option<i64>| {
         v.map(Value::Int)
             .ok_or_else(|| Error(format!("{l} {op:?} {r} is not defined")))
@@ -1493,6 +1882,9 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
 }
 
 fn compare(op: CmpOp, l: Value, r: Value) -> Result<Value, Error> {
+    if any_pending([&l, &r]) {
+        return Ok(Value::Pending);
+    }
     let ord = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Str(a), Value::Str(b)) => a.cmp(b),
@@ -1656,17 +2048,6 @@ mod tests {
         assert_eq!(v.to_string(), "[`0(()) -> 1, `1(()) -> 2, `2(()) -> 3]");
     }
 
-    #[test]
-    fn a_channel_read_before_its_define_runs_is_refused() {
-        let e = refused(indoc! {r#"
-            ch = defer()
-            out = test_sink()
-            out << sum(ch)
-            ch <<= [1, 2]
-        "#});
-        assert!(e.contains("is read before its feed"), "{e}");
-    }
-
     /// Two equal maps written in different orders would give 12 and 21.
     #[test]
     fn an_accumulating_loop_over_a_keyed_collection_is_refused() {
@@ -1678,6 +2059,52 @@ mod tests {
             out << acc
         "#});
         assert!(e.contains("may depend on its iteration order"), "{e}");
+    }
+
+    /// The accumulation happens in a called function, through a `Mut` parameter.
+    #[test]
+    fn an_accumulating_call_in_a_loop_over_a_keyed_collection_is_refused() {
+        let e = refused(indoc! {r#"
+            def step(acc: Mut(Int), v):
+                acc := acc * 10 + v
+            acc := 0
+            for v in map([("b", 1), ("a", 2)]):
+                step(acc, v)
+            out = test_sink()
+            out << acc
+        "#});
+        assert!(e.contains("may depend on its iteration order"), "{e}");
+    }
+
+    /// The commit happens in a called function, and each commit takes the next commit time.
+    #[test]
+    fn a_commit_in_a_call_in_a_loop_over_a_keyed_collection_is_refused() {
+        let e = refused(indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 0
+            def take(r):
+                with begin():
+                    pool := r
+                    out << pool
+                0
+            for v in map([("b", 1), ("a", 2)]):
+                take(v)
+        "#});
+        assert!(e.contains("may depend on its iteration order"), "{e}");
+    }
+
+    /// A mutable variable each iteration makes for itself does not outlive the iteration, so
+    /// writing it does not make the loop depend on its order.
+    #[test]
+    fn a_loop_over_a_keyed_collection_may_write_its_own_variables() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            for v in map([("b", 1), ("a", 2)]):
+                t := v
+                t := t * 10
+                out << t
+        "#});
+        assert_eq!(v.to_string(), "[\"a\" -> 20, \"b\" -> 10]");
     }
 
     /// Integer keys run in ascending order whatever order the entries were written in, so two
@@ -1731,16 +2158,147 @@ mod tests {
         assert_eq!(v.to_string(), "[() -> 1]");
     }
 
+    /// A feed that never runs adds nothing, so a read before it sees the whole collection.
     #[test]
-    fn a_channel_read_before_its_feeds_run_is_refused() {
+    fn a_channel_read_before_a_feed_that_never_runs_is_the_whole_collection() {
+        let v = out(indoc! {r#"
+            ch = defer()
+            out = test_sink()
+            out << sum(ch)
+            if 1 > 2:
+                ch << 5
+        "#});
+        assert_eq!(v.to_string(), "[() -> 0]");
+    }
+
+    /// The first block writes `pool` through a call.
+    #[test]
+    fn two_with_sites_writing_one_variable_through_a_call_are_refused() {
         let e = refused(indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 0
+            def set(p: Mut(Int, Txn), r):
+                p := r
+            for r in [2, 3]:
+                with begin():
+                    set(pool, r)
+            with begin():
+                pool := pool + 1
+                out << pool
+        "#});
+        assert!(e.contains("more than one `with` block"), "{e}");
+    }
+
+    /// A read denotes the whole collection, so one before the `<<=` sees what it defines.
+    #[test]
+    fn a_channel_read_before_its_define_runs_sees_it() {
+        let v = out(indoc! {r#"
+            ch = defer()
+            out = test_sink()
+            out << sum(ch)
+            ch <<= [1, 2]
+        "#});
+        assert_eq!(v.to_string(), "[() -> 3]");
+    }
+
+    #[test]
+    fn a_channel_read_before_its_feeds_run_sees_them() {
+        let v = out(indoc! {r#"
             ch = defer()
             out = test_sink()
             out << sum(ch)
             for x in [1, 2, 3]:
                 ch << x
         "#});
-        assert!(e.contains("is read before its feed"), "{e}");
+        assert_eq!(v.to_string(), "[() -> 6]");
+    }
+
+    /// The feed runs when `push` is called, after the read, and is part of what the read
+    /// denotes.
+    #[test]
+    fn a_channel_read_sees_a_feed_in_a_function_called_later() {
+        let v = out(indoc! {r#"
+            ch = defer()
+            def push(n):
+                ch << n
+                0
+            out = test_sink()
+            out << sum(ch)
+            out << push(5)
+        "#});
+        assert_eq!(v.to_string(), "[`0(()) -> 5, `1(()) -> 0]");
+    }
+
+    /// A channel whose contents depend on a read of itself has no one answer: any `n` solves
+    /// `ch = [n]` with `n = sum(ch)`.
+    #[test]
+    fn a_channel_fed_from_a_read_of_itself_is_refused() {
+        let e = refused(indoc! {r#"
+            ch = defer()
+            ch << sum(ch)
+            out = test_sink()
+            out << 1
+        "#});
+        assert!(e.contains("a cycle"), "{e}");
+    }
+
+    /// The cycle runs through a mutable variable: `ch`'s contribution is `x`, and `x` is
+    /// written from a read of `ch`.
+    #[test]
+    fn a_cycle_through_a_mutable_variable_is_refused() {
+        let e = refused(indoc! {r#"
+            ch = defer()
+            x := sum(ch)
+            ch << x
+            out = test_sink()
+            out << 1
+        "#});
+        assert!(e.contains("a cycle"), "{e}");
+    }
+
+    /// The cycle runs through control: whether `ch` is fed depends on a read of `ch`.
+    #[test]
+    fn a_cycle_through_a_branch_is_refused() {
+        let e = refused(indoc! {r#"
+            ch = defer()
+            if sum(ch) > 0:
+                ch << 1
+            out = test_sink()
+            out << 1
+        "#});
+        assert!(e.contains("a cycle"), "{e}");
+    }
+
+    /// `b`'s contribution is `x`, written from a read of `a`, which is fed after it; the reads
+    /// of `a` and `b` both run before the feeds they depend on, and neither depends on itself.
+    #[test]
+    fn reads_that_depend_on_each_other_through_a_mutable_variable_resolve_in_order() {
+        let v = out(indoc! {r#"
+            a = defer()
+            b = defer()
+            out = test_sink()
+            out << sum(b)
+            x := sum(a)
+            b << x
+            a << 5
+        "#});
+        assert_eq!(v.to_string(), "[() -> 5]");
+    }
+
+    /// Whether the branch writes `x` depends on a read of `ch`, which is fed later; the read of
+    /// `x` after the branch sees the write it made.
+    #[test]
+    fn a_branch_on_a_channel_read_decides_a_later_read_of_a_mutable_variable() {
+        let v = out(indoc! {r#"
+            ch = defer()
+            x := 1
+            out = test_sink()
+            if sum(ch) > 3:
+                x := 10
+            out << x
+            ch << 5
+        "#});
+        assert_eq!(v.to_string(), "[() -> 10]");
     }
 
     #[test]
