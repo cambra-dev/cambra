@@ -3359,6 +3359,29 @@ fn build_commit_store(
     // Per scalar key, the stream giving its seed, the value it holds before any commit (a
     // literal init is a constant; a computed init streams to its value).
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
+    // Whether this store continues a recurrence the retired version was running.
+    // A store whose seed summarizes positions has folded them already, so its
+    // drive resumes above them; one whose seed summarizes none needs its source
+    // from the beginning.
+    //
+    // Two ways a seed summarizes positions, and the identity of the variable is
+    // only the first. A variable that carries its own value is the ordinary
+    // reload. A variable seeded from a `@LoadFrom` is the other: its identity is
+    // new, so it carries nothing, while the value it starts at is one the retired
+    // version folded positions into. Asking only the identity would send such a
+    // store back over an input it has already counted.
+    //
+    // Answered for the store rather than for each key, because one store drives
+    // one position sequence: a key added beside one that resumes begins wherever
+    // that store resumes, and folding the two over different prefixes of one
+    // drive is not a thing the store can do.
+    let continues = paths
+        .iter()
+        .any(|path| ctx.inherited.mutable_state.contains_key(path))
+        || keys
+            .iter()
+            .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
+
     // The store-wide per-commit value extent types a *proposal's* read and write set
     // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
     // the extent must describe them all: for a heterogeneous multi-key store

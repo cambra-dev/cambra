@@ -478,6 +478,49 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                         }
                     }
                 }
+                // Each part of a store is also a collection over the store's rows, with a
+                // statement of its own, and that statement is held to the contract like any
+                // other collection's. A release of the store names its positions, which are
+                // each part's keys, so a reclaimed prefix leaves every part as released.
+                let Tile::Store {
+                    state,
+                    decided,
+                    frontier,
+                    ..
+                } = tile
+                else {
+                    unreachable!("matched as a store")
+                };
+                let Tile::Record(logs) = &**state else {
+                    unreachable!("a store's state is a record of per-key changelogs")
+                };
+                let part = |name: &str| {
+                    let mut l = label.to_vec();
+                    l.push(name.to_string());
+                    l
+                };
+                for (name, log) in logs {
+                    let label = part(&format!("#changelog.{name}"));
+                    walk(log, &label, level, rows, above, nodes, entries);
+                }
+                walk(
+                    decided,
+                    &part("#decided"),
+                    level,
+                    rows,
+                    above,
+                    nodes,
+                    entries,
+                );
+                walk(
+                    frontier,
+                    &part("#frontier"),
+                    level,
+                    rows,
+                    above,
+                    nodes,
+                    entries,
+                );
             }
             // An aggregation is one accumulator per row, compared row by row. Beneath no
             // level nothing is complete, and a row it has not reached holds nothing yet.
@@ -956,6 +999,63 @@ pub(crate) mod test_helpers {
         }
 
         fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// A store's parts are collections held to the contract like any other: a decided set
+    /// stated `True` that gains a position has added a key beneath a complete path. The same
+    /// growth under a statement naming only what is decided passes.
+    #[test]
+    fn a_store_part_growing_beneath_its_own_statement_is_reported() {
+        use crate::interpreter::commit_operator::{CommitEngine, full_store_tiling};
+        use crate::interpreter::operator_conversion::store_key;
+        use crate::interpreter::{BaseType, Extent, FunctionGuard, Position, Predicate, Value};
+        use std::collections::HashMap;
+        let tiling = full_store_tiling(
+            Extent::Base(BaseType::UInt),
+            HashMap::from([(
+                "acc".to_string(),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            )]),
+        );
+        let mut engine = CommitEngine::unopened();
+        let step = |engine: &mut CommitEngine, p: usize| {
+            let writes = HashMap::from([(store_key("acc", Value::Unit), Value::Int(p as i64))]);
+            engine.step(Position::new(Value::UInt(p)), Some(writes));
+            engine.render_full_store_tile(&tiling)
+        };
+        let last = step(&mut engine, 0);
+        let result = step(&mut engine, 1);
+        let released = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
+        super::assert_complete_region_unchanged("honest", &last, &result, &released);
+
+        let claim_all = |mut tile: Tile| {
+            if let Tile::Store { decided, .. } = &mut tile
+                && let Tile::DataFunction {
+                    domain_predicate, ..
+                } = &mut **decided
+            {
+                *domain_predicate = Predicate::True;
+            }
+            tile
+        };
+        let outcome = std::panic::catch_unwind(|| {
+            super::assert_complete_region_unchanged(
+                "claims_all",
+                &claim_all(last.clone()),
+                &claim_all(result.clone()),
+                &released,
+            )
+        });
+        let message = outcome
+            .expect_err("a decided set stated whole while it grows is reported")
+            .downcast::<String>()
+            .map(|m| *m)
+            .unwrap_or_default();
+        assert!(
+            message.contains("#decided")
+                && message.contains("beneath a path it had called complete"),
+            "{message}"
+        );
     }
 
     /// A value in a record's field filled in beneath a key already called complete is an

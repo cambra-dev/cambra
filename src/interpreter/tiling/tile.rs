@@ -136,6 +136,11 @@ pub enum Tile {
         ///
         /// Reclaimed with the changelogs by the engine's release-driven GC, so a
         /// long-lived loop does not retain it; `frontier` is what survives.
+        ///
+        /// It and each changelog state as complete, under each row's own path, the
+        /// positions at or below that row's watermark, and everything once the store is
+        /// terminal. A row's positions restart, so a statement naming positions alone would
+        /// say one row's watermark of every row.
         decided: Box<Tile>,
         /// Each row's **frontier**: a collection over the store's rows whose run holds that
         /// row's watermark `w` — every position `≤ w` is decided — or nothing for a row
@@ -151,6 +156,9 @@ pub enum Tile {
         /// are different stores that got to different places. Projecting one row out is then
         /// the ordinary row retain, with no watermark to recover. Closing the domain is the
         /// separate `terminal` axis, so a closed store keeps its watermarks.
+        ///
+        /// A watermark moves as its row decides, so the collection states nothing complete
+        /// until the store is terminal. It grows by join rather than by adding keys.
         frontier: Box<Tile>,
         /// Whether the store's domain is closed: no further commit will ever land, so a read
         /// waiting on the store's closure (`StoreFinalRead`, a carry `StoreValueStream`)
@@ -285,10 +293,12 @@ impl Tile {
                     domain.clone(),
                     Tiling::Scalar(Extent::Base(crate::ccl::BaseType::Unit)),
                 );
-                state.check_from(&tiling.store_state())
-                    && seed.check_from(codomain)
-                    && decided.check_from(&positions)
-                    && frontier.check_from(&positions)
+                // The parts are collections over the store's own rows, so each states its
+                // completeness under the levels the store stands beneath.
+                state.check_from_over(&tiling.store_state(), levels)
+                    && seed.check_from_over(codomain, levels)
+                    && decided.check_from_over(&positions, levels)
+                    && frontier.check_from_over(&positions, levels)
             }
             _ => false,
         }
@@ -1056,34 +1066,29 @@ impl Tile {
                     TileGuard::Function(FunctionGuard::Domain(Predicate::True))
                 } else {
                     TileGuard::Function(FunctionGuard::Domain(
-                        store_change_positions(state).union(&running_frontier(frontier)),
+                        self.store_keys()
+                            .filter_map(|key| self.store_changelog(key))
+                            .fold(Predicate::False, |changed, (written, _)| {
+                                changed.union(&Predicate::from_column_value(written))
+                            })
+                            .union(&running_frontier(frontier)),
                     ))
                 }
             }
         }
     }
 
-    /// Every commit tick at which this store records a write, ascending and deduplicated:
-    /// the union of its keys' changelogs. A tick is a change of the store when any one key's
+    /// Every position at which this store records a write, ascending and deduplicated: the
+    /// union of its keys' changelogs. A position is a change of the store when any one key's
     /// changelog carries it, so a carry-forward read emits a position at each.
-    pub fn store_change_ticks(&self) -> Vec<usize> {
-        let Tile::Store { state, .. } = self else {
-            panic!("store_change_ticks is a store's: {self:?}")
-        };
-        let Tile::Record(keys) = state.as_ref() else {
-            unreachable!("a store's state is a record of per-key changelogs; got {state:?}")
-        };
-        let mut ticks = std::collections::BTreeSet::new();
-        for log in keys.values() {
-            let Tile::DataFunction { domain, .. } = log else {
-                unreachable!("a store key's changelog is a collection; got {log:?}")
-            };
-            ticks.extend((0..domain.len()).map(|i| match domain.index_at(i) {
-                Value::UInt(tick) => tick,
-                other => unreachable!("a changelog is keyed by commit ticks; got {other:?}"),
-            }));
+    pub fn store_change_positions(&self) -> Vec<Position> {
+        let mut positions = std::collections::BTreeSet::new();
+        for key in self.store_keys() {
+            if let Some((written, _)) = self.store_changelog(key) {
+                positions.extend((0..written.len()).map(|i| Position::new(written.index_at(i))));
+            }
         }
-        ticks.into_iter().collect()
+        positions.into_iter().collect()
     }
 
     /// A collection over one row — the whole value — with dev-build-only validation.
@@ -2181,9 +2186,15 @@ pub fn nest_levels(
 
 /// A store's frontier over its rows, from each row's watermark: a run holding the one
 /// position that row is decided through, or nothing for a row decided through none.
+///
+/// `complete` is the collection's statement. A row's watermark moves as the store decides,
+/// so its key is final only once the store can decide nothing more: `True` for a terminal
+/// store and `False` otherwise. The frontier grows by join rather than by adding keys,
+/// which `assert_complete_region_unchanged` checks on its own.
 pub(crate) fn store_frontier_rows(
     watermarks: impl IntoIterator<Item = Option<Value>>,
     domain: &Extent,
+    complete: Predicate,
 ) -> Tile {
     let mut starts = Vec::new();
     let mut positions = Vec::new();
@@ -2196,7 +2207,7 @@ pub(crate) fn store_frontier_rows(
         ColumnValue::UInts(starts),
         ColumnValue::from_values(positions, domain),
         Box::new(Tile::Scalar(ColumnValue::Units(len))),
-        Predicate::True,
+        complete,
         BitSet::new(),
     )
 }
@@ -2612,18 +2623,6 @@ pub fn validate_tile(tile: &Tile) -> bool {
         Tile::DataFunction { row_starts, .. } => valid_over(tile, row_starts.len()),
         Tile::Store { .. } => valid_over(tile, 1),
     }
-}
-
-/// Every position at which a store's state records a write, as the predicate naming
-/// them: a position is a change of the store when any one key's changelog carries it.
-fn store_change_positions(state: &Tile) -> Predicate {
-    let Tile::Record(keys) = state else {
-        unreachable!("a store's state is a record of per-key changelogs; got {state:?}")
-    };
-    keys.values().fold(Predicate::False, |acc, log| match log {
-        Tile::DataFunction { domain, .. } => acc.union(&Predicate::from_column_value(domain)),
-        other => unreachable!("a store key's changelog is a collection; got {other:?}"),
-    })
 }
 
 /// Whether `tile` is well formed as a value vectorized over `rows` rows.
