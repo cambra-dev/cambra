@@ -397,7 +397,7 @@ pub fn tile_to_canonical(tile: Tile) -> String {
 /// Extract a readable string from a `catch_unwind` payload.  Most compiler
 /// panics carry `String` or `&'static str`; anything else falls back to a
 /// placeholder so the test doesn't lose its diagnostic.
-fn panic_payload_to_string(payload: &Box<dyn Any + Send>) -> String {
+pub(crate) fn panic_payload_to_string(payload: &Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else if let Some(s) = payload.downcast_ref::<&'static str>() {

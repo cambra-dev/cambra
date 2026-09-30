@@ -301,6 +301,38 @@ fn an_opaque_binder_inherits_its_initializer_s_refinement() {
     assert_eq!(format!("{}", infer_program("y ^= 5\ny\n")), "Int@5");
 }
 
+/// A function's codomain drops a refinement naming an opaque binder its own body
+/// introduced: that binder stands for one value per call, so the refinement would
+/// relate two calls' results through one name. A binder bound outside the function
+/// denotes one value for every call and stays
+/// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's
+/// opaque binders").
+#[rstest]
+#[case::bound_inside(
+    indoc! {r#"
+        def f(x: Int):
+            r ^= x;
+            r ^+ 0
+        f(1)
+    "#},
+    "Int"
+)]
+#[case::bound_outside(
+    indoc! {r#"
+        r ^= 1;
+        def f(x: Int):
+            r ^+ 0
+        f(2)
+    "#},
+    "{Int | __elem == r ^+ 0}"
+)]
+fn a_function_s_codomain_drops_its_body_s_opaque_binders(
+    #[case] code: &str,
+    #[case] expected: &str,
+) {
+    assert_eq!(format!("{}", infer_program(code)), expected);
+}
+
 /// The three shapes a trait can take are each exercised by a real program, which is
 /// what keeps the machinery from being fitted to one of them.
 ///

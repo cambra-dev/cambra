@@ -1373,11 +1373,26 @@ fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr
 /// with the values it reads *inlined* rather than naming binders it is being
 /// moved away from. The lift makes the write a sibling of the block on the
 /// enclosing loop, where a block-spine binder is out of scope — and
-/// A-normalization puts every compound written value behind one of those
-/// binders (`cnt := cnt + 1` arrives as `let __anf = cnt + 1 in cnt := __anf`).
-/// Inlining is the model the mutability phases already use for a written value
+/// A-normalization puts every mutable-variable read behind one of those binders
+/// (`cnt := cnt + 1` arrives as `let __anf ^= cnt in cnt := __anf + 1`;
+/// `crate::ccl::anf`, "A mutable-variable read is not atomic"). Inlining is the
+/// model the mutability phases already use for a written value
 /// (`crate::ccl::mut_elim`'s read-your-writes environment), for the same
 /// reason: a value lifted out of a scope has to be self-contained.
+///
+/// The inlined read is evaluated where the write lands, so a definiens bound
+/// before a write the lift crosses would report that write's value.
+/// [`check_no_induction_write_reading_past_a_write`] rejects that block before the
+/// phase runs, which is what leaves this arm free to discharge unconditionally.
+///
+/// **A binding the lift leaves with no consumer is dropped.** The transactional
+/// remainder is what states the block's footprint ([`collect_footprint`]) and
+/// which induction accumulators the commit decision reads
+/// ([`cross_domain_reads`]), so a read-binding left behind by the write that
+/// consumed it claims a read the block no longer makes. For `cnt := cnt + 1`
+/// that claim is `cnt`, and [`fold_cross_domain_loops`] then folds every loop
+/// writing `cnt` into a cross-domain letrec for an accumulator no decision
+/// reads.
 fn partition_spine(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
@@ -1413,14 +1428,20 @@ fn partition_spine(
             bound_expr,
             body,
         } => {
-            // The binding stays on the block spine — the transactional remainder
-            // may read it too — and also enters `env`, so a write lifted past it
-            // carries its value instead of its name.
+            // The binding enters `env`, so a write lifted past it carries its
+            // value instead of its name, and stays on the block spine for the
+            // transactional remainder to read.
             env.insert(
                 binding.name.clone(),
                 Subst::discharge_env_in_place(bound_expr.as_ref().clone(), env),
             );
             let body = partition_spine(*body, txn_mut_vars, lifted, env);
+            // A binding the remainder does not name is one the lift took the last
+            // consumer of. Dropping it is what keeps the remainder's reads the
+            // block's reads.
+            if !is_free_in_value(&binding.name, &body) {
+                return body;
+            }
             Expr {
                 node: TypedExprNode::Let {
                     binding,
@@ -1565,6 +1586,132 @@ pub fn check_no_guarded_induction_write_in_block(
         }
     });
     result
+}
+
+/// Reject an induction write whose value reads past a write — a `with begin():`
+/// block that binds a value reading a mutable variable, writes that variable, and
+/// then writes an induction accumulator from the binding.
+///
+/// [`partition_spine`] lifts an induction write onto the enclosing loop and
+/// discharges the block's `let` definientia into it, so the write leaves holding
+/// the values it reads rather than binders it is moving away from. A read inlined
+/// that way is evaluated at the lift destination, past every write the block makes
+/// between the binding and the write carrying it, and reports the crossed write's
+/// value rather than the one the binding took. `inline.rs`'s
+/// `reads_a_variable_written_in` refuses the same move over the same hazard.
+/// Refusing is not available here: the lift is what puts the write outside the
+/// block, where a block-spine binder is out of scope.
+///
+/// Two shapes cross no write and are admitted. A read in the lifted write's own
+/// value (`cnt := cnt + 1`) stands where the write stands, and the lift preserves
+/// the relative order of the writes it moves. A binding made after the write it
+/// reads is already on the far side of it.
+pub fn check_no_induction_write_reading_past_a_write(
+    expr: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> Result<(), String> {
+    if let TypedExprNode::Begin { body } = &expr.node
+        && let Some(var) = induction_write_reading_past_a_write(body, txn_mut_vars)
+    {
+        return Err(format!(
+            "an induction write inside a `with begin():` block reads a value bound before \
+             `{var}` was written in the same block, and that value reads `{var}`. The \
+             induction write is lifted out of the block, so the read would report `{var}`'s \
+             value after the write rather than before it. Move the write to `{var}` outside \
+             the block, or bind the value after it"
+        ));
+    }
+    let mut result = Ok(());
+    expr.walk_children(|c| {
+        if result.is_ok() {
+            result = check_no_induction_write_reading_past_a_write(c, txn_mut_vars);
+        }
+    });
+    result
+}
+
+/// The mutable variable a lifted induction write's value reads past, found by
+/// walking the block spine [`partition_spine`] walks and carrying the same `let`
+/// bindings.
+///
+/// A write to a mutable variable invalidates every binding already made whose
+/// definiens reads it, and a binding whose definiens reads an invalidated binding
+/// is invalidated too: discharge inlines the invalidated read into the new
+/// definiens. An induction write reading an invalidated binding is the rejected
+/// shape.
+fn induction_write_reading_past_a_write(
+    block: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> Option<Name> {
+    // Binder ⟼ the names its discharged definiens reads, so a write's target can be
+    // matched against every binding it invalidates.
+    let mut reads: HashMap<Name, HashSet<Name>> = HashMap::new();
+    // Binder ⟼ the mutable variable written since it was bound that it reads.
+    let mut invalidated: HashMap<Name, Name> = HashMap::new();
+    let mut spine = block;
+    loop {
+        match &spine.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                let mut discharged = HashSet::new();
+                let mut inherited = None;
+                for n in free_names_in_value(bound_expr) {
+                    match reads.get(&n) {
+                        Some(r) => discharged.extend(r.iter().cloned()),
+                        None => {
+                            discharged.insert(n.clone());
+                        }
+                    }
+                    inherited = inherited.or_else(|| invalidated.get(&n).cloned());
+                }
+                reads.insert(binding.name.clone(), discharged);
+                if let Some(var) = inherited {
+                    invalidated.insert(binding.name.clone(), var);
+                }
+                spine = body;
+            }
+            TypedExprNode::ExprStmt { expr: effect, body } => {
+                if let TypedExprNode::MutWrite { name, key, value } = &effect.node
+                    && !txn_mut_vars.contains(name)
+                {
+                    let mut free = free_names_in_value(value);
+                    if let Some(k) = key {
+                        free.extend(free_names_in_value(k));
+                    }
+                    if let Some(var) = free.iter().find_map(|n| invalidated.get(n)) {
+                        return Some(var.clone());
+                    }
+                }
+                // Both kinds of write invalidate: a lifted one moves out from under the
+                // bindings made before it, and a transactional one takes its variable to
+                // a value only the block sees.
+                let mut targets = HashSet::new();
+                collect_write_targets(effect, &mut targets);
+                let crossed: Vec<(Name, Name)> = reads
+                    .iter()
+                    .filter(|(binder, _)| !invalidated.contains_key(*binder))
+                    .filter_map(|(binder, r)| {
+                        let target = targets.iter().find(|t| r.contains(*t))?;
+                        Some((binder.clone(), target.clone()))
+                    })
+                    .collect();
+                invalidated.extend(crossed);
+                spine = body;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Every mutable variable `expr` writes, a write under a guard included.
+fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
+    if let TypedExprNode::MutWrite { name, .. } = &expr.node {
+        out.insert(name.clone());
+    }
+    expr.walk_children(|c| collect_write_targets(c, out));
 }
 
 /// Enforce that `await_final` **consumes** its mutable variable: no mention of a mutable variable

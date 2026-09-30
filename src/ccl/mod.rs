@@ -19,6 +19,7 @@ pub mod letrec;
 pub mod lower;
 pub mod mut_elim;
 pub mod mut_read;
+pub mod mut_scope;
 pub mod names;
 pub mod panes;
 pub mod planning;

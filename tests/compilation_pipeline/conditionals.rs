@@ -1495,3 +1495,19 @@ fn one_let_bound_conditional_consumed_by_two_generators(#[case] c: &str, #[case]
         Value::Int(expected),
     );
 }
+
+/// TODO: Support refined conditional writes.
+#[test]
+fn refined_conditional_write() {
+    check_compile_error(
+        indoc! {r#"
+x: Mut({Int where _ >= 0}) := 0
+for p in [1, 2, 3]:
+    x := x ^+ 1
+    if p > 1:
+        x := x ^+ 1
+x
+        "#},
+        "post-letrec produced an invalid tree",
+    )
+}

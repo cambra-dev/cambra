@@ -929,3 +929,36 @@ fn feeds_and_define_mixed_rejected() {
 fn unbound_defer_handle_rejected() {
     expect_feed_error("defer()", "unbound defer handle");
 }
+
+/// TODO: Support refined writes to vars used with feeds.
+#[test]
+fn refined_write_used_with_feed() {
+    check_compile_error(
+        indoc! {r#"
+x: Mut({Int where _ >= 0}) := 0
+o = defer()
+for p in [1,2,3]:
+    o << x
+    x := x ^+ 1
+    o << x
+x
+        "#},
+        "open bound recorded",
+    )
+}
+
+#[test]
+fn let_binding_into_feed() {
+    check_scalar(
+        indoc! {r#"
+out = defer()
+x := 0
+for i in [1, 2, 3]:
+  if i > 1:
+    a = i + 1
+    out << a
+    x += a
+"#},
+        Value::Unit,
+    )
+}

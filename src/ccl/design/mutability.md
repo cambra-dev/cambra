@@ -174,12 +174,28 @@ through the parameter's handle for the one position where a `Mut` parameter is g
 something that is not a mutable variable (a program the second-class discipline rejects, but which
 still has to be typed to be reported well).
 
+### A read is performed where it is written
+
+A read denotes the value the variable holds at the point it is performed, so A-normalization
+(`ccl/anf.rs`) names one where it stands, in sequence with the writes beside it. Every other atomic
+term denotes one value wherever it stands, which is what makes leaving one in a position a hoist
+moves past free. A hoist moves the terms beside a read earlier, so the read is performed after them:
+in `t = (x, g(x))`, with `g` writing through a `Mut` parameter, hoisting the call leaves the element
+reading `x` to be performed after the write. Named, the element is the value `x` held where the
+tuple was written.
+
+An application's **argument** is the position this does not reach. A read there may be the handle a
+pass-by-reference callee writes through, which is a question about the callee's parameter and so
+unanswerable before inference, and the mention has to stay bare for `emit_apply` to relate it to
+that parameter. Such a read is performed at the call.
+
 ### A read is named while inference runs
 
-`mut_read` (`ccl/mut_read.rs`) binds each block's mutable-variable reads to an immutable variable,
-one per **read segment** — the statements between one write to that variable and the next. Every
-read in a segment references the segment's binder, which is opaque (`^=`), so a type lifted out of
-its scope keeps the binder rather than reading the mutable variable back in its place.
+Each of those bindings is a **read segment**'s — the statements between one write to that variable
+and the next — and `mut_read` (`ccl/mut_read.rs`) adopts it as one, minting for the single value
+position A-normalization leaves in place, a value-position `match`'s scrutinee. Every read in a
+segment references the segment's binder, which is opaque (`^=`), so a type lifted out of its scope
+keeps the binder rather than reading the mutable variable back in its place.
 
 A refinement is what demands the name. Inference refines a computed value by the term that computed
 it, so an operand reading `x` types as `{Int | __elem == x ^+ 1}` — a type naming a mutable
@@ -192,7 +208,31 @@ on a writer's spine is an operator in the graph, and the phases below recognize 
 Every use of a segment's binder precedes the write that ended the segment, which is what makes the
 substitution sound; `inline` moves uses, so it runs after.
 
-Five positions keep the read as lowering built it, each because a later pass reads the term there:
+That ordering rests on the CHL rule that captured names are read-only
+([chl-spec.md](../../../docs/chl-spec.md), "4.1 `def` — function definition"), which no pass
+enforces today: a `def` that writes a captured mutable variable compiles, and the write is
+invisible to the segment its call sits in.
+
+A diagnostic spells the binder as the variable it reads. `mut_read::read_respelling` builds that
+rename and `compile_program` applies it to an inference error's types, so a message reports
+`{Int | __elem == x ^+ 1}` where the type carries the binder. The rename is display alone:
+substituting the variable into a type inference still holds is
+[what no type may do](#a-mutable-variable-read-is-an-explicit-operation). A binder the user wrote
+keeps its spelling — `x0 ^= x` names the read itself.
+
+An unannotated mutable variable takes such a refinement as a contribution. Its value type is an
+inference variable minted at the declaration, outside every read binder. `x := 0` followed by
+`x := x ^+ 1` records `{Int | __elem == __read ^+ 1}` on that variable, over a binder the variable's
+own scope does not hold; the binder is opaque, which is what admits the reference
+(`src/ccl/design/type-inference.md`, "The invariant"). The join over the seed and the write
+establishes neither predicate, so the variable types as `Int`, and the joined value type of a
+mutable variable written more than once carries no refinement.
+
+A write inside a `for` body is the case still refused. Its contribution names the loop target, which
+carries neither a definiens to discharge nor a fact that outlives its scope.
+
+Five positions keep the read as lowering built it, in both passes, each because a later pass reads
+the term there:
 an application's function and argument (the three handle positions above), a block's terminal
 expression (the tail rules, and rule 2's escape check), the value of a feed
 (`rewrite_as_of_reads`), and a refined cast's value (whose target holds a copy of the term). The
@@ -559,8 +599,10 @@ CHL source
   → lower              (surface CCL: For / MutWrite / Begin / Feed / Defer; Mut/Feed types from annotations;
                         NO mutability classification — every loop is a `For`, intro-vs-write is scope-only)
   → uniquify
-  → anf                (A-normalization: every operand position holds an atomic term)
-  → mut_read           (name each block's reads: one opaque binding per read segment)
+  → anf                (A-normalization: every operand position holds an atomic term, and each
+                        mutable-variable read is named where it is performed)
+  → mut_read           (read segments: adopt A-normalization's read bindings, mint for a
+                        value-position `match`'s scrutinee)
   → infer + check      (on the surface-CCL tree; Feed(V) with a rigid ChanDom domain types the defers)
   → mut_read unbind    (substitute each read-segment binder back, except where a type spells it)
   → inline             (UDFs — incl. writers and defer-mediating lambdas — reach their call sites)
@@ -718,6 +760,42 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
+#### Loop-body bindings
+
+A binding the loop body introduces stays a binding in the writer body. The walk that builds the
+writer (`mut_elim`'s `transform_chain`) threads a read-your-writes environment, and inlining a
+binding into that environment copies its value into every read: the chain `aₖ = aₖ₋₁ + aₖ₋₁` then
+costs a factor of two per binding, so the writer body is exponential in the loop body's length.
+
+Where the binding stands is decided by the domain its reads compile at, not by scope. Op-conversion
+compiles a `let`'s bound expression at the domain of the `let` and shares that one producer with
+every read, so a `let` is transparent to domain restriction only where nothing under it restricts.
+A value-`Case` arm restricts — `lambda_elim` compiles it to `filter_values(π̂) ≫ 𝑒` — so a read of
+an outer binding inside an arm takes values at the positions the arm excludes, and the union of the
+arms claims one domain key twice. A nested lambda is the same shape one level along: its body
+iterates at its own domain.
+
+So each maximal sub-expression of the decision that restricts nothing is given the bindings it
+reads (`sink_prefix`), and a value the merge lifts out of a branch — a write set becoming a `Case`
+arm, a feed becoming a field on the top decision record — takes its bindings with it. The copies
+are bounded by those regions and by the number of bindings, where inlining is bounded by two to
+that number.
+
+Each copy is α-renamed. `lambda_elim` lifts a `let` out of the lambda that encloses it, so two
+copies in sibling positions of one writer body reach the same scope, where two bindings of one name
+shadow and the first copy's reads resolve to the second copy's value.
+
+Two kinds of binding are inlined rather than kept:
+
+- A **write**'s value (`x := 𝑒`), which advances the read-your-writes environment rather than
+  binding a name. Each write has one reader — the next write to that variable, or the write set —
+  so a `let` buys no sharing and costs op-conversion a fan-out of the writer input.
+- An **opaque** binding (`x ^= 𝑒`), the read segment's snapshot `mut_read` mints. A refined mutable
+  variable's contribution predicate names that binder — `{Int | __elem == __anf ^+ 1}` on the value
+  the next segment writes — so keeping the binder leaves the predicate pointing at a `let` the
+  point-free rebuild turns into a function of the writer parameter, whose codomain then references
+  an enclosing function with no binder to open at (`subst::open_codomain`).
+
 ## Worked example
 
 A transactional mutable variable and an induction counter shared across two HTTP endpoints:
@@ -752,11 +830,18 @@ out-of-block form** (it fires once per iteration unconditionally, independent of
 transaction commits). A **guarded** in-block induction write (`if q: cnt += 1`) is a different matter:
 committing it only when the transaction commits needs commit-gated carry-forward (the value-`Case`
 machinery upstack), so today it is **rejected** (`check_no_guarded_induction_write_in_block`) rather than
-silently lifted with the wrong (unconditional) semantics. A commit *decision* that reads an induction accumulator
-(`balance += cnt`) **is also implemented** — the accumulator is threaded through the writer source and
-the commit engine co-iterates it (see [Reading an induction accumulator in a commit
-decision](#reading-an-induction-accumulator-in-a-commit-decision)). (A write to `balance` *outside* a
-`with begin():` block is rejected in both the model and the implementation.)
+silently lifted with the wrong (unconditional) semantics. The lift also constrains where the written
+value is bound: it leaves the block carrying the block `let` definientia it names, so a definiens
+bound before a write the lift crosses would report that write's value rather than the one it took,
+and that block is rejected too (`check_no_induction_write_reading_past_a_write`). A value bound
+after the write it reads travels unchanged, since the lift preserves the relative order of the
+writes it moves. A binding the lift takes the last consumer of leaves with it: what stays behind
+is the block's footprint and the set of accumulators its decision reads, so a read-binding left
+standing would claim a read the block no longer makes. A commit *decision* that reads an induction
+accumulator (`balance += cnt`) **is also implemented** — the accumulator is threaded through the
+writer source and the commit engine co-iterates it (see [Reading an induction accumulator in a
+commit decision](#reading-an-induction-accumulator-in-a-commit-decision)). (A write to `balance`
+*outside* a `with begin():` block is rejected in both the model and the implementation.)
 
 After mut_elim (with `IncrIdx`/`GetIdx` the two request-source domains):
 

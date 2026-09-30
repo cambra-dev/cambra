@@ -7,9 +7,9 @@ use std::rc::Rc;
 use crate::ccl::scope::{ScopedItem, for_each_scoped_item};
 use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit, LogicKind, Name,
-    PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode, UnaryOpKind, V_ABORT,
-    V_COMMIT, V_FIRED, V_IDLE,
+    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, F_WRITES, FieldKey, Lit,
+    LogicKind, Name, PredicateId, ProjKey, Refinement, RefinementSet, Type, TypedExprNode,
+    UnaryOpKind, V_ABORT, V_COMMIT, V_FIRED, V_IDLE,
 };
 
 /// The `commit` selector field of the **intermediate** decision record the two
@@ -64,6 +64,42 @@ pub(crate) fn spelled_in_a_type(expr: &Expr, name: &Name) -> bool {
     let mut found = false;
     expr.walk_children(|c| found = found || spelled_in_a_type(c, name));
     found
+}
+
+/// `ty` with every refinement whose predicate names a binder `escaped` reports
+/// dropped, at every depth — the position keeps its base type and claims nothing
+/// about it.
+///
+/// Dropping rather than rewriting is what a position with no discharge available
+/// can do: a refinement naming a binder that is out of scope where the type now
+/// stands states a restriction nothing can decide, and a restriction nothing can
+/// decide is weaker than no restriction at all. The result is a supertype of
+/// `ty`, so a value of `ty` still inhabits it.
+pub(crate) fn drop_refinements_naming(ty: &Type, escaped: &dyn Fn(&Name) -> bool) -> Type {
+    let mut out = ty.clone();
+    drop_refinements_naming_in_place(&mut out, escaped);
+    out
+}
+
+fn drop_refinements_naming_in_place(ty: &mut Type, escaped: &dyn Fn(&Name) -> bool) {
+    // Children first: `walk_children_mut` on a `Refinement` yields its base, and
+    // the collapse below replaces the whole node once that base is settled.
+    ty.walk_children_mut(|child| drop_refinements_naming_in_place(child, escaped));
+    let Type::Refinement(base, refinements) = ty else {
+        return;
+    };
+    let mut kept = RefinementSet::new();
+    for r in refinements.iter() {
+        if !crate::ccl::subst::refinement_free_vars(r)
+            .iter()
+            .any(escaped)
+        {
+            kept.insert(r.clone());
+        }
+    }
+    if kept.len() != refinements.len() {
+        *ty = Type::refined((**base).clone(), kept);
+    }
 }
 
 /// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write, and
@@ -542,6 +578,76 @@ pub(crate) fn strip_iterate_markers(e: &Expr) -> Expr {
                 out
             }
         };
+    }
+    out
+}
+
+/// Whether `e` binds a transparent `let` anywhere in its term tree.
+///
+/// The guard on [`discharge_transparent_lets`], so a predicate already in that
+/// form keeps its `Rc` rather than being rebuilt into an equal copy.
+fn binds_a_transparent_let(e: &Expr) -> bool {
+    if matches!(
+        &e.node,
+        TypedExprNode::Let { binding, .. } if binding.transparency == BindingTransparency::Transparent
+    ) {
+        return true;
+    }
+    let mut found = false;
+    e.walk_children(|c| found |= binds_a_transparent_let(c));
+    found
+}
+
+/// Substitute away a predicate's transparent `let` bindings
+/// (`let x = e in b` ⟹ `b[x ↦ e]`).
+///
+/// A refinement predicate is a *denotational* term, and a `let` there names a
+/// sub-term rather than saying which values the refinement admits, so one
+/// predicate reaches a comparison under two spellings. A-normalization
+/// (`src/ccl/anf.rs`) names every compound operand, so a definiens
+/// [`crate::ccl::inline`] substitutes into a predicate carries those names, while
+/// the copy whose single occurrence inlining's read-once rule already moved into
+/// place does not. The deficit rule in `src/ccl/infer/solver/constrain.rs`
+/// compares predicates structurally ([`Refinement`]'s `PartialEq`), so the two
+/// spellings read as a refinement the subtype lacks. Discharging the bindings
+/// puts both in one form. It also keeps the predicate inside the SMT encoder's
+/// fragment, which has no `Let` arm and reports one as unencodable
+/// (`src/ccl/infer/solver/smt.rs`).
+///
+/// **Transparent bindings only.** An opaque binder withholds its definiens
+/// because the definiens does not determine the value — a mutable-variable read
+/// is the case (`src/ccl/mut_read.rs`) — so substituting one back names a
+/// variable holding no single value in a position that must denote one.
+pub(crate) fn discharge_transparent_lets(r: &Refinement) -> Refinement {
+    if !binds_a_transparent_let(&r.predicate) {
+        return r.clone();
+    }
+    // The rewrite copies the definiens into each occurrence it fills, so it runs
+    // under a recording naming the source predicate's own root — as
+    // `Subst::force_refinement`'s does for the transport this normalizes after.
+    let _g = crate::ccl::provenance::enter(
+        r.predicate.node_id(),
+        "predicate.discharge_transparent_lets",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    Refinement::born(Rc::new(discharge_transparent_lets_in_term(&r.predicate)))
+}
+
+/// [`discharge_transparent_lets`] on a bare term, bottom-up so a chain of
+/// bindings collapses in one pass.
+fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
+    let mut out = e.clone();
+    out.map_children(|c| discharge_transparent_lets_in_term(&c));
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &out.node
+        && binding.transparency == BindingTransparency::Transparent
+    {
+        let mut body = body.as_ref().clone();
+        Subst::discharge_in_place(&mut body, &binding.name, bound_expr);
+        return body;
     }
     out
 }
@@ -2192,6 +2298,7 @@ where
 mod tests {
     use super::*;
     use crate::ccl::ty::TypeKind;
+    use crate::ccl::{AggregateKind, CompareKind};
 
     /// **A realized conditional inside a predicate is caught at the planning wall.**
     ///
@@ -2270,5 +2377,58 @@ mod tests {
             "a collection composed with an element map is still a collection, got {}",
             composed.ty
         );
+    }
+
+    /// Two spellings of one predicate — an A-normalization binding and the
+    /// collapsed form inlining leaves behind — compare equal once the binding is
+    /// discharged, which is what keeps the deficit rule from reporting a
+    /// refinement the subtype already carries.
+    #[test]
+    fn a_transparent_binding_is_discharged_into_the_predicate() {
+        let elem = || Expr::var(Name::elem()).with_ty(Type::Base(BaseType::Int));
+        let sum = || {
+            Expr::aggregate(
+                Expr::var(Name::from("xs")).with_ty(Type::data_fun(
+                    Type::UIntRange(2),
+                    Type::Base(BaseType::Int),
+                )),
+                AggregateKind::Sum,
+            )
+            .with_ty(Type::Base(BaseType::Int))
+        };
+        let eq = |rhs: Expr| {
+            Expr::binop(elem(), BinOpKind::Compare(CompareKind::Equals), rhs)
+                .with_ty(Type::Base(BaseType::Bool))
+        };
+        let named = Refinement::born(Rc::new(eq(Expr::let_bind(
+            Name::from("__anf"),
+            sum(),
+            Expr::var(Name::from("__anf")).with_ty(Type::Base(BaseType::Int)),
+        ))));
+        let collapsed = Refinement::born(Rc::new(eq(sum())));
+
+        assert_ne!(named, collapsed, "the two spellings differ structurally");
+        assert_eq!(discharge_transparent_lets(&named), collapsed);
+    }
+
+    /// An opaque binding stays: it withholds its definiens because the definiens
+    /// does not determine the value, so substituting it back would name a
+    /// mutable variable in a position that must denote one.
+    #[test]
+    fn an_opaque_binding_is_left_standing() {
+        let read = Expr::let_bind_with(
+            Name::from("__read"),
+            Expr::var(Name::from("x")).with_ty(Type::Base(BaseType::Int)),
+            Expr::var(Name::from("__read")).with_ty(Type::Base(BaseType::Int)),
+            BindingTransparency::Opaque,
+        );
+        let pred = Expr::binop(
+            Expr::var(Name::elem()).with_ty(Type::Base(BaseType::Int)),
+            BinOpKind::Compare(CompareKind::Equals),
+            read,
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        let r = Refinement::born(Rc::new(pred));
+        assert_eq!(discharge_transparent_lets(&r), r);
     }
 }

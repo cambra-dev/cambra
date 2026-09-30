@@ -529,11 +529,21 @@ pub enum InferError {
     /// obligation the way an index-in-range refinement is; a filter that reached
     /// planning as a term would never raise this.
     ///
-    /// There is no surface workaround today: reading the mutable variable into an immutable
-    /// first (`k = x`) does not help, because discharging `[k ↦ x]` puts the mutable variable's
-    /// name straight back into the predicate. Reported here so the program is rejected
-    /// with its source position instead of tripping the debug-only scope net (and, in
-    /// release, surviving to panic at the pre-channelize wall).
+    /// Reading the mutable variable into a binding first is the surface workaround.
+    /// [`crate::ccl::mut_read`] names the reads it reaches with an opaque binder, and an
+    /// opaque binder is what a type lifted out of its scope keeps, so the predicate
+    /// mentions the binder and never the variable — `k = x` ahead of the comprehension
+    /// compiles.
+    ///
+    /// What reaches here is the read that pass leaves in place
+    /// (`src/ccl/design/mutability.md`, "A read is named while inference runs"): a
+    /// refined cast's value, whose target holds a copy of the term below it, which
+    /// inference dedups against by structural equality. Rewriting the term alone leaves
+    /// the two unequal, so a filter written on the variable itself is rejected.
+    ///
+    /// Reported here so the program is rejected with its source position instead of
+    /// tripping the debug-only scope net (and, in release, surviving to panic at the
+    /// pre-channelize wall).
     MutableInRefinedType {
         /// The mutable variable's name.
         name: String,
@@ -613,6 +623,85 @@ pub enum InferError {
         /// The base name of the write target.
         name: String,
     },
+}
+
+impl InferError {
+    /// Rewrite every type this error renders through `f`.
+    ///
+    /// The one caller is the diagnostic boundary in
+    /// [`compile_program`](crate::ccl::context::compile_program), which respells
+    /// the binders [`crate::ccl::mut_read`] names a mutable variable's reads with
+    /// (see [`read_respelling`](crate::ccl::mut_read::read_respelling)). A
+    /// message is the only thing downstream of this: an error has left inference
+    /// by the time it arrives, so nothing reasons with the types again.
+    ///
+    /// Every type the variants carry is mapped, the trait-instance base types
+    /// included. A rewrite that means nothing for a base type costs nothing
+    /// there, and the alternative is a list of exceptions each of which has to
+    /// stay true as the variants change.
+    pub(crate) fn map_types(&mut self, f: &dyn Fn(&Type) -> Type) {
+        let mut each = |ty: &mut Type| *ty = f(ty);
+        let each_requirement = |r: &mut StatedRequirement| {
+            r.accepted.iter_mut().for_each(&mut each);
+            for (_, accepted) in r.siblings.iter_mut() {
+                accepted.iter_mut().for_each(&mut each);
+            }
+        };
+        match self {
+            InferError::TypeMismatch {
+                found, expected, ..
+            } => {
+                each(found);
+                if let Some(expected) = expected {
+                    each(expected);
+                }
+            }
+            InferError::MissingField { found, .. } | InferError::ExpectedFunction { found, .. } => {
+                each(found)
+            }
+            InferError::AnnotationMismatch {
+                annotation,
+                inferred,
+            } => {
+                each(annotation);
+                each(inferred);
+            }
+            InferError::DomainJoinConflict { domains, .. } => domains.iter_mut().for_each(each),
+            InferError::NoTraitInstance {
+                found, accepted, ..
+            } => {
+                each(found);
+                accepted.iter_mut().for_each(each);
+            }
+            InferError::UnsatisfiableOperand { requirements } => {
+                requirements.iter_mut().for_each(each_requirement)
+            }
+            InferError::RequirementContradictsBound {
+                requirements,
+                required,
+                found,
+            } => {
+                requirements.iter_mut().for_each(each_requirement);
+                each(required);
+                each(found);
+            }
+            InferError::MutableInRefinedType { ty, .. }
+            | InferError::ScopeViolation { ty, .. }
+            | InferError::MutInCompositeType { ty, .. } => each(ty),
+            // No type to render: these carry a name, an id, or a rendered label.
+            InferError::UnboundVariable(_)
+            | InferError::Unsupported(_)
+            | InferError::EmptyCase { .. }
+            | InferError::UnresolvedHole { .. }
+            | InferError::UnresolvedBoundedHole { .. }
+            | InferError::UnresolvedInfer { .. }
+            | InferError::UnresolvedPartial { .. }
+            | InferError::IncompatibleBounds { .. }
+            | InferError::MutNotBareVariable { .. }
+            | InferError::MutArgNotMutable { .. }
+            | InferError::MutWriteToNonMutable { .. } => {}
+        }
+    }
 }
 
 /// An [`InferError`] paired with the [`NodeId`](crate::ccl::provenance::NodeId)

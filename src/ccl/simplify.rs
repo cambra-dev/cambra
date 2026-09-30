@@ -1066,6 +1066,19 @@ fn try_partial_lookup(expr: &mut Expr) -> bool {
 /// **One occurrence** makes the rewrite a move rather than a copy, so it duplicates
 /// nothing and drops nothing — which is what makes it safe on a subtree holding an
 /// `iterate` ([`is_iteration`]).
+///
+/// **Either function kind.** A collection is a data function, and a collection standing
+/// in a value former is substituted in here: planning reads a record component's chain
+/// head structurally (`src/ccl/planning/iterate.rs`), so a component left as a binder
+/// reaches op-conversion as a bare list literal with no `iterate` before it. This is the
+/// pass that undoes the value-former exception [`crate::ccl::inline`]'s
+/// `stands_in_a_value_former` maintains, after `diff` has read the pairing that exception
+/// serves.
+///
+/// This is the third copy of "an `AnfTemp` read once, substituted away", alongside
+/// [`crate::ccl::inline`]'s read-once arm and its `flatten_anf_bindings`. The three
+/// differ in side conditions and in the phase they run at, and collapsing them into one
+/// rule is unresolved.
 fn try_let_morphism_inline(expr: &mut Expr) -> bool {
     let TypedExprNode::Let {
         binding,

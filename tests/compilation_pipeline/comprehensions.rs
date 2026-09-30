@@ -361,3 +361,20 @@ fn a_whole_collection_fold_keeps_its_element_materialized(
 ) {
     check_scalar(program, Value::Int(total));
 }
+
+/// A filtered comprehension's source rides the cast-target refinement as well
+/// as the term, and the two copies are compared structurally. A `Let` outside
+/// the comprehension is read freely by the predicate copy, so `inline`'s
+/// list-element move has to reach both: rewriting the term alone leaves
+/// `[1, 3, 5]` under a type still describing `[1, a, 5]`, which op-conversion
+/// rejects as a non-constant element.
+#[test]
+fn a_let_outside_a_filtered_comprehension_moves_into_both_copies_of_its_source() {
+    check_scalar(
+        indoc! {r#"
+            a = 3
+            sum([x for x in [1, a, 5] if x > 2])
+        "#},
+        Value::Int(8),
+    )
+}

@@ -59,8 +59,10 @@ After beta-reducing a UDF call, `inline_impl` is re-applied to the result so tha
 binder's definiens, dropping the `Let` when no reader remains. A list literal's elements
 are a value position: op-conversion compiles the whole literal to one table read at
 graph-build time, so an element is sequenced against nothing and the move changes no
-order. A definiens reading a mutable variable the body writes stays bound, because the
-read would otherwise move past the write.
+order. A definiens reading a mutable variable the body may write stays bound, because the
+read would otherwise move past the write. Two mentions count as a write: a `MutWrite` to
+that variable, and a handle passed to a callee, whose body this pass has not expanded at
+the binding it is rewriting.
 
 The relocated definiens carries A-normalization's bindings for its own compound
 sub-values, and `flatten_anf_bindings` substitutes each into its one use as the element is

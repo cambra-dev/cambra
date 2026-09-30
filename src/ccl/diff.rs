@@ -2805,9 +2805,11 @@ mod tests {
             );
             // The swap localizes to the two swapped positions rather than the
             // whole recurrence: the two reads pair with their counterparts and
-            // move. A-normalization names each read above the tuple, so the
-            // positions holding them are the tuple's two `AnfTemp` `Var`s, each
-            // resolving to the other version's binder.
+            // move. A-normalization names each read above the tuple, and
+            // `inline::stands_in_a_value_former` keeps those names standing at
+            // the element positions for this pairing, so the two sites are the
+            // tuple's `AnfTemp` `Var`s, each resolving to the other version's
+            // binder.
             let sites = r.divergences();
             assert!(
                 matches!(

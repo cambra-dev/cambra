@@ -11,20 +11,34 @@
 //! Before:
 //!
 //! ```text
-//! for p in xs do let __anf = x ^+ 1 in x := __anf;
-//!                let __anf = x ^+ 2 in x := __anf; unit
+//! let n = match m { `ping(s) → s; `close(_) → 0 } in n
 //! ```
 //!
 //! After:
 //!
 //! ```text
-//! for p in xs do let __read ^= x in let __anf = __read ^+ 1 in x := __anf;
-//!                let __read ^= x in let __anf = __read ^+ 2 in x := __anf; unit
+//! let __read ^= m in let n = match __read { `ping(s) → s; `close(_) → 0 } in n
 //! ```
 //!
 //! Every use of a segment's binder precedes the write that ended the segment.
 //! That is what [`unbind`] substitutes back on, and it holds of the tree this
 //! pass produces and of no later one.
+//!
+//! # A read A-normalization already named
+//!
+//! A-normalization hoists a read out of every value position it can move one
+//! out of, into an opaque binding at the read's source position, so that a
+//! hoist beside it does not overtake it (`crate::ccl::anf`, "A mutable-variable
+//! read is not atomic"). Such a binding is a read-segment binding already, and
+//! [`spine`] adopts it — opening the segment on the binder that is there rather
+//! than naming the same read a second time inside it.
+//!
+//! What is left to mint for is the one value position A-normalization leaves in
+//! place: a value-position `match`'s **scrutinee**, whose naming would carry a
+//! dependent result's binders into a type that then passes under them, which is
+//! why that pass leaves it (`crate::ccl::anf`, "Five recognition contracts").
+//! The scrutinee above is that position. Every other position either has a
+//! binding already or is one both passes leave alone (below).
 //!
 //! # Why a read gets a name
 //!
@@ -41,6 +55,13 @@
 //! reads `x` back in the binder's place, which is the mutable variable in a
 //! refinement again.
 //!
+//! # A read binder in a diagnostic
+//!
+//! [`read_respelling`] maps each binder back to the variable it reads, and
+//! `compile_program` applies the rename to an inference error's types. The
+//! binder exists for inference, so a message carrying one names something the
+//! reader cannot look up.
+//!
 //! # What ends a segment
 //!
 //! A statement ends the segment of every mutable variable it still mentions once
@@ -55,6 +76,12 @@
 //! The mention is what this pass can read. Whether `f(x)` writes `x` is a
 //! question about `f`'s parameter, and before inference neither that type nor —
 //! for a call to a `def` — the body behind it is in hand.
+//!
+//! Which mentions can be a write rests on the CHL rule that captured names are
+//! read-only (`docs/chl-spec.md`, "4.1 `def` — function definition"): a call
+//! whose argument list does not mention `x` cannot write `x`. No pass enforces
+//! that rule today, so a `def` writing a captured mutable variable compiles and
+//! the write ends no segment.
 //!
 //! # Positions this pass does not rewrite
 //!
@@ -75,7 +102,7 @@
 //! copy of the term being cast, and inference dedups the two by structural
 //! equality. The copy rides a type slot, so rewriting the term alone leaves them
 //! unequal — the reason A-normalization leaves the position alone as well
-//! (`crate::ccl::anf`, "Three recognition contracts").
+//! (`crate::ccl::anf`, "Five recognition contracts").
 //!
 //! **A block's terminal expression, when it is a bare reference.** A tail is
 //! read for what it denotes rather than for what it is stamped with: a statement
@@ -97,13 +124,15 @@
 //! anywhere inside such a block still ends the enclosing block's segment — the
 //! walk for mentions descends through the whole statement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ccl::{
     BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
     ccl_utils::spelled_in_a_type,
     lambda_elim::substitute,
+    mut_scope::{Muts, is_mut_var, under_param, with},
     provenance::{self, Nature},
+    subst::Subst,
 };
 
 /// Bind every block's mutable-variable reads. See the module docs.
@@ -113,14 +142,8 @@ pub fn run(expr: Expr) -> Expr {
     // narrower scope.
     let root_id = expr.node_id();
     let _g = provenance::enter(root_id, "mut_read.bind", Nature::Machinery);
-    block(expr, &HashSet::new())
+    block(expr, &Muts::new())
 }
-
-/// The mutable variables in scope, by the binder that introduced them.
-///
-/// Post-uniquify every binder is globally unique, so membership answers
-/// "is this `Var` a mutable variable read?" on the name alone.
-type Muts = HashSet<Name>;
 
 /// The immutable binder each mutable variable currently reads through, over the
 /// block being walked. A variable absent from the map has no open segment: its
@@ -146,6 +169,24 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
             bound_expr,
             body,
         } => {
+            // A-normalization sequences a read at its own opaque binding
+            // (`crate::ccl::anf`, "A mutable-variable read is not atomic"),
+            // which is a read-segment binding already: it opens the segment
+            // rather than being named a second time inside it. The mention is
+            // the read this binding holds, so it ends no segment either.
+            if is_mut_var(&bound_expr, muts) && binding.transparency == BindingTransparency::Opaque
+            {
+                let TypedExprNode::Var(source) = &bound_expr.node else {
+                    unreachable!("is_mut_var matched a Var")
+                };
+                open.insert(source.clone(), binding.name.clone());
+                let body = spine(*body, muts, open);
+                return rebuild(TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(body),
+                });
+            }
             let mut minted = Minted::new();
             let bound_expr = operand(*bound_expr, muts, open, &mut minted);
             close_written(&bound_expr, open);
@@ -184,8 +225,7 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
             let mut minted = Minted::new();
             let init = operand(*init, muts, open, &mut minted);
             close_written(&init, open);
-            let mut inner = muts.clone();
-            inner.insert(binding.name.clone());
+            let inner = with(muts, &binding.name);
             let body = spine(*body, &inner, open);
             wrap(
                 minted,
@@ -244,16 +284,7 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
         // guards — is evaluated in the enclosing block and stays an operand of
         // the statement carrying it.
         TypedExprNode::Lambda { param, body } => {
-            let mut inner = muts.clone();
-            if param
-                .user_annotation
-                .as_ref()
-                .is_some_and(|ty| ty.mut_value_type().is_some())
-            {
-                // A `Mut` parameter is pass-by-reference: the body reads a
-                // mutable variable its caller owns.
-                inner.insert(param.name.clone());
-            }
+            let inner = under_param(muts, param);
             **body = block(std::mem::take(body), &inner);
             expr
         }
@@ -304,7 +335,7 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
 
         // **A refined cast's value.** The predicate on the target is a *copy* of
         // the term below it, and inference dedups the two by structural
-        // equality (`crate::ccl::anf`, "Three recognition contracts"). This
+        // equality (`crate::ccl::anf`, "Five recognition contracts"). This
         // pass cannot rewrite the copy — it never descends into a type — so it
         // rewrites neither, and the mention ends the segment as any other does.
         TypedExprNode::Cast { target, .. } if target.carries_refinement() => expr,
@@ -336,20 +367,20 @@ fn read_binder(name: &Name, open: &mut Open, minted: &mut Minted) -> Name {
     binder
 }
 
-/// Is `e` a bare reference to a mutable variable — the shape a handle position
-/// requires?
-fn is_mut_var(e: &Expr, muts: &Muts) -> bool {
-    matches!(&e.node, TypedExprNode::Var(name) if muts.contains(name))
-}
-
 /// End the segment of every mutable variable `stmt` still mentions: each such
 /// mention is a position the variable may be written through (module docs,
 /// "What ends a segment"). Reads have already been rewritten, so a mention that
-/// survives is not one — and a binder this pass minted is not a key of `open`,
-/// so its own definiens closes nothing.
+/// survives is not one.
 ///
 /// The walk reaches every child, sub-blocks included: a write nested in one ends
-/// the enclosing block's segment too.
+/// the enclosing block's segment too. A binder minted for *this* statement is
+/// sealed by [`wrap`] after this walk, so the `Var` its binding reads is not in
+/// the tree yet and closes nothing. One minted inside a sub-block is: the
+/// sub-block is already rewritten when the walk reaches it, and the `Var` its
+/// binding reads is a mention like any other. So a read after a sub-block that
+/// reads the same variable opens a fresh segment — `a = x ^+ 0; ys = [… x …]; b
+/// = x ^+ 0` gets two binders, and `a == b` is not provable. Conservative, not
+/// wrong: the sub-block's own statements may write.
 fn close_written(stmt: &Expr, open: &mut Open) {
     match &stmt.node {
         TypedExprNode::Var(name) | TypedExprNode::MutWrite { name, .. } => {
@@ -385,6 +416,68 @@ fn rebuilder(e: &Expr) -> impl Fn(TypedExprNode) -> Expr + use<> {
         out.user_annotation = annotation.clone();
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Respelling: a read binder in a diagnostic
+// ---------------------------------------------------------------------------
+
+/// The rename spelling each read-segment binder in `expr` as the mutable
+/// variable it reads: `[__read ↦ x]` for the binder opened on a read of `x`.
+///
+/// For a message and nothing else. `compile_program` applies it to an inference
+/// error's types on the way out, past the point anything types them again.
+/// Substituting the variable into a type inference still holds is the rewrite
+/// [`MutableInRefinedType`](crate::ccl::infer::InferError::MutableInRefinedType)
+/// refuses: a mutable variable has no single value for a type to refer to.
+///
+/// A binder the user wrote keeps its spelling. `x0 ^= x` names the read `x0`,
+/// and respelling it `x` reports a name the program does not use at that point,
+/// so the rename covers the binders [`run`] and [`crate::ccl::anf`] mint — those
+/// with no source spelling.
+pub fn read_respelling(expr: &Expr) -> Subst {
+    let mut out = Subst::id();
+    respell(expr, &Muts::new(), &mut out);
+    out
+}
+
+/// Walk for read-segment bindings, carrying the mutable variables in scope.
+fn respell(expr: &Expr, muts: &Muts, out: &mut Subst) {
+    match &expr.node {
+        // The two binders that put a mutable variable in scope, each over its
+        // own sub-tree: a declaration over its body, a pass-by-reference
+        // parameter over the lambda's.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            respell(init, muts, out);
+            respell(body, &with(muts, &binding.name), out);
+            return;
+        }
+        TypedExprNode::Lambda { param, body } => {
+            respell(body, &under_param(muts, param), out);
+            return;
+        }
+        // A read-segment binding: opaque, bound to a bare read, and named by a
+        // binder a pass minted.
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if binding.transparency == BindingTransparency::Opaque
+            && binding.name.source_spelling().is_none() =>
+        {
+            if let TypedExprNode::Var(source) = &bound_expr.node
+                && muts.contains(source)
+            {
+                *out = out.extended_rename(binding.name.clone(), source.clone());
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children(|child| respell(child, muts, out));
 }
 
 // ---------------------------------------------------------------------------

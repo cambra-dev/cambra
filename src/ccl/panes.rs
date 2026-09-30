@@ -990,6 +990,11 @@ mod tests {
     /// transaction, which `transact_phase` disassembles, `mut_elim` rebuilds as
     /// a `LetRec`, and `channelize` rewrites.
     ///
+    /// [`Phase::MutRead`] is absent for that reason: A-normalization names every
+    /// read this program performs (`crate::ccl::anf`, "A mutable-variable read
+    /// is not atomic") and `mut_read` adopts those bindings rather than minting
+    /// its own.
+    ///
     /// The list is sorted by phase name rather than pipeline order, so it reads
     /// as a set and a new phase lands where its spelling puts it.
     #[test]
@@ -1012,7 +1017,6 @@ mod tests {
                 Phase::Inline,
                 Phase::LambdaElim,
                 Phase::Letrec,
-                Phase::MutRead,
                 Phase::Planning,
                 Phase::Transact
             ],

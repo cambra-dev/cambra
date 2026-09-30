@@ -68,8 +68,8 @@
 use crate::ccl::{
     BindingTransparency, Expr, Lit, Name, Refinement, Type, TypedExprNode,
     ccl_utils::{
-        PredMemo, count_free, free_names_in_value, is_free, spelled_in_a_type,
-        walk_refined_predicates_mut,
+        PredMemo, count_free, discharge_transparent_lets, free_names_in_value, is_free,
+        spelled_in_a_type, walk_refined_predicates_mut,
     },
     lambda_elim::substitute,
     names::SyntheticKind,
@@ -171,17 +171,44 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
     }
 }
 
-/// Returns `true` if `name` is written by a mutable-variable mutation (`MutWrite`) anywhere
-/// inside `expr`. A mutable write advances the variable's history, so an alias
-/// `let y = x` may not be substituted past one (the read would move to the wrong
-/// position) — the mutation-era complement to [`is_let_bound`]'s lexical-rebind
-/// check. Conservative: any write to `x` in the body blocks the substitution,
-/// even if every use of the alias precedes it.
+/// Returns `true` if `name` may be written anywhere inside `expr`. A write
+/// advances the variable's history, so an alias `let y = x` may not be
+/// substituted past one (the read would move to the wrong position) — the
+/// mutation-era complement to [`is_let_bound`]'s lexical-rebind check.
+///
+/// Two mentions may be a write, the same two that end a read segment
+/// (`crate::ccl::mut_read`, "What ends a segment"):
+///
+/// - a [`TypedExprNode::MutWrite`] target, which is the write itself; and
+/// - a **handle** — a bare reference whose node carries the `Mut` history
+///   rather than the value — in an [`TypedExprNode::Apply`]'s function or
+///   argument position, which is where a pass-by-reference writer takes it.
+///   The callee's body is not in hand here: this pass expands a UDF at the
+///   binding that holds it, which is above the call, so a call in `expr` is
+///   still an unexpanded `Apply` when this runs.
+///
+/// Conservative twice over: any such mention anywhere in the body blocks the
+/// substitution, even if every use of the alias precedes it, and a callee that
+/// only reads its parameter blocks it too.
 fn is_mut_written(name: &Name, expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::MutWrite { name: target, .. } if target == name => true,
+        TypedExprNode::Apply { function, argument }
+            if is_handle_to(function, name) || is_handle_to(argument, name) =>
+        {
+            true
+        }
         _ => expr.any_child(|e| is_mut_written(name, e)),
     }
+}
+
+/// Is `e` a bare reference to `name` carrying its `Mut` history — the shape a
+/// handle position takes (`src/ccl/design/mutability.md`, "A mutable variable
+/// read is an explicit operation")? A read of the same variable is stamped with
+/// the value type by the rule that emits it, so the stamp is what tells the two
+/// apart.
+fn is_handle_to(e: &Expr, name: &Name) -> bool {
+    matches!(&e.node, TypedExprNode::Var(n) if n == name) && e.ty.mut_value_type().is_some()
 }
 
 /// Whether `definiens` reads a mutable variable that `body` writes.
@@ -285,7 +312,11 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
             "inline.list_element",
             provenance::Nature::Machinery,
         );
-        move_into_list_elements(*body, &binding.name, &bound_expr)
+        // A memo of its own, scoped to this `[name ↦ definiens]` move rather
+        // than to the pass: the walk above has already visited these predicates
+        // under `memo` and recorded them unchanged, and a hit there is served
+        // without running the rewrite at all.
+        move_into_list_elements(*body, &binding.name, &bound_expr, &PredMemo::new())
     };
 
     // Drop the `Let` only when this rewrite moved the definiens and left no reader
@@ -327,14 +358,23 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
 /// "Duplication"). Each copy is flattened where it lands
 /// ([`flatten_anf_bindings`]).
 ///
-/// Type slots are not walked here. [`inline_list_element_reads`] reaches a
-/// predicate's own list literals by recursing into the predicate, which handles
-/// the `Let` that copy carries rather than the read this replaces.
+/// A predicate's copy of the list is rewritten too, by recursing into it with
+/// this same function. Where the `Let` sits inside the comprehension the copy
+/// carries its own `Let` and [`inline_list_element_reads`]'s recursion reaches
+/// it; where the `Let` sits outside, the copy holds a free read of `name` and
+/// only this walk reaches that. Rewriting one side alone leaves the node's type
+/// describing a collection its value no longer is, which op-conversion rejects
+/// at whichever side still names the binder.
 ///
 /// Shadowing needs no tracking: uniquify gives every binder its own identity, so
 /// `name` is not re-bound under the `Let` that binds it. [`inline_and_beta_reduce`]
 /// rests on the same property.
-fn move_into_list_elements(mut body: Expr, name: &Name, definiens: &Expr) -> (Expr, bool) {
+fn move_into_list_elements(
+    mut body: Expr,
+    name: &Name,
+    definiens: &Expr,
+    memo: &PredMemo,
+) -> (Expr, bool) {
     let mut moved = false;
     if let TypedExprNode::List(elts) = &mut body.node {
         for elt in elts.iter_mut() {
@@ -344,8 +384,23 @@ fn move_into_list_elements(mut body: Expr, name: &Name, definiens: &Expr) -> (Ex
             }
         }
     }
+    body.walk_type_slots_mut(|ty| {
+        walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            // A predicate the binder does not occur in is reported unchanged, so
+            // it keeps its origin `Rc` and stays pointer-shared with its
+            // occurrences on other nodes rather than being reallocated at each.
+            if !is_free(name, pred) {
+                return false;
+            }
+            let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
+            let (rewritten, pred_moved) = move_into_list_elements(old, name, definiens, memo);
+            *pred = rewritten;
+            moved |= pred_moved;
+            pred_moved
+        });
+    });
     body.map_children(|child| {
-        let (child, child_moved) = move_into_list_elements(child, name, definiens);
+        let (child, child_moved) = move_into_list_elements(child, name, definiens, memo);
         moved |= child_moved;
         child
     });
@@ -440,10 +495,15 @@ fn move_single_occurrence(mut body: Expr, name: &Name, definiens: Expr) -> (Expr
 /// `Tuple`, `Record` or `List`?
 ///
 /// The one position the rewrite above leaves alone. A former's elements are
-/// read *by position* downstream: the diff pairs a tuple's elements against the
+/// read by position downstream: the diff pairs a tuple's elements against the
 /// other version's to localize an edit to the elements that moved
 /// (`crate::ccl::diff`), and a named element is what makes that pairing a
 /// `Var`-to-`Var` correspondence rather than a whole-recurrence rewrite.
+///
+/// The one consumer this exception serves is that pairing, which couples this
+/// pass to `diff`'s notion of a site. `diff`'s
+/// `a_swapped_pair_of_registers_is_not_a_shared_root` pins the shape from the
+/// other side; a change to either belongs with a change to the other.
 fn stands_in_a_value_former(name: &Name, body: &Expr) -> bool {
     let holds = |elts: &[Expr]| {
         elts.iter()
@@ -552,21 +612,6 @@ fn inline_impl(expr: Expr) -> Expr {
                 return substitute(body, &binding.name, &bound_expr);
             }
 
-            // **An A-normalization temp naming a product former.** ANF names
-            // every compound sub-expression so inference meets only atomic
-            // operands, and a call's tupled argument list is one of them:
-            // `f(xs, 10)` reaches this pass as `let __anf = (xs, 10) in …
-            // __anf.0 … __anf.1 …`. Op-conversion reads a projection's operand
-            // structurally — it compiles `(xs, 10) ▷ .0` to `xs` and has no arm
-            // for a `Var` standing where the tuple does — so the binding has to
-            // go before it gets there. Substituting restores exactly the shape
-            // beta-reduction produced before the temp stood between the
-            // projection and the former it projects.
-            //
-            // Bounded to an [`SyntheticKind::AnfTemp`] binder and a product
-            // former: a binding a consumer recognizes is recognized *by* its
-            // binding, and a collection former's binding is what planning hangs
-            // an iteration marker on.
             // **An A-normalization temp read once.** The temp exists to give
             // inference an atomic operand, and a binding read once is no
             // sharing. Two later passes read the binding as one:
@@ -581,13 +626,7 @@ fn inline_impl(expr: Expr) -> Expr {
             // binder, one occurrence (a refinement predicate's counted), and no
             // read of a variable the body writes.
             if !binder_spelled_in_a_type
-                && matches!(
-                    binding.name,
-                    Name::Synthetic {
-                        kind: SyntheticKind::AnfTemp,
-                        ..
-                    }
-                )
+                && binding.name.is_anf_temp()
                 && count_free(&binding.name, &body) == 1
                 && !reads_a_variable_written_in(&bound_expr, &body)
                 && !stands_in_a_value_former(&binding.name, &body)
@@ -619,15 +658,33 @@ fn inline_impl(expr: Expr) -> Expr {
                 };
             }
 
+            // **An A-normalization temp naming a product former.** ANF names
+            // every compound sub-expression so inference meets only atomic
+            // operands, and a call's tupled argument list is one of them:
+            // `f(xs, 10)` reaches this pass as `let __anf = (xs, 10) in …
+            // __anf.0 … __anf.1 …`. Op-conversion reads a projection's operand
+            // structurally — it compiles `(xs, 10) ▷ .0` to `xs` and has no arm
+            // for a `Var` standing where the tuple does — so the binding has to
+            // go before it gets there. Substituting restores exactly the shape
+            // beta-reduction produced before the temp stood between the
+            // projection and the former it projects.
+            //
+            // Bounded to an [`SyntheticKind::AnfTemp`] binder and a product
+            // former: a binding a consumer recognizes is recognized *by* its
+            // binding, and a collection former's binding is what planning hangs
+            // an iteration marker on.
+            //
+            // The read-once rule above moves its definiens; this one copies,
+            // because each projection needs the former standing under it, so a
+            // temp several projections read is substituted at every one. A
+            // copy duplicates whatever its definiens does, and
+            // `anf_chain_builds_a_product` admits a chain whose definientia are
+            // not pure, so the same write guard the read-once rule carries
+            // applies here.
             if !binder_spelled_in_a_type
-                && matches!(
-                    binding.name,
-                    Name::Synthetic {
-                        kind: SyntheticKind::AnfTemp,
-                        ..
-                    }
-                )
+                && binding.name.is_anf_temp()
                 && anf_chain_builds_a_product(&bound_expr)
+                && !reads_a_variable_written_in(&bound_expr, &body)
             {
                 let _g =
                     provenance::enter(node_id, "inline.anf_product", provenance::Nature::Machinery);
@@ -980,13 +1037,23 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
 /// query runs under [`NoScope`], because this pass holds no binder types for the
 /// tree it was handed; an assumption left out only weakens the antecedent.
 ///
+/// Both sides have their transparent `let` bindings discharged first
+/// ([`discharge_transparent_lets`]), for the reason the deficit rule does it: a
+/// definiens this pass substitutes into a predicate carries A-normalization's
+/// bindings while the copy it already collapsed does not, and neither the
+/// structural relation nor the encoder's fragment reads the two as one predicate.
+///
 /// Anything subtler than both is exactly what should trip the assert and get a real
 /// `restrict` lift.
 fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
-    let demanded = param_ty.refinements();
-    if demanded.is_empty() {
+    if param_ty.refinements().is_empty() {
         return true;
     }
+    let demanded: Vec<Refinement> = param_ty
+        .refinements()
+        .iter()
+        .map(discharge_transparent_lets)
+        .collect();
     // A mutable variable mention in a value position is a *read*, so what the argument denotes is
     // the value the mutable variable holds and the refinements it supplies are the ones on that
     // value type. The two sides are otherwise recorded at different levels: the deref
@@ -995,19 +1062,22 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
     // survive on the bare `Var` for the phase to find the read. Comparing the stamp
     // against the parameter would ask a handle to entail a fact about a value. See
     // `src/ccl/design/mutability.md`, "`Mut` is a CCL type".
-    let mut supplied: Vec<&Refinement> = arg_ty.refinements().iter().collect();
+    let mut supplied: Vec<Refinement> = arg_ty
+        .refinements()
+        .iter()
+        .map(discharge_transparent_lets)
+        .collect();
     if let Some(value) = arg_ty.mut_value_type() {
-        supplied.extend(value.refinements());
+        supplied.extend(value.refinements().iter().map(discharge_transparent_lets));
     }
 
-    if demanded.iter().all(|d| supplied.contains(&d)) {
+    if demanded.iter().all(|d| supplied.contains(d)) {
         return true;
     }
     // The base the query runs over is the argument's value, so the `Mut` stamp comes
     // off here for the reason it does above.
     let base = arg_ty.mut_value_type().unwrap_or(arg_ty).peel_refinements();
-    let supplied: Vec<Refinement> = supplied.into_iter().cloned().collect();
-    match smt_sub(base, &supplied, demanded, &NoScope) {
+    match smt_sub(base, &supplied, &demanded, &NoScope) {
         Ok(entailed) => entailed,
         // A predicate the encoder cannot read leaves the entailment undecided, which
         // is the structural answer: the demand is not discharged, and the caller's

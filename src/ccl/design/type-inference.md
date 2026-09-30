@@ -190,6 +190,10 @@ def identity(x):
   fallback existed. The encoded fragment is over surface-syntax predicate shapes, and
   `lambda_elim` rewrites every predicate point-free, so no check at or after that pass reaches
   the fallback at all — the reach is inference and `inline`.
+* **SMT-supported post-inference checks.** Some but not all
+  post-inference checks use SMT checking. Post-planning checks only
+  use structural equality, and will need an SMT encoding for
+  point-free expressions in order to upgrade to SMT.
 
 *(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
@@ -471,6 +475,8 @@ Inference runs once, up front. But the pipeline re-checks types repeatedly *afte
 * **`CheckCtx`** — the post-inference check (`infer::check`). The *same* rules run, but the hooks now *verify* rather than *solve*: `subexpr` returns the child's already-recorded `child.ty` (what inference decided) instead of re-deriving it, `require_sub` confirms a relation the solver should already have established, and a final **reconcile** step checks the rule's reconstructed type against the node's recorded type.
 
 So the two passes share one description of the language's structure; they differ only in whether a rule's obligations are *emitted as constraints* or *checked against the recorded solution*. Adding or changing a structural rule updates both at once. Both contexts treat refinements strictly and identically; see §4 for how the check stays refinement-aware (adjacency flow checks *and* the reconcile) and why the passes that introduce refined types must keep each node reconstructable.
+
+Currently, post-*planning* checks default to structural equality. Using SMT to match the previous-phase checks will require SMT encoding for point-free expressions.
 
 ---
 
@@ -1368,6 +1374,20 @@ the bound is recorded, and it is a lookup, since uniquify gives every binding si
 violation names the variable and the reference and fails. Every build enforces it: a release
 compile rejects what a debug compile rejects.
 
+An opaque binder is in every telescope of the walk, whatever the lexical position. It carries no
+definiens, so a type lifted past it keeps the name and the name outlives its scope ([`let` binders
+and scope exit](#let-binders-and-scope-exit)). The telescope therefore holds an opaque set shared by
+every variable the walk mints, and entering the binder adds to it, reaching the variables minted
+before it as well. That is what admits a write to a mutable variable declared outside the binder:
+`x := 0` mints the value variable under an empty telescope, and `x := x ^+ 1` contributes
+`{Int | __elem == __read ^+ 1}` over the read binder minted inside
+(`src/ccl/design/mutability.md`, "A read is named while inference runs"). The end-of-inference check
+states the same rule tree-wide, seeding its root scope with every opaque binder the tree holds
+(`check_scope_valid`).
+
+A binder carrying a definiens stays out of that set, its reference being discharged rather than
+carried. A `for` target carries neither, so a contribution naming one still fails the check.
+
 Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
 and the pass-boundary re-derivations that check what a pass produced. A re-derivation walks a tree
 where a pass has erased term binders, and the refinements it meets still name them. The dependent
@@ -1447,6 +1467,11 @@ the binding discharges the reference to the definiens. No re-addressing is neede
 is its telescope entry's address, so the name-keyed discharge already speaks in entries. A Pi entry
 has no definiens, and lifting past one abstracts instead of discharging.
 
+An opaque entry (`x ^= e`) has no definiens either, and lifting past one does neither: the name
+stays in the lifted type, and what it means there is the type the binder was bound at, recorded when
+the binder is entered (`InferCtx::opaque_binders`) and read by every later refinement query. Entry
+rather than exit, because a bound naming the binder is recorded inside its scope.
+
 Emission records the lift, and cannot perform it: the body's type is an inference variable there,
 whose refinements sit in its bounds rather than in the type. `InferCtx::close_let_type` mints the
 `let` node's type outside the binder and records the body's type on its lower edge under `[𝑥 ↦ 𝑣]`,
@@ -1454,6 +1479,32 @@ a suspended discharge read as an application. Every bound naming `𝑥` then cro
 discharges the name, and β fires at coalesce. Returning the body's variable verbatim instead lets a
 refinement over `𝑥` reach the enclosing lambda's codomain, which is minted outside the binder and
 so trips the record-time closure check at the first call site that reads the codomain.
+
+#### A lambda's codomain drops the body's opaque binders
+
+An opaque binder the body introduced stands for one value per call, so a refinement naming it says
+nothing about the function's result: it would relate the results of `f(1)` and `f(2)` through one
+`r`. `Typing::close_body_type` drops such a refinement and reports the base type, a supertype, so
+every result the function produces still inhabits the codomain. A binder still in lexical scope
+where the lambda's rule runs was introduced outside the body and denotes one value for the whole
+function, so it stays; what is dropped are the binders whose scope closed inside the body.
+
+Emission drops on a second variable rather than on the body's own, so the body node keeps the type
+its own rule gave it. `body_ty <: codomain` is an ordinary edge, so what reaches the body's type
+still reaches the codomain, call-site bounds included, and the edge's closure deposits the body's
+concrete lower bounds on the codomain variable directly, following variable-to-variable edges on the
+way. The refinements to drop therefore sit on that variable's own lower bounds, and no later arrival
+can name one: a refinement naming an opaque binder is recorded where the binder is in scope, which
+is inside the body the rule has just finished emitting.
+
+That variable is minted under the lambda's parameter binder, where the codomain stands: the Pi binds
+the parameter in the codomain, so a body refinement naming the parameter closes against the
+variable's telescope. Minting it after the parameter's scope closes leaves the parameter out of that
+telescope, and the same refinement is then an open bound on it.
+
+A demand on the codomain is met by what flows out of the body rather than narrowing a variable
+inside it. `def f(x) => 𝑇` with an unannotated `x` whose body introduces an opaque binder bounds `x`
+from its call sites alone; a conflict with `𝑇` surfaces when those bounds reach the codomain.
 
 #### Discharge is application
 

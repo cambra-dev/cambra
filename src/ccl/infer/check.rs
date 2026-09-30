@@ -26,7 +26,7 @@ use super::emit::{
     emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::Typing;
+use super::typing::{Typing, escaped_opaque_binders};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 use crate::util::ScopeStack;
@@ -438,15 +438,21 @@ impl Typing for CheckCtx {
 
     fn scoped_let<R>(
         &mut self,
-        name: &Name,
-        bound_ty: &Type,
+        binding: &TypedBinding,
         _generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        // The opaque binder's standing fact, recorded on the way in for the
+        // reason emission records it there (`InferCtx::scoped_let`).
+        if binding.transparency == BindingTransparency::Opaque {
+            self.telescope.enter_opaque(&binding.name);
+            self.opaque_binders
+                .insert(binding.name.clone(), binding.ty.clone());
+        }
         // See `scoped`. No generalization either: Check never generalizes
         // (`is_generalizable` is `false`), so the binder stands for the one type its
         // definiens has, which is the fact the body's queries assume.
-        self.scoped(name, bound_ty, f)
+        self.scoped(&binding.name, &binding.ty, f)
     }
 
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
@@ -456,10 +462,8 @@ impl Typing for CheckCtx {
         // there.
         if binding.transparency == BindingTransparency::Opaque {
             // The name stays in the lifted type, so what it means there — the type it
-            // was bound at — outlives the scope `scoped_let` has just closed
-            // ([`CheckCtx::opaque_binders`]).
-            self.opaque_binders
-                .insert(binding.name.clone(), binding.ty.clone());
+            // was bound at — outlives the scope ([`CheckCtx::opaque_binders`],
+            // recorded by `scoped_let` on the way in).
             return body_ty;
         }
         let name = &binding.name;
@@ -480,6 +484,19 @@ impl Typing for CheckCtx {
         } else {
             body_ty
         }
+    }
+
+    fn close_body_type(&mut self, body_ty: Type) -> Result<Type, LocatedInferError> {
+        // Check reads resolved types, so the drop is the structural rewrite itself.
+        let escaped =
+            escaped_opaque_binders(&self.opaque_binders, |n| self.scopes.lookup(n).is_some());
+        if escaped.is_empty() {
+            return Ok(body_ty);
+        }
+        Ok(crate::ccl::ccl_utils::drop_refinements_naming(
+            &body_ty,
+            &|n| escaped.contains(n),
+        ))
     }
 
     fn bind_annotation(&mut self, _inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {

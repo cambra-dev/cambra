@@ -469,23 +469,14 @@ fn a_let_bound_constant_returned_directly() {
     )
 }
 
-/// **This test pins a defect, not a decision — it should start failing when the
-/// defect is fixed.**
-///
-/// `2` is not `0`, so inference admits the call: the argument's type
-/// is `Int@2`, which entails both written demands through the fallback. Planning's
-/// post-pass check then rejects the same call. Both predicates are point-free by
-/// then — `__elem ▷ ((id, 0 ▷ const) ▷ zip ≫ neq)` — which is outside the encoded
-/// fragment, so the deficit falls back to the structural matching the fallback
-/// exists to get past, and a well-typed program reports an internal invariant
-/// failure.
-///
-/// Widening the encoding past surface syntax retires this pin, as would checking
-/// against the pre-elimination predicate. Once it passes, the program evaluates
-/// `4 // 2`. The rejecting counterpart is `tests/programs/refinement/`.
+/// A demand at one parameter of two, entailed by the argument without matching it:
+/// `Int@2` against `{Int | __elem != 0}`. Inference admits the call through
+/// `smt_sub`, and `inline`'s beta-reduction substitutes the argument for the binder,
+/// so the refined parameter is gone before planning's post-pass check runs. That
+/// check still compares structurally; `post_planning_smt` pins a refinement that
+/// survives to it. The rejecting counterpart is `tests/programs/refinement/`.
 #[test]
-#[should_panic(expected = "post-planning produced an invalid tree: [Type mismatch")]
-fn refinements_that_survive_to_post_planning_check_are_rejected() {
+fn a_refined_divisor_entailed_by_the_argument() {
     check_scalar(
         indoc! {r#"
             def no_zero_no_one_div(left: Int, right: {Int where _ != 0}):
@@ -854,5 +845,116 @@ fn complex_anf() {
 1 + 2 + "Hello" + 4 + 5
         "#},
         "1 + 2 + \"Hello\" + 4 + 5",
+    )
+}
+
+/// TODO: The typecheck for uses of polymorphic functions occurs
+/// during Coalesce, in which SMT is not currently used. In this
+/// example, structural equality comparison cannot reconcile the
+/// semantically equivalent refinements {_ == 4 ^+ 1} and {_ == a}.
+#[test]
+fn monomorphization_check_is_not_smt() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    4 ^+ 1
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Type mismatch for monomorphization specialization",
+    )
+}
+
+/// It is unsound to consider the `r` from `f(1)` and the `r` from
+/// `f(2)` to be the same value, and so `r` is not present in the
+/// external output type inferred for `f`: the refinement naming it is
+/// dropped at the lambda boundary and `f` reports `Int`
+/// (`Typing::close_body_type`).
+///
+/// `b`'s annotation then demands `{Int | __elem == a}` of a value known
+/// only to be an `Int`, which nothing establishes.
+#[test]
+fn dont_discharge_opaques1() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int):
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Annotation mismatch: annotated as {Int | __elem == a}, but inferred as Int",
+    )
+}
+
+/// It is unsound to consider the `r` from `f(1)` and the `r` from
+/// `f(2)` to be the same value, and so `r` should not be present in
+/// the external output type inferred for `f`.
+///
+/// This version rejects the `r` in the output type annotation as
+/// unbound.
+#[test]
+fn dont_discharge_opaques2() {
+    check_compile_error(
+        indoc! {r#"
+def f(x: Int) => { Int where _ == r }:
+    r ^= x;
+    r ^+ 0
+a = f(1)
+b: {Int where _ == a} = f(2)
+a == b
+        "#},
+        "Unbound variable: 'r'",
+    )
+}
+
+/// Reading a mutable variable introduces an opaque binder whose scope closes
+/// inside the body, so the codomain's opaque drop runs; the same refinement names
+/// the parameter, which the Pi binds. The codomain variable carrying the drop is
+/// minted under the parameter binder for that reason
+/// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's
+/// opaque binders").
+#[test]
+fn opaques3() {
+    check_scalar(
+        indoc! {r#"
+x: Mut({Int where _ >= 0}) := 0
+def g(a: Int):
+    x ^+ a
+g(1)
+        "#},
+        Value::Int(1),
+    )
+}
+
+/// The same shape through a comprehension, whose lambda binds the iteration
+/// target rather than a declared parameter.
+#[test]
+fn opaques4() {
+    check_scalar(
+        indoc! {r#"
+x := 3
+ys = [x ^+ i for i in [1,2]]
+()
+        "#},
+        Value::Unit,
+    )
+}
+
+/// TODO: Post-planning typechecks are still limited to structural
+/// equality, and thus fail for refinements that survive to
+/// post-planning. This is currently blocked by the lack of SMT
+/// encoding rules for point-free expressions.
+#[test]
+fn post_planning_smt() {
+    check_compile_error(
+        indoc! {r#"
+x: Mut({Int where _ >= 0}) := 0
+y = x ^+ x
+z: {Int where _ >= 0} = y
+z        "#},
+        "post-planning produced an invalid tree",
     )
 }

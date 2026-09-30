@@ -578,17 +578,21 @@ fn expect_mut_discipline_error(code: &str, needle: &str) {
     );
 }
 
+/// Compile `code`, expect failure, and return the rendered errors.
+fn compile_errors(code: &str) -> String {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    match compile_program(&mut ctx, code, consumer) {
+        Ok(_) => panic!("expected a compile error, but the program compiled"),
+        Err(errs) => render_errors(&errs, "<compile-error-test>", code),
+    }
+}
+
 /// Compile `code`, expect failure, and assert the rendered errors contain
 /// `needle`. The kind-agnostic sibling of [`expect_mut_discipline_error`], for
 /// surface diagnostics that surface at lowering or channelization.
 fn expect_compile_error(code: &str, needle: &str) {
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let errs = match compile_program(&mut ctx, code, consumer) {
-        Ok(_) => panic!("expected a compile error containing {needle:?}, but the program compiled"),
-        Err(e) => e,
-    };
-    let rendered = render_errors(&errs, "<compile-error-test>", code);
+    let rendered = compile_errors(code);
     assert!(
         rendered.contains(needle),
         "expected a compile error containing {needle:?}, got:\n{rendered}"
@@ -1014,6 +1018,68 @@ fn a_refinement_may_depend_on_a_named_read(#[case] code: &str, #[case] expected:
             Predicate::True,
             BitSet::new(),
         ),
+    );
+}
+
+/// A diagnostic spells a mutable variable's read as the **variable**, never as
+/// the binder the read was given.
+///
+/// The binder exists for inference, so a message carrying one names something the
+/// reader cannot look up (`src/ccl/design/mutability.md`, "A read is named while
+/// inference runs"). Two messages carry one: a write the declaration's refinement
+/// refuses, whose found type is the write's own contribution, and the
+/// mutable-in-a-refinement rejection, whose type is the predicate the
+/// comprehension filters on.
+#[rstest]
+#[case::a_write_the_declaration_refines(
+    indoc! {r#"
+        n = 0 - 1
+        x: Mut({Int where _ >= 0}) := 0
+        x := x ^+ n
+        x
+    "#},
+    "found {Int | __elem == x ^+ n}"
+)]
+#[case::a_refinement_over_a_second_mutable(
+    indoc! {r#"
+        x := 2
+        y := 3
+        k = y
+        ys = [i for i in [1, 2, 3] if i < x and i < k]
+        ys
+    "#},
+    "i < x and i < y"
+)]
+fn a_diagnostic_spells_a_read_as_its_variable(#[case] code: &str, #[case] expected: &str) {
+    let rendered = compile_errors(code);
+    assert!(
+        rendered.contains(expected),
+        "expected {expected:?} in:\n{rendered}"
+    );
+    for binder in ["__read", "__anf"] {
+        assert!(
+            !rendered.contains(binder),
+            "`{binder}` reached a diagnostic:\n{rendered}"
+        );
+    }
+}
+
+/// A binder the **user** wrote keeps its own spelling, whatever it is bound to.
+/// `x0 ^= x` names the read `x0`, and a message respelling it `x` would report a
+/// name the program does not use at that point.
+#[test]
+fn a_diagnostic_keeps_a_user_written_opaque_binder() {
+    let rendered = compile_errors(indoc! {r#"
+        n = 0 - 1
+        x := 0
+        x0 ^= x
+        y: Mut({Int where _ >= 0}) := 0
+        y := x0 ^+ n
+        y
+    "#});
+    assert!(
+        rendered.contains("found {Int | __elem == x0 ^+ n}"),
+        "expected the user's own binder in:\n{rendered}"
     );
 }
 
@@ -2159,6 +2225,12 @@ fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
 /// `x` lands in a refinement, which no binding form can keep it out of. The
 /// program compiles until the unified phase, which has no history to rewrite a
 /// mutable reference inside a type into.
+///
+/// What the pin holds is an internal error, not a diagnostic: the panic reads
+/// as a compiler bug for a program that is simply ill-typed. Pinned until the
+/// case reports a user error, so the day it does the pin says so — as
+/// `a_refined_map_key_in_a_mut_annotation_reaches_the_boundary` does for the
+/// refined-map-key form.
 #[test]
 fn dependent_codomain_discharges_mut_var_argument_into_refinement() {
     check_compile_error(
@@ -2176,9 +2248,10 @@ fn dependent_codomain_discharges_mut_var_argument_into_refinement() {
 /// in it rather than with `x` discharged into it: the body types as
 /// `{Int | __elem == a ^+ x1}`, and `x1`'s own refinement is what admits that
 /// against the declared output. The call is still `test(x)`, so the program
-/// stops where its sibling above stops.
+/// stops where its sibling above stops — at the same internal error, pinned
+/// for the same reason.
 #[test]
-fn dependent_codomain_via_snapshot_binder_still_rejected() {
+fn dependent_codomain_via_snapshot_binder_reaches_the_boundary() {
     check_compile_error(
         indoc! {r#"
             x: Mut({Int where _ >= 0}) := 0
@@ -2194,7 +2267,8 @@ fn dependent_codomain_via_snapshot_binder_still_rejected() {
 /// This test passes type inference because the body of the `x0 = x`
 /// let binding is a function with an explicitly annotated type that
 /// does not mention `x`. The call `test(x)` is what carries the mutable
-/// variable into a refinement.
+/// variable into a refinement, so the program stops at the same internal
+/// error as the two above, pinned for the same reason.
 #[test]
 fn call_site_argument_carries_mut_var_into_refinement() {
     check_compile_error(
@@ -2360,20 +2434,51 @@ x
     )
 }
 
-/// Currently, the snapshots created for mutable variables cannot be
-/// captured in bounds on those variables.
-///
-/// Workaround is to always give mutable variables type annotations
-/// when they will be written to by ^+.
+/// A snapshot write to a mutable variable with no annotation. The contribution
+/// `{Int | __elem == __read ^+ 1}` names the read binder, and the value variable
+/// it lands on was minted at the declaration, outside that binder. The binder is
+/// opaque, which puts it in every telescope of the walk. The join over the seed
+/// and the write establishes neither predicate, so the variable types as `Int`.
 #[test]
-fn snapshot_write_to_unannotated_mut_var_leaves_an_open_bound() {
-    check_compile_error(
+fn snapshot_write_to_an_unannotated_mut_var() {
+    check_scalar(
         indoc! {r#"
 x := 0
 x := x ^+ 1
 x
 "#},
-        "open bound recorded",
+        Value::Int(1),
+    )
+}
+
+/// The same shape with the opaque binder written by hand rather than minted by
+/// `mut_read`: one rule covers both, since what admits the contribution is the
+/// binder's opacity and not which pass introduced it.
+#[test]
+fn snapshot_write_through_a_user_written_opaque_binder() {
+    check_scalar(
+        indoc! {r#"
+x := 0
+x0 ^= 5
+x := x0 ^+ 1
+x
+"#},
+        Value::Int(6),
+    )
+}
+
+/// A seed that reads another mutable variable, and no write to join it with. The
+/// seed's refinement is the value variable's only contribution, so it survives —
+/// naming the read binder outside the scope that bound it.
+#[test]
+fn a_seed_reading_another_mut_var_keeps_its_refinement() {
+    check_scalar(
+        indoc! {r#"
+y := 3
+x := y ^+ 1
+x
+"#},
+        Value::Int(4),
     )
 }
 
@@ -2422,7 +2527,13 @@ x
     )
 }
 
-/// Same problem as `snapshot_write_to_unannotated_mut_var_leaves_an_open_bound`.
+/// A loop's target binder is the gap the opaque-binder rule does not close. `p`
+/// is neither opaque nor discharged by the write's edge, so the contribution
+/// `{Int | __elem == __read ^+ p}` cannot be recorded on a value variable minted
+/// outside the loop. Annotating the mutable variable is the workaround: the
+/// contribution is then checked against the declared value type rather than
+/// joined into an inference variable
+/// (`refined_induction_variable_via_annotated_array_write_succeeds`).
 #[test]
 fn snapshot_write_in_loop_to_unannotated_mut_var_leaves_an_open_bound() {
     check_compile_error(
@@ -2433,5 +2544,106 @@ for p in [1,2,3]:
 x
 "#},
         "open bound recorded",
+    )
+}
+
+/// A value-position `match`'s scrutinee is the one read A-normalization leaves
+/// in place, so `mut_read` is what names this one (`src/ccl/mut_read.rs`, "A
+/// read A-normalization already named").
+#[test]
+fn read_in_a_value_position_match_scrutinee() {
+    check_scalar(
+        indoc! {r#"
+m: Mut({`ping{Int} | `close}) := `ping(3)
+n = (match m: case `ping(s): s case `close: 0)
+n
+"#},
+        Value::Int(3),
+    )
+}
+
+/// A read and a write in one statement: the tuple's first element reads `x`
+/// before the call beside it writes through it, so the element is the seed.
+#[test]
+fn read_write_ordering() {
+    check_scalar(
+        indoc! {r#"
+def g(c: Mut(Int)):
+    c += 100
+    c + 0
+x := 1
+t = (x, g(x))
+t.0 * 1000 + t.1
+"#},
+        Value::Int(1101),
+    )
+}
+
+/// The same two operands the other way round: the call writes before the
+/// element reading `x` is reached, so that element is the written value.
+#[test]
+fn read_write_ordering_reversed() {
+    check_scalar(
+        indoc! {r#"
+def g(c: Mut(Int)):
+    c += 100
+    c + 0
+x := 1
+t = (g(x), x)
+t.0 * 1000 + t.1
+"#},
+        Value::Int(101101),
+    )
+}
+
+#[test]
+fn fun_arg_mut_ref_plus() {
+    check_scalar(
+        indoc! {r#"
+def g(c: Mut(Int)):
+    c += 100
+    c + 0
+x := 1
+t = g(x)
+t
+"#},
+        Value::Int(101),
+    )
+}
+
+#[test]
+fn negative_example1() {
+    check_compile_error(
+        indoc! {r#"
+x : Mut({Int where _ <= 5}) := 0;
+x := x ^+ 1
+"#},
+        "Type mismatch for write to mutable variable `x`: expected {Int | __elem <= 5}, found {Int | __elem == x ^+ 1}",
+    )
+}
+
+#[test]
+fn negative_example2() {
+    check_compile_error(
+        indoc! {r#"
+x : Mut({Int where _ <= 5}) := 0;
+m = 0 - 1
+x := x ^+ m
+"#},
+        "Type mismatch for write to mutable variable `x`: expected {Int | __elem <= 5}, found {Int | __elem == x ^+ m}",
+    )
+}
+
+#[test]
+fn split_write() {
+    check_scalar(
+        indoc! {r#"
+cnt := 0
+for i in [1,2,3]:
+  c0 = cnt
+  cnt := c0 + 1
+cnt
+"#},
+        Value::Int(3),
     )
 }

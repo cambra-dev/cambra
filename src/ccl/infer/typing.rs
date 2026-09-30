@@ -8,6 +8,25 @@ use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Name, Type, TypedBinding};
+use std::collections::{BTreeSet, HashMap};
+
+/// The [opaque](crate::ccl::BindingTransparency::Opaque) binders whose lexical
+/// scope has already closed at the current position: recorded as opaque, and no
+/// longer answered by `in_scope`.
+///
+/// Both modes keep the same two pieces of state — a map of every opaque binder
+/// entered, which only grows, and the lexical scope, which does not — so the
+/// question [`Typing::close_body_type`] asks is answered once here.
+pub(super) fn escaped_opaque_binders(
+    opaque_binders: &HashMap<Name, Type>,
+    in_scope: impl Fn(&Name) -> bool,
+) -> BTreeSet<Name> {
+    opaque_binders
+        .keys()
+        .filter(|n| !in_scope(n))
+        .cloned()
+        .collect()
+}
 
 /// The operations a typing rule needs from its surrounding pass.
 ///
@@ -140,15 +159,22 @@ pub(super) trait Typing {
     /// (it never generalizes).
     fn is_generalizable(&self, def: &Expr) -> bool;
 
-    /// Run `f` with a `let` name bound over the body. When `generalize` is set,
-    /// Emit generalizes `bound_ty` at the current level into a polymorphic
-    /// scheme (so each use site instantiates fresh quantified variables);
-    /// otherwise it binds monomorphically (shared). Check ignores `generalize`
-    /// and binds the name at `bound_ty` like any other binder.
+    /// Run `f` with a `let` binding in scope over the body, at the type
+    /// `binding.ty` records. When `generalize` is set, Emit generalizes that
+    /// type at the current level into a polymorphic scheme (so each use site
+    /// instantiates fresh quantified variables); otherwise it binds
+    /// monomorphically (shared). Check ignores `generalize` and binds the name
+    /// like any other binder.
+    ///
+    /// Entering is also where an
+    /// [opaque](crate::ccl::BindingTransparency::Opaque) binder's standing fact
+    /// is recorded, which is why this takes the whole binding: the fact is what
+    /// a query outside the binder's scope reads, and a bound recorded *inside*
+    /// it on a variable minted outside already needs the name accounted for
+    /// (see [`Telescope`](crate::ccl::infer_var::Telescope)).
     fn scoped_let<R>(
         &mut self,
-        name: &Name,
-        bound_ty: &Type,
+        binding: &TypedBinding,
         generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R
@@ -175,6 +201,23 @@ pub(super) trait Typing {
     /// the binder's name still in it, and the binder's own type is what a later
     /// query learns about that name.
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type;
+
+    /// Lift a lambda body's type to the function's codomain, dropping every
+    /// refinement that names an [opaque](crate::ccl::BindingTransparency::Opaque)
+    /// binder the body introduced.
+    ///
+    /// A `let` keeps such a binder's name in the type it lifts, because the name
+    /// denotes one value and what it means outlives the scope
+    /// ([`close_let_type`](Self::close_let_type)). A function's codomain cannot:
+    /// the binder stands for one value per *call*, so a refinement naming it
+    /// would relate the results of two calls through one name. The codomain
+    /// reports the base type instead, a supertype, so every result the function
+    /// produces still inhabits it. A binder still in lexical scope where this
+    /// runs was introduced outside the body and stays.
+    ///
+    /// See `src/ccl/design/type-inference.md`, "A lambda's codomain drops the
+    /// body's opaque binders", for what the two modes each do.
+    fn close_body_type(&mut self, body_ty: Type) -> Result<Type, LocatedInferError>;
 
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this records the **one-way** obligation `inferred <: ann` —

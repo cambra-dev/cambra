@@ -4,11 +4,14 @@
 //! [`crate::ccl::infer::infer`]. Every position that is not already a `Let`'s
 //! bound name gets one: a `BinOp`'s operands, an `Apply`'s argument, a
 //! collection literal's elements, and so on are rewritten so that only an
-//! atomic term — a literal, a variable, a `Lambda` value, a data-source or
-//! projection reference — occupies those positions. This is the opposite of
-//! `src/ccl/design/ir.md`'s documented "Less normalized than ANF" decision;
-//! this pass makes CCL strict ANF instead, and the shape it produces persists
-//! through every later pass rather than being undone after inference.
+//! atomic term — a literal, a variable other than a mutable one, a `Lambda`
+//! value, a data-source or projection reference — occupies those positions.
+//! This is the opposite of `src/ccl/design/ir.md`'s documented "Less normalized
+//! than ANF" decision; this pass makes CCL strict ANF instead, and no later
+//! pass undoes the shape wholesale. Individual bindings do go:
+//! [`crate::ccl::inline`]'s read-once rule substitutes away an `AnfTemp` read
+//! exactly once, so a pass that pattern-matches on such a definiens meets it
+//! directly rather than through the binder.
 //!
 //! # The one exception: refinement predicates
 //!
@@ -16,13 +19,53 @@
 //! [`crate::ccl::TypedBinding::user_annotation`], not a `Cast`
 //! target, not [`crate::ccl::TypedExpr::user_annotation`]. Refinement
 //! predicates exist only inside `Type::Refinement`, so this keeps them
-//! untouched with no special-case skip. Predicate equality is structural
-//! (`Refinement::PartialEq` already has a `Let` arm, so it would tolerate
-//! ANF), but the SMT encoder (`src/ccl/infer/solver/smt.rs`) has no `Let`
-//! arm and treats one as unencodable, which the solver caller turns into
-//! "entailment not proved" — a spurious type error, not lost dedup.
+//! untouched with no special-case skip.
 //!
-//! # Three recognition contracts: positions a `Let` must never sit between
+//! A predicate acquires this pass's bindings anyway, later:
+//! [`crate::ccl::inline`] substitutes a definiens carrying them into one, and
+//! the copy whose single occurrence its read-once rule already moved into place
+//! carries none, so one predicate reaches a comparison under two spellings.
+//! `crate::ccl::ccl_utils::discharge_transparent_lets` takes the bindings back
+//! out at both sites that compare predicates — the deficit rule in
+//! `src/ccl/infer/solver/constrain.rs` and `refinement_discharged_by` in
+//! `src/ccl/inline.rs`. Neither reads the two spellings as one predicate on its
+//! own: equality is structural (`Refinement::PartialEq`), and the SMT encoder
+//! (`src/ccl/infer/solver/smt.rs`) has no `Let` arm, reporting one as
+//! unencodable.
+//!
+//! # A mutable-variable read is not atomic
+//!
+//! A reference to a mutable variable is a read, and a read denotes the value
+//! the variable holds at the point it is performed. Every other atomic term
+//! denotes the same value wherever it stands, which is what makes leaving one
+//! in place free. A hoist moves the terms beside a read earlier, so the read is
+//! performed after them: `(x, g(x))`, where `g` writes through a `Mut`
+//! parameter, hoists the call and leaves the element reading `x` after the
+//! write it was written before. So a read is named like a compound operand,
+//! and its binding lands at the read's source position, in sequence with the
+//! writes beside it. Which names are mutable is answered syntactically, by
+//! [`crate::ccl::mut_scope`], since inference has not run.
+//!
+//! **The binding is opaque.** A transparent binder carries its definiens, so a
+//! type lifted out of the binding's scope reads the mutable variable back in
+//! the binder's place — a type naming a variable that has no single value for
+//! it to refer to (`crate::ccl::mut_read`, "Why a read gets a name"). Opacity
+//! is also what puts the binder in the telescope of a contribution that names
+//! it, and a mutable variable's own writes are contributions of that shape.
+//!
+//! **A chain holding one is flattened onto the statement spine** ([`peel`]).
+//! [`normalize`] seals the bindings an operand needed around that operand, and
+//! an enclosing hoist nests the seal inside its own definiens, where the outer
+//! binding's type names a binder bound strictly inside the term it types. A
+//! transparent binder is discharged at that boundary and an opaque one is not,
+//! so a chain holding a read is peeled and re-sealed one level out while every
+//! other chain keeps its nesting.
+//!
+//! A **handle** position holds the variable rather than its value, so the
+//! mention there is not a read and stays where it stands
+//! ([`atomize_handle`]).
+//!
+//! # Five recognition contracts: positions a `Let` must never sit between
 //!
 //! Five shapes carry an external recognition contract: a later pass
 //! pattern-matches directly on them, and a `Let` sealed between the wrapper
@@ -47,11 +90,10 @@
 //!
 //! **A statement's effect.** `MutWrite`, `For`, `Case`, `Feed` and `Define`
 //! mean nothing except as the `expr` an `ExprStmt` sequences — `mut_elim`
-//! recognizes each by
-//! pattern-matching an `ExprStmt`'s effect directly (e.g.
-//! `mut_elim::rewrite`, `src/ccl/mut_elim.rs:702-708`, matches `for` loops by
-//! requiring `effect.node` to be `TypedExprNode::For` verbatim, and
-//! `push_continuation_into_case` requires it to be a `Case`). Atomizing,
+//! recognizes each by pattern-matching an `ExprStmt`'s effect directly
+//! (`mut_elim::rewrite` matches `for` loops by requiring `effect.node` to be
+//! `TypedExprNode::For` verbatim, and `push_continuation_into_case` requires it
+//! to be a `Case`). Atomizing,
 //! say, a `for` loop's compound iteration source and sealing the hoisted
 //! `Let` around the `For` node — the way an ordinary operand is treated —
 //! plants that `Let` as the `ExprStmt`'s `expr` field, wedged between the
@@ -118,12 +160,13 @@
 //! before that substitution exists.
 
 use crate::ccl::{
-    Branch, Expr, Name, TypedBinding, TypedExprNode,
+    BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
+    mut_scope::{Muts, is_mut_var, under_param, with},
     provenance::{self, Nature},
 };
 
 /// A-normalize `expr`. See the module docs for what "atomic" means here and
-/// the one exception (refinement predicates) and the four recognition
+/// the one exception (refinement predicates) and the five recognition
 /// contracts (an application spine, a statement's effect, a refined cast's
 /// value, a value-position `match`'s scrutinee, and a tupled builtin's
 /// argument).
@@ -134,7 +177,7 @@ pub fn run(expr: Expr) -> Expr {
     let root_id = expr.node_id();
     let out = {
         let _g = provenance::enter(root_id, "anf.hoist", Nature::Machinery);
-        normalize(expr)
+        normalize(expr, &Muts::new())
     };
     #[cfg(debug_assertions)]
     debug_assert_flat_spines(&out);
@@ -143,7 +186,17 @@ pub fn run(expr: Expr) -> Expr {
 
 /// Is `e` already atomic — safe to leave directly in a position ANF requires
 /// be atomic, with no further `let`-binding?
-fn is_atomic(e: &Expr) -> bool {
+///
+/// A reference to a **mutable variable** is not: it is a read, and a read
+/// denotes the value the variable holds at the point it is performed. Left in
+/// place, it is performed wherever the position it sits in ends up being
+/// evaluated — after every binding this pass hoists out from beside it, which
+/// is to say after any write those perform. Naming it puts the read back at its
+/// source position, in sequence with the writes around it.
+fn is_atomic(e: &Expr, muts: &Muts) -> bool {
+    if is_mut_var(e, muts) {
+        return false;
+    }
     matches!(
         e.node,
         TypedExprNode::Lit(_)
@@ -165,7 +218,7 @@ fn is_atomic(e: &Expr) -> bool {
 /// reconstruction via [`let_chain`], so the result never needs anything
 /// hoisted further outward — except when `e` is an `Apply`, handled by
 /// [`normalize_apply_spine`] for the reason in the module docs.
-fn normalize(e: Expr) -> Expr {
+fn normalize(e: Expr, muts: &Muts) -> Expr {
     let id = e.node_id();
     // Lowering pre-stamps some nodes' `ty`/`user_annotation` before inference
     // runs (e.g. a `for`-loop's `Compose` carries a `Type::data_fun(Hole, Hole)`
@@ -191,14 +244,17 @@ fn normalize(e: Expr) -> Expr {
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
         TypedExprNode::Apply { .. } => {
-            let (binds, spine) = normalize_apply_spine(e);
+            let (binds, spine) = normalize_apply_spine(e, muts);
             let_chain(binds, spine)
         }
 
-        TypedExprNode::Lambda { param, body } => rebuild(TypedExprNode::Lambda {
-            param,
-            body: Box::new(normalize(*body)),
-        }),
+        TypedExprNode::Lambda { param, body } => {
+            let inner = under_param(muts, &param);
+            rebuild(TypedExprNode::Lambda {
+                body: Box::new(normalize(*body, &inner)),
+                param,
+            })
+        }
 
         TypedExprNode::Cast { value, target } => {
             // **The third recognition contract: a refined cast's value is
@@ -220,7 +276,7 @@ fn normalize(e: Expr) -> Expr {
             if target.carries_refinement() {
                 return rebuild(TypedExprNode::Cast { value, target });
             }
-            let (binds, value) = atomize(*value);
+            let (binds, value) = atomize(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Cast {
@@ -231,8 +287,8 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::BinOp { left, op, right } => {
-            let (mut binds, left) = atomize(*left);
-            let (right_binds, right) = atomize(*right);
+            let (mut binds, left) = atomize(*left, muts);
+            let (right_binds, right) = atomize(*right, muts);
             binds.extend(right_binds);
             let_chain(
                 binds,
@@ -245,7 +301,7 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::UnaryOp(op, operand) => {
-            let (binds, operand) = atomize(*operand);
+            let (binds, operand) = atomize(*operand, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::UnaryOp(op, Box::new(operand))),
@@ -253,7 +309,7 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::Aggregate { input, kind } => {
-            let (binds, input) = atomize(*input);
+            let (binds, input) = atomize(*input, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Aggregate {
@@ -264,12 +320,12 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::List(elts) => {
-            let (binds, elts) = atomize_list(elts);
+            let (binds, elts) = atomize_list(elts, muts);
             let_chain(binds, rebuild(TypedExprNode::List(elts)))
         }
 
         TypedExprNode::Tuple(elts) => {
-            let (binds, elts) = atomize_list(elts);
+            let (binds, elts) = atomize_list(elts, muts);
             let_chain(binds, rebuild(TypedExprNode::Tuple(elts)))
         }
 
@@ -279,12 +335,12 @@ fn normalize(e: Expr) -> Expr {
         // passes' own mints of them. Each element is a function/collection
         // value in its own right, atomized like any other list of operands.
         TypedExprNode::Compose(elts) => {
-            let (binds, elts) = atomize_list(elts);
+            let (binds, elts) = atomize_list(elts, muts);
             let_chain(binds, rebuild(TypedExprNode::Compose(elts)))
         }
 
         TypedExprNode::Copair(elts) => {
-            let (binds, elts) = atomize_list(elts);
+            let (binds, elts) = atomize_list(elts, muts);
             let_chain(binds, rebuild(TypedExprNode::Copair(elts)))
         }
 
@@ -292,7 +348,7 @@ fn normalize(e: Expr) -> Expr {
             let mut binds = Vec::new();
             let mut out = Vec::with_capacity(fields.len());
             for (name, value) in fields {
-                let (value_binds, value) = atomize(value);
+                let (value_binds, value) = atomize(value, muts);
                 binds.extend(value_binds);
                 out.push((name, value));
             }
@@ -300,7 +356,7 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::VariantCtor { tag, payload } => {
-            let (binds, payload) = atomize(*payload);
+            let (binds, payload) = atomize(*payload, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::VariantCtor {
@@ -311,7 +367,7 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::Feed { name, value } => {
-            let (binds, value) = atomize(*value);
+            let (binds, value) = atomize_handle(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Feed {
@@ -322,7 +378,7 @@ fn normalize(e: Expr) -> Expr {
         }
 
         TypedExprNode::Define { name, value } => {
-            let (binds, value) = atomize(*value);
+            let (binds, value) = atomize_handle(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Define {
@@ -336,13 +392,13 @@ fn normalize(e: Expr) -> Expr {
             let mut binds = Vec::new();
             let key = match key {
                 Some(key) => {
-                    let (key_binds, key) = atomize(*key);
+                    let (key_binds, key) = atomize(*key, muts);
                     binds.extend(key_binds);
                     Some(Box::new(key))
                 }
                 None => None,
             };
-            let (value_binds, value) = atomize(*value);
+            let (value_binds, value) = atomize(*value, muts);
             binds.extend(value_binds);
             let_chain(
                 binds,
@@ -360,27 +416,30 @@ fn normalize(e: Expr) -> Expr {
             body,
         } => rebuild(TypedExprNode::Let {
             binding,
-            bound_expr: Box::new(normalize(*bound_expr)),
-            body: Box::new(normalize(*body)),
+            bound_expr: Box::new(normalize(*bound_expr, muts)),
+            body: Box::new(normalize(*body, muts)),
         }),
 
         TypedExprNode::MutDecl {
             binding,
             init,
             body,
-        } => rebuild(TypedExprNode::MutDecl {
-            binding,
-            init: Box::new(normalize(*init)),
-            body: Box::new(normalize(*body)),
-        }),
+        } => {
+            let inner = with(muts, &binding.name);
+            rebuild(TypedExprNode::MutDecl {
+                init: Box::new(normalize(*init, muts)),
+                body: Box::new(normalize(*body, &inner)),
+                binding,
+            })
+        }
 
         TypedExprNode::ExprStmt { expr, body } => {
-            let (binds, expr) = atomize_stmt_effect(*expr);
+            let (binds, expr) = atomize_stmt_effect(*expr, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::ExprStmt {
                     expr: Box::new(expr),
-                    body: Box::new(normalize(*body)),
+                    body: Box::new(normalize(*body, muts)),
                 }),
             )
         }
@@ -391,19 +450,19 @@ fn normalize(e: Expr) -> Expr {
         // instead, which threads `iter`'s hoisted bindings past the
         // `ExprStmt` rather than sealing them here. See the module docs.
         TypedExprNode::For { target, iter, body } => {
-            let (binds, iter) = atomize(*iter);
+            let (binds, iter) = atomize(*iter, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::For {
                     target,
                     iter: Box::new(iter),
-                    body: Box::new(normalize(*body)),
+                    body: Box::new(normalize(*body, muts)),
                 }),
             )
         }
 
         TypedExprNode::Begin { body } => rebuild(TypedExprNode::Begin {
-            body: Box::new(normalize(*body)),
+            body: Box::new(normalize(*body, muts)),
         }),
 
         TypedExprNode::Case {
@@ -418,15 +477,15 @@ fn normalize(e: Expr) -> Expr {
             // scrutinee is a single position with one reader, so naming it buys
             // nothing here anyway.
             let (binds, scrutinee) = match scrutinee {
-                Some(scrutinee) => (Vec::new(), Some(Box::new(normalize(*scrutinee)))),
+                Some(scrutinee) => (Vec::new(), Some(Box::new(normalize(*scrutinee, muts)))),
                 None => (Vec::new(), None),
             };
             let branches = branches
                 .into_iter()
                 .map(|branch| Branch {
                     pattern: branch.pattern,
-                    guard: normalize(branch.guard),
-                    body: normalize(branch.body),
+                    guard: normalize(branch.guard, muts),
+                    body: normalize(branch.body, muts),
                 })
                 .collect();
             let_chain(
@@ -455,22 +514,106 @@ fn normalize(e: Expr) -> Expr {
 /// elements, an `Apply` argument, ...). Returns the bindings the caller must
 /// wrap around its own reconstruction (via [`let_chain`]), plus the atomic
 /// term to use in `e`'s original position.
-fn atomize(e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
-    let normalized = normalize(e);
-    if is_atomic(&normalized) {
-        return (Vec::new(), normalized);
+fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
+    let (mut binds, core) = peel(normalize(e, muts));
+    if is_atomic(&core, muts) {
+        return (binds, core);
     }
     let name = Name::anf_temp();
-    let binding = TypedBinding::new_unannotated(name.clone());
+    let mut binding = TypedBinding::new_unannotated(name.clone());
+    // A binding naming a **read** is opaque, for the reason
+    // [`crate::ccl::mut_read`]'s is: a transparent binder carries its
+    // definiens, so a type lifted out of this binding's scope reads the mutable
+    // variable back in the binder's place — a type naming a variable with no
+    // single value for it to refer to, which is what naming the read was for.
+    // It is also what puts the binder in the telescope of a contribution that
+    // names it (`src/ccl/design/type-inference.md`, "The invariant"), and a
+    // mutable variable's own writes are contributions of exactly that shape.
+    if is_mut_var(&core, muts) {
+        binding.transparency = BindingTransparency::Opaque;
+    }
     let var_ref = Expr::var(name);
-    (vec![(binding, normalized)], var_ref)
+    binds.push((binding, core));
+    (binds, var_ref)
 }
 
-fn atomize_list(elts: Vec<Expr>) -> (Vec<(TypedBinding, Expr)>, Vec<Expr>) {
+/// Undo [`let_chain`] at the root of `e`: split the bindings this pass sealed
+/// around a normalized operand back off, so the caller re-seals them one level
+/// out, beside its own.
+///
+/// A sealed chain in a position about to be hoisted nests one binding's scope
+/// inside another's definiens — `let __anf₂ = (let __anf₁ = x in __anf₁ ^+ 1)`
+/// — and inference refines a binding by the term that computed it, so
+/// `__anf₂`'s type reads `{Int | __elem == __anf₁ ^+ 1}`: a type naming a
+/// binder bound strictly inside the term it types, which the Barendregt check
+/// in [`crate::ccl::subst`] reports the moment that type passes under the
+/// binder. Peeled, the two are siblings on one spine and every type is written
+/// where its binders are in scope.
+///
+/// Only a chain holding a read is peeled, and then all of it: peeling a
+/// *subset* would move a read across a sibling binding that may write, which is
+/// the mis-ordering this pass is sequencing the read to avoid. A chain of
+/// ordinary hoists keeps its nesting, where a transparent binder is discharged
+/// into the types leaving its scope and a refinement stays written in closed
+/// terms.
+///
+/// Only this pass's own binders are peeled ([`Name::is_anf_temp`]). A `let` the
+/// program wrote, or a statement spine in a value position, is a block of its
+/// own whose writes belong where they stand.
+fn peel(mut e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
+    if !seals_a_read(&e) {
+        return (Vec::new(), e);
+    }
+    let mut binds = Vec::new();
+    loop {
+        match &e.node {
+            TypedExprNode::Let { binding, .. } if binding.name.is_anf_temp() => {}
+            _ => return (binds, e),
+        }
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = e.node
+        else {
+            unreachable!("matched immediately above")
+        };
+        binds.push((binding, *bound_expr));
+        e = *body;
+    }
+}
+
+/// [`atomize`], except at a **handle position**: a bare reference to a mutable
+/// variable is left exactly where it stands.
+///
+/// A read is named to put it in sequence with the writes around it
+/// ([`is_atomic`]), but two of the three positions a handle survives in are not
+/// reads at all (`src/ccl/design/mutability.md`, "A mutable variable read is an
+/// explicit operation"): an application's argument, where `emit_apply` relates
+/// a bare reference to a `Mut` parameter, and an application's function, which
+/// is where a keyed read `m[k]` puts the collection. A feed's value is the
+/// third — `transact_phase::rewrite_as_of_reads` turns a history read fed out
+/// of a read-only block into an as-of join, and it is the bare reference that
+/// says so. Naming any of them leaves the recognizer a `Var` it cannot read
+/// through, so each keeps whatever ordering it had.
+///
+/// Which argument positions are pass-by-reference is not knowable here —
+/// it is a question about the callee's parameter, and inference has not run
+/// (`crate::ccl::mut_read`, "What ends a segment"). So a read in an argument
+/// position is still performed at the call, after any write an argument beside
+/// it performs.
+fn atomize_handle(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
+    if is_mut_var(&e, muts) {
+        return (Vec::new(), e);
+    }
+    atomize(e, muts)
+}
+
+fn atomize_list(elts: Vec<Expr>, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Vec<Expr>) {
     let mut binds = Vec::new();
     let mut out = Vec::with_capacity(elts.len());
     for e in elts {
-        let (e_binds, e) = atomize(e);
+        let (e_binds, e) = atomize(e, muts);
         binds.extend(e_binds);
         out.push(e);
     }
@@ -479,32 +622,33 @@ fn atomize_list(elts: Vec<Expr>) -> (Vec<(TypedBinding, Expr)>, Vec<Expr>) {
 
 /// Atomize the effect an `ExprStmt` carries — the same threading
 /// [`normalize_apply_spine`] gives an `Apply` spine, for the same reason.
-/// `MutWrite` and `For` are structural markers `mut_elim` recognizes by
-/// pattern-matching an `ExprStmt`'s effect directly (e.g.
-/// `mut_elim::rewrite`, `src/ccl/mut_elim.rs:702-708`). Sealing a hoisted
-/// binding locally around one of them — the way [`normalize`] treats an
-/// ordinary child — wedges a `Let` between the `ExprStmt` and the marker,
-/// exactly the shape that match doesn't see through. So their hoisted
-/// bindings thread past the whole `ExprStmt` instead: `for i in [1,2,3]:
-/// ...` becomes `let __anf = [1,2,3] in for i in __anf: ...` (matching what
+/// `MutWrite`, `For`, `Case`, `Feed` and `Define` are structural markers
+/// `mut_elim` recognizes by pattern-matching an `ExprStmt`'s effect directly
+/// (e.g. `mut_elim::rewrite`). Sealing a hoisted binding locally around one of
+/// them — the way [`normalize`] treats an ordinary child — wedges a `Let`
+/// between the `ExprStmt` and the marker, exactly the shape that match doesn't
+/// see through. So their hoisted bindings thread past the whole `ExprStmt`
+/// instead: `for i in [1,2,3]: ...` becomes `let __anf = [1,2,3] in for i in
+/// __anf: ...` (matching what
 /// a programmer gets from writing `xs = [1,2,3]` ahead of the loop by hand),
 /// not `(let __anf = [1,2,3] in for i in __anf: ...); cont` wedged inside
 /// the `ExprStmt`.
 ///
-/// `Feed`/`Define` are excluded on purpose, even though `channelize` reads
-/// them the same way: `mut_elim`'s own `flatten_spine`
-/// (`src/ccl/mut_elim.rs:571-574`) deliberately leaves `Feed`/`Define`-headed
-/// `ExprStmt` chains nested rather than reassociating them, because
-/// `channelize` collects feeds outermost-first and reassociating would
-/// reorder channel contributions. Threading a `Feed`'s hoisted binding past
-/// its `ExprStmt` the same way risks that same reordering, so it falls back
-/// to the ordinary [`normalize`] and seals locally like any other child.
+/// `Case`, `Feed` and `Define` carry the same contract and get the same
+/// treatment: `push_continuation_into_case` requires the effect to be the
+/// `Case`, and `mut_elim`'s `collect_feed_only` and `transform_chain` require
+/// it to be the `Feed`. Threading reorders nothing, because what moves is the
+/// hoisted binding and not the statements: the feeds keep their spine
+/// positions, which is what `channelize`'s outermost-first collection reads.
+/// `mut_elim`'s `flatten_spine` leaves a `Feed`/`Define`-headed `ExprStmt`
+/// chain nested for a different reason — reassociating there moves the
+/// statements themselves, which would reorder the contributions.
 ///
 /// Any other effect kind carries no recognition contract at all, so it too
 /// falls back to [`normalize`] — sealing there is not just safe but
 /// necessary, since a non-marker effect's own value may still be discarded
 /// freely.
-fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
+fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     let id = expr.node_id();
     let ty = expr.ty.clone();
     let annotation = expr.user_annotation.clone();
@@ -518,13 +662,13 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
             let mut binds = Vec::new();
             let key = match key {
                 Some(key) => {
-                    let (key_binds, key) = atomize(*key);
+                    let (key_binds, key) = atomize(*key, muts);
                     binds.extend(key_binds);
                     Some(Box::new(key))
                 }
                 None => None,
             };
-            let (value_binds, value) = atomize(*value);
+            let (value_binds, value) = atomize(*value, muts);
             binds.extend(value_binds);
             (
                 binds,
@@ -536,13 +680,13 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
             )
         }
         TypedExprNode::For { target, iter, body } => {
-            let (binds, iter) = atomize(*iter);
+            let (binds, iter) = atomize(*iter, muts);
             (
                 binds,
                 rebuild(TypedExprNode::For {
                     target,
                     iter: Box::new(iter),
-                    body: Box::new(normalize(*body)),
+                    body: Box::new(normalize(*body, muts)),
                 }),
             )
         }
@@ -552,7 +696,7 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
         } => {
             let (binds, scrutinee) = match scrutinee {
                 Some(scrutinee) => {
-                    let (binds, scrutinee) = atomize(*scrutinee);
+                    let (binds, scrutinee) = atomize(*scrutinee, muts);
                     (binds, Some(Box::new(scrutinee)))
                 }
                 None => (Vec::new(), None),
@@ -561,8 +705,8 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
                 .into_iter()
                 .map(|branch| Branch {
                     pattern: branch.pattern,
-                    guard: normalize(branch.guard),
-                    body: normalize(branch.body),
+                    guard: normalize(branch.guard, muts),
+                    body: normalize(branch.body, muts),
                 })
                 .collect();
             (
@@ -574,7 +718,7 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
             )
         }
         TypedExprNode::Feed { name, value } => {
-            let (binds, value) = atomize(*value);
+            let (binds, value) = atomize_handle(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Feed {
@@ -584,7 +728,7 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
             )
         }
         TypedExprNode::Define { name, value } => {
-            let (binds, value) = atomize(*value);
+            let (binds, value) = atomize_handle(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Define {
@@ -593,8 +737,25 @@ fn atomize_stmt_effect(expr: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
                 }),
             )
         }
-        _ => (Vec::new(), normalize(expr)),
+        _ => (Vec::new(), normalize(expr, muts)),
     }
+}
+
+/// Does the chain this pass sealed at the root of `e` hold a read — an opaque
+/// binding, which [`atomize`] mints for a mutable-variable read and for nothing
+/// else?
+fn seals_a_read(e: &Expr) -> bool {
+    let mut cursor = e;
+    while let TypedExprNode::Let { binding, body, .. } = &cursor.node {
+        if !binding.name.is_anf_temp() {
+            return false;
+        }
+        if binding.transparency == BindingTransparency::Opaque {
+            return true;
+        }
+        cursor = body;
+    }
+    false
 }
 
 /// Wrap `tail` in `binds`, innermost binding last — `binds[0]` becomes the
@@ -628,9 +789,9 @@ fn takes_its_argument_as_a_tuple_term(head: &Expr) -> bool {
 /// where it stands and threading the elements' bindings up to the caller.
 /// Falls back to [`atomize`] when the argument is not a `Tuple` term, which
 /// is the shape `emit_apply` diagnoses rather than one this pass repairs.
-fn atomize_tuple_elements(e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
+fn atomize_tuple_elements(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     if !matches!(e.node, TypedExprNode::Tuple(_)) {
-        return atomize(e);
+        return atomize(e, muts);
     }
     let id = e.node_id();
     let ty = e.ty;
@@ -638,7 +799,7 @@ fn atomize_tuple_elements(e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
     let TypedExprNode::Tuple(elts) = e.node else {
         unreachable!("guarded above")
     };
-    let (binds, elts) = atomize_list(elts);
+    let (binds, elts) = atomize_list(elts, muts);
     let mut out = Expr::preserve(id, TypedExprNode::Tuple(elts)).with_ty(ty);
     out.user_annotation = annotation;
     (binds, out)
@@ -650,12 +811,12 @@ fn atomize_tuple_elements(e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// per level. See the module docs for why sealing per level is wrong here —
 /// it would wedge a `Let` into an outer level's `function` position, which
 /// `crate::ccl::infer::emit`'s spine walk cannot see through.
-fn normalize_apply_spine(e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
+fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     if !matches!(e.node, TypedExprNode::Apply { .. }) {
         // The spine bottoms out at a non-`Apply` head: atomize it like any
         // other value in a position that must be atomic (its own bindings,
         // if any, still thread up rather than sealing here).
-        return atomize(e);
+        return atomize_handle(e, muts);
     }
     let id = e.node_id();
     let ty = e.ty.clone();
@@ -663,11 +824,11 @@ fn normalize_apply_spine(e: Expr) -> (Vec<(TypedBinding, Expr)>, Expr) {
     let TypedExprNode::Apply { function, argument } = e.node else {
         unreachable!("guarded above")
     };
-    let (mut binds, function) = normalize_apply_spine(*function);
+    let (mut binds, function) = normalize_apply_spine(*function, muts);
     let (arg_binds, argument) = if takes_its_argument_as_a_tuple_term(&function) {
-        atomize_tuple_elements(*argument)
+        atomize_tuple_elements(*argument, muts)
     } else {
-        atomize(*argument)
+        atomize_handle(*argument, muts)
     };
     binds.extend(arg_binds);
     let mut rebuilt = Expr::preserve(
@@ -721,7 +882,8 @@ fn debug_assert_flat_spines(e: &Expr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{ArithmeticKind, BinOpKind, Lit};
+    use crate::ccl::symbolic::symbolic;
+    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, HistoryKind, Lit, Type};
 
     const ADD: BinOpKind = BinOpKind::Arithmetic(ArithmeticKind::Add);
     const MUL: BinOpKind = BinOpKind::Arithmetic(ArithmeticKind::Mul);
@@ -755,7 +917,7 @@ mod tests {
         let TypedExprNode::BinOp { left, right, .. } = body.node else {
             panic!("expected the body to be the BinOp");
         };
-        assert!(is_atomic(&left));
+        assert!(is_atomic(&left, &Muts::new()));
         assert_eq!(*right, var("x"));
     }
 
@@ -788,7 +950,10 @@ mod tests {
         let TypedExprNode::Apply { function, argument } = b2.node else {
             panic!("expected the outer Apply");
         };
-        assert!(is_atomic(&argument), "outer argument must be atomic");
+        assert!(
+            is_atomic(&argument, &Muts::new()),
+            "outer argument must be atomic"
+        );
         let TypedExprNode::Apply {
             function: head,
             argument: inner_arg,
@@ -796,20 +961,68 @@ mod tests {
         else {
             panic!("function position must still be a directly-nested Apply, not a Let");
         };
-        assert!(is_atomic(&head));
-        assert!(is_atomic(&inner_arg));
+        assert!(is_atomic(&head, &Muts::new()));
+        assert!(is_atomic(&inner_arg, &Muts::new()));
     }
 
     #[test]
     fn lambda_is_atomic_as_a_value() {
-        let lam = Expr::lambda(Name::Raw("x".into()), crate::ccl::Type::Hole, var("x"));
+        let lam = Expr::lambda(Name::Raw("x".into()), Type::Hole, var("x"));
         let e = Expr::apply(lam.clone(), var("map"));
         let out = run(e);
         // The lambda argument needs no naming; it stays inline.
         let TypedExprNode::Apply { argument, .. } = out.node else {
             panic!("expected Apply");
         };
-        assert!(is_atomic(&argument));
+        assert!(is_atomic(&argument, &Muts::new()));
+    }
+
+    /// `x := 0` over `body`, with `x` a mutable `Int`.
+    fn accumulator(name: &Name, body: Expr) -> Expr {
+        Expr::mut_decl(
+            name.clone(),
+            Type::History {
+                value: Box::new(Type::Base(BaseType::Int)),
+                domain: Box::new(Type::Hole),
+                history_kind: HistoryKind::Overwrite,
+            },
+            lit(0),
+            body,
+        )
+    }
+
+    /// A read beside a hoisted sibling: the tuple's first element is a read and
+    /// its second is a call, so the read is named ahead of the call rather than
+    /// left to be performed after it.
+    #[test]
+    fn a_read_is_named_ahead_of_a_hoisted_sibling() {
+        let x = Name::fresh("x");
+        let call = Expr::apply(Expr::var(x.clone()), var("f"));
+        let out = run(accumulator(
+            &x,
+            Expr::tuple(vec![Expr::var(x.clone()), call]),
+        ));
+        let s = symbolic(&out);
+        // `^=` is the opaque binding: a type lifted out of the read's scope
+        // keeps the binder rather than reading `x` back in its place.
+        assert!(
+            s.contains("__anf ^= x") && s.contains("(__anf, __anf)"),
+            "the read is named ahead of the call: {s}"
+        );
+        assert!(
+            s.find("^= x").unwrap() < s.find("▷ f").unwrap(),
+            "the read is performed before the call: {s}"
+        );
+    }
+
+    /// An application's argument is a handle position: a bare read there is
+    /// what `emit_apply` relates to a `Mut` parameter, so it stays.
+    #[test]
+    fn a_read_in_an_argument_position_stays_bare() {
+        let x = Name::fresh("x");
+        let out = run(accumulator(&x, Expr::apply(Expr::var(x.clone()), var("g"))));
+        let s = symbolic(&out);
+        assert!(!s.contains("__anf"), "nothing is named: {s}");
     }
 
     #[test]

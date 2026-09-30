@@ -53,6 +53,38 @@
 //! inside it. That is what makes threading a single memo across binder crossings
 //! correct — acting differently in different scopes is the whole job of a
 //! substitution, so scope cannot be left out of the key.
+//!
+//! TODO: The `Subst` structure repeatedly duplicates the rhs of
+//! nested let-bindings when inlining, such that a chain of `n` nested
+//! let-bindings produces an `n^2`-sized `Subst`. This has a
+//! measurable impact on compile times, especially when
+//! A-normalization runs before type inference.
+//!
+//! To illustrate, for an original expression:
+//!
+//! ```text
+//! x = 1 + 2 + 3 + 4 + 5
+//! ```
+//!
+//! The A-normalized form is:
+//!
+//! ```text
+//! x0 = 1 + 2
+//! x1 = x0 + 3
+//! x2 = x1 + 4
+//! x = x2 + 5
+//! ```
+//!
+//! And the result `Subst` looks like:
+//!
+//! ```text
+//! {
+//!     x0 -> 1 + 2,
+//!     x1 -> 1 + 2 + 3,
+//!     x2 -> 1 + 2 + 3 + 4,
+//!     x -> 1 + 2 + 3 + 4 + 5
+//! }
+//! ```
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1559,6 +1591,22 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     let mut bound = BTreeSet::new();
     let mut visited = BTreeSet::new();
     collect_type_fv(ty, &mut bound, &mut visited, &mut out);
+    out
+}
+
+/// Collect the free term-variable names of one refinement's predicate — the
+/// per-refinement counterpart of [`type_free_vars`], for a caller deciding
+/// which refinements of a set name a given binder.
+///
+/// The refinement binds [`Name::elem`] over its base, so `__elem` is bound, not
+/// free, inside the predicate.
+pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
+    let mut out = BTreeSet::new();
+    let mut bound = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    with_binders(&mut bound, [Name::elem()], |bnd| {
+        collect_expr_fv(&r.predicate, bnd, &mut visited, &mut out)
+    });
     out
 }
 
