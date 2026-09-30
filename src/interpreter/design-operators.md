@@ -965,8 +965,10 @@ site it left alone keeps its `curry`, and op-conversion reads the domain off the
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
-its key sits. A tile that cannot answer every key answers none, since an undecided key would
-have to re-offset the groups it left.
+its key sits. A key the collection has not decided is left out of its group, and every level
+states the keys' completeness less the paths of the keys left out and of the rows above them.
+The rest of the group goes out as it is answered and is released by path, so the keys left out
+arrive beneath the same row once decided. A one-level stream is the same rule at depth zero.
 
 ### A correlated filter rides the pair
 

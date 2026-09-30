@@ -935,6 +935,21 @@ fn a_group_valued_lookup_is_rejected_by_name() {
 // column it no longer shares.
 #[case::filtered_keys("sum([or_zero(m[k]?) for k in [1, 2, 3] if k > 1])", Value::Int(20))]
 #[case::filtered_to_absent("sum([or_zero(m[k]?) for k in [1, 2, 3] if k > 2])", Value::Int(0))]
+// **Correlated**: an inner comprehension reading the outer binder, so the keys arrive as a
+// group per outer row and each is answered where it sits. Scaled by the row, then keyed by it,
+// then reading it beside the key: 10 + 20, (10 + 0) + (20 + 0), and (11 + 12) + (1 + 2).
+#[case::correlated_scaled(
+    "sum([sum([or_zero(m[k]?) * r for k in [1, 9]]) for r in [1, 2]])",
+    Value::Int(30)
+)]
+#[case::correlated_key(
+    "sum([sum([or_zero(m[k + r]?) for k in [1, 9]]) for r in [0, 1]])",
+    Value::Int(30)
+)]
+#[case::correlated_beside_the_key(
+    "sum([sum([or_zero(m[r]?) + k for k in [1, 2]]) for r in [1, 9]])",
+    Value::Int(26)
+)]
 fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value) {
     let code = format!(
         "def or_zero(o: Option(Int)) => Int:\n\
