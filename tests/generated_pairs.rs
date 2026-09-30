@@ -19,16 +19,18 @@
 //!
 //! Outcomes are classified by mechanism: any `CompileError` is a rejection, whether its
 //! message states a gap or reports a compiler bug, and a sink the compiled program could not
-//! read counts as a panic. An interpreter refusal is a gap in the differential interpreter, not
-//! in the compiler.
+//! read counts as a panic. An interpreter refusal is a gap in the differential interpreter,
+//! except where `docs/chl-spec.md` leaves the program's value undefined: there the refusal is
+//! the answer, and the compiler's is not compared. [`UNDEFINED`] names those cells.
 //!
 //! Two tests run the grid:
 //!
 //! - `live_rows_agree` runs every cell of each skeleton in [`LIVE`], the rows known to agree
 //!   everywhere, and fails on any outcome other than agreement.
 //! - `full_grid` is ignored by default. It runs every cell and reports the failures grouped by
-//!   cause, with a count and sample cells, and names every fully agreeing row [`LIVE`] does not
-//!   list yet. A fix that makes a row agree moves it into [`LIVE`]:
+//!   cause, with a count, sample cells and the first sample's detail, lists the [`UNDEFINED`]
+//!   cells apart, and names every fully agreeing row [`LIVE`] does not list yet. A fix that
+//!   makes a row agree moves it into [`LIVE`]:
 //!   `cargo test --test generated_pairs full_grid -- --ignored --nocapture`.
 
 #[path = "support/differential.rs"]
@@ -40,6 +42,7 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use chl_interp::Value;
 use differential::{Compiled, run_compiled, run_interpreted};
 use indoc::indoc;
 use panic_message::panic_message;
@@ -56,8 +59,13 @@ const LIVE: &[&str] = &[
     "function_body",
     "groupby_source",
     "match_scrutinee",
+    "max_arg",
     "mut_init",
+    "rec_with_coll_feed",
+    "rec_with_coll_projected",
+    "rec_with_coll_scalar_field",
     "record_coll_source",
+    "record_collection_field",
     "record_feed",
     "record_feed_in_loop",
     "record_field",
@@ -70,6 +78,20 @@ const LIVE: &[&str] = &[
     "txn_guard",
     "variant_feed",
 ];
+
+/// Cells whose program has no defined value under `docs/chl-spec.md`, each with the rule that
+/// leaves it undefined. The interpreter's refusal is the answer, so a cell here agrees when the
+/// interpreter refuses, whatever the compiler does
+/// (`undefined_cells_are_refused_by_the_interpreter`).
+const UNDEFINED: &[(&str, &str)] = &[(
+    "max_arg/all_filtered",
+    "`max` of an empty collection is not defined (`docs/chl-spec.md`, \"7.1 Aggregates\")",
+)];
+
+/// Whether `cell` is one of the [`UNDEFINED`] cells.
+fn is_undefined(cell: &str) -> bool {
+    UNDEFINED.iter().any(|(c, _)| *c == cell)
+}
 
 /// The types a hole can want and a filler can produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,8 +148,12 @@ struct Filler {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Outcome {
     Agrees,
-    /// The two sides computed different values.
-    Disagrees(String),
+    /// The two sides computed different values. Carries both values rendered, and the
+    /// [`difference_signature`] the report groups by.
+    Disagrees {
+        values: String,
+        signature: String,
+    },
     /// The compiler panicked, including a failed assertion or phase-boundary check, or the
     /// program completed with a sink that could not state a value.
     CompilerPanics(String),
@@ -149,7 +175,7 @@ impl Outcome {
     fn kind(&self) -> &'static str {
         match self {
             Outcome::Agrees => "Agrees",
-            Outcome::Disagrees(_) => "Disagrees",
+            Outcome::Disagrees { .. } => "Disagrees",
             Outcome::CompilerPanics(_) => "CompilerPanics",
             Outcome::CompilerRejects(_) => "CompilerRejects",
             Outcome::InterpreterGap(..) => "InterpreterGap",
@@ -161,7 +187,7 @@ impl Outcome {
     fn detail(&self) -> &str {
         match self {
             Outcome::Agrees | Outcome::DidNotFinish => "",
-            Outcome::Disagrees(d)
+            Outcome::Disagrees { values: d, .. }
             | Outcome::CompilerPanics(d)
             | Outcome::CompilerRejects(d)
             | Outcome::InterpreterGap(d, _)
@@ -745,18 +771,80 @@ fn classify(source: &str) -> Outcome {
         Err(payload) => Outcome::InterpreterPanics(first_line(&panic_message(&*payload))),
         Ok(Err(why)) => Outcome::InterpreterGap(why, c.to_string()),
         Ok(Ok(i)) if c == i => Outcome::Agrees,
-        Ok(Ok(i)) => Outcome::Disagrees(format!("compiled {c} vs interpreted {i}")),
+        Ok(Ok(i)) => Outcome::Disagrees {
+            values: format!("compiled {c} vs interpreted {i}"),
+            signature: difference_signature(&c, &i),
+        },
+    }
+}
+
+/// The structure of a disagreement, with the values that vary per filler left out, so the
+/// cells one defect fails share it.
+///
+/// One side holding the other as the only entry of a collection is one extra level of nesting,
+/// named with the key it sits under. Otherwise two values of different [`shape`]s are named by
+/// their shapes. Two values of one shape differ only in their values, which carry no structure
+/// to group by, so the signature is the two values.
+fn difference_signature(compiled: &Value, interpreted: &Value) -> String {
+    let nests = |outer: &Value, inner: &Value| match outer {
+        Value::Collection(c) => match c.entries() {
+            [(key, v)] if v == inner => Some(key.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(key) = nests(interpreted, compiled) {
+        return format!("interpreted nests the compiled value under the key {key}");
+    }
+    if let Some(key) = nests(compiled, interpreted) {
+        return format!("compiled nests the interpreted value under the key {key}");
+    }
+    let (sc, si) = (shape(compiled), shape(interpreted));
+    if sc != si {
+        return format!("compiled {sc} vs interpreted {si}");
+    }
+    format!("compiled {compiled} vs interpreted {interpreted}")
+}
+
+/// A value with every scalar replaced by its type and every collection by its distinct entry
+/// shapes, so values that differ only in their scalars, or in how many entries of one shape
+/// they hold, share a shape.
+fn shape(v: &Value) -> String {
+    match v {
+        Value::Int(_) => "Int".into(),
+        Value::Str(_) => "Str".into(),
+        Value::Bool(_) => "Bool".into(),
+        Value::Unit => "()".into(),
+        Value::CommitTime(_) => "Txn".into(),
+        Value::Pending => unreachable!("an interpreter's answer holds no pending value"),
+        Value::Record(fields) => {
+            let mut fields: Vec<String> = fields
+                .iter()
+                .map(|(n, v)| format!("{n}: {}", shape(v)))
+                .collect();
+            fields.sort();
+            format!("({})", fields.join(", "))
+        }
+        Value::Variant { tag, payload } => format!("`{tag}({})", shape(payload)),
+        Value::Collection(c) => {
+            let entries: std::collections::BTreeSet<String> = c
+                .entries()
+                .iter()
+                .map(|(k, v)| format!("{} -> {}", shape(k), shape(v)))
+                .collect();
+            format!("[{}]", entries.into_iter().collect::<Vec<_>>().join(", "))
+        }
     }
 }
 
 /// The key the report groups one cause's cells under.
 ///
-/// A disagreement is keyed by the two values it renders, and an interpreter gap by its message
-/// stem and the value the compiler produced. Any other detail is keyed by the message stem
-/// [`message_stem`] extracts, so the cells one defect fails group together.
+/// A disagreement is keyed by its [`difference_signature`], and an interpreter gap by its
+/// message stem and the value the compiler produced. Any other detail is keyed by the message
+/// stem [`message_stem`] extracts, so the cells one defect fails group together.
 fn cause_key(outcome: &Outcome) -> String {
     match outcome {
-        Outcome::Disagrees(d) => d.clone(),
+        Outcome::Disagrees { signature, .. } => signature.clone(),
         Outcome::InterpreterGap(why, compiled) => {
             format!("{} / compiled {compiled}", message_stem(why))
         }
@@ -1051,9 +1139,63 @@ fn the_comparison_discriminates() {
     let f = fillers.iter().find(|f| f.name == "list_lit").unwrap();
     let outcome = classify(&program(s, f, &[]));
     assert!(
-        matches!(outcome, Outcome::Disagrees(_)),
+        matches!(outcome, Outcome::Disagrees { .. }),
         "expected a disagreement, got {outcome:?}"
     );
+}
+
+/// The collection-feed defect is one cause whatever collection is fed: the interpreter nests
+/// the compiled value under the unit key.
+#[test]
+fn a_disagreement_is_keyed_by_its_structure_not_its_values() {
+    let value = |source: &str| {
+        chl_interp::run(&format!("out = test_sink()\nout <<= {source}\n"))
+            .expect("the program runs")
+            .remove("out")
+            .expect("sink `out`")
+    };
+    let nested = |source: &str| {
+        chl_interp::run(&format!("out = test_sink()\nout << {source}\n"))
+            .expect("the program runs")
+            .remove("out")
+            .expect("sink `out`")
+    };
+    let key = |source: &str| difference_signature(&value(source), &nested(source));
+    assert_eq!(key("[7]"), key("[1, 2, 3]"));
+    assert_eq!(key("[7]"), key(r#"map([("a", 1)])"#));
+    assert_eq!(
+        key("[7]"),
+        "interpreted nests the compiled value under the key ()"
+    );
+    // Values of one shape have no structure to group by, so their values stay apart.
+    assert_ne!(
+        difference_signature(&value("[1]"), &value("[2]")),
+        difference_signature(&value("[1]"), &value("[3]")),
+    );
+}
+
+/// The source of the cell `name`.
+fn cell_program(name: &str) -> String {
+    let (skeletons, fillers) = (skeletons(), fillers());
+    skeletons
+        .iter()
+        .flat_map(|s| fillers.iter().map(move |f| (s, f)))
+        .flat_map(|(s, f)| placements(s, f).into_iter().map(move |p| (s, f, p)))
+        .find(|(s, f, p)| cell_name(s, f, p) == name)
+        .map(|(s, f, p)| program(s, f, &p))
+        .unwrap_or_else(|| panic!("no cell is named `{name}`"))
+}
+
+/// Each [`UNDEFINED`] cell is refused by the interpreter, which is its answer.
+#[test]
+fn undefined_cells_are_refused_by_the_interpreter() {
+    for (cell, why) in UNDEFINED {
+        let interpreted = run_interpreted(&cell_program(cell));
+        assert!(
+            interpreted.is_err(),
+            "`{cell}` ({why}) has an interpreted value: {interpreted:?}"
+        );
+    }
 }
 
 /// Every [`LIVE`] name is a skeleton, once.
@@ -1074,7 +1216,8 @@ fn live_names_skeletons() {
 fn live_rows_agree() {
     let failures: Vec<String> = run_cells(|s| LIVE.contains(&s.name))
         .into_iter()
-        .filter(|(_, outcome)| *outcome != Outcome::Agrees)
+        // An undefined cell's answer is the interpreter's refusal, which its own test checks.
+        .filter(|(cell, outcome)| *outcome != Outcome::Agrees && !is_undefined(cell))
         .map(|(cell, outcome)| format!("{cell}\t{}\t{}", outcome.kind(), outcome.detail()))
         .collect();
     assert!(
@@ -1096,14 +1239,19 @@ fn full_grid() {
     let mut failing_rows: BTreeMap<&str, usize> = BTreeMap::new();
     for (cell, outcome) in &outcomes {
         *tally.entry(outcome.kind()).or_default() += 1;
-        if *outcome != Outcome::Agrees {
-            by_cause
-                .entry((outcome.kind(), cause_key(outcome)))
-                .or_default()
-                .push(cell);
-            let row = cell.split('/').next().expect("a cell name has a skeleton");
-            *failing_rows.entry(row).or_default() += 1;
+        if *outcome == Outcome::Agrees {
+            continue;
         }
+        // An undefined cell is reported apart, under the rule that leaves it undefined.
+        if is_undefined(cell) {
+            continue;
+        }
+        let row = cell.split('/').next().expect("a cell name has a skeleton");
+        *failing_rows.entry(row).or_default() += 1;
+        by_cause
+            .entry((outcome.kind(), cause_key(outcome)))
+            .or_default()
+            .push(cell);
     }
 
     println!("\n=== {} cells ===", outcomes.len());
@@ -1119,6 +1267,19 @@ fn full_grid() {
             "{:>4} {kind:<15} {cause}\n       e.g. {}",
             cells.len(),
             sample.join(", ")
+        );
+        // The key leaves out what varies per cell; the first sample shows it.
+        let first = outcomes[cells[0]].detail();
+        if first != cause {
+            println!("       {}: {first}", cells[0]);
+        }
+    }
+    println!("\n=== {} undefined by the spec ===", UNDEFINED.len());
+    for (cell, why) in UNDEFINED {
+        println!(
+            "{cell}: {why}\n       {}: {}",
+            outcomes[*cell].kind(),
+            outcomes[*cell].detail()
         );
     }
     let promotable: Vec<&str> = skeletons()
