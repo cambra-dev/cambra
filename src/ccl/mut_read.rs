@@ -42,6 +42,15 @@
 //! reads the written value. The hoisted binding is what holds the read at its
 //! source position, so [`unbind`] leaves it alone ([`Name::is_mut_read`]).
 //!
+//! **A sealed binding outlives every later pass.** Nothing removes one as such.
+//! [`crate::ccl::inline`]'s read-once rule drops the ones read exactly once
+//! whose definiens no write in the body disturbs, and
+//! [`crate::ccl::mut_elim`] inlines the ones standing on a writer's spine; one
+//! read twice, spelled in a type, or blocked by a write reaches planning as an
+//! opaque `let`. A diagnostic raised past inference — lambda-elim's, or
+//! op-conversion's — therefore spells such a read `__anf`, the respelling below
+//! reaching inference errors alone.
+//!
 //! What is left to mint for is the one value position A-normalization leaves in
 //! place: a value-position `match`'s **scrutinee**, whose naming would carry a
 //! dependent result's binders into a type that then passes under them, which is
@@ -500,8 +509,8 @@ fn respell(expr: &Expr, muts: &Muts, out: &mut Subst) {
 // Unbinding: giving the reads back their positions
 // ---------------------------------------------------------------------------
 
-/// Substitute every read-segment binder back into the reads that named it, so
-/// the tree the mutability phases meet is the one lowering built.
+/// Substitute every read-segment binder this pass minted back into the reads
+/// that named it, putting those reads back at the positions lowering gave them.
 ///
 /// Runs immediately after inference, before [`crate::ccl::inline`]. The binding
 /// exists to hold a name a refinement can mention while inference runs; past

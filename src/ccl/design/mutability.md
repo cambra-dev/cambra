@@ -203,15 +203,23 @@ variable, which is [what no type may do](#a-mutable-variable-read-is-an-explicit
 which nothing binds where the type travels. Read through a binder, the same operand types as
 `{Int | __elem == __read ^+ 1}`.
 
-The binder is substituted back immediately after inference, except where a type spells it: a binding
-on a writer's spine is an operator in the graph, and the phases below recognize a read by its term.
-Every use of a segment's binder precedes the write that ended the segment, which is what makes the
-substitution sound; `inline` moves uses, so it runs after.
+A binder `mut_read` minted is substituted back immediately after inference, except where a type
+spells it: a binding on a writer's spine is an operator in the graph, and the phases below recognize
+a read by its term. Every use of such a binder precedes the write that ended the segment, which is
+what makes the substitution sound; `inline` moves uses, so it runs after.
 
 That ordering rests on the CHL rule that captured names are read-only
 ([chl-spec.md](../../../docs/chl-spec.md), "4.1 `def` — function definition"), which no pass
 enforces today: a `def` that writes a captured mutable variable compiles, and the write is
 invisible to the segment its call sits in.
+
+A-normalization's binding stays. Its uses carry no such ordering — one hoisted out of a value
+position can stand after the write that ended the segment — and the binding is what holds the read
+at its source position. `inline`'s read-once rule drops the ones read exactly once whose definiens
+no write in the body disturbs, and `mut_elim` inlines the ones standing on a writer's spine; one
+read twice, spelled in a type, or blocked by a write reaches planning as an opaque `let`. A
+diagnostic raised past inference — `lambda_elim`'s, or op-conversion's — spells such a read `__anf`,
+the rename below reaching inference errors alone.
 
 A diagnostic spells the binder as the variable it reads. `mut_read::read_respelling` builds that
 rename and `compile_program` applies it to an inference error's types, so a message reports
@@ -604,7 +612,8 @@ CHL source
   → mut_read           (read segments: adopt A-normalization's read bindings, mint for a
                         value-position `match`'s scrutinee)
   → infer + check      (on the surface-CCL tree; Feed(V) with a rigid ChanDom domain types the defers)
-  → mut_read unbind    (substitute each read-segment binder back, except where a type spells it)
+  → mut_read unbind    (substitute the binders mut_read minted back, except where a type spells one;
+                        A-normalization's read bindings stay)
   → inline             (UDFs — incl. writers and defer-mediating lambdas — reach their call sites)
   → transact_phase     (the transactional slice of overwrite elimination, and the three rejection
                         gates ahead of it: strip each `with begin():` site → commit records +

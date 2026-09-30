@@ -2612,7 +2612,7 @@ t
 }
 
 #[test]
-fn negative_example1() {
+fn checking_writes_only_assumes_annotation_refinement() {
     check_compile_error(
         indoc! {r#"
 x : Mut({Int where _ <= 5}) := 0;
@@ -2622,8 +2622,10 @@ x := x ^+ 1
     )
 }
 
+/// Here, `m` is unrefined because `-` is unrefined. So despite `^+`
+/// being refined, the outcome of `x ^+ m` is unknown to the solver.
 #[test]
-fn negative_example2() {
+fn checking_writes_fails_for_refined_addition_with_unrefined_additive() {
     check_compile_error(
         indoc! {r#"
 x : Mut({Int where _ <= 5}) := 0;

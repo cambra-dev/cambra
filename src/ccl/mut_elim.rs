@@ -2153,8 +2153,10 @@ fn transform_chain(
         // ([`sink_prefix`], once the decision is assembled).
         //
         // An **opaque** binding is inlined instead. It is the read segment's
-        // snapshot (`mut_read` mints one per segment, `x ^= …`), and a refined
-        // mutable variable's contribution predicate names its binder:
+        // snapshot — the binding A-normalization hoisted and `mut_read` sealed,
+        // one per segment (`crate::ccl::mut_read`, "A read A-normalization
+        // already named") — and a refined mutable variable's contribution
+        // predicate names its binder:
         // `{Int | __elem == __anf ^+ 1}` on the value the next segment writes.
         // Keeping the binder leaves that predicate pointing at a `let` the
         // point-free rebuild turns into a function of the writer parameter, whose

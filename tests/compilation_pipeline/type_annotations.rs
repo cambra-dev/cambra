@@ -875,7 +875,7 @@ a == b
 /// `b`'s annotation then demands `{Int | __elem == a}` of a value known
 /// only to be an `Int`, which nothing establishes.
 #[test]
-fn dont_discharge_opaques1() {
+fn dont_discharge_opaques_out_of_fun_bodies() {
     check_compile_error(
         indoc! {r#"
 def f(x: Int):
@@ -896,7 +896,7 @@ a == b
 /// This version rejects the `r` in the output type annotation as
 /// unbound.
 #[test]
-fn dont_discharge_opaques2() {
+fn opaque_vars_in_fun_body_are_unbound_in_annotation() {
     check_compile_error(
         indoc! {r#"
 def f(x: Int) => { Int where _ == r }:
@@ -917,7 +917,7 @@ a == b
 /// (`src/ccl/design/type-inference.md`, "A lambda's codomain drops the body's
 /// opaque binders").
 #[test]
-fn opaques3() {
+fn safe_to_read_captured_mut_inside_function() {
     check_scalar(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
@@ -929,17 +929,22 @@ g(1)
     )
 }
 
-/// The same shape through a comprehension, whose lambda binds the iteration
-/// target rather than a declared parameter.
+/// TODO: Allow mutable reads to be read in the body of a
+/// comprehension.
 #[test]
-fn opaques4() {
+fn reading_mut_in_comprehension_not_supported() {
     check_scalar(
         indoc! {r#"
 x := 3
 ys = [x ^+ i for i in [1,2]]
-()
+ys
         "#},
-        Value::Unit,
+        "λ i : Int → let __anf : Int@3 ^= x
+in __anf ^+ i
+to
+let __anf : (Int ⇒ Int@3) = x ▷ const
+in (((id, __anf ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
+with (Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})",
     )
 }
 
