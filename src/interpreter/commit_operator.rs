@@ -248,6 +248,11 @@ impl CommitEngine {
         self.decided = Some(position.clone());
         self.decided_positions.push(position.clone());
         if let Some(w) = writes {
+            debug_assert!(
+                !w.is_empty(),
+                "an induction write writes at least one key; a position that writes nothing \
+                 is a carry, `None`"
+            );
             self.write_at(&position, w);
         }
         self.debug_check();
@@ -333,6 +338,11 @@ impl CommitEngine {
     /// consumes no tick and returns [`CommitOutcome::Stale`], leaving the writer
     /// to retry.
     pub fn attempt(&mut self, p: Proposal) -> CommitOutcome {
+        debug_assert!(
+            !p.writes.is_empty(),
+            "a proposal writes at least one key: a tick is recorded only in the changelogs of \
+             the keys it writes, so an empty write set would decide a tick no changelog holds"
+        );
         debug_assert!(
             p.snapshot <= *self.watermark(),
             "proposal snapshot {} is beyond the watermark {}",
@@ -475,7 +485,7 @@ impl CommitEngine {
     /// engine has never written is present with an empty changelog. That is what a fold
     /// needs to distinguish "written nothing yet" from "not a key of this store".
     pub fn render_full_store_tile(&self, tiling: &Tiling) -> Tile {
-        store_tile(&[self], tiling, false)
+        store_tile(&[(Vec::new(), self)], tiling, false)
     }
 
     /// The decided frontier as a predicate: the watermark, or `False` for an induction
@@ -516,15 +526,17 @@ fn render_carrier_tile(engines: &Engines, tiling: &Tiling, complete: &[Predicate
     } else {
         complete
     };
-    render_carrier_level(engines, tiling, complete, done)
+    render_carrier_level(engines, tiling, complete, done, &[])
 }
 
-/// One level of [`render_carrier_tile`]'s walk, with `terminal` the whole carrier's.
+/// One level of [`render_carrier_tile`]'s walk, with `terminal` the whole carrier's and
+/// `above` the path of the row this level stands under.
 fn render_carrier_level(
     engines: &Engines,
     tiling: &Tiling,
     complete: &[Predicate],
     terminal: bool,
+    above: &[Value],
 ) -> Tile {
     let (level_complete, beneath) = complete.split_first().unwrap_or_else(|| {
         unreachable!("a carrier states completion at every level of its decision stream")
@@ -552,7 +564,7 @@ fn render_carrier_level(
         // answered yet.
         let unopened = CommitEngine::unopened();
         return store_tile(
-            &[engine.as_ref().unwrap_or(&unopened)],
+            &[(above.to_vec(), engine.as_ref().unwrap_or(&unopened))],
             tiling,
             terminal && engine.is_some(),
         );
@@ -567,8 +579,9 @@ fn render_carrier_level(
     if store_tiling.is_data_function() {
         let mut starts = Vec::with_capacity(rows.len());
         let mut merged: Option<Tile> = None;
-        for (_, below) in rows {
-            let piece = render_carrier_level(below, store_tiling, beneath, terminal);
+        for (row, below) in rows {
+            let path = [above, std::slice::from_ref(row)].concat();
+            let piece = render_carrier_level(below, store_tiling, beneath, terminal, &path);
             starts.push(merged.as_ref().map_or(0, |t| match t {
                 Tile::DataFunction { domain, .. } => domain.len(),
                 _ => 0,
@@ -615,10 +628,10 @@ fn render_carrier_level(
             BitSet::new(),
         );
     }
-    let per_row: Vec<&CommitEngine> = rows
+    let per_row: Vec<(Vec<Value>, &CommitEngine)> = rows
         .iter()
         .map(|(row, at)| match at {
-            Engines::Store(Some(engine)) => engine,
+            Engines::Store(Some(engine)) => ([above, std::slice::from_ref(row)].concat(), engine),
             Engines::Store(None) => {
                 unreachable!("a row exists once its store is opened, so row {row} holds one")
             }
@@ -644,14 +657,15 @@ fn render_carrier_level(
 /// indexing.
 ///
 /// `engines` are the stores this node stands over — one per row of the level above it, or
-/// the single store of a carrier with no rows above it. Their changelogs run together
+/// the single store of a carrier with no rows above it — each with the path of the row it
+/// stands at, which the empty path is for a lone store. Their changelogs run together
 /// CSR-wise under one node per key, because a changelog is a collection whose rows are the
 /// stores; a lone store is the one-row case of that and needs no separate shape.
 ///
 /// The key space comes from `tiling` rather than from the commits, so a key no engine has
 /// written is present with an empty changelog. That is what a fold needs to distinguish
 /// "written nothing yet" from "not a key of this store".
-fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Tile {
+fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal: bool) -> Tile {
     let Tiling::Record(logs) = tiling.store_state() else {
         unreachable!("a store's state tiling is a record of per-key changelogs")
     };
@@ -661,19 +675,26 @@ fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Til
     debug_assert!(
         engines
             .iter()
-            .flat_map(|e| e.changes.keys().chain(e.seed.keys()))
+            .flat_map(|(_, e)| e.changes.keys().chain(e.seed.keys()))
             .all(|key| { store_key_name(key).is_some_and(|name| logs.contains_key(name)) }),
         "a write or seed names a key outside the store's declared key space, so \
          rendering would drop it: declared {:?}",
         logs.keys().collect::<Vec<_>>(),
     );
-    // The changelogs and the frontiers are each store's **own** positions. A changelog's
-    // own predicate is one statement for the whole level, so it says what the store still
-    // running has decided — the only open one, the drive being sequential — and each row's
-    // watermark is its own entry of `frontier`.
-    let open_frontier = engines.last().map_or(Predicate::False, |engine| {
-        engine.frontier_predicate(&domain)
-    });
+    // What the changelogs and the decided set call complete: under each store's own row,
+    // the positions at or below its watermark, where no later commit lands. The rows restart
+    // their positions, so a statement naming positions alone would say one row's watermark
+    // of every row, including one whose positions are still to be decided. A terminal store
+    // decides nothing more anywhere.
+    let decided_through = match terminal {
+        true => Predicate::True,
+        false => engines
+            .iter()
+            .map(|(row, engine)| {
+                Predicate::qualified(Predicate::exactly(row), engine.frontier_predicate(&domain))
+            })
+            .fold(Predicate::False, |all, one| all.union(&one)),
+    };
     let mut seed_fields = HashMap::with_capacity(logs.len());
     let state = logs
         .into_iter()
@@ -685,7 +706,7 @@ fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Til
             let mut starts = Vec::with_capacity(engines.len());
             let mut positions: Vec<Value> = Vec::new();
             let mut written: Vec<Value> = Vec::new();
-            for engine in engines {
+            for (_, engine) in engines {
                 starts.push(positions.len());
                 for (pos, v) in engine.changes.get(&runtime).into_iter().flatten() {
                     positions.push(pos.value().clone());
@@ -699,7 +720,7 @@ fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Til
             // column carries no keys of its own to disagree with.
             let seeds: Vec<Value> = engines
                 .iter()
-                .filter_map(|engine| engine.seed.get(&runtime).cloned())
+                .filter_map(|(_, engine)| engine.seed.get(&runtime).cloned())
                 .collect();
             assert!(
                 seeds.is_empty() || seeds.len() == engines.len(),
@@ -719,10 +740,9 @@ fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Til
                     written,
                     &codomain.extent(),
                 ))),
-                // A changelog holds every write its engine has committed, so it is decided
-                // exactly where that store is. The store's own `frontier` is what a
-                // consumer reads; this keeps the sub-tile self-describing.
-                open_frontier.clone(),
+                // A changelog holds every write its engine has committed, so it is complete
+                // exactly where that store has decided.
+                decided_through.clone(),
                 BitSet::new(),
             );
             (key, tile)
@@ -730,17 +750,21 @@ fn store_tile(engines: &[&CommitEngine], tiling: &Tiling, terminal: bool) -> Til
         .collect();
     let decided: Vec<Vec<Position>> = engines
         .iter()
-        .map(|engine| engine.decided_positions.clone())
+        .map(|(_, engine)| engine.decided_positions.clone())
         .collect();
     Tile::Store {
         state: Box::new(Tile::Record(state)),
         seed: Box::new(Tile::Record(seed_fields)),
-        decided: Box::new(decided_positions_tile(&decided, &domain)),
+        decided: Box::new(decided_positions_tile(&decided, &domain, decided_through)),
         frontier: Box::new(store_frontier_rows(
             engines
                 .iter()
-                .map(|engine| engine.decided.as_ref().map(|w| w.value().clone())),
+                .map(|(_, engine)| engine.decided.as_ref().map(|w| w.value().clone())),
             &domain,
+            match terminal {
+                true => Predicate::True,
+                false => Predicate::False,
+            },
         )),
         terminal,
         closed_keys: Vec::new(),
@@ -1101,8 +1125,9 @@ pub fn store_decided_positions(decided: &Tile, row: usize) -> Vec<Position> {
         .collect()
 }
 
-/// The decided-position collection for a store over `rows.len()` enclosing rows.
-fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent) -> Tile {
+/// The decided-position collection for a store over `rows.len()` enclosing rows, stating
+/// `complete`: a row's decided set is final where the row has decided.
+fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent, complete: Predicate) -> Tile {
     let mut starts = Vec::with_capacity(rows.len());
     let mut positions = Vec::new();
     for row in rows {
@@ -1114,7 +1139,7 @@ fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent) -> Tile {
         ColumnValue::UInts(starts),
         ColumnValue::from_values(positions, domain),
         Box::new(Tile::Scalar(ColumnValue::Units(len))),
-        Predicate::True,
+        complete,
         BitSet::new(),
     )
 }
@@ -1590,20 +1615,6 @@ fn changelog_value(values: &Tile, i: usize) -> Value {
         Tile::Scalar(column) => column.index_at(i),
         other => panic!("a store key's changelog holds one value per tick; got {other:?}"),
     }
-}
-
-/// Every commit tick at which the store recorded a write, ascending and deduplicated: the
-/// union of its keys' changelogs. A carry-forward read emits a position at each of these,
-/// because a tick that wrote some other key still carries this one forward.
-pub fn store_change_positions(tile: &Tile) -> Vec<Position> {
-    let mut ticks = std::collections::BTreeSet::new();
-    for key in tile.store_keys() {
-        let Some((written, _)) = tile.store_changelog(key) else {
-            continue;
-        };
-        ticks.extend((0..written.len()).map(|i| Position::new(written.index_at(i))));
-    }
-    ticks.into_iter().collect()
 }
 
 /// Field names of the proposal-stream codomain record. `F_WRITES` is shared with
@@ -3670,7 +3681,7 @@ impl TileProducer for AsOfProducer {
         // release names the last change strictly below the frontier, so the frontier's
         // own change survives and the fold still finds each key's value.
         if let Some(f) = &frontier
-            && let Some(below) = last_position_below(store_change_positions(&source_tile), f)
+            && let Some(below) = last_position_below(source_tile.store_change_positions(), f)
         {
             self.source
                 .release(TileGuard::Function(FunctionGuard::Domain(
@@ -5408,7 +5419,7 @@ impl TileProducer for TransactWriterProducer {
                 .filter_map(|o| o.as_ref().map(|(t, _)| t.clone()))
                 .min()
                 .and_then(|oldest_read| {
-                    last_position_below(store_change_positions(&store_tile), &oldest_read)
+                    last_position_below(store_tile.store_change_positions(), &oldest_read)
                 })
         };
         if let Some(through) = release_through {
@@ -5533,15 +5544,9 @@ impl TileProducer for TransactWriterProducer {
                     // Re-proposing this item at a new frontier supersedes its
                     // prior stale proposal(s); drop them so the window stays O(1).
                     self.drop_superseded(&pos);
-                    self.emitted.push(InFlightProposal {
-                        snapshot: frontier,
-                        reads,
-                        writes,
-                        attempt: pos.clone(),
-                    });
-                    self.last_decided_pos = Some(pos);
+                    self.last_decided_pos = Some(pos.clone());
                     if writes.is_empty() {
-                        self.ack_through(pos);
+                        self.ack_through(&pos);
                     } else {
                         // The body-input row stays live until the commit-ack: it is
                         // the attempt in flight, and releasing it now would tell the
@@ -5756,8 +5761,8 @@ mod tests {
 
     /// **A store whose keys hold different value types** renders each changelog at its own
     /// key's type: a `String` key's values are a string column and an `Int` key's an int
-    /// column, where one shared codomain could only name their union. A tick writing one key
-    /// appears in that key's changelog alone.
+    /// column, seed and changelog alike, where one shared codomain could only name their
+    /// union. A tick writing one key appears in that key's changelog alone.
     #[test]
     fn a_store_renders_each_key_at_its_own_value_type() {
         let mut e = CommitEngine::new(HashMap::from([
@@ -5766,30 +5771,41 @@ mod tests {
         ]));
         assert_eq!(
             e.attempt(Proposal {
-                snapshot: 0,
+                snapshot: pos(0),
                 reads: HashMap::new(),
                 writes: HashMap::from([(acct("count"), int(1))]),
             }),
-            CommitOutcome::Committed { ts: 1 }
+            CommitOutcome::Committed { ts: pos(1) }
         );
-        let tiling = full_store_tiling(HashMap::from([
-            (
-                "name".to_string(),
-                Tiling::Scalar(Extent::Base(BaseType::String)),
-            ),
-            ("count".to_string(), Tiling::Scalar(value_extent())),
-        ]));
+        let tiling = full_store_tiling(
+            commit_clock_domain(),
+            HashMap::from([
+                (
+                    "name".to_string(),
+                    Tiling::Scalar(Extent::Base(BaseType::String)),
+                ),
+                ("count".to_string(), Tiling::Scalar(value_extent())),
+            ]),
+        );
         let tile = e.render_full_store_tile(&tiling);
         assert!(validate_tile(&tile));
         let (name_ticks, name_values) = tile.store_changelog("name").expect("a key");
         let (count_ticks, count_values) = tile.store_changelog("count").expect("a key");
-        assert_eq!(*name_ticks, ColumnValue::from_uints(vec![0]));
+        assert!(name_ticks.is_empty(), "nothing wrote `name` after its seed");
+        assert_eq!(*name_values, Tile::Scalar(ColumnValue::Strings(Vec::new())));
+        assert_eq!(*count_ticks, ColumnValue::from_uints(vec![1]));
+        assert_eq!(*count_values, Tile::Scalar(ColumnValue::Ints(vec![1])));
+        let Tile::Store { seed, .. } = &tile else {
+            panic!("a render is a store: {tile:?}")
+        };
+        let Tile::Record(seeds) = seed.as_ref() else {
+            panic!("a store's seed is a record per key: {seed:?}")
+        };
         assert_eq!(
-            *name_values,
+            seeds["name"],
             Tile::Scalar(ColumnValue::Strings(vec!["a".into()]))
         );
-        assert_eq!(*count_ticks, ColumnValue::from_uints(vec![0, 1]));
-        assert_eq!(*count_values, Tile::Scalar(ColumnValue::Ints(vec![0, 1])));
+        assert_eq!(seeds["count"], Tile::Scalar(ColumnValue::Ints(vec![0])));
     }
 
     /// Position-driven induction: `x := 0; for i in [1,2,3,4]: if i > 2: x += i`.
@@ -5828,7 +5844,7 @@ mod tests {
             panic!("induction render is a Store");
         };
         assert_eq!(
-            store_change_positions(&tile).len(),
+            tile.store_change_positions().len(),
             2,
             "only the two committing positions are changes"
         );
@@ -5840,6 +5856,63 @@ mod tests {
             store_frontier(&tile).map(Position::into_value),
             Some(Value::UInt(3)),
             "a store's decided region is [0, 3], not the change count"
+        );
+    }
+
+    /// A store's parts state what is final under each store's own row. Two rows decided to
+    /// different watermarks restart their positions, so position 1 is final under the row
+    /// decided through 2 and not under the row decided through 0. The frontier's watermarks
+    /// still move, so it calls nothing final until the store is terminal.
+    #[test]
+    fn a_store_states_its_parts_complete_under_each_row() {
+        let (mut ahead, mut behind) = (CommitEngine::unopened(), CommitEngine::unopened());
+        for p in 0..=2 {
+            ahead.step(pos(p), Some(balances(&[("acc", p as i64)])));
+        }
+        behind.step(pos(0), Some(balances(&[("acc", 10)])));
+        let tiling = store_tiling(&["acc"]);
+        let rows = [
+            (vec![Value::UInt(0)], &ahead),
+            (vec![Value::UInt(1)], &behind),
+        ];
+        let statement = |tile: &Tile| {
+            let Tile::Store {
+                state,
+                decided,
+                frontier,
+                ..
+            } = tile
+            else {
+                panic!("renders a store")
+            };
+            let Tile::Record(logs) = &**state else {
+                panic!("a store's state is a record of changelogs")
+            };
+            let of = |t: &Tile| match t {
+                Tile::DataFunction {
+                    domain_predicate, ..
+                } => domain_predicate.clone(),
+                other => panic!("a store's parts are collections, got {other:?}"),
+            };
+            (of(&logs["acc"]), of(decided), of(frontier))
+        };
+
+        let (changelog, decided, frontier) = statement(&super::store_tile(&rows, &tiling, false));
+        for pred in [&changelog, &decided] {
+            assert!(pred.contains_path(&[Value::UInt(0), Value::UInt(2)]));
+            assert!(pred.contains_path(&[Value::UInt(1), Value::UInt(0)]));
+            assert!(
+                !pred.contains_path(&[Value::UInt(1), Value::UInt(1)]),
+                "the row decided through 0 has not decided position 1: {pred:?}"
+            );
+        }
+        assert_eq!(frontier, Predicate::False);
+
+        let (changelog, decided, frontier) = statement(&super::store_tile(&rows, &tiling, true));
+        assert_eq!(
+            (changelog, decided, frontier),
+            (Predicate::True, Predicate::True, Predicate::True),
+            "a terminal store decides nothing more anywhere"
         );
     }
 
@@ -6125,7 +6198,7 @@ mod tests {
         // Final accumulator value: 0 (carry) → 0 (carry) → 3 → 7.
         assert_eq!(store_current(&tile, &acc).map(|(_, v)| v), Some(int(7)));
         assert_eq!(
-            store_change_positions(&tile),
+            tile.store_change_positions(),
             vec![pos(2), pos(3)],
             "the two firing positions (items 3, 4); the rest carry, and the init is the \
              store's seed rather than a change"
@@ -6144,7 +6217,7 @@ mod tests {
             Some(int(16))
         );
         assert_eq!(
-            store_change_positions(&tile),
+            tile.store_change_positions(),
             vec![pos(0), pos(1), pos(2)],
             "every committing position (a dense changelog), with the init held as the \
              store's seed rather than a change"
@@ -6167,7 +6240,7 @@ mod tests {
 
         let full = pull_to_terminal(&mut sched, &mut producer);
         assert_eq!(
-            store_change_positions(&full).len(),
+            full.store_change_positions().len(),
             3,
             "full dense changelog: one write per position"
         );
@@ -6185,7 +6258,7 @@ mod tests {
             "the accumulator still reads its correct final value after GC"
         );
         assert_eq!(
-            store_change_positions(&bounded).len(),
+            bounded.store_change_positions().len(),
             1,
             "GC drops the superseded prefix (positions 0, 1), keeping only \
              the latest write (position 2) — the changelog no longer grows with positions"
@@ -6838,7 +6911,7 @@ mod tests {
             })
             .collect();
         let entries = std::iter::once((commit_clock_start(), seed))
-            .chain(store_change_positions(tile).into_iter().map(|tick| {
+            .chain(tile.store_change_positions().into_iter().map(|tick| {
                 let delta = tile
                     .store_keys()
                     .filter_map(|name| {
@@ -8344,7 +8417,7 @@ mod tests {
         // The decided region spans the trailing carries at ticks 4 and 5 — the frontier
         // is 5, not the latest change tick (3) the former `True`-reconstruction would
         // have given.
-        assert_eq!(store_change_positions(&done), vec![pos(3)]);
+        assert_eq!(done.store_change_positions(), vec![pos(3)]);
         // A store that has recorded no change at all is decided wherever its frontier
         // says: the changelog is sparse, so an empty one is a run of carries over the
         // seed. Only an undecided frontier, and a tile that is not a store, have none.

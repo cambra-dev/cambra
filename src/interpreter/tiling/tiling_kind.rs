@@ -244,6 +244,7 @@ impl Tiling {
                 frontier: Box::new(super::store_frontier_rows(
                     std::iter::repeat_n(None, rows),
                     domain,
+                    Predicate::False,
                 )),
                 terminal: false,
                 closed_keys: Vec::new(),

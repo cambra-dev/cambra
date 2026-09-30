@@ -460,6 +460,11 @@ the statement itself.
 
 A violation panics and names the producer tree.
 
+A `Tile::Store` is checked twice: once by what it answers (each row's seed, frontier, and each
+key's value at every decided position), and once part by part, since its changelogs, decided set
+and frontier are collections over its rows with statements of their own. A release of the store
+names its positions, which are each part's keys.
+
 Where an output path's content comes from several inputs, the arms of a `Zip` or a union or the
 two sides of a pairing, the path is complete only where every input calls it complete, so the
 operator intersects their statements. A union arm
@@ -588,7 +593,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic commit-time clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
-- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `Position ⇀ {key: value}`, held as one changelog per key. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
+- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `Position ⇀ {key: value}`, held as one changelog per key. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the key's changelog.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own. It releases the source through each finished item on its ack, and through each filtered row once it reads past it, since no ack comes for a row nothing attempts.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
@@ -938,12 +943,15 @@ and runs the slices together, so that slot's tiling is the source's own (`source
 `column_of_rows`). Deriving it from the item's extent instead reads a record of columns as one
 column of records, which is a store read's rule and not a source's.
 
-A body's writes go the other way: a store write is one value per key, so a keyed write's `insert`
-takes the level, at any depth, and the payload materializes where it becomes the decision's value
+A body's writes go the other way, because a store holds each key's value as one cell per change
+([One changelog per key](#one-changelog-per-key)). A keyed write's `insert` takes the level, at
+any depth, and the payload materializes where it becomes the decision's value
 (`FunctionDef::apply_tile`, `materialize_collections`). The written value reopens into the shape
 the collection's values take, so the rebuilt level is one gather over the collection's entries
-followed by the written ones. An accumulator's seed and the stand-in an absent snapshot slot takes
-are values for the same reason, read out of the row their producer delivered (`materialized_row`).
+followed by the written ones, and a keyed write costs the size of the whole collection. An
+accumulator's seed and the stand-in an absent snapshot slot takes are values for the same reason,
+read out of the row their producer delivered (`materialized_row`). A collection's entries standing
+as a level beneath each change would make a keyed write one entry (`TODO(store-key-levels)`).
 
 **A per-row collection is complete as soon as its row arrives.** A map value carries its own
 keys, so nothing waits on a domain closing to know the group is whole. A producer opening one

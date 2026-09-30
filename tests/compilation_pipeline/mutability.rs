@@ -2973,6 +2973,42 @@ fn a_mut_loop_over_a_map_carries_its_accumulator() {
     );
 }
 
+/// A `mut` loop over a collection whose **rows are collections**, rectangular and jagged. Each
+/// row is one position, so the loop runs once per row rather than once per element: a count
+/// answers the number of rows, and `max(r)` reads each row at its own domain.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::rectangular(
+    indoc! {r"
+        total := 0
+        for r in [[1], [2]]:
+            total += 1
+        total
+    "},
+    2
+)]
+#[case::jagged(
+    indoc! {r"
+        total := 0
+        for r in [box([1]), box([2, 3])]:
+            total += 1
+        total
+    "},
+    2
+)]
+#[case::jagged_rows_read_at_their_own_domain(
+    indoc! {r"
+        total := 0
+        for r in [box([1]), box([2, 3])]:
+            total += max(r)
+        total
+    "},
+    4
+)]
+fn a_mut_loop_over_nested_collections_runs_once_per_row(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
 /// A `mut` loop over a **`groupby`**, which fails earlier and louder than the map: the
 /// partition's key binder escapes into an open bound during inference rather than
 /// reaching the domain check at all. Recorded beside the map case because both are "a
