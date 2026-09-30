@@ -1022,19 +1022,28 @@ fn unbox(
     if !matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) {
         return (e, false);
     }
-    // **A box over a sum introduced nothing**, so it goes whatever its candidates are.
-    // The node and its argument carry the same collection and no witness is being erased —
-    // nothing is recorded, and `instantiate_erased_witnesses` must not touch a binder that
-    // is still live in the argument.
-    if argument.ty.peel_refinements().sum().is_some() {
-        return ((**argument).clone(), true);
-    }
     // **The introduction's stated type, because only a binding position carries the kind.**
     // Determinedness is a fact about the witness's range, and a range belongs to its binder
     // ([`Type::witness_kind`]) — so an interior `box`, whose node type is the sum's body with
     // the witness free, cannot answer. `box`'s function type states the sum it introduces and
     // no rewrite retypes it.
     let stated = function.ty.codomain().unwrap_or_else(|| e.ty.clone());
+    // **A box over a sum introduced nothing**, so it goes whatever its candidates are.
+    // The node and its argument carry the same collection and no witness is being erased —
+    // nothing is recorded, and `instantiate_erased_witnesses` must not touch a binder that
+    // is still live in the argument.
+    //
+    // **Except one stating a described sum.** It re-views the argument's sum as the one its
+    // position declares — a mutable variable's seed restated at its value type is the case
+    // (`mut_elim::view_values_at_value_type`) — and the argument's own sum may be one this pass
+    // erases. Erasing both would leave a plain collection where the declared sum stands, so
+    // this one stays as the entry into that sum, which op-conversion takes as the identity.
+    let described = stated
+        .witness_kind()
+        .is_some_and(|k| !matches!(k, crate::ccl::ty::TypeKind::Enumerated(_)));
+    if argument.ty.peel_refinements().sum().is_some() && !described {
+        return ((**argument).clone(), true);
+    }
     // Only a determined witness — one candidate — is erasable.
     match stated.witness_kind() {
         Some(crate::ccl::ty::TypeKind::Enumerated(ds)) if ds.len() == 1 => {

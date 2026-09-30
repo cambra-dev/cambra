@@ -698,9 +698,40 @@ impl TileProducer for FilterProducer {
             // must be released together; releasing only one leaves the other's upstream
             // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
             // data while the other side returns nothing on the next get().
-            self.predicate.release(obsolete_guard.clone());
+            let keys = predicate_release(obsolete_guard.clone(), self.predicate.tiling());
+            self.predicate.release(keys);
         }
         self.input.release(obsolete_guard);
+    }
+}
+
+/// What a filter's predicate no longer needs, given the release `guard` of the filter's
+/// output: the keys the predicate shares with the input pass through, and beneath them only
+/// a whole value does.
+///
+/// The predicate's cell at a key decides every part of that key's value, so the filter needs
+/// it until the key's value is released whole. Part of a value names no part of the cell.
+fn predicate_release(guard: TileGuard, predicate: &Tiling) -> TileGuard {
+    match guard {
+        g if g.is_universal() => predicate.universal_guard(),
+        g if g.is_empty() => predicate.empty_guard(),
+        TileGuard::Or(arms) => TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| predicate_release(arm, predicate))
+                .collect(),
+        ),
+        keys @ TileGuard::Function(FunctionGuard::Domain(_)) => keys,
+        TileGuard::Function(FunctionGuard::Codomain(inner)) => match predicate {
+            Tiling::DataFunction { codomain, .. } if codomain.is_data_function() => {
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(predicate_release(
+                    *inner, codomain,
+                ))))
+            }
+            _ => predicate.empty_guard(),
+        },
+        other => unreachable!(
+            "a filter's output is a collection, so its guard is a function guard, got {other:?}"
+        ),
     }
 }
 

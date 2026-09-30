@@ -52,6 +52,27 @@ pub enum Tiling {
 }
 
 impl Tiling {
+    /// The tiling a value of `extent` takes: a collection as a `DataFunction`, a record
+    /// holding one as a record of its fields' tilings, and anything else as a `Scalar` column,
+    /// which is what a consumer reading one row at a time reads. The inverse of
+    /// [`Self::extent`] for these shapes.
+    ///
+    /// See `src/interpreter/design-operators.md`, "A collection inside a value stays a tile".
+    pub fn from_extent(extent: &Extent) -> Tiling {
+        match extent {
+            Extent::Function { domain, codomain } => {
+                Tiling::data_function((**domain).clone(), Tiling::from_extent(codomain))
+            }
+            Extent::Record(fields) if extent.holds_a_collection() => Tiling::Record(
+                fields
+                    .iter()
+                    .map(|(name, e)| (name.clone(), Tiling::from_extent(e)))
+                    .collect(),
+            ),
+            _ => Tiling::Scalar(extent.clone()),
+        }
+    }
+
     pub fn extent(&self) -> Extent {
         match self {
             Tiling::Scalar(e) => e.clone(),
@@ -191,13 +212,16 @@ impl Tiling {
     /// walks a chain of them.
     ///
     /// Narrower than [`Self::has_domain`], which a materialized function cell and a store
-    /// also answer: only a collection has keys in a column and a nested tiling under them.
+    /// also answer: only this variant has keys in a column and a nested tiling under them.
     pub fn is_data_function(&self) -> bool {
         matches!(self, Tiling::DataFunction { .. })
     }
 
     /// Whether a level sits here, or inside a record here — the static counterpart of
     /// [`Tile::holds_a_level`](crate::interpreter::Tile::holds_a_level), which carries the rule.
+    ///
+    /// [`Extent::holds_a_collection`] asks whether the value type contains a collection at
+    /// all, which a column of maps answers yes and this no.
     pub fn holds_a_level(&self) -> bool {
         match self {
             Tiling::DataFunction { .. } => true,

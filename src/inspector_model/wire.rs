@@ -215,7 +215,7 @@ pub struct OperatorEdge {
 pub enum OperatorEdgeRole {
     /// A field of the consumer, e.g. `"input"`, `"predicate"`.
     Named { name: String },
-    /// A position in a `Vec` of inputs, as `FanIn` and `UnionOperator` have.
+    /// A position in a `Vec` of inputs, as `Zip` and `UnionOperator` have.
     Positional { index: usize },
     /// A store key, as both stores' `init_ops` are keyed by. Rendered from a
     /// `Value`, so a string key arrives quoted.

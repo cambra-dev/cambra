@@ -50,6 +50,15 @@ impl MapResult {
         };
 
         let input_tiling = input.tiling();
+        // A function applied to an argument holding a collection as a tile yields its
+        // codomain's collections as tiles too ([`Tiling::from_extent`]): the argument could
+        // not have been boxed into a column, and neither can the result. A function's type
+        // says only its codomain extent, which cannot draw that distinction on its own.
+        let fn_result = if input_tiling.deepest_values().holds_a_level() {
+            Tiling::from_extent(&fn_result.extent())
+        } else {
+            fn_result
+        };
         let tiling = apply_at(input_tiling, &fn_domain_extent, fn_result)
             .unwrap_or_else(|| panic!("Cannot apply {function_tiling} to {input_tiling}"));
         Self {
@@ -493,9 +502,9 @@ pub enum MapResultToConstMode {
     /// Replace the codomain with the constant
     Replace,
     /// Replace the codomain x with (constant, x)
-    FanInLeft,
+    ZipLeft,
     /// Replace the codomain x with (x, constant)
-    FanInRight,
+    ZipRight,
 }
 
 impl MapResultToConst {
@@ -509,10 +518,10 @@ impl MapResultToConst {
             MapResultToConstMode::Replace => {
                 change_tiling_result(input.tiling(), |_| constant.tiling().clone())
             }
-            MapResultToConstMode::FanInLeft => change_tiling_result(input.tiling(), |e| {
+            MapResultToConstMode::ZipLeft => change_tiling_result(input.tiling(), |e| {
                 Tiling::tuple(&[constant.tiling().clone(), Tiling::Scalar(e.clone())])
             }),
-            MapResultToConstMode::FanInRight => change_tiling_result(input.tiling(), |e| {
+            MapResultToConstMode::ZipRight => change_tiling_result(input.tiling(), |e| {
                 Tiling::tuple(&[Tiling::Scalar(e.clone()), constant.tiling().clone()])
             }),
         };
@@ -577,8 +586,8 @@ impl TileProducer for MapResultToConstProducer {
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
-            c_tiling.is_scalar(),
-            "MapResultToConst expected scalar tiling, Got {c_tiling:?}"
+            !matches!(c_tiling, Tiling::Aggregation { .. } | Tiling::Store { .. }),
+            "MapResultToConst broadcasts a value, got {c_tiling:?}"
         );
         let i_tiling = self.input.tiling().clone();
         let input_guard = match projection_guard {
@@ -643,18 +652,16 @@ impl TileProducer for MapResultToConstProducer {
         };
 
         let mode = self.mode;
-        process_tile_result(self.tiling(), input_tile, move |codomain| {
-            let const_tile = repeat_tile(constant_tile, codomain.len());
-            let result_tile = match mode {
+        // Stated over tiles rather than columns: `Replace` never reads the values, and the
+        // two `Zip` modes pair with them whatever they carry — a level included, which a
+        // column has nowhere to put.
+        map_tile_result(input_tile, move |values| {
+            let const_tile = repeat_tile(constant_tile, values.rows());
+            match mode {
                 MapResultToConstMode::Replace => const_tile,
-                MapResultToConstMode::FanInLeft => {
-                    Tile::tuple(vec![const_tile, Tile::Scalar(codomain)])
-                }
-                MapResultToConstMode::FanInRight => {
-                    Tile::tuple(vec![Tile::Scalar(codomain), const_tile])
-                }
-            };
-            scalar_tile_to_column_value(result_tile)
+                MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
+                MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
+            }
         })
     }
 

@@ -1314,7 +1314,7 @@ fn elim_lambda_impl(
         // `variant_project(cᵢ)` keeps the scrutinee's *real* domain keys (a union
         // *stream* carries them explicitly), so the outer `id` arm (the full
         // element) and the tag-restricted payload co-iterate by key under the
-        // `zip`/`FanIn`, which inner-joins on the shared keys — the outer arm
+        // `zip`/`Zip`, which inner-joins on the shared keys — the outer arm
         // need not be pre-restricted (the join drops the non-tag-`cᵢ` positions).
         // The two binders merge into one pair (`param ↦ pair.0`, `wᵢ ↦ pair.1`),
         // exactly as the nested-lambda rule does.
@@ -1421,7 +1421,7 @@ fn elim_lambda_impl(
                         typed_compose(vec![scrut_pf.clone(), vp])
                     };
                     // Outer morphism `param_ty ⇒ param_ty` — the full element; the
-                    // zip's `FanIn` restricts it to the tag-`cᵢ` keys by inner-join.
+                    // zip's `Zip` restricts it to the tag-`cᵢ` keys by inner-join.
                     let outer_pf = id().with_ty(Type::fun(param_ty.clone(), param_ty.clone()));
                     // ⟨id, scrut ≫ variant_project(cᵢ)⟩ : param_ty ⇒ (param_ty, Pᵢ).
                     let pair_stream = zip_pair(outer_pf, payload_pf, &fun_kind);

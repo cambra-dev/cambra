@@ -176,6 +176,23 @@ Neither is a "union", and the name matters: in type theory a *union type* is **u
 
 Op-conversion accordingly compiles a fed union as a flat merge — a disjoint join — and **rejects** a fed `Copair` rather than compiling it as the operation it is not. Nothing builds one today: `Builtin::Copair` needs a `++` inside a lambda over its parameter, which fails earlier. When something does, it needs a tagged fed form, not the flat merge.
 
+### The program's outputs are a trailing `Record`
+
+A program that binds a sink ends in a `Record` of the sink-bound names, appended by lowering at
+the tail of the root `Let*` chain so each output is in scope of the bindings above it. The node is
+an ordinary `Record`, the same one a program whose trailing expression is a record literal ends
+in.
+
+Lowering appends it as the body of an `ExprStmt` whose effect is the program's own trailing
+expression, and `channelize` collapses that `ExprStmt` to its body (`drop_expr_stmts`). A sink
+program's trailing expression is therefore dropped, and the `Record` is what sits at the tail.
+Which conversion entry point runs is read off the sink registry, the same fact lowering read when
+it decided to append a `Record` at all.
+
+An output is an iteration site by the rule a product's components follow
+(`planning::iterate`'s `mark_component_source`). A pure program has one output and no `Record`:
+its trailing expression is that output.
+
 ### `Transact` — the domain-parameterized recurrence carrier
 
 CHL mutation-accumulation `for` loops **and** `with begin():` transactions share one carrier node, `Transact`, rather than recursive `Lambda`/`Let` combinations or a dedicated fold node. (For the lowering mechanics and the operator-graph realization, see [lowering.md](lowering.md#mutation-accumulation-loops) and [mutability.md](mutability.md).)

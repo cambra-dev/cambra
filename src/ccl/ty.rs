@@ -2652,6 +2652,21 @@ impl Type {
         matches!(self.peel_refinements(), Type::History { .. })
     }
 
+    /// Whether this denotes a **collection**: a data function, which the runtime sweeps.
+    ///
+    /// A compute function tiles at a function extent too and is not swept, so [`FunKind`]
+    /// separates the two. A refinement is a fact about the value rather than a different
+    /// shape, so it peels first, and a filtered collection is a collection.
+    pub fn is_collection(&self) -> bool {
+        matches!(
+            self.peel_refinements(),
+            Type::Fun {
+                fun_kind: FunKind::Data(..),
+                ..
+            }
+        )
+    }
+
     /// The type of a **list**: a dependent sum `Σ (𝐷: UIntRanges). 𝐷 ⤇ elem` — a
     /// *type*-witness whose kind is every index range ([`TypeKind::UIntRanges`]), so
     /// the length is the witness **domain** rather than a separate scalar value, and

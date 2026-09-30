@@ -24,6 +24,7 @@ use cambra::{
         http_server::{SharedHttpServer, reserve_test_port},
     },
 };
+use indoc::formatdoc;
 use rstest_log::rstest;
 use test_log::test;
 
@@ -382,6 +383,53 @@ fn test_http_serve_wrong_path_gets_404() {
     assert!(
         raw.starts_with("HTTP/1.1 404"),
         "expected 404 status, got: {raw:?}"
+    );
+}
+
+/// A conditionally fed output answers the requests its guard admits, and only those.
+///
+/// Feeding under a guard restricts the channel's domain, so the output's type is
+/// `{source(…) | __elem ▷ …} ⤇ String`, a refined collection that planning marks as an
+/// iteration site like any other (`Type::is_collection`). A rejected request gets no
+/// response, so it goes first on its own connection, left open, and the admitted request
+/// after it must still be answered with its own body.
+#[rstest]
+fn a_conditionally_fed_output_answers_the_requests_its_guard_admits() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/g")
+        for req in reqs:
+            if req != "skip":
+                resps << req
+    "#};
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut ctx = GlobalContext::default();
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
+
+    let (tx, rx) = mpsc::channel::<(String, TcpStream)>();
+    thread::spawn(move || {
+        let mut rejected = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        rejected
+            .write_all(
+                format!(
+                    "POST /g HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 4\r\n\
+                     Connection: close\r\n\r\nskip"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        rejected.flush().unwrap();
+        tx.send((http_post(port, "/g", "go"), rejected)).unwrap();
+    });
+    let (admitted, mut rejected) = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(admitted, "go");
+
+    ctx.scheduler().check_for_notifications();
+    rejected.set_nonblocking(true).unwrap();
+    let mut buf = [0u8; 64];
+    assert!(
+        matches!(rejected.read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the request the guard rejects is not answered",
     );
 }
 

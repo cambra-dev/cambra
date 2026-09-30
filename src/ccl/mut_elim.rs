@@ -802,14 +802,16 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
     Expr::let_in(binding(fresh, vty), value, cont)
 }
 
-/// View each mutable variable's seed at the value type its binder declares.
+/// View each value a mutable variable takes — its seed and every whole-variable write — at
+/// the value type its binder declares.
 ///
 /// A concrete collection is a value of an abstract collection type only through an
 /// introduction: entering a sum is a term and not a subtyping edge
 /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). A mutable variable annotated
 /// `Mut(Map(𝐾, 𝑉), _)` holds the abstract map, whose key domain grows with every write,
 /// while its seed names one key domain — so the seed reaches the mutable variable's type through
-/// [`Builtin::Box`].
+/// [`Builtin::Box`]. A write `m := box(…)` names one key domain the same way. A keyed write
+/// needs nothing here: [`desugar_keyed_writes`] builds its `insert` at the variable's type.
 ///
 /// Stating the mutable variable's value type on that introduction is also what keeps it. `unbox`
 /// erases a box whose **stated** sum lists one candidate, reading the kind off `box`'s own
@@ -822,22 +824,144 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
 /// behind it validates them: the reconcile there is `derived <: recorded`, and the derived
 /// `Σ (σ : [𝑋]). σ ⤇ 𝑉` sits below the stated `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` by kind
 /// containment.
-pub fn view_seeds_at_value_type(expr: &mut Expr) {
-    if let TypedExprNode::MutDecl { binding, init, .. } = &mut expr.node {
-        let value_ty = value_type_of(&binding.ty);
-        if value_ty.peel_refinements().sum().is_some() && init.ty != value_ty {
-            // The `box` this mints stands in for the seed it restates, so the recording
-            // names the seed. Opened around `view_at` alone: the recursion below must
-            // attach its own products to their own nodes.
-            let _g = provenance::enter(
-                init.node_id(),
-                "transact.view_seed_at_value_type",
-                provenance::Nature::Machinery,
-            );
-            view_at(init, value_ty);
+///
+/// A sum inside a product is restated where it sits. A record or tuple value type holding a
+/// sum takes its seed field by field, so `(a=5, b=box(m))` against `{a: Int, b: Map(𝐾, 𝑉)}`
+/// restates `b`'s introduction at the field's sum. A value that is not a product literal is
+/// bound once and rebuilt from its projections.
+pub fn view_values_at_value_type(expr: &mut Expr) {
+    let mut value_tys: HashMap<Name, Type> = HashMap::new();
+    collect_mut_value_types(expr, &mut value_tys);
+    view_values_at(expr, &value_tys);
+}
+
+fn view_values_at(expr: &mut Expr, value_tys: &HashMap<Name, Type>) {
+    let (value, value_ty) = match &mut expr.node {
+        TypedExprNode::MutDecl { binding, init, .. } => {
+            let value_ty = value_type_of(&binding.ty);
+            (Some(&mut **init), Some(value_ty))
         }
+        TypedExprNode::MutWrite {
+            name,
+            key: None,
+            value,
+        } => (Some(&mut **value), value_tys.get(name).cloned()),
+        _ => (None, None),
+    };
+    if let (Some(value), Some(value_ty)) = (value, value_ty)
+        && holds_a_sum(&value_ty)
+    {
+        // What this mints stands in for the value it restates, so the recording names that
+        // value. Opened around `view_at_value_type` alone: the recursion below must attach
+        // its own products to their own nodes.
+        let _g = provenance::enter(
+            value.node_id(),
+            "transact.view_value_at_value_type",
+            provenance::Nature::Machinery,
+        );
+        view_at_value_type(value, &value_ty);
     }
-    expr.walk_children_mut(&mut view_seeds_at_value_type);
+    expr.walk_children_mut(&mut |c| view_values_at(c, value_tys));
+}
+
+/// Whether `ty` is a sum or a product with one among its components.
+fn holds_a_sum(ty: &Type) -> bool {
+    let ty = ty.peel_refinements();
+    ty.sum().is_some()
+        || match ty {
+            Type::Record(fields) => fields.iter().any(|(_, t)| holds_a_sum(t)),
+            Type::Tuple(elems) => elems.iter().any(holds_a_sum),
+            _ => false,
+        }
+}
+
+/// Restate `e` at `target`: through [`view_at`] where `target` is a sum, and component by
+/// component where it is a product holding one.
+fn view_at_value_type(e: &mut Expr, target: &Type) {
+    if target.peel_refinements().sum().is_some() {
+        if e.ty != *target {
+            view_at(e, target.clone());
+        }
+        return;
+    }
+    if !holds_a_sum(target) {
+        return;
+    }
+    if !matches!(e.node, TypedExprNode::Record(_) | TypedExprNode::Tuple(_)) {
+        spell_out_product(e, target);
+        let TypedExprNode::Let { body, .. } = &mut e.node else {
+            unreachable!("spell_out_product binds the seed")
+        };
+        view_at_value_type(body, target);
+        e.ty = body.ty.clone();
+        return;
+    }
+    match (&mut e.node, target.peel_refinements()) {
+        (TypedExprNode::Record(fields), Type::Record(targets)) => {
+            for (name, field) in fields.iter_mut() {
+                let (_, field_target) = targets
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .unwrap_or_else(|| panic!("a record seed's field `{name}` is in its type"));
+                view_at_value_type(field, field_target);
+            }
+            e.ty = Type::Record(
+                fields
+                    .iter()
+                    .map(|(n, f)| (n.clone(), f.ty.clone()))
+                    .collect(),
+            );
+        }
+        (TypedExprNode::Tuple(elems), Type::Tuple(targets)) => {
+            assert_eq!(
+                elems.len(),
+                targets.len(),
+                "a tuple seed has its type's arity"
+            );
+            for (elem, elem_target) in elems.iter_mut().zip(targets) {
+                view_at_value_type(elem, elem_target);
+            }
+            e.ty = Type::Tuple(elems.iter().map(|x| x.ty.clone()).collect());
+        }
+        (node, _) => panic!(
+            "a seed of product type {target} is a product literal once spelled out, got {node:?}"
+        ),
+    }
+}
+
+/// Rewrite a product-typed `e` that is not a literal to `let 𝑡 = e in (𝑓: 𝑡.𝑓, …)`, so each
+/// component can be restated on its own.
+fn spell_out_product(e: &mut Expr, target: &Type) {
+    let value = std::mem::replace(e, Expr::lit(Lit::Unit));
+    let ty = value.ty.clone();
+    let seed = Name::fresh("__seed");
+    let project = |key: Expr, component: &Type| {
+        Expr::apply(
+            Expr::var(&seed).with_ty(ty.clone()),
+            key.with_ty(Type::fun(ty.clone(), component.clone())),
+        )
+        .with_ty(component.clone())
+    };
+    let spelled = match ty.peel_refinements() {
+        Type::Record(fields) => Expr::new(TypedExprNode::Record(
+            fields
+                .iter()
+                .map(|(name, t)| (name.clone(), project(Expr::proj_field(name.clone()), t)))
+                .collect(),
+        ))
+        .with_ty(Type::Record(fields.clone())),
+        Type::Tuple(elems) => Expr::new(TypedExprNode::Tuple(
+            elems
+                .iter()
+                .enumerate()
+                .map(|(i, t)| project(Expr::proj_index(i), t))
+                .collect(),
+        ))
+        .with_ty(Type::Tuple(elems.clone())),
+        other => panic!("a seed of product type {target} has a product type, got {other}"),
+    };
+    let spelled_ty = spelled.ty.clone();
+    *e = Expr::let_in(binding(seed, ty), value, spelled).with_ty(spelled_ty);
 }
 
 /// Restate `e`'s introduction at `target`, minting one where `e` has none.

@@ -86,6 +86,16 @@ pub struct NotifyOrSubscribeResult {
 }
 
 impl Extent {
+    /// Whether a collection sits anywhere inside this extent, however a tile holds it
+    /// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
+    pub fn holds_a_collection(&self) -> bool {
+        match self {
+            Extent::Function { .. } => true,
+            Extent::Record(fields) => fields.values().any(Extent::holds_a_collection),
+            _ => false,
+        }
+    }
+
     /// When subscribing to this extent as an iteration, returns whether to immediately
     /// notify true and whether to add the iterating variable to the scheduler.
     pub fn subscribe_to_iteration_action(&self) -> NotifyOrSubscribeResult {

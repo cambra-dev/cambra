@@ -829,7 +829,7 @@ impl ColumnValue {
                     "Union append: the arms must still partition 0..len"
                 );
             }
-            _ => panic!("Mismatched ColumnValue variants in append"),
+            (s, o) => panic!("Mismatched ColumnValue variants in append: {s:?} and {o:?}"),
         }
     }
 

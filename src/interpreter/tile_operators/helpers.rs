@@ -10,13 +10,58 @@
 use std::collections::HashMap;
 
 use super::{Predicate, Tile, TilePathStep, Tiling};
-use crate::interpreter::{ColumnValue, Extent, Value, bindings_are_list, transform_hashmap_values};
+use crate::interpreter::{
+    ColumnValue, Extent, FuncBinding, Value, bindings_are_list, transform_hashmap_values,
+};
 
-/// Repeat a scalar or record-of-scalars tile `len` times along the domain axis.
+/// A column of map values, one per row, as the tile those collections form
+/// (`src/interpreter/design-operators.md`, "A collection inside a value stays a tile").
+///
+/// A store holds one value per key per tick, so a collection-valued variable is read out of
+/// it as a column of maps.
+///
+/// Keys are sorted within each row, which is the invariant
+/// [`Tile::DataFunction`](crate::interpreter::Tile::DataFunction) states of its `keys`.
+pub(crate) fn open_row_collections(
+    cells: &ColumnValue,
+    key_extent: &Extent,
+    value_extent: &Extent,
+) -> Tile {
+    let mut starts = Vec::with_capacity(cells.len());
+    let mut keys: Vec<Value> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    for row in 0..cells.len() {
+        starts.push(keys.len());
+        let cell = cells.index_at(row);
+        let Value::Function(mut bindings) = cell else {
+            panic!("a collection-valued cell holds a map, got {cell:?}")
+        };
+        bindings.sort_by(|a, b| {
+            a.input
+                .partial_cmp(&b.input)
+                .expect("a collection's keys are one extent's values, so they compare")
+        });
+        for binding in bindings {
+            keys.push(binding.input);
+            values.push(binding.output);
+        }
+    }
+    Tile::grouped(
+        ColumnValue::UInts(starts),
+        ColumnValue::from_values(keys, key_extent),
+        Box::new(Tile::Scalar(ColumnValue::from_values(values, value_extent))),
+        // The row's whole map arrives at once, so nothing more is coming under these keys.
+        Predicate::True,
+        bit_set::BitSet::new(),
+    )
+}
+
+/// Repeat a whole value's tile `len` times along the domain axis.
 ///
 /// Used by [`MapResultToConstProducer`] to broadcast a constant value across all
 /// domain elements: `Tile::Scalar(cv)` → `Tile::Scalar(cv.repeat(len))`;
-/// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`.
+/// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`; a collection, one row
+/// holding its keys, → one group per element, each a copy of that row's.
 pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
     match tile {
         Tile::Scalar(cv) => Tile::Scalar(cv.repeat(len)),
@@ -25,6 +70,14 @@ pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
                 .map(|(k, t)| (k, repeat_tile(t, len)))
                 .collect(),
         ),
+        collection @ Tile::DataFunction { .. } => {
+            assert_eq!(
+                collection.rows(),
+                1,
+                "a broadcast collection is one whole value, its one row's group"
+            );
+            collection.select_rows(&vec![0; len])
+        }
         other => panic!("repeat_tile: unsupported tile shape {other:?}"),
     }
 }
@@ -109,6 +162,73 @@ pub(crate) fn apply_function_tile(
         tile => panic!("apply_function_tile: not a function tile: {tile:?}"),
     }
 }
+/// A tile as a column, turning each collection it holds into one map value per row, for the
+/// places one value is required: a variant's payload rides its arm as one, and a store write
+/// is one value per key. The inverse of [`open_row_collections`].
+///
+/// Distinct from [`scalar_tile_to_column_value`], which refuses a collection held as a tile:
+/// boxing one is a defect wherever the tile was the point, so the two are separate functions
+/// rather than one that always obliges.
+pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
+    match tile {
+        Tile::Scalar(cv) => cv,
+        Tile::Record(m) => ColumnValue::Records(
+            m.into_iter()
+                .map(|(name, field)| (name, materialize_collections(field)))
+                .collect(),
+        ),
+        Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            deleted,
+            ..
+        } => {
+            let inner = materialize_collections(*codomain);
+            let starts: Vec<usize> = (0..row_starts.len())
+                .map(|r| match row_starts.index_at(r) {
+                    Value::UInt(u) => u,
+                    other => panic!("a collection's row starts are UInts, got {other:?}"),
+                })
+                .collect();
+            ColumnValue::Variants(
+                (0..starts.len())
+                    .map(|r| {
+                        let from = starts[r];
+                        let to = starts.get(r + 1).copied().unwrap_or(domain.len());
+                        Value::Function(
+                            (from..to)
+                                .filter(|i| !deleted.contains(*i))
+                                .map(|i| FuncBinding {
+                                    input: domain.index_at(i),
+                                    output: inner.index_at(i),
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        other => panic!("materialize_collections: not a value-shaped tile: {other:?}"),
+    }
+}
+
+/// Replace the tile sitting under every level of `input_tile` with what `transformation`
+/// makes of it — the tile-level [`process_tile_result`].
+///
+/// Used where the result carries levels, which a column has nowhere to put, and where the
+/// values are read as a tile rather than as a column of elements. It needs no tiling: what
+/// it replaces is chosen by the tile's own shape, and the transformation states the rest.
+pub(crate) fn map_tile_result(
+    mut input_tile: Tile,
+    transformation: impl FnOnce(Tile) -> Tile,
+) -> Tile {
+    let values = input_tile.deepest_values_mut();
+    let taken = std::mem::replace(values, Tile::Scalar(ColumnValue::Units(0)));
+    *values = transformation(taken);
+    input_tile
+}
+
 /// Inverse of [`scalar_tile_to_column_value`]: reconstructs a [`Tile`] from a
 /// [`ColumnValue`] using the given [`Tiling`] to determine the output shape.
 ///
