@@ -1016,3 +1016,86 @@ fn a_tuple_of_folds_pairs_at_the_group() {
         ),
     );
 }
+
+/// A comprehension over `sales` grouped by region, with `body` reading each group `g`.
+///
+/// `qty > 2` keeps only west's `amount=200` row, so the filtered per-region sums are north `0`
+/// and west `200`, and the unfiltered ones are north `40` and west `300`.
+fn per_region_program(body: &str) -> String {
+    formatdoc! {r#"
+        sales = [
+            (region="west", amount=100, qty=2),
+            (region="west", amount=200, qty=4),
+            (region="north", amount=40, qty=1),
+        ]
+        [{body} for g in groupby(sales, \r -> r.region)]
+    "#}
+}
+
+/// A per-region collection over [`per_region_program`]'s keys, `north` then `west`.
+fn per_region(value: Tile) -> Tile {
+    Tile::data_function(
+        ColumnValue::strings(&["north", "west"]),
+        Box::new(value),
+        Predicate::True,
+        BitSet::new(),
+    )
+}
+
+/// A product of per-region columns, one `(field, [north, west])` pair per component.
+fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
+    per_region(Tile::Record(
+        fields
+            .iter()
+            .map(|(name, column)| {
+                (
+                    name.to_string(),
+                    Tile::Scalar(ColumnValue::Ints(column.to_vec())),
+                )
+            })
+            .collect(),
+    ))
+}
+
+/// A filtered per-group aggregate on its own applies its filter. This is the control for
+/// [`a_filtered_per_group_aggregate_in_a_product_drops_its_filter`].
+#[test]
+fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
+    check_tile(
+        &per_region_program("sum([s.amount for s in g if s.qty > 2])"),
+        per_region(Tile::Scalar(ColumnValue::Ints(vec![0, 200]))),
+    );
+}
+
+/// **This test pins a defect, not a decision — it should start failing when the defect is
+/// fixed.**
+///
+/// A filtered per-group aggregate placed in a tuple or a record answers the unfiltered sum:
+/// `sum([s.amount for s in g if s.qty > 2])` is north `40` and west `300` where it should be
+/// north `0` and west `200`, the values
+/// [`a_bare_filtered_per_group_aggregate_keeps_its_filter`] gets for the same aggregate
+/// alone. Once fixed, each case's filtered component (`F` in its product) asserts `[0, 200]`.
+///
+/// In the post-planning tree both forms carry the filter as a refinement of the
+/// aggregate's input, `__elem ▷ (g ≫ (.qty, 2 ▷ const) ▷ zip ≫ gt)`. `insert_map_filters`
+/// (`src/ccl/planning/map_filter.rs`) inserts a `map_filter` for the bare form and none for
+/// these, and the program compiles and runs with the refinement unmaterialized.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::beside_a_constant(
+    "(1, F)",
+    per_region_product(&[("_0", [1, 1]), ("_1", [40, 300])])
+)]
+#[case::one_tuple("(F,)", per_region_product(&[("_0", [40, 300])]))]
+#[case::record_field("(k=F)", per_region_product(&[("k", [40, 300])]))]
+#[case::beside_the_unfiltered_sum(
+    "(F, sum([s.amount for s in g]))",
+    per_region_product(&[("_0", [40, 300]), ("_1", [40, 300])])
+)]
+fn a_filtered_per_group_aggregate_in_a_product_drops_its_filter(
+    #[case] product: &str,
+    #[case] pinned: Tile,
+) {
+    let body = product.replace("F", "sum([s.amount for s in g if s.qty > 2])");
+    check_tile(&per_region_program(&body), pinned);
+}
