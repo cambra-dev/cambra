@@ -1040,25 +1040,89 @@ impl Tile {
         (0..offsets.len()).map(move |row| level_run(offsets, row, domain.len()))
     }
 
-    /// A collection's keys that neither a filter nor a release has removed, as `(column index,
-    /// key)` in column order.
+    /// A guard naming exactly the rows [`compact`](Self::compact) removes from this collection,
+    /// or `None` when it removes none or the tile is no collection.
     ///
-    /// A `Restrict`, a keyed merge and a release ([`Self::remove_guarded`]) mark a row deleted
-    /// rather than dropping it, so the domain column still holds its extent's keys and a reader
-    /// of the collection's values reads these. A raw read of `domain` is for what a deleted key
-    /// is still owed: its release (`to_guard`), and the position a loop driver releases
-    /// through.
-    pub fn live_keys(&self) -> impl Iterator<Item = (usize, Value)> + '_ {
+    /// An operator that compacts its input and emits what is left releases this to the input,
+    /// since no consumer of its output sees those rows, so no consumer's guard can name them.
+    ///
+    /// # Panics
+    ///
+    /// When a removed row has no exact spelling as a guard: a deleted key of a collection under
+    /// an enclosing row, or a deleted row inside a nested group. A `Domain` guard names a key
+    /// under every enclosing row, those still to arrive included, and a `Codomain` guard is read
+    /// against every group, so either would release the key where it may still be live. Naming
+    /// a key beneath the path that reaches it needs a predicate qualified by that path, which
+    /// these guards do not have.
+    pub fn deleted_keys_guard(&self) -> Option<TileGuard> {
         let Tile::DataFunction {
-            domain, deleted, ..
+            domain,
+            codomain,
+            deleted,
+            ..
         } = self
         else {
-            panic!("live_keys is a collection's: {self:?}")
+            return None;
         };
-        (0..domain.len())
-            .filter(|i| !deleted.contains(*i))
-            .map(|i| (i, domain.index_at(i)))
+        assert!(
+            !codomain.holds_deleted_rows(),
+            "compacting drops a row deleted inside a nested group, and no guard names a key \
+             beneath the path that reaches it, so the row cannot be released: {self:?}"
+        );
+        if deleted.is_empty() {
+            return None;
+        }
+        assert_eq!(
+            self.rows(),
+            1,
+            "compacting drops a deleted key of a collection under an enclosing row, and a \
+             `Domain` guard would release that key under every row, so it cannot be released: \
+             {self:?}"
+        );
+        let dropped: Vec<usize> = deleted.iter().collect();
+        let keys = domain.select_indices(dropped.iter().copied(), dropped.len());
+        Some(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::from_column_value(&keys),
+        )))
     }
+
+    /// Whether any collection in this tile, at any level, marks a row deleted.
+    fn holds_deleted_rows(&self) -> bool {
+        match self {
+            Tile::DataFunction {
+                codomain, deleted, ..
+            } => !deleted.is_empty() || codomain.holds_deleted_rows(),
+            Tile::Record(fields) => fields.values().any(Tile::holds_deleted_rows),
+            Tile::Aggregation { accumulator, .. } => accumulator.holds_deleted_rows(),
+            Tile::Scalar(_) | Tile::Store { .. } => false,
+        }
+    }
+
+    /// [`live_keys`] of a collection, or `None` for any other tile.
+    pub fn live_keys(&self) -> Option<impl Iterator<Item = (usize, Value)> + '_> {
+        match self {
+            Tile::DataFunction {
+                domain, deleted, ..
+            } => Some(live_keys(domain, deleted)),
+            _ => None,
+        }
+    }
+}
+
+/// A collection's keys that neither a filter nor a release has removed, as `(column index,
+/// key)` in column order, from its `domain` and `deleted` fields.
+///
+/// A `Restrict`, a keyed merge and a release ([`Tile::remove_guarded`]) mark a row deleted
+/// rather than dropping it, so the domain column still holds its extent's keys and a reader of
+/// the collection's values reads these. A raw read of `domain` is for what a deleted key is
+/// still owed: its release (`to_guard`), and the position a loop driver releases through.
+pub fn live_keys<'a>(
+    domain: &'a ColumnValue,
+    deleted: &'a BitSet,
+) -> impl Iterator<Item = (usize, Value)> + 'a {
+    (0..domain.len())
+        .filter(|i| !deleted.contains(*i))
+        .map(|i| (i, domain.index_at(i)))
 }
 
 /// A collection's own `row_starts`, for the validation a constructor does.
@@ -1478,6 +1542,47 @@ mod tests {
 
     use super::*;
     use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, TileGuard, Value};
+
+    // ── The keys compaction removes ───────────────────────────────────────────
+
+    /// Keys `0, 1` under each of two enclosing rows, with `deleted` marking column indices.
+    fn two_rows_of_two_keys(deleted: &[usize]) -> Tile {
+        Tile::DataFunction {
+            row_starts: ColumnValue::UInts(vec![0, 2]),
+            domain: ColumnValue::UInts(vec![0, 1, 0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 20, 21]))),
+            domain_predicate: Predicate::False,
+            deleted: deleted.iter().copied().collect(),
+        }
+    }
+
+    /// A collection over one row names its deleted keys.
+    #[test]
+    fn deleted_keys_guard_names_a_single_row_collections_deleted_keys() {
+        let mut deleted = BitSet::new();
+        deleted.insert(1);
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12]))),
+            Predicate::False,
+            deleted,
+        );
+        let Some(TileGuard::Function(FunctionGuard::Domain(p))) = tile.deleted_keys_guard() else {
+            panic!("the deleted key is named");
+        };
+        assert!(
+            p.contains(&Value::UInt(1)) && !p.contains(&Value::UInt(0)),
+            "{p:?}"
+        );
+    }
+
+    /// A deleted key under one of several enclosing rows has no exact guard: a `Domain` guard
+    /// names it under every row.
+    #[test]
+    #[should_panic(expected = "a `Domain` guard would release that key under every row")]
+    fn deleted_keys_guard_refuses_a_key_deleted_under_one_of_several_rows() {
+        two_rows_of_two_keys(&[1]).deleted_keys_guard();
+    }
 
     // ── Merging a collection delivered row by row ─────────────────────────────
 

@@ -79,6 +79,20 @@ An empty group and a removed key are different tiles: the first is two equal `ro
 level, taken with its subtree by `Tile::compact`. `Tile::retain_keys` produces the first and never
 the second.
 
+A deleted row stays in the tile so that a consumer's release reaches it: `Tile::to_guard` names
+every key the tile holds, deleted ones included, so releasing what a tile showed releases its
+filtered rows too. An operator that compacts its input and emits what is left breaks that, since
+no consumer of its output sees the rows it dropped. Such an operator releases them to its input
+itself, through `Tile::deleted_keys_guard` (`MapResult`, `MapResultToConst`, `Zip`, `SelectField`,
+`CheckedLookup`). One that takes the whole input's `to_guard` before compacting and releases it
+(`Memo`, `Aggregate`, `MapAggregate`) already covers them.
+
+`deleted_keys_guard` releases a deleted key of a collection over one row, and panics on any other
+deleted row. A `Domain` guard names a key under every enclosing row, those still to arrive
+included, and a `Codomain` guard is read against every group, so a key deleted under one enclosing
+row, or inside a nested group, has no exact guard: either would release it where it may still be
+live. Naming a key beneath the path that reaches it needs a predicate qualified by that path.
+
 ### TileGuard
 
 A `TileGuard` specifies a sub-tiling (a downward-closed, ⊕-closed subset of tiles) of interest. It drives
@@ -640,8 +654,12 @@ which drops a non-`UInt` key silently.
 Ascending rather than contiguous, because the positions are the *source's*. A restricted loop
 source (`for l in [x for x in xs if p(x)]`) carries its extent's keys, the filtered ones marked
 deleted. The decode reads only the surviving positions and the recurrence runs over exactly
-those, so the watermark is a lower bound on the next position rather than the position itself,
-and the ticks a filtered-out position would have occupied are never occupied. The alternative,
+those, so the next position can sit above the watermark. A filtered position is still decided,
+as a carry: the driver states every position it has read past complete on the body input
+(`DriverWindow::render`), and the store steps a carry over a complete position that holds no
+decision. Without that the frontier would move only at surviving positions, and a filtered row
+after the last survivor would never be decided, so a read of the store over the loop's extent
+would never emit or release it. The alternative,
 iterating the extent densely and gating the write, was not taken: the domain the pipeline hands
 the store is the refined extent, and a store that disagreed with it would have to recover the
 filter the type already carries.
@@ -659,8 +677,9 @@ done yet".
 The **driver** owns the iteration source and produces the body's `(prev…, item)` input. It
 holds no part of the recurrence, and reads the store on two axes. The frontier is a **tick**
 cursor: `step` advances the watermark unconditionally (so a carry decides its position without
-appending a change), and a frontier equal to `emitted_through + 1` says every emitted position
-has been decided and the next may go. The previous accumulator is that key's value *at* the
+appending a change), and a frontier at or past `emitted_through + 1` says every emitted position
+has been decided and the next may go. It runs past it over the filtered positions the driver has
+read past. The previous accumulator is that key's value *at* the
 frontier (`store_value_at`, one fold per read key — folding *at* the tick the predecessor's
 decision occupies, which is what the recurrence means, rather than taking the key's latest
 write). What the driver does keep is the **item** cursor `emitted_through`, because a
@@ -715,11 +734,16 @@ positions is forwarded to the trigger so the source is reclaimed. Reading by fol
 than by indexed projection is what unifies induction reads with transactional-variable reads.
 
 The trigger enumerates the loop **extent**, which for a restricted source is wider than the
-set of positions the recurrence ran at. That needs no special case: a position the filter
-excluded occupies no tick, so `store_value_at` folds it to the latest write below it — the
-accumulator's value as of that position, which is what a history over the extent means. A
-scalar-final read still lands on the last iterated write, and a tap (`carry_forward: false`)
+set of positions the recurrence ran at. That needs no special case: the store decides a
+position the filter excluded as a carry, so `store_value_at` folds it to the latest write below
+it, the accumulator's value as of that position, which is what a history over the extent means.
+A scalar-final read still lands on the last iterated write, and a tap (`carry_forward: false`)
 still appears only at the positions that fired.
+
+A decided position the read does not emit, a tap that did not fire there, reaches no consumer,
+so no consumer's release covers it. The read releases the trigger through such positions
+itself: every position below the first one it still needs (one undecided, or one emitted and
+not yet released), or every position the trigger holds when there is none.
 
 Folding by position keeps the read independent of the store's own length — the positions
 come from the trigger, the values from the fold. And the trailing-carry undercount that

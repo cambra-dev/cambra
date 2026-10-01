@@ -817,3 +817,67 @@ pub(crate) fn source(name: &str, port: u16) -> String {
     };
     text.replace("{PORT}", &port.to_string())
 }
+
+/// Run `v1` over a live `source1()` of integers holding `before`, reload it to `v2`, then
+/// deliver `after`, complete the source, and answer the program's integer value.
+///
+/// `before` sits at positions `0..`, and `after` at the positions following it. The source
+/// stays live across the reload, so what the replacement is offered is what the retired
+/// version's readers left unreleased.
+pub(crate) fn int_value_across_a_reload_over_a_live_source(
+    v1: &str,
+    v2: &str,
+    before: &[i64],
+    after: &[i64],
+) -> i64 {
+    use std::{cell::RefCell, rc::Rc};
+
+    use cambra::{
+        ccl::{Type, context::GlobalContext},
+        interpreter::{BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value},
+        live_program::LiveProgram,
+    };
+
+    use crate::serving::no_main;
+
+    let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let rows = |from: usize, values: &[i64]| -> Vec<(Value, Value)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (Value::UInt(from + i), Value::Int(*v)))
+            .collect()
+    };
+    let pull = |ctx: &mut GlobalContext, live: &mut LiveProgram| -> Tile {
+        ctx.scheduler().check_for_notifications();
+        let producer = live
+            .main_producer_mut()
+            .expect("the program's value is pulled");
+        producer.get(producer.tiling().universal_guard())
+    };
+
+    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    source.borrow_mut().add_data(&rows(0, before));
+    for _ in 0..20 {
+        pull(&mut ctx, &mut live);
+    }
+    live.reload(&mut ctx, v2, &no_main).expect("v2 replaces v1");
+    source.borrow_mut().add_data(&rows(before.len(), after));
+    source.borrow_mut().set_yield_predicate(Predicate::True);
+    for _ in 0..500 {
+        let tile = pull(&mut ctx, &mut live);
+        if tile.is_terminal() {
+            let Tile::Scalar(ColumnValue::Ints(v)) = tile else {
+                panic!("an integer value, got {tile:?}");
+            };
+            return v[0];
+        }
+    }
+    panic!("the replacement never settled");
+}

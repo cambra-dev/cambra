@@ -334,6 +334,15 @@ impl CheckedLookupProducer {
     }
 }
 
+/// Compact `tile`, which `input` produced, releasing to `input` the rows that drops.
+fn compact_releasing(tile: &mut Tile, input: &mut Box<dyn TileProducer>) {
+    let dropped = tile.deleted_keys_guard();
+    tile.compact();
+    if let Some(dropped) = dropped {
+        input.release(dropped);
+    }
+}
+
 impl TileProducer for CheckedLookupProducer {
     impl_producer_base!();
 
@@ -359,13 +368,14 @@ impl TileProducer for CheckedLookupProducer {
         // Every leg is searched by position, and a release marks rows deleted rather than
         // removing them (`Tile::mark_deleted`), so a tile still carrying deletions answers a
         // released or filtered-out key as present. Compacting drops those rows and clears the
-        // bitset, which is also what leaves the answer with no deletions of its own.
+        // bitset, which is also what leaves the answer with no deletions of its own. A dropped
+        // row reaches no consumer and answers no key, so each leg is released through it.
         match &mut self.source {
             ProducerSource::Split { collection, keys } => {
                 let mut key_tile = keys.get(keys.tiling().universal_guard());
-                key_tile.compact();
+                compact_releasing(&mut key_tile, keys);
                 let mut coll = collection.get(collection.tiling().universal_guard());
-                coll.compact();
+                compact_releasing(&mut coll, collection);
                 match key_tile {
                     // One key: the scalar form `m[k]?`, the key pivoted to one column where
                     // it is a product. An empty column is a key that has not arrived, so
@@ -413,7 +423,7 @@ impl TileProducer for CheckedLookupProducer {
             // An assembled stream of `(collection, key)` rows.
             ProducerSource::Paired(pairs) => {
                 let mut tile = pairs.get(pairs.tiling().universal_guard());
-                tile.compact();
+                compact_releasing(&mut tile, pairs);
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty scalar, and this operator does the same until its rows arrive.
                 let Tile::DataFunction {

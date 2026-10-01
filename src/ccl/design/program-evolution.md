@@ -387,10 +387,14 @@ what it has released upstream, and a source seeds a newly registered producer th
 it release what it has finished, and only that.
 
 A loop driver has finished a row its source's filter removed once it reads past it, so it releases
-that row too (`test_filtered_rows_of_a_live_transaction_source_are_released`). A source seeds a
+that row too (`test_filtered_rows_of_a_live_transaction_source_are_released`). Under an induction
+loop the store decides such a row as well, so the reads of the store emit or release it like any
+other position (`test_filtered_rows_of_a_live_induction_source_are_released`). A source seeds a
 newly registered producer from the release every reader agrees on (`ProducerReleases`), so once
 every other reader of the source has released such a row as well, a replacement version is not
-offered it, even where the replacement's filter would keep it.
+offered it, even where the replacement's filter would keep it. A read of a loop's final value
+keeps the newest position it has seen, since the final value may be there, so a replacement is
+offered that row (`a_filter_edit_offers_only_the_rows_a_reader_holds`).
 
 Nothing establishes a frontier across the graph. Each rebuilt operator resumes wherever its own
 input still has work, and two of them can resume at unrelated positions in unrelated inputs.

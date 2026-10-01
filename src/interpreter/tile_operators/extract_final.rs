@@ -214,9 +214,8 @@ impl TileProducer for ExtractFinalProducer {
             // dense read, the store prefix below the tail's carry source). Without
             // it, a never-terminating loop would pin the whole changelog until a
             // terminal that never comes.
-            if source_tile.is_data_function() {
-                let max_pos = source_tile
-                    .live_keys()
+            if let Some(live) = source_tile.live_keys() {
+                let max_pos = live
                     .filter_map(|(_, key)| match key {
                         Value::UInt(p) => Some(p),
                         _ => None,

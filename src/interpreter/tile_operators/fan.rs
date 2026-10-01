@@ -249,6 +249,11 @@ impl TileProducer for ZipProducer {
                 // intersection, then drop those rows).
                 let mut skeleton: Option<Tile> = None;
                 let mut codomains: Vec<Tile> = Vec::with_capacity(tiles.len());
+                // An input's own deleted rows are dropped below and reach no consumer, so each
+                // input is released through its own; a row only absent from another input may
+                // still arrive there, so it is not.
+                let dropped: Vec<Option<TileGuard>> =
+                    tiles.iter().map(Tile::deleted_keys_guard).collect();
                 for mut filtered in tiles.into_iter() {
                     let Tile::DataFunction { domain, .. } = &filtered else {
                         unreachable!()
@@ -284,6 +289,11 @@ impl TileProducer for ZipProducer {
                         .map(move |(i, cv)| (names[i].clone(), cv))
                         .collect(),
                 );
+                for (input, dropped) in self.inputs.iter_mut().zip(dropped) {
+                    if let Some(dropped) = dropped {
+                        input.release(dropped);
+                    }
+                }
                 let mut out = skeleton.expect("Zip has at least one input");
                 *out.values_at_mut(self.depth) = codomain_record;
                 let Tile::DataFunction {
@@ -622,9 +632,15 @@ impl TileProducer for SelectFieldProducer {
             )
         });
         // The input is released only where every reader of it has released, and less than
-        // that ([`guard_at_field`]), so it can still hold what this consumer released.
+        // that ([`guard_at_field`]), so it can still hold what this consumer released. The
+        // field's own deleted rows are dropped too and reach no consumer, so they are released.
+        let dropped = tile.deleted_keys_guard();
         tile.remove_guarded(self.obsolete_guard().clone());
         tile.compact();
+        if let Some(dropped) = dropped {
+            let at_field = self.at_field(dropped);
+            self.input.release(at_field);
+        }
         tile
     }
 
@@ -833,6 +849,87 @@ mod tests {
             "the rows reach upstream now, so the TODO is done: {:?}",
             log.borrow(),
         );
+    }
+
+    /// Whether `guard` names key `key` of a collection and not key `kept`.
+    fn names_key(guard: &TileGuard, key: usize, kept: usize) -> bool {
+        matches!(guard, TileGuard::Function(FunctionGuard::Domain(p))
+            if p.contains(&Value::UInt(key)) && !p.contains(&Value::UInt(kept)))
+    }
+
+    /// A collection with keys `0, 1, 2` whose row 1 a filter removed.
+    fn filtered_collection() -> Tile {
+        let mut deleted = BitSet::new();
+        deleted.insert(1);
+        Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12]))),
+            Predicate::False,
+            deleted,
+        )
+    }
+
+    /// The field's deleted row is dropped from what `SelectField` emits, so it is released.
+    #[test]
+    fn select_field_releases_the_rows_it_drops() {
+        let field_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let input_tiling =
+            Tiling::Record(HashMap::from([("xs".to_string(), field_tiling.clone())]));
+        let (spy, log) = ReleaseSpy::new(
+            Tile::Record(HashMap::from([("xs".to_string(), filtered_collection())])),
+            input_tiling.clone(),
+        );
+        let mut producer = SelectFieldProducer {
+            base: ProducerBase::new(SelectFieldProducer::alloc_id(), &field_tiling),
+            input: Box::new(spy),
+            name: "xs".to_string(),
+            input_tiling,
+        };
+        producer.get(producer.tiling().universal_guard());
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|g| matches!(g, TileGuard::Record(fields)
+                if fields.get("xs").is_some_and(|g| names_key(g, 1, 0)))),
+            "the field's row 1 is released: {:?}",
+            log.borrow(),
+        );
+    }
+
+    /// Each input's deleted row is dropped from what `Zip` emits, so each input is released
+    /// through its own.
+    #[test]
+    fn zip_releases_the_rows_it_drops() {
+        let input_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let output_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Record(HashMap::from([
+                ("a".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                ("b".to_string(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ])),
+        );
+        let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
+        let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
+        let mut zip = ZipProducer {
+            depth: 1,
+            base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
+            names: vec!["a".to_string(), "b".to_string()],
+            inputs: vec![Box::new(spy_a), Box::new(spy_b)],
+        };
+        zip.get(zip.tiling().universal_guard());
+        for log in [log_a, log_b] {
+            assert!(
+                log.borrow().iter().any(|g| names_key(g, 1, 0)),
+                "each input's row 1 is released: {:?}",
+                log.borrow(),
+            );
+        }
     }
 
     // ── ZipProducer: asymmetric per-branch presence ────────────────────────
