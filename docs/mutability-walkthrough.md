@@ -547,8 +547,8 @@ in for r in [10, 20, 30] do unit;
      __commits : ([0, 0] ⤇ {…, decision: {`commit{writes: (Int), to_out_1: Int} | `abort}}) =
        λ __r : [0, 0] → … `commit((writes: (__txp.0 - 5), to_out_1: __txp.0 - 5)) …
 
-     to_out_0 : ([0, 2] ⤇ Int) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_0
-     to_out_1 : ([0, 0] ⤇ Int) = __commits ≫ .decision ≫ variant_project(`commit) ≫ .to_out_1
+     to_out_0 : (Txn ⤇ Int) = (__commits ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .to_out_0
+     to_out_1 : (Txn ⤇ Int) = (__commits ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .to_out_1
    in feed(out, to_out_0); feed(out, to_out_1); pool ▷ final_read
 ```
 
@@ -566,7 +566,8 @@ Reading it off — exactly the shape §3 predicted, now with two writers:
 - **each `<<` became a tap on its own site's decision** — `to_out_0` beside `writes` in the
   loop's `` `commit `` payload, `to_out_1` in the block's. A denied transaction carries
   neither, which is placement 1 of §4 in the concrete: a reply is gated on the commit because
-  it *rides* the commit.
+  it *rides* the commit. `by_commit_time` keys each site's records by the commit time each
+  carries, so a tap's key has type `Txn`, the key a reader of the reply sees.
 - **the trailing read is `final_read`**, which is what `await_final` resolves to: a sample of
   `pool`'s carried value at the position its own writers finish. It takes no seed operand,
   tick 0 of the store being the seed.
@@ -629,15 +630,19 @@ channel's concrete domain, each `Feed` history to its bare `Fun` — possible on
 inference typed every consumer against the rigid name instead of leaving an `Infer`.
 
 **Example B**'s tail after it. The two taps become one channel, and `out`'s domain is the
-**union** of the two sites' request domains — one reply channel fed from two writers:
+**union** of the two sites' commit times — one reply channel fed from two writers. Each tap is
+keyed by its commit time (`by_commit_time` over the site's commit records), not by the iteration
+that produced it, since a denied iteration commits nothing:
 
 ```
-in letrec out : ([0, 2] | [0, 0] ⤇ Int) = to_out_0 ⊎ to_out_1
+in letrec out : (Txn | Txn ⤇ Int) = to_out_0 ⊎ to_out_1
 in pool ▷ final_read
 ```
 
-That `|` is a `Union` domain — an anonymous positional sum, not a tagged variant — because a
-reader of `out` has no use for which site produced an element.
+That `|` is a `Union` domain — an anonymous positional sum, not a tagged variant. Its arm still
+records which site replied; [A reply's `Txn` domain overstates its keys
+[Interim]](../src/ccl/design/mutability.md#a-replys-txn-domain-overstates-its-keys-interim)
+records why that is more than one store's clock needs.
 
 ### `rewrite_as_of_reads`, then `plan_loops` and the rest of planning
 
@@ -675,10 +680,10 @@ in x
 variable's history:
 
 ```
-let __hist : {pool#6: (Txn ⤇ Int), to_out_0: ([0, 2] ⤇ Int), to_out_1: ([0, 0] ⤇ Int)} =
+let __hist : {pool#6: (Txn ⤇ Int), __to_out_0: (Txn ⤇ Int), __to_out_1: (Txn ⤇ Int)} =
   transact (pool = 100) { [pool]⇒[pool] over iterate ≫ [10, 20, 30] do <decision>;
                           [pool]⇒[pool] over iterate ≫ [unit]         do <decision> }
-in let out : ([0, 2] | [0, 0] ⤇ Int) = __hist.__to_out_0 ⊎ __hist.__to_out_1
+in let out : (Txn | Txn ⤇ Int) = __hist.__to_out_0 ⊎ __hist.__to_out_1
 in __hist.pool#6 ▷ final_read
 ```
 

@@ -279,7 +279,8 @@ enum TxnBinding {
     History,
     /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩ ▷ zip`.
     Commit,
-    /// `__to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field`.
+    /// ``__to_<defer> : Txn ⤇ {`fired{V} | `idle} = (commits_j ▷ by_commit_time) ≫ .decision ≫
+    /// variant_project(`commit) ≫ .field``.
     Tap,
 }
 
@@ -416,12 +417,24 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
     }
 }
 
-/// The history-record tap field a tap binding `commits_j ≫ .decision ≫ .field`
-/// projects — its trailing field projection.
+/// The history-record tap field a tap binding ``(commits_j ▷ by_commit_time) ≫ .decision ≫
+/// variant_project(`commit) ≫ .field`` projects — its trailing field projection.
 fn tap_field(def: &Expr) -> String {
     let TypedExprNode::Compose(elts) = &def.node else {
         panic!("letrec recognition: tap binding is not a composition");
     };
+    // The history record's tap field is typed `Txn ⤇ …`, which holds only if the tap reads
+    // its site's commit records through `by_commit_time`.
+    debug_assert!(
+        matches!(
+            elts.first().map(|e| &e.node),
+            Some(TypedExprNode::Apply { function, .. })
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::ByCommitTime))
+        ),
+        "letrec recognition: a tap is keyed by commit time, so its binding must start with \
+         `commits_j ▷ by_commit_time`: {}",
+        symbolic(def)
+    );
     match elts.last().map(|e| &e.node) {
         Some(TypedExprNode::Proj(ProjKey::Field(f))) => f.clone(),
         _ => panic!("letrec recognition: tap binding does not end in a field projection"),
@@ -504,11 +517,9 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 writers.push(recover_writer(&site_dom, def));
             }
             TxnBinding::Tap => {
-                // The tap's mutable variable field keeps the binding's own site-domained
-                // collection type (𝐼 ⤇ 𝑉): the channel union channelize already
-                // assembled references the taps at that type, and the mutable variable
-                // registration resolves the branch regardless of the field's
-                // domain.
+                // The tap's store field keeps the binding's own type
+                // (``Txn ⤇ {`fired{𝑉} | `idle}``, keyed by commit time): the channel union
+                // channelize already assembled references the taps at that type.
                 taps.push((b.name.clone(), tap_field(&def), b.ty.clone()));
             }
         }
@@ -649,6 +660,15 @@ fn collapse_snapshot_sources(e: &mut Expr, hist: &Name, hist_ty: &Type) {
 /// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
+    // Op-conversion builds a commit store for a `Txn` domain and an induction store for any
+    // other, so an induction group over a `Txn` domain (e.g. a loop over an in-block reply
+    // channel) would be built as the wrong store.
+    assert!(
+        !matches!(domain_ty, Type::Txn),
+        "letrec recognition: an induction recurrence over the `Txn` domain would dispatch \
+         to the commit store: {}",
+        h.ty
+    );
     // The decision codomain is the variant `` {`commit{𝑃} | `abort} ``; the feed taps
     // ride the (dense) `commit` payload record `𝑃` alongside `writes`.
     let payload_ty = commit_payload_ty(&decision_ty);
