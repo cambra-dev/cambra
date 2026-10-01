@@ -1,27 +1,11 @@
-//! CCL type inference public API and post-inference validation.
+//! CCL type inference and post-inference validation.
 //!
-//! Sits between lowering (`ccl::lower`) and compilation (`interpreter::compile_ccl`):
+//! [`infer`] fills inferred types and clears annotations only on success.
+//! Failed trees retain annotations for diagnostics. Pass order and failure stages
+//! are specified in `src/ccl/design/type-inference.md`, "2. The Inference Pipeline".
 //!
-//! ```text
-//! CHL source
-//!   → lower (ccl/lower.rs)            — structural, no type reasoning
-//!   → infer  (ccl/infer/)             — Cambra's inference algorithm
-//!       → infer/solver/               — the constraint solver
-//!   → compile (interpreter/compile_ccl.rs)  — CCL → dataflow operators
-//! ```
-//!
-//! # Type inference
-//!
-//! The public entry point is [`infer`], which runs the two-pass
-//! emit→coalesce engine over the constraint solver in
-//! [`crate::ccl::infer::solver`]. This module also provides post-inference
-//! validation ([`check_fully_typed`], [`typecheck`]) and the
-//! [`TypeInferenceContext`] that holds source-type registrations used by
-//! both inference and compilation.
-//!
-//! The pass fills in [`crate::ccl::TypedExpr::ty`] on every node it visits. User-written
-//! annotations are carried in [`crate::ccl::TypedExpr::user_annotation`]; they are checked for
-//! compatibility with the inferred type at the end of each [`infer`] call.
+//! [`check_fully_typed`] and [`typecheck`] validate recorded types;
+//! [`TypeInferenceContext`] supplies source registrations.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
@@ -37,56 +21,16 @@ use crate::util::ScopeStack;
 // InferArena
 // ---------------------------------------------------------------------------
 
-/// Owns every inference variable minted during one inference run and breaks
-/// the `Rc` cycles their bounds form.
+/// Break inference-variable reference cycles at the end of a run.
 ///
-/// # Why this exists
+/// Captures every fresh variable on this thread and clears its bounds and trait
+/// watches on drop, including error returns. No borrow of either cell may outlive
+/// this guard. Nested arenas on the same thread are unsupported.
 ///
-/// The solver records `α <: β` by pushing `Type::Infer(β)` into
-/// `α`'s bounds and `Type::Infer(α)` into `β`'s bounds. Mutual constraints
-/// (and self-recursive ones) therefore make each [`crate::ccl::InferVar`]
-/// hold a strong `Rc` to the others through its `RefCell<InferBounds>`. Once
-/// Pass 2 (coalesce) overwrites every `expr.ty` with a concrete,
-/// variable-free type, those cells become unreachable from the final AST but
-/// keep each other alive — reference counting alone never reclaims the
-/// cycle, so the whole variable graph leaks after each `infer()` run.
-///
-/// The arena is a zero-field RAII guard over a thread-local capture buffer
-/// (see [`crate::ccl::arena_enter`]). While it is alive, every
-/// [`crate::ccl::InferVar::fresh`] registers its variable in that buffer, so
-/// the buffer holds one strong handle to *every* variable minted during the
-/// run. On drop the arena takes the buffer back and clears each variable's
-/// lower and upper bound lists, severing all bound edges so every refcount
-/// can reach zero. A single flat `Vec` suffices: variables are never looked
-/// up by id (the `Type` carries the `Rc` directly); the arena only needs to
-/// enumerate them once at teardown. Clearing bounds before the `Vec` drops
-/// handles self-cycles and N-way cycles uniformly.
-///
-/// # Why clearing is always safe
-///
-/// Coalesce never reuses a bound-carrying solver variable in its output: it
-/// builds a fresh `Type` and, for a position with no concrete contribution,
-/// mints a brand-new *unconstrained* `Type::Infer`. So every variable the
-/// arena clears is either orphaned from the result tree or has empty bounds
-/// already — clearing can never corrupt a type that survives into the AST.
-///
-/// # Drop-time borrow rule
-///
-/// `Drop` calls `borrow_mut()` on each cell's bounds, so nothing may hold a
-/// live `borrow_mut()` on any owned variable across the arena drop. This is
-/// safe in practice: the solver's bound borrows are all transient
-/// (taken and released within a single `constrain`/`coalesce` step), and the
-/// arena drops only after inference has fully exited.
-///
-/// # Rejected alternative: `Weak` back-edges
-///
-/// We could instead make one direction of each bound edge a
-/// `Weak<InferVar>`, so the cycle is never strong. Rejected: the solver
-/// constraints are *symmetric* mutual references with no natural "back
-/// edge" to demote, so we'd be upgrading `Weak`s and handling the `None`
-/// case throughout the constraint/coalesce hot path. The arena instead pays
-/// a single linear teardown and keeps every bound a plain, always-valid
-/// strong `Type`.
+/// Successful results retain no bound-bearing solver graph; failed trees can
+/// retain variables whose graph has been cleared. For ownership and teardown
+/// rationale, see `src/ccl/design/type-inference.md`,
+/// "3.2 The `InferArena`: who owns inference variables".
 pub struct InferArena {
     /// Zero-sized: the captured variables live in the thread-local buffer
     /// installed by [`crate::ccl::arena_enter`], not in the guard itself.

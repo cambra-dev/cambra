@@ -1,40 +1,15 @@
-//! Regression guard for **refinement-predicate `Rc` sharing** through type
-//! inference.
+//! Regression tests for refinement-predicate allocation sharing through inference.
 //!
-//! Predicates are immutable `Rc<TypedExpr>`s specifically so that a predicate
-//! riding many type slots (a comprehension's filtered domain appears on its
-//! source, map, cast, and consumer-contract types) is *one* allocation shared
-//! by `Rc`, not one copy per occurrence. Every inference pass that rewrites
-//! predicates (coalesce, retype) and every substitution
-//! (`subst`/`lambda_elim`) threads a pass-scoped `ccl_utils::PredMemo` (or, for
-//! substitution, keeps vacuous rewrites `Rc`-identical) to preserve that
-//! sharing. If any pass regresses to an independent rebuild per occurrence, the
-//! distinct-`Rc` count balloons multiplicatively with comprehension nesting —
-//! which later makes planning recompile one predicate once per occurrence,
-//! superlinearly.
+//! The comprehension corpus uses distinct authored filters. After inference,
+//! structurally equal predicates at different `Rc` allocations therefore expose
+//! a split during rewriting rather than independent equal source predicates.
+//! The assertion checks that shape instead of a fixed allocation-count threshold.
 //!
-//! **What is asserted, and why it is not a threshold.** A split leaves a
-//! recognizable shape: one origin term rebuilt into several `Rc`-distinct copies
-//! that are *structurally equal*. Asserting "no two distinct predicate `Rc`s are
-//! structurally equal" names that defect directly. A bound on the distinct-`Rc`
-//! count cannot: it needs a magic number, it drifts as unrelated changes shift
-//! the count, and slack in it silently tolerates the very growth it is meant to
-//! catch.
-//!
-//! We measure at **post-inference** (cheap — milliseconds), which is where the
-//! sharing is established and preserved; the downstream slowdown a regression
-//! causes is in planning, but the *cause* is visible here as duplicated terms.
-//!
-//! **Known scope limit — this corpus is comprehension-only, and the invariant it
-//! asserts is not true program-wide.** Generic instantiation
-//! (`solver::scheme::freshen_refinement_predicate`) rebuilds predicates with an
-//! unconditional `Rc::new` and no `PredMemo`, so any program whose UDF body
-//! carries a predicate leaves structurally-equal `Rc`s behind:
-//! `f = \xs -> [x for x in xs if x > 1]` measures 4 surplus of 9 distinct at one
-//! call site, 29 of 38 at two. Adding such a program here **fails today** — do it
-//! as the regression test when the split is fixed, not before. Tracked as an
-//! open decision in the `lineage-design` note under projects/program-inspector in
-//! the internal vault; rationale in `ccl/design/type-inference.md`.
+//! These tests cover comprehensions, not predicate-bearing generic instantiation,
+//! and measure neither downstream compilation cost nor global interning.
+//! For the sharing contract and its instantiation exception, see
+//! `src/ccl/design/type-inference.md`,
+//! "Sharing is an invariant, not an optimization detail".
 
 use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
 use cambra::ccl::context::{GlobalContext, compile_program};
