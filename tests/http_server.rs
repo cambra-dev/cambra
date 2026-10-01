@@ -25,6 +25,7 @@ use cambra::{
     },
 };
 use indoc::formatdoc;
+use indoc::indoc;
 use rstest_log::rstest;
 use test_log::test;
 
@@ -353,6 +354,51 @@ fn test_http_serve_in_function_body_is_error() {
         "expected Unsupported error, got: {:?}",
         result.errors,
     );
+}
+
+/// Lower `template` with a free port in place of `PORT`, and assert that `http_serve` is refused
+/// as not top level.
+fn assert_http_serve_refused_as_nested(template: &str) {
+    let code = template.replace("PORT", &reserve_test_port().to_string());
+    let mut ctx = LoweringContext::default();
+    let stmts = chl_parser::parse_module(&code)
+        .into_result()
+        .expect("parse failed")
+        .body;
+    let result = lower_stmts(&stmts, &mut ctx);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| format!("{e:?}").contains("http_serve is only supported at the top level")),
+        "expected a top-level restriction, got: {:?}",
+        result.errors,
+    );
+}
+
+/// A loop body lowers its statements apart from the top level, and refuses `http_serve` the
+/// same as any other nested block.
+#[test]
+fn test_http_serve_in_loop_body_is_error() {
+    assert_http_serve_refused_as_nested(indoc! {r#"
+        for x in [1, 2]:
+            requests, responses = http_serve("PORT", "POST", "/echo")
+        0
+    "#});
+}
+
+/// A `with` block lowers its statements apart from the top level, and refuses `http_serve`
+/// the same as any other nested block.
+#[test]
+fn test_http_serve_in_with_block_is_error() {
+    assert_http_serve_refused_as_nested(indoc! {r#"
+        pool: Mut(Int, Txn) := 0
+        for x in [1, 2]:
+            with begin():
+                requests, responses = http_serve("PORT", "POST", "/echo")
+                pool := x
+        0
+    "#});
 }
 
 /// Non-matching paths receive a 404 and do not produce a domain element.

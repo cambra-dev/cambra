@@ -18,7 +18,7 @@ Limitations (current):
 - Only plain string request/response bodies; no headers, status codes, or streaming.
 - `Content-Type` is always `text/html; charset=utf-8`.
 - No TLS/HTTPS.
-- Only top-level assignments are detected; `http_serve` in nested scopes is not supported.
+- `http_serve` is refused in every block other than the top-level one.
 
 ---
 
@@ -85,7 +85,7 @@ when the front is released.
 
 ## Multi-endpoint programs
 
-Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `LoweringContext::sink_bindings`.
+Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `LoweringContext::sink_bindings`. Two calls naming one `responses` binding are refused, as is any other top-level binding of a `responses` name: the sink record reads the innermost binding of each sink name.
 
 ---
 

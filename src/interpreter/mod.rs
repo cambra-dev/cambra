@@ -13,6 +13,10 @@ mod scheduler;
 pub mod sinks;
 mod stdio;
 mod stream_buffer;
+// Test-only surface: `test_sink()` exists for tests to observe a program through, so it is
+// built only where a test is.
+#[cfg(any(test, feature = "test-helpers"))]
+mod test_sink;
 mod test_source;
 pub mod tile_operators;
 pub mod tiling;
@@ -23,6 +27,8 @@ pub use binop::*;
 pub use http_server::HttpServerDataSource;
 pub use scheduler::*;
 pub use stdio::*;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use test_sink::*;
 pub use test_source::*;
 pub use tiling::*;
 pub use types::*;

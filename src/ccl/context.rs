@@ -393,6 +393,13 @@ pub struct SourceSinkRegistry {
     http_routes: HashMap<String, HttpRoute>,
     /// One listener per bound TCP port.
     shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+    /// Test sinks a test holds a handle on, by binding name.
+    ///
+    /// Registry state rather than per-pass state because a sink outlives a version, as a
+    /// route's reply sink does: a replacement version writes to the sink its predecessor
+    /// wrote to, so what the sink holds accumulates across a reload.
+    #[cfg(any(test, feature = "test-helpers"))]
+    test_sinks: HashMap<String, Arc<crate::interpreter::TestSink>>,
 }
 
 impl SourceSinkRegistry {
@@ -516,6 +523,8 @@ impl SourceSinkRegistry {
                 .map(|(n, r)| (n.clone(), r.route.clone())),
             self.shared_servers.iter().map(|(p, s)| (*p, s.clone())),
         );
+        #[cfg(any(test, feature = "test-helpers"))]
+        lowering.adopt_test_sinks(self.test_sinks.iter().map(|(n, s)| (n.clone(), s.clone())));
         lowering
     }
 
@@ -722,6 +731,37 @@ impl GlobalContext {
         let name = source.borrow().get_id().to_string();
         self.lowering.register_source(name.clone(), source.clone());
         self.sources_and_sinks.sources.insert(name, source);
+    }
+
+    /// Supply the sink that `name = test_sink()` binds, and keep a handle on it.
+    ///
+    /// A test reads a sink after the program runs but needs the handle before the program
+    /// is compiled, so the handle is minted here rather than during lowering. Lowering
+    /// refuses a `test_sink()` whose name was never registered.
+    ///
+    /// Every compilation against this context binds the same sink. A reload's replacement
+    /// resumes where its predecessor stopped, so the sink holds each version's writes over
+    /// the positions that version handled. Two programs compiled here without a reload
+    /// between them both write the whole of their output to it, and the keys they share
+    /// collide.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn register_test_sink(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Arc<crate::interpreter::TestSink> {
+        let name = name.into();
+        let sink = Arc::new(crate::interpreter::TestSink::default());
+        // A second handle under one name would replace the first, which would then read
+        // nothing however the program runs.
+        assert!(
+            self.sources_and_sinks
+                .test_sinks
+                .insert(name.clone(), sink.clone())
+                .is_none(),
+            "test sink `{name}` registered twice"
+        );
+        self.lowering.test_sinks.insert(name, sink.clone());
+        sink
     }
 }
 

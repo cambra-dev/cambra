@@ -262,6 +262,7 @@ fn lower_tx_block_scoped(
                 value,
                 transparency,
             } => {
+                refuse_nested_sink(target, value, stmt.span)?;
                 let name = extract_name_target(target, "assignment")?;
                 if !ctx.is_shadowed(&name) && ctx.is_transactional_mut_var(&name) {
                     return Err(LoweringError::unsupported(
