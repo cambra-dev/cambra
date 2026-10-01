@@ -156,7 +156,9 @@ reserved for future use.
 > `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
 > **[Decided]**), `import`, `use`, `as`, `pub`, `run`, `param` and `this` (modules,
-> **[Decided]**, [9. Modules [Decided]](#9-modules-decided)), and `assert` and its
+> **[Decided]**, [9. Modules [Decided]](#9-modules-decided)), `type`
+> (nominal types, **[Decided]**, [6.8 Nominal types and methods
+> [Decided]](#68-nominal-types-and-methods-decided)), and `assert` and its
 > `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names
 > for other purposes. (`with`, `:=`, `match`, `case` and `where` are
@@ -188,9 +190,13 @@ surface level.
 (  )  [  ]  {  }  ,  :  .  ;  \  `
 ```
 
-> **Direction [Decided].** `::` joins the set. It separates a qualifier from the name it
-> qualifies: a module, a run, or a Module-typed parameter from its member (`cart::total`,
-> [9.6 Qualified references](#96-qualified-references)).
+> **Direction [Decided].** Two tokens join the set. `::` separates a qualifier from the name
+> it qualifies: a module or a run from its member (`cart::total`,
+> [9.6 Qualified references](#96-qualified-references)) and a nominal
+> type from its method (`Price::discounted`,
+> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Postfix
+> `!` unwraps a proven `` `some `` ([3.9 Subscript and attribute
+> access](#39-subscript-and-attribute-access)).
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
 a mutable variable. It is *not* Python's walrus operator: it is an
@@ -403,7 +409,7 @@ noted:
 | 15 | `*` `//` | multiplicative |
 | 16 | unary `-` | prefix |
 | 17 | `**` | exponentiation; *right*-associative. It **straddles** the unary `-` at 16 rather than sitting under it — see below |
-| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold |
+| 18 | postfix: `f(args)`, `x[i]`, `x.attr`, `x.0` | left-fold. The method call `x.m(args)` ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the unwrap `e!` ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)) join this level (**[Decided]**) |
 | 19 | atom | literal, name, `(...)`, `[...]`, `{...}`, comprehension |
 
 `**` binds tighter than the unary `-` on its left and looser than the one on
@@ -592,7 +598,9 @@ perform an **effect** when evaluated. The effecting forms:
   A function's effects are always visible in its signature (a `Mut(…)`
   parameter, or a write to a `Txn` variable in its body); there are **no
   implicit-effect functions**, so an inert expression statement (§4.9)
-  stays detectable and rejected.
+  stays detectable and rejected. Effects becoming part of a function's
+  type is **[Tentative]**
+  ([6.9 Effects in function types [Tentative]](#69-effects-in-function-types-tentative)).
 
 Mutation of a *variable* is a property of statements, not expressions:
 `x := e` (§4.3, §8.1) writes a mutable variable, and loop accumulation
@@ -993,11 +1001,16 @@ target.0         -- attribute: tuple field by position
   compile-time type error. An identifier cannot begin with a digit, so
   the two forms never collide. The forms compose freely, since they are
   one operation differing only in the key: `r.p.1`, `t.0.b`.
+- **Method call [Decided].** `x.m(args)`, an attribute followed by call
+  parentheses, calls the method `m` of `x`'s type rather than a field
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+  Calling a function a field holds takes parentheses around the
+  projection: `(r.f)(args)`.
 
 Lists and maps denote *finite functions* from their index domains
-(`UInt`, `K`) to their element / value type, so a subscript is
-"evaluate the finite function at a point" — the same operation as a
-call, `c[k]` and `c(k)` alike.
+(`UInt`, `K`) to their element / value type, so a lookup evaluates the
+finite function at a point. The call `c(k)` is that evaluation and answers
+the value, as `c[k]!` does; `c[k]` answers `Option` (the direction below).
 
 **`[…]` is lookup and `.` is projection — they are not
 interchangeable.** A product is heterogeneous, so it is not a finite
@@ -1034,11 +1047,38 @@ the meaning of `xs[0]` does not depend on what `xs` turns out to be.
 > set being the key type itself; for every other collection nothing discharges the index's
 > membership, so the proven subscript is a type error whatever the index.
 
-> **Direction [Open] — `c[k]?` decides absence at a cut.** Answering `` `none ``
-> requires knowing the collection's domain has a definite value, and today's condition
-> for that is **termination**: the operator withholds `` `none `` until the domain is
-> terminal. A live source never terminates, so a lookup over one answers `` `some `` or
-> never answers.
+> **Direction [Decided] — `c[k]` answers `Option`, and `!` unwraps a proven `` `some ``.**
+> This supersedes the operator pair above. `c[k]?` is retired, and `c[k]` takes its meaning:
+> every subscript answers `Option(T)` for a list or array and `Option(V)` for a map or set.
+> Where the index is proven present, by the evidence the proven lookup above requires, the
+> subscript's type narrows to the one arm ``{`some{V}}``.
+>
+> `!` is a built-in postfix operator from ``{`some{T}}`` to `T`, for every payload type `T`.
+> `e!` means what a call of this function on `e` means:
+>
+> ```python
+> def unwrap(o: {`some{T}}) => T:
+>     `some(ret) = o
+>     ret
+> ```
+>
+> The operand type admits `` `some `` alone, so `c[k]!` type-checks exactly where the
+> lookup's type is narrowed to `` `some ``. Anywhere else it is a compile-time type error at
+> the `!`, never a runtime failure. The body is the single-tag destructuring of
+> [4.3.1 Destructuring patterns](#431-destructuring-patterns). `!` sits at the postfix level
+> ([2.3 Expression precedence](#23-expression-precedence)), and `!=` lexes as one token, so
+> `x! == y` takes the space.
+>
+> **[Interim].** The compiler implements the superseded operator pair and has no `!`. Today's
+> `c[k]?` is the optional lookup this direction spells `c[k]`, and today's `c[k]` is the proven
+> lookup this direction spells `c[k]!`.
+
+> **Direction [Open] — `c[k]?` decides absence at a cut.** The optional lookup is `c[k]?`
+> today and `c[k]` under the direction above; this note applies to it under either spelling.
+> Answering `` `none `` requires knowing the collection's domain has a definite value, and today's
+> condition for that is **termination**: the operator withholds `` `none `` until the domain is
+> terminal. A live source never terminates, so a lookup over one answers `` `some `` or never
+> answers.
 >
 > Termination is standing in for the property actually needed, which is that the domain is
 > **pinned at a cut**. `orders.filter(\o -> o.time < txn.current_time())` is a pinned view
@@ -1769,8 +1809,8 @@ element is chosen per type — it is *not* uniformly the value:
 A **single** target binds the whole element; a **tuple / `->`** target
 destructures it, so a map iterates entries unpacked as `for k -> v in m:` (the
 north-star `storefront` rollup, §7.2). The keyed element carries its membership
-proof, so a key from `for k -> v in m` (or `for k in s`) satisfies the proven
-lookup `m[k] : V` (§3.9). Reaching a map's keys or values as their own
+proof, so a key from `for k -> v in m` (or `for k in s`) narrows `m[k]` to
+`` `some ``, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
 collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
 
 > **[Interim].** Today `for`-in binds the **value** (codomain) for every
@@ -2278,8 +2318,9 @@ form `{T where p(_)}` (§6.4) is writable in annotation position.
 > draws its cut points) need elaboration; and *nominal* domain types
 > carrying their own invariants (a `Price` whose `assert amount >= 0`
 > rides the type instead of being repeated per function) are the agreed
-> direction for factoring recurring contracts, with no syntax settled
-> yet (§6.1, §6.4). Pinned by `discount_contract` (the mechanism in
+> direction for factoring recurring contracts, with no invariant syntax
+> settled yet ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+> Pinned by `discount_contract` (the mechanism in
 > isolation), `nonneg_inventory` (data refinement plus guarded
 > discharge), and `storefront` (both combined, plus the codomain lift
 > under `static assert`).
@@ -2319,13 +2360,8 @@ Named types come in two strengths. A plain `=` binding to a capitalized
 name is a structural **alias** — `Item = {price: Int, cost: Int}` —
 interchangeable with the type it names, and specified in §6.7.
 
-> **Direction [Tentative].** A `type` declaration is **nominal** —
-> `type Price = {amount: Int}` — distinct from every other type of the
-> same shape. Nominal types are the agreed home for domain invariants
-> (a `Price` carrying `assert amount >= 0` in its declaration, per the
-> contracts direction in §6), so a contract states its ontology once
-> instead of repeating asserts at every function; the declaration
-> syntax for that invariant is not yet settled.
+A `type` declaration is **nominal**, `type Price = {amount: Int}`, and is
+specified in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
 
 ### Two annotation forms: exact and bounded
 
@@ -2496,20 +2532,23 @@ CHL has six collection types, and they are distinct types rather than one type
 in different clothes: each has its own lookup, its own iteration element
 (§4.6), and its own answer to whether it is ordered. How they are represented,
 and how the checker carries the distinction, is
-[src/ccl/design/collections.md](../src/ccl/design/collections.md).
+[src/ccl/design/collections.md](../src/ccl/design/collections.md). The lookups
+below use the decided spelling. The [Interim] note in
+[3.9 Subscript and attribute access](#39-subscript-and-attribute-access) maps it
+to the one the compiler accepts today.
 
 - `Array(n, T)` — `n` values in order, `n` known at compile time. Lookup
-  `arr[i]: T` is total, because `i`'s type carries the bound `{i | i < n}`
+  `arr[i]!: T` is total, because `i`'s type carries the bound `{i | i < n}`
   (§3.9).
-- `List(T)` — values in order, count known only at runtime. `lst[i]?:
+- `List(T)` — values in order, count known only at runtime. `lst[i]:
   Option(T)`, since nothing bounds `i`.
 - `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4) as a
-  `Bool`, or `s[k]?: Option(unit)` (§3.9) as a value. The checker does not yet
+  `Bool`, or `s[k]: Option(unit)` (§3.9) as a value. The checker does not yet
   tell a `Set(K)` from a `Map(K, unit)`; both lower to one type
   ([collections.md, "Telling `Set` and `Map` apart [Open]"](../src/ccl/design/collections.md#telling-set-and-map-apart-open)).
-- `Map(K, V)` — one value per key. `m[k]: V` where `k` is proven present,
-  `m[k]?: Option(V)` otherwise (§3.9); membership `k in m`.
-- `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]: V` needs no
+- `Map(K, V)` — one value per key. `m[k]: Option(V)`, and `m[k]!: V` where `k`
+  is proven present (§3.9); membership `k in m`.
+- `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]!: V` needs no
   proof of presence. It stands to `Map` as `Array` stands to `List`: the key set
   is readable from the type rather than known only at runtime.
 - `Collection(T)` — some collection of `T`, saying nothing about which. Every
@@ -2541,7 +2580,9 @@ Decided consequences:
 - **`Set(K)` and `Map(K, unit)` are distinct types [Tentative].** The two carry
   the same information and differ only in which side of the pair is the payload,
   so the distinction is declared rather than read off the shape, and it lands
-  with nominal types (§6.1). Both widen to `Collection`.
+  with nominal types
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+  Both widen to `Collection`.
 - **Widening to `List(T)` or `Collection(T)` is written.** Those types say nothing
   about the domain, so reaching one forgets what the collection knew — an array's
   length, a map's keys — and with it any proven lookup (§3.9). A literal or a
@@ -2744,7 +2785,8 @@ The rules, and what each one is doing:
   (§2.2) and not a new statement form. What separates it from a value binding is
   the **case of the name**: `Caps` means type, without exception (§6.1). A
   `type` keyword is not involved; that spelling belongs to the nominal
-  declaration §6.1 sketches, which an alias is not.
+  declaration ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+  which an alias is not.
 - **An alias names an existing type; it does not make a new one.** The alias and
   its right-hand side are the same type, interchangeable in every position, with
   no nominal distinction, no conversion, and no invariant of the alias's own.
@@ -2789,6 +2831,90 @@ error.
 
 The north-star `storefront` exercises four aliases, two of them refined.
 
+### 6.8 Nominal types and methods [Decided]
+
+A `type` declaration binds a capitalized name to a new **nominal** type:
+
+```python
+type Price = {amount: Int}
+```
+
+`Price` is distinct from `{amount: Int}` and from every other type of that shape, which is
+the difference from an alias ([6.7 Type-alias statements](#67-type-alias-statements)).
+
+A nominal type is the home for domain invariants: a `Price` carrying `assert amount >= 0`
+in its declaration states the contract once, rather than as an assert at every function
+(the contracts direction in [6. Types (informal sketch)](#6-types-informal-sketch)). The
+syntax of that invariant is **[Open]**.
+
+**A method is a `def` whose first parameter is `self`, annotated with a nominal type.**
+
+```python
+def discounted(self: Price, pct: Int) => Price:
+    …
+```
+
+Every `def` of that signature is a method of the type its `self` names. A method binds no
+module-level name: `discounted(p, 10)` does not call it, and two types in one module may each have
+a method `discounted`. Two methods of one type with one name are an error naming both sites.
+Whether a module other than the type's own may declare methods of it is **[Open]**.
+
+A method is reached two ways:
+
+| Written | Means |
+| --- | --- |
+| `p.discounted(10)` | the method call: `discounted` of `p`'s type, with `p` as `self` |
+| `Price::discounted(p, 10)` | the same call, naming the type, with `self` passed first |
+| `Price::discounted` | the method as a function value, of type `(Price, Int) => Price` |
+
+`Price::discounted` names the method without an instance. It is how a call states which type's
+method it means, and the method as an unapplied value has no other spelling.
+
+**Methods and fields are separate namespaces, and the parentheses decide which is meant.**
+`r.f(args)` is a method call, and `r.f` is a field and never a method. A value of `type Counter =
+{f: Int => Int}` holds both when `Counter` also has a method `f`: `r.f` is the function the field
+holds, and `Counter::f` is the method. Calling the function a field holds is written `(r.f)(args)`
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)).
+
+**A type in scope brings its methods into scope.** `x.m()` resolves `m` among the methods
+of nominal types in scope unqualified. A type in scope only qualified, `mod::Price` through
+`import mod` ([9.2 Imports](#92-imports)), qualifies its method
+calls too: `x.mod::Price::discounted(10)`, or `mod::Price::discounted(x, 10)`. With `import
+mod use Price`, `x.discounted(10)` and `Price::discounted(x, 10)` both resolve.
+
+**After `.`, a capitalized segment marks a method.** A `::` path after `.` whose segments are all
+lowercase is a qualified field label, `r.mod2::f1`
+([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+A path with a capitalized segment names a method: that segment is the type, the segment after it is
+the method, and call parentheses follow, `x.mod::Price::discounted(10)`. Module path segments are
+lowercase and type names capitalized ([9.15 Module files](#915-module-files)), so the case of the
+segments decides. A qualified field label followed by call parentheses is an error, since a method
+belongs to a type and not to a module. Calling the function such a field holds is written
+`(r.mod2::f1)(args)`.
+
+**A method call needs its receiver's type.** `x.m()` resolves `m` from the type of `x`. When
+nothing before the call in program text determines that type to be a nominal type, the call is a
+type error that asks for an annotation on `x`.
+
+### 6.9 Effects in function types [Tentative]
+
+A function's type includes its **effects**. An effect is one of:
+
+- IO, through a source or a sink ([7. Built-in functions and
+  sources](#7-built-in-functions-and-sources));
+- mutation of state provided from outside the function, through a `Mut(…)` parameter or a
+  captured mutable variable ([8. Mutability, transactions, and
+  feeds](#8-mutability-transactions-and-feeds)).
+
+Today's effecting calls ([3. Expression semantics](#3-expression-semantics)) carry the
+mutation effect, read off a `Mut(…)` parameter or a `Txn` write in the body. Under this
+direction the function's type states it. Everything else about effects is **[Open]**: how an
+effect is written in a function type, how effects compose and are inferred, and whether a feed
+write is an effect of its own.
+
+**[Open] — crash handling.** What a program does when an effect fails at run time, and in
+particular whether the dataflow downstream of the failure pauses, is undecided.
+
 ---
 
 ## 7. Built-in functions and sources
@@ -2823,13 +2949,12 @@ The north-star programs additionally assume non-aggregate built-ins —
 > two ways: `txn_kv` and `ledger_balance` write `c.restrict(\e -> …)`,
 > the north-star `storefront` writes `orders.filter(\o -> …)`, and
 > nothing decides between them — one of the two names has to go. Both
-> are written in **method** position, which §3.9 does not admit: `.`
-> there is projection of a field out of a product, not lookup of a
-> library function on a collection, and `catalog.keys()` and
-> `txn.current_time()` are the same shape. Whether a collection's
-> combinators are reached through `.` at all — and if so what resolves
-> the name, given that a collection *is* a function (§6.3) and has no
-> fields — is open with them.
+> are written in **method** position, as are `catalog.keys()` and
+> `txn.current_time()`. A method call resolves among the methods of a
+> nominal type ([6.8 Nominal types and methods
+> [Decided]](#68-nominal-types-and-methods-decided)), and no collection
+> type is nominal today. Whether the collection types become nominal
+> types with these combinators as methods is open with them.
 
 ### 7.2 `groupby`
 
@@ -3630,6 +3755,8 @@ param payments: Module{charge: {amount: Int} => Receipt}
 pub def quote(item, qty): …
 pub limit: Int = 10
 pub Qty = {Int where _ >= 0}
+pub type Price = {amount: Int}
+pub def discounted(self: Price, pct: Int) => Price: …
 pub stock: Mut(Map(String, Int), Txn) := []
 pub run inventory as inv
 ```
@@ -3646,6 +3773,10 @@ pub run inventory as inv
   `pub` would change the module's interface.
 - Private names keep the ordinary top-level shadowing of
   [5. Scoping and binding](#5-scoping-and-binding).
+- `pub` on a `type` declaration exports the nominal type. `pub` on a method's `def` exports the
+  method, and a method without `pub` is reached only from its own module, in either spelling
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). A method binds
+  no module-level name, so the bound-once rule above does not apply to it.
 - Types need not be annotated on public members. An unannotated member's contract is its inferred
   type ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 
@@ -3659,7 +3790,7 @@ Module type. `::` separates the name from the member, and `.` stays record proje
 | Written | Position | Means |
 | --- | --- | --- |
 | `cart::total` | value | the public member `total` of `shop::cart`'s shared run |
-| `cart::Item` | type | the public type alias `Item` of `shop::cart` |
+| `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias or a nominal type |
 | `c::count` | value, write target | the public member `count` of the run `c` |
 | `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
 | `p::count` | value, write target | the member `count` of the run passed as `p` |
@@ -3728,6 +3859,7 @@ param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt
 | `Txn` mutable variable | `name: Mut(V, Txn)` |
 | `pub run` | `name: Module{…}`, the run's own Module type |
 | type alias | `Name = T` for an exact type, or `Name <: T` for one known through a bound |
+| nominal type | `Name = T`, where `T` is the nominal type |
 | private member | none |
 
 A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
@@ -3862,8 +3994,11 @@ as `{app: String}`. Within one file this changes nothing.
 - **[Open]** — which module owns the labels of data from outside the program, such as the fields
   of an HTTP request body.
 
-A type alias is the only type member a module has. Exporting one exports a spelling for a structural
-type, and the user's type is the same type.
+A module's type members are its type aliases and its nominal types
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Exporting an
+alias exports a spelling for a structural type, and the user's type is the same type. Exporting a
+nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
+distinct from every other type of its shape.
 
 ### 9.13 Private-in-public
 
