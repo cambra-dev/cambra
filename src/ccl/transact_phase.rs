@@ -82,7 +82,7 @@ use crate::ccl::{
     ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
     mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
     provenance,
-    provenance::NodeId,
+    provenance::{Located, NodeId},
     subst::Subst,
 };
 
@@ -647,7 +647,7 @@ type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
 /// [`collect_txn_mut_vars`]). Keying on the exact binder identity (not the surface
 /// base name) makes the fold immune to an unrelated local variable merely
 /// *spelled* like a mutable variable.
-pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
+pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<String>> {
     // Strip whenever a `with begin():` block is present. A block need not write a
     // transactional mutable variable — a read-only block (`out << balance`) has no write
     // yet must still be unwrapped off the loop spine — so we cannot short-circuit
@@ -1496,16 +1496,17 @@ fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
 pub fn check_no_nested_transactions(
     expr: &Expr,
     _txn_stores: &HashSet<Name>,
-) -> Result<(), String> {
+) -> Result<(), Located<String>> {
     if let TypedExprNode::Begin { body } = &expr.node
         && contains_begin(body)
     {
-        return Err(
+        return Err(Located::new(
             "nested `with begin():` transactions are not supported: a transactional writer \
              called inside a `with begin():` block would run its own transaction within the \
              outer one"
                 .to_string(),
-        );
+            expr.node_id(),
+        ));
     }
     let mut result = Ok(());
     expr.walk_children(|c| {
@@ -1529,7 +1530,7 @@ pub fn check_no_nested_transactions(
 pub fn check_no_induction_only_transactions(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
-) -> Result<(), String> {
+) -> Result<(), Located<String>> {
     if let TypedExprNode::Begin { body } = &expr.node
         && !block_writes_txn(body, txn_mut_vars)
         && let Some(name) = first_non_txn_write(body, txn_mut_vars)
@@ -1538,11 +1539,14 @@ pub fn check_no_induction_only_transactions(
         // accumulator, or a plain non-`Mut` binding (itself a type error caught
         // by the later `MutWrite`-target check). Either way the block commits no
         // mutable variable, so keep the message neutral on which it is.
-        return Err(format!(
-            "`{name}` is written inside a `with begin():` block that commits no transactional \
+        return Err(Located::new(
+            format!(
+                "`{name}` is written inside a `with begin():` block that commits no transactional \
              mutable variable, so the block provides no atomicity. If `{name}` is an induction \
              accumulator, move its write outside the block; if it should be a transactional \
              mutable variable, declare it `Mut(…, Txn)` and write it alongside a mutable variable in the block"
+            ),
+            expr.node_id(),
         ));
     }
     let mut result = Ok(());
@@ -1568,15 +1572,18 @@ pub fn check_no_induction_only_transactions(
 pub fn check_no_guarded_induction_write_in_block(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
-) -> Result<(), String> {
+) -> Result<(), Located<String>> {
     if let TypedExprNode::Begin { body } = &expr.node
         && let Some(name) = guarded_non_txn_write(body, txn_mut_vars, false)
     {
-        return Err(format!(
-            "`{name}` is written under an `if` or a `match` arm inside a `with begin():` \
+        return Err(Located::new(
+            format!(
+                "`{name}` is written under an `if` or a `match` arm inside a `with begin():` \
              block. A branch-guarded induction write in a transaction block is not supported \
              — move the write outside the block, or (if it should be shared across the \
              transaction) declare it `Mut(…, Txn)` and write it directly, not under a branch"
+            ),
+            expr.node_id(),
         ));
     }
     let mut result = Ok(());
@@ -1609,16 +1616,19 @@ pub fn check_no_guarded_induction_write_in_block(
 pub fn check_no_induction_write_reading_past_a_write(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
-) -> Result<(), String> {
+) -> Result<(), Located<String>> {
     if let TypedExprNode::Begin { body } = &expr.node
         && let Some(var) = induction_write_reading_past_a_write(body, txn_mut_vars)
     {
-        return Err(format!(
-            "an induction write inside a `with begin():` block reads a value bound before \
-             `{var}` was written in the same block, and that value reads `{var}`. The \
-             induction write is lifted out of the block, so the read would report `{var}`'s \
-             value after the write rather than before it. Move the write to `{var}` outside \
-             the block, or bind the value after it"
+        return Err(Located::new(
+            format!(
+                "an induction write inside a `with begin():` block reads a value bound before \
+                 `{var}` was written in the same block, and that value reads `{var}`. The \
+                 induction write is lifted out of the block, so the read would report \
+                 `{var}`'s value after the write rather than before it. Move the write to \
+                 `{var}` outside the block, or bind the value after it"
+            ),
+            expr.node_id(),
         ));
     }
     let mut result = Ok(());
@@ -1757,19 +1767,23 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 /// once inlined ([`check_no_nested_transactions`]). It also needs source order, which the
 /// continuation spine here supplies ([`Expr::walk_children`] visits `bound_expr` before `body`
 /// for every spine node) and lowering's right-to-left statement chain is not.
-pub fn check_await_final_linearity(expr: &Expr) -> Result<(), String> {
-    fn used_up(var: &Name) -> String {
-        format!(
-            "`{var}` is unreferenceable after `await_final({var})`: the await consumes the \
-             mutable variable, declaring its commit history complete",
-            var = var.base()
+pub fn check_await_final_linearity(expr: &Expr) -> Result<(), Located<String>> {
+    /// A mention of `var` at `at`, after its await.
+    fn used_up(var: &Name, at: &Expr) -> Located<String> {
+        Located::new(
+            format!(
+                "`{var}` is unreferenceable after `await_final({var})`: the await consumes \
+                 the mutable variable, declaring its commit history complete",
+                var = var.base()
+            ),
+            at.node_id(),
         )
     }
-    fn go(e: &Expr, awaited: &mut HashSet<Name>) -> Result<(), String> {
+    fn go(e: &Expr, awaited: &mut HashSet<Name>) -> Result<(), Located<String>> {
         match &e.node {
-            TypedExprNode::Var(var) if awaited.contains(var) => return Err(used_up(var)),
+            TypedExprNode::Var(var) if awaited.contains(var) => return Err(used_up(var, e)),
             TypedExprNode::MutWrite { name, .. } if awaited.contains(name) => {
-                return Err(used_up(name));
+                return Err(used_up(name, e));
             }
             // The await itself. Its operand is a handle, not a read, so the `Var` is
             // not descended into — otherwise the await would report itself.
@@ -1777,13 +1791,14 @@ pub fn check_await_final_linearity(expr: &Expr) -> Result<(), String> {
                 if matches!(&function.node, TypedExprNode::Builtin(Builtin::AwaitFinal)) =>
             {
                 let TypedExprNode::Var(var) = &argument.node else {
-                    return Err(
+                    return Err(Located::new(
                         "await_final's operand must be a bare mutable variable reference"
                             .to_string(),
-                    );
+                        argument.node_id(),
+                    ));
                 };
                 if !awaited.insert(var.clone()) {
-                    return Err(used_up(var));
+                    return Err(used_up(var, e));
                 }
                 return Ok(());
             }
@@ -1848,7 +1863,7 @@ fn check_store_acyclicity(
     sites: &[RawSite],
     key_init: &HashMap<Name, MutVarDecl>,
     groups: &[Vec<Name>],
-) -> Result<(), String> {
+) -> Result<(), Located<String>> {
     /// Every awaited key `e` depends on, directly or through a marked binder.
     ///
     /// The marked names are found by looking up `e`'s free names, not by testing each
@@ -1926,15 +1941,18 @@ fn check_store_acyclicity(
     // hash order, so a program with two clashing seeds names the same one every run.
     for k in groups.iter().flatten() {
         if let Some(j) = clash(&awaited_in(&key_init[k].init, &marked), store_of(k)) {
-            return Err(format!(
-                "the seed of transactional mutable variable `{}` depends on `await_final({})`, and the \
+            return Err(Located::new(
+                format!(
+                    "the seed of transactional mutable variable `{}` depends on `await_final({})`, and the \
                  two share a commit store — `{}`'s value at commit tick 0 would await that \
                  store's own completion. (An induction accumulator may be seeded from an await: \
                  it is a different recurrence. Two transactional mutable variables land in one store \
                  only when some `with begin():` block mentions them together.)",
-                k.base(),
-                j.base(),
-                k.base()
+                    k.base(),
+                    j.base(),
+                    k.base()
+                ),
+                key_init[k].decl,
             ));
         }
     }
@@ -1946,13 +1964,16 @@ fn check_store_acyclicity(
             .and_then(store_of);
         for (what, e) in [("iteration source", &s.source), ("body", &s.block)] {
             if let Some(k) = clash(&awaited_in(e, &marked), store) {
-                return Err(format!(
-                    "a `with begin():` block's {what} depends on `await_final({0})`, and the \
+                return Err(Located::new(
+                    format!(
+                        "a `with begin():` block's {what} depends on `await_final({0})`, and the \
                      block commits into `{0}`'s own store — one store is one recurrence, so a \
                      value read out of it cannot feed a writer back into it. (Two transactional \
                      mutable variables land in one store only when some `with begin():` block \
                      mentions them together, reads included.)",
-                    k.base()
+                        k.base()
+                    ),
+                    s.parent,
                 ));
             }
         }

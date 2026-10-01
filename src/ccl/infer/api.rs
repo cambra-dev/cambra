@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::provenance::{Located, NodeId};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -714,45 +715,19 @@ impl InferError {
     }
 }
 
-/// An [`InferError`] paired with the [`NodeId`](crate::ccl::provenance::NodeId)
-/// of the expression it was raised at.
+/// An [`InferError`] paired with the node it was raised at.
 ///
-/// The location is *provenance metadata*, not part of the error's identity, so
-/// it rides beside `InferError` rather than inside it: `InferError` stays
-/// location-free and `PartialEq`, which is what lets the inference tests compare
-/// errors by value.
+/// This is what [`infer`] returns on failure, so the blame node travels with the
+/// error it belongs to. The node is not optional: inference builds these through
+/// the inference contexts' `raise` (the `Typing` trait's one error affordance) or
+/// the equivalent stamp in the coalesce walk, both of which supply the node whose
+/// rule is running, and the post-inference checks stamp the node they are
+/// visiting. An inference error that has lost track of its node is
+/// unrepresentable.
 ///
-/// This is what [`infer`] returns on failure, so the blame node travels *with*
-/// the error it belongs to. `compile_program` resolves each id to a source
-/// [`Span`](crate::chl_parser::ast::Span) against the `lowering_projection`
-/// while that projection is in scope (that resolution may fail, which is why
-/// `CompileError::Infer`'s span is optional — the *node* never is).
-///
-/// The node is **not** optional, and the only way to build one of these is
-/// through the inference contexts' `raise` (the `Typing` trait's one error
-/// affordance) or the equivalent stamp in the coalesce walk, both of which
-/// supply the node whose rule is running.
-/// So there is no unlocated state to represent and no partially-constructed
-/// intermediate: an inference error that has lost track of its node is
-/// unrepresentable rather than merely discouraged.
-///
-/// Deliberately concrete rather than a generic `Located<E>`: inference is the
-/// only pass whose errors carry a node today. The other unlocated pipeline
-/// errors — `LambdaElimError`, `ConversionError`, `DeferError`, whose spans
-/// `CompileError`'s docs call future work — are the prospective second, third,
-/// and fourth users; generalize when the first of them lands, not before. (Note
-/// the front-end convention differs on purpose: `LexError`/`ParseErrorInfo`/
-/// `LoweringError` hold a `Span` *inline* per variant, because a span exists
-/// where they are raised. An inference error is raised holding types, not spans,
-/// so it carries a node id and resolves to a span at the `compile_program`
-/// boundary.)
-#[derive(Debug, Clone, PartialEq)]
-pub struct LocatedInferError {
-    /// The underlying inference error.
-    pub error: InferError,
-    /// The node whose typing rule raised the error.
-    pub node_id: crate::ccl::provenance::NodeId,
-}
+/// The front end holds a `Span` inline instead (`LexError`, `ParseErrorInfo`,
+/// `LoweringError`), because a span exists where those are raised.
+pub type LocatedInferError = Located<InferError>;
 
 impl LocatedInferError {
     /// Name what a [`InferError::TypeParamEscapes`] reaches, for the typing rule that
@@ -778,7 +753,7 @@ pub enum EscapeTarget {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl LocatedInferError {
+impl Located<InferError> {
     /// The bare errors of a located list, dropping the blame nodes.
     ///
     /// **Test-only.** Tests assert on error *payloads* and have no projection to
@@ -1459,14 +1434,14 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
 /// Runs as the first phase of [`typecheck`]; callers that want the combined
 /// hole-freeness + semantic check should call [`typecheck`] directly.
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_annotated(expr, Strictness::Strict)
+    check_annotated(expr, Strictness::Strict).map_err(unlocated)
 }
 
 /// [`check_fully_typed`] at the given [`Strictness`].
 ///
 /// Both walls run *after* inference, so this is also where the
 /// annotations-are-cleared invariant is pinned.
-fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<InferError>> {
+fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<LocatedInferError>> {
     debug_assert_annotations_cleared(expr);
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
@@ -1490,14 +1465,14 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<InferE
 fn collect_expr_errors(
     expr: &Expr,
     strictness: Strictness,
-    errors: &mut Vec<InferError>,
+    errors: &mut Vec<LocatedInferError>,
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     collect_type_errors(
         &expr.ty,
         &symbolic(expr),
         strictness,
-        errors,
+        &mut NodeErrors::new(errors, expr.node_id()),
         seen_refinements,
     );
     // Binder-bearing variants emit per-binding type errors before descending
@@ -1508,7 +1483,7 @@ fn collect_expr_errors(
                 &param.ty,
                 param.name.base(),
                 strictness,
-                errors,
+                &mut NodeErrors::new(errors, expr.node_id()),
                 seen_refinements,
             );
             collect_expr_errors(body, strictness, errors, seen_refinements);
@@ -1518,7 +1493,7 @@ fn collect_expr_errors(
                 &binding.ty,
                 binding.name.base(),
                 strictness,
-                errors,
+                &mut NodeErrors::new(errors, expr.node_id()),
                 seen_refinements,
             );
             expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
@@ -1541,7 +1516,7 @@ fn collect_expr_errors(
                         &p.binding.ty,
                         p.binding.name.base(),
                         strictness,
-                        errors,
+                        &mut NodeErrors::new(errors, expr.node_id()),
                         seen_refinements,
                     );
                 }
@@ -1553,7 +1528,13 @@ fn collect_expr_errors(
         // `walk_children` never reaches — check them like a lambda param.
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {
-                collect_type_errors(&b.ty, b.name.base(), strictness, errors, seen_refinements);
+                collect_type_errors(
+                    &b.ty,
+                    b.name.base(),
+                    strictness,
+                    &mut NodeErrors::new(errors, expr.node_id()),
+                    seen_refinements,
+                );
             }
             expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
         }
@@ -1564,13 +1545,30 @@ fn collect_expr_errors(
                 &target.ty,
                 target.name.base(),
                 strictness,
-                errors,
+                &mut NodeErrors::new(errors, expr.node_id()),
                 seen_refinements,
             );
             expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
         }
         TypedExprNode::Error => crate::unexpected_error_node!(),
         _ => expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements)),
+    }
+}
+
+/// The error list [`collect_type_errors`] pushes into, with the node whose type
+/// it is walking: every error it finds is raised at that node.
+struct NodeErrors<'a> {
+    errors: &'a mut Vec<LocatedInferError>,
+    node: NodeId,
+}
+
+impl<'a> NodeErrors<'a> {
+    fn new(errors: &'a mut Vec<LocatedInferError>, node: NodeId) -> Self {
+        NodeErrors { errors, node }
+    }
+
+    fn push(&mut self, error: InferError) {
+        self.errors.push(Located::new(error, self.node));
     }
 }
 
@@ -1585,7 +1583,7 @@ fn collect_type_errors(
     ty: &Type,
     context_sym: &str,
     strictness: Strictness,
-    errors: &mut Vec<InferError>,
+    errors: &mut NodeErrors<'_>,
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     match ty {
@@ -1728,7 +1726,7 @@ fn collect_type_errors(
                     collect_expr_errors(
                         &refinement.predicate,
                         strictness,
-                        errors,
+                        errors.errors,
                         seen_refinements,
                     );
                 }
@@ -1772,6 +1770,14 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreChannelize`]).
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
+    check_pre_channelize_located(expr).map_err(unlocated)
+}
+
+/// [`check_pre_channelize`], keeping the node each error was raised at.
+///
+/// The pipeline's post-inference check reports a residual `Type::Infer` as an
+/// ambiguous program, a user error, so it needs the node to point at.
+pub(crate) fn check_pre_channelize_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     // The relaxation applies only when the tree carries transient histories
     // (feed/mutable machinery). A program with none should be fully resolved
     // after inference, so a residual `Infer` there is an ambiguous program
@@ -1783,7 +1789,13 @@ pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
         Strictness::Strict
     };
     check_annotated(expr, strictness)?;
-    crate::ccl::infer::check(expr)
+    crate::ccl::infer::check::check_located(expr)
+}
+
+/// The errors of a located list, for a caller whose errors are compiler bugs:
+/// it panics with them, and a panic has no source to point into.
+fn unlocated(located: Vec<LocatedInferError>) -> Vec<InferError> {
+    located.into_iter().map(|l| l.error).collect()
 }
 
 /// Whether the tree carries pre-channelize artifacts: a `Defer`/`Feed`/
@@ -1863,7 +1875,7 @@ fn has_pre_channelize_artifacts(expr: &Expr) -> bool {
 /// through the copy is caught by [`check_mut_write_targets`] — which blames the
 /// write rather than the binding. Asserted in debug by
 /// [`debug_assert_no_mut_var_let`].
-pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     debug_assert_no_mut_var_let(expr);
     let mut anf: HashMap<Name, &Expr> = HashMap::new();
     collect_anf_temps(expr, &mut anf);
@@ -2014,7 +2026,14 @@ fn read_through_anf<'e>(mut arg: &'e Expr, anf: &HashMap<Name, &'e Expr>) -> &'e
     arg
 }
 
-fn check_mut_discipline_go(expr: &Expr, anf: &HashMap<Name, &Expr>, errors: &mut Vec<InferError>) {
+fn check_mut_discipline_go(
+    expr: &Expr,
+    anf: &HashMap<Name, &Expr>,
+    errors: &mut Vec<LocatedInferError>,
+) {
+    // This node's own violations, stamped with its id below.
+    let mut here: Vec<InferError> = Vec::new();
+
     // The `symbolic(expr)` render for error labels is computed *lazily* — only
     // in the branches that actually raise an error — because this walk visits
     // every node and the no-error path is overwhelmingly common; rendering the
@@ -2040,13 +2059,13 @@ fn check_mut_discipline_go(expr: &Expr, anf: &HashMap<Name, &Expr>, errors: &mut
         && !forwards_tail
         && !matches!(expr.node, TypedExprNode::Var(_))
     {
-        errors.push(InferError::MutNotBareVariable { at: symbolic(expr) });
+        here.push(InferError::MutNotBareVariable { at: symbolic(expr) });
     }
 
     // Rule 2 on this node's own type. A forwarder's type is its tail's, so the
     // tail's own check already covers it — skip to avoid ancestor-chain dupes.
     if !forwards_tail {
-        check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), errors);
+        check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), &mut here);
     }
 
     // Rule 1(b): an argument passed to a `Mut` parameter must name a real mutable variable
@@ -2067,13 +2086,19 @@ fn check_mut_discipline_go(expr: &Expr, anf: &HashMap<Name, &Expr>, errors: &mut
         {
             let argument = read_through_anf(argument, anf);
             if !matches!(argument.node, TypedExprNode::Var(_)) {
-                errors.push(InferError::MutNotBareVariable {
-                    at: symbolic(argument),
-                });
+                errors.push(Located::new(
+                    InferError::MutNotBareVariable {
+                        at: symbolic(argument),
+                    },
+                    argument.node_id(),
+                ));
             } else if argument.ty.mut_value_type().is_none() {
-                errors.push(InferError::MutArgNotMutable {
-                    at: symbolic(argument),
-                });
+                errors.push(Located::new(
+                    InferError::MutArgNotMutable {
+                        at: symbolic(argument),
+                    },
+                    argument.node_id(),
+                ));
             }
         }
     }
@@ -2081,25 +2106,26 @@ fn check_mut_discipline_go(expr: &Expr, anf: &HashMap<Name, &Expr>, errors: &mut
     // Rule 2 on the binder slots `walk_children` does not reach.
     match &expr.node {
         TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } => {
-            check_binder(binding, errors)
+            check_binder(binding, &mut here)
         }
-        TypedExprNode::Lambda { param, .. } => check_binder(param, errors),
-        TypedExprNode::For { target, .. } => check_binder(target, errors),
+        TypedExprNode::Lambda { param, .. } => check_binder(param, &mut here),
+        TypedExprNode::For { target, .. } => check_binder(target, &mut here),
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {
-                check_binder(b, errors);
+                check_binder(b, &mut here);
             }
         }
         TypedExprNode::Case { branches, .. } => {
             for b in branches {
                 if let Some(p) = &b.pattern {
-                    check_binder(&p.binding, errors);
+                    check_binder(&p.binding, &mut here);
                 }
             }
         }
         _ => {}
     }
 
+    errors.extend(here.into_iter().map(|e| Located::new(e, expr.node_id())));
     expr.walk_children(|e| check_mut_discipline_go(e, anf, errors));
 }
 
@@ -2121,7 +2147,7 @@ fn check_mut_discipline_go(expr: &Expr, anf: &HashMap<Name, &Expr>, errors: &mut
 /// `def f(…)` followed by a write to `f` and no other mention leaves a write naming a
 /// binder that no longer exists. Treating that as nothing to object to accepted the
 /// write silently.
-pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
+pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     let mut muts: HashMap<Name, bool> = HashMap::new();
     collect_mut_binders(expr, &mut muts);
     let mut errors = Vec::new();
@@ -2186,14 +2212,17 @@ fn collect_mut_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
 fn check_mut_write_targets_go(
     expr: &Expr,
     muts: &HashMap<Name, bool>,
-    errors: &mut Vec<InferError>,
+    errors: &mut Vec<LocatedInferError>,
 ) {
     if let TypedExprNode::MutWrite { name, .. } = &expr.node
         && muts.get(name) != Some(&true)
     {
-        errors.push(InferError::MutWriteToNonMutable {
-            name: name.base().to_string(),
-        });
+        errors.push(Located::new(
+            InferError::MutWriteToNonMutable {
+                name: name.base().to_string(),
+            },
+            expr.node_id(),
+        ));
     }
     expr.walk_children(|c| check_mut_write_targets_go(c, muts, errors));
 }
@@ -2914,7 +2943,9 @@ mod tests {
     /// mutability (see src/ccl/design/mutability.md, "Mutability is the type (no lowering registry)").
     #[test]
     fn mut_write_to_non_mutable_rejected() {
-        // let x : Int = 0 in (x := 5)  =>  MutWriteToNonMutable
+        // let x : Int = 0 in (x := 5)  =>  MutWriteToNonMutable, at the write
+        let write = Expr::mut_write("x", Expr::lit(Lit::Int(5)));
+        let write_id = write.node_id();
         let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
@@ -2923,13 +2954,16 @@ mod tests {
                 transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),
-            body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
+            body: Box::new(write),
         });
         assert_eq!(
             check_mut_write_targets(&expr),
-            Err(vec![InferError::MutWriteToNonMutable {
-                name: "x".to_string(),
-            }])
+            Err(vec![Located::new(
+                InferError::MutWriteToNonMutable {
+                    name: "x".to_string(),
+                },
+                write_id,
+            )])
         );
     }
 

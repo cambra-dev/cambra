@@ -1184,18 +1184,21 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
 /// This holds for a determined sum as well: planning erases one only after this phase has
 /// typed the history. Runs on the inlined tree ahead of the transactional slice and
 /// [`run`], which both build a history over a loop's source.
-pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), String> {
+pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), provenance::Located<String>> {
     if let TypedExprNode::For { iter, .. } = &expr.node
         && matches!(
             fun_parts(&iter.ty).0.peel_refinements(),
             Type::WitnessRef(_)
         )
     {
-        return Err(format!(
-            "a `for` loop over a collection whose type is a sum is not supported yet: `{}` has \
-             type {}. A comprehension over it compiles",
-            symbolic(iter),
-            iter.ty
+        return Err(provenance::Located::new(
+            format!(
+                "a `for` loop over a collection whose type is a sum is not supported yet: `{}` \
+                 has type {}. A comprehension over it compiles",
+                symbolic(iter),
+                iter.ty
+            ),
+            iter.node_id(),
         ));
     }
     let mut result = Ok(());

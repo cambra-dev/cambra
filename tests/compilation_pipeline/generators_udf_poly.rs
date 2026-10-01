@@ -277,9 +277,8 @@ fn a_call_of_a_definition_wrong_alone_reports_the_definition() {
     check_compile_error(code, "[<test>:1:1]");
 }
 
-/// The source text each inference error of `code` underlines, `None` for one with no
-/// location.
-fn inference_error_sites(code: &str) -> Vec<Option<String>> {
+/// The source text each inference error of `code` underlines.
+fn inference_error_sites(code: &str) -> Vec<String> {
     use cambra::ccl::context::CompileError;
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -288,7 +287,7 @@ fn inference_error_sites(code: &str) -> Vec<Option<String>> {
     };
     errs.iter()
         .map(|e| match e {
-            CompileError::Infer { span, .. } => span.map(|s| code[s.start..s.end].to_string()),
+            CompileError::Infer { span, .. } => code[span.start..span.end].to_string(),
             other => panic!("expected an inference error, got {other:?}"),
         })
         .collect()
@@ -310,7 +309,7 @@ fn an_error_a_use_causes_through_another_definition_is_reported_at_the_outer_use
             g(True, b)
         f(2)
     "#};
-    assert_eq!(inference_error_sites(code), [Some("f".to_string())]);
+    assert_eq!(inference_error_sites(code), ["f"]);
 }
 
 // When the enclosing definition alone already makes the call fail, the error is that
@@ -326,7 +325,7 @@ fn an_error_the_enclosing_definition_causes_is_reported_in_its_body() {
             g(True, 2)
         f(1)
     "#};
-    assert_eq!(inference_error_sites(code), [Some("g".to_string())]);
+    assert_eq!(inference_error_sites(code), ["g"]);
 }
 
 // List-producing body chained through a poly wrapper, single concrete use

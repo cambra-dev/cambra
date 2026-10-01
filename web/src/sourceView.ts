@@ -211,7 +211,6 @@ export class SourceView {
         to: to > from ? to : from + 1,
         severity: d.severity === "error" ? "error" : "warning",
         message: d.message,
-        source: d.stage,
       });
     }
 

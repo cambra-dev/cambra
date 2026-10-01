@@ -13,7 +13,7 @@ use std::{
 use cambra::{
     ccl::context::{CompileError, GlobalContext, Phase},
     chl_parser::SourceMap,
-    live_program::{DiffReport, LiveProgram, MainConsumerFactory, ReloadReport},
+    live_program::{DiffReport, LiveProgram, MainConsumerFactory, ReloadError, ReloadReport},
 };
 
 use crate::serving::{raw_http, reserve_test_port};
@@ -795,14 +795,14 @@ pub(crate) trait OneFile: Sized {
         ctx: &mut GlobalContext,
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
-    ) -> Result<ReloadReport, Vec<CompileError>>;
+    ) -> Result<ReloadReport, ReloadError>;
 
     fn diff_text(
         &self,
         ctx: &GlobalContext,
         text: &str,
         phase: Phase,
-    ) -> Result<DiffReport, Vec<CompileError>>;
+    ) -> Result<DiffReport, ReloadError>;
 }
 
 impl OneFile for LiveProgram {
@@ -819,7 +819,7 @@ impl OneFile for LiveProgram {
         ctx: &mut GlobalContext,
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
-    ) -> Result<ReloadReport, Vec<CompileError>> {
+    ) -> Result<ReloadReport, ReloadError> {
         self.reload(ctx, &SourceMap::single("<test>", text), main_consumer)
     }
 
@@ -828,7 +828,7 @@ impl OneFile for LiveProgram {
         ctx: &GlobalContext,
         text: &str,
         phase: Phase,
-    ) -> Result<DiffReport, Vec<CompileError>> {
+    ) -> Result<DiffReport, ReloadError> {
         self.diff_against(ctx, &SourceMap::single("<test>", text), phase)
     }
 }

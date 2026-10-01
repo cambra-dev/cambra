@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, thread, time::Duration};
 
 use cambra::{
     ccl::{
-        context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
+        context::{GlobalContext, ReuseTally, eprint_errors},
         provenance::NodeId,
     },
     chl_parser::SourceMap,
@@ -47,7 +47,7 @@ fn poll_control(
                     report.diff,
                     render_unreadable(&report.unreadable)
                 )),
-                Err(errs) => ControlReply::rejected(render_errors(&errs, &sources)),
+                Err(e) => ControlReply::rejected(e.render(&sources)),
             }
         }
         ControlRequest::Reload { code } => {
@@ -66,7 +66,7 @@ fn poll_control(
                         render_unreadable(&report.unreadable),
                     ))
                 }
-                Err(errs) => ControlReply::rejected(render_errors(&errs, &sources)),
+                Err(e) => ControlReply::rejected(e.render(&sources)),
             }
         }
     };

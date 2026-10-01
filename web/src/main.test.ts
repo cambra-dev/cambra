@@ -66,25 +66,24 @@ describe("serializeDiagnostics", () => {
   const starts = byteLineStarts("ab\ncd\n");
   const diag = (message: string, span: { file: number; start: number; end: number } | null) => ({
     severity: "error",
-    stage: "Infer",
     message,
     span,
     labels: [],
   });
 
-  it("renders severity · stage, message, and the line:col span", () => {
+  it("renders severity, message, and the line:col span", () => {
     expect(serializeDiagnostics([diag("mismatched types", { file: 0, start: 0, end: 4 })], starts)).toBe(
-      "error · Infer\nmismatched types\n1:1–2:2",
+      "error\nmismatched types\n1:1–2:2",
     );
   });
 
   it("renders 'no span' for a spanless diagnostic", () => {
-    expect(serializeDiagnostics([diag("boom", null)], starts)).toBe("error · Infer\nboom\nno span");
+    expect(serializeDiagnostics([diag("boom", null)], starts)).toBe("error\nboom\nno span");
   });
 
   it("separates cards with a blank line", () => {
     const text = serializeDiagnostics([diag("one", null), diag("two", null)], starts);
-    expect(text).toBe("error · Infer\none\nno span\n\nerror · Infer\ntwo\nno span");
+    expect(text).toBe("error\none\nno span\n\nerror\ntwo\nno span");
   });
 
   it("reports the empty case with the text the pane itself shows", () => {

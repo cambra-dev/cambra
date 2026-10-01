@@ -150,9 +150,6 @@ export interface Definition {
 
 export interface Diagnostic {
   severity: string;
-  // The compiler stage that raised it — "parse", "lower", "infer", … These are
-  // `CompileError` variants, not pane ids.
-  stage: string;
   message: string;
   // The one range a consumer underlines. A diagnostic is built from one
   // `CompileError`, which carries at most one range.

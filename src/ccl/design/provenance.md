@@ -874,8 +874,11 @@ bit is what says so until every phase in the pair records.
   only — it never tags a `ProvenanceTable` row, and the map between two panes
   stays a homogeneous `NodeId → NodeId` (the lowering projection constrains the
   **product**, not the producer).
-  Release `InferError` diagnostics read the projection one-hop (no fold, before
-  any pane exists). `CompiledProgram` retains it as `lowering_projection`.
+  Every diagnostic a pass after lowering raises carries a blame node and resolves
+  it against the projection (no fold, before any pane exists): the node's own
+  entry, else the entry of a node it was derived from in the active
+  `ProvenanceTable`, else that of a node enclosing it in the tree it was found
+  in. `CompiledProgram` retains the projection as `lowering_projection`.
 - **The lowering leak gate.** `fold_lowering`'s leak taxonomy replaces the
   retired `assert_seed_coverage` (and its `SEED_EMPTY_SPANS_ALLOWLIST`): an
   unrecorded lowering mint surfaces as `Leak::Unrecorded` (every output-tree

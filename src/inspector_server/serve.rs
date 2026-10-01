@@ -324,7 +324,12 @@ mod tests {
         // diagnostics present and structured.
         let diags = v["diagnostics"].as_array().expect("array");
         assert!(!diags.is_empty(), "a type error degrades with diagnostics");
-        assert!(diags.iter().any(|d| d["stage"] == "infer"));
+        assert!(
+            diags.iter().any(|d| d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("Type mismatch"))),
+            "the type error is among them: {diags:?}"
+        );
     }
 
     /// The diagnostics body matches the standalone endpoint in both branches:
