@@ -349,7 +349,7 @@ This moves every golden wire fixture. The re-bless procedure is in
 ## Worked example: two storefronts and an audit log
 
 The example uses **[Decided]** surface that is not implemented (`Feed(…)` declarations, `in`
-guards) and surface this design adds. Its route address `port` is a parameter, which waits on
+guards, `!`) and surface this design adds. Its route address `port` is a parameter, which waits on
 link-time constants ([Dependencies](#dependencies)); until they exist, the two storefront runs
 serve one literal address and conflict.
 
@@ -406,11 +406,11 @@ for req in order_reqs:
     order = req.http::body
     result = with begin():
         if order.sku in items and order.sku in stock:
-            s = stock[order.sku]
+            s = stock[order.sku]!
             if s >= order.qty:
                 stock[order.sku] := s - order.qty
                 audit::events << (audit_api::app=region, audit_api::event="order " + order.sku)
-                str(catalog::sale_price(items[order.sku], order.qty))
+                str(catalog::sale_price(items[order.sku]!, order.qty))
             else:
                 "out of stock"
         else:
