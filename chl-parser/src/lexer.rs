@@ -22,7 +22,7 @@
 //! emitted if the last token wasn't one, and the stack is fully unwound with
 //! `DEDENT`s so every `INDENT` has a partner.
 
-use crate::chl_parser::ast::Span;
+use crate::ast::Span;
 use logos::Logos;
 use smol_str::SmolStr;
 use std::fmt;
@@ -120,7 +120,7 @@ pub enum Token {
     /// Opaque binding `^=` — a `let` whose binder is bound at the initializer's
     /// type and never discharged to the initializer, so a refinement mentioning
     /// the binder keeps the initializer's term out
-    /// ([`BindingTransparency`](crate::ccl::BindingTransparency)). Two chars, so
+    /// (`cambra::ccl::BindingTransparency`). Two chars, so
     /// maximal munch takes it over `Caret` then `Eq`; `=` starts no expression,
     /// so `a ^ = b` is not a competing parse.
     ///

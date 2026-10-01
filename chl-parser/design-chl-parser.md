@@ -1,7 +1,7 @@
 # CHL Parser Design
 
 This document describes the design of the Cambra High-Level Language (CHL)
-parser in `src/chl_parser/`.
+parser in `chl-parser/`.
 
 Two properties shape it: **error recovery** — parsing continues past a local
 syntax error and reports *all* problems in a file, for an interactive UX — and
@@ -39,7 +39,7 @@ CHL source  ── logos lexer ──▶  raw token stream
                             CHL AST  ⇒  CCL lowering
 ```
 
-The pipeline is two distinct stages, both inside `src/chl_parser/`:
+The pipeline is two distinct stages, both inside `chl-parser/src/`:
 
 ### Stage 1 — Lexer (`lexer.rs`)
 
@@ -79,7 +79,7 @@ public entry points:
   from `parser.rs`.
 
 The grammar is precedence-climbed for binary operators, one combinator per level of
-[docs/chl-spec.md](../../docs/chl-spec.md), "2.3 Expression precedence", each built from the
+[docs/chl-spec.md](../docs/chl-spec.md), "2.3 Expression precedence", each built from the
 one tighter than it. `**` is the exception: it straddles the unary `-`, tighter than one on
 its left and looser than one on its right, so it shares a `recursive` layer with unary `-`
 rather than sitting in its own.
@@ -90,7 +90,7 @@ comprehension clause — goes through `bracketed_expr` rather than `expr`. That
 production is `oneline_match | expr`, which is what confines the one-line
 `match` to a position where a `)`, `]` or `}` closes its arm list. `match` is a
 keyword, so no `expr` can start with one and the choice needs no backtracking.
-See [docs/chl-spec.md](../../docs/chl-spec.md), "The one-line form" for the rule
+See [docs/chl-spec.md](../docs/chl-spec.md), "The one-line form" for the rule
 and why the bracket rather than the arm body carries it.
 
 Notably absent vs. Python: `/` (true division), `%` (modulo), `>>`
@@ -126,9 +126,9 @@ Key shape choices:
   grouping, the brace parser captures the trailing comma rather than merely allowing it: `{T,}` is
   the one-element product and a comma-free `{T}` is a parse error, while the empty `{}` is the
   **unit type**, which lowering reads as `Unit` (see
-  [docs/chl-spec.md](../../docs/chl-spec.md), "6.6 The empty product is unit"). A `where` clause
+  [docs/chl-spec.md](../docs/chl-spec.md), "6.6 The empty product is unit"). A `where` clause
   after a single colon-free base turns the brace into a refinement type `{T where p}`
-  (`Expr::BraceRefinement`, [docs/chl-spec.md](../../docs/chl-spec.md), "6.4 Refinement syntax");
+  (`Expr::BraceRefinement`, [docs/chl-spec.md](../docs/chl-spec.md), "6.4 Refinement syntax");
   the clause gates off the one-element `{T}` diagnostic, and its predicate `p` — an ordinary
   expression whose subject `_` lowering maps to the refinement binder — is parsed with the same
   `bracketed_expr` as every other bracketed position.
@@ -139,10 +139,10 @@ Key shape choices:
   consumes its `=>` at statement level before the expression parser runs, so that
   position is unaffected and its return type may itself be a function type. Lowering reads `Expr::FunctionType`
   as a `Type::Fun` in annotation position and rejects it as a value
-  ([docs/chl-spec.md](../../docs/chl-spec.md), "6. Types (informal sketch)").
+  ([docs/chl-spec.md](../docs/chl-spec.md), "6. Types (informal sketch)").
 - **The pair arrow `k -> v` has no node of its own.** `a -> b` builds the
   `Expr::Tuple` the parenthesised spelling builds
-  ([docs/chl-spec.md](../../docs/chl-spec.md), "2.4 Atoms"), so a map literal is an
+  ([docs/chl-spec.md](../docs/chl-spec.md), "2.4 Atoms"), so a map literal is an
   ordinary list of pairs, a map comprehension an ordinary comprehension of them,
   and `for k -> v in m` an ordinary tuple target that `expr_to_assign_target`
   already reads. It sits between `<<` and the ternary: `m << k -> v` feeds the
@@ -233,7 +233,7 @@ directly.
 
 ### Threading partial ASTs through to lowering
 
-[`compile_program`](../ccl/context.rs) now runs the **lowering** stage even
+[`compile_program`](../src/ccl/context.rs) runs the **lowering** stage even
 when the parser reported errors, so users see parse + lowering diagnostics
 in one pass instead of having to fix parse errors before any lowering
 problem becomes visible.
@@ -389,5 +389,5 @@ unhelpful `'src must outlive 'static` error — were hit during development:
   function definitions with `yield`, multi-line bracketed expressions, …) and
   assert the AST shape only at the level required to catch regressions.
 
-Run with `cargo test chl_parser` for the unit tests and
+Run with `cargo test -p chl-parser` for the unit tests and
 `cargo test --test chl_parser_roundtrip` for the integration tests.

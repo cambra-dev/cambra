@@ -73,11 +73,12 @@ fn a_scalar_feed_is_one_contribution_keyed_by_unit() {
     assert_eq!(format!("{}", v.expect("a value")), "Function [ () -> 3 ]");
 }
 
-/// Feeding a collection contributes its elements, so the channel carries three
-/// positionally-keyed entries rather than one entry holding a collection — the contrast
-/// with the scalar feed above.
+/// A collection fed at a site that does not iterate lands flat: the channel takes the
+/// collection's own keys (`keys: UInts([0, 1, 2])`) rather than one unit-keyed contribution
+/// holding it, `() -> [2, 4, 6]`, which `docs/chl-spec.md`, "3.7 Feed operator `<<`" makes
+/// it. Pinned as observed.
 #[test]
-fn a_collection_feed_contributes_its_elements() {
+fn a_collection_feed_lands_flat_rather_than_nesting() {
     let v = observe_one(indoc! {r#"
         out = test_sink()
         out << [x * 2 for x in [1, 2, 3]]
@@ -586,4 +587,17 @@ fn a_sink_accumulates_across_a_reload() {
         ["u0 -> 10", "u1 -> 20", "u2 -> 300", "u3 -> 400"],
         "the sink holds v1's writes and then v2's"
     );
+}
+
+/// Feeding a collection built from the loop variable, from inside the loop, produces a tree
+/// that fails the compiler's own post-lambda-elim typecheck. Pinned at the panic it reaches.
+#[test]
+#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
+fn a_collection_fed_from_inside_a_loop_does_not_compile() {
+    observe_one(indoc! {r#"
+        out = test_sink()
+        for x in [1, 2]:
+            out << [x, x * 10]
+    "#})
+    .expect("a value");
 }

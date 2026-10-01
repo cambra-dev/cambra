@@ -1,15 +1,14 @@
 //! Cambra High-Level Language (CHL) parser.
 //!
-//! Replaces the historical `rustpython_parser` front end. CHL has Python-like
-//! indentation-significant syntax but diverges from Python where convenient
-//! for Cambra's data-flow domain (e.g. `<<` / `<<=` feed operators, `++` for
-//! collection union, no `is`/`in`/`while`/`with`/`try`).
+//! CHL has Python-like indentation-significant syntax but diverges from Python
+//! where convenient for Cambra's data-flow domain (e.g. `<<` / `<<=` feed
+//! operators, `++` for collection union).
 //!
 //! Pipeline:
 //!
 //! ```text
 //!  source ──logos──▶ raw tokens ──layout──▶ NEWLINE/INDENT/DEDENT-aware token stream
-//!         ──chumsky──▶ CHL AST (this module's [`ast`])
+//!         ──chumsky──▶ CHL AST (this crate's [`ast`])
 //! ```
 //!
 //! The lexer ([`lexer`]) tokenises with logos and then runs a post-pass that
@@ -18,8 +17,8 @@
 //! those tokens with chumsky combinators and produces the AST defined in
 //! [`ast`].
 //!
-//! See `design-chl-parser.md` (sibling) for the design rationale and the
-//! for picking chumsky 1.0-alpha + logos over alternatives.
+//! See `chl-parser/design-chl-parser.md` for the design rationale and for picking
+//! chumsky 1.0-alpha + logos over alternatives.
 
 pub mod ast;
 pub mod lexer;
