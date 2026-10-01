@@ -65,37 +65,23 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
     }
 }
 
-/// Whether a `let` bound to `def` at `level` should be **generalized** —
-/// typed polymorphically, with each use [`PolyScheme::instantiate`]ing a fresh
-/// copy and the coalesce walk specializing per distinct use instantiation
-/// ([`specialize_use`](super::solve::specialize_use)). Requires both of:
+/// Whether `def` is a generalizable function definition at `level`.
 ///
-/// - **A function definition** (`def` is a `Lambda`). Let-polymorphism
-///   generalizes function definitions; value bindings stay monomorphic and
-///   *shared* — specializing a value would duplicate it, which breaks
-///   structures that rely on sharing (e.g. a deferred-feed value used in
-///   `y ++ y`).
-/// - **A capability, not a collection.** The rule above by *node*, restated by
-///   [`FunKind`](crate::ccl::ty::FunKind): a data function is a value binding
-///   however it is spelled. A `groupby` lowers to a `Lambda` whose type still
-///   carries variables deeper than `level` here, so the node-and-level test alone
-///   admits it — only the kind catches the one collection written as a function.
-///   Specializing a grouping per use is *filter pushdown* (its domain refinement
-///   is the dependent group-key predicate), so refusing it is a cost decision
-///   inference cannot make; see `src/ccl/design/type-inference.md`,
-///   "Generalizing a collection is filter pushdown".
-/// - **A genuinely polymorphic type** — some variable deeper than `level` to
-///   quantify. A function with no quantifiable variable is already monomorphic,
-///   so generalizing it would be a no-op.
+/// All three conditions are required:
 ///
-/// This is the single predicate emission
-/// ([`emit_let`](super::emit::emit_let)), privatization, and the coalesce walk
-/// all consult, so they agree on which `let`s are polymorphic. It deliberately
-/// makes *no* use-count or generator distinction: a single-use function
-/// generalizes to one specialization (later inlined like any monomorphic def),
-/// and a generator/collection-producing UDF generalizes to one specialization
-/// *per distinct element type*, which `inline` then leaves shared (cached)
-/// rather than duplicated.
+/// - The definition is a syntactic lambda.
+/// - Its function kind is not `Data`. A grouping can lower to a lambda but is
+///   still a collection value whose uses must share it.
+/// - Its type contains a variable above `level` to quantify.
+///
+/// Emission and coalescing use the same predicate. There is no use-count or
+/// collection-producing-UDF exception. Specializations are keyed by the use's
+/// `SpecKey`, not just its element type; later inlining expands non-data function
+/// bindings. See `src/ccl/design/type-inference.md`, "Keying a specialization".
+///
+/// Generalizing a grouping would specialize its dependent domain filter per use.
+/// That sharing decision is separate from function generalization; see
+/// `src/ccl/design/type-inference.md`, "Generalizing a collection is filter pushdown".
 pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
     matches!(def.node, TypedExprNode::Lambda { .. })
         && !matches!(
