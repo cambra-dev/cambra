@@ -3,15 +3,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { LiveStore, applyFrame, shownNodes, tagsFor, type LiveState } from "./liveStore";
 import type { LiveFrame, LiveProbe } from "./types";
 
-function probe(tick: number, value: string): LiveProbe {
+function probe(seq: number, value: string): LiveProbe {
   return {
     producerId: 1,
     producer: "P#1",
     shape: "DataFunction",
-    watermark: "True",
+    completeness: "True",
+    obsolete: null,
     note: null,
-    tick,
-    seq: 0,
+    seq,
     stale: false,
     total: 1,
     dropped: 0,
@@ -19,12 +19,12 @@ function probe(tick: number, value: string): LiveProbe {
   };
 }
 
-function frame(tick: number, nodes: [number, string][], final = false): LiveFrame {
+/** A frame whose every probe carries a new answer: its `seq` is the frame's count. */
+function frame(published: number, nodes: [number, string][], final = false): LiveFrame {
   return {
-    tick,
-    published: tick,
+    published,
     final,
-    nodes: nodes.map(([nodeId, value]) => ({ nodeId, probes: [probe(tick, value)] })),
+    nodes: nodes.map(([nodeId, value]) => ({ nodeId, probes: [probe(published, value)] })),
     sources: [],
   };
 }
@@ -34,7 +34,6 @@ const empty: LiveState = {
   nodes: new Map(),
   sources: new Map(),
   tags: [],
-  tick: 0,
 };
 
 describe("applyFrame", () => {
@@ -49,20 +48,30 @@ describe("applyFrame", () => {
     expect(second.nodes.get(11)?.probes[0]?.rows[0]?.value).toBe('"b"');
   });
 
-  // Staleness is the gap between the newest tick and the producer's own, so it
-  // is a number the pane can state rather than a flag it has to trust — and it
-  // is the producer's, because one operator's probes can be behind by
-  // different amounts.
-  it("keeps each producer's own tick so staleness is a difference", () => {
+  // Staleness is the gap between the newest frame and the one a producer's
+  // rows arrived in, so it is a number the pane can state rather than a flag it
+  // has to trust — and it is the producer's, because one operator's probes can
+  // be behind by different amounts.
+  it("records the frame each producer's rows arrived in", () => {
     const state = applyFrame(applyFrame(empty, frame(1, [[10, '"a"'], [11, '"b"']])), frame(7, [[10, '"c"']]));
-    expect(state.tick).toBe(7);
-    expect(state.tick - (state.nodes.get(11)?.probes[0]?.tick ?? 0)).toBe(6);
-    expect(state.tick - (state.nodes.get(10)?.probes[0]?.tick ?? 0)).toBe(0);
+    expect(state.status).toEqual({ kind: "live", published: 7 });
+    expect(state.nodes.get(11)?.probes[0]?.changedAt).toBe(1);
+    expect(state.nodes.get(10)?.probes[0]?.changedAt).toBe(7);
+  });
+
+  // The wire sends every probe's last answer in every frame, so a producer that
+  // has produced nothing since reappears with the `seq` it had. That is the
+  // same answer, and it keeps the frame it first arrived in.
+  it("keeps the arrival frame of an answer a later frame repeats", () => {
+    const first = applyFrame(empty, frame(1, [[10, '"a"']]));
+    const repeat: LiveFrame = { ...frame(4, []), nodes: [{ nodeId: 10, probes: [probe(1, '"a"')] }] };
+    const state = applyFrame(first, repeat);
+    expect(state.nodes.get(10)?.probes[0]?.changedAt).toBe(1);
   });
 
   it("reads a final frame as a finished run", () => {
     const state = applyFrame(empty, frame(3, [[10, '"a"']], true));
-    expect(state.status).toEqual({ kind: "finished", tick: 3 });
+    expect(state.status).toEqual({ kind: "finished", published: 3 });
   });
 
   it("reads an ordinary frame as live", () => {

@@ -1,16 +1,17 @@
 // Runtime validator for the `/api/live` frame shape.
 //
-// A frame arrives as untyped JSON on every tick of a running program, so a
+// A frame arrives as untyped JSON each time a running program records rows, so a
 // backend drift here surfaces far from its cause: a missing `rows` reads as an
 // operator that produced nothing, which is a state the pane is meant to
 // display. `validateLiveFrame` walks the required keys and types and throws an
 // Error naming the failing *path* on the first violation, the same discipline
 // `validateSnapshot` applies to the static payload.
 //
-// Unlike the snapshot there is no golden byte fixture to pin this against: a
-// frame carries ticks and sequence numbers from a live run, so its bytes are
-// not reproducible. This validator plus the Rust side's own frame tests are
-// what hold the contract, and they are extended together.
+// The contract is pinned from both sides by one fixture,
+// `__fixtures__/probe_frame.json`: the Rust golden test renders it and
+// `wire_check::assert_probe_frame_shape` checks it, and this validator's test
+// accepts it. A frame from a live run carries publish counts and sequence
+// numbers, so the fixture is a constructed frame rather than a recorded one.
 
 import type { LiveFrame, LiveNode, LiveProbe, LiveRow, LiveSource } from "./types";
 
@@ -100,9 +101,9 @@ function validateProbe(v: unknown, path: string): LiveProbe {
     producerId: num(o["producerId"], `${path}.producerId`),
     producer: str(o["producer"], `${path}.producer`),
     shape: str(o["shape"], `${path}.shape`),
-    watermark: nullableStr(o["watermark"], `${path}.watermark`),
+    completeness: nullableStr(o["completeness"], `${path}.completeness`),
+    obsolete: nullableStr(o["obsolete"], `${path}.obsolete`),
     note: nullableStr(o["note"], `${path}.note`),
-    tick: num(o["tick"], `${path}.tick`),
     seq: num(o["seq"], `${path}.seq`),
     stale: bool(o["stale"], `${path}.stale`),
     total,
@@ -158,7 +159,6 @@ export function validateLiveFrame(value: unknown): LiveFrame {
     }
   }
   return {
-    tick: num(o["tick"], "tick"),
     published: num(o["published"], "published"),
     final: bool(o["final"], "final"),
     nodes,

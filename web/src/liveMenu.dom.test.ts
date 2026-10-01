@@ -90,14 +90,14 @@ describe("the Values pane menu", () => {
   // frame. Rebuilding the rows on one detaches whatever the reader is using:
   // focus falls to the body, and a mousedown whose element is replaced before
   // mouseup produces no click, so the toggle is dropped. On a program
-  // publishing every tick that is the whole menu.
+  // publishing every pass that is the whole menu.
   it("keeps its rows across a frame that changes no tag", () => {
     live.inspect("Var(a): L1", 1, [1]);
     const before = items(root)[0]!;
     const box = before.querySelector<HTMLInputElement>("input[type=checkbox]")!;
     box.focus();
 
-    live.apply({ tick: 3, published: 3, final: false, nodes: [], sources: [] });
+    live.apply({ published: 3, final: false, nodes: [], sources: [] });
 
     expect(items(root)[0]).toBe(before);
     expect(document.activeElement).toBe(box);

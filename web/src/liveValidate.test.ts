@@ -12,9 +12,9 @@ function probe(overrides: Record<string, unknown> = {}) {
     producerId: 1,
     producer: "MapResultWithSource#1",
     shape: "DataFunction",
-    watermark: "True",
+    completeness: "True",
+    obsolete: null,
     note: null,
-    tick: 1,
     seq: 0,
     stale: false,
     total: 1,
@@ -26,7 +26,6 @@ function probe(overrides: Record<string, unknown> = {}) {
 
 function frame(overrides: Record<string, unknown> = {}) {
   return {
-    tick: 1,
     published: 1,
     final: false,
     nodes: [{ nodeId: 202, probes: [probe()] }],
@@ -38,13 +37,13 @@ function frame(overrides: Record<string, unknown> = {}) {
 describe("validateLiveFrame", () => {
   it("accepts a frame and returns it typed", () => {
     const f = validateLiveFrame(frame());
-    expect(f.tick).toBe(1);
+    expect(f.published).toBe(1);
     expect(f.nodes[0]?.probes[0]?.rows[0]?.value).toBe('"a"');
     expect(f.sources[0]?.name).toBe("stdin");
   });
 
   it("names the failing path", () => {
-    expect(() => validateLiveFrame(frame({ tick: "1" }))).toThrow(/frame\.tick/);
+    expect(() => validateLiveFrame(frame({ published: "1" }))).toThrow(/frame\.published/);
     const bad = frame({ nodes: [{ nodeId: 1, probes: [probe({ rows: [{ key: "u0" }] })] }] });
     expect(() => validateLiveFrame(bad)).toThrow(/nodes\[0\]\.probes\[0\]\.rows\[0\]\.value/);
   });
@@ -76,6 +75,18 @@ describe("validateLiveFrame", () => {
     expect(() => validateLiveFrame(bad)).toThrow(/distinct producerIds/);
   });
 
+  // `null` is the backend saying the consumer has released nothing, not a
+  // missing field.
+  it("accepts an obsolete guard or null, and nothing else", () => {
+    const released = validateLiveFrame(
+      frame({ nodes: [{ nodeId: 1, probes: [probe({ obsolete: "Function(Domain(LessThanEq(u0)))" })] }] }),
+    );
+    expect(released.nodes[0]?.probes[0]?.obsolete).toBe("Function(Domain(LessThanEq(u0)))");
+    expect(validateLiveFrame(frame()).nodes[0]?.probes[0]?.obsolete).toBeNull();
+    const bad = frame({ nodes: [{ nodeId: 1, probes: [probe({ obsolete: undefined })] }] });
+    expect(() => validateLiveFrame(bad)).toThrow(/probes\[0\]\.obsolete/);
+  });
+
   it("accepts a keyless row, which a Scalar produces", () => {
     const f = validateLiveFrame(
       frame({ nodes: [{ nodeId: 1, probes: [probe({ rows: [row(null, '"x"')] })] }] }),
@@ -93,5 +104,8 @@ describe("the golden probe frame", () => {
     expect(f.nodes.map((n) => n.nodeId)).toEqual([1, 2, 3, 4]);
     expect(f.nodes[1]?.probes.map((p) => p.producerId)).toEqual([1, 2]);
     expect(f.sources[0]?.nodeIds).toEqual([1]);
+    expect(f.nodes[1]?.probes[1]?.obsolete).toBe(
+      "Function(Domain(Intervals(IntervalSet { intervals: [Interval(Finite(FullyBounded(Bound(Closed, u0), Bound(Closed, u0))))] })))",
+    );
   });
 });

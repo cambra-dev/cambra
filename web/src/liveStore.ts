@@ -16,14 +16,27 @@ import { validateLiveFrame } from "./liveValidate";
 import type { LiveFrame, LiveProbe, LiveSource } from "./types";
 
 /**
+ * A probe as the store keeps it: the wire's answer, and the frame its rows
+ * arrived in.
+ */
+export interface TrackedProbe extends LiveProbe {
+  /**
+   * The `published` count of the frame in which this probe's `seq` last
+   * changed. The wire carries no time of its own, so the store records when it
+   * first saw each answer, and staleness is the gap to the newest frame.
+   */
+  changedAt: number;
+}
+
+/**
  * What one operator's probes last answered.
  *
- * No tick of its own. A producer carries the tick its rows came from, and an
- * operator's probes can be behind by different amounts, so staleness is read
- * off the producer and never off the node.
+ * No frame count of its own. Each probe carries the frame its rows arrived in,
+ * and an operator's probes can be behind by different amounts, so staleness is
+ * read off the producer and never off the node.
  */
 export interface LiveEntry {
-  probes: LiveProbe[];
+  probes: TrackedProbe[];
 }
 
 /**
@@ -36,8 +49,8 @@ export interface LiveEntry {
 export type LiveStatus =
   | { kind: "connecting" }
   | { kind: "not-run" }
-  | { kind: "live"; tick: number; published: number }
-  | { kind: "finished"; tick: number }
+  | { kind: "live"; published: number }
+  | { kind: "finished"; published: number }
   | { kind: "lost"; clean: boolean };
 
 /**
@@ -75,8 +88,6 @@ export interface LiveState {
   sources: Map<number, LiveSource>;
   /** Inspect gestures, most recent first. */
   tags: readonly LiveTag[];
-  /** The newest tick seen, against which a producer's own tick reads as staleness. */
-  tick: number;
 }
 
 /** The operators the shown tags between them ask for. */
@@ -100,16 +111,27 @@ type Listener = (state: LiveState) => void;
  * Fold a frame into the cache.
  *
  * Per-node replace, not merge. The backend already collapsed each producer's
- * several `get`s within the tick to one answer, so a frame's entry for a node
- * *is* the current answer — nothing needs combining, which is what keeps the
- * `Tile::merge` double-count from reappearing on this side. A node absent from
- * the frame keeps its entry, whose probes hold the ticks their rows came
- * from, which is where staleness comes from.
+ * several `get`s to one answer, so a frame's entry for a node *is* the current
+ * answer — nothing needs combining, which is what keeps the `Tile::merge`
+ * double-count from reappearing on this side. A node absent from the frame
+ * keeps its entry.
+ *
+ * A probe whose `seq` matches the one already held is the same answer, so it
+ * keeps the frame it arrived in; any other probe arrived in this frame.
  */
 export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
   const nodes = new Map(state.nodes);
   for (const node of frame.nodes) {
-    nodes.set(node.nodeId, { probes: node.probes });
+    const held = state.nodes.get(node.nodeId)?.probes ?? [];
+    const probes = node.probes.map((probe): TrackedProbe => {
+      const previous = held.find((p) => p.producerId === probe.producerId);
+      const changedAt =
+        previous !== undefined && previous.seq === probe.seq
+          ? previous.changedAt
+          : frame.published;
+      return { ...probe, changedAt };
+    });
+    nodes.set(node.nodeId, { probes });
   }
   const sources = new Map(state.sources);
   for (const source of frame.sources) {
@@ -119,10 +141,9 @@ export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
     ...state,
     nodes,
     sources,
-    tick: frame.tick,
     status: frame.final
-      ? { kind: "finished", tick: frame.tick }
-      : { kind: "live", tick: frame.tick, published: frame.published },
+      ? { kind: "finished", published: frame.published }
+      : { kind: "live", published: frame.published },
   };
 }
 
@@ -139,7 +160,6 @@ export class LiveStore {
     nodes: new Map(),
     sources: new Map(),
     tags: [],
-    tick: 0,
   };
   private readonly listeners = new Set<Listener>();
 

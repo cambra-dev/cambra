@@ -67,7 +67,7 @@ export function renderLiveMenu(parent: HTMLElement, live: LiveStore): void {
   // store, and a wire frame changes no tag. Rebuilding on one detaches whatever
   // the reader is using — focus falls to the body, and a mousedown whose
   // element is replaced before mouseup produces no click at all, so the toggle
-  // it was making is dropped. On a program publishing every tick that is the
+  // it was making is dropped. On a program publishing every pass that is the
   // whole menu.
   let rendered: string | null = null;
   const sync = (): void => {

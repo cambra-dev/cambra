@@ -262,10 +262,10 @@ export interface Snapshot {
 // The live wire — `/api/live`
 // ---------------------------------------------------------------------------
 //
-// A frame is whole state, not an append. Each one carries every producer that
-// produced during its tick, and replaces the frame before it; the server has
-// already collapsed each producer's several `get`s within the tick to one
-// answer (`ValueRecorder::latest_non_empty`). The frontend keeps a per-node
+// A frame is whole state, not an append. Each one carries every producer's last
+// answer that carried rows, and replaces the frame before it; the server has
+// already collapsed each producer's several `get`s to one answer
+// (`ProbeTable::last_flow`). The frontend keeps a per-node
 // cache so a newly pinned operator answers from the last frame rather than
 // waiting for the next one, which on a converged program never comes.
 
@@ -291,17 +291,21 @@ export interface LiveProbe {
   producer: string;
   // The tile's variant name, e.g. `"DataFunction"`.
   shape: string;
-  // The tile's `domain_predicate`, rendered: `False`, then `LessThanEq(uN)`,
-  // then `True`. `null` for a shape carrying no such region.
-  watermark: string | null;
+  // The region of the domain the output is complete for, rendered: `False`,
+  // then a prefix of the domain, then `True`. `null` for a shape carrying no
+  // such region.
+  completeness: string | null;
+  // The region the producer's consumer has released, rendered, or `null` while
+  // it has released nothing.
+  obsolete: string | null;
   // Why this answer carries no rows, for a shape the backend does not render.
   note: string | null;
-  // The tick this answer came from, which is not the frame's tick when the
-  // producer has since produced nothing.
-  tick: number;
+  // The reading's position in the probe table's total order. The same `seq` in
+  // two frames is the same answer, which is how the store tells how long a
+  // producer has gone without new rows.
   seq: number;
   // Whether a newer reading of this probe carried nothing. True for most probes
-  // in most frames; `tick` against the frame's says how recent the rows are.
+  // in most frames.
   stale: boolean;
   // Rows the tile held, of which `rows` is the last `rows.length`.
   total: number;
@@ -332,10 +336,9 @@ export interface LiveSource {
 }
 
 export interface LiveFrame {
-  // The driver tick this frame reports. Advances only over a tick that recorded
-  // something, so it counts data rather than loop iterations.
-  tick: number;
-  // Frames published so far, so a client can tell it is behind.
+  // Frames published so far, counting this one, so a client can tell it is
+  // behind. Advances only over a pass that recorded something, so it counts
+  // data rather than loop iterations.
   published: number;
   // Whether the run is over and this frame is the last. A reader that never
   // sees one and then loses the socket was disconnected; a reader holding one

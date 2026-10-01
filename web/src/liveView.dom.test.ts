@@ -23,9 +23,9 @@ function probe(overrides: Partial<LiveProbe> = {}): LiveProbe {
     producerId: 1,
     producer: "MapResultWithSource#1",
     shape: "DataFunction",
-    watermark: "True",
+    completeness: "True",
+    obsolete: null,
     note: null,
-    tick: 3,
     seq: 0,
     stale: false,
     total: 3,
@@ -40,7 +40,6 @@ function probe(overrides: Partial<LiveProbe> = {}): LiveProbe {
 
 function frame(overrides: Partial<LiveFrame> = {}): LiveFrame {
   return {
-    tick: 3,
     published: 3,
     final: false,
     nodes: [{ nodeId: 202, probes: [probe()] }],
@@ -104,14 +103,14 @@ describe("the values pane", () => {
 
     live.apply(
       frame({
-        tick: 4,
+        published: 4,
         nodes: [
           {
             nodeId: 202,
             probes: [
               {
                 ...frame().nodes[0]!.probes[0]!,
-                tick: 4,
+                seq: 4,
                 total: 2,
                 dropped: 0,
                 rows: [
@@ -173,29 +172,34 @@ describe("the values pane", () => {
   });
 
   // Each producer is pulled on its own, so one can be current while another is
-  // ticks behind. Shown side by side they read as equals, which is what the
-  // per-producer tick is for.
+  // frames behind. Shown side by side they read as equals, which is what the
+  // per-producer arrival frame is for.
   it("marks the stale producer's rows and leaves the current one's alone", async () => {
     const live = new LiveStore();
     const body = document.createElement("div");
     new LiveView(body, live);
+    const old = probe({
+      producerId: 1,
+      seq: 1,
+      total: 1,
+      dropped: 0,
+      rows: [{ key: "u0", value: '"old"', deleted: false }],
+    });
+    live.apply(frame({ published: 1, nodes: [{ nodeId: 202, probes: [old] }] }));
+    // The wire repeats producer 1's answer under the same `seq`, so it keeps
+    // the frame it arrived in.
     live.apply(
       frame({
+        published: 3,
         nodes: [
           {
             nodeId: 202,
             probes: [
-              probe({
-                producerId: 1,
-                tick: 1,
-                total: 1,
-                dropped: 0,
-                rows: [{ key: "u0", value: '"old"', deleted: false }],
-              }),
+              old,
               probe({
                 producerId: 2,
                 producer: "FanOut#2",
-                tick: 3,
+                seq: 3,
                 total: 1,
                 dropped: 0,
                 rows: [{ key: "u0", value: '"new"', deleted: false }],
@@ -210,7 +214,7 @@ describe("the values pane", () => {
 
     const stale = [...body.querySelectorAll(".live-row.stale .live-value")];
     expect(stale.map((cell) => cell.textContent)).toEqual(['"old"']);
-    expect(body.textContent).toContain("last produced at tick 1 (now 3)");
+    expect(body.textContent).toContain("last produced in frame 1 (now 3)");
   });
 
   // A row that arrives in a later frame belongs where the frame puts it, not
@@ -237,13 +241,13 @@ describe("the values pane", () => {
 
     live.apply(
       frame({
-        tick: 4,
+        published: 4,
         nodes: [
           {
             nodeId: 202,
             probes: [
               probe({
-                tick: 4,
+                seq: 4,
                 total: 2,
                 dropped: 0,
                 rows: [
@@ -284,13 +288,13 @@ describe("the values pane", () => {
 
     live.apply(
       frame({
-        tick: 4,
+        published: 4,
         nodes: [
           {
             nodeId: 202,
             probes: [
               probe({
-                tick: 4,
+                seq: 4,
                 total: 8,
                 dropped: 7,
                 rows: [{ key: "u9", value: '"z"', deleted: false }],

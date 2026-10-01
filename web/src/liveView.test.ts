@@ -1,17 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import type { LiveState } from "./liveStore";
+import type { LiveState, TrackedProbe } from "./liveStore";
 import { TAG_SLOTS, countOf, livePanelState, serializeLivePanel, staleText, tagColour } from "./liveView";
-import type { LiveProbe, LiveSource } from "./types";
+import type { LiveSource } from "./types";
 
-function probe(overrides: Partial<LiveProbe> = {}): LiveProbe {
+function probe(overrides: Partial<TrackedProbe> = {}): TrackedProbe {
   return {
     producerId: 1,
     producer: "MapResultWithSource#1",
     shape: "DataFunction",
-    watermark: "True",
+    completeness: "True",
+    obsolete: null,
     note: null,
-    tick: 5,
+    changedAt: 5,
     seq: 0,
     stale: false,
     total: 1,
@@ -23,11 +24,10 @@ function probe(overrides: Partial<LiveProbe> = {}): LiveProbe {
 
 function state(overrides: Partial<LiveState> = {}): LiveState {
   return {
-    status: { kind: "live", tick: 5, published: 5 },
+    status: { kind: "live", published: 5 },
     nodes: new Map(),
     sources: new Map(),
     tags: [],
-    tick: 5,
     ...overrides,
   };
 }
@@ -68,7 +68,7 @@ describe("livePanelState", () => {
       state({
         status: { kind: "lost", clean: false },
         tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }],
-        nodes: new Map([[10, { probes: [probe({ producerId: 1, tick: 2 })] }]]),
+        nodes: new Map([[10, { probes: [probe({ producerId: 1, changedAt: 2 })] }]]),
       }),
     );
     if (panel.kind !== "groups") throw new Error("expected the values to survive the loss");
@@ -92,12 +92,12 @@ describe("livePanelState", () => {
 
   // An operator's probes are pulled independently, so they can be behind by
   // different amounts and the group carries each one's own answer.
-  it("carries every producer, each with the tick its rows came from", () => {
+  it("carries every producer, each with the frame its rows arrived in", () => {
     const panel = livePanelState(
       state({
         tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }],
         nodes: new Map([
-          [10, { probes: [probe({ producerId: 1, tick: 2 }), probe({ producerId: 2 })] }],
+          [10, { probes: [probe({ producerId: 1, changedAt: 2 }), probe({ producerId: 2 })] }],
         ]),
       }),
     );
@@ -105,7 +105,7 @@ describe("livePanelState", () => {
     const group = panel.groups[0];
     expect(group?.kind).toBe("operator");
     if (group?.kind !== "operator") return;
-    expect(group.probes.map((p) => p.tick)).toEqual([2, 5]);
+    expect(group.probes.map((p) => p.changedAt)).toEqual([2, 5]);
   });
 
   it("renders a pinned source as its retained window", () => {
@@ -161,7 +161,7 @@ describe("serializeLivePanel", () => {
                 probe({
                   producerId: 2,
                   producer: "FanOut#2",
-                  tick: 2,
+                  changedAt: 2,
                   rows: [{ key: "u0", value: '"right"', deleted: false }],
                 }),
               ],
@@ -176,7 +176,7 @@ describe("serializeLivePanel", () => {
     expect(text).toContain("MapResultWithSource#1");
     expect(text).toContain("FanOut#2");
     // Only the producer that is behind says so.
-    expect(text).toContain("last produced at tick 2 (now 5)");
+    expect(text).toContain("last produced in frame 2 (now 5)");
     expect(text.match(/last produced/g)?.length).toBe(1);
   });
 
@@ -191,6 +191,30 @@ describe("serializeLivePanel", () => {
     );
     expect(serializeLivePanel(panel)).toContain("a store is a changelog");
   });
+
+  // The backend sends `null` until the consumer has released something, so a
+  // producer line names a released region only when there is one.
+  it("names a released region only once there is one", () => {
+    const panel = livePanelState(
+      state({
+        tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true }],
+        nodes: new Map([
+          [
+            10,
+            {
+              probes: [
+                probe({ producerId: 1 }),
+                probe({ producerId: 2, obsolete: "Function(Domain(LessThanEq(u3)))" }),
+              ],
+            },
+          ],
+        ]),
+      }),
+    );
+    const text = serializeLivePanel(panel);
+    expect(text).toContain("released: Function(Domain(LessThanEq(u3)))");
+    expect(text.match(/released:/g)?.length).toBe(1);
+  });
 });
 
 describe("countOf and staleText", () => {
@@ -199,16 +223,16 @@ describe("countOf and staleText", () => {
     expect(countOf(2, 9)).toBe("2 of 9 rows");
   });
 
-  it("states staleness as ticks rather than a word", () => {
-    expect(staleText(probe({ tick: 5 }), 5)).toBeNull();
-    expect(staleText(probe({ tick: 5 }), 9)).toBe("last produced at tick 5 (now 9)");
+  it("states staleness as frames rather than a word", () => {
+    expect(staleText(probe({ changedAt: 5 }), 5)).toBeNull();
+    expect(staleText(probe({ changedAt: 5 }), 9)).toBe("last produced in frame 5 (now 9)");
   });
 
-  // The case the difference cannot see: the producer answered this tick and was
-  // then pulled again within it and carried nothing.
-  it("reads the wire's own flag when the tick difference is zero", () => {
-    expect(staleText(probe({ tick: 5, stale: true }), 5)).toBe(
-      "pulled again this tick and answered nothing",
+  // The case the gap cannot see: the producer's rows arrived in this frame,
+  // and it was then pulled again and carried nothing.
+  it("reads the wire's own flag when the frame gap is zero", () => {
+    expect(staleText(probe({ changedAt: 5, stale: true }), 5)).toBe(
+      "pulled again since and answered nothing",
     );
   });
 });

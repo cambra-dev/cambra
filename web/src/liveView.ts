@@ -11,8 +11,16 @@
 // of them; pinning is the reader stating which ones they want, and it is what
 // bounds this list.
 
-import { type LiveEntry, type LiveState, type LiveStatus, type LiveTag, shownNodes, tagsFor } from "./liveStore";
-import type { LiveProbe, LiveRow, LiveSource } from "./types";
+import {
+  type LiveEntry,
+  type LiveState,
+  type LiveStatus,
+  type LiveTag,
+  type TrackedProbe,
+  shownNodes,
+  tagsFor,
+} from "./liveStore";
+import type { LiveRow, LiveSource } from "./types";
 
 /** One inspected operator, or one inspected source, as the pane draws it. */
 export type LiveGroup = {
@@ -41,11 +49,11 @@ export type LiveGroup = {
        * What each producer last answered.
        *
        * Several, because a `FanOut` branch is subscribed once per branch. Every
-       * fact about an answer — its shape, its counts, its watermark, how far
+       * fact about an answer — its shape, its counts, its completeness, how far
        * behind it is — belongs to one of these and not to the operator, so the
        * pane draws a line per producer rather than one line per node.
        */
-      probes: LiveProbe[];
+      probes: TrackedProbe[];
     }
   | { kind: "source"; nodeId: number; source: LiveSource }
   // Asked for, but nothing has ever arrived for it. Rendered rather than
@@ -154,16 +162,16 @@ export function serializeLivePanel(panel: LivePanelState): string {
     case "lost":
       return panel.clean ? "connection closed" : "connection lost";
     case "groups":
-      return panel.groups.map((g) => serializeGroup(g, tickOf(panel.status))).join("\n\n");
+      return panel.groups.map((g) => serializeGroup(g, publishedOf(panel.status))).join("\n\n");
   }
 }
 
-function serializeGroup(group: LiveGroup, tick: number): string {
+function serializeGroup(group: LiveGroup, published: number): string {
   const tags = group.tags.map((t) => `[${t.label}]`).join(" ");
   const prefix = tags === "" ? "" : `${tags} `;
   const meta = metaText(group);
   const head = `${prefix}${headText(group)}${meta === null ? "" : ` — ${meta}`}`;
-  return [head, ...bodyLines(group, tick).map(lineText)].join("\n");
+  return [head, ...bodyLines(group, published).map(lineText)].join("\n");
 }
 
 function lineText(line: BodyLine): string {
@@ -187,21 +195,22 @@ export function countOf(shown: number, total: number): string {
 /**
  * How a producer's staleness reads, or `null` when its answer is the current one.
  *
- * Two signals, and the wire carries both per producer. The tick difference is
- * the one to state where there is one: a number says how far behind and can be
- * compared against the header's own tick, where the word `stale` alone is
- * uncheckable. `stale` catches what the difference cannot — a producer pulled
- * again within this same tick that answered nothing, so its rows are already
- * not what it holds.
+ * Two signals per producer. The frame gap is the one to state where there is
+ * one: a number says how far behind, where the word `stale` alone is
+ * uncheckable. `stale` catches what the gap cannot — a producer pulled again
+ * since its rows arrived that answered nothing, so its rows are already not
+ * what it holds.
  */
-export function staleText(producer: LiveProbe, tick: number): string | null {
-  if (producer.tick < tick) return `last produced at tick ${producer.tick} (now ${tick})`;
-  return producer.stale ? "pulled again this tick and answered nothing" : null;
+export function staleText(producer: TrackedProbe, published: number): string | null {
+  if (producer.changedAt < published) {
+    return `last produced in frame ${producer.changedAt} (now ${published})`;
+  }
+  return producer.stale ? "pulled again since and answered nothing" : null;
 }
 
-/** The newest tick, against which a producer's own tick reads as staleness. */
-function tickOf(status: LiveStatus): number {
-  return status.kind === "live" || status.kind === "finished" ? status.tick : 0;
+/** The newest frame's count, against which a producer's own reads as staleness. */
+function publishedOf(status: LiveStatus): number {
+  return status.kind === "live" || status.kind === "finished" ? status.published : 0;
 }
 
 function el(tag: string, className?: string, text?: string): HTMLElement {
@@ -235,7 +244,7 @@ interface BodyLine {
   value: string;
   /** Whether the tile marks this position deleted. */
   deleted: boolean;
-  /** Whether the producer that answered this line is behind the newest tick. */
+  /** Whether the producer that answered this line is behind the newest frame. */
   stale: boolean;
 }
 
@@ -248,7 +257,7 @@ const LINE_CLASS: Record<BodyRole, string> = {
 };
 
 /** A group's body, in the order it draws. */
-function bodyLines(group: LiveGroup, tick: number): BodyLine[] {
+function bodyLines(group: LiveGroup, published: number): BodyLine[] {
   switch (group.kind) {
     case "silent":
       return [];
@@ -256,7 +265,7 @@ function bodyLines(group: LiveGroup, tick: number): BodyLine[] {
       return windowLines("src", group.source.rows, group.source.dropped, false);
     case "operator":
       return group.probes.flatMap((producer) => {
-        const stale = staleText(producer, tick);
+        const stale = staleText(producer, published);
         const scope = `p${producer.producerId}`;
         const head: BodyLine = {
           id: `producer:${scope}`,
@@ -308,12 +317,13 @@ function windowLines(
 }
 
 /** What one producer answered, as the line above its rows. */
-function producerText(producer: LiveProbe, stale: string | null): string {
+function producerText(producer: TrackedProbe, stale: string | null): string {
   return [
     producer.producer,
     producer.shape,
     countOf(producer.rows.length, producer.total),
-    producer.watermark,
+    producer.completeness,
+    producer.obsolete === null ? null : `released: ${producer.obsolete}`,
     stale,
     producer.note,
   ]
@@ -385,7 +395,7 @@ export const TAG_SLOTS = 7;
  * Retained-mode: groups and rows are kept as handles and updated in place, so a
  * frame replacing a node's rows costs the text it changed rather than the DOM.
  * That is also what preserves scroll position, text selection and hover across
- * a frame — rebuilding the subtree every tick would lose all three.
+ * a frame — rebuilding the subtree every frame would lose all three.
  */
 export class LiveView {
   private readonly root: HTMLElement;
@@ -435,7 +445,7 @@ export class LiveView {
   /**
    * Coalesce frames into one paint.
    *
-   * A run publishes on every tick that recorded something, which can be far
+   * A run publishes on every pass that recorded something, which can be far
    * more often than a frame is worth drawing. Dropping intermediate frames is
    * correct here and only here: the wire is latest-wins, so the newest frame is
    * the whole answer. An append stream could not do this.
@@ -551,7 +561,7 @@ export class LiveView {
     const meta = metaText(group);
     handle.meta.textContent = meta ?? "";
     handle.meta.hidden = meta === null;
-    this.renderRows(handle, bodyLines(group, tickOf(status)));
+    this.renderRows(handle, bodyLines(group, publishedOf(status)));
   }
 
   private renderRows(handle: GroupHandle, lines: BodyLine[]): void {
@@ -566,7 +576,7 @@ export class LiveView {
       row.row.classList.toggle("deleted", line.deleted);
       row.row.dataset["deleted"] = line.deleted ? "deleted" : "";
       // A stale producer's rows are dimmed, and the producer's own line says
-      // how far behind in ticks — the same two channels.
+      // how many frames behind — the same two channels.
       row.row.classList.toggle("stale", line.stale);
       row.row.dataset["stale"] = line.stale ? "stale" : "";
     }
@@ -617,7 +627,7 @@ function metaText(group: LiveGroup): string | null {
       return `retained ${countOf(group.source.rows.length, group.source.total)}`;
     case "operator":
       // Nothing an operator's answer says holds for the operator: shape,
-      // counts, watermark and staleness are each one producer's, and a group
+      // counts, completeness and staleness are each one producer's, and a group
       // that summarised them read the first producer's as the node's.
       return null;
   }
