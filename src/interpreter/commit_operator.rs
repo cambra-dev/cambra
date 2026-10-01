@@ -37,10 +37,9 @@
 //! A writer's *proposal*, unlike the store, carries its read and write sets as map cells:
 //! each rides a [`map_to_value`] `Value::Function` in a `ColumnValue::Variants` column, so
 //! the proposal stream is `step → {snap, reads, writes}` with `reads`/`writes` map-valued.
-//! Their key sets are the writer's **static** footprint — a decision writes every carry key
-//! of the store consuming it, and the read set names every key the writer reads, omitting
-//! one the store has no value for yet. The cell is the representation they have, not one
-//! the shape requires.
+//! Their key sets vary from one decision to the next: a write set holds every carry key of
+//! the store consuming it and only the taps that fired, and a read set omits a key the
+//! store holds no value for yet.
 //!
 //! # Concurrency is logical
 //!
@@ -80,9 +79,10 @@ pub type CommitTs = usize;
 ///
 /// A writer produces one of these by reading some keys at a decided snapshot and
 /// deciding what to write. `reads`/`writes` are the read set and write set. A
-/// read-only transaction (a guard that denies and writes nothing) is a *local*
-/// decision by the writer and never becomes a proposal — only writes reach the
-/// engine, so `writes` is non-empty in practice.
+/// read-only transaction (a guard that denies, or a grant that writes nothing) is a
+/// *local* decision by the writer and never becomes a proposal, so `writes` is never
+/// empty: a tick appears in the changelog of each key it writes, and a tick writing
+/// nothing would be decided in the frontier and recorded nowhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
     /// The committed prefix the writer read — a decided timestamp.
@@ -205,6 +205,11 @@ impl CommitEngine {
         );
         self.next_ts = position + 1;
         if let Some(w) = writes {
+            debug_assert!(
+                !w.is_empty(),
+                "an induction write writes at least one key; a position that writes nothing \
+                 is a carry, `None`"
+            );
             for k in w.keys() {
                 self.latest_write.insert(k.clone(), position);
             }
@@ -217,6 +222,11 @@ impl CommitEngine {
     /// consumes no tick and returns [`CommitOutcome::Stale`], leaving the writer
     /// to retry.
     pub fn attempt(&mut self, p: Proposal) -> CommitOutcome {
+        debug_assert!(
+            !p.writes.is_empty(),
+            "a proposal writes at least one key: a tick is recorded only in the changelogs of \
+             the keys it writes, so an empty write set would decide a tick no changelog holds"
+        );
         debug_assert!(
             p.snapshot <= self.watermark(),
             "proposal snapshot {} is beyond the watermark {}",
@@ -334,10 +344,11 @@ impl CommitEngine {
                 let tile = Tile::data_function(
                     ticks,
                     Box::new(Tile::Scalar(column)),
-                    // A changelog holds every write the engine has committed, so it is
-                    // decided exactly where the store is. The store's own `frontier` is
-                    // what a consumer reads; this keeps the sub-tile self-describing.
-                    self.frontier_predicate(),
+                    // **A changelog claims nothing decided.** Read as a collection, a
+                    // decided tick missing from it would be absent, where the store reads
+                    // it as a tick that left this key's value standing. The store's
+                    // `frontier` is the one statement of what is decided.
+                    Predicate::False,
                     BitSet::new(),
                 );
                 (key, tile)
@@ -520,7 +531,7 @@ pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
     let Tile::Store { frontier, .. } = tile else {
         return None;
     };
-    if store_change_ticks(tile).is_empty() {
+    if tile.store_change_ticks().is_empty() {
         return None;
     }
     frontier_from_domain(frontier)
@@ -780,8 +791,8 @@ pub fn map_to_value(map: &HashMap<Value, Value>) -> Value {
 /// this decodes rode a `ColumnValue::Variants` column whose extent is a
 /// [`map_extent`] (`Key ⇀ Value`). That holds for proposal read/write sets —
 /// inference's `emit_transact_writer` types the proposal codomain's `reads`/`writes`
-/// fields as map-valued, and the writer renders them via [`map_to_value`]. A
-/// non-`DataFunction` value would be a `Variants` cell holding something other than its
+/// fields as map-valued, and the writer renders them via [`map_to_value`]. A value other
+/// than a `Value::Function` would be a `Variants` cell holding something other than its
 /// declared map extent — impossible by construction.
 pub fn value_to_map(v: &Value) -> HashMap<Value, Value> {
     match v {
@@ -791,15 +802,15 @@ pub fn value_to_map(v: &Value) -> HashMap<Value, Value> {
             .collect(),
         other => unreachable!(
             "a Variants map cell is a Value::Function (its map_extent is Key ⇀ Value, \
-             guaranteed by render_full_store_tile / emit_transact_writer); got {other:?}"
+             guaranteed by emit_transact_writer); got {other:?}"
         ),
     }
 }
 
 /// The extent of a `Key ⇀ Value` map cell — a [`map_to_value`] `Value::Function`
-/// carried in a `Variants` column. This is a **proposal's** read and write sets, which is
-/// where the encoding survives: the store's own state is a record keyed by the same keys
-/// ([`full_store_tiling`]), and a proposal's key sets are as static as the store's.
+/// carried in a `Variants` column. This is a **proposal's** read and write sets, whose key
+/// sets vary per decision; the store's own state is one changelog per key
+/// ([`full_store_tiling`]).
 fn map_extent(key_extent: &Extent, value_extent: &Extent) -> Extent {
     Extent::Function {
         domain: Box::new(key_extent.clone()),
@@ -840,25 +851,6 @@ fn changelog_value(values: &Tile, i: usize) -> Value {
         Tile::Scalar(column) => column.index_at(i),
         other => panic!("a store key's changelog holds one value per tick; got {other:?}"),
     }
-}
-
-/// Every commit tick at which the store recorded a write, ascending and deduplicated: the
-/// union of its keys' changelogs. A carry-forward read emits a position at each of these,
-/// because a tick that wrote some other key still carries this one forward.
-pub fn store_change_ticks(tile: &Tile) -> Vec<CommitTs> {
-    let mut ticks = std::collections::BTreeSet::new();
-    for key in tile.store_keys() {
-        let Some((written, _)) = tile.store_changelog(key) else {
-            continue;
-        };
-        ticks.extend(
-            (0..written.len()).filter_map(|i| match written.index_at(i) {
-                Value::UInt(t) => Some(t),
-                _ => None,
-            }),
-        );
-    }
-    ticks.into_iter().collect()
 }
 
 /// Field names of the proposal-stream codomain record. `F_WRITES` is shared with
@@ -1898,7 +1890,7 @@ impl TileProducer for StoreValueStreamProducer {
         // emit time (the accumulating consumer has already merged it). The ticks are
         // the store's, not this key's: a carry gains a position wherever any key was
         // written.
-        let all_ticks: Vec<usize> = store_change_ticks(&store);
+        let all_ticks: Vec<usize> = store.store_change_ticks();
         let folded = fold_changelog_key_ascending(
             &store,
             all_ticks.iter().copied(),
@@ -4281,19 +4273,28 @@ impl TileProducer for TransactWriterProducer {
                         .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
                         .map(|(_, kv)| kv)
                         .collect();
+                    // **A grant that writes nothing is read-only**, which is a local
+                    // decision and never a proposal ([`Proposal`]): with no carry key and
+                    // no tap fired, the filter above leaves nothing, and committing that
+                    // would consume a tick no key's changelog records. It finishes the item
+                    // as a deny does.
                     // Re-proposing this item at a new frontier supersedes its
                     // prior stale proposal(s); drop them so the window stays O(1).
                     self.drop_superseded(pos);
-                    self.emitted.push(InFlightProposal {
-                        snapshot: frontier,
-                        reads,
-                        writes,
-                        attempt: pos,
-                    });
                     self.last_decided_pos = Some(pos);
-                    // The body-input row stays live until the commit-ack: it is
-                    // the attempt in flight, and releasing it now would tell the
-                    // driver this item is finished before it has committed.
+                    if writes.is_empty() {
+                        self.ack_through(pos);
+                    } else {
+                        // The body-input row stays live until the commit-ack: it is
+                        // the attempt in flight, and releasing it now would tell the
+                        // driver this item is finished before it has committed.
+                        self.emitted.push(InFlightProposal {
+                            snapshot: frontier,
+                            reads,
+                            writes,
+                            attempt: pos,
+                        });
+                    }
                 }
                 // Deny: a purely local read-only decision (the body chose not to
                 // write at this snapshot — e.g. `if pool >= r`). No proposal, no
@@ -4418,6 +4419,44 @@ mod tests {
         vec![init.keys().cloned().collect(); n_writers]
     }
 
+    /// **A store whose keys hold different value types** renders each changelog at its own
+    /// key's type: a `String` key's values are a string column and an `Int` key's an int
+    /// column, where one shared codomain could only name their union. A tick writing one key
+    /// appears in that key's changelog alone.
+    #[test]
+    fn a_store_renders_each_key_at_its_own_value_type() {
+        let mut e = CommitEngine::new(HashMap::from([
+            (acct("name"), Value::String("a".into())),
+            (acct("count"), int(0)),
+        ]));
+        assert_eq!(
+            e.attempt(Proposal {
+                snapshot: 0,
+                reads: HashMap::new(),
+                writes: HashMap::from([(acct("count"), int(1))]),
+            }),
+            CommitOutcome::Committed { ts: 1 }
+        );
+        let tiling = full_store_tiling(HashMap::from([
+            (
+                "name".to_string(),
+                Tiling::Scalar(Extent::Base(BaseType::String)),
+            ),
+            ("count".to_string(), Tiling::Scalar(value_extent())),
+        ]));
+        let tile = e.render_full_store_tile(&tiling);
+        assert!(validate_tile(&tile));
+        let (name_ticks, name_values) = tile.store_changelog("name").expect("a key");
+        let (count_ticks, count_values) = tile.store_changelog("count").expect("a key");
+        assert_eq!(*name_ticks, ColumnValue::from_uints(vec![0]));
+        assert_eq!(
+            *name_values,
+            Tile::Scalar(ColumnValue::Strings(vec!["a".into()]))
+        );
+        assert_eq!(*count_ticks, ColumnValue::from_uints(vec![0, 1]));
+        assert_eq!(*count_values, Tile::Scalar(ColumnValue::Ints(vec![0, 1])));
+    }
+
     /// Position-driven induction: `x := 0; for i in [1,2,3,4]: if i > 2: x += i`.
     /// The guard (`i > 2`) fires at positions 2 and 3; positions 0 and 1 carry.
     /// Modelled as sparse `step`s over the iteration extent — a change only where
@@ -4454,7 +4493,7 @@ mod tests {
             panic!("induction render is a Store");
         };
         assert_eq!(
-            store_change_ticks(&tile).len(),
+            tile.store_change_ticks().len(),
             2,
             "only the two committing positions are changes"
         );
@@ -4864,7 +4903,7 @@ mod tests {
         // Final accumulator value: 0 (carry) → 0 (carry) → 3 → 7.
         assert_eq!(store_current(&tile, &acc).map(|(_, v)| v), Some(int(7)));
         assert_eq!(
-            store_change_ticks(&tile).len(),
+            tile.store_change_ticks().len(),
             3,
             "tick 0 (the init seed) plus the two firing positions (items 3, 4); the rest carry"
         );
@@ -4882,7 +4921,7 @@ mod tests {
             Some(int(16))
         );
         assert_eq!(
-            store_change_ticks(&tile).len(),
+            tile.store_change_ticks().len(),
             4,
             "tick 0 (the init seed) plus every committing position (a dense changelog)"
         );
@@ -4904,7 +4943,7 @@ mod tests {
 
         let full = pull_to_terminal(&mut sched, &mut producer);
         assert_eq!(
-            store_change_ticks(&full).len(),
+            full.store_change_ticks().len(),
             4,
             "full dense changelog: seed + three writes"
         );
@@ -4922,7 +4961,7 @@ mod tests {
             "the accumulator still reads its correct final value after GC"
         );
         assert_eq!(
-            store_change_ticks(&bounded).len(),
+            bounded.store_change_ticks().len(),
             1,
             "keep-latest GC drops the superseded prefix (ticks 0,1,2), keeping only \
              the latest write (tick 3) — the changelog no longer grows with positions"
@@ -5532,7 +5571,8 @@ mod tests {
     /// [`CommitEngine::render_full_store_tile`].
     fn decode_store(tile: &Tile) -> Option<(usize, StoreEntries)> {
         let frontier = store_frontier(tile)?;
-        let entries = store_change_ticks(tile)
+        let entries = tile
+            .store_change_ticks()
             .into_iter()
             .map(|tick| {
                 let delta = tile
@@ -6886,7 +6926,9 @@ mod tests {
                     Box::new(Tile::Scalar(ColumnValue::from_ints(
                         log.iter().map(|(_, b)| *b).collect(),
                     ))),
-                    frontier.clone(),
+                    // As `CommitEngine` renders one: the store's frontier is the only
+                    // statement of what is decided.
+                    Predicate::False,
                     BitSet::new(),
                 );
                 (account.to_string(), tile)

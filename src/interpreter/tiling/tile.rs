@@ -94,12 +94,16 @@ pub enum Tile {
         /// One changelog per store key: a [`Tile::Record`] whose fields are the key
         /// space, each field a [`Tile::DataFunction`] over one row — the commit ticks at
         /// which that key was written, ascending, against the values written there.
-        /// A tick a key's changelog omits did not write it, so its value holds.
+        /// A tick a key's changelog omits did not write it, so its value holds. Each
+        /// changelog's own `domain_predicate` is `False`: read as a collection, a decided
+        /// tick it omits would be absent, and `frontier` is the one statement of which
+        /// ticks are decided.
         ///
-        /// A key's values are a tile, so a collection-valued key carries its elements
-        /// as a level rather than as one materialized cell; and a write set spanning
-        /// several keys lands as one tick in each of their changelogs, which is what
-        /// replaces a per-tick heterogeneous map.
+        /// A key's values are one scalar column, one cell per tick
+        /// (`commit_operator::changelog_value`), so a collection-valued key holds each
+        /// collection it was written as one materialized map value. Carrying its elements
+        /// as a level beneath the tick is `TODO(store-key-levels)`. A write set spanning
+        /// several keys lands as one tick in each of their changelogs.
         state: Box<Tile>,
         /// The decided frontier: `LessThanEq(w)` means every tick `≤ w` is decided
         /// — the watermark `w` counts trailing carries (positions past the latest
@@ -760,20 +764,43 @@ impl Tile {
             // collection's — consumers release a prefix of it. A tick naming any key is a
             // change of the store, so the ticks are the union over the key changelogs.
             Tile::Store {
-                state,
-                frontier,
-                terminal,
-                ..
+                frontier, terminal, ..
             } => {
                 if *terminal {
                     TileGuard::Function(FunctionGuard::Domain(Predicate::True))
                 } else {
                     TileGuard::Function(FunctionGuard::Domain(
-                        store_change_ticks(state).union(frontier),
+                        Predicate::from_column_value(&ColumnValue::from_uints(
+                            self.store_change_ticks(),
+                        ))
+                        .union(frontier),
                     ))
                 }
             }
         }
+    }
+
+    /// Every commit tick at which this store records a write, ascending and deduplicated:
+    /// the union of its keys' changelogs. A tick is a change of the store when any one key's
+    /// changelog carries it, so a carry-forward read emits a position at each.
+    pub fn store_change_ticks(&self) -> Vec<usize> {
+        let Tile::Store { state, .. } = self else {
+            panic!("store_change_ticks is a store's: {self:?}")
+        };
+        let Tile::Record(keys) = state.as_ref() else {
+            unreachable!("a store's state is a record of per-key changelogs; got {state:?}")
+        };
+        let mut ticks = std::collections::BTreeSet::new();
+        for log in keys.values() {
+            let Tile::DataFunction { domain, .. } = log else {
+                unreachable!("a store key's changelog is a collection; got {log:?}")
+            };
+            ticks.extend((0..domain.len()).map(|i| match domain.index_at(i) {
+                Value::UInt(tick) => tick,
+                other => unreachable!("a changelog is keyed by commit ticks; got {other:?}"),
+            }));
+        }
+        ticks.into_iter().collect()
     }
 
     /// A collection over one row — the whole value — with dev-build-only validation.
@@ -1554,18 +1581,6 @@ pub fn validate_tile(tile: &Tile) -> bool {
         Tile::DataFunction { row_starts, .. } => valid_over(tile, row_starts.len()),
         Tile::Store { .. } => valid_over(tile, 1),
     }
-}
-
-/// Every commit tick at which a store's state records a write, as the predicate naming
-/// them: a tick is a change of the store when any one key's changelog carries it.
-fn store_change_ticks(state: &Tile) -> Predicate {
-    let Tile::Record(keys) = state else {
-        unreachable!("a store's state is a record of per-key changelogs; got {state:?}")
-    };
-    keys.values().fold(Predicate::False, |acc, log| match log {
-        Tile::DataFunction { domain, .. } => acc.union(&Predicate::from_column_value(domain)),
-        other => unreachable!("a store key's changelog is a collection; got {other:?}"),
-    })
 }
 
 /// Whether `tile` is well formed as a value vectorized over `rows` rows.
