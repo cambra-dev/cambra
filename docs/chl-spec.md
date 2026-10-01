@@ -1079,13 +1079,13 @@ body.
 | `(e,)`, `(e₀, e₁, …)`, `e₀, e₁, …` | An anonymous heterogeneous product (tuple). Element types may differ. Tuples are positional, not unordered: `(1, 2)` and `(2, 1)` are distinct values. |
 | `(name=e, …)` | A record (named-field product). Field names are bare identifiers; field types may differ. The parentheses are the product constructor, shared with tuples (§2.4). |
 
-**List elements are constants.** Each element of a list literal is a constant or an expression
-that evaluates to one: it names no loop, comprehension, lambda or `def` variable, no mutable
-variable an enclosing loop writes, and no local or function derived from one of those.
-`[x, x * 10]` inside `for x in xs` is a compile error (``a list element must be a constant, but
-this one varies with `x` ``). The rule is read off the program text, so a `def` parameter counts
-inside the body whatever a call passes: `def f(n): [n, 1]` is refused. A collection whose
-elements vary is a comprehension's job, as in `[n for i in [1, 2]]`.
+**List elements are constants.** Each element of a list literal has one value however the program
+runs: it may not depend on the variable of an enclosing loop or comprehension, or on a mutable
+variable an enclosing loop writes, including through a local or a call. `[x, x * 10]` inside
+`for x in xs` is a compile error (``a list element must be a constant, but this one varies with
+`x` ``). A `def` parameter is whatever its call passes, so `def f(n): [n, 1]` builds `[3, 1]`
+from `f(3)` and is refused under `for x in xs: f(x)`. A collection whose elements vary is a
+comprehension's job, as in `[n for i in [1, 2]]`.
 
 > **Partly implemented.** A closed scalar computation such as `[1 + 1]` folds to its constant
 > during planning and is accepted. A closed element that folding does not reduce, such as

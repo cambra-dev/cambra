@@ -754,3 +754,122 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 // type-checks as a Σ (the consumer's kind variable pinned by it) and *compiles* via
 // value-`Case` fan-out — see `conditionals.rs` for the end-to-end
 // compile-and-run coverage.
+
+// ---------------------------------------------------------------------------
+// List literal elements are constants
+// ---------------------------------------------------------------------------
+
+/// Compile `body` as the statements of a program feeding `out`, and answer its rendered
+/// compile errors, or `None` if it compiles.
+fn list_element_errors(body: &str) -> Option<String> {
+    let code = format!("out = defer()\n{}\nout\n", body.trim_end());
+    let mut ctx = cambra::ccl::context::GlobalContext::default();
+    let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
+    match cambra::ccl::context::compile_program(&mut ctx, &code, consumer) {
+        Ok(_) => None,
+        Err(errs) => Some(cambra::ccl::context::render_errors(&errs, "<test>", &code)),
+    }
+}
+
+/// An element that varies when the program runs is refused, naming the variable it varies with
+/// where the program wrote one. A mutable variable's read reaches the check as a read of the
+/// loop's accumulator record, which no name of the program's spells, so that refusal names
+/// none.
+#[rstest]
+#[case::loop_variable(indoc! {"
+    for x in [1, 2]:
+        out << [x, x * 10]
+"}, Some("x"))]
+#[case::comprehension_variable("out << [[x] for x in [1, 2]]\n", Some("x"))]
+#[case::local_computed_from_the_loop_variable(indoc! {"
+    for x in [1, 2]:
+        y = x * 2
+        out << [y]
+"}, Some("x"))]
+#[case::binding_inside_a_block(indoc! {"
+    c = 3 > 2
+    for x in [1, 2]:
+        y = if c:
+                d = x * 2
+                d
+            else:
+                0
+        out << [y]
+"}, Some("x"))]
+#[case::def_capturing_the_loop_variable(indoc! {"
+    for x in [1, 2]:
+        def h(k):
+            x + k
+        out << [h(1)]
+"}, Some("x"))]
+#[case::def_parameter_passed_the_loop_variable(indoc! {"
+    def f(n):
+        [n, 1]
+    for x in [1, 2]:
+        out << sum(f(x))
+"}, Some("x"))]
+#[case::mutable_written_in_the_loop(indoc! {"
+    acc := 0
+    for x in [1, 2]:
+        acc := acc + x
+        out << [acc]
+"}, None)]
+#[case::transactional_variable_written_in_the_block(indoc! {"
+    q: Mut(Int, Txn) := 0
+    with begin():
+        q := q + 1
+        out << [q, 1]
+"}, None)]
+fn a_varying_list_element_is_refused(#[case] body: &str, #[case] varies_with: Option<&str>) {
+    let rendered = list_element_errors(body).expect("the program is refused");
+    let expected = match varies_with {
+        Some(name) => {
+            format!("a list element must be a constant, but this one varies with `{name}`")
+        }
+        None => "a list element must be a constant, but this one varies\n".to_string(),
+    };
+    assert!(rendered.contains(&expected), "{rendered}");
+}
+
+/// An element that does not vary when the program runs is not refused as varying, whatever names
+/// it reads. Some of these programs fail later for another reason: a list literal fed inside a
+/// loop is not planned yet (`a_per_element_record_holding_a_list_literal_is_not_yet_planned`).
+#[rstest]
+#[case::constant_elements_in_a_loop(indoc! {"
+    for x in [1, 2]:
+        out << [1, 2]
+"})]
+#[case::shadowed_loop_variable(indoc! {"
+    for x in [1, 2]:
+        x = 1
+        out << [x]
+"})]
+#[case::accumulator_after_its_loop(indoc! {"
+    acc := 0
+    for x in [1, 2]:
+        acc := acc + x
+    out << [acc]
+"})]
+#[case::def_capturing_nothing(indoc! {"
+    for x in [1, 2]:
+        def h(k):
+            k + 1
+        out << [h(1)]
+"})]
+#[case::match_payload_shadowing_the_loop_variable(indoc! {"
+    for x in [1, 2]:
+        y = (match `some(5): case `some(x): x)
+        out << [y]
+"})]
+#[case::def_parameter_passed_a_constant(indoc! {"
+    def f(n):
+        [n, 1]
+    out << sum(f(3))
+"})]
+fn a_constant_list_element_is_not_refused_as_varying(#[case] body: &str) {
+    let rendered = list_element_errors(body).unwrap_or_default();
+    assert!(
+        !rendered.contains("a list element must be a constant, but this one varies"),
+        "{rendered}"
+    );
+}

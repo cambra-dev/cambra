@@ -604,14 +604,15 @@ fn a_collection_fed_from_inside_a_loop_does_not_compile() {
     let Err(errs) = compile_program(&mut ctx, source, consumer) else {
         panic!("expected a compile error");
     };
-    // Both elements vary, and each is refused at its own span.
+    // One refusal, pointing at the first element that reads the loop variable.
+    assert_eq!(errs.len(), 1, "{errs:?}");
     let rendered = render_errors(&errs, "<test>", source);
-    assert_eq!(
-        rendered
-            .matches("a list element must be a constant, but this one varies with `x`")
-            .count(),
-        2,
+    assert!(
+        rendered.contains("a list element must be a constant, but this one varies with `x`"),
         "{rendered}"
     );
-    assert!(rendered.contains("out << [x, x * 10]"), "{rendered}");
+    assert!(
+        rendered.contains("3:13"),
+        "the span is the element `x`: {rendered}"
+    );
 }
