@@ -1,10 +1,5 @@
 //! The two rewrites a **correlated** comprehension's `curry` site needs.
 //!
-//! Neither moves a refinement to make it compile. Where a refinement sits is decided by what
-//! it says — a present-key proof rides the binder whose lookup reads it, a filter rides the
-//! pair it selects from — and `lambda_elim` places both. What is left here is naming a
-//! domain the term does not carry, and applying a filter nothing else applies.
-//!
 //! An inner comprehension whose body reads the outer binder runs once per outer row, and
 //! `lambda_elim` writes that as `curry(𝑔)` over the outer collection, where `𝑔` takes the pair
 //! `(outer value, inner element)`. Both rewrites read that pair.

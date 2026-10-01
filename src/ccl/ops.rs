@@ -470,7 +470,8 @@ pub enum Builtin {
     /// surviving elements differ per key. Planning emits this when a refinement rides
     /// the inner collection's domain under the outer key's binder, which is what a
     /// per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produces.
-    /// Compiles to the `MapFilter` tile operator.
+    /// Compiles to the `Filter` tile operator, as `filter_values` does: the predicate
+    /// compiles over the two-level input, so its mask is over the inner keys.
     MapFilter,
 
     // Aggregations (codomain of a function-typed input → scalar).

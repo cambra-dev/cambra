@@ -561,16 +561,28 @@ impl TileProducer for UncurryProducer {
     }
 }
 
-/// Filters a function tile by a predicate, keeping only pairs whose domain element
-/// maps to `true` under the predicate.
+/// Filters a collection by a predicate over its keys, keeping the entries the predicate
+/// maps to `true` together with their values.
 ///
-/// The `predicate` operator must produce a function from the input's domain type to
-/// `bool`. For each domain element in the input tile, the predicate is evaluated;
-/// only elements where it returns `true` are retained together with their associated
-/// codomain values.
+/// The predicate takes one of two forms.
 ///
-/// TODO we should replace this with a Restrict node that filters based on a function of the domain,
-/// rather than this which filters based on a function of the codomain.
+/// - **A function value.** It is applied to the input's outermost keys, and the answer is
+///   the mask over them.
+/// - **A collection over the input's levels down to some depth, with `Bool` beneath.** Its
+///   innermost values are one boolean per key of the input's level at that depth, so they
+///   are the mask over that level: [`Tile::retain_keys`] drops entries from each row's
+///   group and leaves every level above standing. A one-level predicate filters the
+///   input's own keys. A deeper one filters the inner collections one outer key at a time,
+///   which is what a correlated filter and a per-group filter
+///   (`sum([s.amount for s in g if s.qty > 2])` over a `groupby`) need: the survivors
+///   differ from row to row.
+///
+/// The input may hold levels beneath the predicate's depth. Those are part of each
+/// surviving entry's value, and the filter does not read them.
+///
+/// TODO we should replace the function-value form with a Restrict node that filters based
+/// on a function of the domain, rather than this which filters based on a function of the
+/// codomain.
 pub struct Filter {
     /// Output tiling, equal to the input tiling (filtering preserves the type).
     base: OperatorBase,
@@ -582,8 +594,26 @@ pub struct Filter {
 
 impl Filter {
     /// Create a `Filter` that retains elements of `input` for which `predicate` is `true`.
+    ///
+    /// Panics if a collection-valued predicate holds more levels than the input: its mask
+    /// would name keys the input does not have.
     pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
+        let levels = |tiling: &Tiling| {
+            let mut levels = 0;
+            let mut node = tiling;
+            while let Tiling::DataFunction { codomain, .. } = node {
+                levels += 1;
+                node = codomain;
+            }
+            levels
+        };
+        assert!(
+            levels(predicate.tiling()) <= levels(&tiling),
+            "a filter's predicate masks one of its input's levels, so it holds no more levels \
+             than the input: predicate {}, input {tiling}",
+            predicate.tiling(),
+        );
         Self {
             base: OperatorBase::new(tiling),
             input,
@@ -666,63 +696,59 @@ impl TileProducer for FilterProducer {
                 }
                 _ => panic!("Filter predicate is not a function"),
             },
-            // Both predicate and input are collections over the same entries: the predicate
-            // compiled over the same rows, so its innermost values are one boolean per
-            // innermost key, in key order — the mask `retain_keys` takes, which re-offsets
-            // the groups a filter shortens.
+            // The predicate is a collection over the input's levels down to its own innermost
+            // one, so its innermost values are one boolean per key of the input's level at
+            // that depth, in key order — the mask `retain_keys` takes, which re-offsets the
+            // groups a filter shortens.
             (pred @ Tile::DataFunction { .. }, mut input @ Tile::DataFunction { .. }) => {
+                let depth = pred
+                    .innermost_depth()
+                    .unwrap_or_else(|| unreachable!("the arm matched a collection"));
                 let Tile::DataFunction {
                     domain: pred_keys, ..
-                } = pred
-                    .innermost_level()
-                    .unwrap_or_else(|| unreachable!("the arm matched a collection"))
+                } = pred.values_at(depth)
                 else {
-                    unreachable!("innermost_level answers a collection")
+                    unreachable!("innermost_depth names a collection")
                 };
-                let Tile::DataFunction { domain: inner, .. } = input
-                    .innermost_level()
-                    .unwrap_or_else(|| unreachable!("the arm matched a collection"))
-                else {
-                    unreachable!("innermost_level answers a collection")
+                let Tile::DataFunction { domain: keys, .. } = input.values_at(depth) else {
+                    panic!(
+                        "a filter's predicate masks the level at depth {depth}, which its \
+                         input does not hold: {input:?}"
+                    )
                 };
                 // **The mask is positional**, so it applies only while the two sides are in
                 // step. An input with nothing in it is already filtered — the predicate
                 // keeps answering for entries whose rows have been handed on.
-                if inner.is_empty() {
+                if keys.is_empty() {
                     return input;
                 }
-                // Anything else out of step is a shape this does not serve, and it says so
-                // rather than reading a mask across the misalignment (which drops the wrong
-                // entries, silently) or answering empty (which waits for an alignment that is
-                // not coming). Each side is pulled from its own branch of the pairs, and a
-                // source delivering its rows one at a time — a transaction's — lets the
-                // predicate reach entries the input has not.
+                // Anything else out of step is refused rather than read across the
+                // misalignment, which drops the wrong entries silently, or answered empty,
+                // which waits for an alignment that is not coming. Each side is pulled from
+                // its own branch of the pairs, so either may have reached entries the other
+                // has not.
                 assert_eq!(
                     pred_keys.len(),
-                    inner.len(),
-                    "a correlated filter needs its predicate and its rows in step; the \
-                     predicate has answered for a different number of entries than the rows \
-                     carry. A source that delivers rows one at a time is the case this does \
-                     not serve yet.",
+                    keys.len(),
+                    "a filter needs its predicate and its rows in step; the predicate has \
+                     answered for a different number of entries than the rows carry",
                 );
                 // Equal counts are what a positional mask needs stated on every pull, and
-                // equal keys are what makes it the right mask. The second walks both columns,
-                // so it is checked where checks cost nothing.
+                // equal paths are what makes it the right mask. A cartesian product gives
+                // every row the same inner keys, so the masked level's column alone would
+                // pass a predicate one row ahead of the input; the whole path to each entry
+                // does not. Comparing them walks every level, so it is checked where checks
+                // cost nothing.
                 debug_assert!(
-                    pred_keys == inner,
-                    "a correlated filter's predicate and rows agree in count but not in keys, \
-                     so the mask is positional over two different orders",
+                    pred.row_paths_at(depth + 1) == input.row_paths_at(depth + 1),
+                    "a filter's predicate and rows agree in count but not in paths, so the \
+                     mask is positional over two different orders",
                 );
                 let pred_column = scalar_tile_to_column_value(pred.deepest_values().clone());
                 let mask = pred_column
                     .as_bitvec()
                     .unwrap_or_else(|| panic!("Expected bools"));
-                // The mask names the innermost keys, so it drops entries from each row's
-                // group and leaves every level above standing.
-                input
-                    .innermost_level_mut()
-                    .unwrap_or_else(|| unreachable!("the arm matched a collection"))
-                    .retain_keys(mask);
+                input.values_at_mut(depth).retain_keys(mask);
                 input
             }
             _ => panic!("Invalid Filter input tiles"),
@@ -769,175 +795,6 @@ fn predicate_release(guard: TileGuard, predicate: &Tiling) -> TileGuard {
         other => unreachable!(
             "a filter's output is a collection, so its guard is a function guard, got {other:?}"
         ),
-    }
-}
-
-/// Filters the **inner collections** of a collection of collections, one outer key at a
-/// time.
-///
-/// [`Filter`] and [`Restrict`] both narrow a collection's own keys. Neither reaches inside
-/// a nested one, where the keys a predicate selects on are the inner collection's — the
-/// per-key collection — and the survivors differ from key to key. A per-group filter
-/// (`sum([s.amount for s in g if s.qty > 2])` over a `groupby`) is that shape: the
-/// refinement rides the inner collection's keys, under the outer key's binder.
-///
-/// The predicate produces the same nesting over `Bool`, so its innermost values are the
-/// mask directly — inner key `i` survives iff the predicate's entry `i` is `true`. Running
-/// the keys of every group together is what makes this one masked pass rather than a
-/// per-key loop: the outer level is untouched, and [`Tile::retain_keys`] re-cuts the inner
-/// runs around the survivors.
-pub struct MapFilter {
-    /// Output tiling, equal to the input's — filtering removes rows, not structure.
-    base: OperatorBase,
-    /// The two-level input whose inner collections are filtered.
-    input: Box<dyn TileOperator>,
-    /// A `Bool`-codomain two-level function over the input's keys and inner domain.
-    predicate: Box<dyn TileOperator>,
-}
-
-impl MapFilter {
-    /// Create a `MapFilter` retaining the inner-collection rows where `predicate` holds.
-    ///
-    /// Panics unless both operands hold two levels: the whole point of this
-    /// operator is the inner domain, and a one-level collection has no inner domain to
-    /// filter (use [`Filter`] or [`Restrict`]).
-    pub fn new(input: Box<dyn TileOperator>, predicate: Box<dyn TileOperator>) -> Self {
-        let two_levels = |tiling: &Tiling| {
-            matches!(tiling, Tiling::DataFunction { codomain, .. }
-                if matches!(codomain.as_ref(), Tiling::DataFunction { codomain: inner, .. }
-                    if !inner.holds_a_level()))
-        };
-        let tiling = input.tiling().clone();
-        assert!(
-            two_levels(&tiling),
-            "MapFilter expects a two-level DataFunction input, got {tiling:?}"
-        );
-        assert!(
-            two_levels(predicate.tiling()),
-            "MapFilter expects a two-level DataFunction predicate, got {:?}",
-            predicate.tiling()
-        );
-        Self {
-            base: OperatorBase::new(tiling),
-            input,
-            predicate,
-        }
-    }
-}
-
-impl TileOperator for MapFilter {
-    impl_operator_base!();
-
-    fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
-        visit(value("input", &*self.input));
-        visit(value("predicate", &*self.predicate));
-    }
-
-    fn subscribe(
-        &mut self,
-        _intent_guard: TileGuard,
-        consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
-        let predicate_producer = self.predicate.subscribe(
-            self.predicate.tiling().universal_guard(),
-            forwarding_consumer(&shared),
-            scheduler,
-        );
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            forwarding_consumer(&shared),
-            scheduler,
-        );
-        Box::new(MapFilterProducer {
-            base: ProducerBase::new(MapFilterProducer::alloc_id(), self.tiling()),
-            input: input_producer,
-            predicate: predicate_producer,
-        })
-    }
-
-    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
-        self.input.result_correlation()
-    }
-}
-
-struct MapFilterProducer {
-    base: ProducerBase,
-    input: Box<dyn TileProducer>,
-    predicate: Box<dyn TileProducer>,
-}
-
-impl TileProducer for MapFilterProducer {
-    impl_producer_base!();
-
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
-            .child("predicate", self.predicate.inspect(opts))
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let pred_guard = self.predicate.tiling().universal_guard();
-        let input_guard = self.input.tiling().universal_guard();
-        let predicate_result = self.predicate.get(pred_guard);
-        let mut input_result = self.input.get(input_guard);
-
-        let Tile::DataFunction {
-            codomain: pred_inner_tile,
-            ..
-        } = predicate_result
-        else {
-            panic!("MapFilter predicate produced a non-collection");
-        };
-        let Tile::DataFunction {
-            domain: pred_inner,
-            codomain: pred_rows,
-            ..
-        } = *pred_inner_tile
-        else {
-            panic!("MapFilter predicate is not a collection of collections");
-        };
-        let Tile::DataFunction {
-            codomain: inner, ..
-        } = &input_result
-        else {
-            panic!("MapFilter input produced {input_result:?}, expected a collection");
-        };
-        let Tile::DataFunction {
-            domain: input_inner,
-            ..
-        } = inner.as_ref()
-        else {
-            panic!("MapFilter input is not a collection of collections");
-        };
-        let pred_inner = &pred_inner;
-        // The mask is positional over the flattened rows, so the two sides must be
-        // the same flattening of the same keys. They share an upstream `FanOut`, so
-        // a mismatch is a planning bug rather than a data-dependent case.
-        debug_assert_eq!(
-            pred_inner, input_inner,
-            "MapFilter predicate and input must flatten the same inner domains"
-        );
-        let pred_column = scalar_tile_to_column_value(*pred_rows);
-        let mask = pred_column
-            .as_bitvec()
-            .unwrap_or_else(|| panic!("MapFilter predicate codomain is not boolean"));
-        let Tile::DataFunction {
-            codomain: inner, ..
-        } = &mut input_result
-        else {
-            unreachable!("the shape was matched above")
-        };
-        inner.retain_keys(mask);
-        input_result
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Both sides read the same upstream collection, so they release together —
-        // releasing one leaves the other's `FanOut` guard stale, which re-delivers
-        // consumed rows on the next `get`. Same coupling as [`Filter`].
-        self.predicate.release(obsolete_guard.clone());
-        self.input.release(obsolete_guard);
     }
 }
 
@@ -1303,6 +1160,107 @@ mod tests {
     use super::*;
     use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
     use crate::interpreter::{BaseType, ColumnValue, Extent};
+
+    fn uints(values: &[usize]) -> ColumnValue {
+        ColumnValue::UInts(values.to_vec())
+    }
+
+    /// One level of `keys` grouped by `starts`, over `codomain`.
+    fn level(starts: &[usize], keys: &[usize], codomain: Tile) -> Tile {
+        Tile::grouped(
+            uints(starts),
+            uints(keys),
+            Box::new(codomain),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    /// A collection keyed `1` and `2` over `codomain`.
+    fn outer(codomain: Tile) -> Tile {
+        Tile::data_function(
+            uints(&[1, 2]),
+            Box::new(codomain),
+            Predicate::True,
+            BitSet::new(),
+        )
+    }
+
+    /// `levels` collections of `UInt` keys over `UInt` values.
+    fn uint_tiling(levels: usize) -> Tiling {
+        (0..levels).fold(
+            Tiling::Scalar(Extent::Base(BaseType::UInt)),
+            |codomain, _| Tiling::data_function(Extent::Base(BaseType::UInt), codomain),
+        )
+    }
+
+    /// The predicate both cases filter by: two levels over the keys `1 ↦ [10, 20]` and
+    /// `2 ↦ [10, 30]`, keeping `(1, 10)` and `(2, 30)`.
+    fn per_row_predicate() -> TestTileProducer {
+        let mask: BitVec = [true, false, false, true].into_iter().collect();
+        TestTileProducer::new(
+            outer(level(
+                &[0, 2],
+                &[10, 20, 10, 30],
+                Tile::Scalar(ColumnValue::Bools(mask)),
+            )),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::data_function(
+                    Extent::Base(BaseType::UInt),
+                    Tiling::Scalar(Extent::Base(BaseType::Bool)),
+                ),
+            ),
+        )
+    }
+
+    fn filter(input: Tile, levels: usize) -> Tile {
+        let tiling = uint_tiling(levels);
+        let mut filter = FilterProducer {
+            base: ProducerBase::new(FilterProducer::alloc_id(), &tiling),
+            input: Box::new(TestTileProducer::new(input, tiling.clone())),
+            predicate: Box::new(per_row_predicate()),
+        };
+        filter.get(filter.tiling().universal_guard())
+    }
+
+    /// A two-level predicate masks each row's inner keys, so the survivors differ by row and
+    /// the outer level stands.
+    #[test]
+    fn a_two_level_predicate_filters_each_rows_inner_keys() {
+        let input = outer(level(
+            &[0, 2],
+            &[10, 20, 10, 30],
+            Tile::Scalar(uints(&[100, 200, 300, 400])),
+        ));
+        assert_eq!(
+            filter(input, 2),
+            outer(level(&[0, 1], &[10, 30], Tile::Scalar(uints(&[100, 400])))),
+        );
+    }
+
+    /// An input holding a level beneath the predicate's is masked at the predicate's depth:
+    /// each dropped key takes its group of the level below with it.
+    #[test]
+    fn a_predicate_masks_the_level_at_its_own_depth() {
+        let input = outer(level(
+            &[0, 2],
+            &[10, 20, 10, 30],
+            level(
+                &[0, 2, 3, 4],
+                &[5, 6, 5, 7, 8, 9],
+                Tile::Scalar(uints(&[1, 2, 3, 4, 5, 6])),
+            ),
+        ));
+        assert_eq!(
+            filter(input, 3),
+            outer(level(
+                &[0, 1],
+                &[10, 30],
+                level(&[0, 2], &[5, 6, 8, 9], Tile::Scalar(uints(&[1, 2, 5, 6]))),
+            )),
+        );
+    }
 
     #[test]
     fn uncurry_producer_basic() {

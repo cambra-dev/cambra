@@ -247,11 +247,18 @@ fn refuse_escaped_pair_witness(expr: &Expr) -> Result<(), LambdaElimError> {
 /// Currently stateless — the nested-lambda rule mints its `__pair` binder
 /// straight from [`Name::pair`] (uid-identified, no counter to carry) — but
 /// kept as the threaded context the elimination walk already expects.
-struct ElimContext {}
+struct ElimContext {
+    /// The rebuilds of filters lifted onto a pair, keyed by the pair's parameter and its
+    /// bare product: one memo for the pass, so the occurrences of one filter that shared an
+    /// `Rc` share its rebuild ([`crate::ccl::ccl_utils::PredMemo`]).
+    pair_lifts: crate::ccl::ccl_utils::PredMemo<(Name, Type)>,
+}
 
 impl ElimContext {
     fn new() -> Self {
-        Self {}
+        Self {
+            pair_lifts: crate::ccl::ccl_utils::PredMemo::new(),
+        }
     }
 
     /// A fresh `__pair` binder for the nested-lambda rule.
@@ -945,14 +952,8 @@ fn elim_lambda_impl(
             // take the proof away from the site that needs it. A filter the program wrote
             // is the other kind: nothing has applied it yet.
             //
-            // **A filter reading only the element lifts too, which is more than it needs.**
-            // Its natural home is the component, where the type would still say it depends
-            // on the element alone, and where the inner domain could be narrowed once
-            // instead of once per outer row. Neither inner-source builder applies a
-            // component refinement today: the type-read route strips it in `extent_of` and
-            // drops the filter, and the named-source route hands the refined domain to
-            // `IterateExtent`, which rejects it. Until both narrow the inner domain
-            // themselves, the pair is the only place a filter is applied at all.
+            // A filter reading only the element lifts too, because neither inner-source
+            // builder applies a refinement left on the inner component.
             let (lifting, staying): (Vec<Refinement>, Vec<Refinement>) = y_ty
                 .refinements()
                 .iter()
@@ -990,9 +991,16 @@ fn elim_lambda_impl(
                     crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
                         .apply_expr(&on_element)
                 };
+                let key = (param.clone(), bare_pair.clone());
                 let lifted: Vec<Refinement> = lifting
-                    .iter()
-                    .map(|r| Refinement::born(Rc::new(onto_pair(&r.predicate))))
+                    .into_iter()
+                    .map(|mut r| {
+                        ctx.pair_lifts.rebuild(&mut r, &key, |predicate| {
+                            *predicate = onto_pair(&Rc::new(predicate.clone()));
+                            true
+                        });
+                        r
+                    })
                     .collect();
                 if lifted.is_empty() {
                     bare_pair.clone()
@@ -2097,7 +2105,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     if let Ok(e) = &result {
         assert!(
             reclosed_let_ty || original_ty.without_pi_names() == e.ty.without_pi_names(),
-            "{} vs {}",
+            "lambda elimination changed a node's type: {} vs {}",
             original_ty,
             e.ty
         );
