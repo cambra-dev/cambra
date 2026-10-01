@@ -150,7 +150,7 @@ handle. The domain name lets consumers type against the handle before the channe
 Channelization stamps constructed nodes from their typed children, then substitutes each rigid
 name with its assembled domain and erases the `Feed` history wrapper. This does not require a
 second inference pass. The strict post-channelization type check verifies the result. See
-[Feed handles as an invariant History constructor](type-inference.md#feed-handles-as-an-invariant-history-constructor-typehistory--kind-feed-).
+[Feed handles as invariant histories](type-inference.md#feed-handles-as-invariant-histories).
 
 For a structured mutation loop, `emit_for` checks that the source is a function, binds its element
 type to the loop target, and checks the body as a statement. The `For` node has type `Unit`.
