@@ -1071,7 +1071,7 @@ impl Tile {
             };
             complete = match depth {
                 0 => domain_predicate.clone(),
-                _ => Predicate::qualified(complete, Predicate::True).union(domain_predicate),
+                _ => complete.descend(1).union(domain_predicate),
             };
             node = codomain;
         }
@@ -1490,18 +1490,23 @@ impl Tile {
                 groups[group].push(row);
             }
         }
-        groups
-            .into_iter()
-            .map(|rows| {
-                let (start, end) = self.row_run(rows[0]);
-                let keys =
-                    Predicate::from_column_value(&domain.select_indices(start..end, end - start));
-                let rows = rows.iter().fold(Predicate::False, |all, &row| {
-                    all.union(&Predicate::exactly(&row_paths[row]))
-                });
-                Predicate::qualified(rows, keys)
-            })
-            .fold(Predicate::False, |all, one| all.union(&one))
+        Predicate::union_all(
+            groups
+                .into_iter()
+                .map(|rows| {
+                    let (start, end) = self.row_run(rows[0]);
+                    let keys = Predicate::from_column_value(
+                        &domain.select_indices(start..end, end - start),
+                    );
+                    let rows = Predicate::union_all(
+                        rows.iter()
+                            .map(|&row| Predicate::exactly(&row_paths[row]))
+                            .collect(),
+                    );
+                    Predicate::qualified(rows, keys)
+                })
+                .collect(),
+        )
     }
 
     /// The half-open run of `domain` belonging to row `row`.
@@ -2216,6 +2221,156 @@ mod tests {
             keys_left(codomain(Predicate::True)),
             ColumnValue::UInts(vec![])
         );
+    }
+
+    /// Two rows, `0 ↦ {10, 11}` and `1 ↦ {10}`, nothing stated complete.
+    fn two_rows() -> Tile {
+        two_level_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 10],
+            vec![1, 2, 3],
+            Predicate::False,
+        )
+    }
+
+    /// One row's group taken out as a collection of its own.
+    fn group(keys: Vec<usize>, values: Vec<i64>, stated: Predicate) -> Tile {
+        Tile::data_function(
+            ColumnValue::UInts(keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            stated,
+            BitSet::new(),
+        )
+    }
+
+    /// At the outermost level the whole tile is the one group, so the rebuild is the group.
+    #[test]
+    fn regroup_beneath_at_the_outermost_level_is_the_one_group() {
+        let replacement = group(vec![7], vec![70], Predicate::True);
+        let rebuilt = two_rows().regroup_beneath(
+            CurryLevel::OUTERMOST,
+            Tile::Scalar(ColumnValue::Ints(Vec::new())),
+            &mut |_| replacement.clone(),
+        );
+        assert_eq!(rebuilt, replacement);
+    }
+
+    /// The rebuild may change each row's keys: the groups' runs are re-cut around what each
+    /// row now holds, the rows above stand, and each group's statement is read beneath its
+    /// own row.
+    #[test]
+    fn regroup_beneath_recuts_the_runs_around_new_keys() {
+        let rebuilt = two_rows().regroup_beneath(
+            CurryLevel::new(1),
+            group(Vec::new(), Vec::new(), Predicate::False),
+            &mut |row| match row {
+                0 => group(vec![5], vec![50], Predicate::False),
+                _ => group(vec![6, 7], vec![60, 70], Predicate::True),
+            },
+        );
+        let levels = rebuilt.key_levels();
+        assert_eq!(
+            *levels[0].1,
+            ColumnValue::UInts(vec![0, 1]),
+            "the rows stand"
+        );
+        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 1]));
+        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![5, 6, 7]));
+        let Tile::DataFunction {
+            domain_predicate: stated,
+            ..
+        } = rebuilt.values_at(CurryLevel::new(1))
+        else {
+            panic!("the rebuilt level is a collection: {rebuilt:?}")
+        };
+        let at = |r: usize, k: usize| stated.contains_path(&[Value::UInt(r), Value::UInt(k)]);
+        assert!(
+            at(1, 6) && at(1, 7),
+            "row 1's group said it is complete: {stated:?}"
+        );
+        assert!(!at(0, 5), "row 0's said nothing: {stated:?}");
+        assert!(
+            !at(0, 6),
+            "row 1's statement stays beneath row 1: {stated:?}"
+        );
+    }
+
+    /// With no rows there are no groups to run together, so the rebuilt level is the
+    /// caller's empty level.
+    #[test]
+    fn regroup_beneath_with_no_rows_answers_the_empty_level() {
+        let empty = two_level_uint_int(vec![], vec![], vec![], vec![], Predicate::False);
+        let level = Tile::grouped(
+            ColumnValue::UInts(Vec::new()),
+            ColumnValue::UInts(Vec::new()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(Vec::new()))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let rebuilt = empty.regroup_beneath(CurryLevel::new(1), level.clone(), &mut |row| {
+            unreachable!("no row {row} to rebuild")
+        });
+        assert_eq!(*rebuilt.values_at(CurryLevel::new(1)), level);
+    }
+
+    /// `per_group` derives that empty level from the result's tiling.
+    #[test]
+    fn per_group_reads_the_empty_level_off_the_tiling() {
+        let empty = two_level_uint_int(vec![], vec![], vec![], vec![], Predicate::False);
+        use crate::ccl::BaseType;
+        use crate::interpreter::Extent;
+        let uint = Extent::Base(BaseType::UInt);
+        let out = Tiling::data_function(
+            uint.clone(),
+            Tiling::data_function(uint, Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        let rebuilt = empty.per_group(&out, CurryLevel::new(1), &mut |row| {
+            unreachable!("no row {row} to rebuild")
+        });
+        assert_eq!(
+            *rebuilt.values_at(CurryLevel::new(1)),
+            out.values_at(CurryLevel::new(1)).empty_at_no_rows()
+        );
+    }
+
+    /// At the outermost level the group is the tile itself, borrowed; past the rows a tile
+    /// holds there is no group.
+    #[test]
+    fn group_at_borrows_the_outermost_group_and_has_none_past_the_rows() {
+        let tile = two_rows();
+        let whole = tile
+            .group_at(CurryLevel::OUTERMOST, 0)
+            .expect("the one group");
+        assert!(matches!(whole, Cow::Borrowed(_)));
+        assert_eq!(*whole, tile);
+        assert!(tile.group_at(CurryLevel::new(1), 2).is_none());
+    }
+
+    /// At the outermost level a dropped key takes its whole group with it.
+    #[test]
+    fn retain_paths_at_the_outermost_level_drops_a_key_with_its_group() {
+        let mut tile = two_rows();
+        tile.retain_paths(CurryLevel::OUTERMOST, &|p: &[Value]| p != [Value::UInt(0)]);
+        assert_eq!(
+            tile.paths_at(CurryLevel::new(1)),
+            vec![vec![Value::UInt(1), Value::UInt(10)]]
+        );
+    }
+
+    /// Three levels down, each level's mask is read against the survivors of the one above,
+    /// so one entry goes and its siblings and cousins stay.
+    #[test]
+    fn retain_paths_reads_whole_paths_three_levels_down() {
+        let mut tile = abc();
+        let gone = [Value::UInt(10), Value::UInt(2), Value::UInt(200)];
+        tile.retain_paths(CurryLevel::new(2), &|p: &[Value]| p != gone);
+        let u = |v: [usize; 3]| v.iter().map(|k| Value::UInt(*k)).collect::<Vec<_>>();
+        assert_eq!(
+            tile.paths_at(CurryLevel::new(2)),
+            vec![u([10, 1, 100]), u([10, 2, 201]), u([20, 3, 300])]
+        );
+        assert!(validate_tile(&tile));
     }
 
     /// `group_at` restates a group over its own paths, and `regroup_beneath` puts it back

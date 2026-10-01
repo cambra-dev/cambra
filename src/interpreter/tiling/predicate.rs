@@ -21,35 +21,36 @@ fn same_region(a: &Predicate, b: &Predicate) -> bool {
     a == b || (a.subsumes(b) && b.subsumes(a))
 }
 
-/// The two predicate shapes that are **boxes**: products of one predicate per component,
+/// The two predicate shapes that are **componentwise**: products of one predicate per component,
 /// admitting a key when every component admits its part.
 ///
-/// A [`Record`](Predicate::Record) is a box over one record key's fields, taken in name
-/// order, which is the order [`Value`]'s comparison takes them in. A
-/// [`Qualified`](Predicate::Qualified) predicate is a box over two components, the
-/// enclosing path and the key under it; an unqualified predicate is the box
+/// A [`Record`](Predicate::Record) is a componentwise predicate over one record key's fields, taken
+/// in name order, which is the order [`Value`]'s comparison takes them in. A
+/// [`Qualified`](Predicate::Qualified) predicate is a componentwise predicate over two components,
+/// the enclosing path and the key under it; an unqualified predicate is the componentwise predicate
 /// `(True, itself)` ([`split_qualification`](Predicate::split_qualification)).
 ///
-/// Both shapes take one algebra, written once over the components: boxes meet component
-/// by component, join where they differ in at most one component, and one box less another
-/// is a staircase of boxes. Containment is componentwise too, which is exact for products:
-/// a nonempty box lies inside another exactly when each of its components does.
-enum BoxShape {
+/// Both shapes take one algebra, written once over the components: componentwise predicates meet
+/// component by component, join where they differ in at most one component, and one componentwise
+/// predicate less another is a staircase of componentwise predicates. Containment is componentwise
+/// too, which is exact for products: a nonempty componentwise predicate lies inside another exactly
+/// when each of its components does.
+enum Componentwise {
     Record(Vec<String>),
     Qualified,
 }
 
-impl BoxShape {
-    /// `a` and `b` read as boxes of one shape, component by component, or `None` where
-    /// neither is a box.
+impl Componentwise {
+    /// `a` and `b` read as componentwise predicates of one shape, component by component, or `None`
+    /// where neither is componentwise.
     fn of<'a>(
         a: &'a Predicate,
         b: &'a Predicate,
-    ) -> Option<(BoxShape, Vec<&'a Predicate>, Vec<&'a Predicate>)> {
+    ) -> Option<(Componentwise, Vec<&'a Predicate>, Vec<&'a Predicate>)> {
         match (a, b) {
             (Predicate::Qualified { .. }, _) | (_, Predicate::Qualified { .. }) => {
                 let ((q1, k1), (q2, k2)) = (a.split_qualification(), b.split_qualification());
-                Some((BoxShape::Qualified, vec![q1, k1], vec![q2, k2]))
+                Some((Componentwise::Qualified, vec![q1, k1], vec![q2, k2]))
             }
             (Predicate::Record(m1), Predicate::Record(m2)) => {
                 assert!(
@@ -60,26 +61,27 @@ impl BoxShape {
                 names.sort();
                 let first = names.iter().map(|n| &m1[n]).collect();
                 let second = names.iter().map(|n| &m2[n]).collect();
-                Some((BoxShape::Record(names), first, second))
+                Some((Componentwise::Record(names), first, second))
             }
             _ => None,
         }
     }
 
-    /// The box with these components, in canonical form: a box with an empty component
-    /// admits nothing, and is [`Predicate::False`].
+    /// The componentwise predicate with these components, in canonical form: a componentwise
+    /// predicate with an empty component admits nothing, and is [`Predicate::False`].
     fn build(&self, components: Vec<Predicate>) -> Predicate {
         if components.iter().any(Predicate::is_false) {
             return Predicate::False;
         }
         match self {
-            BoxShape::Record(names) => {
+            Componentwise::Record(names) => {
                 Predicate::Record(names.iter().cloned().zip(components).collect())
             }
-            BoxShape::Qualified => {
-                let [enclosing, here]: [Predicate; 2] = components
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("a qualified box has two components"));
+            Componentwise::Qualified => {
+                let [enclosing, here]: [Predicate; 2] =
+                    components.try_into().unwrap_or_else(|_| {
+                        unreachable!("a qualified componentwise predicate has two components")
+                    });
                 Predicate::qualified(enclosing, here)
             }
         }
@@ -89,9 +91,10 @@ impl BoxShape {
         self.build(a.iter().zip(b).map(|(p, q)| p.intersect(q)).collect())
     }
 
-    /// The one box `a ∪ b` is, where there is one: the boxes agree on every component but
-    /// at most one, which takes the union of the two. Differing in two components, their
-    /// union has a corner neither box has, so no single box is it.
+    /// The one componentwise predicate `a ∪ b` is, where there is one: the componentwise predicates
+    /// agree on every component but at most one, which takes the union of the two. Differing in two
+    /// components, their union has a corner neither componentwise predicate has, so no single
+    /// componentwise predicate is it.
     fn join(&self, a: &[&Predicate], b: &[&Predicate]) -> Option<Predicate> {
         let differing: Vec<usize> = (0..a.len()).filter(|&i| !same_region(a[i], b[i])).collect();
         let mut components: Vec<Predicate> = a.iter().map(|p| (*p).clone()).collect();
@@ -103,10 +106,10 @@ impl BoxShape {
         Some(self.build(components))
     }
 
-    /// `a ∖ b` as a staircase: the box at step `i` keeps what component `i` alone leaves,
-    /// over the components before it that `b` does hold and the components after it
-    /// untouched. The steps are disjoint and cover `a ∖ b` exactly. Subtracting component
-    /// by component into one box instead drops every key agreeing with `b` in any
+    /// `a ∖ b` as a staircase: the componentwise predicate at step `i` keeps what component `i`
+    /// alone leaves, over the components before it that `b` does hold and the components after it
+    /// untouched. The steps are disjoint and cover `a ∖ b` exactly. Subtracting component by
+    /// component into one componentwise predicate instead drops every key agreeing with `b` in any
     /// component, so `(1, 0) ∖ ({1} × {1})` would come back empty.
     fn minus(&self, a: &[&Predicate], b: &[&Predicate]) -> Predicate {
         let steps: Vec<Predicate> = (0..a.len())
@@ -129,19 +132,21 @@ impl BoxShape {
         }
     }
 
-    /// Whether box `a` contains box `b`, for a nonempty `b`.
+    /// Whether componentwise predicate `a` contains componentwise predicate `b`, for a nonempty
+    /// `b`.
     fn contains(a: &[&Predicate], b: &[&Predicate]) -> bool {
         a.iter().zip(b).all(|(p, q)| p.subsumes(q))
     }
 }
 
-/// The one box two predicates' union is, where both are boxes and one box is their union.
+/// The one componentwise predicate two predicates' union is, where both are componentwise
+/// predicates and one componentwise predicate is their union.
 fn join(a: &Predicate, b: &Predicate) -> Option<Predicate> {
-    let (shape, first, second) = BoxShape::of(a, b)?;
+    let (shape, first, second) = Componentwise::of(a, b)?;
     shape.join(&first, &second)
 }
 
-/// The first of `arms` that `arm` joins with, and the box they join into.
+/// The first of `arms` that `arm` joins with, and the componentwise predicate they join into.
 fn join_with_any(arm: &Predicate, arms: &[Predicate]) -> Option<(usize, Predicate)> {
     arms.iter()
         .enumerate()
@@ -150,15 +155,14 @@ fn join_with_any(arm: &Predicate, arms: &[Predicate]) -> Option<(usize, Predicat
 
 /// A predicate that describes a subset of values in an extent.
 ///
-/// **One region has one spelling** wherever the representation allows it, because the
-/// derived `PartialEq` is what release accumulation tests to decide whether a release added
-/// anything ([`TileProducer::release`](crate::interpreter::tile_operators::TileProducer)):
-/// an ordered set is an [`Intervals`](Self::Intervals) clamped to its type's range
-/// ([`intervals`](Self::intervals)), an empty region is [`False`](Self::False), and a
-/// region covering the whole type is [`True`](Self::True). A union of boxes has more than
-/// one spelling in general; [`flatten_or`](Self::flatten_or) joins boxes that share all
-/// but one component, and [`subsumes`](Self::subsumes) compares regions rather than
-/// spellings.
+/// **One region has one spelling** wherever the representation allows it, because the derived
+/// `PartialEq` is what release accumulation tests to decide whether a release added anything
+/// ([`TileProducer::release`](crate::interpreter::tile_operators::TileProducer)): an ordered set is
+/// an [`Intervals`](Self::Intervals) clamped to its type's range ([`intervals`](Self::intervals)),
+/// an empty region is [`False`](Self::False), and a region covering the whole type is
+/// [`True`](Self::True). A union of componentwise predicates has more than one spelling in general;
+/// [`flatten_or`](Self::flatten_or) joins componentwise predicates that share all but one
+/// component, and [`subsumes`](Self::subsumes) compares regions rather than spellings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     True,
@@ -166,14 +170,14 @@ pub enum Predicate {
     /// An ordered scalar key's admitted values. Never built over records: a record key is
     /// described field by field, as a [`Record`](Self::Record) or a union of them.
     Intervals(IntervalSet<Value>),
-    /// A box over a record key: the AND of each field's predicate.
+    /// A componentwise predicate over a record key: the AND of each field's predicate.
     Record(HashMap<String, Predicate>),
     /// The union of multiple predicates — admits any value accepted by any arm.
     ///
-    /// A union of boxes as [`Predicate::flatten_or`] leaves it: no two arms join into one box
-    /// ([`BoxShape`]). Three or more arms can still cover one box that no two of them make,
-    /// so an `Or` is not proof the region is no single box. Invariant: arms never directly
-    /// nest another `Or`.
+    /// A union of componentwise predicates as [`Predicate::flatten_or`] leaves it: no two arms join
+    /// into one componentwise predicate ([`Componentwise`]). Three or more arms can still cover one
+    /// componentwise predicate that no two of them make, so an `Or` is not proof the region is no
+    /// single componentwise predicate. Invariant: arms never directly nest another `Or`.
     Or(Vec<Predicate>),
     /// Predicate over a discriminated-union domain: one predicate per **named tag**, and
     /// `rest` for every tag it does not name.
@@ -201,14 +205,13 @@ pub enum Predicate {
     /// satisfies `here`.
     ///
     /// Every other arm is **unqualified**: read against the last component of a path
-    /// alone, it admits the same key value under every enclosing path. That is the whole
-    /// of what a curried collection's levels could say before this arm, and it is why a
-    /// statement about one parent's keys had to be widened to cover every parent's.
+    /// alone, it admits the same key value under every enclosing path, so on its own it
+    /// states one parent's keys only by stating every parent's.
     /// `enclosing` is itself a predicate over the level above's paths, `Qualified` again
     /// where the nest is deeper, so depth costs nesting rather than a concept per level.
     ///
-    /// A box over `(enclosing, here)`, so it takes the same algebra as a record
-    /// ([`BoxShape`]).
+    /// A componentwise predicate over `(enclosing, here)`, so it takes the same algebra as a record
+    /// ([`Componentwise`]).
     ///
     /// Built through [`qualified`](Predicate::qualified), which drops the arm where
     /// `enclosing` admits everything: admitting the same keys everywhere is what the
@@ -257,6 +260,17 @@ impl Predicate {
         }
     }
 
+    /// The union of `arms`: `False` for none, and one [`flatten_or`](Self::flatten_or) over
+    /// all of them otherwise. Folding [`union`](Self::union) instead re-runs the join and
+    /// subsumption pass on every step, which is quadratic in the arms each time.
+    pub fn union_all(arms: Vec<Predicate>) -> Predicate {
+        if arms.is_empty() {
+            Predicate::False
+        } else {
+            Predicate::flatten_or(arms)
+        }
+    }
+
     /// Builds a `Predicate` from a list of arms, flattening any nested `Or`
     /// variants.  Returns the single element directly when `arms` has length
     /// one to avoid gratuitous wrapping.
@@ -271,12 +285,12 @@ impl Predicate {
         if flat.is_empty() {
             unreachable!("flatten_or called with no arms");
         }
-        // Boxes that agree on every component but one are one box ([`BoxShape`]). A column
-        // of records arrives as one point per row, and a drive states each enclosing row's
-        // progress as a box of its own, so without this a region is one arm per row however
-        // regular it is, and every later union compares all of them. A joined arm goes
-        // round again, since one join can enable the next, and takes the earliest place it
-        // came from.
+        // Componentwise predicates that agree on every component but one are one componentwise
+        // predicate ([`Componentwise`]). A column of records arrives as one point per row, and a
+        // drive states each enclosing row's progress as a componentwise predicate of its own, so
+        // without this a region is one arm per row however regular it is, and every later union
+        // compares all of them. A joined arm goes round again, since one join can enable the next,
+        // and takes the earliest place it came from.
         let mut joined: Vec<Predicate> = Vec::with_capacity(flat.len());
         for mut arm in flat {
             let mut slot = joined.len();
@@ -313,6 +327,15 @@ impl Predicate {
             1 => reduced.into_iter().next().unwrap(),
             _ => Predicate::Or(reduced),
         }
+    }
+
+    /// This region of paths read `levels` levels further in: every path extending one it
+    /// admits. What a statement about a level's keys says of the levels beneath them, since
+    /// completeness closes downward.
+    pub fn descend(&self, levels: usize) -> Predicate {
+        (0..levels).fold(self.clone(), |region, _| {
+            Predicate::qualified(region, Predicate::True)
+        })
     }
 
     /// [`Qualified`](Self::Qualified) in canonical form.
@@ -409,11 +432,27 @@ impl Predicate {
         Predicate::tagged(TagMap::from_arms(tags), rest)
     }
 
+    /// The part of this predicate that says the same under every enclosing path: its
+    /// unqualified arms, all of it where it is unqualified, and nothing where it is
+    /// qualified throughout.
+    pub fn unqualified_arms(&self) -> Predicate {
+        match self {
+            Predicate::Or(arms) => Predicate::union_all(
+                arms.iter()
+                    .filter(|arm| !arm.qualifies())
+                    .cloned()
+                    .collect(),
+            ),
+            one if !one.qualifies() => one.clone(),
+            _ => Predicate::False,
+        }
+    }
+
     /// Whether this predicate names an enclosing path anywhere in it.
     ///
-    /// What [`contains`](Self::contains) checks before reading a bare key: a qualified
-    /// predicate cannot answer for one, and a caller that has not been converted to pass
-    /// the whole path would silently get the answer for every enclosing path at once.
+    /// What [`contains`](Self::contains) checks before reading a bare key: a bare key does
+    /// not say which enclosing path it sits under, so it cannot answer for a qualified
+    /// predicate.
     pub fn qualifies(&self) -> bool {
         match self {
             Predicate::Qualified { .. } => true,
@@ -476,7 +515,7 @@ impl Predicate {
                     false => None,
                 }
             }
-            // A box, so one empty side empties it, as for a record.
+            // Componentwise, so one empty side empties it, as for a record.
             Predicate::Qualified { enclosing, here } if enclosing.is_false() || here.is_false() => {
                 Some(false)
             }
@@ -543,7 +582,7 @@ impl Predicate {
             (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
                 Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::intersect)
             }
-            (a, b) => match BoxShape::of(a, b) {
+            (a, b) => match Componentwise::of(a, b) {
                 Some((shape, first, second)) => shape.meet(&first, &second),
                 None => panic!("Cannot intersect incompatible predicates: {self:?} and {other:?}"),
             },
@@ -593,7 +632,7 @@ impl Predicate {
                 let whole = m.keys().map(|k| (k.clone(), Predicate::True)).collect();
                 Predicate::Record(whole).minus(other)
             }
-            (a, b) => match BoxShape::of(a, b) {
+            (a, b) => match Componentwise::of(a, b) {
                 Some((shape, first, second)) => shape.minus(&first, &second),
                 None => panic!("Cannot subtract incompatible predicates: {self:?} minus {other:?}"),
             },
@@ -624,9 +663,9 @@ impl Predicate {
             (Predicate::Union { tags: ps, rest: pr }, Predicate::Union { tags: qs, rest: qr }) => {
                 Predicate::zip_tags((ps, *pr), (qs, *qr), Predicate::union)
             }
-            // Two boxes join into one where they agree on every component but one;
-            // otherwise the join is the two of them, which is what `Or` is for.
-            (a, b) => match BoxShape::of(a, b) {
+            // Two componentwise predicates join into one where they agree on every component but
+            // one; otherwise the join is the two of them, which is what `Or` is for.
+            (a, b) => match Componentwise::of(a, b) {
                 Some((shape, first, second)) => shape
                     .join(&first, &second)
                     .unwrap_or_else(|| Predicate::flatten_or(vec![a.clone(), b.clone()])),
@@ -694,14 +733,14 @@ impl Predicate {
         }
     }
 
-    /// Returns `true` if every value admitted by `other` is also admitted by `self`:
-    /// `other ⊆ self`, exactly.
+    /// Returns `true` if every value admitted by `other` is also admitted by `self`: `other ⊆
+    /// self`, exactly.
     ///
-    /// Two boxes compare component by component, and a union on the right is contained
-    /// when each of its arms is; both rules are exact. A union on the left may cover a
-    /// region no single arm covers, so where no arm answers alone the question becomes
-    /// whether `other ∖ self` is empty. Two predicates over different domains have no
-    /// answer, and [`minus`](Self::minus) refuses them.
+    /// Two componentwise predicates compare component by component, and a union on the right is
+    /// contained when each of its arms is; both rules are exact. A union on the left may cover a
+    /// region no single arm covers, so where no arm answers alone the question becomes whether
+    /// `other ∖ self` is empty. Two predicates over different domains have no answer, and
+    /// [`minus`](Self::minus) refuses them.
     pub fn subsumes(&self, other: &Predicate) -> bool {
         match (self, other) {
             // Everything subsumes the empty set, and the universal set subsumes everything.
@@ -722,17 +761,17 @@ impl Predicate {
                         Predicate::at_tag(ps, *pr, tag).subsumes(&Predicate::at_tag(qs, *qr, tag))
                     })
             }
-            (a, b) => match BoxShape::of(a, b) {
+            (a, b) => match Componentwise::of(a, b) {
                 // `other` is nonempty, having passed the first arm.
-                Some((_, first, second)) => BoxShape::contains(&first, &second),
+                Some((_, first, second)) => Componentwise::contains(&first, &second),
                 None => other.minus(self).is_false(),
             },
         }
     }
 
-    /// Exactly `v`, and nothing else. A record is the box of its fields' points, and `Unit`,
-    /// the one value of its type, is everything, as [`from_column_value`](Self::from_column_value)
-    /// spells a column of it.
+    /// Exactly `v`, and nothing else. A record is the componentwise predicate of its fields'
+    /// points, and `Unit`, the one value of its type, is everything, as
+    /// [`from_column_value`](Self::from_column_value) spells a column of it.
     pub(crate) fn point(v: Value) -> Predicate {
         match v {
             Value::Unit => Predicate::True,
@@ -857,11 +896,7 @@ impl Predicate {
         let covered = above
             .iter()
             .enumerate()
-            .map(|(level, whole)| {
-                (level + 1..depth).fold(whole.clone(), |region, _| {
-                    Predicate::qualified(region, Predicate::True)
-                })
-            })
+            .map(|(level, whole)| whole.descend(depth - 1 - level))
             .fold(Predicate::False, |all, region| all.union(&region));
         if covered.is_false() {
             return None;
@@ -917,11 +952,11 @@ impl Predicate {
 
     /// Everything ordered at or below `v`: the watermark a prefix release names.
     ///
-    /// A record key is ordered lexicographically over its fields in name order, as
-    /// [`Value`]'s comparison orders it, and a prefix of that order is a staircase of boxes
-    /// ([`BoxShape`]), one per field: `≤ (𝑎, 𝑏)` is `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. That is
-    /// the construction [`domain_prefix`](super::domain_prefix) takes across levels, taken
-    /// across fields.
+    /// A record key is ordered lexicographically over its fields in name order, as [`Value`]'s
+    /// comparison orders it, and a prefix of that order is a staircase of componentwise predicates
+    /// ([`Componentwise`]), one per field: `≤ (𝑎, 𝑏)` is `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. That is the
+    /// construction [`domain_prefix`](super::domain_prefix) takes across levels, taken across
+    /// fields.
     pub fn at_or_below(v: Value) -> Predicate {
         Predicate::up_to(v, true)
     }
@@ -1022,8 +1057,8 @@ impl Predicate {
                 if len == 0 {
                     return Predicate::False;
                 }
-                // Records have no interval spelling, so the set is one point box per row,
-                // which `flatten_or` joins where the rows fill a box.
+                // Records have no interval spelling, so the set is one point per row,
+                // which `flatten_or` joins where the rows fill one componentwise predicate.
                 Predicate::flatten_or(
                     (0..len)
                         .map(|i| {
@@ -1059,25 +1094,24 @@ impl Predicate {
 
     /// Check whether this predicate is structurally valid for the given [`Extent`].
     ///
-    /// A predicate is applicable when it makes sense to use it as a filter over
-    /// values drawn from that extent:
+    /// A predicate is applicable when it makes sense to use it as a filter over values drawn from
+    /// that extent:
     ///
     /// - [`Predicate::True`] and [`Predicate::False`] are applicable to any extent.
-    /// - [`Predicate::Intervals`] is applicable to a **scalar** ordered extent
-    ///   ([`Extent::Base`], [`Extent::UIntRange`]) whose element type matches the
-    ///   predicate's value type.
-    /// - [`Predicate::Record`] is applicable to [`Extent::Record`] when the key sets
-    ///   match and each field predicate is applicable to its field extent.
+    /// - [`Predicate::Intervals`] is applicable to a **scalar** ordered extent ([`Extent::Base`],
+    ///   [`Extent::UIntRange`]) whose element type matches the predicate's value type.
+    /// - [`Predicate::Record`] is applicable to [`Extent::Record`] when the key sets match and each
+    ///   field predicate is applicable to its field extent.
     /// - [`Predicate::Or`] is applicable when every arm is applicable to the extent.
     ///
-    /// A record extent therefore takes only per-field boxes. A prefix of its lexicographic
-    /// order is one of those too, a staircase ([`at_or_below`](Self::at_or_below)), so an
-    /// interval over record values is refused here rather than left to meet a box it has
-    /// no rule against.
+    /// A record extent therefore takes only per-field componentwise predicates. A prefix of its
+    /// lexicographic order is one of those too, a staircase ([`at_or_below`](Self::at_or_below)),
+    /// so an interval over record values is refused here rather than left to meet a componentwise
+    /// predicate it has no rule against.
     ///
-    /// One extent, so a predicate naming an enclosing path is **not** applicable: the
-    /// domain it claims has levels this one does not.
-    /// [`is_applicable_over`](Self::is_applicable_over) is the form that carries them.
+    /// One extent, so a predicate naming an enclosing path is **not** applicable: the domain it
+    /// claims has levels this one does not. [`is_applicable_over`](Self::is_applicable_over) is the
+    /// form that carries them.
     pub fn is_applicable_to(&self, extent: &Extent) -> bool {
         self.is_applicable_over(std::slice::from_ref(extent))
     }
@@ -1646,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn a_qualified_box_answers_only_under_its_enclosing_path() {
+    fn a_qualified_predicate_answers_only_under_its_enclosing_path() {
         let box_ = Predicate::qualified(only(1), Predicate::at_or_below(u(0)));
         assert!(box_.contains_path(&under(1, 0)));
         assert!(!box_.contains_path(&under(1, 1)), "past the keys it names");
@@ -1877,8 +1911,8 @@ mod tests {
         );
     }
 
-    /// A box with an empty component admits nothing, and its meet says so rather than
-    /// keeping a record that reads as nonempty.
+    /// A componentwise predicate with an empty component admits nothing, and its meet says so
+    /// rather than keeping a record that reads as nonempty.
     #[test]
     fn a_record_meet_with_an_empty_field_is_empty() {
         let p1 = record_pred(&[("a", Predicate::True), ("b", uint_intervals(&[1]))]);
@@ -2029,7 +2063,7 @@ mod tests {
         assert!(prefix.is_applicable_to(&extent));
     }
 
-    /// A prefix and a region per field meet under the box algebra, where two readings of
+    /// A prefix and a region per field meet under the componentwise algebra, where two readings of
     /// one record key would have no rule between them.
     #[test]
     fn a_record_prefix_meets_a_per_field_region() {
@@ -2040,7 +2074,8 @@ mod tests {
         let rest = prefix.minus(&column);
         assert!(rest.contains(&pair(0, 9)));
         assert!(!rest.contains(&pair(0, 0)) && !rest.contains(&pair(1, 0)));
-        // The same region, though a union of boxes may spell it with different boxes.
+        // The same region, though a union of componentwise predicates may spell it with different
+        // componentwise predicates.
         let joined = prefix.union(&column);
         assert!(
             joined.subsumes(&prefix) && prefix.subsumes(&joined),
@@ -2063,8 +2098,9 @@ mod tests {
 
     // ── Exact containment and one spelling per region ─────────────────────────
 
-    /// A union can cover a box that none of its arms covers alone. Here the arms differ in
-    /// both fields, so they do not join, and each holds half of the box's `_1` range.
+    /// A union can cover a componentwise predicate that none of its arms covers alone. Here the
+    /// arms differ in both fields, so they do not join, and each holds half of the componentwise
+    /// predicate's `_1` range.
     #[test]
     fn a_union_subsumes_a_box_its_arms_cover_only_together() {
         let low = record_pred(&[
@@ -2085,7 +2121,7 @@ mod tests {
         assert!(both.subsumes(&box_));
         assert!(
             !box_.subsumes(&both),
-            "the union holds (2, 3), the box does not"
+            "the union holds (2, 3), the componentwise predicate does not"
         );
     }
 
@@ -2119,8 +2155,8 @@ mod tests {
         uint_intervals(&[1]).subsumes(&record_pred(&[("_0", uint_intervals(&[1]))]));
     }
 
-    /// Rows stated one at a time, each a box qualified by its own enclosing row, join into
-    /// one box where their keys agree, not one arm per row.
+    /// Rows stated one at a time, each a componentwise predicate qualified by its own enclosing
+    /// row, join into one componentwise predicate where their keys agree, not one arm per row.
     #[test]
     fn rows_stated_one_at_a_time_join_into_one_box() {
         let row = |r: usize| Predicate::qualified(Predicate::point(u(r)), uint_intervals(&[0, 1]));
@@ -2640,7 +2676,8 @@ mod tests {
     // subsumes every arm.
     #[test]
     fn subsumes_or_any_arm_suffices() {
-        // Two boxes differing in both fields, and neither inside the other, stay two arms.
+        // Two componentwise predicates differing in both fields, and neither inside the other, stay
+        // two arms.
         let arm_a = record_pred(&[
             ("x", Predicate::at_or_below(Value::UInt(10))),
             ("y", Predicate::at_or_below(Value::UInt(10))),

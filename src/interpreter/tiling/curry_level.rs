@@ -82,3 +82,21 @@ impl std::fmt::Display for CurryLevel {
         write!(f, "level {}", self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::{BaseType, Extent};
+
+    /// The innermost level is the last one, at any depth; a tiling that is not a collection
+    /// has none.
+    #[test]
+    fn innermost_of_is_the_last_collection_level() {
+        let int = || Extent::Base(BaseType::Int);
+        let one = Tiling::data_function(int(), Tiling::Scalar(int()));
+        let three = Tiling::data_function(int(), Tiling::data_function(int(), one.clone()));
+        assert_eq!(CurryLevel::innermost_of(&Tiling::Scalar(int())), None);
+        assert_eq!(CurryLevel::innermost_of(&one), Some(CurryLevel::OUTERMOST));
+        assert_eq!(CurryLevel::innermost_of(&three), Some(CurryLevel::new(2)));
+    }
+}

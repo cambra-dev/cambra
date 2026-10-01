@@ -145,11 +145,6 @@ impl TileGuard {
 /// [`Tile::remove_guarded`](crate::interpreter::Tile::remove_guarded) drops a key only
 /// where a domain guard names it, and [`TileGuard::covers_path`] reads the same region.
 fn lift(chain: TileGuard) -> Vec<TileGuard> {
-    fn wrap(depth: usize, guard: TileGuard) -> TileGuard {
-        (0..depth).fold(guard, |g, _| {
-            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
-        })
-    }
     let mut depth: usize = 0;
     let mut leaf = &chain;
     while let TileGuard::Function(FunctionGuard::Codomain(inner)) = leaf {
@@ -160,10 +155,10 @@ fn lift(chain: TileGuard) -> Vec<TileGuard> {
         return vec![chain];
     };
     if leaf.is_universal() {
-        return lift(wrap(
-            above,
-            TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
-        ));
+        return lift(
+            CurryLevel::new(above)
+                .wrap_guard(TileGuard::Function(FunctionGuard::Domain(Predicate::True))),
+        );
     }
     let pred = match leaf {
         TileGuard::Function(FunctionGuard::Domain(pred)) => pred,
@@ -174,10 +169,10 @@ fn lift(chain: TileGuard) -> Vec<TileGuard> {
             if rows.is_false() {
                 return vec![chain];
             }
-            return lift(wrap(
-                above,
-                TileGuard::Function(FunctionGuard::Domain(rows.clone())),
-            ));
+            return lift(
+                CurryLevel::new(above)
+                    .wrap_guard(TileGuard::Function(FunctionGuard::Domain(rows.clone()))),
+            );
         }
         TileGuard::Record(fields) => return lift_record(fields, depth),
         _ => return vec![chain],
@@ -198,17 +193,18 @@ fn lift(chain: TileGuard) -> Vec<TileGuard> {
             let Predicate::Qualified { enclosing, .. } = arm else {
                 unreachable!("partitioned on the qualified arms")
             };
-            lift(wrap(
-                above,
-                TileGuard::Function(FunctionGuard::Domain(*enclosing)),
-            ))
+            lift(
+                CurryLevel::new(above)
+                    .wrap_guard(TileGuard::Function(FunctionGuard::Domain(*enclosing))),
+            )
         })
         .collect();
     if !part.is_empty() {
-        lifted.push(wrap(
-            depth,
-            TileGuard::Function(FunctionGuard::Domain(Predicate::flatten_or(part))),
-        ));
+        lifted.push(
+            CurryLevel::new(depth).wrap_guard(TileGuard::Function(FunctionGuard::Domain(
+                Predicate::flatten_or(part),
+            ))),
+        );
     }
     lifted
 }
@@ -219,11 +215,7 @@ fn lift(chain: TileGuard) -> Vec<TileGuard> {
 /// What the fields name beyond those keys stays as a record arm, less the keys the lifted
 /// arm names, so the two arms do not both name one region.
 fn lift_record(fields: &HashMap<String, TileGuard>, depth: usize) -> Vec<TileGuard> {
-    let record = || {
-        (0..depth).fold(TileGuard::Record(fields.clone()), |g, _| {
-            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
-        })
-    };
+    let record = || CurryLevel::new(depth).wrap_guard(TileGuard::Record(fields.clone()));
     let whole = fields.values().fold(Predicate::True, |acc, field| {
         acc.intersect(&whole_rows(field))
     });
@@ -233,9 +225,7 @@ fn lift_record(fields: &HashMap<String, TileGuard>, depth: usize) -> Vec<TileGua
     let mut covered = vec![Predicate::False; depth];
     covered[depth - 1] = whole.clone();
     let mut lifted = lift(
-        (0..depth - 1).fold(TileGuard::Function(FunctionGuard::Domain(whole)), |g, _| {
-            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
-        }),
+        CurryLevel::new(depth - 1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(whole))),
     );
     let rest = TileGuard::Record(
         fields
@@ -244,9 +234,7 @@ fn lift_record(fields: &HashMap<String, TileGuard>, depth: usize) -> Vec<TileGua
             .collect(),
     );
     if !rest.is_empty() {
-        lifted.push((0..depth).fold(rest, |g, _| {
-            TileGuard::Function(FunctionGuard::Codomain(Box::new(g)))
-        }));
+        lifted.push(CurryLevel::new(depth).wrap_guard(rest));
     }
     lifted
 }
@@ -761,10 +749,7 @@ pub fn domain_prefix(path: Vec<Value>) -> TileGuard {
                 false => Predicate::below(key.clone()),
             };
             let at = Predicate::qualified(Predicate::exactly(&path[..level]), bound);
-            (0..level).fold(
-                TileGuard::Function(FunctionGuard::Domain(at)),
-                |inner, _| TileGuard::Function(FunctionGuard::Codomain(Box::new(inner))),
-            )
+            CurryLevel::new(level).wrap_guard(TileGuard::Function(FunctionGuard::Domain(at)))
         })
         .collect();
     TileGuard::flatten_or(arms)

@@ -361,11 +361,10 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 domain_predicate,
                 deleted,
             } => {
+                // The rule `Tile::completion_at` states.
                 let complete = match level {
                     0 => domain_predicate.clone(),
-                    _ => {
-                        Predicate::qualified(above.clone(), Predicate::True).union(domain_predicate)
-                    }
+                    _ => above.descend(1).union(domain_predicate),
                 };
                 let ColumnValue::UInts(starts) = row_starts else {
                     unreachable!("a collection's row starts are positions")
@@ -465,10 +464,9 @@ fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
             TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
                 walk(inner, label, depth + 1, level)
             }
-            TileGuard::Function(FunctionGuard::Domain(pred)) if depth <= level => (depth..level)
-                .fold(pred.clone(), |region, _| {
-                    Predicate::qualified(region, Predicate::True)
-                }),
+            TileGuard::Function(FunctionGuard::Domain(pred)) if depth <= level => {
+                pred.descend(level - depth)
+            }
             _ => Predicate::False,
         }
     }

@@ -802,11 +802,13 @@ impl TileProducer for MapResultToConstProducer {
         // (`src/interpreter/design-operators.md`, "The completeness contract").
         let input_levels = self.input.tiling().levels();
         let held = (input_levels > 0).then(|| {
-            input_tile
-                .paths_at(CurryLevel::new(input_levels - 1))
-                .iter()
-                .map(|path| Predicate::exactly(path))
-                .fold(Predicate::False, |all, one| all.union(&one))
+            Predicate::union_all(
+                input_tile
+                    .paths_at(CurryLevel::new(input_levels - 1))
+                    .iter()
+                    .map(|path| Predicate::exactly(path))
+                    .collect(),
+            )
         });
         // Stated over tiles rather than columns: `Replace` never reads the values, and the
         // two `Zip` modes pair with them whatever they carry — a level included, which a
@@ -907,10 +909,53 @@ struct MapResultWithSourceProducer {
     /// We need this in order to translate domain obsolete guards into releases of the underlying
     /// source.
     result_correlation: Vec<TilePathStep>,
-    /// The input last read, where it holds a level beneath its keys: a release naming paths
-    /// beneath particular keys is read against the paths it holds
+    /// What the input last read holds, where it holds a level beneath its keys: a release
+    /// naming paths beneath particular keys is read against it
     /// ([`Self::released_beneath_every_key`]).
-    last_nested_input: Option<Tile>,
+    last_nested_input: Option<HeldBeneathKeys>,
+}
+
+/// The parts of a two-level input a release beneath particular keys is read against, kept
+/// in place of the input itself so a pull does not copy its values.
+struct HeldBeneathKeys {
+    /// The outermost level's own completeness.
+    outer_stated: Predicate,
+    /// The inner level's own completeness.
+    inner_stated: Predicate,
+    /// Which inner paths are complete, from any level on the path ([`Tile::completion_at`]).
+    complete: Predicate,
+    /// The outermost keys, each as its one-component path.
+    outer_keys: Vec<Vec<Value>>,
+    /// The path of every inner key.
+    inner_paths: Vec<Vec<Value>>,
+}
+
+impl HeldBeneathKeys {
+    /// What `input` holds beneath its keys, or `None` for an input that is not a two-level
+    /// collection.
+    fn of(input: &Tile) -> Option<Self> {
+        let Tile::DataFunction {
+            domain_predicate: outer_stated,
+            ..
+        } = input
+        else {
+            return None;
+        };
+        let Tile::DataFunction {
+            domain_predicate: inner_stated,
+            ..
+        } = input.values_at(CurryLevel::new(1))
+        else {
+            return None;
+        };
+        Some(HeldBeneathKeys {
+            outer_stated: outer_stated.clone(),
+            inner_stated: inner_stated.clone(),
+            complete: input.completion_at(CurryLevel::new(1)),
+            outer_keys: input.paths_at(CurryLevel::OUTERMOST),
+            inner_paths: input.paths_at(CurryLevel::new(1)),
+        })
+    }
 }
 
 impl MapResultWithSourceProducer {
@@ -950,42 +995,26 @@ impl MapResultWithSourceProducer {
     /// either unqualified at the inner level or beneath each outer key of a complete outer
     /// level ([`Tile::completion_at`]).
     fn released_beneath_every_key(&self, pred: &Predicate) -> Predicate {
-        let unqualified = |p: &Predicate| match p {
-            Predicate::Or(arms) => arms
-                .iter()
-                .filter(|arm| !arm.qualifies())
-                .fold(Predicate::False, |all, one| all.union(one)),
-            one if !one.qualifies() => one.clone(),
-            _ => Predicate::False,
-        };
-        let everywhere = unqualified(pred);
+        let everywhere = pred.unqualified_arms();
         if !pred.qualifies() {
             return everywhere;
         }
-        let Some(
-            input @ Tile::DataFunction {
-                domain_predicate: outer_stated,
-                ..
-            },
-        ) = &self.last_nested_input
+        let Some(HeldBeneathKeys {
+            outer_stated,
+            inner_stated,
+            complete,
+            outer_keys,
+            inner_paths,
+        }) = &self.last_nested_input
         else {
             return everywhere;
         };
-        let Tile::DataFunction {
-            domain_predicate: stated,
-            ..
-        } = input.values_at(CurryLevel::new(1))
-        else {
-            return everywhere;
-        };
-        let complete_under_every_key = unqualified(stated);
-        let complete = input.completion_at(CurryLevel::new(1));
-        let outer_keys = input.paths_at(CurryLevel::OUTERMOST);
+        let complete_under_every_key = inner_stated.unqualified_arms();
         let released = &self.base.obsolete_guard;
         let mut all_released: Vec<(Value, bool)> = Vec::new();
-        for path in input.paths_at(CurryLevel::new(1)) {
+        for path in inner_paths {
             let key = path[path.len() - 1].clone();
-            let covered = released.covers_path(&path);
+            let covered = released.covers_path(path);
             match all_released.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, all)) => *all &= covered,
                 None => all_released.push((key, covered)),
@@ -1019,7 +1048,7 @@ impl TileProducer for MapResultWithSourceProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         if self.input.tiling().levels() > 1 {
-            self.last_nested_input = Some(input_tile.clone());
+            self.last_nested_input = HeldBeneathKeys::of(&input_tile);
         }
         let source = self.source.borrow();
         process_tile_result(self.tiling(), input_tile, move |codomain| {
