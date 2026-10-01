@@ -36,7 +36,7 @@ use crate::{
         tile_operators::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, MakeRecord, MapAggregate, MapDomain,
-            MapExtractAggregate, MapFilter, MapResult, MapResultToConst, MapResultToConstMode,
+            MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
             TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
             level_count, zip_arms_at, zip_arms_named_at,
@@ -1977,17 +1977,25 @@ fn convert_impl_inner(
             Ok(Box::new(Restrict::new(pred_op)))
         }
 
-        // filter_values(p): the **value-preserving** mid-chain filter (a writer
-        // decision body's value-`Case` fan-out arm). Requires `input=Some(_)` — the
-        // `D ⤇ V` element collection. Unlike `restrict` (which returns the domain
-        // identity for a source a map re-indexes), this keeps each surviving
-        // element's value `V`, so the arm's `≫ eᵢ` maps the elements directly. The
-        // fed input feeds both the `Filter` value stream and the predicate, so it is
+        // filter_values(p) and map_filter(p): the **value-preserving** mid-chain filters.
+        // Both require `input=Some(_)`, the collection to filter, and keep each surviving
+        // entry's value. `filter_values` filters a collection's own keys (a writer decision
+        // body's value-`Case` fan-out arm, where `restrict` would return the domain identity
+        // for a source a map re-indexes); `map_filter` filters the inner collections of a
+        // partition, one outer key at a time. The predicate compiles over the same input, so
+        // its levels say which of the input's levels it masks, and one `Filter` serves both.
+        // The fed input feeds both the `Filter` value stream and the predicate, so it is
         // fanned to the two.
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::FilterValues) =>
+            if matches!(
+                as_builtin(function),
+                Some(Builtin::FilterValues | Builtin::MapFilter)
+            ) =>
         {
-            let upstream = expect_input(input, "filter_values")?;
+            let name = as_builtin(function)
+                .unwrap_or_else(|| unreachable!("the guard matched a builtin"))
+                .name();
+            let upstream = expect_input(input, name)?;
             // `Memo` the shared upstream: `Filter` pulls it as both the value stream
             // and (through the predicate) the boolean stream, and the transaction
             // writer re-pulls the body once per proposal — without the memo the two
@@ -1996,20 +2004,6 @@ fn convert_impl_inner(
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
             let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
             Ok(Box::new(Filter::new(fan.branch(), pred_op)))
-        }
-
-        // `map_filter(p)`: filter the inner collections of a partition, per outer
-        // key. The fed input is the two-level collection, fanned to the value side and
-        // the predicate exactly as `filter_values` fans its element stream — the
-        // difference is the depth, a level under a level rather than one level, and
-        // so the domain the predicate selects on is the inner one.
-        TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::MapFilter) =>
-        {
-            let upstream = expect_input(input, "map_filter")?;
-            let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
-            let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
-            Ok(Box::new(MapFilter::new(fan.branch(), pred_op)))
         }
 
         // cast(value): pure type-level assertion — re-views `value` under
@@ -2288,7 +2282,24 @@ fn convert_impl_inner(
                 && as_builtin(argument).is_none() =>
         {
             let outer = expect_input(input, "curry")?;
-            let Some(Type::Tuple(pair)) = argument.ty.domain() else {
+            // **The domain read off the type is the whole of what this site iterates**, so a
+            // refinement on it is one nothing here applies: `extent_of` strips it. A filter
+            // on the pair is planning's to emit as a term (`planning/correlated.rs`), and one
+            // left standing would drop silently. A present-key proof on the inner component
+            // says the domain is in the data, which the type cannot enumerate; planning names
+            // such a source, and one it did not name reaches here.
+            let domain = argument.ty.domain();
+            let unapplied = |what: &str| {
+                ConversionError::Unsupported(format!(
+                    "a correlated inner comprehension whose {what} is not supported yet: the \
+                     inner domain is read off the type {}, which cannot apply it",
+                    argument.ty
+                ))
+            };
+            if domain.as_ref().is_some_and(|d| !d.refinements().is_empty()) {
+                return Err(unapplied("pair carries a filter planning did not emit"));
+            }
+            let Some(Type::Tuple(pair)) = domain else {
                 return Err(ConversionError::TypeError(format!(
                     "a curried morphism takes the pair of what it is curried over and what it \
                      iterates, so its domain is a two-element tuple; got {}",
@@ -2301,6 +2312,16 @@ fn convert_impl_inner(
                     argument.ty
                 )));
             };
+            if inner
+                .refinements()
+                .iter()
+                .any(|r| r.is_collection_membership())
+            {
+                return Err(unapplied("source is a collection planning did not name"));
+            }
+            if !inner.refinements().is_empty() {
+                return Err(unapplied("inner domain carries a filter"));
+            }
             let inner = ctx.extent_of(inner)?;
             let pairs = Box::new(Product::new(outer, Box::new(IterateExtent::new(inner))));
             convert_impl(argument, Some(pairs), ctx)

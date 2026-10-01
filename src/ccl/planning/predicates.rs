@@ -7,6 +7,8 @@
 //! [`crate::ccl::ccl_utils::bare_predicate_of_fn`] that the iterate/restrict and
 //! op-conversion lowering consume.
 
+use std::collections::HashSet;
+
 use super::*;
 use crate::ccl::RefinementSet;
 
@@ -57,17 +59,23 @@ use crate::ccl::RefinementSet;
 // noise; a base that ever became large enough to matter would be a signal about
 // the types, not about this key.
 
-/// True if a `__pair` binder ([`Name::is_synthetic_pair`]) appears anywhere in
-/// the **term** `e` — its node and child *expressions*, never its type slots.
+/// True if a `__pair` binder ([`Name::is_synthetic_pair`]) other than one of
+/// `referenced` appears anywhere in the **term** `e` — its node and child
+/// *expressions*, never its type slots.
 ///
-/// Type slots are skipped on purpose: lambda elimination leaves `__pair` only
-/// as a `Fun.name` Pi binder in a type slot, which every equality path ignores
+/// Type slots are skipped on purpose: lambda elimination leaves `__pair` in a
+/// type slot as a `Fun.name` Pi binder, which every equality path ignores
 /// (`eq_term_modulo_ty_slots` is type-blind; the structural reconcile strips Pi
 /// names via `without_pi_names`). The invariant this backs is purely about the
 /// compared term.
-fn term_mentions_pair_binder(e: &Expr) -> bool {
+///
+/// `referenced` is the pair binders the predicate read before it was compiled. A
+/// predicate under a correlated site reads its row through the pair the site's
+/// function takes, and its reference to that binder is a free name like any
+/// other: compilation keeps it, and it is the same name in every compilation.
+fn term_mentions_pair_binder(e: &Expr, referenced: &HashSet<Name>) -> bool {
     let here = match &e.node {
-        TypedExprNode::Var(n) => n.is_synthetic_pair(),
+        TypedExprNode::Var(n) => n.is_synthetic_pair() && !referenced.contains(n),
         TypedExprNode::Lambda { param, .. } => param.name.is_synthetic_pair(),
         TypedExprNode::Let { binding, .. } => binding.name.is_synthetic_pair(),
         TypedExprNode::LetRec { bindings, .. } => {
@@ -86,7 +94,7 @@ fn term_mentions_pair_binder(e: &Expr) -> bool {
         return true;
     }
     let mut found = false;
-    e.walk_children(|c| found |= term_mentions_pair_binder(c));
+    e.walk_children(|c| found |= term_mentions_pair_binder(c, referenced));
     found
 }
 
@@ -289,6 +297,10 @@ fn compile_refinements(
             // predicate in the single bare form while pinning a point-free core, so
             // the iterate/restrict producers (built from the same `p`) carry a
             // structurally-identical refinement to the cast demand they satisfy.
+            let referenced: HashSet<Name> = ccl_utils::free_names_in_value(bare)
+                .into_iter()
+                .filter(Name::is_synthetic_pair)
+                .collect();
             let p = fn_of_bare_predicate(&base_ctx, bare, slot);
             let mut compiled = ccl_utils::bare_predicate_of_fn(&base_ctx, p);
             // The compiled predicate's own sub-expressions can carry *nested*
@@ -304,13 +316,15 @@ fn compile_refinements(
             // elimination's freshly-minted `__pair` (`Uid::fresh()`) never survive
             // into the compared *term*. It legitimately survives as a `Fun.name` Pi
             // binder in a type slot (which `eq_term_modulo_ty_slots` is type-blind
-            // to), so the check is term-only. Assert that load-bearing invariant
-            // rather than leaving it argued. Enforced in every build: a predicate
-            // this skipped in release is one whose producer/consumer match compares
-            // terms that are not value functions, and that mismatch surfaces later
-            // as an unrelated operator-conversion failure.
+            // to), so the check is term-only. A `__pair` the predicate read before
+            // compiling is not one this compilation minted: it is the binder of an
+            // enclosing correlated site, which a type under that site's function
+            // names as it would a user binder, so the check exempts exactly those.
+            // Enforced in every build: a predicate this skipped in release is one whose
+            // producer/consumer match compares terms that are not value functions, and
+            // that mismatch surfaces later as an unrelated operator-conversion failure.
             assert!(
-                !term_mentions_pair_binder(&compiled),
+                !term_mentions_pair_binder(&compiled, &referenced),
                 "a `__pair` binder survived into a compiled predicate term, \
                  breaking the value-function property the structural \
                  producer/consumer match relies on: {}",
