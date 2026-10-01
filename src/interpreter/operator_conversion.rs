@@ -3264,13 +3264,6 @@ fn build_commit_store(
     // Per scalar key, an acyclic init operator seeding its tick-0 value (a literal
     // init is the trivial op; a computed init drains to its scalar).
     let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    // The store-wide per-commit value extent types a *proposal's* read and write set
-    // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
-    // the extent must describe them all: for a heterogeneous multi-key store
-    // (`Mut(String, Txn)` + `Mut(Int, Txn)`) it is the union of the distinct per-key
-    // extents, not whichever key was iterated last. A homogeneous store collapses the
-    // union to its single extent. The store's own state carries each key's tiling
-    // instead (`store_values` below), which is what makes the union unnecessary there.
     // Whether this store continues a recurrence the retired version was running.
     // A store whose seed summarizes positions has folded them already, so its
     // drive resumes above them; one whose seed summarizes none needs its source
@@ -3294,6 +3287,13 @@ fn build_commit_store(
             .iter()
             .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
 
+    // The store-wide per-commit value extent types a *proposal's* read and write set
+    // cells (`proposal_stream_tiling`). One cell holds every key the writer touches, so
+    // the extent must describe them all: for a heterogeneous multi-key store
+    // (`Mut(String, Txn)` + `Mut(Int, Txn)`) it is the union of the distinct per-key
+    // extents, not whichever key was iterated last. A homogeneous store collapses the
+    // union to its single extent. The store's own state carries each key's tiling
+    // instead (`store_values` below), which is what makes the union unnecessary there.
     let mut value_extents: Vec<Extent> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
@@ -3358,9 +3358,10 @@ fn build_commit_store(
         })
         .collect();
 
-    // The store's state, one field per key with that key's own value tiling. The taps
-    // are read from the writers' bodies rather than from `keys_map`, which does not
-    // hold them until each writer is converted below — after the store they read back.
+    // The store's state, one field per key, each a scalar of that key's own value extent
+    // (`TODO(store-key-levels)` on `Tile::Store`). The taps are read from the writers'
+    // bodies rather than from `keys_map`, which does not hold them until each writer is
+    // converted below — after the store they read back.
     let mut store_values: HashMap<String, Tiling> = keys_map
         .iter()
         .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
@@ -4402,8 +4403,8 @@ to the other's value",
     // all minted after the writer's own subexpressions have been converted, so
     // they attribute to the writer rather than to the enclosing binding.
     let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
-    // The store's state, one field per key — accumulators and taps alike, each with its
-    // own value tiling.
+    // The store's state, one field per key — accumulators and taps alike, each a scalar of
+    // its own value extent.
     let store_values: HashMap<String, Tiling> = keys_map
         .iter()
         .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))

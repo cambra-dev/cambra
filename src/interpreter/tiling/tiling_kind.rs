@@ -47,8 +47,10 @@ pub enum Tiling {
         domain: Extent,
         /// The per-key state record `{key: value}` the store maps each commit
         /// time to. One field per mutable variable and reply tap, each with that
-        /// key's own value tiling — so a collection-valued key names its elements
-        /// here, where one shared value extent could only name their union.
+        /// key's own value extent, where one shared extent could only name their
+        /// union. Each field's tiling is a scalar, so a collection-valued key's
+        /// value is one materialized cell (`TODO(store-key-levels)` on
+        /// [`Tile::Store`]).
         codomain: Box<Tiling>,
     },
 }
