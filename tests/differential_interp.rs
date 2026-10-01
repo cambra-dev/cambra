@@ -530,8 +530,109 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
-/// A `with begin():` block whose write reads nothing, over a source filtered to nothing. No
-/// block runs, so no commit lands and the terminal read is the seed.
+/// A loop whose body overwrites an accumulator with a value that reads neither the
+/// accumulator nor the loop item. The decision is a constant, so the snapshot scaffold and
+/// the source term are both gone by recognition and the writer's extent is all that is left
+/// of its source.
+#[test]
+fn a_loop_overwriting_an_accumulator_with_a_constant() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [1, 2]:
+            acc := 7
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// A constant write beside an accumulating one. The decision reads `b` and the item, so it is
+/// not constant, and the loop's one writer keeps its snapshot.
+#[test]
+fn a_constant_and_an_accumulating_writer_in_one_loop() {
+    agree(indoc! {r#"
+        a := 1
+        b := 0
+        for i in [1, 2, 3]:
+            a := 7
+            b := b + i
+        out = test_sink()
+        out << a * 100 + b
+    "#});
+}
+
+/// A constant reached through a local binding in the body is still a constant decision.
+#[test]
+fn a_constant_overwrite_through_a_local() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [1, 2]:
+            y = 3
+            acc := y
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// A constant written through a `Mut` parameter: inlining leaves the constant decision a
+/// write in the loop body would have.
+#[test]
+fn a_constant_overwrite_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def fw(c: Mut(Int)):
+            c := 5
+        c := 0
+        for x in [1, 2]:
+            fw(c)
+        out = test_sink()
+        out << c
+    "#});
+}
+
+/// Two accumulators, both written constantly, so the loop's one writer reads no snapshot.
+#[test]
+fn two_accumulators_both_written_with_constants() {
+    agree(indoc! {r#"
+        a := 1
+        b := 10
+        for i in [1, 2]:
+            a := 7
+            b := 9
+        out = test_sink()
+        out << a + b
+    "#});
+}
+
+/// The same overwrite over a source filtered to nothing. The writer's extent is then a
+/// declared superset of the positions the source has; the extent's refinement becomes a
+/// `restrict` on the source, so no position survives and the accumulator keeps its seed
+/// rather than taking the write.
+#[test]
+fn a_constant_overwrite_over_an_empty_filtered_source() {
+    agree(indoc! {r#"
+        acc := 1
+        for i in [z for z in [1, 2] if z > 9]:
+            acc := 7
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// Filtered to one survivor out of three: the loop body runs once, at the surviving
+/// position, and the sink is keyed by it. A writer reading every declared position would
+/// feed three.
+#[test]
+fn a_constant_overwrite_over_a_filtered_source_runs_once_per_survivor() {
+    agree(indoc! {r#"
+        out = test_sink()
+        acc := 1
+        for i in [z for z in [1, 2, 3] if z > 2]:
+            acc := 7
+            out << acc
+    "#});
+}
+
+/// The transactional half: a `with begin():` block whose write reads nothing, over a source
+/// filtered to nothing. No block runs, so no commit lands and the terminal read is the seed.
 #[test]
 fn a_constant_transactional_write_over_an_empty_filtered_source() {
     agree(indoc! {r#"
@@ -753,4 +854,30 @@ fn floor_division_with_a_negative_divisor_truncates() {
         |v: i64| Value::Collection(Collection::from_entries(vec![(Value::Unit, Value::Int(v))]));
     assert_eq!(compiled(source), at_unit(-3));
     assert_eq!(interpreted(source), at_unit(-4));
+}
+
+/// A constant whole-collection write in a loop body replaces the collection at each iteration.
+#[test]
+fn a_constant_whole_collection_write_in_a_loop() {
+    agree(indoc! {r#"
+        out = test_sink()
+        c := [1, 2]
+        for i in [1, 2]:
+            c := [3, 4]
+        out << sum(c)
+    "#});
+}
+
+/// The same write through a `Mut` parameter, to a map.
+#[test]
+fn a_constant_whole_map_write_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def put(m: Mut(Map(Int, Int))):
+            m := box(map([(5, 50), (6, 60)]))
+        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        for x in [3, 4]:
+            put(m)
+        out = test_sink()
+        out << sum(m)
+    "#});
 }
