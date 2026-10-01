@@ -122,7 +122,7 @@ use crate::ccl::{
     TypedBinding, TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
-    provenance,
+    provenance::{self, Located, NodeId},
 };
 
 /// A **channel type**, which this pass is the one that erases: a nominal channel
@@ -162,17 +162,17 @@ fn has_type_residue(ty: &Type) -> bool {
 #[derive(Debug, PartialEq)]
 pub enum DeferError {
     /// A deferred binding had no corresponding `Feed` or `Define` in its scope.
-    NoFeedOrDefine(String),
+    NoFeedOrDefine(Name),
     /// A deferred binding had more than one `Define` in its scope.
-    MultipleDefinitions(String),
+    MultipleDefinitions(Name),
     /// Both `Feed` and `Define` were found for the same deferred binding.
-    FeedsAndDefinesMixed(String),
+    FeedsAndDefinesMixed(Name),
     /// A `Define` appeared inside a context where it is not allowed
     /// (e.g. inside a Loop body, Compose element, or Case branch).
-    NestedDefinition,
+    NestedDefinition(Name),
     /// A `Feed` references a defer-handle that was never bound by a
     /// surrounding `let d = Defer`.
-    UnboundDeferHandle(String),
+    UnboundDeferHandle(Name),
     /// A cluster of defers has channels that reference each other
     /// cyclically (e.g. `x ≪= y; y ≪= x`). Channels are `Feed`-kind letrec
     /// bindings and carry no `get_prev_*` guard, so a cycle has no
@@ -180,7 +180,7 @@ pub enum DeferError {
     /// ([`crate::ccl::letrec::check_letrec_causal`]), the same law that
     /// governs overwrite recursion. The payload names one of the defers on the
     /// cycle.
-    MutuallyRecursiveCycle(String),
+    MutuallyRecursiveCycle(Name),
     /// A feeding `Case` reached the generic structural recursion — a
     /// conditional feed with no enclosing iteration source to restrict per arm
     /// (the loop-sourced multi-arm case is fanned out at the `Compose` site via
@@ -188,40 +188,61 @@ pub enum DeferError {
     /// lift there, over a `{Unit | π̂ᵢ}` driver; a scrutinee / pattern feed
     /// cannot be gated by a boolean predicate, so it is rejected rather than
     /// miscompiled. The payload names the defer.
-    PartialFeedCaseUnsupported(String),
+    PartialFeedCaseUnsupported(Name),
 }
 
 impl fmt::Display for DeferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DeferError::NoFeedOrDefine(name) => {
+                let name = name.base();
                 write!(f, "deferred binding '{name}' has no feed or define")
             }
             DeferError::MultipleDefinitions(name) => {
+                let name = name.base();
                 write!(f, "deferred binding '{name}' has multiple definitions")
             }
             DeferError::FeedsAndDefinesMixed(name) => {
+                let name = name.base();
                 write!(f, "deferred binding '{name}' has both feeds and a define")
             }
-            DeferError::NestedDefinition => {
+            DeferError::NestedDefinition(_) => {
                 write!(f, "<<= must occur as a top-level statement")
             }
             DeferError::UnboundDeferHandle(name) => {
+                let name = name.base();
                 write!(f, "feed/define references unbound defer handle '{name}'")
             }
             DeferError::MutuallyRecursiveCycle(name) => {
+                let name = name.base();
                 write!(
                     f,
                     "deferred bindings form a mutually recursive cycle through '{name}'"
                 )
             }
             DeferError::PartialFeedCaseUnsupported(name) => {
+                let name = name.base();
                 write!(
                     f,
                     "deferred binding '{name}' is fed from some but not all branches of a \
                      multi-way conditional; this shape is not supported yet"
                 )
             }
+        }
+    }
+}
+
+impl DeferError {
+    /// The deferred binding the error is about.
+    fn defer(&self) -> &Name {
+        match self {
+            DeferError::NoFeedOrDefine(name)
+            | DeferError::MultipleDefinitions(name)
+            | DeferError::FeedsAndDefinesMixed(name)
+            | DeferError::NestedDefinition(name)
+            | DeferError::UnboundDeferHandle(name)
+            | DeferError::MutuallyRecursiveCycle(name)
+            | DeferError::PartialFeedCaseUnsupported(name) => name,
         }
     }
 }
@@ -640,6 +661,10 @@ struct ChannelizeCtx {
     /// reconstructed from the substituted domain. An alias records none and erases
     /// unbound, as it did before.
     channel_kinds: Vec<(Name, crate::ccl::ty::FunKind)>,
+    /// The `let d = Defer` node that declares each deferred binding, which is
+    /// where an error about the binding is raised. Recorded as the walk reaches
+    /// each declaration; every error names its binding, so [`run`] locates it here.
+    defer_decls: HashMap<Name, NodeId>,
 }
 
 impl ChannelizeCtx {
@@ -647,7 +672,15 @@ impl ChannelizeCtx {
         Self {
             resolved_domains: Vec::new(),
             channel_kinds: Vec::new(),
+            defer_decls: HashMap::new(),
         }
+    }
+
+    /// `error` at its binding's declaration, or at `root` for a binding the walk
+    /// never reached — a residual handle no `let d = Defer` binds.
+    fn locate(&self, error: DeferError, root: NodeId) -> Located<DeferError> {
+        let node = self.defer_decls.get(error.defer()).copied().unwrap_or(root);
+        Located::new(error, node)
     }
 }
 
@@ -670,8 +703,9 @@ impl ChannelizeCtx {
 /// `Unit`-typed value that can be dropped.  Doing this in `channelize`
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
-pub fn run(expr: Expr) -> Result<Expr, DeferError> {
+pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
     let mut ctx = ChannelizeCtx::new();
+    let root = expr.node_id();
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
     //
@@ -681,9 +715,9 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // module docs), leaving only the flattened `let d = Defer in …` chains this
     // walk handles. The former Phase-1 chain rewriter and the call-site smart
     // walker that existed for the un-inlined higher-order case are retired.
-    let rewritten = channelize_expr(expr, &mut ctx)?;
+    let rewritten = channelize_expr(expr, &mut ctx).map_err(|e| ctx.locate(e, root))?;
     let mut rewritten = drop_expr_stmts(rewritten);
-    assert_no_defer_residue(&rewritten)?;
+    assert_no_defer_residue(&rewritten).map_err(|e| ctx.locate(e, root))?;
     // With nominal channel domains, every consumer of a defer read typed
     // *concretely* against `ChanDom(d)` at inference — there is no `Infer`
     // channel-domain residue to re-derive. Closing the tree is therefore a pure
@@ -1304,10 +1338,10 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
-        TypedExprNode::Defer => Err(DeferError::UnboundDeferHandle("<defer>".into())),
+        TypedExprNode::Defer => Err(DeferError::UnboundDeferHandle(Name::from("<defer>"))),
         TypedExprNode::DisjointJoin(elts) => elts.iter().try_for_each(assert_no_defer_residue),
         TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } => {
-            Err(DeferError::UnboundDeferHandle(name.base().to_string()))
+            Err(DeferError::UnboundDeferHandle(name.clone()))
         }
         TypedExprNode::Let {
             bound_expr, body, ..
@@ -1434,6 +1468,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
             {
                 chan_names.insert(binding.name.clone(), n);
             }
+            ctx.defer_decls.insert(binding.name.clone(), node_id);
             let mut defer_names = vec![binding.name];
             let mut current_body = *body;
             loop {
@@ -1449,6 +1484,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
                         {
                             chan_names.insert(b.name.clone(), n);
                         }
+                        ctx.defer_decls.insert(b.name.clone(), cur_let_id);
                         defer_names.push(b.name);
                         current_body = *inner;
                     }
@@ -1671,11 +1707,11 @@ fn channelize_cluster(
         let mut define: Option<Expr> = None;
         rewritten = extract_for_defer(rewritten, name, &mut feeds, &mut define, false)?;
         let channel = match (feeds.is_empty(), define) {
-            (true, None) => return Err(DeferError::NoFeedOrDefine(name.base().to_string())),
+            (true, None) => return Err(DeferError::NoFeedOrDefine(name.clone())),
             (true, Some(d)) => d,
             (false, None) => combine_feed_values(feeds),
             (false, Some(_)) => {
-                return Err(DeferError::FeedsAndDefinesMixed(name.base().to_string()));
+                return Err(DeferError::FeedsAndDefinesMixed(name.clone()));
             }
         };
         channels.insert(name.clone(), channel);
@@ -1738,7 +1774,7 @@ fn channelize_cluster(
             .first()
             .expect("cycle names a binding")
             .clone();
-        return Err(DeferError::MutuallyRecursiveCycle(name.base().to_string()));
+        return Err(DeferError::MutuallyRecursiveCycle(name));
     }
     Ok(bind_cluster_at_scope(rewritten, group))
 }
@@ -2350,10 +2386,10 @@ fn extract_for_defer_impl(
         }
         TypedExprNode::Define { name, value } if &name == defer_name => {
             if in_inner_scope {
-                return Err(DeferError::NestedDefinition);
+                return Err(DeferError::NestedDefinition(defer_name.clone()));
             }
             if define.is_some() {
-                return Err(DeferError::MultipleDefinitions(defer_name.to_string()));
+                return Err(DeferError::MultipleDefinitions(defer_name.clone()));
             }
             *define = Some(*value);
             TypedExprNode::Lit(Lit::Unit)
@@ -2509,7 +2545,7 @@ fn extract_for_defer_impl(
                     true,
                 )?;
                 if lambda_define.is_some() {
-                    return Err(DeferError::NestedDefinition);
+                    return Err(DeferError::NestedDefinition(defer_name.clone()));
                 }
                 let new_argument = extract_for_defer(
                     *argument.clone(),
@@ -2777,7 +2813,7 @@ fn extract_for_defer_impl(
                             true,
                         )?;
                         if lambda_define.is_some() {
-                            return Err(DeferError::NestedDefinition);
+                            return Err(DeferError::NestedDefinition(defer_name.clone()));
                         }
                         // Emit per-feed companion composes BEFORE pushing
                         // the rewritten lambda — `new_elts` is the prefix
@@ -2871,7 +2907,7 @@ fn extract_for_defer_impl(
                 extract_for_defer(*body, defer_name, &mut local_feeds, &mut local_define, true)?
             };
             if local_define.is_some() {
-                return Err(DeferError::NestedDefinition);
+                return Err(DeferError::NestedDefinition(defer_name.clone()));
             }
             for v in local_feeds {
                 // The channel contribution is this lambda with the fed value for its body, so
@@ -2925,7 +2961,7 @@ fn extract_for_defer_impl(
                     true,
                 )?;
                 if branch_define.is_some() {
-                    return Err(DeferError::NestedDefinition);
+                    return Err(DeferError::NestedDefinition(defer_name.clone()));
                 }
                 if !branch_feeds.is_empty() {
                     any_feed = true;
@@ -2953,9 +2989,7 @@ fn extract_for_defer_impl(
                 let guard_only =
                     scrutinee.is_none() && per_branch.iter().all(|(p, ..)| p.is_none());
                 if !guard_only {
-                    return Err(DeferError::PartialFeedCaseUnsupported(
-                        defer_name.to_string(),
-                    ));
+                    return Err(DeferError::PartialFeedCaseUnsupported(defer_name.clone()));
                 }
                 let unit_ty = Type::Base(BaseType::Unit);
                 let mut prior_guards: Vec<Expr> = Vec::new();
@@ -3173,13 +3207,18 @@ mod tests {
         assert!(!s.contains("define"), "no Define should remain: {s}");
     }
 
-    /// `let d = Defer in <body without feeds>` — error.
+    /// `let d = Defer in <body without feeds>` — error, raised at the `let`.
     #[test]
     fn run_no_feed_is_error() {
         let body = var("d");
-        let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
-        let err = run(typed(expr)).unwrap_err();
-        assert_eq!(err, DeferError::NoFeedOrDefine("d".into()));
+        let expr = typed(Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body));
+        let decl = expr.node_id();
+        let err = run(expr).unwrap_err();
+        assert!(
+            matches!(&err.error, DeferError::NoFeedOrDefine(d) if d.base() == "d"),
+            "expected NoFeedOrDefine(d), got {err:?}"
+        );
+        assert_eq!(err.node_id, decl);
     }
 
     /// Multiple feeds: copaired (distinct index sets, tagged apart).
@@ -3264,7 +3303,7 @@ mod tests {
         let with_a = Expr::let_bind("a", Expr::new(TypedExprNode::Defer), with_b);
         let err = run(typed(with_a)).unwrap_err();
         assert!(
-            matches!(err, DeferError::MutuallyRecursiveCycle(_)),
+            matches!(err.error, DeferError::MutuallyRecursiveCycle(_)),
             "expected MutuallyRecursiveCycle, got {err:?}"
         );
     }

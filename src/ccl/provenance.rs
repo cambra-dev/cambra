@@ -150,6 +150,30 @@ impl NodeId {
     }
 }
 
+/// An error paired with the [`NodeId`] of the node it was raised at.
+///
+/// A pass after lowering raises errors holding types and names, not spans; the
+/// node is what it has. `compile_program` resolves the node to a source
+/// [`Span`](crate::chl_parser::ast::Span) against the lowering projection, so
+/// every error a pass after lowering reports reaches the user with a span.
+///
+/// The location is metadata beside the error rather than inside it, so `E` stays
+/// location-free and comparable by value in tests.
+#[derive(Debug, PartialEq)]
+pub struct Located<E> {
+    /// The underlying error.
+    pub error: E,
+    /// The node the error was raised at.
+    pub node_id: NodeId,
+}
+
+impl<E> Located<E> {
+    /// `error` raised at `node_id`.
+    pub fn new(error: E, node_id: NodeId) -> Self {
+        Located { error, node_id }
+    }
+}
+
 impl std::fmt::Debug for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "NodeId({})", self.0)

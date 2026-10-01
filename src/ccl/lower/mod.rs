@@ -85,12 +85,9 @@ use crate::{
         Branch, Expr, Lit, Type, TypedExprNode,
         provenance::{Nature, RewriteLabel},
     },
-    chl_parser::{
-        ast::{
-            Expr as ChlExpr, Lit as ChlLit, Module as ChlModule, RecordField, Span, Spanned,
-            Stmt as ChlStmt, VariantPayload as ChlVariantPayload,
-        },
-        source_map::report_config,
+    chl_parser::ast::{
+        Expr as ChlExpr, Lit as ChlLit, Module as ChlModule, RecordField, Span, Spanned,
+        Stmt as ChlStmt, VariantPayload as ChlVariantPayload,
     },
     interpreter::{
         DataSink, DataSourceDomainExtentImpl,
@@ -130,10 +127,8 @@ use transactions::*;
 
 /// Errors that can occur during CHL → CCL lowering.
 ///
-/// Carries the source span of the offending construct so the error can be
-/// rendered with ariadne via [`LoweringError::to_report`] / the
-/// [`crate::ccl::context::CompileError::Lower`] dispatch in
-/// [`crate::ccl::context::CompileError::render`].
+/// Carries the source span of the offending construct, which
+/// [`crate::ccl::context::CompileError::render`] labels with the message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoweringError {
     /// The AST node or construct is not yet supported by this lowering pass.
@@ -174,28 +169,6 @@ impl LoweringError {
     pub fn span(&self) -> Span {
         match self {
             LoweringError::Unsupported { span, .. } => *span,
-        }
-    }
-
-    /// Build an ariadne [`Report`](ariadne::Report), coloured when `color` is
-    /// set. Colour off suits snapshot or log output; interactive callers want
-    /// it on. Every other setting is [`report_config`]'s, so the report reads
-    /// the span's offsets as bytes.
-    pub fn to_report(&self, color: bool) -> ariadne::Report<'static, Span> {
-        use ariadne::{Color, Label, Report, ReportKind};
-        let config = report_config(color);
-        match self {
-            LoweringError::Unsupported { span, message } => {
-                Report::build(ReportKind::Error, span.file, span.start)
-                    .with_config(config)
-                    .with_message("lowering error")
-                    .with_label(
-                        Label::new(*span)
-                            .with_message(message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-            }
         }
     }
 }
@@ -1147,6 +1120,12 @@ fn lower_expr_inner(
 pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
     let mut errors: Vec<LoweringError> = Vec::new();
     let value = lower_stmts_recovering(module, ctx, &mut errors);
+    // A block lowers its statements last to first, so they report in that order.
+    // The reader reads first to last.
+    errors.sort_by_key(|e| {
+        let span = e.span();
+        (span.file, span.start, span.end)
+    });
     LoweringResult { value, errors }
 }
 
