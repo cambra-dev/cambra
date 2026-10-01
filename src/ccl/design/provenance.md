@@ -558,8 +558,7 @@ Four refinements the shapes above do not cover:
   recording is innermost while it runs, so the mint hook attaches to it and the
   outer one keeps only what it built itself: `mut_elim` opens
   `letrec.accumulator` per accumulating variable and `letrec.feed` on each feed
-  statement inside `letrec.loop`, and `planning/loops` opens `planning.txn_read`
-  on each continuation read inside `planning.recognize`.
+  statement inside `letrec.loop`.
 
   A construct the split names can be several source statements. A recurrence slot
   belongs to its accumulating variable, so a body that writes one variable twice
