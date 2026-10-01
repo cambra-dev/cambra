@@ -855,3 +855,29 @@ fn floor_division_with_a_negative_divisor_truncates() {
     assert_eq!(compiled(source), at_unit(-3));
     assert_eq!(interpreted(source), at_unit(-4));
 }
+
+/// A constant whole-collection write in a loop body replaces the collection at each iteration.
+#[test]
+fn a_constant_whole_collection_write_in_a_loop() {
+    agree(indoc! {r#"
+        out = test_sink()
+        c := [1, 2]
+        for i in [1, 2]:
+            c := [3, 4]
+        out << sum(c)
+    "#});
+}
+
+/// The same write through a `Mut` parameter, to a map.
+#[test]
+fn a_constant_whole_map_write_through_a_mut_parameter() {
+    agree(indoc! {r#"
+        def put(m: Mut(Map(Int, Int))):
+            m := box(map([(5, 50), (6, 60)]))
+        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        for x in [3, 4]:
+            put(m)
+        out = test_sink()
+        out << sum(m)
+    "#});
+}

@@ -3581,10 +3581,10 @@ fn a_one_entry_seed_reaches_a_transactional_keyed_write() {
 /// == 1, __elem ▷ (… ▷ collection_contains)}` and fails the invariance check on a
 /// collection domain downstream; the arity is the workaround, not part of what this pins.
 ///
-/// Two adjacent shapes are absent. A *constant* whole-collection write through a parameter
-/// (`m := box(map(…))`) is not keyed, and fails to compile as the same write in the loop body
-/// does. Transactional pass-by-reference is refused at lowering: a `with begin():` block takes
-/// writes, bindings, guards and feeds, not a call.
+/// Two adjacent shapes are absent. A constant whole-collection write through a parameter
+/// (`m := box(map(…))`) is not keyed; `a_constant_whole_map_write_through_a_mut_parameter` in
+/// `tests/differential_interp.rs` covers it. Transactional pass-by-reference is refused at
+/// lowering: a `with begin():` block takes writes, bindings, guards and feeds, not a call.
 #[test]
 fn a_keyed_write_through_a_mut_parameter() {
     let value = final_mut_var_value(indoc! {r#"
