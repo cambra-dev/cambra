@@ -103,6 +103,11 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
+    # The probe slot. Shared because the driver reads one table while every
+    # producer writes it, and the producer graph has no `&self` traversal that
+    # would let the driver collect per-producer buffers instead; what crosses it
+    # is a rendered row, never a tile passed between operators.
+    ("src/interpreter/value_probe.rs", "shared cell of `Option<ProbeTable>`"),
 ]
 
 # Inner types that are legitimate by construction. Matched against the inner

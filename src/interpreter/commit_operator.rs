@@ -942,7 +942,7 @@ impl TileOperator for CommitOperator {
         }
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -996,7 +996,12 @@ impl TileOperator for CommitOperator {
             .collect::<Vec<_>>();
         let n = writer_producers.len();
         Box::new(CommitProducer {
-            base: ProducerBase::new(CommitProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                CommitProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             writer_producers,
             consumed: vec![0; n],
             writer_terminal: vec![false; n],
@@ -1428,7 +1433,7 @@ impl TileOperator for InductionStore {
             .peek(&mut |op| visit(value_late(EdgeRole::Named("body"), op)));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1472,7 +1477,12 @@ impl TileOperator for InductionStore {
             body_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
         };
         Box::new(InductionStoreProducer {
-            base: ProducerBase::new(InductionStoreProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                InductionStoreProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             // Seed tick 0 with the accumulators' inits, so the changelog is
             // self-describing: `read_as_of`/`store_value_at` fold to the init below
             // the first *iteration* change (a leading carry) without an external
@@ -1745,7 +1755,7 @@ impl TileOperator for StoreValueStream {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("store_op", &*self.store_op));
     }
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1764,7 +1774,12 @@ impl TileOperator for StoreValueStream {
             .store_op
             .subscribe(g, forwarding_consumer(&consumer), scheduler);
         Box::new(StoreValueStreamProducer {
-            base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                StoreValueStreamProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -1942,7 +1957,7 @@ impl TileOperator for StoreFinalRead {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("store_op", &*self.store_op));
     }
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1958,7 +1973,12 @@ impl TileOperator for StoreFinalRead {
             .store_op
             .subscribe(g, forwarding_consumer(&consumer), scheduler);
         Box::new(StoreFinalReadProducer {
-            base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                StoreFinalReadProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -2108,7 +2128,7 @@ impl TileOperator for StoreDenseRead {
         visit(value("trigger", &*self.trigger));
         visit(value("store_op", &*self.store_op));
     }
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -2129,7 +2149,12 @@ impl TileOperator for StoreDenseRead {
                 .subscribe(g, forwarding_consumer(&consumer), scheduler)
         };
         Box::new(StoreDenseReadProducer {
-            base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                StoreDenseReadProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             trigger_producer,
             store_producer,
             key: self.key.clone(),
@@ -2504,7 +2529,7 @@ impl TileOperator for AsOf {
         visit(value("source", &*self.source));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -2529,7 +2554,12 @@ impl TileOperator for AsOf {
             _ => unreachable!("AsOf tiles as a function"),
         };
         Box::new(AsOfProducer {
-            base: ProducerBase::new(AsOfProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                AsOfProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             trigger,
             source,
             output: self.output.clone(),
@@ -3032,7 +3062,7 @@ impl TileOperator for InductionDriver {
         visit(value("source_op", &*self.source_op));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -3045,7 +3075,12 @@ impl TileOperator for InductionDriver {
             scheduler,
         );
         Box::new(InductionDriverProducer {
-            base: ProducerBase::new(InductionDriverProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                InductionDriverProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -3365,7 +3400,7 @@ impl TileOperator for TransactDriver {
         visit(value("source_op", &*self.source_op));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -3378,7 +3413,12 @@ impl TileOperator for TransactDriver {
             scheduler,
         );
         Box::new(TransactDriverProducer {
-            base: ProducerBase::new(TransactDriverProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                TransactDriverProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -3855,7 +3895,7 @@ impl TileOperator for TransactWriter {
         visit(value("body_op", &*self.body_op));
         visit(value("driver_op", &*self.driver_op));
     }
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -3884,7 +3924,12 @@ impl TileOperator for TransactWriter {
             self.driver_op
                 .subscribe(dg, forwarding_consumer(&consumer), scheduler);
         Box::new(TransactWriterProducer {
-            base: ProducerBase::new(TransactWriterProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                TransactWriterProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             store_producer,
             body_producer,
             driver_producer,
@@ -4460,14 +4505,14 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
             Box::new(ProposalSourceProducer {
-                base: ProducerBase::new(ProposalSourceProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(ProposalSourceProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
             })
         }
@@ -4508,14 +4553,14 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
             Box::new(RecordingSourceProducer {
-                base: ProducerBase::new(RecordingSourceProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(RecordingSourceProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
                 released: self.released.clone(),
             })
@@ -4677,7 +4722,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
@@ -4688,7 +4733,7 @@ mod tests {
                     .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
             Box::new(AddIfBodyProducer {
                 key: self.key.clone(),
-                base: ProducerBase::new(AddIfBodyProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(AddIfBodyProducer::alloc_id(), &self.tiling),
                 input,
                 threshold: self.threshold,
             })
@@ -5067,7 +5112,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
@@ -5075,7 +5120,10 @@ mod tests {
         ) -> Box<dyn TileProducer> {
             let inner = self.inner.subscribe(intent_guard, consumer, scheduler);
             Box::new(ReleaseRecorderProducer {
-                base: ProducerBase::new(ReleaseRecorderProducer::alloc_id(), self.inner.tiling()),
+                base: ProducerBase::unowned(
+                    ReleaseRecorderProducer::alloc_id(),
+                    self.inner.tiling(),
+                ),
                 inner,
                 releases: self.releases.clone(),
             })
@@ -5567,14 +5615,14 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
             Box::new(ProposalSourceProducer {
-                base: ProducerBase::new(ProposalSourceProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(ProposalSourceProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
             })
         }
@@ -5689,7 +5737,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -5700,7 +5748,7 @@ mod tests {
                 .store_op
                 .subscribe(store_guard, Box::new(|| {}), scheduler);
             Box::new(CounterBodyProducer {
-                base: ProducerBase::new(CounterBodyProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(CounterBodyProducer::alloc_id(), &self.tiling),
                 store_producer,
                 key: self.key.clone(),
                 window: ProposalWindow::new(),
@@ -5805,7 +5853,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,
@@ -5813,7 +5861,7 @@ mod tests {
         ) -> Box<dyn TileProducer> {
             let inner = self.inner.subscribe(intent_guard, consumer, scheduler);
             Box::new(DriverProbeProducer {
-                base: ProducerBase::new(DriverProbeProducer::alloc_id(), self.inner.tiling()),
+                base: ProducerBase::unowned(DriverProbeProducer::alloc_id(), self.inner.tiling()),
                 inner,
                 seen: self.seen.clone(),
             })
@@ -6084,7 +6132,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -6095,7 +6143,7 @@ mod tests {
                 .store_op
                 .subscribe(store_guard, Box::new(|| {}), scheduler);
             Box::new(TokenWriterProducer {
-                base: ProducerBase::new(TokenWriterProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(TokenWriterProducer::alloc_id(), &self.tiling),
                 store_producer,
                 key: self.key.clone(),
                 costs: self.costs.clone(),
@@ -6277,7 +6325,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -6288,7 +6336,7 @@ mod tests {
                 .store_op
                 .subscribe(store_guard, Box::new(|| {}), scheduler);
             Box::new(StoreReadAsOfProducer {
-                base: ProducerBase::new(StoreReadAsOfProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(StoreReadAsOfProducer::alloc_id(), &self.tiling),
                 store_producer,
                 key: self.key.clone(),
                 t: self.t,
@@ -6388,7 +6436,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -6399,7 +6447,7 @@ mod tests {
                 .store_op
                 .subscribe(store_guard, Box::new(|| {}), scheduler);
             Box::new(BankWriterProducer {
-                base: ProducerBase::new(BankWriterProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(BankWriterProducer::alloc_id(), &self.tiling),
                 store_producer,
                 transfers: self.transfers.clone(),
                 current: 0,
@@ -6538,14 +6586,14 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
             Box::new(FixedSourceProducer {
-                base: ProducerBase::new(FixedSourceProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(FixedSourceProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
             })
         }

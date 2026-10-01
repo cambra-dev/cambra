@@ -5337,7 +5337,7 @@ mod variant_ctor_tests {
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn Consumer>,
@@ -5345,7 +5345,7 @@ mod variant_ctor_tests {
         ) -> Box<dyn TileProducer> {
             consumer.notify();
             Box::new(FixedStreamProducer {
-                base: ProducerBase::new(FixedStreamProducer::alloc_id(), &self.tiling),
+                base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
                 released: false,
             })

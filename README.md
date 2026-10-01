@@ -82,25 +82,27 @@ Run a program:
 cargo run -- tests/programs/filter_and_aggregate/program.cambra
 ```
 
-### Web inspector
+### Inspector
 
-Pass `--inspect` to serve a live dashboard showing the parsed CHL AST, the lowered CCL, the operator graph, and runtime producer state:
+The inspector serves the source alongside one IR tree pane per compiler stage, cross-linked by node→node provenance, with the operator graph as its terminal pane. Two modes, exclusive by construction.
 
-```bash
-cargo run -- --inspect tests/programs/inner_join/program.cambra
-```
-
-The inspector defaults to port 8080 (`--inspect=9090` to change it). After the program finishes, the process stays alive so you can browse `http://localhost:<port>`; Ctrl+C to exit.
-
-### Program inspector
-
-Pass `--inspect-only` to compile a program and serve a read-only view of it — the source alongside one IR tree pane per compiler stage, cross-linked by node→node provenance — without running it:
+Pass `--inspect-only` to compile a program and serve that view without running it:
 
 ```bash
 cargo run -- --inspect-only tests/programs/polymorphic/program.cambra
 ```
 
-Same default port, and exclusive with the flags that run a program (`--inspect`, `--control`): one answers what the program *is*, the other what a run of it *does*. `--dump-snapshot` prints the same payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
+`--inspect-only` is exclusive with the flags that run a program (`--inspect`, `--control`): one answers what the program *is*, the other what a run of it *does*.
+
+Pass `--inspect` to run the program and additionally stream the values flowing through its operators over `GET /api/live`:
+
+```bash
+printf 'hello\nworld\n' | cargo run -- --inspect tests/programs/streaming_echo/program.cambra
+```
+
+The served frontend does not read `/api/live` yet, so the browser shows the panes and no values; the `Values` pane that renders them is a separate change.
+
+Both default to port 8080 (`--inspect=9090` to change it). Under `--inspect` values are recorded only while a client holds `/api/live` open, and the process stays alive after the program finishes, so a client connected through the run can still read them; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
 
 ### Control port
 

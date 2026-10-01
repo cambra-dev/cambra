@@ -1,8 +1,14 @@
-//! Structural validators for the `/api/snapshot` wire shape — the Rust mirror
-//! of the frontend's `validateSnapshot` (`web/src/wireValidate.ts`).
-//! Asserting the wire contract in one place lets the transport, the server and
-//! `tests/inspector_goldens.rs` check one contract (the cross-language twin of
-//! the TS validator, since the two cannot literally share code).
+//! Structural validators for the inspector's two wire shapes.
+//!
+//! The `/api/snapshot` half mirrors the frontend's `validateSnapshot`
+//! (`web/src/wireValidate.ts`), so the transport, the server and
+//! `tests/inspector_goldens.rs` check the contract the frontend reads. The two
+//! cannot share code, so each language carries its own validator.
+//!
+//! The `/api/live` half, [`assert_probe_frame_shape`], has no TypeScript twin.
+//! It pins the probe frame's keys and orderings, and runs on the frame
+//! `inspector_model::frame`'s golden test compares against the committed
+//! fixture `web/src/__fixtures__/probe_frame.json`.
 //!
 //! **Public, not `#[cfg(test)]`.** `tests/inspector_goldens.rs` is a separate
 //! crate linking the library as a consumer does, so a `#[cfg(test)]` item is
@@ -656,4 +662,136 @@ fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
             );
         }
     }
+}
+
+/// The keys of a probe frame (`/api/live`), at each level.
+///
+/// Written out rather than derived from `inspector_model::frame`'s types, for
+/// the reason [`PANE_IDS`] is: a list read off the producer agrees with the
+/// producer by construction. A field added, renamed or removed is meant to fail
+/// here, and the failure is the notice that the wire changed.
+const PROBE_FRAME_KEYS: [&str; 4] = ["published", "final", "nodes", "sources"];
+const PROBED_NODE_KEYS: [&str; 2] = ["nodeId", "probes"];
+const PROBE_KEYS: [&str; 11] = [
+    "producerId",
+    "producer",
+    "shape",
+    "completeness",
+    "obsolete",
+    "note",
+    "seq",
+    "stale",
+    "total",
+    "dropped",
+    "rows",
+];
+const PROBE_ROW_KEYS: [&str; 3] = ["key", "value", "deleted"];
+const SOURCE_WINDOW_KEYS: [&str; 5] = ["nodeIds", "name", "total", "dropped", "rows"];
+
+/// Assert that `v` is a probe frame: exactly the keys at every level, nodes in
+/// ascending `nodeId`, each node's probes in ascending `producerId`, and every
+/// `total` equal to its rows plus `dropped`. Panics naming the offending path
+/// otherwise.
+pub fn assert_probe_frame_shape(v: &Value) {
+    assert_exact_keys(v, &PROBE_FRAME_KEYS, "frame");
+    assert!(v["published"].is_u64(), "frame.published is a number");
+    assert!(v["final"].is_boolean(), "frame.final is a boolean");
+
+    let nodes = array_at(v, "nodes", "frame");
+    assert_ascending(nodes, "nodeId", "frame.nodes");
+    for (i, node) in nodes.iter().enumerate() {
+        let at = format!("frame.nodes[{i}]");
+        assert_exact_keys(node, &PROBED_NODE_KEYS, &at);
+        let probes = array_at(node, "probes", &at);
+        assert!(
+            !probes.is_empty(),
+            "{at}.probes is non-empty: a node ships only with a probe"
+        );
+        assert_ascending(probes, "producerId", &format!("{at}.probes"));
+        for (j, probe) in probes.iter().enumerate() {
+            let at = format!("{at}.probes[{j}]");
+            assert_exact_keys(probe, &PROBE_KEYS, &at);
+            for key in ["producer", "shape"] {
+                assert!(probe[key].is_string(), "{at}.{key} is a string");
+            }
+            for key in ["completeness", "obsolete", "note"] {
+                assert!(
+                    probe[key].is_string() || probe[key].is_null(),
+                    "{at}.{key} is a string or null"
+                );
+            }
+            assert!(probe["seq"].is_u64(), "{at}.seq is a number");
+            assert!(probe["stale"].is_boolean(), "{at}.stale is a boolean");
+            assert_rows_and_counts(probe, &at);
+        }
+    }
+
+    for (i, source) in array_at(v, "sources", "frame").iter().enumerate() {
+        let at = format!("frame.sources[{i}]");
+        assert_exact_keys(source, &SOURCE_WINDOW_KEYS, &at);
+        assert!(source["name"].is_string(), "{at}.name is a string");
+        for (k, id) in array_at(source, "nodeIds", &at).iter().enumerate() {
+            assert!(id.is_u64(), "{at}.nodeIds[{k}] is a number");
+        }
+        assert_rows_and_counts(source, &at);
+    }
+}
+
+/// `v`'s keys are exactly `keys`.
+fn assert_exact_keys(v: &Value, keys: &[&str], at: &str) {
+    let object = v.as_object().unwrap_or_else(|| panic!("{at} is an object"));
+    let mut found: Vec<&str> = object.keys().map(String::as_str).collect();
+    found.sort_unstable();
+    let mut expected = keys.to_vec();
+    expected.sort_unstable();
+    assert_eq!(found, expected, "{at} has exactly the keys {keys:?}");
+}
+
+fn array_at<'v>(v: &'v Value, key: &str, at: &str) -> &'v Vec<Value> {
+    v[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("{at}.{key} is an array"))
+}
+
+/// Every entry of `entries` carries a numeric `key`, strictly ascending.
+fn assert_ascending(entries: &[Value], key: &str, at: &str) {
+    let values: Vec<u64> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            e[key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{at}[{i}].{key} is a number"))
+        })
+        .collect();
+    assert!(
+        values.windows(2).all(|w| w[0] < w[1]),
+        "{at} is in strictly ascending {key}: {values:?}"
+    );
+}
+
+/// `v.rows` are rows, and `v.total` is `rows.len() + v.dropped`.
+fn assert_rows_and_counts(v: &Value, at: &str) {
+    let rows = array_at(v, "rows", at);
+    for (k, row) in rows.iter().enumerate() {
+        let at = format!("{at}.rows[{k}]");
+        assert_exact_keys(row, &PROBE_ROW_KEYS, &at);
+        assert!(
+            row["key"].is_string() || row["key"].is_null(),
+            "{at}.key is a string or null"
+        );
+        assert!(row["value"].is_string(), "{at}.value is a string");
+        assert!(row["deleted"].is_boolean(), "{at}.deleted is a boolean");
+    }
+    let total = v["total"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{at}.total is a number"));
+    let dropped = v["dropped"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{at}.dropped is a number"));
+    assert_eq!(
+        total,
+        rows.len() as u64 + dropped,
+        "{at}.total is its rows plus dropped"
+    );
 }

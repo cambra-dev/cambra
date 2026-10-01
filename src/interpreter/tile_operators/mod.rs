@@ -27,6 +27,7 @@ pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, 
 use crate::{
     ccl::provenance::NodeId,
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
+    interpreter::value_probe::ProbeSlot,
     interpreter::{Consumer, Extent, Scheduler, validate_tile},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -110,6 +111,7 @@ pub trait TileOperator {
 
     /// Subscribe to this operator with an intent guard and consumer.
     /// Returns a producer that allows the consumer to get data and release regions.
+    /// Contains generic logic for all operators.
     ///
     /// # Arguments
     /// * `intent_guard` - The region of the operator's extent that the consumer
@@ -121,6 +123,20 @@ pub trait TileOperator {
     /// # Returns
     /// A producer that provides access to the data and allows releasing regions
     fn subscribe(
+        &mut self,
+        intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        self.subscribe_impl(intent_guard, consumer, scheduler)
+    }
+
+    /// Subscribe to this operator.  Operator-specific logic.
+    ///
+    /// Builds exactly one producer, whose [`ProducerBase::new`] names this
+    /// operator and takes `scheduler`'s probe slot. An input's producer is
+    /// reached through its own [`subscribe`](Self::subscribe).
+    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -319,6 +335,12 @@ impl Notified {
 pub struct ProducerBase {
     /// Instance-unique ID, allocated by [`TileProducer::alloc_id`].
     pub id: usize,
+    /// The operator that built this producer. `None` only for a test double
+    /// built with `ProducerBase::unowned`.
+    pub node_id: Option<NodeId>,
+    /// The probe slot of the scheduler this producer was subscribed under,
+    /// written on every [`TileProducer::get`] while it holds a table.
+    pub(crate) probes: ProbeSlot,
     /// Output tiling for this producer.
     pub tiling: Tiling,
     /// Obsolete region of the tiling
@@ -327,21 +349,61 @@ pub struct ProducerBase {
 }
 
 impl ProducerBase {
-    /// A producer whose input notification does not reach it, so every pull reads.
-    pub(crate) fn new(id: usize, tiling: &Tiling) -> Self {
-        Self::listening(id, tiling, Notified::Always)
+    /// The base of the producer `owner`'s `subscribe_impl` builds. Its input
+    /// notification does not reach it, so every pull reads.
+    pub(crate) fn new(
+        id: usize,
+        tiling: &Tiling,
+        owner: &OperatorBase,
+        scheduler: &Scheduler,
+    ) -> Self {
+        Self::listening(id, tiling, owner, scheduler, Notified::Always)
     }
 
-    /// A producer that reads only when its input has said something since its last
-    /// pull. `notified` is the flag whose [`Notified::consumer`] this producer's
-    /// `subscribe` installed on its input.
-    pub(crate) fn listening(id: usize, tiling: &Tiling, notified: Notified) -> Self {
+    /// [`new`](Self::new), for a producer that reads only when its input has
+    /// said something since its last pull. `notified` is the flag whose
+    /// [`Notified::consumer`] this producer's `subscribe` installed on its input.
+    pub(crate) fn listening(
+        id: usize,
+        tiling: &Tiling,
+        owner: &OperatorBase,
+        scheduler: &Scheduler,
+        notified: Notified,
+    ) -> Self {
         Self {
             id,
+            node_id: Some(owner.id),
+            probes: scheduler.probes().clone(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
             notified,
         }
+    }
+
+    /// A producer no operator built, for a test double constructing one
+    /// directly. It names no operator and is never probed.
+    #[cfg(test)]
+    pub(crate) fn unowned(id: usize, tiling: &Tiling) -> Self {
+        Self {
+            id,
+            node_id: None,
+            probes: ProbeSlot::default(),
+            tiling: tiling.clone(),
+            obsolete_guard: tiling.empty_guard(),
+            notified: Notified::Always,
+        }
+    }
+}
+
+/// Detach this producer's probe when it goes.
+///
+/// `LiveProgram::reload`'s teardown drops a replaced version's producers, so
+/// their probes go with them, and the probe table never has to decide which
+/// entries are still live. An operator the reload kept is not rebuilt, so its
+/// producer is not dropped and its probe's readings continue across the swap.
+impl Drop for ProducerBase {
+    fn drop(&mut self) {
+        self.probes.detach(self.node_id, self.id);
     }
 }
 
@@ -384,6 +446,16 @@ pub trait TileProducer {
     /// Return the instance-unique numeric ID assigned at construction.
     fn producer_id(&self) -> usize {
         self.base().id
+    }
+
+    /// The [`NodeId`] of the operator that built this producer, or `None` for a
+    /// producer built outside any [`TileOperator::subscribe`].
+    ///
+    /// One operator can build several producers — a `FanOut` branch is
+    /// subscribed once per branch — so this identifies the operator and not the
+    /// instance. [`producer_id`](Self::producer_id) is the instance.
+    fn operator_id(&self) -> Option<NodeId> {
+        self.base().node_id
     }
 
     /// Allocate the next instance ID for this producer type.
@@ -455,6 +527,17 @@ pub trait TileProducer {
             "{result:?} vs {:?}",
             self.tiling()
         );
+        // After `get_impl` rather than around it: `get_impl` pulls this
+        // producer's inputs, whose own `get` borrows the same probe table, and a
+        // borrow held across that call overlaps the inner one.
+        let base = self.base();
+        base.probes.observe_named(
+            base.node_id,
+            base.id,
+            || self.name(),
+            &result,
+            &base.obsolete_guard,
+        );
         result
     }
 
@@ -463,9 +546,8 @@ pub trait TileProducer {
 
     /// Release interest in a region.
     /// The `obsolete_guard` specifies a sub-region of the subscription that
-    /// is no longer needed. Returns an expanded obsolete guard that may be
-    /// larger if the producer has additional obsolescence information (e.g.,
-    /// from variables with their own obsolete guards).
+    /// is no longer needed. It is added to [`obsolete_guard`](Self::obsolete_guard),
+    /// and [`release_impl`](Self::release_impl) runs only when that grew.
     fn release(&mut self, obsolete_guard: TileGuard) {
         trace!("{} release: {obsolete_guard:?}", self.name());
         assert!(
@@ -555,7 +637,7 @@ pub(crate) mod test_helpers {
     impl TestTileProducer {
         pub(crate) fn new(tile: Tile, tiling: Tiling) -> Self {
             Self {
-                base: ProducerBase::new(Self::alloc_id(), &tiling),
+                base: ProducerBase::unowned(Self::alloc_id(), &tiling),
                 tile,
             }
         }
@@ -577,7 +659,7 @@ pub(crate) mod test_helpers {
             let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             (
                 Self {
-                    base: ProducerBase::new(Self::alloc_id(), &tiling),
+                    base: ProducerBase::unowned(Self::alloc_id(), &tiling),
                     tile,
                     released: released.clone(),
                 },
@@ -638,7 +720,7 @@ pub(crate) mod test_helpers {
             let released = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             (
                 Self {
-                    base: ProducerBase::new(Self::alloc_id(), &tiling),
+                    base: ProducerBase::unowned(Self::alloc_id(), &tiling),
                     tile,
                     released: released.clone(),
                 },
@@ -664,5 +746,94 @@ pub(crate) mod test_helpers {
         fn release_impl(&mut self, obsolete_guard: TileGuard) {
             self.released.borrow_mut().push(obsolete_guard);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Consumer, InputEdgeSpec, OperatorBase, ProducerBase, Scheduler, Tile, TileGuard,
+        TileOperator, TileProducer, Tiling,
+    };
+    use crate::interpreter::{Extent, types::BaseType, types::ColumnValue};
+
+    fn int_tiling() -> Tiling {
+        Tiling::Scalar(Extent::Base(BaseType::Int))
+    }
+
+    struct OneRow {
+        base: ProducerBase,
+    }
+
+    impl TileProducer for OneRow {
+        impl_producer_base!();
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            Tile::Scalar(ColumnValue::Ints(vec![7]))
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    struct Leaf {
+        base: OperatorBase,
+    }
+
+    impl TileOperator for Leaf {
+        impl_operator_base!();
+
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+        fn subscribe_impl(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(OneRow {
+                base: ProducerBase::new(
+                    OneRow::alloc_id(),
+                    &self.base.tiling,
+                    &self.base,
+                    scheduler,
+                ),
+            })
+        }
+    }
+
+    /// A producer subscribed before probing is switched on is probed once it
+    /// is, under its operator's id: probes attach on demand, not at build.
+    #[test]
+    fn a_producer_is_probed_under_its_operator_once_its_scheduler_enables_probing() {
+        let mut op = Leaf {
+            base: OperatorBase::new(int_tiling()),
+        };
+        let mut scheduler = Scheduler::new();
+        let mut producer = op.subscribe(
+            int_tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut scheduler,
+        );
+        assert_eq!(producer.operator_id(), op.operator_id());
+
+        producer.get(int_tiling().universal_guard());
+        assert!(!scheduler.probes().is_enabled());
+
+        scheduler.probes().enable();
+        producer.get(int_tiling().universal_guard());
+        let keys: Vec<_> = scheduler
+            .probes()
+            .with_table(|table| table.probe_keys().collect())
+            .expect("probing is on");
+        assert_eq!(keys, vec![(op.operator_id(), producer.producer_id())]);
+
+        drop(producer);
+        assert_eq!(
+            scheduler
+                .probes()
+                .with_table(|table| table.probe_keys().count()),
+            Some(0),
+            "dropping a producer detaches its probe",
+        );
     }
 }

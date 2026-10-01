@@ -1,5 +1,5 @@
-//! The inspector's transport edge: the read-only model rendered as JSON, and
-//! the HTTP server that hands it to the frontend.
+//! The inspector's transport edge: the read-only model rendered as JSON, a
+//! run's probe frames, and the HTTP server that hands both to the frontend.
 //!
 //! The model itself is [`inspector_model`](crate::inspector_model), which owns
 //! the payload shape and the indices it is built from and answers no positional
@@ -17,16 +17,23 @@
 //! Every path emits the whole payload. The wire has one shape, and
 //! [`snapshot_json_pretty`] differs from [`snapshot_json`] in whitespace alone.
 //!
+//! # Live frames
+//!
+//! [`live`] carries a running program's probe frames over the `GET /api/live`
+//! websocket, on a route separate from the snapshot. The frame's shape is
+//! [`ProbeFrame`](crate::inspector_model::frame::ProbeFrame).
+//!
 //! # The frontend is a sibling directory, not a crate
 //!
 //! `web/` is the TypeScript frontend and its build; the bundle
 //! it produces is embedded by [`serve`]. It is a JS project rather than a
 //! workspace member because the Rust half of the inspector is this module.
 
+pub mod live;
 mod serve;
 pub mod wire_check;
 
-pub use serve::{serve, snapshot_body_pretty};
+pub use serve::{serve, serve_compiled, snapshot_body_pretty};
 
 use crate::ccl::context::CompiledProgram;
 use crate::inspector_model::InspectedProgram;

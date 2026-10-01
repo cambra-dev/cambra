@@ -53,14 +53,19 @@ impl TileOperator for Converse {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(ConverseProducer {
-            base: ProducerBase::new(ConverseProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ConverseProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -307,14 +312,19 @@ impl TileOperator for MapDomain {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MapDomainProducer {
-            base: ProducerBase::new(MapDomainProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapDomainProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -428,14 +438,19 @@ impl TileOperator for Uncurry {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                UncurryProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -599,7 +614,7 @@ impl TileOperator for Filter {
         visit(value("predicate", &*self.predicate));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -617,7 +632,12 @@ impl TileOperator for Filter {
             scheduler,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                FilterProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -796,7 +816,7 @@ impl TileOperator for MapFilter {
         visit(value("predicate", &*self.predicate));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -814,7 +834,12 @@ impl TileOperator for MapFilter {
             scheduler,
         );
         Box::new(MapFilterProducer {
-            base: ProducerBase::new(MapFilterProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapFilterProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -949,7 +974,7 @@ impl TileOperator for Restrict {
         visit(value("predicate", &*self.predicate));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -961,7 +986,12 @@ impl TileOperator for Restrict {
             scheduler,
         );
         Box::new(RestrictProducer {
-            base: ProducerBase::new(RestrictProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                RestrictProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             predicate: predicate_producer,
         })
     }
@@ -1076,7 +1106,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -1193,7 +1223,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -1287,7 +1317,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -1356,7 +1386,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -1390,7 +1420,7 @@ mod tests {
             )
         };
         let mut producer = ConverseProducer {
-            base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
         };
         producer.get(producer.tiling().universal_guard())

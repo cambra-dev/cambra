@@ -172,7 +172,7 @@ impl TileOperator for CheckedLookup {
         }
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -205,7 +205,12 @@ impl TileOperator for CheckedLookup {
             )),
         };
         Box::new(CheckedLookupProducer {
-            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &self.base.tiling),
+            base: ProducerBase::new(
+                CheckedLookupProducer::alloc_id(),
+                &self.base.tiling,
+                &self.base,
+                scheduler,
+            ),
             source,
             released: false,
         })

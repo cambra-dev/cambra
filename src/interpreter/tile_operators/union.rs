@@ -297,7 +297,7 @@ impl TileOperator for UnionOperator {
         }
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -316,7 +316,12 @@ impl TileOperator for UnionOperator {
             })
             .collect();
         Box::new(UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                UnionProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             inputs: input_producers,
             flat: self.flat,
         })
@@ -522,7 +527,7 @@ mod tests {
         fn tiling(&self) -> &Tiling {
             &self.0
         }
-        fn subscribe(
+        fn subscribe_impl(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
@@ -801,7 +806,7 @@ mod tests {
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         );
         let mut producer = UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &union_tiling),
             inputs,
             // Tagged, not flat-merged: the assertions below read per-arm
             // variants off a `ColumnValue::Union` domain.
@@ -876,15 +881,15 @@ mod tests {
         );
 
         let producer = UnionProducer {
-            base: ProducerBase::new(UnionProducer::alloc_id(), &union_tiling),
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &union_tiling),
             inputs: vec![
                 Box::new(SpyProducer {
-                    base: ProducerBase::new(0, &int_function_tiling()),
+                    base: ProducerBase::unowned(0, &int_function_tiling()),
                     tile: int_function_tile(),
                     log: log0.clone(),
                 }),
                 Box::new(SpyProducer {
-                    base: ProducerBase::new(1, &int_function_tiling()),
+                    base: ProducerBase::unowned(1, &int_function_tiling()),
                     tile: int_function_tile(),
                     log: log1.clone(),
                 }),

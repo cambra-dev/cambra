@@ -52,7 +52,7 @@ impl TileOperator for Aggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -62,7 +62,12 @@ impl TileOperator for Aggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(AggregateProducer::new(
-            self.tiling().clone(),
+            ProducerBase::new(
+                AggregateProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input_producer,
         ))
     }
@@ -84,8 +89,8 @@ struct AggregateProducer {
 
 impl AggregateProducer {
     /// Construct an `AggregateProducer`, seeding the accumulator with the identity element.
-    fn new(tiling: Tiling, input: Box<dyn TileProducer>) -> Self {
-        let (kind, accumulator) = match &tiling {
+    fn new(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
+        let (kind, accumulator) = match &base.tiling {
             Tiling::Aggregation {
                 kind,
                 accumulator: acc_tiling,
@@ -100,7 +105,7 @@ impl AggregateProducer {
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
         };
         Self {
-            base: ProducerBase::new(Self::alloc_id(), &tiling),
+            base,
             input,
             kind,
             accumulator,
@@ -192,14 +197,19 @@ impl TileOperator for ExtractAggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(ExtractAggregateProducer {
-            base: ProducerBase::new(ExtractAggregateProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ExtractAggregateProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
@@ -315,7 +325,7 @@ impl TileOperator for MapExtractAggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -325,7 +335,12 @@ impl TileOperator for MapExtractAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapExtractAggregateProducer {
-            base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapExtractAggregateProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             kind: self.kind,
         })
@@ -565,7 +580,7 @@ impl TileOperator for MapAggregate {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe(
+    fn subscribe_impl(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -575,7 +590,12 @@ impl TileOperator for MapAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapAggregateProducer {
-            base: ProducerBase::new(MapAggregateProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapAggregateProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             kind: self.kind,
             accumulators: HashMap::new(),
@@ -738,7 +758,10 @@ mod tests {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
-        let mut producer = AggregateProducer::new(tiling.clone(), Box::new(spy));
+        let mut producer = AggregateProducer::new(
+            ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
+            Box::new(spy),
+        );
 
         let first = producer.get(tiling.universal_guard());
         let Tile::Aggregation { accumulator, .. } = &first else {
@@ -771,7 +794,10 @@ mod tests {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
-        let mut producer = AggregateProducer::new(tiling.clone(), Box::new(spy));
+        let mut producer = AggregateProducer::new(
+            ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
+            Box::new(spy),
+        );
 
         producer.release(tiling.universal_guard());
         assert!(
@@ -822,7 +848,7 @@ mod tests {
             },
         );
         let mut producer = MapAggregateProducer {
-            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
@@ -903,7 +929,7 @@ mod tests {
             },
         );
         let mut producer = MapAggregateProducer {
-            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
