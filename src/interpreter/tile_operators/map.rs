@@ -196,8 +196,14 @@ impl TileProducer for MapResultProducer {
         // carry the input's `domain` through to the output while building the
         // codomain only from live rows — so a tile still carrying deleted rows
         // yields a domain and codomain of different lengths, which is not a valid
-        // tile. `Restrict` upstream produces the same shape.
+        // tile. `Restrict` upstream produces the same shape. Mapping a filtered row
+        // could evaluate the partial expression the filter guards, so the rows are
+        // dropped rather than carried; no consumer sees them, so this releases them.
+        let dropped = input_tile.deleted_keys_guard();
         input_tile.compact();
+        if let Some(dropped) = dropped {
+            self.input.release(dropped);
+        }
         let function_tile = self.function.get(self.function.tiling().universal_guard());
 
         // A function whose values are themselves a collection needs special-case handling:
@@ -611,6 +617,11 @@ impl TileProducer for MapResultToConstProducer {
         } = &input_tile
             && input_tile.is_empty()
         {
+            // The empty tile below drops the input's deleted rows, which no consumer then
+            // sees, so this releases them.
+            if let Some(dropped) = input_tile.deleted_keys_guard() {
+                self.input.release(dropped);
+            }
             let mut out = self.tiling().empty_tile();
             if let Tile::DataFunction {
                 domain_predicate: out_pred,

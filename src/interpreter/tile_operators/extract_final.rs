@@ -214,13 +214,9 @@ impl TileProducer for ExtractFinalProducer {
             // dense read, the store prefix below the tail's carry source). Without
             // it, a never-terminating loop would pin the whole changelog until a
             // terminal that never comes.
-            if let Tile::DataFunction {
-                domain, deleted, ..
-            } = &source_tile
-            {
-                let max_pos = (0..domain.len())
-                    .filter(|i| !deleted.contains(*i))
-                    .filter_map(|i| match domain.index_at(i) {
+            if let Some(live) = source_tile.live_keys() {
+                let max_pos = live
+                    .filter_map(|(_, key)| match key {
                         Value::UInt(p) => Some(p),
                         _ => None,
                     })

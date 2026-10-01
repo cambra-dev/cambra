@@ -1,6 +1,7 @@
 use bit_set::BitSet;
 
 use super::*;
+use crate::interpreter::live_keys;
 use crate::interpreter::operator_graph::value_at;
 use crate::{
     ccl::TagMap,
@@ -208,17 +209,15 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         if i == 0 {
             domain_predicate = dp;
         }
-        let live: Vec<usize> = (0..domain.len())
-            .filter(|r| !deleted.contains(*r))
-            .collect();
+        let pairs_before = pairs.len();
+        for (row, key) in live_keys(&domain, &deleted) {
+            pairs.push((key, offset + row));
+        }
         // An arm contributing no row is skipped rather than concatenated: it carries an
         // empty column whose kind is whatever its producer happened to build, and
         // concatenating that against a sibling's is a mismatch over nothing.
-        if live.is_empty() {
+        if pairs.len() == pairs_before {
             continue;
-        }
-        for row in live {
-            pairs.push((domain.index_at(row), offset + row));
         }
         offset += domain.len();
         // Arms disagree on whether a compound value rides boxed (`Scalar(Records)`) or as

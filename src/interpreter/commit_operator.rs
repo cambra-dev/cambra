@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::ccl::F_WRITES;
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, FunctionGuard, Predicate, Scheduler, SharedConsumer,
-    Tile, TileGuard, Tiling, Value, WakeupQueue, forwarding_consumer, shared_consumer,
+    Tile, TileGuard, Tiling, Value, WakeupQueue, forwarding_consumer, live_keys, shared_consumer,
     tile_operators::{
         CycleSlot, CyclicSequencingProducer, ProducerBase, TileOperator, TileProducer,
     },
@@ -1237,7 +1237,8 @@ impl TileProducer for CommitProducer {
 }
 
 /// Decode an iteration source tile into `(absolute domain position, item)` pairs,
-/// **sorted by position**.
+/// **sorted by position**, for the positions that survive: a row the source marks
+/// deleted is not an item.
 ///
 /// Both drivers read their source through this. An **async** source's domain
 /// arrives *unordered* (it enumerates a set of arrived keys) and *compacts* as its
@@ -1249,7 +1250,10 @@ impl TileProducer for CommitProducer {
 /// list is the special case (its domain is already `[0, 1, …]`).
 fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     let Tile::DataFunction {
-        domain, codomain, ..
+        domain,
+        codomain,
+        deleted,
+        ..
     } = tile
     else {
         return Vec::new();
@@ -1257,15 +1261,71 @@ fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
     if !matches!(codomain.as_ref(), Tile::Scalar(_) | Tile::Record(_)) {
         return Vec::new();
     }
-    let keys = &domain;
-    let mut pairs: Vec<(usize, Value)> = (0..keys.len())
-        .filter_map(|i| match keys.index_at(i) {
+    // A restricted source still carries its extent's keys, the filtered ones deleted.
+    // Reading them all makes either driver run an item at a position the source does not
+    // have.
+    let mut pairs: Vec<(usize, Value)> = live_keys(domain, deleted)
+        .filter_map(|(i, key)| match key {
             Value::UInt(pos) => Some((pos, source_value_at(codomain, i))),
             _ => None,
         })
         .collect();
     pairs.sort_by_key(|(pos, _)| *pos);
+    // A position names one item. The two drivers resolve a repeated one differently (the
+    // induction driver's map keeps the last, the transaction driver's search the first),
+    // so a source delivering a surviving position twice has no single meaning here.
+    debug_assert!(
+        pairs.windows(2).all(|w| w[0].0 < w[1].0),
+        "an iteration source delivered a surviving position twice: {:?}",
+        pairs.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
     pairs
+}
+
+/// The positions a collection tile's domain holds, deleted rows included, in column order;
+/// none for any other tile.
+fn domain_positions(tile: &Tile) -> impl Iterator<Item = usize> + '_ {
+    let domain = match tile {
+        Tile::DataFunction { domain, .. } => Some(domain),
+        _ => None,
+    };
+    domain.into_iter().flat_map(|domain| {
+        (0..domain.len()).filter_map(|i| match domain.index_at(i) {
+            Value::UInt(p) => Some(p),
+            _ => None,
+        })
+    })
+}
+
+/// The highest position a collection tile holds, deleted rows included.
+fn highest_position(tile: &Tile) -> Option<usize> {
+    domain_positions(tile).max()
+}
+
+/// How far a driver has read its source tile: every position below `next`, the next one it
+/// will run, or every position the tile holds when there is none.
+fn source_read_through(next: Option<usize>, src: &Tile) -> Option<usize> {
+    match next {
+        Some(p) => p.checked_sub(1),
+        None => highest_position(src),
+    }
+}
+
+/// Release a driver's source through `through`, unless `released` already reaches it, and
+/// record the advance.
+fn release_source_prefix(
+    source: &mut dyn TileProducer,
+    released: &mut Option<usize>,
+    through: Option<usize>,
+) {
+    if let Some(through) = through
+        && !released.is_some_and(|r| r >= through)
+    {
+        source.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(through)),
+        )));
+        *released = Some(through);
+    }
 }
 
 /// The `Value` at position `i` of a source codomain tile — a scalar column or a
@@ -1539,6 +1599,28 @@ impl TileProducer for InductionStoreProducer {
                 "a step at position {pos} advances the watermark to its tick {}",
                 pos + 1
             );
+        }
+        // A position the body input states complete and holds no decision for is one the
+        // loop does not run at: the driver read past it, a row the source's filter removed
+        // (`DriverWindow::render`). It is decided with nothing written, as a carry. Without
+        // this the frontier would move only at surviving positions, so a filtered row after
+        // the last survivor would never be decided, and a read of the store over the loop's
+        // extent would never emit, and never release, that position.
+        // A terminal body input states everything complete, which `done` below closes the
+        // frontier on instead, so only a bounded statement is walked.
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &body_tile
+            && let Some(bound) = domain_predicate.max_released_position()
+        {
+            while self.processed() <= bound
+                && domain_predicate.contains(&Value::UInt(self.processed()))
+                && next_decided_position(&body_tile, self.processed())
+                    .is_none_or(|p| p > self.processed())
+            {
+                let pos = self.processed();
+                self.engine.step(pos + 1, None);
+            }
         }
         // Reclaim the decisions just consumed. This release travels back through
         // the body to the driver, which compacts its emitted window and releases
@@ -2054,6 +2136,8 @@ impl TileOperator for StoreDenseRead {
             value_extent: self.value_extent.clone(),
             carry_forward: self.carry_forward,
             key_write_ticks: Vec::new(),
+            released_through: None,
+            trigger_released_through: None,
         })
     }
 }
@@ -2069,6 +2153,11 @@ struct StoreDenseReadProducer {
     /// carry read's [`Self::release_impl`] uses it to find the carry source of the
     /// earliest still-needed position — the store prefix it can safely release.
     key_write_ticks: Vec<usize>,
+    /// The highest loop position this read's consumer has released.
+    released_through: Option<usize>,
+    /// The trigger prefix this read has released, by its consumer's release or by reading
+    /// past a filtered row, so a pull that reads nothing new does not repeat the release.
+    trigger_released_through: Option<usize>,
 }
 
 impl TileProducer for StoreDenseReadProducer {
@@ -2083,8 +2172,9 @@ impl TileProducer for StoreDenseReadProducer {
         let Tile::DataFunction {
             domain: positions,
             domain_predicate: trigger_pred,
+            deleted,
             ..
-        } = trigger
+        } = &trigger
         else {
             return self.tiling().empty_tile();
         };
@@ -2109,13 +2199,24 @@ impl TileProducer for StoreDenseReadProducer {
         // accumulator only if the highest loop position is last. (A co-iterated
         // read aligns by domain *value* via `zip_arms`, so ordering is immaterial
         // there; sorting is correct for both.)
-        let mut sorted: Vec<usize> = (0..positions.len())
-            .map(|i| match positions.index_at(i) {
+        //
+        // The trigger is the loop's own source, so a filtered row arrives deleted: the loop
+        // does not run there, and it is no position of this read's output.
+        let mut sorted: Vec<usize> = live_keys(positions, deleted)
+            .map(|(_, key)| match key {
                 Value::UInt(p) => p,
                 _ => unreachable!("induction loop-extent positions are UInt"),
             })
             .collect();
         sorted.sort_unstable();
+        // The first position not yet decided, which this read still has to fold.
+        let first_undecided = {
+            let decided_through = store_frontier(&store);
+            sorted
+                .iter()
+                .copied()
+                .find(|p| !decided_through.is_some_and(|w| *p < w))
+        };
         // **Only decided positions may be emitted.** Position `p` reads tick
         // `p + 1`, so it is decided exactly when `p + 1 <= frontier`. Folding an
         // *undecided* position would resolve it to the carried earlier value and
@@ -2153,6 +2254,24 @@ impl TileProducer for StoreDenseReadProducer {
                 values.push(v);
             }
         }
+        // A decided position this read does not emit, a tap that did not fire there or a row
+        // the trigger marks deleted, reaches no consumer, so no consumer release covers it.
+        // This read releases it: every trigger position below the first one it still needs
+        // (one undecided, or one emitted and not yet released), or every position the trigger
+        // holds when there is none.
+        let first_held = kept
+            .iter()
+            .copied()
+            .find(|p| !self.released_through.is_some_and(|r| *p <= r));
+        let next_needed = match (first_undecided, first_held) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        release_source_prefix(
+            &mut *self.trigger_producer,
+            &mut self.trigger_released_through,
+            source_read_through(next_needed, &trigger),
+        );
         let positions = ColumnValue::from_uints(kept);
         // Cache the (ascending) ticks that wrote `key`, so a carry read's release
         // can find the carry source of the first still-needed position. Only a
@@ -2179,7 +2298,7 @@ impl TileProducer for StoreDenseReadProducer {
         // emitted set rather than a `LessThanEq` bound keeps it honest when the
         // trigger has not yet delivered every position below the frontier.
         let domain_predicate = if store.is_terminal() {
-            trigger_pred
+            trigger_pred.clone()
         } else {
             Predicate::from_column_value(&positions)
         };
@@ -2228,6 +2347,7 @@ impl TileProducer for StoreDenseReadProducer {
                             Predicate::LessThanEq(Value::UInt(upto)),
                         )));
                 }
+                self.released_through = self.released_through.max(Some(max_pos));
             }
             self.trigger_producer.release(obsolete_guard);
         }
@@ -2654,8 +2774,8 @@ struct DriverRow {
     item_index: usize,
     /// The row's absolute domain position, which the body's decision is looked
     /// up by ([`body_decision_at`]). Ascending across the window, and on the
-    /// induction side not necessarily contiguous: a restricted loop source
-    /// delivers a subset of its extent's positions and the recurrence runs over
+    /// induction side not necessarily contiguous: a restricted loop source's
+    /// surviving positions are a subset of its extent's and the recurrence runs over
     /// exactly those.
     position: usize,
 }
@@ -2672,7 +2792,7 @@ struct DriverRow {
 /// Positions are **absolute and ascending**, each carried on its row: released
 /// rows compact off the front without renumbering the rest, because the body
 /// looks a decision up by domain *value* ([`body_decision_at`]). They need not be
-/// contiguous — a restricted induction source has positions its extent does not.
+/// contiguous — a restricted induction source lacks positions its extent has.
 struct DriverWindow {
     read_extents: Vec<Extent>,
     item_extent: Extent,
@@ -2755,7 +2875,12 @@ impl DriverWindow {
     /// every retained row is live: a re-pull within a round re-emits only what
     /// the body has not merged, and an already-released position cannot come
     /// back to duplicate a domain position in the body's `Memo`.
-    fn render(&self, done: bool) -> Tile {
+    ///
+    /// `read_through` is how far the driver has read its source, filtered rows included.
+    /// Every position up to it is complete: emitted, released, or a row the source's filter
+    /// removed, which the driver never emits. Stating that is what lets the store decide a
+    /// filtered position (see `InductionStoreProducer::get_impl`).
+    fn render(&self, done: bool, read_through: Option<usize>) -> Tile {
         // Column `i < r` is read key `i`'s snapshot; column `r` is the item. Same
         // index that names the field, so the layout stays the tiling's.
         let item = self.read_extents.len();
@@ -2788,7 +2913,11 @@ impl DriverWindow {
             if done {
                 Predicate::True
             } else {
-                Predicate::from_column_value(&domain)
+                let emitted = Predicate::from_column_value(&domain);
+                match read_through {
+                    Some(r) => emitted.union(&Predicate::LessThanEq(Value::UInt(r))),
+                    None => emitted,
+                }
             },
             BitSet::new(),
         )
@@ -2966,9 +3095,10 @@ struct InductionDriverProducer {
     /// its ticks).
     emitted_through: Option<usize>,
     /// Highest source position released back upstream. The driver never re-reads
-    /// a position it has emitted, so that prefix is reclaimable; a co-iterated
-    /// reader keeps its own positions live through the source's cross-producer
-    /// release intersection.
+    /// a position it has emitted and never reads a filtered one, so every emitted
+    /// position and every filtered one below the next it will emit is reclaimable; a
+    /// co-iterated reader keeps its own positions live through the source's
+    /// cross-producer release intersection.
     source_released_through: Option<usize>,
     /// Whether the whole source has been released (`True`) after the loop
     /// finished — the finite loop's `get_released_predicate() == True`
@@ -2985,7 +3115,7 @@ impl TileProducer for InductionDriverProducer {
         // been emitted, so the live window is the whole remaining answer. The driver
         // owns the source, so the obligation is its to keep.
         if self.source_fully_released {
-            return self.window.render(true);
+            return self.window.render(true, None);
         }
         let src = self
             .source_producer
@@ -3000,8 +3130,8 @@ impl TileProducer for InductionDriverProducer {
         // never looks back, so a late arrival below the cursor would be dropped in
         // silence. A position at or below the cursor is still legitimate *here*: the
         // release below is what removes the consumed prefix, and the source is free
-        // to honour it a pull late. The domain need not be contiguous — a restricted
-        // source (`for l in [x for x in xs if p(x)]`) delivers a subset of its
+        // to honour it a pull late. The positions need not be contiguous — a restricted
+        // source (`for l in [x for x in xs if p(x)]`) survives at a subset of its
         // extent's positions and the recurrence runs over exactly those.
         debug_assert!(
             by_pos.keys().all(|&p| {
@@ -3045,13 +3175,23 @@ impl TileProducer for InductionDriverProducer {
                 .min()
         };
         let tick_cursor = self.emitted_through.map_or(0, |p| p + 1);
+        // The store also passes the positions this driver has read past without emitting,
+        // the rows a filter removed, once the body input states them complete (see
+        // `DriverWindow::render`). So its frontier can run past `tick_cursor` up to one past
+        // what this driver has released, and every emitted position is decided once it
+        // reaches `tick_cursor`.
+        let passed_cursor = self
+            .source_released_through
+            .max(self.emitted_through)
+            .map_or(0, |p| p + 1);
         if let Some(frontier) = frontier {
             debug_assert!(
-                frontier <= tick_cursor,
-                "the store decided through tick {frontier} but the driver has only emitted \
-                 through tick {tick_cursor} — a decision cannot precede the input it decides"
+                frontier <= passed_cursor,
+                "the store decided through tick {frontier} but the driver has only emitted or \
+                 read past through tick {passed_cursor} — a decision cannot precede the input \
+                 it decides"
             );
-            if frontier == tick_cursor
+            if frontier >= tick_cursor
                 && let Some(pos) = next_delivered(self.emitted_through)
             {
                 // The previous accumulator is that key's value as of the frontier:
@@ -3083,24 +3223,20 @@ impl TileProducer for InductionDriverProducer {
                     Predicate::LessThanEq(Value::UInt(frontier)),
                 )));
         }
-        // Reclaim the source prefix this driver has consumed. It only ever reads
-        // the position it is about to emit and never re-reads an earlier one.
-        if let Some(through) = self.emitted_through
-            && !self.source_released_through.is_some_and(|r| r >= through)
-        {
-            self.source_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(through)),
-                )));
-            self.source_released_through = Some(through);
-        }
+        // Reclaim the source prefix this driver has read past, filtered rows included; see
+        // `source_released_through`.
+        let pending = next_delivered(self.emitted_through);
+        release_source_prefix(
+            &mut *self.source_producer,
+            &mut self.source_released_through,
+            source_read_through(pending, &src).max(self.emitted_through),
+        );
         // Every position of a complete source has been emitted: the body input
         // is final, and that terminality propagates through the body's decision
         // stream to close the store's frontier. Positions arrive in ascending
         // order, so "no delivered position above the cursor" means "there is no
         // next" — the question a restricted source needs asked, since the position
         // one past the cursor may simply not be in its domain.
-        let pending = next_delivered(self.emitted_through);
         let done = source_complete && pending.is_none();
         // Re-arm while the cycle still has work only it can trigger: a position
         // has arrived that is not yet emitted. That is the whole condition — it
@@ -3133,7 +3269,7 @@ impl TileProducer for InductionDriverProducer {
             self.wakeups.request(self.consumer.clone());
         }
 
-        self.window.render(done)
+        self.window.render(done, self.source_released_through)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -3251,6 +3387,7 @@ impl TileOperator for TransactDriver {
             window: DriverWindow::new(self.read_extents.clone(), self.item_extent.clone()),
             current: self.resume_at,
             latest_emit: None,
+            source_released_through: self.resume_at.checked_sub(1),
         })
     }
 }
@@ -3290,6 +3427,9 @@ struct TransactDriverProducer {
     /// is a pure function of that pair, so re-emitting at an unchanged pair would
     /// duplicate a domain position against the body's `Memo`.
     latest_emit: Option<(usize, CommitTs)>,
+    /// The source prefix this driver has released, by a finish or by reading past a
+    /// filtered row, so a pull that reads nothing new does not repeat the release.
+    source_released_through: Option<usize>,
 }
 
 /// The most rows this driver's live window may hold: the attempt the writer has
@@ -3352,8 +3492,9 @@ impl TileProducer for TransactDriverProducer {
         // grows over time, and positions are absolute, so `get` returns whatever
         // the source still offers under stable append-only positions. The drive
         // does release a prefix — `release_impl` withdraws each item as it
-        // finishes — so what is offered shrinks off the front, which is why an
-        // item is named by its domain position rather than by a column index.
+        // finishes, and a filtered row is withdrawn below once the drive reads past
+        // it — so what is offered shrinks off the front, which is why an item is
+        // named by its domain position rather than by a column index.
         let src = self
             .source_producer
             .get(self.source_producer.tiling().universal_guard());
@@ -3368,6 +3509,15 @@ impl TileProducer for TransactDriverProducer {
         // withdraws the position from the source.
         let items = decode_source_positioned(&src);
         let next_item = items.iter().find(|(pos, _)| *pos >= self.current);
+        // A filtered row is finished once the drive reads past it: nothing attempts it, so
+        // no ack will release it. Every position below the next item is filtered or has
+        // finished, and with no next item every position the tile holds is. The attempt in
+        // flight, if any, is the next item, so it stays offered.
+        release_source_prefix(
+            &mut *self.source_producer,
+            &mut self.source_released_through,
+            source_read_through(next_item.map(|(pos, _)| *pos), &src),
+        );
         let store = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -3421,7 +3571,7 @@ impl TileProducer for TransactDriverProducer {
         if next_item.is_some() {
             self.wakeups.request(self.consumer.clone());
         }
-        self.window.render(done)
+        self.window.render(done, None)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -3452,12 +3602,13 @@ impl TileProducer for TransactDriverProducer {
             // just finished has finished too. Releasing it is what makes the
             // source's own release state this drive's progress record, so a
             // replacement drive is offered what this one did not finish and
-            // nothing it did — see `src/ccl/design/program-evolution.md`,
+            // nothing it did or read past — see `src/ccl/design/program-evolution.md`,
             // "Where a producer registering now starts".
-            self.source_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::LessThanEq(Value::UInt(finished)),
-                )));
+            release_source_prefix(
+                &mut *self.source_producer,
+                &mut self.source_released_through,
+                Some(finished),
+            );
         }
         self.window.compact(pred);
         self.debug_assert_window_invariants();
@@ -3514,21 +3665,6 @@ fn is_fired_tag(tag: &crate::ccl::FieldKey) -> bool {
     matches!(tag, crate::ccl::FieldKey::Name(n) if n == crate::ccl::V_FIRED)
 }
 
-/// The newest position present in a body-input tile — the attempt a writer is
-/// currently deciding, superseding any older live one (see the caller). `None`
-/// when the driver has emitted nothing live.
-fn newest_body_position(tile: &Tile) -> Option<usize> {
-    let Tile::DataFunction { domain, .. } = tile else {
-        return None;
-    };
-    (0..domain.len())
-        .filter_map(|i| match domain.index_at(i) {
-            Value::UInt(p) => Some(p),
-            _ => None,
-        })
-        .max()
-}
-
 /// The lowest position `tile` decides at or after `pos`, or `None` when it decides
 /// none.
 ///
@@ -3536,15 +3672,7 @@ fn newest_body_position(tile: &Tile) -> Option<usize> {
 /// at consecutive positions: a restricted loop source iterates a subset of its
 /// extent, so the position after `p` in the decision stream need not be `p + 1`.
 fn next_decided_position(tile: &Tile, pos: usize) -> Option<usize> {
-    let Tile::DataFunction { domain, .. } = tile else {
-        return None;
-    };
-    (0..domain.len())
-        .filter_map(|i| match domain.index_at(i) {
-            Value::UInt(p) if p >= pos => Some(p),
-            _ => None,
-        })
-        .min()
+    domain_positions(tile).filter(|p| *p >= pos).min()
 }
 
 /// Extract a writer body's grant/deny *decision* at position `pos` of its input.
@@ -4023,7 +4151,7 @@ impl TileProducer for TransactWriterProducer {
             .driver_producer
             .get(self.driver_producer.tiling().universal_guard());
         self.driver_terminal = driver_tile.is_terminal();
-        let newest = newest_body_position(&driver_tile);
+        let newest = highest_position(&driver_tile);
         // The writer decides only the *newest* live driver position, and that
         // **supersedes** every older live one. Sound because the driver's whole
         // live window belongs to one item — it emits only for the item it has not
@@ -4343,6 +4471,123 @@ mod tests {
                 tile: self.tile.clone(),
             })
         }
+    }
+
+    /// A live loop source whose rows a filter has removed: every row of `items` is marked
+    /// deleted, and the tile is not terminal. It records every release it receives.
+    struct FilteredLiveSource {
+        tiling: Tiling,
+        tile: Tile,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+
+    impl FilteredLiveSource {
+        fn new(items: &[i64]) -> Self {
+            let tiling =
+                Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(value_extent()));
+            let tile = Tile::data_function(
+                ColumnValue::from_uints((0..items.len()).collect()),
+                Box::new(Tile::Scalar(ColumnValue::from_values(
+                    items.iter().map(|n| int(*n)).collect(),
+                    &value_extent(),
+                ))),
+                Predicate::False,
+                (0..items.len()).collect(),
+            );
+            Self {
+                tiling,
+                tile,
+                released: Rc::default(),
+            }
+        }
+    }
+
+    impl TileOperator for FilteredLiveSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(RecordingSourceProducer {
+                base: ProducerBase::new(RecordingSourceProducer::alloc_id(), &self.tiling),
+                tile: self.tile.clone(),
+                released: self.released.clone(),
+            })
+        }
+    }
+
+    struct RecordingSourceProducer {
+        base: ProducerBase,
+        tile: Tile,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+
+    impl TileProducer for RecordingSourceProducer {
+        fn base(&self) -> &ProducerBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut ProducerBase {
+            &mut self.base
+        }
+        // A `Restrict` keeps a filtered row's key, marked deleted, in every tile it
+        // emits, so this offers the tile as built.
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.clone()
+        }
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
+    /// The induction driver releases the rows a filter removed once it reads past them, as
+    /// the transaction driver does: no decision is emitted for one, so no store release ever
+    /// reaches it. Over a live source filtered to nothing, it releases both rows.
+    #[test]
+    fn induction_driver_releases_filtered_rows_it_reads_past() {
+        let acc = acct("acc");
+        let store = InductionStore::new(
+            vec![(acc.clone(), Box::new(Constant::new(int(0), value_extent())))],
+            vec![acc.clone()],
+            Vec::new(),
+            key_extent(),
+            value_extent(),
+            0,
+        );
+        let set_body = store.body_input_setter();
+        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let source = FilteredLiveSource::new(&[10, 20]);
+        let released = source.released.clone();
+        let driver = InductionDriver::new(
+            fan.branch(),
+            Box::new(source),
+            vec![acc.clone()],
+            vec![value_extent()],
+            value_extent(),
+            0,
+        );
+        set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
+        let mut op = fan.branch();
+        let guard = op.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        for _ in 0..4 {
+            producer.get(producer.tiling().universal_guard());
+            sched.check_for_notifications();
+        }
+        assert!(
+            released.borrow().iter().any(|g| matches!(
+                g,
+                TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(1))))
+            )),
+            "the driver releases both filtered rows: {:?}",
+            released.borrow()
+        );
     }
 
     /// The `commit` payload extent for a single-key writer: `{writes: {acc: value}}`.
@@ -5584,7 +5829,7 @@ mod tests {
                 seen.max_window = seen.max_window.max(domain.len());
                 // Positions are absolute and one per attempt, so the highest ever
                 // seen counts the attempts even after the window compacts.
-                if let Some(top) = newest_body_position(&tile) {
+                if let Some(top) = highest_position(&tile) {
                     seen.attempts = seen.attempts.max(top + 1);
                 }
             }
@@ -6705,6 +6950,24 @@ mod tests {
             decode_source_positioned(&tile),
             vec![(0, int(10)), (1, int(20)), (2, int(30))],
             "items must be paired with their domain position and sorted ascending"
+        );
+    }
+
+    #[test]
+    fn decode_source_positioned_skips_deleted_rows() {
+        // A `Restrict` marks a row deleted and keeps its key, so the decode is what drops
+        // it: the recurrence runs over the positions the source still has.
+        let mut deleted = BitSet::new();
+        deleted.insert(1);
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10, 20, 30]))),
+            Predicate::True,
+            deleted,
+        );
+        assert_eq!(
+            decode_source_positioned(&tile),
+            vec![(0, int(10)), (2, int(30))],
         );
     }
 

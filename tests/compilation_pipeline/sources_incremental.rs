@@ -16,6 +16,7 @@ use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
     sort_function_by_domain, tuple_field,
 };
+use indoc::indoc;
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
@@ -692,6 +693,52 @@ x";
     );
 }
 
+/// A transaction loop over a live source filtered to nothing releases every row it reads
+/// past. No block runs, so no commit acknowledges a row, and a row the filter removes is
+/// consumed when the drive reads past it.
+#[test_log::test]
+fn test_filtered_rows_of_a_live_transaction_source_are_released() {
+    let code = "\
+pool: Mut(Int, Txn) := 100
+for r in [z for z in source1() if z > 99]:
+    with begin():
+        pool := 7
+await_final(pool)";
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    ctx.scheduler().check_for_notifications();
+    pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
+    assert_eq!(
+        test_source.borrow().get_released_predicate(),
+        Predicate::LessThanEq(Value::UInt(1)),
+        "both filtered rows are released while the source is live"
+    );
+
+    // No block ran, so the store still holds its seed.
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    assert_eq!(
+        pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty),
+        Tile::Scalar(ColumnValue::Ints(vec![100])),
+    );
+}
+
 #[test_log::test]
 fn test_incremental_aggregates() {
     let code = "[sum(x) for x in groupby(source1(), \\x -> x // 10)]";
@@ -941,5 +988,100 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
         pull_and_release(&[(3, 40)]),
         delivered(vec![3], vec![40]),
         "and the release still lands after the accumulated guard has two regions",
+    );
+}
+
+/// Pull `producer` `laps` times over a live source holding `rows` at positions `0..`,
+/// releasing everything each pull answers as a sink does, and answer what the source has
+/// released.
+fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) -> Predicate {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let rows: Vec<(Value, Value)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (Value::UInt(i), Value::Int(*v)))
+        .collect();
+    test_source.borrow_mut().add_data(&rows);
+    ctx.scheduler().check_for_notifications();
+    for _ in 0..laps {
+        let tile = producer.get(producer.tiling().universal_guard());
+        if tile.is_data_function() {
+            producer.release(tile.to_guard());
+        }
+        ctx.scheduler().check_for_notifications();
+    }
+    test_source.borrow().get_released_predicate()
+}
+
+/// An induction loop over a live source filtered to nothing releases every row, as the
+/// transaction loop above does. The driver reads past both rows, the store decides them with
+/// nothing written, and the feed's read of the store, which emits nothing there, releases them.
+#[test_log::test]
+fn test_filtered_rows_of_a_live_induction_source_are_released() {
+    let code = indoc! {"
+        out = defer()
+        x := 0
+        for i in [z for z in source1() if z > 99]:
+            x := x + i
+            out << x
+        out
+    "};
+    let released = released_by_a_sink_over_a_live_source(code, &[10, 20], 12);
+    assert!(
+        (0..=1).all(|p| released.contains(&Value::UInt(p))),
+        "both filtered rows are released while the source is live: {released:?}"
+    );
+}
+
+/// A feed inside a loop releases the positions it does not fire at. Position 2 decides without
+/// feeding, and no later position is there to carry the release past it.
+#[test_log::test]
+fn test_a_feed_releases_the_positions_it_does_not_fire_at() {
+    let code = indoc! {"
+        out = defer()
+        x := 0
+        for i in source1():
+            x := x + i
+            if i > 15:
+                out << x
+        out
+    "};
+    let released = released_by_a_sink_over_a_live_source(code, &[10, 20, 5], 12);
+    assert!(
+        (0..=2).all(|p| released.contains(&Value::UInt(p))),
+        "every row is released while the source is live: {released:?}"
+    );
+}
+
+/// An operator that drops a filtered row from what it emits releases that row, since no
+/// consumer of its output sees it. Each program reads a live source of `10, 200, 20` through a
+/// filter keeping only `200`, and a sink releases what each pull answers; every row is then
+/// released, the two filtered ones included.
+#[rstest_log::rstest]
+#[case::map("[z + 1 for z in source1() if z > 99]")]
+#[case::map_of_a_source_filtered_to_nothing("[z + 1 for z in source1() if z > 999]")]
+#[case::zip("[(z, z * 2) for z in source1() if z > 99]")]
+#[case::field_of_a_record(indoc! {"
+    r = (xs=[z for z in source1() if z > 99], n=1)
+    [v + 1 for v in r.xs]
+"})]
+#[case::checked_lookup(indoc! {"
+    m = map([(200, 1), (10, 2)])
+    [m[z]? for z in source1() if z > 99]
+"})]
+fn test_a_dropped_filtered_row_is_released(#[case] code: &str) {
+    let released = released_by_a_sink_over_a_live_source(code, &[10, 200, 20], 12);
+    assert!(
+        (0..=2).all(|p| released.contains(&Value::UInt(p))),
+        "every row is released while the source is live: {released:?}"
     );
 }

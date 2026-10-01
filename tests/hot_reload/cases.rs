@@ -4139,3 +4139,58 @@ fn an_exact_annotation_on_a_loaded_collection_names_what_differs() {
         "and the divergence it quotes is the binder identity, got {rendered}",
     );
 }
+
+/// A filter edit over a live source offers the replacement only the rows some reader of the
+/// retired version still holds (`src/ccl/design/program-evolution.md`, "3. Build the rest and
+/// wire it to its input"). `10` and `20` arrive while the filter is `z > 99`, so the loop runs
+/// neither, and the reload edits the filter to `z > 5` before `1000` arrives.
+///
+/// - Under the transaction loop every reader has released both rows, so the replacement folds
+///   only `1000`.
+/// - Under the induction loop the read of `x` still holds position 1, the newest it has seen,
+///   since the final value may be there. So the replacement is offered `20` and folds it: 1020.
+#[rstest]
+#[case::induction(indoc! {r#"
+    x := 0
+    for i in [z for z in source1() if z > THRESHOLD]:
+        x := x + i
+    x
+"#}, 1020)]
+#[case::transaction(indoc! {r#"
+    pool: Mut(Int, Txn) := 0
+    for r in [z for z in source1() if z > THRESHOLD]:
+        with begin():
+            pool := pool + r
+    await_final(pool)
+"#}, 1000)]
+fn a_filter_edit_offers_only_the_rows_a_reader_holds(#[case] program: &str, #[case] expected: i64) {
+    let value = int_value_across_a_reload_over_a_live_source(
+        &program.replace("THRESHOLD", "99"),
+        &program.replace("THRESHOLD", "5"),
+        &[10, 20],
+        &[1000],
+    );
+    assert_eq!(value, expected);
+}
+
+/// A filter edit over a live source folds each row once. `10`, `200` and `20` arrive while the
+/// filter is `z > 99`, so the loop folds `200` at position 1. The reload edits the filter to `z >
+/// 5`, `1000` arrives, and the value is the carried `200` plus the rows the replacement is
+/// offered: `20`, which the read of `x` still holds as the newest position, and `1000`. The
+/// replacement starts above position 1, since every reader has released it.
+#[test]
+fn a_filter_edit_over_a_live_source_folds_each_row_once() {
+    let program = indoc! {r#"
+        x := 0
+        for i in [z for z in source1() if z > THRESHOLD]:
+            x := x + i
+        x
+    "#};
+    let value = int_value_across_a_reload_over_a_live_source(
+        &program.replace("THRESHOLD", "99"),
+        &program.replace("THRESHOLD", "5"),
+        &[10, 200, 20],
+        &[1000],
+    );
+    assert_eq!(value, 1220);
+}
