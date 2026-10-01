@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::Type;
-use cambra::ccl::context::{GlobalContext, compile_program};
+use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
 use cambra::interpreter::{
     BaseType, Consumer, Extent, Predicate, SinkReadError, TestDataSource, Value,
 };
@@ -589,15 +589,30 @@ fn a_sink_accumulates_across_a_reload() {
     );
 }
 
-/// Feeding a collection built from the loop variable, from inside the loop, produces a tree
-/// that fails the compiler's own post-lambda-elim typecheck. Pinned at the panic it reaches.
+/// A list literal's elements are constants (`docs/chl-spec.md`, "3.11 List, tuple, record
+/// literals"), so a list built from the loop variable is refused.
 #[test]
-#[should_panic(expected = "post-lambda-elim produced an invalid tree")]
 fn a_collection_fed_from_inside_a_loop_does_not_compile() {
-    observe_one(indoc! {r#"
+    let source = indoc! {r#"
         out = test_sink()
         for x in [1, 2]:
             out << [x, x * 10]
-    "#})
-    .expect("a value");
+    "#};
+    let mut ctx = GlobalContext::default();
+    ctx.register_test_sink("out");
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let Err(errs) = compile_program(&mut ctx, source, consumer) else {
+        panic!("expected a compile error");
+    };
+    // One refusal, pointing at the first element that reads the loop variable.
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    let rendered = render_errors(&errs, "<test>", source);
+    assert!(
+        rendered.contains("a list element must be a constant, but this one varies with `x`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("3:13"),
+        "the span is the element `x`: {rendered}"
+    );
 }

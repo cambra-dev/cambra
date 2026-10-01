@@ -102,7 +102,13 @@ pub enum CompileError {
         span: Option<chl_parser::ast::Span>,
     },
     /// Lambda elimination failed.
-    LambdaElim(lambda_elim::LambdaElimError),
+    ///
+    /// `span` is resolved at the `compile_program` boundary the way
+    /// [`Infer`](Self::Infer)'s is, for an error that names the node it refuses.
+    LambdaElim {
+        error: lambda_elim::LambdaElimError,
+        span: Option<chl_parser::ast::Span>,
+    },
     /// Operator-graph conversion failed.
     Conversion(ConversionError),
     /// A post-inference phase rejected the program for a semantic reason that
@@ -159,8 +165,25 @@ impl CompileError {
             CompileError::Infer { error, span: None } => {
                 buf.extend_from_slice(format!("error: type inference: {error:?}\n").as_bytes());
             }
-            CompileError::LambdaElim(e) => {
-                buf.extend_from_slice(format!("error: lambda elimination: {e:?}\n").as_bytes());
+            CompileError::LambdaElim {
+                error,
+                span: Some(span),
+            } => {
+                use ariadne::{Color, Label, Report, ReportKind};
+                Report::build(ReportKind::Error, src_name, span.start)
+                    .with_config(ariadne::Config::default().with_color(false))
+                    .with_message(error.to_string())
+                    .with_label(
+                        Label::new((src_name, (*span).into()))
+                            .with_message(error.to_string())
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+                    .write((src_name, ariadne::Source::from(src)), &mut buf)
+                    .expect("ariadne write should not fail on Vec<u8>");
+            }
+            CompileError::LambdaElim { error, span: None } => {
+                buf.extend_from_slice(format!("error: {error}\n").as_bytes());
             }
             CompileError::Conversion(e) => {
                 buf.extend_from_slice(
@@ -254,7 +277,10 @@ impl From<LoweringError> for CompileError {
 
 impl From<lambda_elim::LambdaElimError> for CompileError {
     fn from(e: lambda_elim::LambdaElimError) -> Self {
-        Self::LambdaElim(e)
+        Self::LambdaElim {
+            error: e,
+            span: None,
+        }
     }
 }
 
@@ -295,7 +321,10 @@ impl IntoCompileErrors for Vec<InferError> {
 
 impl IntoCompileErrors for lambda_elim::LambdaElimError {
     fn into_compile_errors(self) -> Vec<CompileError> {
-        vec![CompileError::LambdaElim(self)]
+        vec![CompileError::LambdaElim {
+            error: self,
+            span: None,
+        }]
     }
 }
 
@@ -2086,7 +2115,18 @@ fn run_passes(
     let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
         lambda_elim::run(channelized)
     })
-    .errs()?;
+    .map_err(|error| {
+        let span = match &error {
+            // A read a later phase built (a mutable variable's, or one substituted for a
+            // local) has no lowering span, but the list around it keeps the literal's id.
+            lambda_elim::LambdaElimError::VaryingListElement { read, list, .. } => [read, list]
+                .into_iter()
+                .find_map(|id| lowering_projection.get(id))
+                .and_then(|attr| attr.spans.first().copied()),
+            lambda_elim::LambdaElimError::Unsupported(_) => None,
+        };
+        vec![CompileError::LambdaElim { error, span }]
+    })?;
     // `typecheck` enforces hole-freeness as its first phase, so the check here
     // covers both.
     settle(&lambda_elim, "post-lambda-elim", Check::Typed)?;
