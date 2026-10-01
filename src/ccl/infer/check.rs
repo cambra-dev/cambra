@@ -26,7 +26,7 @@ use super::emit::{
     emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
-use super::typing::{Typing, escaped_opaque_binders};
+use super::typing::{LetScheme, Typing, escaped_opaque_binders};
 use super::{lit_base, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, offered_base};
 use crate::util::ScopeStack;
@@ -192,6 +192,18 @@ impl Typing for CheckCtx {
 
     fn current_node(&self) -> NodeId {
         self.current_node
+    }
+
+    fn recover(
+        &mut self,
+        error: LocatedInferError,
+        _reads_before: usize,
+    ) -> Result<(), LocatedInferError> {
+        Err(error)
+    }
+
+    fn poisoned_reads(&self) -> usize {
+        0
     }
 
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
@@ -467,7 +479,7 @@ impl Typing for CheckCtx {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
-        _generalize: bool,
+        _scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         // The opaque binder's standing fact, recorded on the way in for the
