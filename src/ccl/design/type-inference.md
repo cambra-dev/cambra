@@ -243,6 +243,24 @@ constrain(lhs, rhs):
         # (level-mismatch arms extrude the offending side and retry; see §1)
 ```
 
+#### An error stops its statement, not the pass
+
+A failed rule returns its error to the nearest enclosing statement: a `let` definition, a `:=`
+initializer, or an expression statement. That statement's rule records the error and types its
+continuation (`Typing::recover`), so emission reports at most one error per statement, in source
+order.
+
+A `let` whose definition failed binds its name at a fresh variable minted one level inside the
+binding and generalizes it. Each use instantiates its own copy, so uses that demand different types
+of the failed definition do not conflict, and the failure reports once. A `:=` whose initializer
+failed binds the variable at its declared history, which its writes still constrain.
+
+After any emission error, inference stops before the operand-requirement sweep and Pass 2. The graph
+lacks the constraints the failed statements would have contributed, so what those passes would
+report is the gap rather than the program. Check mode shares the rules and does not recover at
+statements: its rules record a failed constraint and continue, and an error a rule returns ends the
+walk.
+
 #### Apply is one-way
 
 **Under-determined domains are recovered as use-site specialization.** The `Apply` rule emits only

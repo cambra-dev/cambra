@@ -43,6 +43,20 @@ pub(super) trait Typing {
         }
     }
 
+    /// Record `error` and continue past the statement that raised it, or return
+    /// it to stop.
+    ///
+    /// A statement is a `let` definition, a `:=` initializer or an expression
+    /// statement, and the rule that types its continuation is the one that
+    /// recovers ([`emit_let`](super::emit::emit_let),
+    /// [`emit_mut_decl`](super::emit::emit_mut_decl),
+    /// [`emit_expr_stmt`](super::emit::emit_expr_stmt)). Emit records the error,
+    /// so a program's statements are typed and reported independently. Check
+    /// returns it: Check's own rules already record and continue (its
+    /// `require_sub`), and an error one of them returns ends the walk, as it did
+    /// before statements recovered.
+    fn recover(&mut self, error: LocatedInferError) -> Result<(), LocatedInferError>;
+
     /// Obtain the type of a child sub-expression. In Emit mode this recurses
     /// via [`emit_node`](super::emit::emit_node), emitting the child's
     /// constraints and writing its inferred type onto the child node.

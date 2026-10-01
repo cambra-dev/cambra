@@ -530,9 +530,22 @@ pub(crate) fn run(
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
-    // Emission is fail-fast, so there is at most one error; it already carries
-    // the node whose rule raised it (`Typing::raise`).
-    emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
+    // Emission recovers at each statement (`Typing::recover`), so it reports
+    // one error per failing statement, each carrying the node whose rule raised
+    // it (`Typing::raise`). An error no statement encloses ends the walk.
+    //
+    // After any error the passes below do not run: the graph lacks the
+    // constraints the failed statements would have contributed, so the
+    // requirement sweep and coalesce would report those gaps rather than
+    // anything in the program.
+    let emitted = emit_node(expr, &mut sub_ctx);
+    let mut errors = std::mem::take(&mut sub_ctx.errors);
+    if let Err(e) = emitted {
+        errors.push(e);
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
 
     // The graph is complete here and nothing has been materialized yet — the one
     // point at which eager trait narrowing can be checked against the ground truth

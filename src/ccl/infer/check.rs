@@ -132,6 +132,10 @@ impl Typing for CheckCtx {
         self.current_node
     }
 
+    fn recover(&mut self, error: LocatedInferError) -> Result<(), LocatedInferError> {
+        Err(error)
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         // Recurse to collect the child's own errors, then hand back its
         // *recorded* type (not the rule-derived, throwaway-laden one) so the
