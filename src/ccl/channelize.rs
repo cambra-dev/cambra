@@ -19,11 +19,9 @@
 //! is **origin-agnostic**: it never distinguishes an accumulator-loop feed from
 //! a feed-only-loop or scalar feed.
 //!
-//! Type errors report against the user-shaped tree (inference types the defer
-//! constructs directly: see `design/type-inference.md`, "Feed handles as an
-//! invariant `History` constructor (`Type::History { kind: Feed }`)"), so this
-//! step never fails on a user error — it only rejects internally-inconsistent
-//! shapes.
+//! Inference checks defer constructs on the user-shaped tree; channelization
+//! validates the channel shapes it consumes. For the history constraint rules,
+//! see `design/type-inference.md`, "Feed handles as invariant histories".
 //!
 //! **Type-preserving by construction.** Every channel node this module builds is
 //! stamped with its concrete type from its children (mirroring how
@@ -916,11 +914,10 @@ fn slot_holds_type(
 /// [`erase_chan_domains_in_type`] does not reach: `Type::walk_children_mut` visits a
 /// `Type::Refinement`'s base and not its predicate.
 ///
-/// A predicate over a channel-domain source holds that domain in its own node types; a
-/// filtered comprehension over a channel is the program that writes one. The strict wall
-/// walks predicates, so a residue left here is reported there
-/// (`src/ccl/design/type-inference.md`,
-/// "Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)").
+/// A predicate over a channel-domain source carries that domain in its node types.
+/// The post-channelization type check visits predicates and rejects residual
+/// channel domains. See `src/ccl/design/type-inference.md`,
+/// "Feed handles as invariant histories".
 ///
 /// A predicate's own type slots go back through [`erase_chan_domains_in_slot`], so a
 /// refinement sitting in one has its predicate erased too. `walk_refined_predicates_mut`

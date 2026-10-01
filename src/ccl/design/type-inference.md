@@ -1050,432 +1050,520 @@ another thread for teardown.
 
 ## 4. Information Flow and Type Mapping
 
-Cambra carries features beyond plain algebraic subtyping (explicit refinements, tagged sums); this section describes how each is represented in the solver and materialized back out.
+The solver operates on `ccl::Type`. Annotation normalization prepares its input; compaction and
+coalescing materialize the resulting bound graph. This section specifies tagged variants,
+refinements, history handles, and annotation forms.
 
 #### The unified tagged sum
 
-Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>, Openness)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
+`Type::Variant(Vec<(FieldKey, Type)>, Openness)` represents tagged variants during inference and
+in the typed AST. Named tags use `FieldKey::Name`; positional tags use `FieldKey::Index`.
+A positional annotation `𝐴 | 𝐵` has tags 0 and 1. `Copair`, including lowered `++`, constructs
+positional variants. This representation is distinct from
+[dependent sums](#47-dependent-sums), which quantify witnesses rather than select variant tags.
 
-Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `` `tag(…) ``) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). A positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/`Copair` produces exactly that (see §2's `emit_copair`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
+`constrain_go` checks every producer tag against the consumer:
 
-That one rule does **two** jobs, and the [`Openness`] marker is what separates them. Recursing into a tag both sides carry is what pushes the payload into the supertype's slot — how a `match` arm's binder learns its type from the scrutinee. Rejecting a subtype tag the supertype lacks is the exhaustiveness check. A **closed** arm set does both; an **open** one keeps the payload recursion and drops the rejection, which is what a `match` with a `case _:` needs and what no closed judgment can express (on the tag axis the scrutinee is the supertype, on the payload axis its payload is the subtype, and one edge cannot point both ways).
+- A shared tag requires the producer payload to subtype the consumer payload.
+- A tag absent from a closed consumer produces `ExtraTag`.
+- A tag absent from an open consumer is skipped, without skipping later shared tags.
 
-Openness is a property of a *demand*, never of a value: every producer of a sum is closed, and `Open` appears only on the right of a subtyping edge. Compaction and coalescing **carry** it (`CompactVariant` pairs the tag map with its openness) rather than flattening it, because a type *error* naming that demand is resolved through the same round-trip — closing the arm set there would report that the scrutinee failed to be an exact sum, when what it failed was to be a subtype of a partial one, and only the rendered `| …` tells those apart. Nothing else reads it: the runtime `Extent` has no counterpart, and no node's coalesced type comes out open. That last is an invariant, not a theorem, so `types_agree_modulo_unread` compares openness and an escape shows up there as a disagreement.
+The open form expresses the partial demand of a `match` with a default arm. It propagates payload
+types into named arms without rejecting tags handled by the default. Producers are closed;
+the relation debug-asserts that no open variant reaches its left side.
 
-Two arm sets meeting at one position meet their openness — `Open` survives only if both sides are open, since a closed side is the one contributing a requirement on the tag set. The tag *map* still merges by the ordinary intersect/union rule; that is an approximation when exactly one side is open, and no program reaches it (a scrutinee takes one `Case` demand per `match`).
+`CompactVariant` retains openness during compaction and materialization, including diagnostic
+types. The rendered `| …` distinguishes an open demand from an exact arm set. Runtime extents
+have no openness marker. The coalesce read-stability check compares the marker, but that check is
+not a proof that every possible materialized expression is closed.
 
-Two senses of "union" remain distinct:
+When variant contributions merge, openness remains open only if both contributions are open.
+The tag maps still use polarity-dependent intersection or union. With a mixture of open and closed
+contributions this is an approximation; the reachable nested-child case and its tests are specified
+under [The collapse happens at the position](#the-collapse-happens-at-the-position).
 
-* ***union of lower bounds*** — the lattice operation at coalesce time (§1, §2); an internal solver operation, not an AST node.
-* a **positional `Variant`** — the all-`Index` tagged sum that materializes a `++` collection-union or a user `A | B` annotation.
-
-Inference does not *infer* a multi-atom sum from a primitive collision (it raises `IncompatibleBounds`); positional variants enter only via `++` or a user annotation.
+A union of lower bounds is a solver operation, not a positional variant. Incompatible primitive
+bounds do not invent tags: `Int` and `String` at one position produce `IncompatibleBounds`.
+An explicitly tagged variant containing both is a single compatible shape.
 
 #### Tagged-variant expressions
 
-* **`VariantCtor { tag, payload }`** constructs a singleton `Variant({tag: payload})`; width-subtyping flows it into any consumer expecting a superset of tags.
-* **`Case`** is the single dispatch node for both logical (`if`/guard) and structural (variant-tag) matching — see §2's `emit_case`. A structural `Case` carries a scrutinee and branches with `Pattern`s; width-subtyping enforces tag coverage and binds each payload at its per-tag narrowed type.
+`VariantCtor { tag, payload }` constructs a closed singleton variant. Width subtyping permits its
+use where a consumer admits additional tags. CHL's backtick constructor lowers to this node.
 
-(Both are reachable from source: `` `tag(payload) `` lowers to `VariantCtor`, and `match` / `case` to a pattern-`Case` — `match` needs no IR node of its own.)
+`Case` represents both logical branching and structural pattern matching. A structural case carries
+a scrutinee and branch patterns; `emit_case` constrains tag coverage and binds payloads at their
+per-tag types. `match` does not require a separate IR node. See
+[`Case` inference](#case-inference) for unobservable payload handling.
 
 #### A literal is refined by its own value
 
-A literal is typed by *which* literal it is: `5 : {Int | __elem == 5}`, its base refined by the singleton predicate. Not a `Literal(base, value)` constructor — an ordinary refinement, so every rule above applies unchanged and none has to learn a new case.
+`lit_singleton` gives a non-unit literal its base type refined by `__elem == literal`.
+For example, `5` has type `Int@5`, the display form of `{Int | __elem == 5}`. Unit needs no
+additional predicate because its base already has one inhabitant.
 
-The reason is that a literal knows more about itself than its base does, and that knowledge is what a proof obligation needs: `a[0]` can only discharge against `Array(3, 𝑇)`'s index range if `0`'s type says it *is* `0`. Typing `5` as plain `Int` throws that away at the one place it is free to keep. The predicate is built **typed** — only *node* annotations get their embedded predicates re-inferred, and this one rides a type the rule makes rather than one a user wrote.
+`singleton_predicate` constructs a fully typed term: the comparison has type `Bool`, and its
+inner literal has the unrefined base type. Refining that inner literal again would recurse
+indefinitely. These generated predicates do not depend on annotation-predicate inference.
 
-What this changed is instructive, because refinements were rare enough before that several rules assumed their absence. Each was already wrong for a user-written refinement; literals are merely the first thing that makes them reachable.
+The singleton supplies facts needed by obligations such as an array index-range check. It is an
+ordinary refinement and is not erased wholesale after inference. Exact annotations can discard it;
+see [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded).
 
-* **An operator does not *inherit* its operands' refinements**, and does not have to be *made* not to. A refinement is a fact about a value, so an operator that computes a new value cannot carry one over: `𝑥 + 𝑥` where `𝑥` is `2` produces `4`. Arithmetic, comparison and negation state their requirement as a [trait](#traits), over a variable per operand and per associated type — all unrelated — which leaves no path for an operand's refinement to reach the result by sharing (`an_operator_result_carries_no_operand_refinement`). The remaining monomorphic operators (`and`, `++`, `not`) keep an ordinary scheme and pass their operands verbatim — nothing is shared with the result, so a refined operand simply flows into a concrete domain. Aggregates likewise keep theirs, since their operand is a *collection* whose refinements describe its domain and the rule must see them.
+An operator computing a new value must not inherit an operand's refinement by sharing its type
+variable. Arithmetic and comparison trait requirements use separate operand and result positions.
+`an_operator_result_carries_no_operand_refinement` checks this distinction. Monomorphic boolean
+and collection operators use their declared rules; aggregates must retain the collection-domain
+information their rules consume.
 
-  Inheriting is not the same as **computing**, and only the first is ruled out. `{Int | __elem == 2} + {Int | __elem == 3}` genuinely *is* `{Int | __elem == 5}`, and a trait instance is where such a rule would live, since it determines the output type rather than forcing it to be a position the operands already occupy. Today every instance computes a base and stops — a property of the table, not of the mechanism. Two things would have to change to lift it: an instance would need the operands' *types* rather than their bases, and the deposit would have to move to a point where those types are final. Eager deposit is sound for a base because a base never weakens, while a refinement set only shrinks as further lower bounds arrive — so a refinement computed from a partial view is too strong. A rule computing from resolved operands then meets recurrences (`x := x + 1` resolves its operand through its own output), where it must already be sound at the cut; and anything beyond constant folding and interval arithmetic needs predicate *implication*, which the lattice deliberately does not have (refinements match structurally — see this file's module-level note in `src/ccl/infer/solver/mod.rs`).
-* **A mutable variable takes no refinement** from its initializer or from any single write. A mutable variable is not one value but the sequence its writes produce, so its value type is the join over all of them; taking one contribution's refinement would assert it never changes, which is what declaring it mutable denies. The rule holds at every place a mutable variable's value type is *built*, not just at the `:=`/`+=` rule: the `Transact` carrier's keys (where the seed is the value type's only lower bound, so an unstripped seed would resolve the mutable variable — and every read of it — to the seed's singleton), the recognition that builds that carrier, and the phase that reads the value type back off the seed binding.
-* **Every merge point joins** — a list's elements, a `Case`'s arms, a mutable variable's seed and writes, a channel's contributions. This is the one rule the singleton made load-bearing, and the one place it is easy to get wrong, because a merge that simply *adopts one input's type* looks right until the inputs carry different refinements. The law: a refinement is a fact about **a value**, and a merge point is not one value — it is whichever input the runtime supplies — so a refinement survives the merge only if *every* input establishes it. Two arms depositing different singletons intersect to none (`1 if 𝑐 else 2` is an `Int`); two arms depositing the same restriction keep it (identical filtered comprehensions stay filtered, `5 if 𝑐 else 5` is still `Int@5`). Where the merge is a fresh variable every input flows into, the solver's join *is* the rule and nothing has to strip; where a pass builds the merged type by hand (`channelize`'s channel union, the `Transact` carrier's key seeds) it must intersect the refinements explicitly.
+Computing a result refinement is different from inheriting one. The `AddRefined` operation `^+`
+has a refinement-producing trait instance. It does not establish that ordinary `+` propagates
+singletons or that arbitrary arithmetic predicates are inferred. Any proposed richer rule must
+remain valid as operand bounds accumulate: a refinement inferred from only one lower-bound
+contribution can become too strong after another arrives. Recurrences also require soundness when
+an operand is resolved through the operation's own output. Supported semantic comparisons are
+bounded by [the SMT encoding](#semantic-entailment-as-a-fallback).
 
-  **Stripping is not the join.** It over-approximates in the safe direction (a refinement every input establishes is thrown away) and it is not variance-stable: for a *collection* input, whose extent rides the contravariant `Fun` domain, relating a refined input to a stripped sibling demands `𝐷 <: {𝐷 | 𝑝}` and rejects two arms that are literally the same expression. `𝐷 <: {𝐷 | 𝑝}` is never a real obligation in this language — acquiring a refinement is an explicit `cast` — so seeing one means an erasure manufactured it. Inputs whose extents genuinely differ meet on the domain (both refinements accumulate — the extent both admit), since that is where a function type's join puts them.
-* **A `Mut` input derefs into the join**, exactly as a mutable read derefs into a tuple element, so a `Case` over two mutable variables types as their *value*. The second-class discipline's rule 1 therefore has no `Mut` on the selection to reject; what it protects — a selected mutable variable reaching a position that writes through it — is its argument clause, which reads the argument *node*. See [No aliasing: `Mut` values are second-class (downward-only)](mutability.md#no-aliasing-mut-values-are-second-class-downward-only).
-* **`__elem` is bound by the refinement it rides**, so it is never free *in a type* — the free-variable walk must not report it so.
-* **Beta reduction discharges a refined parameter** when the argument's type entails it: substituting the argument is what establishes the precondition.
+At a merge position, a refinement survives only when every incoming value establishes it.
+Different singleton arms such as `1` and `2` lose their singleton on joining; two `5` arms can
+retain `Int@5`. This rule applies to list elements, case arms, mutable seeds and writes, and channel
+contributions. A fresh join variable delegates the merge to the solver. A pass constructing a
+merged type directly must perform the corresponding refinement merge itself.
 
-Singletons are *not* erased after inference. They are ordinary refinements and ride through to the runtime like any other, which also keeps them available to a future constant fold. They print as their base pinned to the literal (`Int@5`, not `{Int | __elem == 5}`).
+`emit_mut_decl` contributes its initializer verbatim to the mutable value variable, alongside
+the writes. A mutable variable with no writes can retain its seed's refinement; mutability alone
+does not require erasure. A single write or seed must not be selected as the type of all values.
+Recurrence and channel construction must preserve the same distinction between one contribution
+and the completed value type.
+
+Stripping all refinements is not the join: it loses facts shared by all inputs. For functions,
+the variance and kind of each position also matter. A collection's data domain is invariant, so
+erasing its refinement can create an invalid domain comparison even between equivalent inputs.
+Differing data domains require the explicit representation described under
+[The domain join needs `box`](#the-domain-join-needs-box), not a generic variance argument.
+
+A `Case` reading mutable variables joins their values, not writable aliases. The restriction on
+passing a selection to a mutating function also inspects the argument node; see
+[No aliasing](mutability.md#no-aliasing-mut-values-are-second-class-downward-only).
+The reserved `__elem` name is bound within a refinement, not free in its enclosing type.
+Inlining discharges a refined parameter only when the argument type satisfies its precondition;
+see [Inlining pass](optimization.md#inlining-pass-cclinliners).
 
 #### Refinements on the lattice
 
-A **refined type** `{T | p}` carries a *set* of [`Refinement`]s, and the lattice treats each as a black box: it accumulates them and matches them by identity, reasoning about what they imply only through the fallback below (the predicate's logical content is real and used by the runtime, otherwise opaque *here*). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{b₁ | S₁} <: {b₂ | S₂}` iff `b₁ <: b₂` and `S₂ ⊆ S₁ ∪ refinements(b₁)`** — more refinements ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}`. Refinements match by **type-blind structural equality of their predicate terms** (`Refinement`'s `PartialEq` / `eq_term_modulo_ty_slots`) and not by predicate implication, which is what [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) supplies for the cases structural matching leaves. Structural matching makes refinement identity agnostic to *where* a predicate was constructed (join planning re-mints `{D | p}` at every marker it emits — `make_iterate` / `make_restrict` / `refine_with` — and must match the structurally-identical contract recorded elsewhere on the tree) and to in-place type resolution (copies of one predicate along a monomorphization descent line differ only in their inferred-type slots); a pointer-equal predicate `Rc` short-circuits as the fast path, since a refinement that merely flows around shares its `Rc`. The refinement set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (refinements are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
+`Type::Refinement` carries a set of predicates required of its base value. Structural subtyping
+compares base types and requires the producer to supply the consumer's predicates. Thus
+`{𝑇 | 𝑝, 𝑞} <: {𝑇 | 𝑝}` and `{𝑇 | 𝑝} <: 𝑇`.
+
+Predicate equality is type-blind structural term equality, with pointer equality as a fast path.
+The representation and binder rules are specified under
+[Refinement representation during specialization](#refinement-representation-during-specialization).
+Equal terms can be rebuilt at different sites and still satisfy the same structural demand;
+equality does not itself prove implication between different terms.
+
+`constrain_go` transports both sides' predicates into the ambient binder frame before comparison.
+It computes the consumer predicates missing from the producer, then takes one of these paths:
+
+1. With no deficit, constrain the peeled base types.
+2. If the producer base is an inference variable, constrain it against the consumer base with the
+   missing predicates attached. That variable can still acquire the required information.
+3. For a concrete producer with a deficit, use the caller's SMT policy. A structural-only caller
+   rejects; an SMT-enabled caller can establish entailment as described below.
+
+An unrefined concrete type does not acquire an arbitrary predicate through subtyping. A successful
+semantic proof can establish a required predicate already implied by its type. `Cast` is instead
+an explicit domain-refining operation: `emit_cast` constructs the result from the value's function
+type and the target's predicates. It does not justify refinement acquisition by an upcast edge.
+The target and inferred result remain distinct;
+see [Cast targets and inferred views](#cast-targets-and-inferred-views).
+
+At a compact position, positive merging intersects refinement sets and negative merging unions
+them. Simplification preserves these positional contributions while rewriting variable identities;
+see [Simplification](#simplification).
 
 ##### Semantic entailment as a fallback
 
-A deficit `S₂ \ S₁` over a concrete `b₁` asks `smt_sub`
-([`crate::ccl::infer::solver::smt`]) whether `S₁` entails `S₂` before the rule reports a
-mismatch. `{Int | __elem == 1 ^+ 3 ^+ 2} <: {Int | __elem == 1 ^+ 5}` holds by that route and
-not by structural matching.
+For a concrete base with a structural deficit, `smt_sub` in `infer/solver/smt.rs` asks whether
+the producer's predicates entail the consumer's. For example,
+`{Int | __elem == 1 ^+ 3 ^+ 2} <: {Int | __elem == 1 ^+ 5}` can succeed without structural equality.
 
-The query is `∀ __elem. ⋀Γ ∧ ⋀S₁ ⇒ ⋀S₂`, decided by asking Z3 for unsatisfiability of
-`⋀Γ ∧ ⋀S₁ ∧ ¬⋀S₂`. `__elem` is declared once at `b₁`'s sort and shared by both sides, or, where
-`b₁` is a product, read through its fields
-([A product is reached through its fields](#a-product-is-reached-through-its-fields)). Both
-sides are transported into the ambient frame (`Subst::force_refinement`) first, because the
-query compares terms and the two sides' predicates are written in different binder contexts.
+The query asks Z3 whether `Γ ∧ ⋀S₁ ∧ ¬⋀S₂` is unsatisfiable. `Γ` contains supported assumptions
+from the caller's scope. The predicates have already been transported by
+`Subst::force_refinement`; both sides refer to the same subject and ambient free names.
+An unsatisfiable result proves entailment; a satisfying model refutes it under the encoded
+assumptions. `unknown`, process failures, and solver errors return `SmtError`, not `false`.
 
-`Γ` is [The scope a query runs in](#the-scope-a-query-runs-in): every other free name is
-declared at a sort as well, so it is universally quantified too, and what is assumed about it
-comes from the scope the caller supplies.
+The expression encoder accepts integer and boolean literals, scalar variables and projected
+fields, unary negation and boolean negation, addition and subtraction, multiplication with a
+literal factor, comparisons, and boolean connectives. Supported sorts include `Int`, `UInt`,
+`UIntRange`, and `Bool`; unsigned sorts add range constraints. A named string sort does not provide
+string-literal or concatenation encoding. General function applications, nonlinear multiplication,
+floor division, and exponentiation are outside this fragment.
 
-The encoding covers linear integer arithmetic over scalars: literals, variables, field
-reads, `+`/`-`, `*` with a literal factor, the comparisons, and the boolean
-connectives. `smt_sub` returns `false` for one reason: the solver produced a model of
-`⋀S₁ ∧ ¬⋀S₂`, a value satisfying `S₁` and violating `S₂`. Every other outcome is an
-`SmtError` naming what happened, because a query that was not asked or not answered has no
-result of its own to report.
-
-The deficit rule decides an unreadable predicate anyway, as a mismatch: that is the answer
-structural matching had already reached, so falling back to it is incomplete and never unsound.
-The remaining errors — a solver that will not start, one that breaks mid-query, an `unknown` —
-reach `map_constrain_err`, which aborts on each. `TODO(smt-undecided)` there records the policy
-those want instead.
+An unsupported predicate produces `SmtError::Encoding`. The subtype deficit rule treats that
+outcome as a mismatch: failure to encode is not evidence of entailment. Other SMT errors reach
+`map_constrain_err`, which currently panics. `TODO(smt-undecided)` records a proposed change to
+some of that policy; it is not implemented error recovery.
 
 ##### A product is reached through its fields
 
-An SMT constant stands for a scalar, and the unit one is minted for is an **access path**: a root
-name and the projections read through it (`Path`, in `src/ccl/infer/solver/smt.rs`). A record or a
-tuple has no sort, so a product-typed name denotes no constant; `x.b` denotes one, and keying that
-constant by the path is what makes two occurrences of `x.b` one constant.
+SMT scalar constants are keyed by `Path`: a root name and a sequence of projections.
+A product has no scalar sort, so declaring a tuple or record root creates no constant.
+Reading `x.b` declares the scalar leaf at that path; another read of `x.b` reuses it.
 
-`x = (a = 10, b = 2 ^+ 1); def foo(t: Int) => {Int where _ == t + 3}: t ^+ x.b` is the case that
-needs it: the body is inferred `{Int | __elem == t ^+ x.b}`, and the entailment follows from
-`x.b == 3`.
+The root's scope type determines the path's type when available, rather than the expression's
+possibly unresolved mid-emission slot. The query subject follows the same rule: a scalar base
+declares one constant, and a product base supplies the types of the projected leaves.
+An unsupported subject base prevents encoding predicates about it.
 
-A path's type is the type its root is bound at, read once per key, and that type wins over the slot
-on the term that read it — the scope records what the value is, while a projection's slot
-mid-emission is an inference variable. The subject is rooted at `b₁` the same way: a scalar base
-declares one constant, a product base declares none and each path read out of it is declared where
-it is read. A base that is neither leaves every predicate about it unencodable.
-
-Assumptions come from every prefix of a path rather than from its leaf alone, because a refinement
-on a product states its predicate about the product: that `x.b` is `3` can be written on `x` as
-`{{b: Int} | __elem.b == 3}` or on its field as `{b: Int@3}`, and the two are one assumption.
-`__elem` addresses the subject of the predicate it appears in, so a read inside `x`'s own refinement
-reroots onto `x` — `__elem.b` there and `x.b` outside are one leaf.
+Assumptions are collected at every prefix of a path. A product refinement
+`{{b: Int} | __elem.b == 3}` and a field type `{b: Int@3}` can both establish `x.b == 3`.
+Within the root's own predicate, `__elem.b` is rerooted onto `x.b`; it does not become an unrelated
+query-subject field. For `x = (a=10, b=2 ^+ 1)`, a function body `t ^+ x.b` can therefore satisfy
+the result refinement `__elem == t + 3`.
 
 ##### The scope a query runs in
 
-`smt_sub` takes a `ScopeEnv` — a lookup from a free name to the type it is bound at. A path rooted
-at a name the scope binds is declared at the sort its type gives it, and the refinements the types
-along it carry join the antecedent, restated about the path. A path the scope settles nothing about
-is declared at the sort of the node reading it and nothing is assumed about it.
+`ScopeEnv` looks up a free name's bound type. A supported path uses that type's sort and contributes
+its encodable refinements to `Γ`. Without a usable scope type, the encoder can use the reading
+node's type to choose a sort but assumes no additional facts about the name.
 
-`x = 2; def foo(t: Int) => {Int where _ == t + 2}: t ^+ x` is the case that needs it: the body
-is inferred `{Int | __elem == t ^+ x}`, and `t ^+ x == t + 2` follows only from `x == 2`, which
-is the refinement on the type `x` is bound at.
+Lookups are demand-driven. For `x = 2`, the predicate `t ^+ x == t + 2` needs the assumption
+`x == 2`. For `y = x ^+ 1`, translating `y`'s refinement can trigger the lookup of `x`.
+Paths are marked before their assumptions are traversed, preventing recursive re-entry.
+The encoder does not enumerate unused binders or all fields of a product. Besides avoiding work,
+this prevents an unrelated contradictory binder from proving an otherwise unsupported query.
 
-Assumptions chain, because a binder is looked up when a predicate mentions it and the lookup
-runs on its own refinements too: `x = 2; y = x ^+ 1` reaches `y == 3` by declaring `y`, meeting
-`x` inside `y`'s predicate, and declaring `x` with its own. The binder is declared before its
-refinements are translated, so binders that reference each other terminate.
+| Caller/environment | Available assumptions and policy |
+| --- | --- |
+| Emission through `constrain_subtype_in` | `InferCtx` supplies lexical and recorded opaque binder types. `value_type` resolves their positive contributions with opposite-side compaction disabled, so a use's demand cannot prove itself. |
+| Post-inference checks | `CheckCtx` supplies lexical and opaque binder types from the tree through `constrain_subtype_in` and `constrain_subtype_under_in`. Recorded `Var` types are trusted; a missing scope entry contributes no assumption rather than a name-resolution error. |
+| `NoScope` | Supplies no binder types. Used by inlining's discharge check and probes without a program scope. The query can prove less than one with lexical assumptions. |
+| `SkipSmtScope` | Suppresses the query. `constrain_subtype` uses this structural-only policy. |
 
-A lookup and not an enumeration. Declaring every binder in scope would let one nothing mentions
-change the answer — a contradictory binder proves the entailment outright — and it costs a
-declaration per binder on a query that names two. A product's fields are not enumerated either,
-for the same reason.
-
-Three environments implement the lookup, and a fourth suppresses the query:
-
-- **Emission** passes its lexical scope (`InferCtx`'s `ScopeStack`) plus the opaque binders it has
-  recorded, through `constrain_subtype_in`. A binder's slot
-  mid-emission is an inference variable, so the scheme body is resolved before it can be read
-  as a fact — `value_type`, the compact → simplify → coalesce pipeline with the
-  opposite-polarity fallback suppressed. The positive reading is what makes the assumption
-  sound: the slot also carries what the binder's *uses* demanded of it, and assuming a demand
-  would let an entailment prove itself from what it was asked to establish. `x = 2` needs no
-  resolution (the literal's singleton is on the node), `x = 2 ^+ 1` does — the sum's singleton
-  is on the variable's bounds, and unresolved the binder has no sort at all. A generalized
-  binder's quantified variables stay uninstantiated; a polytype has no sort, so it is dropped
-  rather than assumed wrong.
-- **The post-inference check** builds its own Γ from the tree it walks (`CheckCtx`'s `scopes`
-  and `opaque_binders`) and passes it through `constrain_subtype_in` and
-  `constrain_subtype_under_in`. A binder is bound at the type its own rule hands
-  `Typing::scoped`, resolved — a fact about every value reaching it, because the binding site is
-  held to it by the edge that rule draws. Nothing here resolves a name: a `Var` node's recorded
-  type is trusted, and a name Γ does not bind leaves the query an assumption short rather than
-  reporting an error.
-- **`NoScope`** is the empty environment: `inline`'s discharge check, which runs over a tree
-  whose binders it does not hold, and any probe over types built outside a program.
-  An empty scope only weakens what the fallback can prove, so it can reject what emission
-  admitted and never the reverse.
-- **`SkipSmtScope`** decides a deficit structurally, raising no query at all, and
-  `constrain_subtype` supplies it — so a caller reaches the fallback by naming a scope. That
-  split is caller policy riding the scope trait rather than a fourth environment; the
-  `ScopeEnv::is_skip_smt` doc names the shape it wants instead.
-
-Dropping is the discipline throughout: a path with no sort, a predicate body outside the
-fragment, a name two binders disagree about. An assumption left out weakens the antecedent and
-cannot make an invalid entailment provable.
+Emission does not instantiate a generalized binder merely to create an SMT assumption. Unresolved
+or unsupported types provide no usable sort. Unsupported scope assumptions are dropped rather than
+treated as facts; omitted assumptions weaken the antecedent. This differs from an unencodable
+predicate on either side of the requested comparison, which makes that comparison undecidable by
+the encoder and falls back to structural rejection.
 
 ##### The set is the representation, not just the reading
 
-`Type::Refinement` carries a `RefinementSet` — unordered, deduplicated, with set-semantic `Eq`/`Hash` — and `Type::refined` is the sole constructor, establishing two invariants: the set is non-empty, and the base is never itself a refinement. Nested layers flatten, so `{{𝑇 | 𝑝} | 𝑞}` is *unrepresentable* and "which layer is outermost" cannot be asked.
+`RefinementSet` is deduplicated and has order-insensitive equality and hashing.
+`Type::refined` returns the bare base for an empty set and unions into an already refined base
+instead of nesting wrappers. Callers must use this constructor to maintain those invariants;
+the `Type` enum itself does not make a manually constructed nested wrapper unrepresentable.
 
-That question previously had an answer, and the answer was constraint **arrival order**: two refined upper bounds meeting at one variable produced `{{𝑇 | 𝑞} | 𝑝}` or `{{𝑇 | 𝑝} | 𝑞}` depending on which arrived first. Subtyping never cared — the deficit machinery above already compares layers as a set — but `Type`'s derived equality did, and structural equality is load-bearing wherever a type is an **identity**: the trivial-equality short-circuit in `constrain_go`, cache keys, `SpecKey`, and the recorded-vs-recomputed walls. One `Vec` was serving three incompatible readings — a set to subtyping, a stack to planning, an identity to the walls.
-
-Flattening is sound because every refinement at a position restricts the same underlying element: a refinement narrows *which* values inhabit a type, it does not change them, so an outer refinement's `__elem` ranges over exactly the values an inner one does. Canonically *sorting* the `Vec` was tried and rejected: it pins the ambiguity rather than deleting it, and it denies planning the freedom to apply refinements in whatever order it likes.
+All predicates at one position restrict the same underlying value, so flattening preserves their
+meaning. Layer order must not affect subtype equality, cache keys, or specialization keys.
+Physical iteration order is a separate matter, specified below; sorting a stored set alone would
+not represent dependencies between predicates.
 
 ##### Materializing a refinement set is a pipeline, and a pipeline is ordered
 
-The set is unordered as a *fact about a value*. Materializing it is not: planning emits one `restrict` per refinement, and stage 𝑘 reads elements already narrowed by stages 1..𝑘-1, so its element type is the base narrowed by the refinements applied before it — not the bare base. Planning therefore **chooses** an order.
+Planning applies each domain refinement as a restriction. A stage's element type is the base
+refined by the predicates applied before that stage. `application_order` in `ty.rs` returns each
+predicate paired with that element type.
 
-Which order is free is not entirely planning's to say. Two refinements are usually
-independent, and then any order yields a well-typed pipeline for the same final domain and a
-cost model could pick the cheapest filter first. Some are not: the outer filter of `[y for y in
-[x for x in xs if 𝑝] if 𝑞]` reads the `𝑝`-filtered collection, so `𝑞`'s predicate carries
-`{𝐷 | 𝑝}` in its own types and cannot be applied to elements `𝑝` has not yet removed. That
-ordering is the program's nesting, and flattening `{{𝐷 | 𝑝} | 𝑞}` into one set leaves it
-recorded nowhere but inside `𝑞`'s predicate. `ccl::application_order` reads it back from
-there, and orders everything else as the set holds it.
+`dependency_order` inspects predicate type slots to find references to sibling refinements.
+For nested filters, the outer predicate can read a collection already narrowed by the inner
+predicate; the inner restriction must then precede it. The function sorts candidates by their
+rendered predicate and repeatedly selects the first whose dependencies have been placed.
+Independent predicates therefore use a content-based tie-breaker, not physical insertion order.
+If no candidate is ready, the implementation takes the first remaining member; that fallback is
+not a cycle diagnostic or a proof that arbitrary dependency cycles are supported.
 
-Choosing *differently in two places* is what is never free, since the types along the pipeline
-and the predicates compiled for it must agree. That is why the order is recovered rather than
-derived: a derived order is only as stable as what it derives from, and the three sites needing
-one — the `restrict` chain, the predicates compiled for it, and the check that re-derives both
-— run at different points. Ordering by the refinements' rendered predicates was tried and
-failed exactly there, because compiling a predicate rewrites the very term the key reads, so
-predicates compiled under the order read before compilation landed in a pipeline typed by the
-order read after.
+Compilation, restriction typing, and checking must agree on the order they use. Rebuilding a
+predicate can change its rendered term, so callers cannot assume that independently sorting
+pre- and post-rewrite terms gives the same order. The ordering helper is the shared mechanism;
+the order is not part of `RefinementSet` equality.
 
-The chosen order is a **permutation** of the physical one, and that is the trap: a site
-rewriting refinements *in place* walks them physically, and zipping the application order's
-types onto that walk pairs refinements with the wrong element type — silently, since the two
-sequences have equal length. `application_elem_types` does the permutation explicitly and is
-what such a site uses.
+`application_elem_types` maps the chosen element types back to physical slice positions.
+An in-place rewrite uses that mapping rather than zipping application-order types onto a
+physical-order walk. The mapping uses the identity of borrowed slice members; type-blind equality
+would not distinguish all occurrences reliably.
 
-Nothing above planning may read the order back. `RefinementSet`'s equality is
-order-insensitive, so what planning fixes never reaches an identity — order-blind types, an
-order recovered once at planning.
+The debug-only `CAMBRA_REFINEMENT_ORDER=reverse` setting reverses physical set order. CI exercises
+both orders using the same binaries. It checks order-sensitive consumers and deduplication of
+equal predicate terms carrying different embedded types; it does not establish a global theorem
+that every future consumer ignores physical order.
 
-`CAMBRA_REFINEMENT_ORDER=reverse` (debug builds only) flips the set's physical order globally,
-and CI runs the suite both ways — an unrun knob rots exactly as an uncompiled feature does. Two
-classes of order-dependence survive a compile-clean rewrite of this kind: a consumer that
-*iterates* the set and lets the order reach something observable, and a dedup that keeps the
-first-inserted of two `eq`-equal members whose type-blind-equal predicate terms carry different
-embedded type slots. Recovering a nested filter's order from its predicate is what keeps the
-compiled term identical under the flip rather than merely well-typed. The variable is read at
-runtime, so the reversed pass reuses the binaries the ordinary one built.
+#### Refinement-aware shape and post-inference checks
 
-**A refinement never changes a type's shape.** It is a claim about the value at a position, not part of the structure carrying it, so `{(𝐷 ⇒ 𝑉) | 𝑝}` *is* a function and `{Mut(𝑉, 𝐷) | 𝑝}` *is* a mutable variable. Every rule that dispatches on or destructures a shape therefore looks *through* the outer layers first — `Type::peel_refinements`, and the handle accessors `Type::mut_value_type` / `as_feed` / `is_handle` built on it, which are what the typing rules and the second-class `Mut` discipline both ask "is this a mutable variable?" with. It is the same claim-versus-structure distinction a trait obligation draws when it reads a base off an operand ([Refinements are transparent](#refinements-are-transparent)): what narrowing consumes is the structure, and the refinement rides along untouched.
+A refinement restricts values without changing the base's shape. Shape accessors use
+`Type::peel_refinements`; `mut_value_type`, `as_feed`, and `is_handle` preserve that distinction
+when recognizing handles. Trait narrowing likewise examines operand structure without treating
+the predicate as another type constructor to narrow.
 
-A refinement is **required**, so `constrain_subtype` is strict for *concrete* bases: an unrefined concrete value does **not** flow into a refined position (`T ⊀ {T | p}`), and `{T | q} ⊀ {T | p}`. The one subtlety is the `S₂ ⊆ S₁ ∪ refinements(b₁)` clause: when the subtype side's base `b₁` is an **inference variable**, it can still acquire the deficit `S₂ \ S₁`, so the solver flows `b₁ <: {b₂ | S₂ \ S₁}` onto the variable rather than rejecting (the refinement analog of how the record/function arms thread structure through a variable base; it fails later iff the variable resolves to a concrete base lacking those refinements). This is what lets a value that is *already* refined flow into a position whose variable base demands a further refinement — `{D | p} ⇒ V <: {?a | q} ⇒ V` records `?a <: {D | p}`, so the position carries both `p` and `q`. Acquiring a refinement on a *concrete* value is still an *explicit* operation, not subsumption: the `Cast` node, written `cast({D | r} ⇒ V, value)`, is typed by `emit_cast` rebuilding the value's function type with the target's domain refinements, with no `value <: target` edge (see [`Cast` — explicit refinement acquisition](ir.md#cast--explicit-refinement-acquisition)); nested casts compose because the rebuild stacks onto the refinements the value already carries. The interpreter compiles a refinement on a **collection domain** to a runtime `Restrict`/`Filter` at the iteration boundary (the `Iterate`/`Restrict` arms of `operator_conversion`, where `extent_of` strips the domain refinement into a `Restrict`). The predicate `Expr` of each refinement is inferred/coalesced like any other sub-tree (annotation-borne predicates via `emit_annotation_predicates` / `coalesce_type_predicates`).
+Post-inference checks retain refinements in both adjacency constraints and reconstructed-result
+reconciliation. A transformation must leave the recorded type supported by the reconstructed
+type, not erase both sides to make them agree. The shared rules and their limits are specified
+under [The post-inference check](#the-post-inference-check-shared-rules).
 
-**Refinements in the post-inference check.** The post-inference structural check (`infer::check`,
-reimplemented on the same structural rules as emission via the `Typing` trait — see §2, *The
-post-inference check*) is **strict and refinement-aware throughout** — it does not strip refinements
-before its width-subtyping checks. It runs the solver's subtyping relation in two places, both fully
-refinement-aware, and both in the Γ the walk builds from the tree ([The scope a query runs
-in](#the-scope-a-query-runs-in)), so a refinement deficit reaches the semantic fallback there as it
-does during emission. `x: Mut({Int where _ >= 0}) := 0` with a write `x := x ^+ 1` is the case that
-needs it: the seed types `Int@0`, the write types `{Int | __elem == __read ^+ 1}`, and neither
-matches the declaration structurally — `0 >= 0` admits the seed, and `__read ^+ 1 >= 0` follows from
-the type the read's opaque binder is bound at. The two places:
+The check builds Γ from lexical and opaque binder types, as described under
+[The scope a query runs in](#the-scope-a-query-runs-in). For
+`x: Mut({Int where _ >= 0}) := 0` followed by `x := x ^+ 1`, structural matching alone does not
+establish the annotation: SMT proves the seed nonnegative and uses the read binder's declared
+refinement to prove the write nonnegative.
 
-* **Adjacency rules** (a `Compose` link's `prev_cod <: next_dom`, an `Apply`'s argument-vs-domain) check *refinement flow*: feeding an unrefined producer into a refinement consumer is rejected (`T ⊀ {T | p}`), exactly as the solver is. There is **no cast escape** — a producer must already carry the refinement its consumer demands. A `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because join planning surfaces the iterated / join-satisfying domain on the *producing* morphism's codomain, so the upstream genuinely supplies `{D | r}` (see the reconstructability bullets below). The producer's refinement and the cast's contract are typically re-minted as distinct predicate terms, so the adjacency relies on the structural-predicate match above.
-* **The reconcile** (a node's rule-reconstructed type vs the type inference recorded on it) is the plain strict `rule <: recorded` subtype check, refinements included (the recorded type may be a width-wider supertype — e.g. an annotation). A rule that rebuilds a node's type from its children rebuilds its refinements too, so a recorded refinement the reconstruction lacks is a real disagreement about the node — and in practice it is one specific bug: a **merge point that took one input's refinement** instead of the join of all of them (see the merge law above). Comparing modulo refinements here — stripping both sides, or a refinement-blind relation — is the *only* thing that hides that class, and this is the check best placed to catch it. Keeping it strict is what forced each merge point to join.
+The following construction sites preserve this requirement:
 
-For the reconcile to hold, the passes that *introduce* refined types post-inference (lambda-elim, join-planning) must leave each node's recorded type **reconstructable** — consistent with what the bottom-up rules rebuild from its children. These sites were emitting internally-inconsistent or under-refined nodes and are now fixed at the source rather than papered over by relaxing the check:
+- `make_iterate` produces a refined domain from itself. `set_extent` and `refine_extent` propagate
+  a join's satisfied predicates through the producer's function spine, including both sides of
+  data functions. Refining only the codomain would leave the data domain inconsistent.
+- `make_restrict` retains the restriction requested by the site, including a vacuous predicate.
+  It cannot use `refine_with`'s true-predicate elimination when the consumer still requires that
+  declared refinement.
+- The cast-wrapped `groupby` lambda retains a Pi binder for the key referenced by its predicate.
+  `recognize_groupby_sites` and `convert_groupby_pointful` recognize the dependent source and build
+  `converse(c ≫ key) ≫ map(c)` at that source's type, including the group refinement. A bare member
+  domain would claim every element belongs to every group.
+- Join planning stamps `PermuteDomain` with the actual input morphism's type, including domain
+  refinements. Stamping the builtin with an unrefined type while its application retains the
+  refined input would leave the two nodes unreconcilable.
 
-* **Iterated / join-satisfying extents on producers** (`planning`'s `set_extent` / `refine_extent`). An iteration source produces the refined domain it iterates, so it is symmetric `{D | p} ⤇ {D | p}` (`make_iterate`); a hash join folds its equi-conditions into the key structure with no residual `Restrict`, so the extent it yields would otherwise reach the body's `cast` *bare*. `refine_extent` refines **both sides** for that reason: a data function's domain *is* its data, so refining only the codomain would leave the domain claiming rows the join never produces — readable as a supertype under the contravariant reading of a function, but wrong for a collection, and it puts every enclosing type at odds with the site. Threaded down the combinator's whole function spine so the leaf builtin the Check pass rebuilds from agrees. Reconstructable because a combinator node carries its own function type and `emit_apply` returns *that* codomain verbatim. `make_restrict` builds its refinement directly rather than through `refine_with`, whose trivially-true degeneracy is right for `make_iterate` (an unrefined site should not print `{D | true}`) but wrong here: the caller emits one `restrict` per layer the *site* declared, so dropping a vacuous one leaves the source producing a bare extent while the site — and the body's `{D | true}` cast — still demand the refined one.
+#### Feed handles as invariant histories
 
-* **Dependent groupby refinement** (`lambda_elim`'s cast-wrapped-lambda arm). `groupby` lowers to `λ k → cast({I | key(i) == k} ⇒ A, λ i → c(i))`. Because the key binder `k` is now a genuine **Pi binder** (the refinement closes over it but the *value* does not mention it), lambda-elim emits the Pi-const form `const(cast(c)) : (k) ⇒ ({I | i ▷ c ▷ key == k} ⇒ A)` — the `k`-dependence rides the refinement and is materialized as a `Restrict` at the iteration boundary (the dependent-application model, §4.5). Planning's pointful recogniser (`recognize_groupby_sites` / `convert_groupby_pointful`) matches that Pi-const source directly — identifying the key binder structurally as the free variable on one side of the predicate's equality — and emits the bucketize chain `converse(c ≫ key) ≫ map(c)` **at the source's own type** — `(k: K) ⤇ ({I | key(i) == k} ⤇ V)`, group refinement and Pi binder intact. A group holds the members sharing one key, and a data function's domain *is* its data, so typing a group as the bare `I` would claim every element belongs to every group; the binder has to ride the function type as a Pi or the predicate's `k` dangles.
-* **`permute_domain` over a refined morphism** (`join_plan::convert_loop_join`). The combinator is polymorphic in the morphism it rearranges; its declared input type is the morphism's *actual* type (which may carry the join-condition refinement), not a bare `actual ⇒ actual`. Otherwise `apply_function` re-stamps the partially-applied combinator's recorded type to `fun(expr.ty, …)` (carrying the refinement) while its inner `PermuteDomain` builtin keeps the bare declaration — an inconsistent node the reconstruction can't rebuild, because the refinement rides the morphism's *invariant* domain⇒codomain position (where subtyping would demand `T <: {T|p}` *and* `{T|p} <: T` at once).
+A feed handle is `Type::History` with `history_kind: HistoryKind::Append`, domain `𝐷`, and
+value type `𝑉`. Its read view is the data function `𝐷 ⤇ 𝑉`; display writes `feed(𝐷 ⤇ 𝑉)`.
+The same type constructor with `HistoryKind::Overwrite` represents `Mut(𝑉, 𝐷)`.
+These are distinct capabilities, not interchangeable spellings.
 
-#### Feed handles as an invariant `History` constructor (`Type::History { kind: Feed }`)
+`emit_defer` creates fresh domain and value variables. For a bare `Defer` let RHS, `emit_let`
+replaces the domain with rigid `ChanDom(d)`. `emit_feed` contributes a channel from its fed value;
+`emit_define` constrains against the definition's entire type. Both statements return `Unit`.
+The fresh domain in a feed contribution is constrained against the rigid channel name, not left
+unconstrained. `channelize` later substitutes the assembled domain and removes defer constructs
+and append-history handles. Downstream passes consume the resulting channel/value, not the handle.
 
-A feed handle is `Type::History { value: 𝑇, domain: 𝐷, history_kind: HistoryKind::Append }` (displayed `feed(𝐷 ⤇ 𝑉)`) — a collection `𝐷 ⤇ 𝑇` carried as two children plus a two-valued `history_kind` marker. It **shares the `Type::History` variant with a mutable variable** (`history_kind: Overwrite`, displayed `Mut(𝑉, 𝐷)`); the two were unified from the former `Type::Feed(ρ)` / `Type::Mut{…}` pair (see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type)). `let 𝑑 = Defer in body` gives `𝑑` an `Append`-kind history whose channel `𝐷 ⤇ 𝑇` is the *post-channelize result type* of the binding (a `𝐷 ⤇ 𝑇` channel for fed defers, the defined value's type for `<<=`-defined defers). Like `Hole` and `Infer` the `Append` kind is **transient**, scoped to inference: `channelize` (which runs after inference) eliminates every defer construct along with its feed histories, and no pass downstream of it may observe one. (This is the feed-handle type of [`Feed` is a CCL type](mutability.md#feed-is-a-ccl-type) — what a defer-mediating UDF parameter carries.)
+A structurally opaque target such as a lambda parameter receives a feed-handle demand. Invariance
+carries contributions back to the caller's channel. A bare defer binding is monomorphic; one
+inside a generalized definition freshens with that definition. Captured variables still obey the
+scheme cutoff, so freshening does not copy every history indiscriminately.
 
-Below, **`Feed(ρ)`** abbreviates a `kind: Feed` history whose reconstructed channel is `ρ = 𝐷 ⤇ 𝑇`; the `value`/`domain` children are the two halves of `ρ`. An `Overwrite` history reaches the relation as a handle — a read has already dereffed at the rule that emitted it — so the four invariance rules below are specifically the `Feed`-kind behavior.
+`constrain_go` implements these cases:
 
-The typing rules are `emit_defer`, `emit_feed`, and `emit_define` in `infer/emit.rs`.
-`emit_defer` initially creates a history with fresh domain and value variables. For
-`let d = Defer`, `emit_let` immediately replaces the domain with rigid `ChanDom(d)`.
-A feed contributes `δ ⤇ value_ty` to the handle's channel; its fresh domain variable is
-constrained to that rigid name, not left as an unconstrained `Infer`. A define contributes
-its entire value type. Both statements have type `Unit`.
+| Relation | Behavior |
+| --- | --- |
+| Histories of the same kind | Constrain both value types and both domains in both directions. |
+| Append history against a non-history consumer | Compare its reconstructed data-function read view with the consumer. |
+| Function against an append-history demand | Compare the function with the demanded channel read view; this supports materialized read views during specialization. |
+| Other non-append shape against an append-history demand | Return `NotAFeed`; a scalar or overwrite handle cannot acquire feed capability. |
 
-A structurally opaque target, such as a lambda parameter, receives a feed-handle upper bound.
-The call-site argument meets that bound, and history invariance propagates contributions back
-to the caller's channel. A bare `Defer` RHS is not generalized, so feeds and reads share its
-history. A defer inside a generalized function freshens with the function's instantiation.
-`channelize` later substitutes the assembled channel domain for each `ChanDom`.
+The invariant child constraints run under identity substitutions, not the Pi discharges accumulated
+outside the handle. Transporting non-invertible discharges in both directions can make incompatible
+substitutions meet on one child variable. Consequently, a binder-dependent refinement inside a fed
+value is not discharged across the handle by this rule. Feed-through-UDF support remains bounded
+by that limitation.
 
-`History` is the lattice's only **invariant** constructor. Feeding is a contravariant capability (a feed contributes an element *into* the channel) while reading is covariant, so a feed handle flowing through a function parameter must propagate feed contributions *backwards* to the caller's channel — a one-way `arg <: param` edge would strand the callee's contribution on the parameter variable. Four constraint rules (`constrain_go`), where `Feed(a)`/`Feed(b)` are same-`kind` (`Feed`) histories:
+Overwrite histories have no transparent subtype dereference: expression typing emits their value
+reads explicitly. A function-shaped value can satisfy the append-history read-view relation, so
+that relation alone does not validate every write target; `channelize` also checks genuine misuse
+of plain collections. The reverse cross-kind direction need not report `NotAFeed`: that error is
+the append-demand arm's diagnostic. Both directions still reject equating the two capabilities.
 
-1. **`Feed(a) <: Feed(b)`** ⇒ both `a <: b` and `b <: a` (invariance — payloads are equated). The payload edges run under **identity morphisms**: a payload is the channel's plain value type, not content inside a Pi binder's scope, so apply-site discharges do not transport into it — and must not, or the two-way edge makes two distinct non-invertible discharges meet at one payload variable (the closure-bridge corner) for ordinary chained defer functions. The cost: a binder-dependent refinement inside a fed value's type is not discharged across the handle (out of scope alongside the filter-feed-through-UDF gaps).
-2. **`Feed(a) <: 𝑇`** for non-feed `𝑇` ⇒ `a <: 𝑇` — transparent read (`sum(d)`, `d + 1`, `x <<= y` chains discharge through the handle). The post-inference structural check mirrors this: `CheckCtx::apply` takes the handle's read view (`Type::read_view`) once and hands that one function to both consumers an application reaches, the shape edge (`as_function`) and the argument edge (`constrain_argument`).
-3. **`Fun(…) <: Feed(a)`** ⇒ `Fun(…) <: a` — a *channel-shaped* lhs is the read view of the feed handle (coalescing a use position that both held and read the handle surfaces the bare channel; monomorphization's two-way pin then meets that view against the definition's `Feed`).
-4. **`𝑇 <: Feed(a)`** for any other non-feed `𝑇` ⇒ `ConstrainError::NotAFeed` — the write capability cannot be conjured from a plain value (`g(5)` where `g` feeds its parameter).
+Invariant histories require these solver treatments:
 
-The shared variant keeps the overwrite/feed operator discipline **on the type**: rule 1's invariance arm matches only *same-`kind`* `History`/`History` pairs, so an `Overwrite` history demanded as a feed (or a feed as an overwrite history) is not equated — the `Overwrite` history arrives as the handle it is and meets rule 4, whose left-hand side is any non-feed shape, as `NotAFeed`. So `<<` into a `:=` mutable variable, or `+=` on a `defer` channel, is a type error with no separate structural check (see [`Mut` is a CCL type](mutability.md#mut-is-a-ccl-type)).
+- `extrude_invariant` links a level-crossing proxy to its original in both directions and records
+  it under both polarity keys. It can upgrade an existing one-way proxy instead of reusing it
+  without the missing link.
+- Compaction stores kind, value, and domain in `CompactType::history_slot`. Materialization and
+  simplification visit the children at the same polarity; the constraints have already propagated
+  information in both directions.
+- `dissolve_read_feeds` replaces an append-history contribution by its channel function when the
+  position also has atom, product, variant, or function contributions. A lone feed or an overwrite
+  history retains its constructor. The replacement preserves positional refinements.
 
-Invariance has no MLsub-blessed polar story, so the two polarity-sensitive mechanisms treat it specially:
-
-* **Extrusion** (`extrude_invariant`): a history's `value`/`domain` variables crossing a level boundary each get a *single* fresh proxy linked to the original by **both** a lower and an upper bound (an equality link through the standard lower×upper closure), instead of the polar one-way link. The proxy registers under both `ExtrudeCache` polarity keys.
-* **Compaction/coalesce**: the two children occupy a dedicated `CompactType::history_slot` (carrying the `kind`), recursing at the **same polarity** — by compaction time the constraint-level invariance has already propagated both directions, so this is materialization only, not a second polarity analysis. `simplify_type` walks the slot at the same polarity; refinement/co-occurrence behavior is unchanged.
-* **Transparent read at joins** (`dissolve_read_feeds`): rule 2 covers a feed handle meeting a concrete consumer *directly*, but a read can also meet other contributions through a shared join variable (`x + 1` flows `Feed(Int)` and `Int` into the binop's `∀α.(α,α)→α`). At coalesce, a position carrying a `Feed`-kind `history_slot` **alongside** non-feed contributions dissolves the handle into its channel before the contribution count; a feed handle alone (or two handles merged) keeps its constructor. Feeding-then-scalar-reading still errors correctly: the dissolved channel is `Fun(?, T)`, which genuinely collides with a scalar.
-
-Freshening (`freshen_above`) is polarity-free and recurses through the payload like any position, so a generalized DI function (`λ𝑛 → let 𝑥 = Defer in …`) instantiates a fresh feed handle per use site — the "fresh defer per call" semantics.
+These are history-specific rules. Data-function domains also have an
+[invariance contract](#data-domains-are-invariant); histories are not the only invariant position.
 
 ### The binder slot, and why annotations do not outlive inference
 
-A binder's `ty` records **the type the binder is bound at** — the type its references have. For an unannotated binder that is its initializer's type, but the two are not the same thing, and every binder position resolves the slot the same way: emit writes the type it bound the variable at, coalesce resolves it in place. `let` was once the exception, reconstructing its slot afterwards as a copy of the coalesced RHS type, and that is what made annotations look load-bearing after inference.
+A binder's `ty` is the type its references have, not necessarily its initializer's type.
+An immutable deref-copy binds a value while its initializer can be a history handle. A mutable
+introduction binds a history while its initializer is a value. Emission records the binding rule;
+[Binder-slot resolution](#binder-slot-resolution) specifies how coalescing resolves it in place.
 
-Two annotated forms are where the initializer's type and the bound-at type diverge, in opposite directions:
+`user_annotation` is an inference input, not a post-inference source of type information.
+Successful `infer` clears it from nodes and binders, including those inside refinement predicates.
+The post-inference debug checks assert that annotations are absent. Failed inference retains
+annotations for diagnostics; the success postcondition does not apply to that tree.
 
-* A **deref-copy** `y : 𝑉 = 𝑥` off a mutable variable `𝑥` binds `y` at the value type `𝑉`, while its initializer is a *history*. Recording the initializer's type made `y` an alias of `𝑥` in the type system — so the second-class `Mut` discipline, which keys on types, then misfired on a variable the user declared immutable: `z = y` was rejected as an unannotated `Mut` alias, and `y += 1` was *accepted* as a write.
-* A **mutable variable introduction** `𝑥 : Mut(𝑉) := init` binds `𝑥` at the history `Mut(𝑉, 𝐷)`, while its initializer is a plain value. Recording the initializer's type left the mutable variable's own slot reading `𝑉`, so the transaction-mutable variable scan could not classify it from the slot.
+Clearing and checking traverse type slots as well as expression children. A group-by predicate
+inside `Cast.target` can itself contain an annotated node, which a child-only walk misses.
+Both traversals combine the type-slot and predicate walkers; see
+[Type-slot coverage](#type-slot-coverage) for the shared traversal surface and regression test.
 
-Both readers compensated by consulting `user_annotation`, which held the user's declaration and so happened to answer correctly. That is the proxy the slot's honesty removes, and removing it matters because **an annotation is a pre-inference input**: it is a raw type from lowering, never normalized and never coalesced. A pass that pattern-matches one is reading a shape from before inference ran. So `infer` **clears every annotation on success**, and both post-inference walls pin the emptiness (`debug_assert_annotations_cleared`) — an invariant worth checking rather than asserting, since a stale annotation is only *read* by whichever pass thinks to look, and a leak surfaces as a wrong answer somewhere else entirely.
-
-**Both the clearing and the check follow type slots, not just children.** An annotation does not only ride the expression tree: `groupby` stamps the relation tying its key parameter to its key function onto a node inside the cast target's *refinement predicate*, and a predicate hangs off a type slot, which no `walk_children` reaches. A walk over children alone therefore clears every annotation it can see and then certifies the tree clean while a live one sits in a type — the leak and the check blind in exactly the same place, which is why the check could not report it. Both walks compose `walk_type_slots` with `walk_refined_predicates`, so they cover the same ground inference does when it *reads* an annotation.
-
-Nothing has to outlive the annotation. The one fact a later pass used to need from it — *is this binder a mutable variable?* — is answered structurally instead: only `MutDecl` (a `:=` introduction) and a pass-by-reference `Lambda` param bind one, and a `Let` cannot, because `emit_let` reads through an initializer that is a mutable variable. That retired the `Mut` discipline's rule 3 along with the bit that stood in for the declaration (see `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are second-class (downward-only)").
+Later passes classify mutable binders from the resolved representation and binding construct,
+not the erased annotation. `MutDecl` and pass-by-reference lambda parameters bind mutable
+handles; ordinary lets read through mutable initializers.
 
 ### Annotation kinds: exact and bounded
 
-An annotation at a binder answers one of two different questions, and CHL spells them differently because the answers diverge.
+An exact annotation `𝑥 : 𝑇` binds at `𝑇`, subject to `rhs <: 𝑇` or `arg <: 𝑇`.
+A bounded annotation `𝑥 <: 𝑇` infers the binding's type with `𝑇` as an upper bound.
 
-`𝑥 : 𝑇` is **exact**: the binder's type *is* `𝑇`. The initializer (or, at a parameter, the argument) must satisfy `rhs <: 𝑇`, and everything downstream of the binder sees `𝑇` — the value's own type is not observable through it.
+| Position | Exact `:` | Bounded `<:` |
+| --- | --- | --- |
+| Let | Complete holes from the RHS, normalize the annotation, and bind at it. | Bind through a fresh variable constrained below the annotation. |
+| Parameter | Normalize the annotation and bind at it; callers must satisfy it. | Bind at a fresh variable with the annotated upper bound; body demands can further constrain it. |
 
-`𝑥 <: 𝑇` is **bounded**: the binder's type is *inferred*, with `𝑇` as an upper bound. The value's own type flows through; `𝑇` only constrains what may reach the binder.
+The forms agree when the inferred type contributes no information beyond the exact annotation.
+They differ for width and refinements, not just for complex annotations:
 
-The two coincide only where the value's type already *is* the annotation, leaving nothing to discard. They differ wherever the value's type is a **strict** subtype of it — and the annotation's own shape does not decide that, because a Cambra type carries more than a base:
+- `x : {a: Int} = (a=1, b=2)` hides `b`; the bounded form retains both fields.
+- `x : Int = 5` discards the singleton; `x <: Int = 5` retains `Int@5`, which can satisfy an
+  index-range obligation that a bare `Int` cannot.
+- `def f(v <: {a: Int}): v.b` adds a body demand for `b` to the annotated requirement for `a`.
+  Its callers must supply both fields. An exact parameter cannot silently acquire the extra field.
 
-* **Width.** `x : {a: Int} = (a=1, b=2)` binds `x` at `{a: Int}`, so `x.b` is an error. `x <: {a: Int} = (a=1, b=2)` binds `x` at the record's own type, which still has both fields, so `x.b` is `Int@2`.
-* **Refinements.** A literal is typed by its own value ([A literal is refined by its own value](#a-literal-is-refined-by-its-own-value)), so `x : Int = 5` binds `x` at `Int` — the annotation is precisely what discards the singleton — while `x <: Int = 5` leaves it at `Int@5`. Only the second still discharges `arr[x]`'s index-range obligation.
-* **Delivery.** Trait narrowing consumes bases that *arrive* at an operand ([Delivery: the watch follows the edge](#delivery-the-watch-follows-the-edge)), and only the exact form puts one there — it binds at `Int`, while the bounded form binds at a variable that `Int` sits above. Both `def f(x: Int): x + "s"` and `def f(x <: Int): x + "s"` are ill-typed and both are rejected with no call site, but not by the same machinery: the exact form delivers `Int`, which narrows the obligation until `"s"` empties it, while the bounded form delivers nothing and is caught instead by [Requirements are read together, once](#requirements-are-read-together-once), reading the requirement against the bound already recorded on the value.
+The forms can also deliver information to trait resolution at different times. An exact `Int`
+parameter supplies that base immediately. A bounded parameter has `Int` above its variable, not
+as a delivered value. Both `def f(x: Int): x + "s"` and the bounded spelling are rejected without
+a call site; eager narrowing detects the former, while the
+[requirement sweep](#requirements-are-read-together-once) checks the latter against its bound.
+The semantic promise is the annotation; the diagnostic mechanism is not part of that promise.
 
-  This last one is a difference in *reach*, not in meaning, and it is the only bullet here that is. Do not read it as the split saying that `x <: Int` promises less; what it promises is stated above, and this row is about which mechanism happens to notice.
-
-The refinement case is worth reading twice: the annotation is a bare `Int` and the forms still differ, because `Int@5` is a strict subtype of `Int`. A "simple" annotation is no guarantee that the two agree — only a value that knows nothing beyond the annotation is.
-
-Both kinds apply at both binder positions, `let` and function parameter, with one rule each. The distinction and the two spellings are both settled; the spec states them and gives the reasoning for the tokens ([chl-spec.md](../../../docs/chl-spec.md), "Two annotation forms: exact and bounded"). Nothing below depends on which tokens they are: the mode is a two-valued property of a binder that lowering reads off the surface and turns into `BoundedHole`-or-not, so the surface and the representation are independent.
-
-| | `𝑥 : 𝑇` (exact) | `𝑥 <: 𝑇` (bounded) |
-|---|---|---|
-| `let` | bind at `𝑇`; require `rhs <: 𝑇` | bind at the inferred RHS type; require it `<: 𝑇` |
-| parameter | bind at `𝑇`; every call site requires `arg <: 𝑇` | bind at a fresh variable; require it `<: 𝑇` |
-
-The bounded column is the *only* behaviour that existed before the split, at both positions: a binder annotation contributed one upper bound and nothing else, because `bind_annotation` is one-way (`inferred <: ann` — an annotation has to admit the value, not equal it). A parameter's type was therefore the **meet** of its annotation and whatever its body demanded, which is worth stating plainly because it is neither of the two readings one expects: in `def f(v <: {a: Int}): v.b`, the annotation admits the argument and the projection widens the demand, so `𝑣` ends up at `{a: Int, b: 𝑇}` and callers must supply both fields. That is still what the bounded form means; the split gave it its own spelling and gave `:` the exact reading.
-
-Neither rule needs a mode test at its binder. A parameter binds at `normalize(annotation)`: exact normalizes to `𝑇` itself, bounded to a variable bounded by `𝑇`, and the old two-step (bind at a fresh variable, *then* reconcile against the annotation) is what made an exact annotation behave as neither reading — it contributed one upper bound among several instead of being the type. A `let` binds at the same normalization of its (completed) annotation, and two special cases fall out as consequences rather than tests: a **deref-copy** (`y: Int = x` off a mutable variable) binds at the annotation because that is what exact *means*, and a bare `_` completes to the initializer's type, which for a mutable-variable initializer is the *value* it reads — so `y: _ = x` binds exactly where `y = x` does, and writing through `y` is rejected the same way.
+An exact deref-copy uses the declared value type. With `y: _ = x`, completion instead supplies
+the value read from mutable `x`, matching an unannotated copy. Neither form creates a writable
+alias.
 
 #### BoundedHole is a marker in a type slot, not a type
 
-The bounded form is represented by a `Type::BoundedHole(𝑇)`, which `normalize_annotation` erases into a fresh variable carrying `𝑇` as an upper bound. It is the same kind of object as `Type::Hole` one rung up: `Hole` is the unbounded case, and the two compose in exactly the positions where a compound annotation is partly specified.
+Lowering represents a bounded annotation as `Type::BoundedHole(𝑇)`. Normalization replaces it
+with a fresh inference variable and records `𝑇` as an upper bound. It is an annotation marker,
+not another runtime type or a new subtype constructor.
 
-Neither is a type, and that is the first thing to know about `BoundedHole`. `Hole`, `Infer`, and `BoundedHole` all inhabit the `Type` enum because *annotation and binder positions are typed positions*, not because they denote anything: `BoundedHole(𝑇)` is not "the type of values below `𝑇`" — no such type exists, since a bound picks out no set of values on its own. It records an obligation for inference to discharge, and inference discharges it by minting a variable and giving it `𝑇` as an upper bound; the bound then lives where bounds belong, on a variable in the constraint graph.
+The marker can occur inside a compound annotation. Multi-parameter lowering constructs one tuple
+parameter, so `def f(x: 𝐴, y <: 𝐵, z)` needs the annotation
+`Tuple([𝐴, BoundedHole(𝐵), Hole])`. A single mode flag on that tuple binder could not represent
+the three positions independently.
 
-The consequence is that no *typing* rule may take a `BoundedHole`. There is nothing to subtype against, nothing to narrow, nothing to compact — the solver asserts this rather than inventing a rule (`constrain::extrude`, `compact`). Only the structural walks that rewrite every slot uniformly — substitution, free-variable collection, refinement stripping — pass through one, and they do so because they are indifferent to what a slot means.
-
-Putting the bound *in the type* rather than beside it is forced by the **multi-parameter encoding**, not chosen for symmetry. A `def` with more than one parameter uncurries to a single tuple parameter whose annotation is one `Type::Tuple`, with `Hole` at each unannotated position (`lower::functions::uncurry_params`). So `def f(x: 𝐴, y <: 𝐵, z)` has to express three distinct annotation modes *inside one type*, and `Tuple([𝐴, BoundedHole(𝐵), Hole])` does it with no new plumbing. Carrying the mode alongside the type instead would need a mode *tree* mirroring the type's shape, which is this variant in a worse spelling.
+Structural traversals such as substitution can preserve the marker before inference. Constraint
+and compaction rules must not consume an unnormalized `BoundedHole`; their unreachable branches
+detect that violation rather than assigning it typing semantics.
 
 #### BoundedHole cannot outlive inference
 
-`BoundedHole` is inference's to erase: Pass 1 replaces it with an `Infer` variable, and nothing downstream can observe one — not by convention but because **the slot it would live in does not survive inference at all**. See [The binder slot, and why annotations do not outlive inference](#the-binder-slot-and-why-annotations-do-not-outlive-inference); the bounded form needs no lifecycle rule of its own.
+Normalization removes bounded markers from solver types, and successful inference removes the
+original annotation slots. Both are necessary: erasing markers only from inferred `ty` fields
+would leave the raw declaration available to later passes.
 
-That the slot does not survive is what makes the guarantee structural, and following `Hole`'s precedent instead would *not* have sufficed. `Hole`'s discipline is erasure plus a check on `ty` slots (`UnresolvedHole`) — which leaves annotation slots covered by neither, so an un-erased marker can sit in one to the end of inference whenever a compound annotation is partly unspecified. That is survivable for `Hole`, which means "unspecified" and is read as such; it is not survivable for `BoundedHole`, which carries a *bound* that something must discharge. A marker whose whole content is a constraint cannot be left somewhere nothing looks.
-
-The remaining backstop is therefore narrow: a binder `ty` is the only slot a `BoundedHole` could reach, and `collect_type_errors` reports `UnresolvedBoundedHole` there. Nothing is expected to trip it — a `BoundedHole` reaching the solver un-normalized fails earlier, since there is no rule for constraining against one.
+`collect_type_errors` reports `UnresolvedBoundedHole` if a marker survives in a checked type slot.
+This is a compiler-invariant backstop, not a supported unresolved result. A marker passed directly
+to constraint solving can fail earlier. The lifetime and failure-path qualification are the same
+as [other annotations](#the-binder-slot-and-why-annotations-do-not-outlive-inference).
 
 #### A Hole inside an exact annotation is still inferred
 
-An exact annotation may be partly unspecified — `x: List(_) = [1, 2, 3]`, or the `Feed(_)` bindings the corpus uses. A `Hole` there means "infer this position", so the binder's type is the annotation **with each `Hole` filled from the corresponding position of the inferred RHS type** (`emit::complete_annotation`). That makes `x: _ = e` exactly equivalent to `x = e`, and `x: List(_) = [1, 2, 3]` bind at `List(Int)`. Records complete by *name*, so a field the annotation does not mention is dropped rather than completed — which is exactly the width an exact annotation discards. A **parameter** has no initializer to complete from, so a `Hole` there is simply a fresh variable resolved from the call sites.
+`complete_annotation` fills a let annotation's `Hole` positions from the inferred RHS before
+normalization. A bare `_` therefore preserves the RHS type. A parameter has no initializer;
+its holes normalize to fresh variables constrained by body uses and calls.
 
-The filling is a structural function on the two types, deliberately not a constraint: binding at a normalized annotation and relying on the one-way `rhs <: ann` edge to drive the annotation's fresh variables does *not* work — those variables are minted at the outer level, after the RHS's level has been popped, and escape inference unresolved. Shape disagreements need no handling here, because a `rhs` that cannot flow into `ann` at all is already an `AnnotationMismatch`.
+Completion retains the annotation's declared structure. It pairs equal-length tuples by position,
+records by field name, function domains and codomains structurally, and history children by role.
+Unmentioned record fields are not copied. A refinement keeps its declared predicates while filling
+its base from the peeled RHS. Dependent function codomains align the initializer's binder with
+the annotation's binder before copying a type into it. Shapes not handled by completion retain
+the annotation and are checked by the later subtype constraint.
+
+Completion is a structural operation, not a reverse subtype edge. Relying solely on one-way
+`rhs <: annotation` constraints can leave holes minted at the enclosing level unresolved.
+Incompatible annotations are reported as `AnnotationMismatch`; filling does not relax that check.
 
 #### A `Mut(…)` annotation is exact
 
-`Type::History` is **invariant in both payloads**: `constrain` relates two histories of
-the same kind in both directions, because a mutable variable is read *and* written
-through the same binder. A `:=` binder's type is a `Mut(𝑉, 𝐷)`, and those two facts
-together rule out both of the spellings a mutable introduction does not accept. Lowering
-rejects them (`lower::stmts::check_mut_decl_annotation`) rather than reinterpreting them:
+An annotation on `:=` must be an exact history annotation. `check_mut_decl_annotation` rejects a
+plain value annotation `𝑥 : 𝑉 := 𝑒` and a bounded history annotation `𝑥 <: Mut(𝑉) := 𝑒`.
+`mut_param_history_type` also rejects a bounded pass-by-reference parameter.
 
-* `𝑥 <: Mut(𝑉) := 𝑒` — under invariance the only type below `Mut(𝑉, 𝐷)` is `Mut(𝑉, 𝐷)`,
-  so the bound admits exactly the annotation and `<:` claims nothing `:` does not.
-* `𝑥 : 𝑉 := 𝑒` — a plain value type names the wrong thing. The binder is at `Mut(𝑉, 𝐷)`,
-  so reading a bare `𝑉` there would make `:` mean something at a `:=` binder that it
-  means at no other.
+The binder denotes the read/write handle, whose value and domain are invariant. A bound on that
+handle is not a bound only on future stored values. Distributing the marker into
+`Mut(BoundedHole(𝑉), 𝐷)` would change the meaning of the written annotation.
+The surface syntax provides no nested value-ceiling form; see
+[Exact and bounded annotations](../../../docs/chl-spec.md#two-annotation-forms-exact-and-bounded).
 
-The invariance argument does not depend on the binder being a `:=`, so it rejects a
-bounded pass-by-reference parameter too (`lower::functions::mut_param_history_type`):
-a `Mut(…)` annotation is exact wherever it is written.
-
-The consequence for the representation is that a `BoundedHole` never wraps a history,
-which `normalize_annotation` asserts. That is worth stating, because the alternative is
-representable and tempting: **distributing** the bound into the value position, as
-`Mut(BoundedHole(𝑉), 𝐷)`. A mutable variable binder's slot must stay structurally a
-`History` — `mut_value_type`, the deref coercion in `constrain`, `mut_elim`, and
-`transact_phase` all dispatch on that shape, and a variable standing for the whole handle
-would skip a write's `value <: 𝑉` edge — so the value position is the only slot a bound
-*could* occupy. But that is a fact about the pipeline, not about what `<: Mut(𝑉)`
-denotes; distributing silently re-points the bound at a type other than the one written.
-Rejecting leaves "a mutable whose value type is inferred under a ceiling" with no
-spelling, which is the honest position: under invariance it is not a bound on the
-binder's type at all, and no surface syntax puts a bound in a nested position (see
-[chl-spec.md](../../../docs/chl-spec.md), "Two annotation forms: exact and bounded").
+`normalize_annotation` rejects a `BoundedHole` wrapping a handle. This keeps the mutable binder's
+type structurally recognizable by `mut_value_type`, write typing, and later mutable-variable passes.
 
 #### Exact annotations bound monomorphization
 
-An exact parameter annotation is the program's only lever over specialization count, and this is the sharpest practical consequence of the split.
+A concrete exact parameter annotation can prevent argument refinements from splitting the domain
+part of a specialization key. A bounded parameter retains a variable there, so each instantiation
+can receive the argument's singleton. `exact_param_collapses_specializations` checks a function
+called at `1` and `2`: the bounded `Int` parameter produces two clones and the exact `Int`
+parameter produces one for that program.
 
-Specialization is keyed on instantiation identity ([Keying a specialization](#keying-a-specialization)), whose negative read follows a domain's *lower* bounds — the argument that flowed in. With a bounded (or absent) parameter annotation the domain is a variable, so each call site's argument type reaches the key, and the definition splits **per distinct argument type, including per literal value**: `let f = λ 𝑣 → 𝑣 + 1 in let a = f(1) in let b = f(2) in a` yields two clones of one body, distinguished only by the singletons `1` and `2`.
-
-An exact annotation binds the parameter at a concrete, level-0 type. `freshen_above` short-circuits it, every instantiation shares one domain, no argument refinement can reach the domain position, and the uses collapse to a single specialization.
-
-Two caveats keep that from being a blanket guarantee. First, the win is confined to the domain, and the key's *codomain* read follows the consumer's demand — deliberately, since the clone is coalesced under this use's pin and a key blind to the consumer would under-split. So an exact annotation collapses the uses only as far as their consumers agree. Second, the bounded form is genuinely per-call-site checked rather than checked once: `freshen_above` copies a variable's bounds, so the `<: 𝑇` obligation is instantiated with each use and enforced at every argument position.
+This is not an unconditional one-clone guarantee. Exact annotations may contain holes, generalized
+eligibility depends on the whole type, and consumer demands can distinguish the codomain key.
+The [key timing and precision limits](#key-timing-and-precision-limits) also apply.
+Freshening copies a bounded parameter's obligations, so every instantiated argument is checked
+against its bound rather than relying on a check performed once at the definition.
 
 ### Flowing In: normalizing annotations
 
-There is no conversion *into* a solver type — the solver consumes `ccl::Type` as-is. The only adjustment Pass 1 makes is `normalize_annotation`, which readies a user annotation / expected type for constraint solving:
+`normalize_annotation` consumes `ccl::Type`; it does not translate into a separate solver language.
 
-* **Holes (`Type::Hole`):** become fresh `Type::Infer` variables at the current level.
-* **Bounds (`Type::BoundedHole(𝑇)`):** become fresh `Type::Infer` variables at the current level, carrying `𝑇` as an upper bound — `Hole` with a ceiling (see [Annotation kinds: exact and bounded](#annotation-kinds-exact-and-bounded)).
-* **Shared holes (`Type::SharedHole(id)`):** the first occurrence of an id mints a fresh variable
-  and every later one reuses it, so two annotation positions carrying one id resolve to one
-  variable.
-* **Refinements:** are **kept** (recursing to normalize the inner) — they ride the lattice natively (above). A `Refinement(Hole, r)` source annotation thus becomes `Refinement(?fresh, r)`.
-* **Everything else** — including existing `Type::Infer` vars, `Tuple`/`Record` products, and `Type::Variant` sums — is kept verbatim and handled by the solver's structural constraint rules. Tuples and records are width-subtyped positionally/by name; variants are admissible at both polarities (the dual of records), so they need no fresh-var indirection.
+| Input position | Normalized representation |
+| --- | --- |
+| `Hole` | Fresh inference variable at the current level and telescope. |
+| `BoundedHole(𝑇)` | Fresh variable with a recursively normalized upper bound, excluding history wrappers. |
+| `SharedHole(id)` | One variable reused for every occurrence of that id in the inference context. |
+| Refinement | Normalized base with its predicate set retained. |
+| Structural type | Recursively normalized children; shape, tags, and kind information retained. |
+| Existing inference variable or leaf | Retained. |
+
+A named function extends the telescope for its codomain. Its domain and carried witness kinds
+normalize at the enclosing scope. This ensures variables minted inside dependent annotations have
+the binder context needed by [stored bounds](#scoped-inference-variables-a-stored-bound-closes-against-a-telescope).
+Annotation predicates are visited by the expression-typing rules as well; retaining a predicate
+set during structural normalization does not itself infer those expression trees.
 
 #### A shared hole naming a domain states an equation
 
-`bind_annotation` is one-way, and the domain position is contravariant, so a shared id lands below
-every domain annotated with it rather than equal to any of them. That is a common lower bound: it
-orders each domain under the variable and says nothing between the domains. Lowering writes the id
-to claim that two positions are one domain — an unfiltered single-generator comprehension and the
-source it iterates. A [data domain](#data-domains-are-invariant) is invariant, so the claim is an
-equation, and `bind_annotation` draws its other half.
+Lowering uses a shared hole to identify a comprehension's domain with its source's domain.
+The forward annotation constraint alone places one bound at the contravariant domain position;
+it does not establish equality between all domains mentioning that variable.
+`bind_annotation` adds the reverse relation where that shared id names a data domain.
 
-The equation is drawn only where the id names the domain. A domain variable reached any other way
-may receive several domains by design — a conditional collection's arms, a domain-generic consumer's
-parameter — and `constrain_go`'s invariant-domain arm declines to equate those for that reason.
+The extra equation is restricted to this annotation identity. A domain variable used for another
+purpose can collect distinct domains, as in a conditional collection or a domain-generic consumer.
+It is not equated with every contribution merely because the position is invariant.
 
-It is never drawn against a bound witness. A sum's domain is its binder's reference, and entering a
-sum is a term ([Only a term builds a sum](#only-a-term-builds-a-sum)), so equating that reference
-with a free variable escapes the binder instead of relating two positions.
+The equation is also excluded for a bound witness. Relating a free variable to that reference
+would let the witness escape its sum. Entering a sum instead requires a
+[term that builds it](#only-a-term-builds-a-sum).
 
-The merge at a negative position takes no matching exclusion, because it states nothing. A
-reference meeting a concrete type is settled where the edge is drawn: `constrain_go` distributes
-the demand over the witness's candidates, one invariant edge each, and reports a mismatch where
-the kind names no candidate. Compaction reads back only what those edges admitted, and a
-reference and a concrete atom arriving at one position are two shapes, which `coalesce_compact`
-reports as `IncompatibleBounds`.
+Negative compaction has a different responsibility: it reads constraints already admitted.
+A witness demand is checked against its candidates by `constrain_go`. A witness reference and
+a concrete atom surviving at one materialized position remain distinct shapes and produce
+`IncompatibleBounds`; compaction does not invent an equality to reconcile them.
 
 ### Flowing Out: coalescing
 
-Once constraints are resolved (Pass 2), `coalesce_compact` resolves each node's `Type::Infer` variables in place:
+`coalesce_compact` constructs a materialized `Type` from the compact graph; `coalesce_node`
+writes the result into the AST. The standard shape cases are specified under
+[Materialization outcomes](#materialization-outcomes), rather than repeated here.
 
-* **Products:** dense `Index` keys become `Type::Tuple`; `Name` keys become `Type::Record`; a sparse `Index` product (an open/under-determined position) coalesces to a fresh `Type::Infer` rather than a concrete product. **No keys at all has no type** — a positive merge intersects field sets, so the empty map is what two products sharing no field merge to, and there is no zero-field product for it to be: `Type::Tuple([])` and `Type::Record([])` are invalid, and unit is a *base* type a product reaches only through an operation that says so (see [docs/chl-spec.md](../../../docs/chl-spec.md#66-the-empty-product-is-unit)). The position is rejected as `CoalesceError::IncompatibleBounds` — bounds with no common shape, which is the same rejection two colliding atoms get, read one level down. The `product` constructor still maps the empty case to `Unit`, because a *constructed* empty product is an operation that says so; the empty case has no keys to tell positional from named keying, so without that collapse each construction site would pick a spelling arbitrarily and two spellings for one type fail to reconcile at the consistency wall, which compares a node's recorded type against one rebuilt from its children.
-* **Variants:** materialize into `Type::Variant(Vec<(FieldKey, Type)>)` with tags in `BTreeMap` order. A variant payload sits at a record-field-like position, so it inherits that position's polarity and coalesces by the same rule as a record field value. An all-`Index` variant pretty-prints as a bare `A | B | C`. Arm *order* is a presentation detail and nothing depends on it: arms are keyed by tag everywhere downstream — in a `Type::Variant`, in a runtime union column, and in `variant_project`/`variant_wrap` — so a variant a pass constructs by hand (the writer decision variant ``{`commit{𝑃} | `abort}``) and the same variant materialized by the solver in sorted order are interchangeable.
-* **Refinements:** the refinement set carried at a position is re-attached to the materialized inner type through `Type::refined`, which is one `Type::Refinement` node holding the whole set — there are no layers to order. An empty set (and the `None` a non-value contribution carries) yields the bare type.
-* **Incompatible bounds:** if a variable accumulates multiple distinct concrete primitives (e.g. `Int` and `String`) with no tag to discriminate them, the solver emits an `IncompatibleBounds` error. A *tagged* sum is unaffected — ``{`i{Int} | `s{String}}`` is a single `Variant`, not a primitive collision.
-* **Recursive types:** the algorithm has no occurs check. With one-way Apply edges a self-application like `λx. x x` produces no cyclic bound graph — it types cleanly (MLsub would give `(α ∧ (α ⇒ β)) ⇒ β`; Cambra drops the unconstrained `α` leg and infers `(?a ⇒ ?b) ⇒ ?c`, an unapplied-lambda type carrying `Infer`s), while *misusing* one (`(λy. y y)(1)`) still fails with `ExpectedFunction`. Should a residual cyclic bound graph ever form, `coalesce_compact` rejects it with a `RecursiveType` error — a defensive check; no current emission path produces one.
+An empty product contribution is a separate error case. Positive merging can intersect two field
+sets down to no common field. `coalesce_record` rejects that empty map as `IncompatibleBounds`;
+it does not infer `Unit`. Constructing an empty product explicitly uses the language's unit rule,
+which is different from finding no shared field in a join. See
+[The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit).
+
+Variants materialize in `BTreeMap` tag order and retain their openness marker. Payloads use the
+enclosing position's polarity. Tag identity, not vector order, is the contract for later consumers;
+positional variants display as `𝐴 | 𝐵 | 𝐶`.
+
+Refinement sets are reattached through `Type::refined`. An empty set yields the bare materialized
+type. No physical predicate order becomes part of that type's equality.
+
+The solver has no occurs check, but materialization rejects retained recursive-variable definitions
+with `RecursiveType`. Self-application alone does not establish that condition: one-way application
+constraints can infer an unapplied self-applicator with unresolved positions.
+`test_self_application_types` checks its function-shaped domain;
+`self_application_rejected_without_panic` checks misuse against
+a non-function. Those cases do not prove that every emission path avoids cyclic bounds.
 
 ---
 
