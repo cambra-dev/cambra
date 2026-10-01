@@ -133,7 +133,7 @@ impl TileProducer for PermuteRecordDomainProducer {
             unreachable!();
         };
         let output_domain = ColumnValue::Records(permute_record(input_fields, &self.permutation));
-        let output_domain_pred = permute_boxes(&domain_predicate, &self.permutation);
+        let output_domain_pred = permute_componentwise(&domain_predicate, &self.permutation);
         Tile::grouped(
             row_starts,
             output_domain,
@@ -148,7 +148,7 @@ impl TileProducer for PermuteRecordDomainProducer {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
             TileGuard::Function(FunctionGuard::Domain(pred)) => TileGuard::Function(
-                FunctionGuard::Domain(permute_boxes(&pred, &self.permutation)),
+                FunctionGuard::Domain(permute_componentwise(&pred, &self.permutation)),
             ),
             g => unreachable!("PermuteRecordDomain cannot honor the release guard {g:?}"),
         };
@@ -158,18 +158,21 @@ impl TileProducer for PermuteRecordDomainProducer {
 
 /// `pred`, a region of a tuple domain, with its fields permuted.
 ///
-/// A region of records is a union of boxes, one predicate per field
-/// (`src/interpreter/design-operators.md`, "Boxes and prefixes"), so it permutes box by box.
-fn permute_boxes(pred: &Predicate, permutation: &[usize]) -> Predicate {
+/// A region of records is a union of componentwise predicates, one predicate per field
+/// (`src/interpreter/design-operators.md`, "Componentwise predicates and prefixes"), so it permutes
+/// one componentwise predicate at a time.
+fn permute_componentwise(pred: &Predicate, permutation: &[usize]) -> Predicate {
     match pred {
         Predicate::True | Predicate::False => pred.clone(),
         Predicate::Record(fields) => Predicate::Record(permute_record(fields.clone(), permutation)),
         Predicate::Or(arms) => Predicate::flatten_or(
             arms.iter()
-                .map(|arm| permute_boxes(arm, permutation))
+                .map(|arm| permute_componentwise(arm, permutation))
                 .collect(),
         ),
-        p => unreachable!("a tuple domain's region is a union of boxes, got {p:?}"),
+        p => unreachable!(
+            "a tuple domain's region is a union of componentwise predicates, got {p:?}"
+        ),
     }
 }
 
@@ -221,7 +224,8 @@ fn flatten_predicate(pred: &Predicate, field_map: &[(String, Option<String>)]) -
                 })
                 .collect(),
         ),
-        // A region of records is a union of boxes, and flattening acts box by box.
+        // A region of records is a union of componentwise predicates, and flattening acts one
+        // componentwise predicate at a time.
         Predicate::Or(arms) => Predicate::flatten_or(
             arms.iter()
                 .map(|arm| flatten_predicate(arm, field_map))
@@ -1152,8 +1156,9 @@ mod tests {
         assert_eq!(result, Some(vec![tuple_step(1), TilePathStep::Codomain]));
     }
 
-    /// A record key's statement after a subtraction (a withheld key, a released one) is a
-    /// staircase of boxes, an `Or`, which permuting the key's fields permutes box by box.
+    /// A record key's statement after a subtraction (a withheld key, a released one) is a staircase
+    /// of componentwise predicates, an `Or`, which permuting the key's fields permutes one
+    /// componentwise predicate at a time.
     #[test]
     fn permuting_a_record_domain_permutes_a_staircase_statement() {
         let (mut input_tile, input_tiling) = make_three_field_records_tile_and_tiling();

@@ -320,14 +320,7 @@ impl TileProducer for ConverseProducer {
                     .map(under_every_group)
                     .fold(Predicate::False, |all, one| all.union(&one)),
                 TileGuard::Function(FunctionGuard::Codomain(inner)) => match inner.as_ref() {
-                    TileGuard::Function(FunctionGuard::Domain(keys)) => match keys {
-                        Predicate::Or(arms) => arms
-                            .iter()
-                            .filter(|arm| !arm.qualifies())
-                            .fold(Predicate::False, |all, one| all.union(one)),
-                        unqualified if !unqualified.qualifies() => unqualified.clone(),
-                        _ => Predicate::False,
-                    },
+                    TileGuard::Function(FunctionGuard::Domain(keys)) => keys.unqualified_arms(),
                     _ => Predicate::False,
                 },
                 _ => Predicate::False,
@@ -776,13 +769,14 @@ impl TileProducer for FilterProducer {
                 let depth = pred
                     .innermost_depth()
                     .unwrap_or_else(|| unreachable!("the arm matched a collection"));
+                let level = CurryLevel::new(depth);
                 let Tile::DataFunction {
                     domain: pred_keys, ..
-                } = pred.values_at(depth)
+                } = pred.values_at(level)
                 else {
                     unreachable!("innermost_depth names a collection")
                 };
-                let Tile::DataFunction { domain: keys, .. } = input.values_at(depth) else {
+                let Tile::DataFunction { domain: keys, .. } = input.values_at(level) else {
                     panic!(
                         "a filter's predicate masks the level at depth {depth}, which its \
                          input does not hold: {input:?}"
@@ -820,7 +814,7 @@ impl TileProducer for FilterProducer {
                 let mask = pred_column
                     .as_bitvec()
                     .unwrap_or_else(|| panic!("Expected bools"));
-                input.values_at_mut(depth).retain_keys(mask);
+                input.values_at_mut(level).retain_keys(mask);
                 input
             }
             _ => panic!("Invalid Filter input tiles"),

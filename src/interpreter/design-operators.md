@@ -174,8 +174,8 @@ signal in tiles and as a region specifier in guards.
 | `True` | All values. Universal predicate; identity under `intersect`. |
 | `False` | No values. Empty predicate; annihilator under `intersect`. |
 | `Intervals(IntervalSet<Value>)` | A scalar key's admitted values, clamped to the type's range. `Predicate::at_or_below(v)` builds the prefix `≤ v`, the upper-bound streaming signal, and `Predicate::below(v)` the strict one. Never built over records. |
-| `Record(fields)` | A box over a record key: one predicate per field, with AND semantics. |
-| `Or(arms)` | A union of boxes no two of which join into one box, as `flatten_or` leaves it; three or more arms can still cover one box. Arms are always flat (no nested `Or`). |
+| `Record(fields)` | A componentwise predicate over a record key: one predicate per field, with AND semantics. |
+| `Or(arms)` | A union of componentwise predicates no two of which join into one componentwise predicate, as `flatten_or` leaves it; three or more arms can still cover one componentwise predicate. Arms are always flat (no nested `Or`). |
 | `Qualified { enclosing, here }` | A key of an inner level **under the enclosing path that reaches it**: admits `(k₀ … k_d)` when `(k₀ … k_{d-1})` satisfies `enclosing` and `k_d` satisfies `here`. Built through `Predicate::qualified`, which drops the arm where `enclosing` admits everything. |
 | `Union { tags, rest }` | A predicate over a union-typed extent (`Extent::Union`): one predicate per named tag, and `rest` (`True` or `False`) for every tag it does not name. A value `Union { tag, inner }` satisfies it iff the predicate for `tag`, its own or `rest`, admits `inner`. A predicate need not name every tag of its domain: a column names only the tags it holds, which width subtyping makes fewer than its extent's, and a point names one. Built through `Predicate::tagged`, whose canonical form names no tag that says what `rest` does; `Predicate::over_every_tag` builds one from the whole tag set, which is `True` when every tag is. Used as the domain predicate on tiles emitted by `UnionProducer`, and split by `UnionProducer::release_impl` to forward each tag's predicate to the upstream input for that tag. |
 
@@ -212,9 +212,10 @@ conservative `false` would make the caller act on a region that is not the one i
 `is_applicable_to` checks one level. `TileGuard::covers_path` is the same question asked of a
 guard, and `TileGuard::check_from_under` threads the levels a `Codomain` step has walked past.
 
-A qualified predicate is a box over two components ([Boxes and prefixes](#boxes-and-prefixes)).
-`split_qualification` splits any predicate into the enclosing paths it is qualified by and the
-keys it admits under them, an unqualified one as `(True, self)`, so one rule serves both shapes.
+A qualified predicate is a componentwise predicate over two components ([Componentwise predicates
+and prefixes](#componentwise-predicates-and-prefixes)). `split_qualification` splits any predicate
+into the enclosing paths it is qualified by and the keys it admits under them, an unqualified one as
+`(True, self)`, so one rule serves both shapes.
 
 ### Restating a moved group
 
@@ -232,32 +233,32 @@ one that puts a group back under a different row restates what the group carries
 group placed without restating names paths under other rows, which the check in
 [The completeness contract](#the-completeness-contract) reports as a change to a complete path.
 
-### Boxes and prefixes
+### Componentwise predicates and prefixes
 
-A `Record` and a `Qualified` predicate are both **boxes**: products of one predicate per
+A `Record` and a `Qualified` predicate are both **componentwise**: products of one predicate per
 component, admitting a key when every component admits its part. A record's components are its
 fields in name order, the order `Value`'s comparison takes them in; a qualified predicate's are
-the enclosing path and the key. One algebra serves both (`BoxShape` in `tiling/predicate.rs`):
+the enclosing path and the key. One algebra serves both (`Componentwise` in `tiling/predicate.rs`):
 
 - A meet is componentwise.
-- A join is one box where the two agree on every component but one, and an `Or` otherwise.
-  `flatten_or` joins any two arms this way, so a region stated one row at a time stays one box
-  per run of rows alike, not one arm per row.
+- A join is one componentwise predicate where the two agree on every component but one, and an
+  `Or` otherwise. `flatten_or` joins any two arms this way, so a region stated one row at a time
+  stays one componentwise predicate per run of rows alike, not one arm per row.
 - A difference is a staircase: step `i` keeps what component `i` alone leaves, over the
   components before it that the subtrahend holds and the components after it untouched.
-- Containment is componentwise, which is exact for a nonempty box.
+- Containment is componentwise, which is exact for a nonempty componentwise predicate.
 
-A **prefix** of a lexicographic order is a staircase of boxes: `≤ (𝑎, 𝑏)` is
+A **prefix** of a lexicographic order is a staircase of componentwise predicates: `≤ (𝑎, 𝑏)` is
 `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. `domain_prefix` builds one across levels, one qualified arm per
-level, and `Predicate::at_or_below` builds one across a record key's fields. An interval is
-never built over record values, so a record key has only the box algebra, and a prefix meets a
-per-field region under the same rules as any two boxes.
+level, and `Predicate::at_or_below` builds one across a record key's fields. An interval is never built over
+record values, so a record key has only the componentwise algebra, and a prefix meets a per-field
+region under the same rules as any two componentwise predicates.
 
-`subsumes` is exact. A union on the left may cover a box that no single arm covers, so where no
-arm answers alone it asks whether `other ∖ self` is empty. Exactness rests on each region having
-one spelling where the representation allows it: `Predicate::intervals` clamps a set to its
-type's range, since the interval crate does not know that a `UInt` stops at 0 and would keep
-`(-∞, 3]` and `[0, 3]` apart, and it returns `False` for an empty set and `True` for one
+`subsumes` is exact. A union on the left may cover a componentwise predicate that no single arm
+covers, so where no arm answers alone it asks whether `other ∖ self` is empty. Exactness rests on
+each region having one spelling where the representation allows it: `Predicate::intervals` clamps a
+set to its type's range, since the interval crate does not know that a `UInt` stops at 0 and would
+keep `(-∞, 3]` and `[0, 3]` apart, and it returns `False` for an empty set and `True` for one
 covering the type.
 
 ### Curry levels
