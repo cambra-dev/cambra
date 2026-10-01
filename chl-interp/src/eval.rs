@@ -1619,6 +1619,8 @@ impl Interp {
 
             ("box", 1) => self.eval(&args[0]),
 
+            // `max` of an empty collection is not defined
+            // (`docs/chl-spec.md`, "7.1 Aggregates").
             ("max", 1) => {
                 let c = match self.eval(&args[0])? {
                     Value::Collection(c) => c,

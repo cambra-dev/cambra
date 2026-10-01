@@ -710,6 +710,9 @@ nondeterminism elsewhere in §3: unordered collections and unspecified
 evaluation order are decided semantics (order simply is not
 observable), not gaps.
 
+An aggregate over an empty collection is not defined today; §7.1 gives
+its planned `Option(T)` result.
+
 What the semantic rules in this document *do* rely on is only the
 notion of definedness itself: short-circuit `and`/`or` (§3.5), the
 ternary (§3.6), and `if`/`elif` (§4.5) guarantee that a non-selected
@@ -2709,6 +2712,12 @@ of built-in functions.
 
 Both are unary and take a collection-typed argument. Other aggregates
 (`min`, `count`, `avg`, `len`) are **[Planned]** but not yet recognised.
+
+Every aggregate's result is to become `Option(T)`, `` `none `` for an
+empty collection, as §3.9's optional lookup is **[Planned]**. A
+statically proven deref for a collection known to be non-empty goes with
+it, and is not designed yet. Until then `max` of an empty collection is
+not defined ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).
 
 The north-star programs additionally assume non-aggregate built-ins —
 `str`, `open`, `stdout`, and a stream-restriction combinator

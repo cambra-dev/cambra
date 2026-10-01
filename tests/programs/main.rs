@@ -17,6 +17,8 @@
 
 mod common;
 mod compile_timing;
+#[path = "../support/panic_message.rs"]
+mod panic_message;
 #[path = "../support/serving.rs"]
 mod serving;
 

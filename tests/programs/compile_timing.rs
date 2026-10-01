@@ -75,7 +75,7 @@ use cambra::{
     interpreter::Consumer,
 };
 
-use super::{common::panic_payload_to_string, serving::reserve_test_port};
+use super::{panic_message::panic_message, serving::reserve_test_port};
 
 /// Repetition count, the same switch the library's `provenance_pane_perf`
 /// reads: one knob for every ignored perf driver. Spelled here rather than
@@ -288,7 +288,7 @@ fn best_compile<T>(
                     &rendered.borrow(),
                 )));
             }
-            Err(payload) => return Outcome::Rejected(summary(&panic_payload_to_string(&payload))),
+            Err(payload) => return Outcome::Rejected(summary(&panic_message(&*payload))),
         }
     }
     Outcome::Compiled(best)
