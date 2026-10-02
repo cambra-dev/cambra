@@ -63,7 +63,8 @@ use crate::{
 ///
 /// [`compile_program`] returns `Result<_, Vec<CompileError>>`: the parser and
 /// lowering each report every error they find, and lowering runs on the parser's
-/// partial tree, so one pass returns all of both. Each entry is single-phase; the
+/// partial tree, so one pass returns all of both. Type inference runs only on a
+/// program both accept, and reports one error per failing statement. Each entry is single-phase; the
 /// parser's multi-error output is flattened into one [`CompileError::Parse`] per
 /// [`ParseError`].
 ///
@@ -2711,6 +2712,47 @@ Error: lowering error
             "no error points at {expected:?}:\n{}",
             render_errors(&errs, &sources)
         );
+    }
+
+    /// Emission recovers at each statement: every failing statement reports, in
+    /// source order, and a binding whose definition failed reports nothing more at
+    /// its uses. `expected` is the text each error's span covers.
+    #[rstest]
+    #[case::two_definitions("x = foo + 1\ny = bar + 2\nx + y\n", &["foo", "bar"])]
+    #[case::two_mismatches("x = 1 + \"a\"\ny = 2 + \"b\"\nx\n", &["1 + \"a\"", "2 + \"b\""])]
+    #[case::uses_of_a_failed_definition("x = foo\ny = x + 1\nz = not x\ny\n", &["foo"])]
+    #[case::a_failed_annotation("x: Int = \"s\"\ny = x + 1\nz = 2 + \"t\"\ny\n", &["x: Int = \"s\"", "2 + \"t\""])]
+    #[case::a_mutable_seed(
+        indoc::indoc! {r#"
+            a := foo
+            for i in [1, 2]:
+                a := a + i
+            b = 1 + "s"
+            a
+        "#},
+        &["foo", "1 + \"s\""]
+    )]
+    #[case::a_statement(
+        indoc::indoc! {r#"
+            acc := 0
+            for i in nope:
+                acc := acc + i
+            b = 1 + "s"
+            acc
+        "#},
+        &["nope", "1 + \"s\""]
+    )]
+    fn emission_reports_every_failing_statement(#[case] code: &str, #[case] expected: &[&str]) {
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let pointed: Vec<&str> = errs
+            .iter()
+            .map(|e| {
+                let span = e.span().expect("an inference error carries a span");
+                &code[span.start..span.end]
+            })
+            .collect();
+        assert_eq!(pointed, expected, "{}", render_errors(&errs, &sources));
     }
 
     /// Lowering reports its errors in source order, though it lowers a block's

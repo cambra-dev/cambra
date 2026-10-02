@@ -175,6 +175,9 @@ pub(super) struct InferCtx {
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
     telescope: Telescope,
+    /// The errors emission recovered from ([`Typing::recover`]), in the order it
+    /// raised them, which is source order.
+    pub(super) errors: Vec<LocatedInferError>,
 }
 
 impl InferCtx {
@@ -192,6 +195,7 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             telescope: Telescope::empty(),
+            errors: Vec::new(),
         }
     }
 
@@ -392,6 +396,11 @@ impl Typing for InferCtx {
 
     fn current_node(&self) -> NodeId {
         self.current_node_id
+    }
+
+    fn recover(&mut self, error: LocatedInferError) -> Result<(), LocatedInferError> {
+        self.errors.push(error);
+        Ok(())
     }
 
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
