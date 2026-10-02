@@ -197,8 +197,8 @@ ordered before the bound whole and those after it empty, which one `rest` cannot
 Every arm but `Qualified` is **unqualified**: read against the last component of a path alone,
 it says the same of that key under every enclosing path. That is the whole of what a curried
 collection's levels could state on their own, and it over-claims wherever the levels are not
-alike — a nested carrier keeps its enclosing rows open while the row being run is decided, so a
-key complete under the running row would be claimed under every row.
+alike — a nested induction store keeps its enclosing positions open while the row being run is
+decided, so a key complete under the running row would be claimed under every row.
 
 `Qualified` states a region of **paths** instead. `enclosing` is itself a predicate over the
 level above's paths, `Qualified` again where the nest is deeper, so depth costs nesting rather

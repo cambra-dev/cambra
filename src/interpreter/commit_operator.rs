@@ -2991,7 +2991,7 @@ impl DriverWindow {
             } else {
                 let emitted = Predicate::from_column_value(&domain);
                 match read_through {
-                    Some(r) => emitted.union(&Predicate::LessThanEq(Value::UInt(r))),
+                    Some(r) => emitted.union(&Predicate::at_or_below(Value::UInt(r))),
                     None => emitted,
                 }
             },
@@ -4714,10 +4714,10 @@ mod tests {
             sched.check_for_notifications();
         }
         assert!(
-            released.borrow().iter().any(|g| matches!(
-                g,
-                TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(1))))
-            )),
+            released.borrow().iter().any(|g| *g
+                == TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+                    Value::UInt(1)
+                )))),
             "the driver releases both filtered rows: {:?}",
             released.borrow()
         );
