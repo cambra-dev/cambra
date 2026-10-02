@@ -70,6 +70,11 @@ A backtick begins a variant tag only when an identifier starts at its end. Any o
 `DetachedBacktick`, with the backtick as its span; `check_tags` checks the raw token stream before
 the layout pass.
 
+A statement opens a block either from its head keyword (`if`, `def`, …) or from
+an assignment's right-hand side, and the layout pass tells them apart by the
+line's first token. On a line that begins with `pub`, the second token is the
+statement's head, so `pub def f():` opens its body as `def f():` does.
+
 ### Stage 2 — Parser (`parser.rs`)
 
 A chumsky combinator parser consumes the layout-resolved token stream and
@@ -182,6 +187,24 @@ Key shape choices:
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.
+- **Module statements have their own variants.** `Stmt::Import`, `Stmt::Run`,
+  `Stmt::Param` and `Stmt::Discard` carry the statements of
+  [docs/chl-spec.md](../docs/chl-spec.md), "9. Modules [Decided]". `Stmt::Pub`
+  wraps the statement `pub` marks rather than being a field of each statement
+  that can introduce a member, so one rule (`pub_refusal`) refuses `pub` on every
+  statement that introduces none. It carries the keyword's span, because on a
+  `@LoadFrom` declaration or a `@RenamedFrom` run `pub` stands on the line below
+  the decorator, where the statement does not start. A renamed run is a
+  `Stmt::Run` whose `renamed_from` names the predecessor's run, since the
+  decorator changes only which run it pairs with.
+- **One production spells a `::` path.** `qualified_name` parses a name and its
+  qualifier in every position that names a member: a reference
+  (`Expr::Qualified`), a field access's label (`Expr::Attribute`'s
+  `attr_qualifier`), and a record field's label (`RecordField::qualifier`). An
+  empty qualifier is the current module's label. A tag's qualifier precedes its
+  backtick, `` mod2::`some ``, and `tag_name` parses it for a constructor, a
+  variant type's arm, and a `case` pattern alike. Lowering refuses every module
+  construct before it lowers anything (`src/ccl/lower/module_syntax.rs`).
 
 ## Surface builtins
 
@@ -472,7 +495,8 @@ unhelpful `'src must outlive 'static` error — were hit during development:
 ## Testing
 
 - **Unit tests** in `lexer.rs` and `parser.rs` cover individual grammar
-  productions and the layout pass.
+  productions and the layout pass; `parser/module_tests.rs` covers the module
+  syntax.
 - **Integration tests** in `tests/chl_parser_roundtrip.rs` parse
   representative CHL programs (joined comprehensions, defer/feed patterns,
   function definitions with `yield`, multi-line bracketed expressions, …) and

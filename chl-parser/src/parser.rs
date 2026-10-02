@@ -60,13 +60,16 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
-    CompClause, Comprehension, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm, MatchPattern,
-    Module, Param, PayloadPattern, RecordField, Requirement, Span, Spanned, Stmt, TypeAnnotation,
-    TypeParam, UnaryOp, VariantPayload,
+    CompClause, Comprehension, DiscardHead, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm,
+    MatchPattern, Module, ModulePath, Param, PayloadPattern, QualifiedName, RecordField,
+    Requirement, RunArg, Span, Spanned, Stmt, TypeAnnotation, TypeParam, UnaryOp, UseItem,
+    VariantPayload,
 };
 use crate::lexer::{self, Token};
 
 mod error;
+#[cfg(test)]
+mod module_tests;
 // `error::*` is the public re-export surface for the diagnostics types. The
 // explicit `pub use` of `ParseResult` disambiguates it from the identically
 // named `chumsky::prelude::ParseResult` brought in above: an explicit import
@@ -164,12 +167,24 @@ where
         }
         .map_with(|node, e| Spanned::new(e.span(), node));
 
-        let name =
-            select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), Expr::Name(s)));
-
         let ident_only = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
             .labelled("identifier");
+
+        // A name, bare or `::`-qualified: `x`, `cart::total`, `this::f1`. Every
+        // position that names a member takes this one production — a value or
+        // type reference, a field label after `.`, and a record field's label —
+        // so a qualifier is spelled the same in each (`docs/chl-spec.md`, "9.6
+        // Qualified references" and "9.12 Field labels and tags belong to a
+        // module").
+        let name = qualified_name().map_with(|(qualifier, name), e| {
+            let node = if qualifier.is_empty() {
+                Expr::Name(name.node)
+            } else {
+                Expr::Qualified(QualifiedName { qualifier, name })
+            };
+            Spanned::new(e.span(), node)
+        });
 
         // ---- One-line `match` (bracketed positions only) --------------
         //
@@ -283,12 +298,13 @@ where
         // constructor and `=` binds a named field (§2.4). Tried before the
         // plain-expression tail below; `name` not followed by `=` (e.g. `(x)`,
         // `(x, y)`, `(x == y)`) falls through to a group/tuple.
-        let record_field = ident_only
+        let record_field = qualified_name()
             .then_ignore(just(Token::Eq))
             .then(bracketed_expr.clone())
-            .map(|((name, name_span), value)| RecordField {
-                name,
-                name_span,
+            .map(|((qualifier, name), value)| RecordField {
+                name: name.node,
+                name_span: name.span,
+                qualifier,
                 value,
             });
         let paren_record = record_field
@@ -384,8 +400,10 @@ where
             .validate(|((items, trailing_comma), refinement), e, emitter| {
                 let span = e.span();
                 let with_value = items.iter().filter(|(_, v)| v.is_some()).count();
-                let all_idents =
-                    !items.is_empty() && items.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
+                let all_idents = !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|(k, _)| matches!(k.node, Expr::Name(_) | Expr::Qualified(_)));
                 if let Some(predicate) = refinement {
                     // Refinement `{ T where p }`. The base is exactly one
                     // colon-free type; a `field: T` item or more than one item is
@@ -420,13 +438,23 @@ where
                     // trailing comma — `field: T` already marks the form.
                     let fields = items
                         .into_iter()
-                        .map(|(k, v)| match k.node {
-                            Expr::Name(name) => RecordField {
-                                name,
-                                name_span: k.span,
-                                value: v.expect("all items have a value"),
-                            },
-                            _ => unreachable!("guarded by all_idents"),
+                        .map(|(k, v)| {
+                            let value = v.expect("all items have a value");
+                            match k.node {
+                                Expr::Name(name) => RecordField {
+                                    name,
+                                    name_span: k.span,
+                                    qualifier: Vec::new(),
+                                    value,
+                                },
+                                Expr::Qualified(QualifiedName { qualifier, name }) => RecordField {
+                                    name: name.node,
+                                    name_span: name.span,
+                                    qualifier,
+                                    value,
+                                },
+                                _ => unreachable!("guarded by all_idents"),
+                            }
                         })
                         .collect();
                     (Spanned::new(span, Expr::BraceRecord(fields)), false)
@@ -504,8 +532,7 @@ where
         //     comma-free item, `{T}`) is what says the braces are the *tag's*
         //     rather than the payload type's. That is the one form a standalone
         //     type rejects, which is why it is free to mean this here.
-        let variant_ctor = just(Token::Backtick)
-            .ignore_then(ident_only)
+        let variant_ctor = tag_name()
             .then(
                 choice((
                     paren_group.clone().map(PayloadBracket::Paren),
@@ -515,7 +542,7 @@ where
                 ))
                 .or_not(),
             )
-            .validate(|((tag, tag_span), bracket), e, emitter| {
+            .validate(|((tag_qualifier, (tag, tag_span)), bracket), e, emitter| {
                 let payload = match bracket {
                     None => None,
                     // `` `tag() `` is the nullary form written the long way: the
@@ -567,6 +594,7 @@ where
                     Expr::VariantCtor {
                         tag,
                         tag_span,
+                        tag_qualifier,
                         payload,
                     },
                 )
@@ -650,15 +678,22 @@ where
         // identifier can never begin with a digit, so the two forms cannot collide; the
         // digits ride in the same `attr` slot and lowering resolves which `ProjKey` they
         // mean. (`.0` lexes as `Dot` then `Int` — there is no float token to swallow it.)
+        //
+        // A named key may carry the module its label belongs to, `r.mod2::f1`; a
+        // positional key has no module.
         let attr_key = choice((
-            ident_only,
-            select! { Token::Int(n) => n }
-                .map_with(|n, e| (SmolStr::from(n.to_string()), e.span())),
+            qualified_name(),
+            select! { Token::Int(n) => n }.map_with(|n, e| {
+                (
+                    Vec::new(),
+                    Spanned::new(e.span(), SmolStr::from(n.to_string())),
+                )
+            }),
         ))
         .labelled("field name or index");
         let attribute = just(Token::Dot)
             .ignore_then(attr_key)
-            .map(|(name, span)| PostfixOp::Attribute(name, span));
+            .map(|(qualifier, name)| PostfixOp::Attribute(name, qualifier));
 
         let postfix = atom
             .clone()
@@ -676,10 +711,11 @@ where
                             index,
                             checked,
                         },
-                        PostfixOp::Attribute(attr, attr_span) => Expr::Attribute {
+                        PostfixOp::Attribute(attr, attr_qualifier) => Expr::Attribute {
                             target: Box::new(target),
-                            attr,
-                            attr_span,
+                            attr: attr.node,
+                            attr_span: attr.span,
+                            attr_qualifier,
                         },
                     };
                     Spanned::new(span, node)
@@ -1150,7 +1186,69 @@ enum PostfixOp {
     Call(Vec<Spanned<Expr>>),
     /// A subscript, plus whether it carried the `?` checked suffix.
     Subscript(Box<Spanned<Expr>>, bool),
-    Attribute(SmolStr, Span),
+    /// A field key and the qualifier of its label.
+    Attribute(Spanned<SmolStr>, Vec<Spanned<SmolStr>>),
+}
+
+/// A variant tag and the `::` qualifier before its backtick: `` `some `` is
+/// `([], some)` and `` mod2::`some `` is `([mod2], some)` (`docs/chl-spec.md`,
+/// "9.12 Field labels and tags belong to a module").
+///
+/// The qualifier precedes the backtick, so the backtick still opens the tag
+/// itself, as in an unqualified one.
+fn tag_name<'src, I>()
+-> impl Parser<'src, I, (Vec<Spanned<SmolStr>>, (SmolStr, Span)), PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+{
+    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let head = choice((
+        just(Token::This).map_with(|_, e| Spanned::new(e.span(), SmolStr::new_static("this"))),
+        ident,
+    ));
+    let qualifier = head
+        .then(
+            just(Token::ColonColon)
+                .ignore_then(ident)
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .then_ignore(just(Token::ColonColon))
+        .map(|(head, rest)| std::iter::once(head).chain(rest).collect::<Vec<_>>());
+    qualifier
+        .or_not()
+        .map(Option::unwrap_or_default)
+        .then_ignore(just(Token::Backtick))
+        .then(
+            select! { Token::Ident(s) => s }
+                .map_with(|s, e| (s, e.span()))
+                .labelled("identifier"),
+        )
+}
+
+/// A name and the `::` qualifier before it: `x` is `([], x)` and
+/// `shop::eu::stock` is `([shop, eu], stock)`.
+///
+/// `this` stands only at the head of a qualifier, so a bare `this`, or a `this`
+/// after a `::`, is a parse error.
+fn qualified_name<'src, I>()
+-> impl Parser<'src, I, (Vec<Spanned<SmolStr>>, Spanned<SmolStr>), PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+{
+    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let segments = ident
+        .separated_by(just(Token::ColonColon))
+        .at_least(1)
+        .collect::<Vec<_>>();
+    let this = just(Token::This)
+        .map_with(|_, e| Spanned::new(e.span(), SmolStr::new_static("this")))
+        .then_ignore(just(Token::ColonColon));
+    this.or_not().then(segments).map(|(this, mut segments)| {
+        let name = segments.pop().expect("`at_least(1)` segment");
+        let qualifier = this.into_iter().chain(segments).collect();
+        (qualifier, name)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,26 +1405,197 @@ where
                 name_span,
                 annotation,
             });
-        // ---- @LoadFrom(x) ------------------------------------------
+        // ---- module statements: import, run, param ------------------
+        // (`docs/chl-spec.md`, "9.2 Imports", "9.3 Runs", "9.4 Parameters")
+        let binder = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+        let module_alias = just(Token::As)
+            .ignore_then(binder.validate(|name, _, emitter| {
+                if starts_capitalized(&name.node) {
+                    emitter.emit(Rich::custom(
+                        name.span,
+                        format!(
+                            "`{}` is capitalized, which names a type; a module or run \
+                             name begins with a lowercase letter",
+                            name.node
+                        ),
+                    ));
+                }
+                name
+            }))
+            .or_not();
+        let use_item = binder
+            .then(just(Token::As).ignore_then(binder).or_not())
+            .validate(|(name, alias), _, emitter| {
+                if let Some(alias) = &alias
+                    && starts_capitalized(&name.node) != starts_capitalized(&alias.node)
+                {
+                    emitter.emit(Rich::custom(
+                        alias.span,
+                        format!(
+                            "`{}` and `{}` differ in case; a capitalized name is a type, so \
+                             a `use` alias keeps the case of the member it names",
+                            name.node, alias.node
+                        ),
+                    ));
+                }
+                UseItem { name, alias }
+            });
+        let use_clause = just(Token::Use)
+            .ignore_then(choice((
+                use_item
+                    .clone()
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+                use_item
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )))
+            .or_not()
+            .map(Option::unwrap_or_default);
+
+        let import_stmt = just(Token::Import)
+            .ignore_then(module_path())
+            .then(module_alias.clone())
+            .then(use_clause.clone())
+            .map_with(|((path, alias), uses), e| {
+                Spanned::new(e.span(), Stmt::Import { path, alias, uses })
+            });
+
+        let run_arg = binder
+            .then_ignore(just(Token::Eq))
+            .then(expr.clone())
+            .map(|(name, value)| RunArg { name, value });
+        let run_stmt = just(Token::Run)
+            .ignore_then(module_path())
+            .then(
+                run_arg
+                    .separated_by(just(Token::Comma))
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .or_not()
+                    .map(Option::unwrap_or_default),
+            )
+            .then(module_alias.clone())
+            .then(use_clause)
+            .map_with(|(((path, args), alias), uses), e| {
+                Spanned::new(
+                    e.span(),
+                    Stmt::Run {
+                        path,
+                        args,
+                        alias,
+                        uses,
+                        renamed_from: None,
+                    },
+                )
+            });
+
+        // A capitalized parameter is a type parameter, known through a bound
+        // (`<:`); a lowercase one is a value, known through its exact type
+        // (`:`). The case decides which annotation the parameter takes.
+        let param_stmt = just(Token::Param)
+            .ignore_then(binder)
+            .then(
+                annotation_mode()
+                    .then(expr.clone())
+                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
+                    .or_not(),
+            )
+            .then(just(Token::Eq).ignore_then(expr.clone()).or_not())
+            .validate(|((name, annotation), default), e, emitter| {
+                let is_type = starts_capitalized(&name.node);
+                match annotation.as_ref().map(|a| a.mode) {
+                    Some(AnnotationMode::Bounded) if !is_type => emitter.emit(Rich::custom(
+                        e.span(),
+                        format!(
+                            "a value parameter's type is exact: `param {}: T`; `<:` bounds a \
+                             type parameter, whose name is capitalized",
+                            name.node
+                        ),
+                    )),
+                    Some(AnnotationMode::Exact) if is_type => emitter.emit(Rich::custom(
+                        e.span(),
+                        format!(
+                            "a type parameter is known through a bound: `param {} <: T`",
+                            name.node
+                        ),
+                    )),
+                    _ => {}
+                }
+                Spanned::new(
+                    e.span(),
+                    Stmt::Param {
+                        name,
+                        annotation,
+                        default,
+                    },
+                )
+            });
+
+        // ---- Decorators: @LoadFrom(x), @RenamedFrom(r), @Discard -------
         //
         // A decorator and the declaration it decorates are one statement, not a
-        // general decorator grammar attached to an arbitrary one. `LoadFrom` is
-        // the only decorator CHL has, and the declaration it takes is the only
-        // one that may carry an annotation without a value — the decorator is
-        // where the value comes from. Parsing the two together is what keeps a
-        // bare `y: T` a parse error everywhere else.
+        // general decorator grammar attached to an arbitrary one. Each decorator
+        // takes its own declaration form: `@LoadFrom` the only declaration that
+        // may carry an annotation without a value, since the decorator is where
+        // the value comes from, `@RenamedFrom` a `run`, and `@Discard` a
+        // declaration head with neither.
+        // Parsing each pair together is what keeps a bare `y: T` a parse error
+        // everywhere else.
         //
-        // The decorator name is matched as an identifier and checked after, so
-        // an unknown one is reported by name rather than as a failure to find
-        // `@`.
-        let load_from_stmt = just(Token::At)
-            .ignore_then(select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span())))
-            .then(
-                select! { Token::Ident(s) => s }
-                    .map_with(|s, e| Spanned::new(e.span(), s))
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
-            )
-            .then_ignore(just(Token::Newline))
+        // The decorator name is matched as an identifier and checked once the
+        // declaration has parsed, so an unknown one is reported by name rather
+        // than as a failure to find `@`.
+        let discard_head = choice((
+            just(Token::Run)
+                .ignore_then(module_path())
+                .then(module_alias)
+                .map(|(path, alias)| DiscardHead::Run { path, alias }),
+            just(Token::Import)
+                .ignore_then(module_path())
+                .map(|path| DiscardHead::Import { path }),
+            binder.map(DiscardHead::Name),
+        ));
+        let decorator_arg = select! { Token::Ident(s) => s }
+            .map_with(|s, e| Spanned::new(e.span(), s))
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .then_ignore(just(Token::Newline));
+        // A run takes `pub` at the head of its own line, as a loaded declaration
+        // does.
+        let renamed_from_tail = decorator_arg
+            .clone()
+            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
+            .then(run_stmt.clone())
+            .map(|((source, keyword), run)| {
+                let Stmt::Run {
+                    path,
+                    args,
+                    alias,
+                    uses,
+                    renamed_from: None,
+                } = run.node
+                else {
+                    unreachable!("`run_stmt` parses an undecorated `Stmt::Run`")
+                };
+                let stmt = Stmt::Run {
+                    path,
+                    args,
+                    alias,
+                    uses,
+                    renamed_from: Some(source),
+                };
+                (keyword, stmt)
+            });
+        let load_from_tail = decorator_arg
+            // A loaded declaration is an ordinary declaration with no
+            // initializer, so it takes `pub` where any declaration does: at the
+            // head of its own line.
+            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
             .then(
                 select! { Token::Ident(s) => s }
                     .map_with(|s, e| Spanned::new(e.span(), AssignTarget::Name(s))),
@@ -1336,23 +1605,62 @@ where
                     .then(expr.clone())
                     .map(|(mode, ty)| TypeAnnotation { mode, ty }),
             )
+            .map(|(((source, keyword), target), annotation)| {
+                let stmt = Stmt::LoadFrom {
+                    target,
+                    annotation,
+                    source,
+                };
+                (keyword, stmt)
+            });
+        let discard_tail = just(Token::Newline)
+            .ignore_then(discard_head)
+            .map(|head| (None, Stmt::Discard(head)));
+        let decorated_stmt = just(Token::At)
+            .ignore_then(select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span())))
+            .then(choice((load_from_tail, renamed_from_tail, discard_tail)))
             .then_ignore(just(Token::Newline))
-            .try_map_with(|(((decorator, source), target), annotation), e| {
-                let (name, name_span) = decorator;
-                if name != "LoadFrom" {
-                    return Err(Rich::custom(
-                        name_span,
-                        format!("unknown decorator `{name}`; the only one is `LoadFrom`"),
-                    ));
+            .try_map_with(|((name, name_span), (keyword, stmt)), e| {
+                let expected = match &stmt {
+                    Stmt::LoadFrom { .. } => "LoadFrom",
+                    Stmt::Run { .. } => "RenamedFrom",
+                    _ => "Discard",
+                };
+                if name == expected {
+                    let stmt = Spanned::new(e.span(), stmt);
+                    return Ok(match keyword {
+                        None => stmt,
+                        Some(keyword) => Spanned::new(
+                            e.span(),
+                            Stmt::Pub {
+                                keyword,
+                                stmt: Box::new(stmt),
+                            },
+                        ),
+                    });
                 }
-                Ok(Spanned::new(
-                    e.span(),
-                    Stmt::LoadFrom {
-                        target,
-                        annotation,
-                        source,
-                    },
-                ))
+                let message = match (name.as_str(), &stmt) {
+                    ("LoadFrom", Stmt::Run { .. }) => "a `run` cannot carry `@LoadFrom`, which \
+                                                       loads one variable; a renamed run is \
+                                                       marked `@RenamedFrom(r)`, naming the run \
+                                                       it was"
+                        .to_string(),
+                    ("LoadFrom", _) => "`@LoadFrom(x)` names the variable it loads from, and \
+                                        decorates a declaration `y: T` on the next line"
+                        .to_string(),
+                    ("RenamedFrom", _) => "`@RenamedFrom(r)` names the run this one was, and \
+                                           decorates a `run` statement on the next line"
+                        .to_string(),
+                    ("Discard", _) => "`@Discard` takes no argument, and decorates a \
+                                       declaration head on the next line: a name, a `run`, or \
+                                       an `import`"
+                        .to_string(),
+                    _ => format!(
+                        "unknown decorator `{name}`; the decorators are `LoadFrom`, \
+                         `RenamedFrom` and `Discard`"
+                    ),
+                };
+                Err(Rich::custom(name_span, message))
             });
 
         let def_stmt = just(Token::Def)
@@ -1459,8 +1767,34 @@ where
             just(Token::Semi).then_ignore(just(Token::Newline).or_not()),
             just(Token::Newline),
         ));
-        let simple_stmt =
-            choice((return_stmt, pass_stmt, expr_or_assign)).then_ignore(stmt_terminator);
+        let simple_stmt = choice((
+            return_stmt,
+            pass_stmt,
+            import_stmt,
+            run_stmt,
+            param_stmt,
+            expr_or_assign,
+        ))
+        .then_ignore(stmt_terminator);
+
+        // `pub` before the statement it marks. Any statement parses after it, so
+        // `pub` on one that introduces no member is reported against that
+        // statement rather than as a failure to parse it.
+        let pub_stmt = just(Token::Pub)
+            .map_with(|_, e| e.span())
+            .then(stmt.clone())
+            .validate(|(keyword, inner): (Span, Spanned<Stmt>), e, emitter| {
+                if let Some(refused) = pub_refusal(&inner.node) {
+                    emitter.emit(Rich::custom(keyword, refused));
+                }
+                Spanned::new(
+                    e.span(),
+                    Stmt::Pub {
+                        keyword,
+                        stmt: Box::new(inner),
+                    },
+                )
+            });
 
         // ---- Statement-level recovery -------------------------------
         //
@@ -1510,7 +1844,8 @@ where
             for_stmt,
             with_stmt,
             def_stmt,
-            load_from_stmt,
+            decorated_stmt,
+            pub_stmt,
             block_assign,
             simple_stmt,
         ))
@@ -1519,6 +1854,101 @@ where
         .recover_with(via_parser(stmt_recovery))
         .boxed()
     })
+}
+
+/// A module path, `shop::cart`, holding the rule its segments follow
+/// (`docs/chl-spec.md`, "9.15 Module files").
+fn module_path<'src, I>() -> impl Parser<'src, I, ModulePath, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+{
+    select! { Token::Ident(s) => s }
+        .map_with(|s, e| Spanned::new(e.span(), s))
+        .labelled("module name")
+        .separated_by(just(Token::ColonColon))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .validate(|segments, _, emitter| {
+            for segment in &segments {
+                if segment.node.starts_with("__") {
+                    emitter.emit(Rich::custom(
+                        segment.span,
+                        format!(
+                            "module name `{}` begins with `__`, a namespace user code \
+                             cannot bind",
+                            segment.node
+                        ),
+                    ));
+                } else if !segment.node.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    emitter.emit(Rich::custom(
+                        segment.span,
+                        format!(
+                            "module name `{}` must begin with a lowercase letter; a \
+                             capitalized name is a type",
+                            segment.node
+                        ),
+                    ));
+                }
+            }
+            ModulePath { segments }
+        })
+}
+
+/// Whether `name` begins with an uppercase letter, which makes it a type name
+/// (`docs/chl-spec.md`, "6.1 Direction: term/type syntax split [Decided]").
+fn starts_capitalized(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
+}
+
+/// Why `pub` cannot mark `stmt`, or `None` if `stmt` may introduce a member
+/// (`docs/chl-spec.md`, "9.5 Visibility").
+///
+/// A recovered [`Stmt::Error`] is accepted: its own parse error already
+/// reports it.
+fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
+    let what = match stmt {
+        Stmt::Assign { .. }
+        | Stmt::AnnAssign { .. }
+        | Stmt::MutAssign { .. }
+        | Stmt::FunctionDef { .. }
+        | Stmt::Run {
+            renamed_from: None, ..
+        }
+        | Stmt::Error => return None,
+        Stmt::Run {
+            renamed_from: Some(_),
+            ..
+        } => {
+            "`pub` on a renamed run stands at the head of the run's line, below the decorator: \
+             `@RenamedFrom(r)` above `pub run …`"
+        }
+        Stmt::Import { .. } => {
+            "`pub` is refused on an `import`: a module exports only what it declares"
+        }
+        Stmt::Param { .. } => "`pub` is refused on a `param`",
+        Stmt::Pub { .. } => "`pub` is written once",
+        Stmt::AugAssign { .. } => {
+            "`pub` is refused on a compound assignment, which writes a variable another statement introduced"
+        }
+        Stmt::Define { .. } => {
+            "`pub` is refused on `<<=`, which defines a deferred value another statement introduced"
+        }
+        Stmt::LoadFrom { .. } => {
+            "`pub` on a loaded declaration stands at the head of the declaration's line, below \
+             the decorator: `@LoadFrom(x)` above `pub y: T`"
+        }
+        Stmt::Discard(_) => "`pub` is refused on `@Discard`, which declares nothing",
+        Stmt::Expr(_)
+        | Stmt::If { .. }
+        | Stmt::Match { .. }
+        | Stmt::For { .. }
+        | Stmt::With { .. }
+        | Stmt::Return(_)
+        | Stmt::Pass => {
+            "`pub` marks a statement that introduces a member: an assignment, a `def`, or a `run`"
+        }
+    };
+    Some(what)
 }
 
 /// Intermediate type used inside the statement-level expression dispatch.
@@ -1818,8 +2248,9 @@ where
 {
     let match_ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
     let case_pattern = choice((
-        just(Token::Backtick).ignore_then(match_ident),
-        select! { Token::Ident(s) if s.as_str() == "_" => s }.map_with(|s, e| (s, e.span())),
+        tag_name(),
+        select! { Token::Ident(s) if s.as_str() == "_" => s }
+            .map_with(|s, e| (Vec::new(), (s, e.span()))),
     ));
     let case_binder = choice((
         select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
@@ -1834,34 +2265,37 @@ where
         )
         .then_ignore(just(Token::Colon))
         .then(body)
-        .validate(|(((tag, tag_span), binder), body), e, emitter| {
-            if tag.as_str() == "_" {
-                if binder.is_some() {
-                    emitter.emit(Rich::custom(
-                        e.span(),
-                        "the default arm `case _:` binds no payload: the tags it \
+        .validate(
+            |(((tag_qualifier, (tag, tag_span)), binder), body), e, emitter| {
+                if tag.as_str() == "_" {
+                    if binder.is_some() {
+                        emitter.emit(Rich::custom(
+                            e.span(),
+                            "the default arm `case _:` binds no payload: the tags it \
                          covers have different payload types",
-                    ));
+                        ));
+                    }
+                    return MatchArm {
+                        pattern: None,
+                        body,
+                    };
                 }
-                return MatchArm {
-                    pattern: None,
-                    body,
+                let payload = match binder {
+                    Some(Some(name)) => PayloadPattern::Named(name),
+                    Some(None) => PayloadPattern::Ignored,
+                    None => PayloadPattern::Absent,
                 };
-            }
-            let payload = match binder {
-                Some(Some(name)) => PayloadPattern::Named(name),
-                Some(None) => PayloadPattern::Ignored,
-                None => PayloadPattern::Absent,
-            };
-            MatchArm {
-                pattern: Some(MatchPattern {
-                    tag,
-                    tag_span,
-                    payload,
-                }),
-                body,
-            }
-        })
+                MatchArm {
+                    pattern: Some(MatchPattern {
+                        tag,
+                        tag_span,
+                        tag_qualifier,
+                        payload,
+                    }),
+                    body,
+                }
+            },
+        )
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
@@ -1894,6 +2328,7 @@ fn expr_to_assign_target(spanned: Spanned<Expr>) -> Result<Spanned<AssignTarget>
             index,
             checked: false,
         } => AssignTarget::Subscript { target, index },
+        Expr::Qualified(q) => AssignTarget::Qualified(q),
         _ => return Err(span),
     };
     Ok(Spanned::new(span, node))

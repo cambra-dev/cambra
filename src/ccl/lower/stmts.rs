@@ -922,6 +922,9 @@ pub(super) fn extract_name_target(
                  (write it as `m[k] := …`)"
             ),
         )),
+        AssignTarget::Qualified(_) => {
+            unreachable!("a qualified target is refused before lowering (`refuse_module_syntax`)")
+        }
     }
 }
 
@@ -939,6 +942,9 @@ pub(super) fn write_target_name(target: &Spanned<AssignTarget>) -> Option<&str> 
             _ => None,
         },
         AssignTarget::Tuple(_) => None,
+        AssignTarget::Qualified(_) => {
+            unreachable!("a qualified target is refused before lowering (`refuse_module_syntax`)")
+        }
     }
 }
 
@@ -1879,6 +1885,9 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         // through `ParseResult::errors` before this message is ever read.
         ChlExpr::Error => "a malformed expression",
         // The forms with their own arms in `lower_type_expr` never reach here.
+        ChlExpr::Qualified(_) => {
+            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
+        }
         ChlExpr::Name(_)
         | ChlExpr::BraceRecord(_)
         | ChlExpr::BraceGroup(_)
