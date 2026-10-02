@@ -1017,6 +1017,44 @@ fn a_tuple_of_folds_pairs_at_the_group() {
     );
 }
 
+/// A tuple whose arms both keep the group's elements, a collection and a fold, is where a
+/// pair at the group and a pair at the innermost level differ. It fails before conversion, at
+/// substitution's `debug_assertions`-gated check for a discharged binder, and is pinned as it
+/// fails there. A build without that check compiles it, and `east` pairs `[1]` with 50 and
+/// `west` pairs `[2, 4]` with 300.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "discharged binder"))]
+fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
+    check_tile(
+        indoc! {r#"
+            sales = [
+                (region="west", amount=100, qty=2),
+                (region="east", amount=50,  qty=1),
+                (region="west", amount=200, qty=4),
+            ]
+            [([s.qty for s in g], sum([s.amount for s in g])) for g in groupby(sales, \r -> r.region)]
+        "#},
+        Tile::data_function(
+            ColumnValue::strings(&["east", "west"]),
+            Box::new(Tile::Record(HashMap::from([
+                (
+                    "_0".into(),
+                    Tile::grouped(
+                        ColumnValue::UInts(vec![0, 1]),
+                        ColumnValue::from_uints(vec![1, 0, 2]),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4]))),
+                        Predicate::True,
+                        BitSet::new(),
+                    ),
+                ),
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![50, 300]))),
+            ]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    );
+}
+
 /// A comprehension over `sales` grouped by region, with `body` reading each group `g`.
 ///
 /// `qty > 2` keeps only west's `amount=200` row, so the filtered per-region sums are north `0`
@@ -1077,9 +1115,10 @@ fn a_bare_filtered_per_group_aggregate_keeps_its_filter() {
 /// alone. Once fixed, each case's filtered component (`F` in its product) asserts `[0, 200]`.
 ///
 /// In the post-planning tree both forms carry the filter as a refinement of the
-/// aggregate's input, `__elem ▷ (g ≫ (.qty, 2 ▷ const) ▷ zip ≫ gt)`. `insert_map_filters`
-/// (`src/ccl/planning/map_filter.rs`) inserts a `map_filter` for the bare form and none for
-/// these, and the program compiles and runs with the refinement unmaterialized.
+/// aggregate's input, `__elem ▷ (g ≫ (.qty, 2 ▷ const) ▷ zip ≫ gt)`.
+/// `insert_per_group_filters` (`src/ccl/planning/per_group_filter.rs`) inserts a
+/// `map(filter_values(𝑞))` for the bare form and none for these, and the program compiles and
+/// runs with the refinement unmaterialized.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::beside_a_constant(
@@ -1109,5 +1148,29 @@ fn a_per_group_filter_keeps_each_elements_collection() {
     check_scalar(
         "sum([sum([sum(s.xs) for s in g if s.q > 1]) for g in groupby([(k=a > 1, q=a, xs=[a * j for j in [1, 2]]) for a in [1, 2, 3]], \\x -> x.k)])",
         Value::Int(15),
+    );
+}
+
+/// A two-arm zip with one constant arm over grouped rows pairs at the groups' keys, as the
+/// same pairing does through the generic zip. The fast path compiles to `MapResultToConst`,
+/// which pairs at the level the zip is converted at rather than at the innermost one.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::group_then_const(
+    r"[(g, 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]",
+    r"[(g, sum(g) * 0 + 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]"
+)]
+#[case::const_then_group(
+    r"[(1, g) for g in groupby([1, 2, 3, 4], \v -> v // 2)]",
+    r"[(sum(g) * 0 + 1, g) for g in groupby([1, 2, 3, 4], \v -> v // 2)]"
+)]
+#[case::fold_then_const(
+    r"[(sum(g), 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]",
+    r"[(sum(g), sum(g) * 0 + 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]"
+)]
+fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] generic: &str) {
+    assert_eq!(
+        sort_tile_collections(run_pipeline(fast)),
+        sort_tile_collections(run_pipeline(generic)),
     );
 }

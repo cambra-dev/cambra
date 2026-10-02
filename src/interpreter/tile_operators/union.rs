@@ -36,7 +36,7 @@ pub struct UnionOperator {
     flat: bool,
     /// The level the union merges at, which leaves every level above it standing — the
     /// same parameter [`Zip::new_at`](super::Zip::new_at) takes, and for the same reason. A
-    /// partition inside a nested recurrence runs once per enclosing row, so its arms
+    /// partition inside a nested recurrence runs once per enclosing position, so its arms
     /// agree above the level being merged and differ only below it.
     level: CurryLevel,
 }

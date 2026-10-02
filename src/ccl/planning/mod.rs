@@ -42,7 +42,7 @@ mod groupby;
 mod iterate;
 mod join;
 mod loops;
-mod map_filter;
+mod per_group_filter;
 mod predicates;
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
@@ -93,8 +93,8 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// runs before the materialisation walk.
 ///
 /// The error is an unsupported program: a jagged row realization cannot keep
-/// ([`conditionals::realize_conditional_collections`]), or a per-group filter no
-/// `map_filter` materializes ([`map_filter::reject_unmaterialized_narrowings`]).
+/// ([`conditionals::realize_conditional_collections`]), or a per-group narrowing no
+/// filter materializes ([`per_group_filter::reject_unmaterialized_narrowings`]).
 pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // Refinement predicates travel through inference and lambda-elim as bare
     // expressions over the implicit `REFINEMENT_BINDER` (design §6.3) and are
@@ -132,8 +132,8 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // and this one is a codomain in. It runs after predicate compilation because it
     // matches the point-free predicate, and after the group-by rewrite because the
     // site's upstream is the `converse` chain it splices into.
-    map_filter::insert_map_filters(&mut expr);
-    map_filter::reject_unmaterialized_narrowings(&expr)?;
+    per_group_filter::insert_per_group_filters(&mut expr);
+    per_group_filter::reject_unmaterialized_narrowings(&expr)?;
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its

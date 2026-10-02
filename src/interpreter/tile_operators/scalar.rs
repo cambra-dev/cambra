@@ -383,6 +383,27 @@ impl TileProducer for VariantWrapProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let mut tile = self.input.get(self.input.tiling().universal_guard());
+        // **A collection payload is a value only once it is whole.** The arm holds it as one
+        // materialized cell, which cannot grow, so a row's cell is emitted once that row's
+        // collection is complete and not before. At the outermost level the payload is one
+        // row, the whole input, and once it is released there is nothing left to wrap: a
+        // released collection reads as an empty one, which is not the value it was.
+        if self.input.tiling().values_at(self.level).holds_a_level() {
+            match self.level.enclosing() {
+                None if !tile.is_terminal() || self.obsolete_guard().is_universal() => {
+                    return self.tiling().empty_tile();
+                }
+                None => {}
+                Some(rows) => {
+                    let complete = tile.completion_at(rows);
+                    let paths = tile.paths_at(rows);
+                    let whole = bit_vec::BitVec::from_fn(paths.len(), |key| {
+                        complete.contains_path(&paths[key])
+                    });
+                    tile.values_at_mut(rows).retain_keys(&whole);
+                }
+            }
+        }
         // Which of the two cases this is was decided at construction, from the input's
         // tiling, and is read back from the output's: a payload **stream** keeps its domain
         // and wraps element-wise (so the constructor composes as `payload ≫ variant_wrap`),

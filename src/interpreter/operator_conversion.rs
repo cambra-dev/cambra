@@ -1731,10 +1731,11 @@ fn convert_impl_inner(
         {
             let input = expect_input(input, "const")?;
             let const_op = convert_impl(argument, None, ctx)?;
-            Ok(Box::new(MapResultToConst::new(
+            Ok(Box::new(MapResultToConst::new_at(
                 input,
                 const_op,
                 MapResultToConstMode::Replace,
+                ctx.level(),
             )))
         }
 
@@ -1762,10 +1763,11 @@ fn convert_impl_inner(
                             MapResultToConstMode::ZipRight
                         };
                         let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), ctx)?;
-                        return Ok(Box::new(MapResultToConst::new(
+                        return Ok(Box::new(MapResultToConst::new_at(
                             non_const_arm,
                             const_arm,
                             mode,
+                            level,
                         )));
                     }
                     // Generic path: fan_out the input so every branch shares the
@@ -2030,32 +2032,22 @@ fn convert_impl_inner(
             Ok(Box::new(Restrict::new(pred_op)))
         }
 
-        // filter_values(p) and map_filter(p): the **value-preserving** mid-chain filters.
-        // Both require `input=Some(_)`, the collection to filter, and keep each surviving
-        // entry's value. `filter_values` masks the keys its elements stand at (a writer
-        // decision body's value-`Case` fan-out arm, where `restrict` would return the domain
-        // identity for a source a map re-indexes). `map_filter(q)` is `filter_values(q)` one
-        // level in: it masks the keys of each element collection, and its predicate asks of
-        // each of those keys. The fed input feeds both the `Filter` value stream and the
-        // predicate, so it is fanned to the two.
+        // filter_values(p): the **value-preserving** mid-chain filter. Requires `input=Some(_)`,
+        // the collection to filter, and keeps each surviving entry's value, where `restrict`
+        // would return the domain identity for a source a map re-indexes. It masks the keys
+        // its elements stand at; under `map`, which converts it one level in, those are the
+        // keys of each element collection. The fed input feeds both the `Filter` value stream
+        // and the predicate, so it is fanned to the two.
         TypedExprNode::Apply { argument, function }
-            if matches!(
-                as_builtin(function),
-                Some(Builtin::FilterValues | Builtin::MapFilter)
-            ) =>
+            if as_builtin(function) == Some(Builtin::FilterValues) =>
         {
-            let builtin =
-                as_builtin(function).unwrap_or_else(|| unreachable!("the guard matched a builtin"));
-            let upstream = expect_input(input, builtin.name())?;
-            let level = match builtin {
-                Builtin::MapFilter => CurryLevel::new(ctx.level().index() + 1),
-                _ => ctx.level(),
-            };
-            let masked = level.enclosing().ok_or_else(|| {
-                ConversionError::TypeError(format!(
-                    "`{}` filters the keys its elements stand at, and a scalar has none",
-                    builtin.name()
-                ))
+            let upstream = expect_input(input, "filter_values")?;
+            let masked = ctx.level().enclosing().ok_or_else(|| {
+                ConversionError::TypeError(
+                    "`filter_values` filters the keys its elements stand at, and a scalar has \
+                     none"
+                        .to_string(),
+                )
             })?;
             // `Memo` the shared upstream: `Filter` pulls it as both the value stream
             // and (through the predicate) the boolean stream, and the transaction
@@ -2063,7 +2055,7 @@ fn convert_impl_inner(
             // fan branches desync (one sees a position the other has already
             // consumed).
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
-            let pred_op = convert_at(argument, Some(fan.branch()), level, ctx)?;
+            let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
             Ok(Box::new(Filter::new_at(fan.branch(), pred_op, masked)))
         }
 
@@ -2749,11 +2741,10 @@ fn convert_impl_inner(
             }
             let variant_extents = TagMap::from_arms(variant_extents);
             let payload_op = convert_impl(payload, None, ctx)?;
-            // Applied rather than composed: one payload becomes one variant value, and a
-            // collection-valued payload is read as the collection of them it also looks like
-            // — the reading this form has always taken. The payload is a root, so that is
-            // the level it is converted at.
-            let level = CurryLevel::new(usize::from(payload.ty.is_collection()));
+            // Applied rather than composed: one payload becomes one variant value, a
+            // collection-valued one included, which the arm holds materialized in one cell.
+            // The node's type is one variant value, so the wrap acts on the payload whole.
+            let level = CurryLevel::OUTERMOST;
             Ok(Box::new(VariantWrap::new_at(
                 payload_op,
                 tag_key,
@@ -3493,7 +3484,7 @@ fn build_commit_store(
         // *intersection*, so a body's consume-release cannot advance it past an
         // attempt still in flight.
         let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
-        // The body runs over the store's own domain, whatever the carrier sits in.
+        // The body runs over the store's own domain, whatever the `Transact` sits in.
         let body_op = convert_at(&w.body, Some(driver_fan.branch()), CurryLevel::new(1), ctx)?;
         // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
@@ -4487,7 +4478,7 @@ to the other's value",
         item_extent,
         resume_at,
     );
-    // The body runs over the store's own domain, whatever the carrier sits in.
+    // The body runs over the store's own domain, whatever the `Transact` sits in.
     set_body(convert_at(
         &w.body,
         Some(Box::new(driver)),
@@ -4927,8 +4918,7 @@ fn union_operand_ops(
             // consistent under a re-entrant pull — the transaction writer pulls the
             // body once per proposal.
             // The arms partition the level the copairing is converted at, so they merge one
-            // level above it. A nested carrier's body is converted one level in, so its
-            // partition merges one level in and leaves the enclosing row standing.
+            // level above it.
             let level = ctx.level().enclosing().unwrap_or(CurryLevel::OUTERMOST);
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
             let ops = operands

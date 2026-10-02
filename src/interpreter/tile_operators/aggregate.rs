@@ -651,6 +651,9 @@ impl TileProducer for MapAggregateProducer {
                 domain_predicate.clone()
             })
             .collect();
+        // Which groups are complete, over whole paths: those some level on the path calls
+        // complete ([`Tile::completion_at`]).
+        let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let parent_paths = input_tile.row_paths_at(depth);
         let folded = input_tile.values_at(CurryLevel::new(depth));
         let Tile::DataFunction { codomain, .. } = folded else {
@@ -684,9 +687,9 @@ impl TileProducer for MapAggregateProducer {
         // element whenever any part of the domain is open, which is never right for a live
         // source: a collection held per row is complete as soon as its row arrives, and an
         // aggregate over one would otherwise never settle. Reading only the **outermost**
-        // level is the same mistake one level up: under a nested carrier the enclosing rows
-        // stay open while the row being run is decided, so an aggregate inside the nest
-        // would never settle either.
+        // level is the same mistake one level up: under a nested store the enclosing
+        // positions stay open while the one being run is decided, so an aggregate inside the
+        // nest would never settle either.
         let mut entries: Vec<(Vec<Value>, Tile)> = self
             .accumulators
             .iter()
@@ -698,13 +701,7 @@ impl TileProducer for MapAggregateProducer {
 
         let terminal: BitVec = entries
             .iter()
-            .map(|(path, _)| {
-                level_predicates
-                    .iter()
-                    .take(path.len())
-                    .enumerate()
-                    .any(|(level, pred)| pred.contains_path(&path[..=level]))
-            })
+            .map(|(path, _)| complete.contains_path(path))
             .collect();
         // One accumulator per key, run together in path order: a scalar fold's rows are a
         // column, and `Sole`'s are the elements' own levels.
@@ -1008,6 +1005,54 @@ mod tests {
             released.borrow().contains(&key_two),
             "the per-key release must reach the input, got {:?}",
             released.borrow()
+        );
+    }
+
+    /// An input holding the group `[0, 2, 1]` under an open outer key, the order `Tile::merge`
+    /// gives two interleaving deliveries. The first pull sums 330 and releases what it read,
+    /// so a second pull adds nothing.
+    #[test]
+    fn a_sum_over_a_group_held_out_of_order_counts_each_element_once() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![0, 2, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 120, 110]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let (spy, _) = QuietSpy::new(tile, in_tiling);
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(int())),
+            },
+        );
+        let mut producer = MapAggregateProducer {
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &out_tiling),
+            input: Box::new(spy),
+            kind: AggregateKind::Sum,
+            accumulators: HashMap::new(),
+            standing: HashSet::new(),
+        };
+        producer.get(out_tiling.universal_guard());
+        let second = producer.get(out_tiling.universal_guard());
+        let Tile::Aggregation { accumulator, .. } = second.values_at(CurryLevel::new(1)) else {
+            panic!("the fold sits beneath one level, got {second:?}")
+        };
+        assert_eq!(
+            **accumulator,
+            Tile::Scalar(ColumnValue::Ints(vec![330])),
+            "each element counted once"
         );
     }
 
