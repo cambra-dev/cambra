@@ -1548,168 +1548,228 @@ a non-function. Those cases do not prove that every emission path avoids cyclic 
 
 ## 4.5 Dependent refinements via Pi types
 
-Some refinement predicates **close over an outer binder**. The motivating case is group-by: partitioning `xs` by `key_fn` produces, per key `𝑘`, the partition `{𝑖: 𝐼 | 𝑖 ▷ xs ▷ key_fn == 𝑘} ⇒ 𝑉` — the predicate references `𝑘`, bound *outside* the refinement. Expressing, propagating, and discharging such predicates inside the solver is what the Pi-type machinery adds. (This folds in the durable material from the original point-in-time design proposal for dependent refinements via Pi types.)
+A dependent function's result type can reference its argument. `Type::Fun` records an optional
+term binder in `name`; `(𝑘: 𝐾) ⇒ 𝑉` binds `𝑘` in `𝑉`, not in `𝐾`.
+For a grouping, the collection at key `𝑘` has a domain refined by
+`__elem ▷ xs ▷ key_fn == 𝑘`. Applying the grouping at `𝑘₀` substitutes that term into the
+result refinement.
 
-**Pi types.** `Type::Fun` carries an optional binder: `Fun { name: Option<Name>, domain, codomain }`. `name: Some(𝑥)` is the dependent type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain`; `name: None` is the ordinary function type. `emit_lambda` always names the binder from the lambda parameter, so a predicate that closes over the parameter stays bound. The binder is **cosmetic for ordinary functions** — `coalesce_compact_go` keeps it only when the codomain's refinement predicates actually reference it (queried via `subst::type_free_vars`) and strips it otherwise, so monomorphic output is unchanged and equality/printing don't churn.
+`emit_lambda` names the parameter in the live function type. Coalescing retains the name only
+when `codomain_depends_on` finds a dependency, including an indexed reference. Ordinary
+non-dependent output therefore need not retain a Pi name. The name is an opening address and
+display spelling; closed bound-reference identity is specified below.
 
-**Substitutions and contexts (`ccl::subst`).** A `Subst` is a context morphism that maps *term* binders (`Var` names) to replacement `TypedExpr`s. It never relabels a type variable — that is freshening's job. Two flavours: a **rename** `[𝑘 ↦ 𝑥]` (invertible) and a **discharge** `[𝑥 ↦ arg]` (one-way). The traversal is uniform over terms and types: `apply_expr` rewrites each node's type slots via `apply_type` in the same pass, so a substituted binder occurring inside a type-borne refinement predicate is discharged where it sits (no value-only contract, no dangling residual for §6.2 to catch in release builds). It is a true no-op when no substituted binder occurs free in the term — value or type slots — so a vacuous discharge from a non-dependent application changes nothing and shares the predicate `Rc`. Capture is impossible under the Barendregt convention (binder uids are minted once at lowering; copies preserve them) and the engine *asserts* it instead of α-renaming. Predicates are immutable, so a substitution always *rebuilds* a changed predicate (a fresh `Rc`); the engine drives two modes that differ only in what else they touch: **transport** (`apply_expr`/`apply_type`, builds new terms — the constraint-edge flavour) and **in-place rewrite** (`rewrite_expr`, mutates the term tree the caller owns; a predicate the substitution actually touches is rebuilt, one it merely walks past keeps its `Rc` — the pass-level flavour that `lambda_elim::substitute`, `channelize::channelize_substitute`, inlining's beta step, and lowering's uncurrying all wrap). Both modes thread the same `PredMemo`, so occurrences that shared one term are re-pointed at the same result. A **context** (`well_formed` / `type_free_vars`) is the dual *checking* device: a type is well-formed iff its predicates' free term-vars are in scope.
+Three mechanisms have distinct responsibilities:
 
-**Edges carry substitutions, stored two-sided in their native direction.** Each entry of a variable's bound lists is a `Bound { self_subst, ty, ty_subst }`: an upper entry on `𝑉` reads `𝑉‹self_subst› <: ty‹ty_subst›`, a lower entry `ty‹ty_subst› <: 𝑉‹self_subst›` (both identity for ordinary bounds). `constrain_subtype` delegates to `constrain_go(lhs, rhs, sl, sr, cache)` — each side under its own morphism. The **Fun/Fun arm derives the binder correspondence** `[𝑘 ↦ 𝑥]` onto the lhs side of the codomain edge, and the contravariant domain edge **swaps the two sides** rather than inverting anything. The var arms record edges verbatim — *nothing is inverted at record time*. A **discharge has no inverse**, so edges are recorded in their native direction rather than pre-inverted and re-inverted during closure (which would degrade a discharge to the identity, silently destroying it whenever a consumer edge is recorded before the producer's concrete codomain arrives — the opaque/higher-order application order, O3). Under identity morphisms every arm reduces exactly to the substitution-free solver, so all monomorphic inference is byte-identical.
+- `Subst` transports term references and typed replacement expressions through types and terms.
+- Inference-variable telescopes constrain which free names a stored bound may reference.
+- Pi closing and opening convert references between stored indices and the names or arguments
+  used by a reader.
 
-**Closure chains by bridging holder views, composing forward only.** When a new edge meets a variable's existing opposite edges, the two entries hold `𝑉` under possibly different morphisms (`lo`, `hi`); `bridge_holder_gap` reconciles them by moving whichever side is movable (substitution application is monotone w.r.t. subtyping): equal morphisms need no bridge; an invertible side bridges by `hi ∘ lo⁻¹` (renames only — lossless); two non-invertible composites that share their discharge part and differ only in correspondence renames are factored (`Subst::split_renames`) and bridged on the rename part. Two *distinct* discharges meeting at one variable is the domain-join corner (O1/O4), guarded by `invert_rename`'s panic — the loud tripwire, never a silent drop. The **constraint cache is σ-aware**: it keys each `(lhs, rhs)` pair on the *set of side-morphism pairs* seen, so `g(0)` and `g(1)` flowing into one position record two distinct edges instead of the second being conflated away; termination holds because cyclic (var⇄var) edges carry renames over the episode's finite binder set, whose composites saturate, while discharges ride acyclic content edges.
+Generalization freshens inference variables; it is not term substitution. Predicate allocation
+sharing is a separate contract described under
+[Predicate memo contexts](#predicate-memo-contexts).
 
-**Coalesce forces suspended substitutions.** `compact_go` threads a substitution accumulator: descending a bound edge composes the edge's *rendering morphism* (`edge_render_subst`: `ty_subst`, transported across `self_subst` by rename-inversion, or by the identity for a discharge — exact because the content lives in the post-discharge context and cannot mention the discharged binder, debug-asserted) and the composite is applied — *forced* — at each refinement-predicate leaf. A bound reached transitively through `𝑣 → 𝑤 → …` thus arrives with every edge's morphism composed (the deferred transitive closure recovered by the walk). Identity accumulator ⇒ no-op.
+### Substitution and bound transport
 
-**Dependent application.** `Typing::apply` types `f(arg)`. Emit constrains `fn_ty <: (𝑥: 𝑑) ⇒ result` against an expected Pi (the one-way Apply shape edge of §2) and returns `result` under a suspended discharge `[𝑥 ↦ arg]` on a fresh variable's lower edge, fired on the partition predicate at coalesce. So `groupby(xs, key)(𝑘₀)` types as `{𝑖 | 𝑖 ▷ xs ▷ key == 𝑘₀} ⇒ 𝑉`. The **post-inference check** (`CheckCtx::apply`) re-runs the discharge on the resolved codomain so its reconstruction matches; `force_refinement` rewrites the predicate to the same term in both places, so the two refinements compare equal under structural refinement equality (§4).
+For term binders, `Subst` stores `Mapping::Rename` and `Mapping::Discharge`. A rename replaces a
+name; a discharge replaces it with a typed expression. The same infrastructure also has witness
+mappings, but term substitution does not freshen `InferVar` identities.
 
-The expected binder is **always globally fresh** (proposal §5.2 verbatim; the §3.6 freshness discipline). The two-sided edge storage is what makes this sound at every polarity and in every constraint order: the correspondence `[𝑘 ↦ 𝑥]` and the discharge `[𝑥 ↦ arg]` compose forward along the closure regardless of whether `fn_ty` was concrete at the apply site or resolved only later (the opaque/higher-order case — a dependent function received as a *parameter* — now discharges correctly, unblocking O3 at the graph level). A contravariant position is reached by side-*swapping*, not inversion, so the discharge arrives at a `map`/aggregate's parameter domain intact. The remaining deferral is the domain-join corner — two *distinct* discharges meeting at one coalescing position (O1/O4) — guarded loudly by the closure bridge's tripwire.
+`apply_expr` and `apply_type` return transported structures. `rewrite_expr` rewrites an owned term
+in place. Both reach type slots and type-borne predicates, respect binders, and use predicate memos.
+An unchanged predicate can retain its allocation. A returned expression copy is not necessarily an
+allocation or `NodeId` no-op: expression-copy identity follows the provenance rules.
 
-**Discharged-argument slot resolution.** A predicate's interior is typed **by construction**, and the invariant that makes that hold is that *substitution never discards a type*. A `Discharge` carries a typed argument term and clones it; a `Rename` materializes as a fresh `Var` node and takes the type of the occurrence it replaces, because α-renaming cannot change a term's type — the type belongs to the position, not to the name. Nothing re-derives a predicate's types afterwards, and nothing may: a predicate's interior is outside the walk that resolves node types (its terms ride a *type*), so a slot left untyped here would survive to the post-inference wall as an unresolved variable with no way to recover it except lexical scope — which is a *name* lookup standing in for a type that was thrown away. (`freshen_above` separately copy-and-freshens a specialization clone's predicate type slots.)
+`Mapping::as_expr` gives a renamed variable the replaced occurrence's type and copies a discharge's
+typed argument. The in-place variant preserves the replacement root's occurrence identity.
+Substitution must not discard type information merely because it changes the referenced name.
+Predicate interiors can subsequently be coalesced; they are not excluded from the type-slot walk.
 
-**`let`-closing (codomain extraction).** A `let 𝑥 = 𝑣 in body` node's type is the body's type, which may close over `𝑥`. Emission records the lift as a suspended discharge on the `let` node's own variable (see [`let` binders and scope exit](#let-binders-and-scope-exit)), and `coalesce_node` discharges `[𝑥 ↦ 𝑣]` into the resolved type (derived from the body's already-closed type, so chained `let`s close to fixpoint) — the design's `let`-closing refinement-move site. The discharge quotes `𝑣`, so a pass that rewrites `𝑣` re-runs it: `lambda_elim`'s two `Let` arms rebuild the node's type from the eliminated body and definition, and the post-pass check reconstructs it from the tree it is handed, which holds the eliminated `𝑣` alone. Only a dependent binding is rebuilt, so elimination changes a node's type exactly where the term it quotes changed. Together with the contravariant discharge above, every coalesced node's type is **well-formed in its lexical scope**, checked at the end of inference by `check_scope_valid` (§6.2) in debug builds: a free predicate variable must be bound by an enclosing Pi binder or AST binder, or be a source. A violation is a compiler bug (a substitution-descent miss leaving a dangling predicate binder), reported as an internal `InferError::ScopeViolation`. This is a debug-build regression net: because substitution rewrites type-borne occurrences in the same pass as the term, a dangling predicate binder is structurally unrepresentable; the per-substitution `debug_assert`s in `ccl::subst` remain as fast-path guards.
+Capture avoidance depends on the binder discipline and the substitution's scope handling.
+Assertions check violations instead of silently alpha-renaming arbitrary input trees. This is an
+implementation contract, not a proof that malformed substitutions cannot be represented.
 
-**Lambda elimination.** A `λ 𝑥 → e` whose binder is free only in `e`'s *type* (a refinement closes over it) — not its value — eliminates to the **Pi-const** form `const(e) : (𝑥) ⇒ e.ty` (`is_free_in_value` distinguishes the two). It also fires after the currying/pairing rule rewrites a captured partition predicate onto a pair domain: the residual `λ __pair → <point-free value>` has its binder free only in that refinement.
+#### Native bound edges and closure
 
-**Deferred (flagged in code).**
-* **O2 (polymorphic case)** — `freshen_above` copy-and-freshens a refined value's predicate type slots through the shared cache (its `Refinement` arm), so a specialization's predicate is a proper freshen instance rather than a shared `Rc`. Immutable predicate terms are acyclic, so no refinement-cycle guard is needed.
-* **O4** — two *different* discharges of one refinement (`g(0)` vs `g(1)`) are distinguished once forced — `force_refinement` rewrites the predicate term and refinement equality is structural (§4) — and the constraint cache is σ-aware, so the two discharges record distinct edges rather than conflating. The residual domain-join corner is two *distinct non-invertible* morphisms meeting at one variable (O1/O4), guarded loudly by `bridge_holder_gap`'s panic tripwire rather than silently dropped.
+A stored `Bound` has a type and a substitution on each side of its relation:
 
-The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
+| Entry held on variable `𝑉` | Meaning |
+| --- | --- |
+| Upper | `𝑉‹self_subst› <: ty‹ty_subst›` |
+| Lower | `ty‹ty_subst› <: 𝑉‹self_subst›` |
+
+Ordinary edges use identity substitutions. `constrain_go` carries both substitutions while
+decomposing types. A function-domain comparison swaps sides; it does not invert a discharge.
+The codomain comparison aligns binder names with `Subst::aligned` when required. Variable arms
+record the resulting relation in its native direction. Pre-inverting a discharge would lose the
+argument replacement, including when a concrete function reaches an earlier opaque application.
+
+When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
+
+1. Identical views need no bridge.
+2. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
+   renames at this site. This is an existing restricted transport assumption, not general
+   invertibility of discharge.
+3. If either view is invertible, compose its inverse forward with the other view.
+4. Otherwise, split rename and discharge parts. Equal discharge parts, compared modulo term type
+   slots, permit a bridge through an invertible rename part.
+5. Whole views equal modulo type slots also need no bridge.
+6. Distinct non-invertible views not covered by these cases panic.
+
+The licensed view is required by existing extrusion and per-occurrence dependent uses.
+Removing it without another representation reactivates those failures. Its source contract is
+limited to the current monomorphic treatment of the indexed family; first-class polymorphic
+dependent uses require a separate design. No rule here silently discards an unbridgeable discharge.
+
+`ConstrainCache` records the side-substitution pairs seen for each `(lhs, rhs)` type pair.
+Two applications such as `g(0)` and `g(1)` must not collapse solely because the underlying variable
+pair is equal. This cache breaks repeated edge processing; its existence alone is not a general
+termination proof for arbitrary substitution-bearing graphs.
+
+Rendering a bound is different from transporting an edge. `Bound::render_subst` combines the
+content substitution with the inverse of the holder substitution. If the latter is not invertible,
+it preserves the invertible rename part and leaves the discharge part unapplied: the content is
+already in the post-discharge context. A non-injective rename part can also fall back to identity.
+Debug checks require every untransported binder to be absent from the content.
+Dropping the whole mixed substitution would also drop useful renames.
+
+`compact_go` accumulates these rendering substitutions while following bounds and forces the
+composite at refinement leaves. `RefinementScope` then closes references against the functions
+enclosing that position. Identity transport preserves an unchanged predicate.
+
+### Dependent application and reconstruction
+
+`InferCtx::apply` creates a fresh expected binder with `Name::solver_arg`, a domain variable, and
+a result variable. It emits the one-way function-shape and argument constraints described under
+[Apply is one-way](#apply-is-one-way). A further fresh variable receives the result as a lower
+bound under the discharge mapping from the expected binder to the argument.
+
+The discharge stays suspended while the result's refinements are in the bound graph. Coalescing
+forces it after the function correspondence has reached the result. The expected binder is fresh
+even when the function type is already known; reusing the definition's binder would conflate the
+application's temporary correspondence with that binder's existing scope.
+
+`CheckCtx::apply` reads the function through `Type::read_view` for all three operations: shape,
+argument constraint, and result discharge. For a dependent recorded function, `discharge_codomain`
+opens indexed references at the argument and handles any remaining name-spelled references.
+Checking reconstructs this result instead of starting another inference pass.
+
+A lambda whose parameter occurs in the body's type but not its value can eliminate to the
+Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty`. `lambda_elim` distinguishes value freedom
+with `is_free_in_value`; a dependency in a refinement still requires the Pi binder. The same
+situation can arise after pairing and currying introduce a parameter for a point-free body.
 
 ### Scoped inference variables: a stored bound closes against a telescope
 
-A refinement predicate may reference an enclosing binder, and the bound carrying that refinement
-travels away from the binder during inference. Group-by's lowering does that: it puts the dependent
-refinement in a cast target while the function binding `__gb_k` is minted separately, so the
-refinement lands on a variable whose position has no enclosing function. Nothing checked it there —
-`check_scope_valid` runs on coalesced node types once inference ends, never on bounds — and the
-sites that decide identity compare stored types structurally, which is α-sensitive.
+An inference variable carries the term-binder telescope at its creation. A bound can refer to
+those names or to binders discharged by its edge substitutions. Separately, references bound by
+functions inside a stored type use Pi indices. These mechanisms let the solver check scope at
+record time and compare closed types without depending on their binder spellings.
 
-Two mechanisms answer that. Each inference variable carries the scope it was created in, and a bound
-recorded on it that references anything else is a record-time internal error. References a bound's
-own functions introduce are stored as de Bruijn indices assigned when the function is constructed,
-so two α-variant closed types are structurally identical at every site that decides identity:
-refinement-set dedup, `CompactType::merge`, the constraint cache, and `SpecKey`.
+A group-by annotation can place its refinement on a variable outside the function node that
+visually contains the key binder. The variable's telescope, not that node's shape, determines
+whether the free key reference is permitted. A later whole-tree scope check cannot replace this
+record-time obligation.
 
 #### The invariant
 
-Every inference variable records the **telescope** of binders in lexical scope at its creation: Pi
-binders and `let` binders, interleaved in scope order. Emission already holds this context at every
-`fresh()` — `InferCtx::scopes` tracks in-scope bindings for `Var` typing — and discards it.
+`bound_scope_gaps` requires every free term name in a bound's type to occur in the holder's
+telescope or in the domain of either edge substitution. `enforce_bound_scope` panics on a gap
+in every build, naming the holder, bound side, and escaping reference. It is an internal invariant
+failure, not a recoverable user diagnostic.
 
-A bound recorded on a variable **closes against the holder's telescope**: every free term variable
-of the bound's type is in the telescope or in the edge's substitution domain. The check runs when
-the bound is recorded, and it is a lookup, since uniquify gives every binding site one uid. A
-violation names the variable and the reference and fails. Every build enforces it: a release
-compile rejects what a debug compile rejects.
+`InferCtx::fresh` passes the current telescope to `InferVar::fresh_in`. Emission extends that
+telescope for term binders, and normalization extends it when descending dependent annotations.
+The scope invariant also applies to bounds recorded during specialization and post-pass derivation.
 
-An opaque binder is in every telescope of the walk, whatever the lexical position. It carries no
-definiens, so a type lifted past it keeps the name and the name outlives its scope ([`let` binders
-and scope exit](#let-binders-and-scope-exit)). The telescope therefore holds an opaque set shared by
-every variable the walk mints, and entering the binder adds to it, reaching the variables minted
-before it as well. That is what admits a write to a mutable variable declared outside the binder:
-`x := 0` mints the value variable under an empty telescope, and `x := x ^+ 1` contributes
-`{Int | __elem == __read ^+ 1}` over the read binder minted inside
-(`src/ccl/design/mutability.md`, "A read is named while inference runs"). The end-of-inference check
-states the same rule tree-wide, seeding its root scope with every opaque binder the tree holds
-(`check_scope_valid`).
+Each telescope also shares a growing set of opaque binders with the other telescopes from its
+root. `enter_opaque` adds a name to that set, including for variables created before entry.
+This permits a mutable variable declared outside a read binder to receive a refinement naming
+that read: `x := x ^+ 1` contributes `__elem == __read ^+ 1` to the variable created for `x`.
+A transparent let is discharged instead; a `for` target has no such exemption.
 
-TODO: Opaque binders are exempt from the invariant check at record time, and so escapes of opaque binders currently surface later.
+`check_scope_valid` likewise seeds its root with every opaque binder present in the tree.
+Neither check establishes lexical containment for those names. TODO: enforce opaque-binder
+escape restrictions at record time instead of relying on later consumers to expose invalid uses.
+The read-binder contract is described under
+[A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs).
 
-A binder carrying a definiens stays out of that set, its reference being discharged rather than
-carried. A `for` target carries neither, so a contribution naming one still fails the check.
+`ConstrainCache::for_derivation` distinguishes `LiveSolve` from `PostPass` for the codomain-opening
+policy. It does not disable the bound-scope check. A transformed tree must still provide the
+binders required by the types its rules reconstruct.
 
-Enforcement covers every derivation: the live solve, meaning emission and its specialization pins,
-and the pass-boundary re-derivations that check what a pass produced. A re-derivation walks a tree
-where a pass has erased term binders, and the refinements it meets still name them. The dependent
-function's type binds them there, and the chain walk enters its Pi binder (see [Where the
-conversions run](#where-the-conversions-run)). The tree holds every binder its refinements
-reference; a reference to one it does not hold is a bound that left its binder's scope.
+Registered sources use `TypedExprNode::Source`, not a free `Var` reference. The source registry
+types them, while ordinary variables resolve through lexical scope. Source names therefore need
+no exemption in the term-name telescope check.
 
-`ConstrainCache::for_derivation` names the two cases, and the `Fun`/`Fun` codomain edge reads the
-same value (see [Where the conversions run](#where-the-conversions-run)).
-
-A program source needs no standing in the telescope, because the check never sees a reference to
-one. A source is referenced by a `TypedExprNode::Source` node rather than by a variable: lowering
-emits that node for every source reference, `emit_node`'s `Source` arm types it from the source
-registry, and the `Var` arm resolves against the scope stack alone and rejects any name not in it. A
-source name therefore never reaches `subst::type_free_vars`, so every gap the check finds is a
-reference some pass failed to rewrite.
+The later `check_scope_valid` is a separate debug check over coalesced expression types.
+It reports `ScopeViolation` for an escaping term reference. Passing the record-time check does
+not prove every later rewrite preserves lexical scope, so neither check is redundant.
 
 #### A binder reference is stored in one of two forms
 
-The form says whether the type itself binds the reference. The scheme is the standard locally
-nameless one: a free reference is a name, a bound one an index.
+The representation is locally nameless:
 
-- **A reference to a telescope entry is a name.** A uniquified name identifies its telescope entry
-  exactly, so the record-time check is a lookup, and the same name denotes the same binder at every
-  holder that may legally hold the bound. A bound crossing a variable-to-variable edge therefore
-  keeps its references as they stand, and the reader re-runs the closure check against its own
-  telescope. The discharge machinery keeps addressing binders by name, unchanged.
-- **A reference to one of the type's own functions is a de Bruijn index, assigned at abstraction.**
-  Constructing a function over a body closes the body: a free reference to the function's binder
-  becomes an index counting outward. The type constructors own the conversion, so a function they
-  build cannot carry a free name for its own binder, and a closed function is α-canonical. That is
-  what the merge, the caches, and `SpecKey` compare on.
+- A reference to a surrounding telescope entry is a free, uniquified `Name`. Each variable
+  receiving a bound checks that name against its own telescope or the edge's discharge domains.
+- A reference bound by a function inside the type is `Name::PiBound(PiRef)`. Its index counts
+  enclosing function-codomain crossings to that function. Function domains do not enter their
+  own term binder's scope.
 
-The split follows from where identity runs. An identity site sees a refinement without its enclosing
-functions — `merge_refinements` compares refinement sets sitting beside `CompactFun`'s `name` slot,
-one function below it — so a reference must say which of the two kinds it is, on its own. A name is
-ambiguous between them; an index is the second kind and names the function by counting. The
-telescope supplies context for the first kind and cannot for the second, whose binders are not in
-it.
+Names identify the captured environment. Indices identify binders carried inside the compared
+type, so alpha-renaming those binders does not change the stored references. Refinement equality,
+compaction, and keys can compare a predicate without recovering a discarded outer name pairing.
 
-Structural equality then needs no context: names are globally unique, indices are anchored to
-functions that travel with the type, and neither needs re-basing anywhere. The constraint cache's
-`(Type, Type)` key is unaffected.
-
-`Type::Fun`'s `name` slot therefore carries no identity: a refinement's binding is its index, so the
-slot never participates in an identity comparison. It is the opening address that descent and
-application open the function at, so coalesce keeps it exactly on the functions whose codomains
-reference it (`subst::codomain_depends_on`) and strips it elsewhere.
+The function's `name` slot supplies the address used when opening its codomain and a display
+spelling, not the identity of its closed references. `codomain_depends_on` determines whether
+materialization keeps that slot. Indices count named and unnamed function crossings alike;
+removing spelling metadata must not change what they count.
 
 #### Interior term binders stay named, and compare by position
 
-A refinement's predicate may contain a term lambda — `λ x → x // 2` in the group-by case — and its
-parameter stays a name. That binder sits inside the refinement rather than outside it, so the
-compared terms carry it and the correspondence is local: `eq_term_modulo_ty_slots` threads a
-pairing and compares a reference to it by its binder's position, and `hash_term_modulo_ty_slots`
-hashes it by position so
-the `Eq`/`Hash` contract survives. The name stays the stored form, so the predicate is still a term
-planning can compile.
+A lambda inside a refinement predicate remains a term lambda with a named parameter.
+`eq_term_modulo_ty_slots` pairs these interior binders while comparing their terms;
+`hash_term_modulo_ty_slots` uses the corresponding binder positions. Independently named
+interior lambdas can therefore compare equal without changing their stored syntax.
 
-Closing treats such a parameter as a shadow: inside the lambda, a reference spelled like the
-enclosing function's binder is the lambda's and keeps its name. Uniquification already keeps the two
-spellings apart in a compiled program, so the shadow makes closing correct without depending on that
-convention, as the `Fun`/`Fun` opening gate does not depend on it either.
+Pi closing treats an interior binder as a shadow. A reference to that binder must not become
+an index for a same-spelled enclosing function. The closing walk handles this explicitly,
+even though uniquification normally gives the two binders different identities.
 
-Positions and indices are both needed. Every refinement a program produces routes its element
-through a function, so it carries an interior lambda, and a filter written twice mints that binder
-twice (`λ x#3 → x#3 > 1` against `λ x#6 → x#6 > 1`). Comparing it by name splits a refinement set
-that should dedup, and a `Data` domain admits no join across the split: with indices alone,
-`if c: [x for x in xs if x > 1] else: [x for x in xs if x > 1]` is rejected
-(`tests/type_check.rs`, `test_case_with_filtered_comprehension_arms_passes_consistency_wall`).
+Interior alpha-equivalence and exterior Pi indices solve different problems. Two authored
+filtered comprehensions can have alpha-equivalent predicate lambdas with different parameter
+uids. Name-only comparison would split their refinements and cause an invariant data-domain
+mismatch. `test_case_with_filtered_comprehension_arms_passes_consistency_wall` exercises that case.
 
 #### `let` binders and scope exit
 
-A `let` telescope entry carries its definiens. A refinement may reference it while in scope, which a
-user-written refinement type needs (`{Int | __elem > n}` with `n` let-bound). Lifting a type past
-the binding discharges the reference to the definiens. No re-addressing is needed: a uniquified name
-is its telescope entry's address, so the name-keyed discharge already speaks in entries. A Pi entry
-has no definiens, and lifting past one abstracts instead of discharging.
+When a result type leaves a transparent let binder's scope, references to the binder are replaced
+with its definition, subject to the mutable-definition exceptions below. A Pi binder has no
+defining value to substitute; leaving that binder instead
+abstracts the result into a function type.
 
-An opaque entry (`x ^= e`) has no definiens either, and lifting past one does neither: the name
-stays in the lifted type, and what it means there is the type the binder was bound at, recorded when
-the binder is entered (`InferCtx::opaque_binders`) and read by every later refinement query. Entry
-rather than exit, because a bound naming the binder is recorded inside its scope.
+An opaque entry (`x ^= e`) is not discharged: its name remains in the lifted type.
+`scoped_let` records its bound type in `opaque_binders` on entry, so refinement queries can
+recover that fact after lexical scope exit. `close_let_type` returns the body type unchanged
+for this case in both emission and checking.
 
-Emission records the lift, and cannot perform it: the body's type is an inference variable there,
-whose refinements sit in its bounds rather than in the type. `InferCtx::close_let_type` mints the
-`let` node's type outside the binder and records the body's type on its lower edge under `[𝑥 ↦ 𝑣]`,
-a suspended discharge read as an application. Every bound naming `𝑥` then crosses an edge that
-discharges the name, and β fires at coalesce. Returning the body's variable verbatim instead lets a
-refinement over `𝑥` reach the enclosing lambda's codomain, which is minted outside the binder and
-so trips the record-time closure check at the first call site that reads the codomain.
+For a transparent value binding, `InferCtx::close_let_type` runs after restoring the enclosing
+telescope. It creates the let
+node's result variable there and adds the body's type as a lower bound with the discharge
+`[𝑥 ↦ definition]`. A direct substitution into the body's variable would miss refinements
+stored on its bounds. Returning that variable unchanged would expose its local name outside
+the binder without a mediating edge.
+
+The implementation leaves the body type unchanged for `MutDecl` and `MutWrite` definitions.
+They do not denote the immutable value required by this substitution: a mutable history is not
+its seed, and a write is not the written value. They are eliminated before consumers of the
+lifted type use that representation.
+
+Coalescing closes the result using the resolved body and definition. Nested lets close from
+inside outward. If lambda elimination rewrites a definition quoted by the result type, its let
+rebuild must discharge the rewritten definition again. The post-pass check likewise reconstructs
+from the tree it receives, not from a pre-transformation quoted term.
 
 #### A lambda's codomain drops the body's opaque binders
 
@@ -1739,324 +1799,206 @@ from its call sites alone; a conflict with `𝑇` surfaces when those bounds rea
 
 #### Discharge is application
 
-A `Bound { self_subst, ty, ty_subst }` whose substitution discharges a binder is a closed function
-applied at an argument — `(λ𝑥. ty) arg`, written as a type with a free variable plus a map that
-promises to remove it. The substitution's domain binders therefore count as the type's own in the
-record-time check, and β fires at coalesce against the telescope.
+A discharge-bearing bound represents applying a type family to a term argument. Its substitution
+domain accounts for names permitted in the stored type before that application is forced.
+`Subst::invert` does not invert a discharge; it accepts only injective rename mappings.
 
-Two mechanisms transported the name form rather than the index, and they retire with it: the
-`Fun`/`Fun` `extended_rename` and `Subst::licensed_correspondence_view`. Disabling the licensed view
-trips `bridge_holder_gap`'s tripwire on extrusion across levels under a generalized `let` and on
-per-occurrence group-by keys through a polymorphic definition, so the index does not subsume them.
+Pi indices do not eliminate every name-based transport operation. Live bounds still name
+telescope entries, and the closure bridge still uses `Subst::aligned` and the restricted
+`licensed_correspondence_view` where appropriate. The cases and failure mode are specified under
+[Native bound edges and closure](#native-bound-edges-and-closure).
 
 #### Where the conversions run
 
-A type is **closed** — references to its own functions stored as indices — from construction on, and
-a bound recorded mid-solve is **open**, with references to telescope entries stored as names. An
-index counts the functions crossed from their codomain side between the reference and its binder,
-named and unnamed alike, so it survives `Type::without_pi_names`. Closing and opening are one walk
-each over the mixed type/term structure (`subst`'s `PiWalk`), reached through `close_pi_binder` and
-`open_pi_binder` at construction, descent and application, and through `RefinementScope` in the
-compact and key walks. Those are the four kinds of site.
+`PiWalk` implements closing and opening across mixed type and predicate-term structure.
+`close_pi_binder` closes occurrences of one named binder. `open_pi_binder` replaces references
+to the enclosing function with a `Mapping`, leaving references bound inside the codomain intact.
 
-**Construction closes.** The type constructors — `Type::pi`, `Type::pi_kinded`,
-`Type::pi_eliminated`, `Type::fun_like` — abstract the codomain they are given, and so does every
-rebuild that assembles a dependent function around a codomain it computed from node types
-(`emit_cast`, `emit_compose`). A codomain that is a bare variable has nothing to close; emission's
-`pi(x, D, ?c)` is that case, and the refinements that later accumulate on `?c` reference `x` by name
-against their telescopes. A rebuild that carries a `FunKind` takes `Type::pi_kinded` rather than a
-`Fun` literal: the group-by partition function (`planning::groupby`'s `emit_groupby`) and the
-eliminated group-by lambda's Pi (`lambda_elim`) are dependent collections, and reaching for the
-literal to set `kind` leaves a free binder name in a stored type.
+**Construction closes.** `Type::pi`, `pi_kinded`, `pi_eliminated`, and `fun_like` close the
+codomain they construct. Rebuilds such as `emit_cast` and `emit_compose` also close dependent
+results. A codomain carried from another function must first be aligned with its new binder;
+`complete_annotation` does this before filling an annotation from an initializer.
 
-Two sites assemble a `Fun { name: Some(_), .. }` and close nothing, one on each side of the
-construction boundary. `emit_lambda`'s codomain is the live in-solve type, which stays name-spelled:
-its refinements accumulate behind an inference variable, and the compact and key walks are what
-close them, so closing the reachable ones here would put an index-spelled refinement and a
-name-spelled one at a single position — what closing in those walks exists to prevent.
-`coalesce_compact_go`'s refinements arrive already closed, and the `CompactType` it assembles from
-mirrors `Fun`s one-to-one, so a closed index counts to the function being built; closing is the
-identity there, and the `Fun` literal says so.
+Two direct function constructions have different inputs. `emit_lambda` keeps the live in-solve
+codomain in named form; some of its refinements can still be hidden behind variables.
+`coalesce_compact_go` assembles a function from refinements already closed by compaction.
+Closing indiscriminately at the former site could mix indexed and named versions at one position.
 
-**Closing reaches only references spelled as the binder it closes over**, so a codomain carried
-from one function into another is aligned before it is closed. Two functions related at a position
-have one binder under two names, and `Subst::aligned` is that alignment. Both sites that carry a
-codomain across take it: `constrain_go` draws the codomain edge under it, and `complete_annotation`
-fills an exact annotation's codomain from its initializer's. A fill that skipped it would leave the
-initializer's name free in a stored type, which no construction-time close can repair, because the
-name it closes over is the annotation's.
+**Compaction and keying close their reads.** `compact_go` and `key_go` force bound substitutions
+and close each predicate under the enclosing `RefinementScope`. Deduplication happens while
+contributions merge, before a final function is assembled, so waiting until materialization is
+too late. `coalesce_type_predicates` closes rebuilt predicates again: resolving their interior
+type slots can expose named references from the live graph after the enclosing type was closed.
 
-**A refinement closes against the enclosing functions of the walk carrying it.** `compact_go` and
-the `SpecKey` walk both do so in the same two arms that force the edge substitutions into it
-(`force_refinement`), and `coalesce_type_predicates` does so again on what it rebuilds. That third
-site is a re-entry: a predicate's sub-expression type slots hold inference variables `compact_go`
-steps over, and resolving them afterwards reads name-spelled references out of the live graph and
-puts them back into a type the walk already closed. Nothing earlier can: `CompactType::merge` dedups refinements while bounds
-fold, before any function is assembled, so a closed cast and a live emitted function meeting at one
-variable would otherwise put an index-spelled refinement and a name-spelled one at a single
-position. `subst::RefinementScope` is the state both walks thread — the enclosing-binder stack and
-the closing memo in one type, so the two cannot disagree about what a refinement closes against.
+**Descent opens.** The function constraint arm opens a closed codomain at its binder's name
+when the reader needs named references. During `LiveSolve`, it does so toward a side whose
+codomain contains inference variables; concrete closed pairs can compare index-to-index.
+`PostPass` derivation opens dependent codomains unconditionally because different passes may
+have produced different stored forms. Unconditionally opening concrete pairs during live solving
+could capture an unrelated free name matching a display spelling.
 
-**Descent opens.** Walking under a binder converts that binder's indices back to a name. The `Fun`/
-`Fun` codomain edge opens each side at its own binder name and carries the correspondence as a
-discharge at a variable (`[k ↦ x]`, read as an application), so a bound recorded on an inner
-variable references the binder by name and closes against that variable's telescope.
-Which derivation is running decides whether that edge opens at all. The live solve opens only toward
-a side carrying inference variables, since a dangling index can only land on a bound and only a live
-side records one. A re-derivation opens unconditionally, because it reconciles two passes'
-spellings of one type.
+`open_codomain` is the rebuild entry point used by composition adjacency, lambda elimination's
+application transformer, and the group-by recognizer. The recognizer needs a free key reference
+to match its equality predicate. A missing name on a function whose codomain references it
+is debug-asserted rather than treated as a valid anonymous dependency.
 
-`normalize_annotation` extends the emission telescope with each Pi binder it descends past, so the
-variables it mints inside a dependent annotation carry the binder in scope; this closes the group-by
-case, whose refinements land on variables whose telescopes never saw `__gb_k`.
-`subst::open_codomain` is the same conversion at a rebuild, where a pass holds a morphism and the
-codomain it just read off it. Three passes call it:
+Scope entry accompanies opening. `emit_compose`'s recursive chain walk enters preceding dependent
+function binders before checking following morphisms. `normalize_annotation` extends the telescope
+for a named function's codomain. Variables minted under either traversal must admit the names the
+opened refinements contain.
 
-- `emit_compose`, before the adjacency `prev_cod <: next_dom`, because the next morphism's domain
-  names the binder the chain composes under;
-- `lambda_elim`'s application rule, for the `apply` transformer's domain, which sits under the pair
-  morphism's binder;
-- the group-by recognizer, on the function it matches, because it identifies the key binder as the
-  free `Var` on one side of the predicate's equality.
-
-Opening at a name puts a free reference into the type being compared, so the walk descends into the
-binder's scope as well. A chain is typed morphism by morphism inside the dependent functions before
-it (`emit_compose`'s `compose_chain`), so the variables those steps mint close against the binder
-their refinements name: a dependent function and the transformers consuming it are siblings in the
-term and nested in scope.
-
-**Application opens at the argument.** Applying a closed function — the dependent-application
-discharge, β at coalesce — replaces the binder's indices with the argument term. Opening at a name
-and opening at an argument are one operation with a different replacement. The post-inference
-check's `apply` rule is this site's second caller: it re-derives an application's type from the
-closed function the tree records, so it opens the codomain at the argument before comparing against
-the stored, already-discharged type.
-
-Each identity site therefore compares like with like: whether a type is closed follows from which
-side of the construction boundary it sits on, not from when it arrives.
+**Application opens at the argument.** Replacing Pi indices with an argument term uses the same
+opening walk as replacing them with a name. `discharge_codomain` supplies this operation to
+post-inference application checking. It is not an index-rebasing pass over an arbitrary type.
 
 #### Display opens what it descended through
 
-An index is a stored form, not a read form. `Display for Type` threads the functions it descends
-through and prints a reference to one of them as that function's binder name, so a dependent type
-reads with the spellings it had before indices existed:
+Type display tracks the enclosing function binders and renders Pi references with those names.
+For example, a grouped collection can display as:
 
-    ((__gb_k: Int) ⤇ ({[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ x : Int → x) == __gb_k} ⤇ Int))
+```text
+(k: Int) ⤇ ({[0, 2] | __elem ▷ xs ▷ key == k} ⤇ Int)
+```
 
-A display that does not hold the function reads the spelling off the reference instead. A
-`Name::PiBound` carries a `PiRef`: the index, plus the binder's spelling where the closing happened.
-Identity reads the index alone, so the spelling decides nothing and two equal references may print
-differently.
+`PiRef` also carries a spelling hint for a reference displayed without its enclosing function,
+as in a domain fragment reported by an error. Equality, ordering, and hashing use only the index.
+Two equal references can have different hints and therefore print differently when detached.
 
-A diagnostic is the display that does not hold the function. It blames a fragment rather than a
-whole type — `coalesce_compact_go`'s domain-join conflict reports the domains of the function it is
-half-way through assembling, and the function binding their references is further out in the walk,
-so there is nothing to descend through. Without the spelling on the reference, that domain reads
-`{[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ x : Int → x) == #0}`.
-
-The stored form never converts back. Construction closes at every phase — planning builds functions
-through `Type::pi_kinded` — so a one-shot conversion after inference would be undone by the next
-rebuild.
+Display does not rewrite the stored type into named form. Later passes still construct closed
+functions through the same APIs; closing is not a one-time post-inference conversion.
 
 #### Freshening and `SpecKey`
 
-The keyed-map type a group-by lowers is the exercising case. A generalized definition holding one,
-stored at level `L` with its refinements closed (`#n` is an index):
+In a type shaped as `(k: ?K) ⤇ ((i: {?D | __elem ▷ f == #0}) ⤇ ?V)`, the `#0` in the
+inner domain refers to `k`: the inner binder is not in scope in its own domain.
+The same outer reference inside the inner codomain would have index 1.
 
-    (k: ?K) |=> ((i: {?D | __elem |> f == #0}) |=> ?V)
+Freshening preserves these indices and function names while copying eligible inference variables.
+`freshen_refinement_predicate` freshens predicate type slots without renaming its term structure.
+Captured outer names remain names and continue to reference the definition's environment.
+This does not guarantee predicate allocation sharing; the
+[generic-instantiation exception](#one-known-exception-scoped-and-unfixed-generic-instantiation)
+remains.
 
-`#0` is the reference to `k`. The predicate sits in the inner function's domain, where only the
-outer binder is in scope, because a binder scopes over its codomain and not its domain; the same
-reference from the inner codomain would be `#1`.
+`SpecKey` closes references under the functions it walks and retains names outside that scope.
+Alpha-variant closed binders therefore need not split otherwise equal keys, while distinct captured
+binders can. Discharges are forced before predicates enter the key, so different arguments can
+remain distinguishable. These are contributions to the full
+[specialization key](#keying-a-specialization), not sufficient conditions for clone reuse alone.
 
-Freshening copies indices verbatim, and that is the whole interaction. `freshen_above` copies a
-`Fun`'s `name` slot structurally, and `freshen_refinement_predicate` rewrites only a predicate's
-type slots (through `freshen_expr_type_slots`), leaving term structure including `#0` untouched. An
-index is anchored to a function inside the same type being copied, so the copy cannot dangle. Free
-names in a predicate — the definition's captured environment, level ≤ `L` — copy verbatim and stay
-correct, because every use of the definition sits lexically inside those binders' scope and all
-clones share the one captured binder.
+Specialization pins the fresh clone to the use's live instantiation, not merely its preliminary
+materialized type. Closed function sides can open into the clone's named telescope context as
+the relation reaches its variables. Indices themselves are copied unchanged until a binder
+crossing opens them at a name or an application opens them at an argument.
 
-`SpecKey` compares the closed spelling across uses. Two uses whose lowered annotations are
-α-variant, such as two textually identical group-bys each minting its own binder uids, spell
-identically once closed, so their keys agree and the memo shares the specialization. A refinement
-referencing a binder outside the walked type keeps its uniquified name in the key, so two uses under
-distinct enclosing binders key apart. One function discharged at two arguments keys apart on the
-σ-forced predicates, since `key_go` forces each edge's substitution into a refinement before it
-lands in the key.
+### Predicate compilation after lambda elimination
 
-The pin re-bases by opening, not by rewriting indices. `specialize_use` pins a clone to the use's
-resolved type: the resolved side is closed, and the clone's emitted functions are live (`pi(x, D,
-?c)` with refinements behind variables). The pin's `Fun`/`Fun` edges open the closed side at the
-clone's binder names as bounds cross, after which every bound landing on a clone variable is
-name-spelled against that variable's telescope. No index is re-based: an index converts to a name at
-a binder crossing or to a term at an application, and otherwise travels untouched.
+Type-borne predicates remain in bare pointful form while the enclosing term undergoes lambda
+elimination. Planning's group-by and join recognizers consume that form before it is lost to
+generic predicate compilation. A compiler pass must not compile those predicates early merely
+because they are expression trees.
+
+Planning compiles predicates at iteration sites and then calls `compile_refinement_predicates`
+across the remaining tree. The whole-tree pass also reaches consumer contracts outside those
+sites, which must compare structurally with their producers after planning.
+`fn_of_bare_predicate` uses the lambda-elimination/simplification path for the predicate function.
+Compilation uses `PredMemo<Type>`: both original predicate allocation and base context matter.
+
+Nested refinements inside predicate type slots are compiled recursively. The pass asserts in all
+builds that a freshly minted pairing binder does not survive in a compiled predicate's term.
+A binder occurring only in a type slot has a different role and is excluded from that term check.
+
+Single-key grouping lookups and nested filtered-source groupings exercise this ordering.
+The pipeline sequence is specified under [Planning](optimization.md#planning-cclplanning);
+recognizer ordering and the whole-tree contract pass must remain consistent with it.
 
 ## 4.6 Data vs compute functions
 
-A function either represents a collection or is a capability that can be called.
-`Type::Fun` stores which as a `FunKind`, either `Data` or `Compute`.
+`FunKind` distinguishes a data function, which represents a collection, from a compute function,
+which can be called. It also permits an unresolved kind variable that constraints can pin.
+Concrete `Data` and `Compute` kinds are not interchangeable through subtyping.
 
-Lowering chooses the kind from the CHL construct. List literals, comprehensions,
-`groupby`, `++`, and registered sources are `Data`; a `lambda` and a `def` are
-`Compute`, a generator `def` included — it is a capability whose *result* is a
-collection. Where lowering does not yet know the domain and codomain, it states the
-kind as a `data_fun` annotation and inference reads that as the stamp. A function
-parameter is the one thing lowering cannot decide, having no construct to read: it
-gets a kind variable, which the argument pins.
+Lowering supplies kinds from constructs. Lists, comprehensions, groupings, and collection union
+are data functions. A lambda or `def` is a compute function, including a generator definition
+whose result is a collection. A function-valued parameter can carry a kind variable until its
+argument determines the kind. Inference must preserve those declarations rather than infer kind
+solely from the domain's shape or a later consumer's intent.
 
-Compute functions follow the usual contravariance on the domain. Data functions are
-invariant, because the domain is the exact set of elements the collection holds, so
-changing it changes the data. Neither kind converts to the other; they are unrelated
-by subtyping.
+Rebuilds use `Type::fun_like` to retain the exemplar's kind while changing its domain or codomain.
+`wrap_with_iterate` requires an iteration site already to be data; it does not turn a capability
+into a collection. A lost kind is a typing/rebuild error, not an instruction to stamp `Data` later.
 
-Downstream phases including inlining and planning dispatch on the distinction, so
-every pass carries a function's kind rather than rebuilding one. `Type::fun_like` is
-the rebuild that does: it copies the exemplar's kind, so rewriting only a domain or a
-codomain cannot turn a collection into a capability.
-
-A `FunKind` answers two questions — whether the domain is data, and, for a sum, which index
-the function binds — and only the first travels between types. A cast is where that shows: it
-re-views its value at its target, so its node type takes the target's data-vs-capability
-answer (`ccl_utils::canonical_cast_ty`) while keeping its own binders. The slot does not
-travel, because the index is named at each type's own domain position, so a second type
-states it in binders of its own and copying the slot leaves a function binding a name its own
-domain does not say.
-
-A kind is never re-derived from a domain's shape, and never from what a consumer will do with
-the function. `wrap_with_iterate` asserts that an iteration site is already a collection
-rather than making one; a site that reaches it as a capability is a pass that lost the kind,
-which is the defect worth reporting.
+A data kind can also carry witness binders for a dependent sum. The data/compute decision and
+the binder slot have different transfer rules. A cast adopts its target's kind decision while
+preserving the value's own binders, as implemented by `canonical_cast_ty`. Copying another type's
+slot could bind a witness that the new type's domain never names; see
+[The index is named at the domain position](#the-index-is-named-at-the-domain-position).
 
 ### A refinement predicate is a data function
 
-A refinement's predicate over a collection yields one `Bool` per element, so its function
-form is a collection: `Σ (σ : 𝐾). σ ⤇ Bool` where the domain is a witness. Planning compiles
-it under the binders its domain is written under
-(`planning::predicates::fn_of_bare_predicate`), and the runtime agrees — `Restrict` evaluates
-the predicate over the extent.
+The function form of a collection predicate yields one boolean per domain element.
+`fn_of_bare_predicate` constructs a data function; when its domain is a bound witness, the function
+carries the corresponding sum binders. Its bare stored form remains `__elem ▷ predicate_function`.
+`Restrict` evaluates the function over the collection's extent.
 
-Typing it as a capability has nowhere to put the binder. `FunKind::Compute` carries no slot,
-so a predicate over a conditional source names a witness its own type does not bind, and
-every comparison it reaches needs that binder supplied from outside. Saying it here is what
-lets the post-inference check reconcile a node in the empty witness context.
+`FunKind::Compute` has no witness-binder slot. Stamping that kind on a predicate whose domain names
+a bound witness would leave its function type relying on an external witness context. The data
+representation carries the binders needed to check the predicate at its own boundary.
 
 ### Generalizing a collection is filter pushdown
 
-`should_generalize` requires a **capability**: a `Lambda` whose kind is not `Data`. The node test
-alone does not get there, because `groupby` lowers to a `Lambda` and its type where that predicate
-runs is still `(__gb_k: ?𝑘) ⤇ ((__gb_i: {?𝑖 | __elem ▷ xs ▷ key == __gb_k}) ⤇ ?𝑣)` — variables
-deeper than the binding level, so the level test admits it. Only the kind catches the one
-collection written as a function.
+`should_generalize` excludes data functions even when their expression node is a lambda and their
+type has variables above the binding level. A grouping is such a case: its lowering uses lambdas,
+but the result represents shared collection data. The full eligibility rule is specified under
+[Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation).
 
-Note *what* that domain refinement is: the dependent group-key predicate of
-[Dependent refinements via Pi types](#45-dependent-refinements-via-pi-types). Lookups at different
-keys pin `__gb_k` differently, and a `SpecKey`'s negative read follows exactly that
-`arg <: domain` edge — so specializing a grouping per use means **one copy of the source filtered
-to each reader's key**, which is filter pushdown. That wins when the predicates are selective and
-loses when readers are many and overlapping: `sum(g(1)) + sum(g(2)) + sum(g(3))` rebuilds the whole
-partition three times where one `Memo` serves all three. The choice is selectivity against reader
-count, and inference cannot make it — it runs before planning knows an extent, so the blanket
-refusal is the bounded-worst-case side until there is a cost model to consult. The same decision
-waits on the term side, where the inlining pass preserves
-[collection sharing](optimization.md#collection-sharing).
+Specializing a grouping at each key lookup could copy its source with that key's dependent filter.
+This would change the placement of computation and sharing, rather than merely freshen a callable
+interface. It can help selective uses or repeat work across overlapping uses; inference has no
+cost model to choose between them. The current rule preserves the data binding. Inlining makes
+the related term-level distinction described under
+[Collection sharing](optimization.md#collection-sharing).
 
 ### Data domains are invariant
 
-The `Fun`/`Fun` domain edge is contravariant, which is right for a *compute*
-function: the domain is a parameter, nothing in the language can ask a capability
-which inputs it accepts, and shrinking the accepted set only under-promises. A
-**data** function's domain is invariant instead;
-[The domain join needs `box`](#the-domain-join-needs-box) is the join half of the same
-model.
+A compute function's domain is contravariant: a function accepting more inputs can satisfy a
+consumer requiring fewer. A data function's domain describes the collection's actual elements.
+Implicitly narrowing or widening it would change what the compiled program enumerates.
 
-**One lattice.** Subtyping and joining are the same order, so they cannot disagree.
-Suppose the contravariant edge applied to data functions, making a wider collection
-a subtype of a narrower one — `[0,10] ⤇ 𝑉 <: [0,5] ⤇ 𝑉`, which is `[0,5] <: [0,10]`
-at the domain. Then the least upper bound of the arms of `[1,2] if c else [1,2,3]`
-is `[0,1] ⤇ Int`, and `sum` of it returns `3` even when the else-arm ran, with
-nothing in the type recording that a row was dropped. Under invariance the two
-collections are instead incomparable, so they have no least upper bound at all and the
-conditional is rejected. Boxing each arm supplies one — the Σ over both domains, which
-loses nothing — and that is why the two halves fit together rather than trading off.
+For example, the `Iterate` conversion constructs an iteration source from the predicate's static
+domain. Treating `[0,10] ⤇ 𝑉` as `[0,5] ⤇ 𝑉` would enumerate six indices of an eleven-element
+collection. Record width subtyping does not have this effect: a record consumer reads only the
+fields named by its contract. Collection transformations also reproduce their input domain in
+their output, so the domain cannot be treated solely as a contravariant input parameter.
 
-**Why the stand-in is not free.** The contravariant reading is tempting because it
-looks like record width subtyping, which *is* sound: `{a: Int, b: Int} <: {a: Int}`
-because a consumer of `{a: Int}` can only apply a key it declared, so the extra
-field is unobservable. A data function has consumers that **reflect** its domain
-rather than index into it, and they make the difference observable twice over.
+The same requirement applies at joins. Collections with unequal domains are not silently narrowed
+to a common prefix or given an implicit sum. Programs that combine them need the explicit boxing
+described under [The domain join needs `box`](#the-domain-join-needs-box).
+Accepting arbitrary extents is a polymorphism problem; taking a prefix requires an explicit
+operation. Neither requires a subtype coercion that silently drops rows.
 
-- The declared domain **is the loop bound the program runs**. Op-conversion's
-  `Builtin::Iterate` arm builds its iteration source as
-  `IterateExtent::new(extent_of(𝐷))` from the *static* domain of the iterate
-  marker's predicate. So handing an 11-row collection to a slot declared
-  `[0,5] ⤇ 𝑉` does not forget rows the way the record forgets `b`; it emits a
-  program that reads six of them and reports the result as the collection's.
-- The domain is **reproduced in consumer results**. A comprehension has the shape
-  `𝐷 ⤇ 𝐴 ⇒ 𝐷 ⤇ 𝐵`, so `𝐷` occurs covariantly — in an output — as well as
-  contravariantly at application, and a variable occurring in both positions is
-  invariant. That is the ordinary variance calculus, not a Cambra-specific rule, and
-  it is the whole content of the `Data`/`Compute` split: a compute domain occurs
-  contravariantly only, because nothing enumerates it.
+The function constraint arm first relates kinds. If either resolved kind is data, it uses the
+invariant-domain path:
 
-There is a coherent language in which the wider collection *should* stand in: one
-where a declared domain is a **view**, and narrowing it means "give me this much of
-it". Cambra is not that language — and the reason is *not* that a data domain is
-currently unwritable. It will not stay unwritable:
-[`Array(𝑛, 𝑇)`](../../../docs/chl-spec.md#63-direction-collection-types-decided),
-a data function over `Fin(𝑛)`, is a planned surface type. The reason is that both
-things the view reading would buy are better bought elsewhere, and the surface
-syntax is what makes them cheap:
+1. Draw the ordinary reversed domain edge.
+2. Unless either immediate domain is `Type::Infer`, also draw the forward domain edge.
+3. Preserve `SmtError` as an undecided comparison; wrap other domain failures in
+   `DataDomainMismatch`, retaining their cause.
 
-- **"Works for any length" is quantification, not subsumption.** The function that
-  accepts every extent is `∀𝑛. Array(𝑛, 𝑇) ⇒ …`, an ordinary scheme the solver
-  already freshens per use. Contravariant widening is a poor stand-in for
-  polymorphism: it relates one pair of extents at one site, and charges the row-set
-  guarantee everywhere for it.
-- **A deliberate prefix is a term, not a coercion.** A program that wants the first
-  five rows takes them, and the truncation is then visible where it happens, at an
-  extent chosen by the use site. A subsumption edge hides the same truncation in a
-  declaration, and only ever at the width that declaration happens to name.
+A variable-sided edge records a contribution without equating it immediately with every other
+contribution. Compaction/materialization then checks the domain contributions together and can
+report `DomainJoinConflict`. Depending on which constraints force the comparison, a program can
+fail at the concrete edge or during materialization. The representation of such joins is specified
+under [Materialization](#materialization).
 
-So the rule is stable under a surface data domain. What the syntax changes is that
-the explicit forms invariance requires become *writable*, which argues for the rule
-rather than against it.
+Both directions matter for refinements. One direction rejects dropping a collection's declared
+filter; the other rejects treating an unfiltered collection as though that filter had already
+restricted its data. SMT can establish supported predicate equivalences, but a failed or undecided
+query does not authorize an implicit filter. `a_data_domain_relates_only_to_itself` tests refined
+and unrefined directions, reflexivity, and the compute-function contrast.
 
-**How it is enforced: an equation between types, accumulation at variables.** When
-both kinds are concretely `Data` and both domains are concrete, the `Fun`/`Fun` arm
-constrains the domains in both directions rather than contravariantly. A domain edge
-with a variable on either side records its bound in the edge's native direction and
-asserts no equation — n arm domains reaching one consumer's domain variable satisfy
-the invariant without being equal to each other — and the reverse obligation is
-discharged at materialization, where every contribution to the variable meets in the
-compact domain lattice and two distinct domains are a conflict. Both spellings are
-order-independent: whether a side is a variable is a property of the edge, not of
-when it fires, accumulation commutes, and the lattice decides with every bound in
-hand.
-
-Both directions is also all it takes. `[`Type::UIntRange`]` relating only by equality
-already rejects both base directions, and refinement **drop** (`{𝐷 | 𝑝} ⤇ 𝑉 <:
-𝐷 ⤇ 𝑉`) is already rejected one step less obviously, since behind a contravariant
-domain it demands `𝐷 <: {𝐷 | 𝑝}`. What the reverse edge adds is the case that
-inversion left admitted — refinement **acquisition**, `𝐷 ⤇ 𝑉 <: {𝐷 | 𝑝} ⤇ 𝑉`, an
-unfiltered collection standing where a filtered domain is declared. A failure in
-either direction is reported as `ConstrainError::DataDomainMismatch`, naming the two
-domains; `a_data_domain_relates_only_to_itself` pins all four directions plus the
-reflexive case, and the compute counterpart that still relates contravariantly. The
-exception is a domain comparison that raised a query and got no answer back: an
-`SmtError` decided nothing, so it is reported as itself rather than relabelled into a
-conflict.
-
-**Emitting both directions does not preempt a join.** Two domains meeting at one
-variable is a join like any other, and it has the same answer as anywhere else: none,
-unless the program wrote a `box`. A domain position is not privileged — it does not get
-an implicit sum that a `Case` result would not get. So `[0,1]` and `[0,2]` meeting at a
-domain variable is a `CoalesceError::DomainJoinConflict`, and the same program can be diagnosed from the edge
-or from coalesce depending on whether a consumer forces the question early (see
-[The domain join needs `box`](#the-domain-join-needs-box)).
-
-The rule fires wherever the edge is drawn, the kind edge with it, including the
-post-inference re-check in `check.rs`.
+Post-inference checks use the same constraint relation. Invariance is not confined to emission,
+and the known variable-accumulation cases do not establish general constraint-order independence.
 
 ## 4.7 Dependent sums
 
