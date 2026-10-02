@@ -1,5 +1,5 @@
 //! Loop planning: recognize each phase-emitted point-free `LetRec` and lower
-//! it onto the [`TypedExprNode::Transact`] carrier op-conversion compiles.
+//! it onto the [`TypedExprNode::Transact`] node op-conversion compiles.
 //!
 //! [`plan_loops`] runs after `lambda_elim`, on the point-free normal form the
 //! mutability eliminator ([`crate::ccl::mut_elim`]) emits. It splits each
@@ -26,12 +26,12 @@ use crate::ccl::{
 };
 
 // ---------------------------------------------------------------------------
-// Recognition: point-free LetRec → Transact (the carrier planning stages and
+// Recognition: point-free LetRec → Transact (the node planning stages and
 // op-conversion compiles)
 // ---------------------------------------------------------------------------
 
 /// Lower every phase-emitted `LetRec` — **after `lambda_elim`**, on its
-/// point-free normal form — onto the [`TypedExprNode::Transact`] carrier:
+/// point-free normal form — onto the [`TypedExprNode::Transact`] node:
 /// `let __hist = Transact{…} in <reads off __hist.field>`. An unrecognized
 /// group is a compile-time panic (no silent fallback) — the phases and this
 /// recognizer are co-designed against the point-free normal forms, exercised
@@ -43,7 +43,7 @@ use crate::ccl::{
 /// `channelize` and `lambda_elim`; recognition then splits each binding into
 /// its guard scaffold and its **verbatim, already point-free writer body**
 /// (the decision-factored form the phases emit), so nothing is rebuilt.
-/// Planning stages the carrier's writer sources (its `Transact` arm) and
+/// Planning stages the `Transact`'s writer sources (its `Transact` arm) and
 /// op-conversion picks the engine on the domain, both unchanged.
 ///
 /// Two shapes are recognized, dispatched on the guard: a **transaction**
@@ -57,9 +57,9 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
         // Read before the destructure moves `expr.node` out: a recording needs
         // the id, never the node, so a site that no longer holds its input can
         // still open one. The `LetRec` is what every recognition arm below
-        // replaces — the `Transact` carrier, the `let __hist = …` binding it, and
+        // replaces — the `Transact`, the `let __hist = …` binding it, and
         // the plain `let` chain a channel group flattens to. The group's
-        // bindings that vanish into the carrier are deaths, which the pane
+        // bindings that vanish into the `Transact` are deaths, which the pane
         // difference reports without anyone naming them.
         let letrec_id = expr.node_id();
         let TypedExprNode::LetRec { bindings, body } = expr.node else {
@@ -98,7 +98,7 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
             return flatten_channel_group(bindings, body);
         }
         // `Nature::Machinery` for both recognition arms: a `LetRec` becoming a
-        // `Transact` is a change of carrier, not the expansion of a source
+        // `Transact` is a change of node, not the expansion of a source
         // construct. The loop or `with begin():` block the user wrote was
         // expanded into this `LetRec` by `mut_elim` / `transact_phase`, and
         // those recordings are where the fidelity claim belongs.
@@ -122,7 +122,7 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
         );
         let (h, def) = bindings.into_iter().next().unwrap();
         // The definition is planned inside `recognize_group`, once this writer's own
-        // parameter is normalized. An inner loop's carrier is built against that
+        // parameter is normalized. An inner loop's `Transact` is built against that
         // parameter, so planning the definition first would build it against a shape
         // this level is about to change.
         return recognize_group(h, def, body);
@@ -326,7 +326,7 @@ fn split_decision(
 /// Destructure a post-elim decision compose
 /// `(⟨slot₀⟩, …, ⟨source⟩) ▷ zip ≫ ⟨body…⟩` into its snapshot slots, the
 /// trailing source, the writer body (the tail elements re-composed, verbatim), and
-/// the writer's parameter — the `(enclosing, position)` pair for a nested carrier,
+/// the writer's parameter — the `(enclosing, position)` pair for a nested `Transact`,
 /// `None` for a top-level one. The body's tuple-parameter element types (snapshot value
 /// types then the item) stamp the rebuilt body compose.
 fn split_decision_compose(
@@ -360,7 +360,7 @@ fn split_decision_compose(
         panic!("letrec recognition: decision snapshot is not a tuple");
     };
     // The head builds the body's parameter. A nested writer whose body reads the
-    // enclosing row takes `(enclosing-and-position, slots)`, and the head then zips the
+    // enclosing position takes `(enclosing-and-position, slots)`, and the head then zips the
     // parameter itself, `id`, with a zip of the slots; one whose body does not takes the
     // slots directly, elimination having no reason to pass a row it never reads. Read off
     // the head rather than the body's domain: every slot but the source is a read of
@@ -373,7 +373,9 @@ fn split_decision_compose(
                     if matches!(function.node, TypedExprNode::Builtin(Builtin::Zip))));
     if body_takes_pair {
         let [_row, inner] = slots.as_slice() else {
-            panic!("letrec recognition: a body taking the enclosing row is fed it beside the slots")
+            panic!(
+                "letrec recognition: a body taking the enclosing position is fed it beside the slots"
+            )
         };
         let TypedExprNode::Apply { argument, function } = &inner.node else {
             panic!("letrec recognition: a nested decision's slots are not a zip application");
@@ -424,7 +426,7 @@ fn split_decision_compose(
         c
     };
     // Give every nested writer the same parameter. Where the body does not read the
-    // enclosing row it takes the slots alone, so projecting the slots out in front of
+    // enclosing position it takes the slots alone, so projecting the slots out in front of
     // it says the same thing at the shape the rest of the pipeline reads — a
     // composition, which leaves the body itself untouched.
     let body = match &parameter {
@@ -620,7 +622,7 @@ fn hist_record(fields: Vec<(String, Type)>) -> Type {
 }
 
 /// Destructure a transaction `LetRec` (from [`crate::ccl::transact_phase`],
-/// post-elim) into the `Transact{keys, writers, domain: Txn}` carrier. The
+/// post-elim) into the `Transact{keys, writers, domain: Txn}` node. The
 /// group\'s bindings, by shape ([`classify_txn_binding`]): one **history** per
 /// key (its `init` off the guard\'s default slot), one **commit-record** per
 /// `with begin():` site ([`recover_writer`] — writer body verbatim), one
@@ -813,7 +815,7 @@ fn collapse_snapshot_sources(
 /// Whether a morphism of `(enclosing, position)` reads the position.
 ///
 /// The parameter is read at the head of a compose, so a read of the position is a
-/// `.1` in that position. Used on a nested carrier's seed, which is the value entering
+/// `.1` in that position. Used on a nested `Transact`'s seed, which is the value entering
 /// the inner loop at an enclosing position and so cannot vary with the position the
 /// loop is about to run over.
 fn reads_own_position(e: &Expr) -> bool {
@@ -940,7 +942,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         }
     };
     // Now that this writer's parameter is settled, plan what is inside it: an inner
-    // loop's carrier reads this parameter, so it has to be built against the final
+    // loop's `Transact` reads this parameter, so it has to be built against the final
     // shape rather than the one elimination happened to leave.
     let writer_body = plan_loops(writer_body);
     // Each snapshot slot is `__prev ≫ .acc`, the previous value of the accumulator its label
@@ -998,7 +1000,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let keys: Vec<TransactKey> = inits
         .into_iter()
         .map(|(label, init)| {
-            // A nested carrier's seed is a morphism of the enclosing writer's parameter.
+            // A nested `Transact`'s seed is a morphism of the enclosing writer's parameter.
             // A record of seeds closed in it rides under one `const`, which distributes
             // over the fields — the shape a mutable variable the enclosing body
             // introduces leaves, its seed being the same at every enclosing position.
@@ -1009,13 +1011,13 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
                 }
                 _ => init,
             };
-            // A nested carrier's seed is the value entering the inner loop at an
-            // enclosing position, so it is constant in this carrier's own position
+            // A nested `Transact`'s seed is the value entering the inner loop at an
+            // enclosing position, so it is constant in this `Transact`'s own position
             // even though it is a morphism of the pair. The engine reads it anywhere
             // in the row; the assertion is what makes that reading safe.
             debug_assert!(
                 enclosing.is_none() || !reads_own_position(&init),
-                "letrec recognition: a nested carrier's seed `{label}` reads its own \
+                "letrec recognition: a nested `Transact`'s seed `{label}` reads its own \
                  position, which the value entering the loop cannot depend on"
             );
             TransactKey {
@@ -1063,14 +1065,14 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         domain: domain_ty.clone(),
         parameter,
     });
-    // A nested carrier is one history record per enclosing row, so it is a function of
+    // A nested `Transact` is one history record per enclosing position, so it is a function of
     // the enclosing parameter, and its reads are morphisms of that parameter
     // (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence carrier").
-    let carrier_ty = match &enclosing {
+    let transact_ty = match &enclosing {
         Some(ctx_ty) => Type::fun(ctx_ty.clone(), hist_ty.clone()),
         None => hist_ty.clone(),
     };
-    transact.ty = carrier_ty.clone();
+    transact.ty = transact_ty.clone();
 
     let hist = Name::fresh("__hist");
     let mut body = letrec_body;
@@ -1093,11 +1095,11 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         h.name
     );
 
-    Expr::let_in(binding(hist, carrier_ty), transact, body)
+    Expr::let_in(binding(hist, transact_ty), transact, body)
 }
 
-/// What a history read is rewritten against: the carrier's binder, its history record's
-/// type, and for a nested carrier the enclosing parameter it is a function of.
+/// What a history read is rewritten against: the `Transact`'s binder, its history record's
+/// type, and for a nested `Transact` the enclosing parameter it is a function of.
 struct HistReads<'a> {
     hist: &'a Name,
     hist_ty: &'a Type,
@@ -1107,17 +1109,17 @@ struct HistReads<'a> {
     domain_ty: &'a Type,
 }
 
-/// Key `field`'s history `Fun(D, V)` read off the carrier: the projection `__hist.field` of a
-/// top-level carrier's record, or for a nested carrier the morphism `__hist ≫ .field` of the
-/// enclosing parameter, one history per enclosing row.
+/// Key `field`'s history `Fun(D, V)` read off the `Transact`: the projection `__hist.field` of a
+/// top-level `Transact`'s record, or for a nested `Transact` the morphism `__hist ≫ .field` of the
+/// enclosing parameter, one history per enclosing position.
 fn hist_field_read_of(reads: &HistReads<'_>, field: String, field_ty: Type) -> Expr {
     match reads.enclosing {
         None => hist_field_read(reads.hist, reads.hist_ty, field, field_ty),
         Some(ctx_ty) => {
             let mut proj = Expr::proj_field(field);
             proj.ty = Type::fun(reads.hist_ty.clone(), field_ty.clone());
-            let carrier = tvar(reads.hist, Type::fun(ctx_ty.clone(), reads.hist_ty.clone()));
-            Expr::compose(vec![carrier, proj]).with_ty(Type::fun(ctx_ty.clone(), field_ty))
+            let hist = tvar(reads.hist, Type::fun(ctx_ty.clone(), reads.hist_ty.clone()));
+            Expr::compose(vec![hist, proj]).with_ty(Type::fun(ctx_ty.clone(), field_ty))
         }
     }
 }
@@ -1141,7 +1143,7 @@ fn rewrite_hist_reads(e: &mut Expr, h: &Name, reads: &HistReads<'_>) {
     // An inner loop's history depends on the enclosing writer's parameter, so
     // `lambda_elim` leaves every read of it as a combinator tree rather than the flat
     // `h ≫ …` compose a parameter-independent history keeps. Peel that tree back to
-    // its steps and rewrite it against the carrier, which is a function of that same
+    // its steps and rewrite it against the `Transact`, which is a function of that same
     // parameter, so the rewritten read is a morphism of it too.
     // A closed transformer applied to the whole view eliminates to a plain compose
     // element rather than to another zip, so a view may end in steps that take it
@@ -1253,8 +1255,8 @@ fn compose_onto_values(read: Expr, steps: Vec<Expr>) -> Expr {
     Expr::compose(elts).with_ty(chain_ty)
 }
 
-/// A nested carrier's read, `read : 𝐸 ⇒ (𝐷 ⤇ 𝑉)`, with `steps` composed onto each
-/// enclosing row's history: `(read, steps ▷ const) ▷ zip ≫ compose`, the shape
+/// A nested `Transact`'s read, `read : 𝐸 ⇒ (𝐷 ⤇ 𝑉)`, with `steps` composed onto each
+/// enclosing position's history: `(read, steps ▷ const) ▷ zip ≫ compose`, the shape
 /// `lambda_elim` gives a per-row value composed with a closed step. `read` alone where
 /// there are no steps.
 fn per_row_view(read: Expr, steps: Vec<Expr>) -> Expr {

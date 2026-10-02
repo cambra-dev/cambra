@@ -170,18 +170,18 @@ CHL source
                       loop's history)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators, then CCC-simplified)
   → plan_loops       (ccl/planning/loops.rs::plan_loops: AFTER lambda_elim, on the point-free normal form,
-                      lower each causal LetRec group onto the domain-parameterized Transact carrier —
+                      lower each causal LetRec group onto the domain-parameterized Transact —
                       induction domain → InductionStore, Txn domain → commit operator. Anchors on the guard
                       builtins (which survive elimination), so one LetRec travels through channelize +
                       lambda_elim and is planned point-free — no pointful/point-free double
-                      representation. Transact is loop planning's output carrier to op-conversion)
+                      representation. Transact is loop planning's output node to op-conversion)
   → planning        (ccl/planning/: hash-join and keyed aggregate optimization; brackets iteration-marking with ccl/simplify.rs)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
   → subscribe()
   → tile producer/consumer dataflow
 ```
 
-Why the pass order is what it is: parsing recovers from errors (partial ASTs with placeholder nodes, multiple diagnostics per file — see [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)); uniquify establishes the Barendregt convention so every later pass can substitute without capture; inference runs early, on the user-shaped tree, so type errors report against the program as written and every later pass transforms fully-typed trees. The three-pass middle — `transact_phase`, `mut_elim`, `channelize` — is **mutability elimination**: transactions, mutation loops, and feeds each become pure, causally-guarded `letrec` groups, so everything downstream sees only the pure value language. Lambda elimination then rewrites the program into point-free combinators because **operators are point-free** — an operator graph has no binders, so lambdas must be compiled away, not closed over; loop planning lowers the letrec groups onto runtime carriers on that same point-free form; and planning is where comprehension shapes become joins and keyed aggregates. Each pass's own design doc is indexed in [src/ccl/design/README.md](../src/ccl/design/README.md) and [src/design.md](../src/design.md).
+Why the pass order is what it is: parsing recovers from errors (partial ASTs with placeholder nodes, multiple diagnostics per file — see [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)); uniquify establishes the Barendregt convention so every later pass can substitute without capture; inference runs early, on the user-shaped tree, so type errors report against the program as written and every later pass transforms fully-typed trees. The three-pass middle — `transact_phase`, `mut_elim`, `channelize` — is **mutability elimination**: transactions, mutation loops, and feeds each become pure, causally-guarded `letrec` groups, so everything downstream sees only the pure value language. Lambda elimination then rewrites the program into point-free combinators because **operators are point-free** — an operator graph has no binders, so lambdas must be compiled away, not closed over; loop planning lowers the letrec groups onto `Transact` nodes on that same point-free form; and planning is where comprehension shapes become joins and keyed aggregates. Each pass's own design doc is indexed in [src/ccl/design/README.md](../src/ccl/design/README.md) and [src/design.md](../src/design.md).
 
 ## The execution model
 

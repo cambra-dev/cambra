@@ -2459,9 +2459,9 @@ fn emit_transact_writer<C: Typing>(
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
     let s_ty = ctx.subexpr(&mut writer.source)?;
-    // A nested carrier's components are lifted pointwise over its enclosing context,
+    // A nested `Transact`'s components are lifted pointwise over its enclosing context,
     // so the source is an iteration source under that context: peel the context function
-    // and the iteration source is what a top-level carrier's is.
+    // and the iteration source is what a top-level `Transact`'s is.
     let s_ty = match parameter {
         Some(_) => {
             ctx.as_function(&s_ty, &|| "nested transaction source".to_string())?
@@ -2575,7 +2575,7 @@ pub(super) fn emit_transact<C: Typing>(
         // reach this variable too — each `with begin(): flag := True` is an ordinary
         // `MutWrite` against it — so `flag := False` written `True` joins to `Bool`
         // rather than claiming `False`.
-        // A nested carrier's seed is where the inner loop starts at each enclosing
+        // A nested `Transact`'s seed is where the inner loop starts at each enclosing
         // position — the enclosing accumulator — so it is a morphism of the enclosing
         // context rather than a closed value.
         let seeded = match parameter {
@@ -2596,13 +2596,13 @@ pub(super) fn emit_transact<C: Typing>(
             fields.push((field, crate::ccl::ccl_utils::history_ty(domain, &value_ty)));
         }
     }
-    // A nested carrier is one history record per enclosing row, so it is a function of the
+    // A nested `Transact` is one history record per enclosing position, so it is a function of the
     // enclosing half of its `(enclosing, position)` parameter.
     Ok(match parameter {
         None => Type::Record(fields),
         Some(p) => {
             let Type::Tuple(parts) = p.peel_refinements() else {
-                panic!("a nested carrier's parameter is the (enclosing, position) pair: {p}")
+                panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {p}")
             };
             fun(parts[0].clone(), Type::Record(fields))
         }

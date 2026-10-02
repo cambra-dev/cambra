@@ -480,10 +480,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // concurrent writer. Reads of a key are the record projection
         // `__hist.k` elsewhere in the tree, not shown here.
         //
-        // A **nested** carrier renders `transact under 𝑃 (…) { … }`, where `𝑃` is the
+        // A **nested** `Transact` renders `transact under 𝑃 (…) { … }`, where `𝑃` is the
         // writers' parameter: every component is a morphism of it rather than a closed
         // value, so the seeds and the source read differently from a top-level
-        // carrier's. Two carriers that differ only in that are different nodes —
+        // `Transact`'s. Two `Transact`s that differ only in that are different nodes —
         // `content_hash` hashes the slot — so rendering them alike is what makes a
         // nested one unreadable beside a flat one.
         TypedExprNode::Transact {

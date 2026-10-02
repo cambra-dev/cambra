@@ -79,24 +79,26 @@ unguarded product domain is a loop that runs zero times.
 
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
 inferred, always spelled at the introduction). A `:=` inside a `for` body introduces one whose
-domain is nested within the enclosing loop's, and the nested carrier is what carries it: the
+domain is nested within the enclosing loop's, and the nested `Transact` is what carries it: the
 introduction seeds the read-your-writes environment, an inner `for` that writes it folds it into its
 own recurrence, and a statement after that loop reads the final value. `body_introduced_mut_vars`
 in `lower/loops.rs` names them and `transform_chain`'s `MutDecl` arm in `mut_elim.rs` seeds them.
 The variable restarts at its seed on the next iteration, the seed being re-evaluated there; the
 write set the enclosing loop carries never names it, so the enclosing store has no key for it.
+A nested `Transact` plans but does not run yet: operator conversion builds one engine per store and
+refuses a `Transact` whose `parameter` is `Some(_)` (`operator_conversion.rs`).
 
 The scope is the block that writes it, so an `if` branch introduces one of its own. The chain
 `splice_after_unit` carries onto each branch goes *inside* the introduction, as it does inside a
 `let`: spliced after it instead, the whole introduction sits in effect position, where the walk
 dispatches on the effect and meets a `MutDecl` it has no arm for.
 
-Three introductions have no such carrier. A **transactional** one inside a `for` body would need a
-`Txn` order per iteration, so it is rejected at lowering. One inside a loop that writes no mutable
-variable declared before it, a generator or a loop that only feeds, has no recurrence of that loop to
-nest in, and is rejected at lowering too. A `:=` inside a `with begin():` block
-would need one per transaction, and has no gate of its own: lowering emits it as a *write*, so the
-program is rejected at inference as `Unbound variable`, naming neither the construct nor the
+Three introductions have no nested `Transact` to carry them. A **transactional** one inside a `for`
+body would need a `Txn` order per iteration, so it is rejected at lowering. One inside a loop that
+writes no mutable variable declared before it, a generator or a loop that only feeds, has no
+recurrence of that loop to nest in, and is rejected at lowering too. A `:=` inside a `with begin():`
+block would need one per transaction, and has no gate of its own: lowering emits it as a *write*, so
+the program is rejected at inference as `Unbound variable`, naming neither the construct nor the
 alternative. The rejection is right; the message is about the wrong thing. What both rejections
 replace is a per-iteration shadowing `let`, which silently discards each update at the boundary —
 the failure `:=` exists to make impossible.
@@ -636,9 +638,9 @@ CHL source
   → as-of-read rewrite (bare history reads fed out of read-only blocks → AsOf)
   → lambda_elim        (the LetRec travels through — bodies point-freed, group intact)
   → typecheck          (strict, no relaxations)
-  → plan_loops         (planning/loops.rs: point-free letrec patterns → the Transact carrier;
+  → plan_loops         (planning/loops.rs: point-free letrec patterns → `Transact`;
                         causality re-checked by the point-free matcher)
-  → planning           (stages the carrier's writer sources) → simplify
+  → planning           (stages the `Transact`'s writer sources) → simplify
   → operator_conversion (Transact → engines, dispatched on the domain)
 ```
 
@@ -656,7 +658,7 @@ for induction; the commit-record `decision` for transactions) — so after
 and `plan_loops` splits scaffold from body structurally, lifting the body
 **verbatim**. A body that reads neither the snapshot nor the loop item is the one exception:
 `lambda_elim` point-frees it to `⟨record⟩ ▷ const`, and `simplify`'s const-reduce drops the
-snapshot and source in front of it. The `Transact` carrier is born at loop planning and spans only
+snapshot and source in front of it. The `Transact` is born at loop planning and spans only
 `plan_loops` → planning → op-conversion.
 
 Inlining runs before `mut_elim`: a UDF that writes a `Mut` parameter or feeds a `Feed` parameter
@@ -731,7 +733,7 @@ But the group can itself depend on a store, through an [`await_final`](#await_fi
 conflict, because an awaited variable's writers all precede the await while a store reading
 the accumulator commits after the accumulator's loop
 (`a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store` pins the
-induction carrier landing *between* two commit stores).
+induction `Transact` landing *between* two commit stores).
 
 **One post-condition covers all of it.** The level assignment, the cross-domain level, and
 the store nesting order are three separate arguments that a reference stays in scope, none
@@ -967,7 +969,7 @@ they are effectively engine tests.
 across multiple feeders (or several feeds in one body), and the multi-writer commit-stream merge order
 for one mutable variable.
 
-## Loop planning (`plan_loops`): letrec patterns → the Transact carrier
+## Loop planning (`plan_loops`): letrec patterns → `Transact`
 
 `plan_loops` (in `planning/loops.rs`) runs **after `lambda_elim`**, on the letrec's point-free normal
 form — anchored on the builtins (`get_prev_seq`, `get_prev_txn`, `begin_<site>`), which are opaque,
@@ -977,10 +979,10 @@ planning lifts it verbatim; the causal accessor's defaults carry the key inits a
 trailing slot the source. A constant decision, `⟨record⟩ ▷ const`, has neither snapshot nor
 source term, and `constant_decision_writer` recovers its writer from the site's domain alone: it
 reads no keys and iterates the extent, restricted when the extent is refined. The planned
-recurrence travels to op-conversion on the **carrier node**
+recurrence travels to op-conversion on the **`Transact` node**
 `Transact { keys, writers, domain }` — explicit key/writer header slots plus the opaque writer
 body — which `planning` iterate-wraps the writer sources of and op-conversion builds the engine
-from. One carrier serves both domains — there is no separate loop node. It is the loop analog of the
+from. One node serves both domains — there is no separate loop node. It is the loop analog of the
 other planning-phase iteration recognizers (`plan_loop_join` for joins, group-by for aggregates), so
 it sits beside them in `planning/`. Causality is re-checked at loop planning's wall by the point-free
 causal matcher (`letrec::check_letrec_causal`).
@@ -1060,8 +1062,8 @@ affordable by that complete compile-time knowledge.
 
 - **`while` loops** — a letrec binding over a condition-bounded prefix of `Nat`; the self-ceiling
   domain is a new *domain*, not a new construct.
-- **Nested `for` loops** — lexicographic product domains; data-dependent bounds meet the
-  refinement-types work as dependent sums.
+- **Nested `for` loops** — realizing the nested `Transact` they plan to: one store per
+  enclosing position, which operator conversion refuses today.
 - **Append-only mutable collections** — an `Appendable` collection as a letrec binding, its
   commit stream being the collection's history. A keyed write overwrites; an append needs the
   domain to grow with the history.
@@ -1095,7 +1097,7 @@ A commit decision may read an induction accumulator at its request position
 phase folds the entangled induction loop (via `fold_induction_loop`, shared with `transform_loop`)
 into its own **outer** single-binding induction letrec wrapping the transaction letrec — dependency
 order, since `incr_commits` reads `𝑐𝑛𝑡` and `𝑐𝑛𝑡` is self-guarded — so `recognize` nests the two
-carriers (`InductionStore` outer, commit engine inner) with **no** cross-domain group logic. The read itself
+`Transact`s (`InductionStore` outer, commit engine inner) with **no** cross-domain group logic. The read itself
 rides the **writer source**: an accumulator the decision reads is zipped into the source,
 `source ↦ λ 𝑟 → (reqs(𝑟), 𝑐𝑛𝑡-view(𝑟)) : 𝐼 ⤇ (item, 𝑉)`, and the decision body reads it off the item
 tuple's slot. This keeps recognition's writer round-trip intact — `recover_writer` lifts the source
