@@ -5,6 +5,7 @@ use cambra::{
         context::{GlobalContext, ReuseTally, eprint_errors, render_errors},
         symbolic::symbolic,
     },
+    chl_parser::SourceMap,
     control_port::{ControlPort, ControlReply, ControlRequest},
     interpreter::{
         Consumer,
@@ -47,29 +48,38 @@ fn poll_control(
 ) {
     let Some(port) = control else { return };
     let Some(message) = port.poll() else { return };
+    // A new version is the running root with new text, so its diagnostics name
+    // the root's path, and after a reload so does the running program.
+    let root = live.sources().path(live.sources().root()).to_owned();
     let reply = match message.request() {
-        ControlRequest::Diff { code, phase } => match live.diff_against(ctx, code, *phase) {
-            Ok(report) => ControlReply::ok(format!(
-                "{}{}",
-                report.diff,
-                render_unreadable(&report.unreadable)
-            )),
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
-        },
-        ControlRequest::Reload { code } => match live.reload(ctx, code, main_consumer) {
-            Ok(report) => {
-                // The new graph has subscribed but nothing has pulled it, so arm
-                // the driver for one pass.
-                *new_data.borrow_mut() = true;
-                let ReuseTally { kept, bound } = report.reuse;
-                ControlReply::ok(format!(
-                    "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+        ControlRequest::Diff { code, phase } => {
+            let sources = SourceMap::single(root, code.as_str());
+            match live.diff_against(ctx, &sources, *phase) {
+                Ok(report) => ControlReply::ok(format!(
+                    "{}{}",
                     report.diff,
-                    render_unreadable(&report.unreadable),
-                ))
+                    render_unreadable(&report.unreadable)
+                )),
+                Err(errs) => ControlReply::rejected(render_errors(&errs, &sources)),
             }
-            Err(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
-        },
+        }
+        ControlRequest::Reload { code } => {
+            let sources = SourceMap::single(root, code.as_str());
+            match live.reload(ctx, &sources, main_consumer) {
+                Ok(report) => {
+                    // The new graph has subscribed but nothing has pulled it, so arm
+                    // the driver for one pass.
+                    *new_data.borrow_mut() = true;
+                    let ReuseTally { kept, bound } = report.reuse;
+                    ControlReply::ok(format!(
+                        "reloaded: {kept}/{bound} operators kept\n\n{}{}",
+                        report.diff,
+                        render_unreadable(&report.unreadable),
+                    ))
+                }
+                Err(errs) => ControlReply::rejected(render_errors(&errs, &sources)),
+            }
+        }
     };
     message.answer(reply);
 }
@@ -97,10 +107,11 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
-    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
+    let sources = SourceMap::single(src_name, code);
+    let mut live = match LiveProgram::start(&mut ctx, &sources, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
-            eprint_errors(&errs, src_name, code);
+            eprint_errors(&errs, &sources);
             return Err(());
         }
     };

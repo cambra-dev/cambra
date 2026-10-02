@@ -1,6 +1,7 @@
 # Modules
 
-> **Status: [Sketched].** A proposed implementation. Nothing here is implemented.
+> **Status: [Sketched].** A proposed implementation. Only the first item of the [Implementation
+> stack](#implementation-stack) is implemented.
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -266,13 +267,13 @@ pub struct Span { pub file: FileId, pub start: usize, pub end: usize }
 defect, asserted in debug.
 
 The alternative is one offset space across all files, with each file assigned a base offset, which
-is how `rustc`'s `SourceMap` works. `Span` would keep its current shape. It fails on edits: changing
+is how `rustc`'s `SourceMap` works. `Span` would carry no file. It fails on edits: changing
 one file moves the base of every file after it, and so every span in them. Spans are compared across
 versions by `/diff` output and the inspector. A per-file offset changes only when its own file
 changes.
 
-The parser threads the file through chumsky's span context. `chumsky::span::Span::Context` is `()`
-today and becomes `FileId`.
+The parser threads the file through chumsky's span context: `chumsky::span::Span::Context` is
+`FileId`.
 
 `FileId` is an index into the compilation's `SourceMap`, meaningful within one compilation. Anything
 that outlives a compilation names the file by path.
@@ -282,9 +283,9 @@ diagnostic about a copy names the run as well as the span.
 
 ### The source map
 
-`SourceMap` holds, per `FileId`, the module path, the file path, the source text, and a newline
-index built on first use. It replaces `CompiledProgram::source: String`. The line and column of a
-span are computed from the map when a diagnostic renders.
+`SourceMap` holds, per `FileId`, the file path, the source text, and a newline index built on first
+use. Loading adds each file's module path. `CompiledProgram::sources` keeps the map a program was
+compiled from. The line and column of a span are computed from the map when a diagnostic renders.
 
 ### Diagnostics
 
@@ -336,7 +337,7 @@ An inference error's span resolves through the lowering projection, as it does t
 ## Inspector
 
 The payload's `source` becomes `sources`: one entry per file, carrying `file`, module path, file
-path, and text. Every `span` on the wire gains `file`
+path, and text. The `file` of every `span` on the wire indexes `sources`
 ([src/inspector_model/design.md](../src/inspector_model/design.md)). The source pane shows one file
 at a time, with a file list. Clicking a node in another pane opens the file its span points into. A
 node of a member also names its run.
@@ -457,7 +458,8 @@ One PR per item, each updating the spec and design docs it touches:
 2. **Syntax.** The seven keywords, `import`, `run`, and `param` statements with `use` clauses,
    `@Discard`, and a visibility flag on introducing statements. Lowering refuses the new statements
    with an unsupported error.
-3. **Loading and the module graph.** Path resolution, per-file parsing, cycle refusal, link order.
+3. **Loading and the module graph.** Path resolution, per-file parsing, module paths in the
+   `SourceMap`, cycle refusal, link order.
 4. **Imports.** `Name::Member`, `Unique::home`, per-module lowering and uniquification, interfaces,
    shared runs, the IO check on imports, visibility, `use` clauses, closed aliases, qualified
    callees, labels and tags that carry their module.

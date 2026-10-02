@@ -1,6 +1,7 @@
 //! Feed (`<<`, `<<=`) and define operators on `defer()` channels, plus the
 //! multi-arm `if/elif`-with-feeds known-gap test.
 
+use cambra::chl_parser::SourceMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -844,7 +845,7 @@ fn scalar_define_into_defer_is_rejected() {
     let code = "x = defer()\nx <<= 1\nx";
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let result = compile_program(&mut ctx, code, consumer);
+    let result = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer);
     assert!(
         result.is_err(),
         "a scalar defined into a feed channel must be a type error"
@@ -864,11 +865,12 @@ x << "s"
 x"#;
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let errs = match compile_program(&mut ctx, code, consumer) {
+    let sources = SourceMap::single("<defer-error-shape-test>", code);
+    let errs = match compile_program(&mut ctx, &sources, consumer) {
         Ok(_) => panic!("an Int and a String fed into one defer must be a type error"),
         Err(e) => e,
     };
-    let rendered = render_errors(&errs, "<defer-error-shape-test>", code);
+    let rendered = render_errors(&errs, &sources);
     assert!(
         rendered.contains("Int") && rendered.contains("String"),
         "expected the conflicting element types in the message, got:\n{rendered}"
@@ -891,11 +893,12 @@ x"#;
 /// Assert `code` fails to compile with a rendered error containing `needle`.
 fn expect_feed_error(code: &str, needle: &str) {
     let mut ctx = GlobalContext::default();
-    let errs = match compile_program(&mut ctx, code, Box::new(|| {})) {
+    let sources = SourceMap::single("<feed-reject-test>", code);
+    let errs = match compile_program(&mut ctx, &sources, Box::new(|| {})) {
         Ok(_) => panic!("expected a compile error containing {needle:?}; program compiled"),
         Err(e) => e,
     };
-    let rendered = render_errors(&errs, "<feed-reject-test>", code);
+    let rendered = render_errors(&errs, &sources);
     assert!(
         rendered.contains(needle),
         "expected error to contain {needle:?}; got:\n{rendered}"

@@ -204,8 +204,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
   it("throws when a node's spans repeat one span or are not narrowest first", () => {
     const repeated = minimalSuccess();
     paneNodes(repeated)[0].spans = [
-      { start: 0, end: 1 },
-      { start: 0, end: 1 },
+      { file: 0, start: 0, end: 1 },
+      { file: 0, start: 0, end: 1 },
     ];
     expect(() => validateSnapshot(repeated)).toThrow(
       /nodes\[0\]\.spans\[1\].*not already on this node/,
@@ -213,8 +213,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
 
     const widest = minimalSuccess();
     paneNodes(widest)[0].spans = [
-      { start: 0, end: 9 },
-      { start: 2, end: 3 },
+      { file: 0, start: 0, end: 9 },
+      { file: 0, start: 2, end: 3 },
     ];
     expect(() => validateSnapshot(widest)).toThrow(/nodes\[0\]\.spans\[1\].*narrowest first/);
     // The message has to carry the numbers it rejected. It reported

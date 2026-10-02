@@ -2252,8 +2252,13 @@ fn open_recording_depth() -> usize {
 mod tests {
     use super::*;
 
+    /// A span in the one file these tests' attributions name.
     fn span(start: usize, end: usize) -> Span {
-        Span::new(start, end)
+        Span::new(
+            crate::chl_parser::SourceMap::single("<test>", "").root(),
+            start,
+            end,
+        )
     }
 
     /// The phase the tests record under. The recorder is phase-agnostic — the tag
@@ -3218,8 +3223,12 @@ mod tests {
         for (name, code) in pipeline_corpus() {
             let mut ctx = GlobalContext::default();
             let consumer: Box<dyn Consumer> = Box::new(|| {});
-            compile_program(&mut ctx, &code, consumer)
-                .unwrap_or_else(|e| panic!("{name}: expected a successful compile, got {e:?}"));
+            compile_program(
+                &mut ctx,
+                &crate::chl_parser::SourceMap::single(name, &code),
+                consumer,
+            )
+            .unwrap_or_else(|e| panic!("{name}: expected a successful compile, got {e:?}"));
             total += take_predicate_sweep_skips();
         }
         assert_eq!(

@@ -54,7 +54,7 @@ describe("byteLineStarts / lineCol (byte offsets)", () => {
 describe("formatSpan", () => {
   it("formats a non-null span as a line:col range", () => {
     const starts = byteLineStarts("ab\ncd\n");
-    expect(formatSpan({ start: 0, end: 4 }, starts)).toBe("1:1–2:2");
+    expect(formatSpan({ file: 0, start: 0, end: 4 }, starts)).toBe("1:1–2:2");
   });
 
   it("returns 'no span' for a null span", () => {
@@ -64,7 +64,7 @@ describe("formatSpan", () => {
 
 describe("serializeDiagnostics", () => {
   const starts = byteLineStarts("ab\ncd\n");
-  const diag = (message: string, span: { start: number; end: number } | null) => ({
+  const diag = (message: string, span: { file: number; start: number; end: number } | null) => ({
     severity: "error",
     stage: "Infer",
     message,
@@ -73,7 +73,7 @@ describe("serializeDiagnostics", () => {
   });
 
   it("renders severity · stage, message, and the line:col span", () => {
-    expect(serializeDiagnostics([diag("mismatched types", { start: 0, end: 4 })], starts)).toBe(
+    expect(serializeDiagnostics([diag("mismatched types", { file: 0, start: 0, end: 4 })], starts)).toBe(
       "error · Infer\nmismatched types\n1:1–2:2",
     );
   });
@@ -94,7 +94,7 @@ describe("serializeDiagnostics", () => {
   });
 
   it("is built from the same lines the pane renders", () => {
-    const d = diag("mismatched types", { start: 0, end: 4 });
+    const d = diag("mismatched types", { file: 0, start: 0, end: 4 });
     expect(serializeDiagnostics([d], starts)).toBe(diagnosticLines(d, starts).join("\n"));
   });
 });

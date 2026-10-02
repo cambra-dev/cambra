@@ -12,6 +12,7 @@
 //! the demonstration.
 
 use super::serving::{exchange, http_post, no_main, reserve_test_port, start_sink};
+use cambra::chl_parser::SourceMap;
 
 fn source(text: &str, port: u16) -> String {
     text.replace("{PORT}", &port.to_string())
@@ -51,7 +52,7 @@ bob
 
     live.reload(
         &mut ctx,
-        &source(include_str!("reloaded.cambra"), port),
+        &SourceMap::single("<test>", source(include_str!("reloaded.cambra"), port)),
         &no_main,
     )
     .expect("editing a loop body is a change between existing endpoints");

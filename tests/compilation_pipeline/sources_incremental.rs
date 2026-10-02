@@ -3,6 +3,7 @@
 //! incremental global aggregate, mutation loop over a source, and incremental
 //! group-by aggregates.
 
+use cambra::chl_parser::SourceMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -60,7 +61,8 @@ fn test_test_source(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -121,7 +123,8 @@ fn test_source_filter_nonterminal() {
         *notified_clone.borrow_mut() = true;
     });
     let code = "[s for s in source1() if s < 15]";
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -199,7 +202,8 @@ fn test_inner_join(#[case] code: &str) {
     });
 
     // let mut producer = ctx.compile_program(code, consumer).unwrap_or_render("<test>", code);
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -376,7 +380,8 @@ fn test_incremental_join_simple(#[case] code: &str) {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -460,8 +465,9 @@ fn test_incremental_global_aggregate() {
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
+    let sources = SourceMap::single("<test>", code);
     let mut compiled =
-        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
+        compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
@@ -528,7 +534,8 @@ x";
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(move || {});
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     test_source.borrow_mut().add_data(&[
@@ -573,8 +580,9 @@ o";
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
+    let sources = SourceMap::single("<test>", code);
     let mut compiled =
-        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
+        compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     test_source.borrow_mut().add_data(&[
@@ -630,7 +638,8 @@ x";
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // Pull a few times between batches to verify the loop doesn't emit
@@ -709,7 +718,8 @@ fn test_incremental_aggregates() {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     ctx.scheduler().check_for_notifications();
@@ -803,7 +813,8 @@ fn test_source_backed_collection_component(#[case] code: &str, #[case] expected:
     ctx.register_source(test_source.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let sources = SourceMap::single("<test>", code);
+    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
 
@@ -831,8 +842,9 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
+    let sources = SourceMap::single("<t>", code);
     let mut compiled =
-        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
+        compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // One lap is one delivery followed by one pull. A `Memo` re-reads only after a
@@ -901,8 +913,9 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
+    let sources = SourceMap::single("<t>", code);
     let mut compiled =
-        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<t>", code);
+        compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     let mut pull_and_release = |rows: &[(usize, i64)]| {

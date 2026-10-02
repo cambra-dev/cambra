@@ -2,6 +2,7 @@
 //! polymorphic UDF chains (monomorphization through wrappers, diamonds, and
 //! triple chains), plus nested generator functions.
 
+use cambra::chl_parser::SourceMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
@@ -367,7 +368,11 @@ fn test_poly_chain_with_extra_param() {
 fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let result = compile_program(&mut ctx, "f = \\x -> [x, x]\nf", consumer);
+    let result = compile_program(
+        &mut ctx,
+        &SourceMap::single("<test>", "f = \\x -> [x, x]\nf"),
+        consumer,
+    );
     assert!(
         result.is_err(),
         "ambiguous (never-exercised) generic must fail with a diagnostic"

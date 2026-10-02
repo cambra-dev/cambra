@@ -41,6 +41,7 @@
 //! iterating a data source. Ratchet 5 validates all four like any other gallery
 //! program, naming the source it dumped when one fails.
 
+use cambra::chl_parser::SourceMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -968,8 +969,8 @@ fn ids_are_the_only_difference_between_two_compiles() {
         let payload = |name: &str| {
             let mut ctx = GlobalContext::default();
             let consumer: Box<dyn Consumer> = Box::new(|| {});
-            let compiled =
-                compile_program(&mut ctx, &source, consumer).expect("a corpus program compiles");
+            let compiled = compile_program(&mut ctx, &SourceMap::single(name, &source), consumer)
+                .expect("a corpus program compiles");
             let mut v: Value =
                 serde_json::from_str(&cambra::inspector_server::snapshot_json(&compiled, name))
                     .expect("the payload is valid JSON");

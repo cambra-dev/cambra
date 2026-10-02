@@ -44,16 +44,17 @@ use cambra::ccl::symbolic::symbolic;
 use cambra::ccl::uniquify;
 use cambra::ccl::{BaseType, Expr, Lit, Refinement, Type, TypedExprNode};
 use cambra::chl_parser;
+use cambra::chl_parser::SourceMap;
 use std::rc::Rc;
 
 /// Parse → lower → uniquify → infer `code` (the pipeline prefix through type
 /// inference; comprehensions over literals need no source registration).
 fn infer_source(code: &str) -> Expr {
-    let module = chl_parser::parse_module(code)
+    let module = chl_parser::parse_module(SourceMap::single("<test>", code).root(), code)
         .value
         .expect("parse should succeed");
     let mut lctx = LoweringContext::default();
-    let mut expr = lower_stmts(&module.body, &mut lctx)
+    let mut expr = lower_stmts(&module, &mut lctx)
         .value
         .expect("lowering should succeed");
     expr = uniquify::run(expr);
@@ -133,7 +134,10 @@ fn a_cast_target_does_not_carry_its_value_s_refinements() {
     let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
     let compiled = compile_program(
         &mut ctx,
-        "[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]",
+        &SourceMap::single(
+            "<test>",
+            "[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]",
+        ),
         consumer,
     )
     .expect("the nested filter compiles");

@@ -127,7 +127,7 @@ export function resolveLinks(graph: LinkGraph, seeds: PaneNode[]): ResolveResult
     }
   }
 
-  // Project the highlighted nodes to their source spans (deduped by start/end).
+  // Project the highlighted nodes to their source spans (deduped by file/start/end).
   const sourceSpans: Span[] = [];
   const seenSpan = new Set<string>();
   for (const pane of graph.panes) {
@@ -135,7 +135,7 @@ export function resolveLinks(graph: LinkGraph, seeds: PaneNode[]): ResolveResult
     for (const id of ids) {
       const span = pane.spanOf(id);
       if (!span) continue;
-      const k = `${span.start}:${span.end}`;
+      const k = `${span.file}:${span.start}:${span.end}`;
       if (seenSpan.has(k)) continue;
       seenSpan.add(k);
       sourceSpans.push(span);

@@ -10,6 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cambra::{
+    ccl::context::{CompileError, GlobalContext, Phase},
+    chl_parser::SourceMap,
+    live_program::{DiffReport, LiveProgram, MainConsumerFactory, ReloadReport},
+};
+
 use crate::serving::{raw_http, reserve_test_port};
 /// Run a `stdin`-sourced program under `--control`, feeding it `before`, then
 /// swapping it for `reloaded` and feeding it `after`.
@@ -770,6 +776,61 @@ pub(crate) mod fixtures {
             t := t + z
             tick_resps << t
     "#};
+}
+
+/// [`LiveProgram`]'s calls that take a version, for a version that is one
+/// file.
+///
+/// Every case writes a version as one program text. These build its one-file
+/// [`SourceMap`], so a case passes the text as it reads.
+pub(crate) trait OneFile: Sized {
+    fn start_text(
+        ctx: &mut GlobalContext,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Self, Vec<CompileError>>;
+
+    fn reload_text(
+        &mut self,
+        ctx: &mut GlobalContext,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<ReloadReport, Vec<CompileError>>;
+
+    fn diff_text(
+        &self,
+        ctx: &GlobalContext,
+        text: &str,
+        phase: Phase,
+    ) -> Result<DiffReport, Vec<CompileError>>;
+}
+
+impl OneFile for LiveProgram {
+    fn start_text(
+        ctx: &mut GlobalContext,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Self, Vec<CompileError>> {
+        LiveProgram::start(ctx, &SourceMap::single("<test>", text), main_consumer)
+    }
+
+    fn reload_text(
+        &mut self,
+        ctx: &mut GlobalContext,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<ReloadReport, Vec<CompileError>> {
+        self.reload(ctx, &SourceMap::single("<test>", text), main_consumer)
+    }
+
+    fn diff_text(
+        &self,
+        ctx: &GlobalContext,
+        text: &str,
+        phase: Phase,
+    ) -> Result<DiffReport, Vec<CompileError>> {
+        self.diff_against(ctx, &SourceMap::single("<test>", text), phase)
+    }
 }
 
 pub(crate) fn source(name: &str, port: u16) -> String {
