@@ -248,7 +248,7 @@ fn test_datasource_named_record_join() {
     let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected Function, got {tile:?}");
     };
-    let Tile::Record(mut fields) = *codomain else {
+    let Tile::Record { mut fields, .. } = *codomain else {
         panic!("expected Record codomain");
     };
     assert_eq!(
@@ -338,7 +338,7 @@ fn test_scalar_component_beside_a_collection(#[case] code: &str, #[case] expecte
 fn test_product_of_collections_is_a_record_of_tables() {
     check_collection_tile(
         "r = (a=[1, 2], b=[4, 5, 6]); r",
-        Tile::Record(
+        Tile::record(
             [
                 ("a".to_string(), make_int_list(&[1, 2])),
                 ("b".to_string(), make_int_list(&[4, 5, 6])),
@@ -361,7 +361,7 @@ fn test_list_of_records_holding_collections() {
         "xs = [(a=1, b=[1, 2]), (a=3, b=[4, 5])]; xs",
         Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
-            Box::new(Tile::Record(
+            Box::new(Tile::record(
                 [
                     ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
                     (
@@ -447,7 +447,7 @@ fn a_let_bound_partition_component_reaches_a_subst_defect() {
 fn test_a_filtered_component_keeps_the_domain_it_binds() {
     check_collection_tile(
         "r = (n=1, xs=[y for y in [1, 2, 3] if y > 2]); r",
-        Tile::Record(
+        Tile::record(
             [
                 ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
                 (

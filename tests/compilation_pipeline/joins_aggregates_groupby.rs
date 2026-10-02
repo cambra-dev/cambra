@@ -381,7 +381,7 @@ fn a_bare_groupby_tail_is_driven() {
     Tile::data_function(ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
             ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
-        ])), Box::new( Tile::Record(HashMap::from([
+        ])), Box::new( Tile::record(HashMap::from([
             ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10, 20, 10, 20]))),
             ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))),
         ]))), Predicate::Record(HashMap::from([
@@ -438,12 +438,12 @@ fn a_bare_groupby_tail_is_driven() {
 #[case(
     "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
     "iterate ≫ [1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⤇ ((Int, Int), (Int, Int)))",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::Record(HashMap::from([
-            ("_1".into(), Tile::Record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1, 2]), Box::new(Tile::record(HashMap::from([
+            ("_1".into(), Tile::record(HashMap::from([
                 ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
                 ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
             ]))),
-            ("_0".into(), Tile::Record(HashMap::from([
+            ("_0".into(), Tile::record(HashMap::from([
                 ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
                 ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
             ]))),
@@ -606,7 +606,7 @@ fn a_bare_groupby_tail_is_driven() {
             ("_0".into(), ColumnValue::UInts(vec![0, 1, 2])),
             ("_1".into(), ColumnValue::UInts(vec![2, 1, 0])),
             ("_2".into(), ColumnValue::UInts(vec![1, 0, 2])),
-        ])), Box::new(Tile::Record(HashMap::from([
+        ])), Box::new(Tile::record(HashMap::from([
             ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
             ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
         ]))), Predicate::Record(HashMap::from([
@@ -1022,7 +1022,7 @@ fn a_tuple_of_folds_pairs_at_the_group() {
         "#},
         Tile::data_function(
             ColumnValue::strings(&["east", "west"]),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![50, 300]))),
                 ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 6]))),
             ]))),
@@ -1051,7 +1051,7 @@ fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
         "#},
         Tile::data_function(
             ColumnValue::strings(&["east", "west"]),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 (
                     "_0".into(),
                     Tile::grouped(
@@ -1097,7 +1097,7 @@ fn per_region(value: Tile) -> Tile {
 
 /// A product of per-region columns, one `(field, [north, west])` pair per component.
 fn per_region_product(fields: &[(&str, [i64; 2])]) -> Tile {
-    per_region(Tile::Record(
+    per_region(Tile::record(
         fields
             .iter()
             .map(|(name, column)| {

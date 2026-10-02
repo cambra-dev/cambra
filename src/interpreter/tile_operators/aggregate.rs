@@ -358,7 +358,7 @@ impl TileProducer for MapExtractAggregateProducer {
         // non-terminal keys of that level go. Keeping the levels is what leaves a deeper
         // fold's grouping intact for the fold above it.
         let slot = output.deepest_values_mut();
-        let folded = std::mem::replace(slot, Tile::Record(HashMap::new()));
+        let folded = std::mem::replace(slot, Tile::record(HashMap::new()));
         let Tile::Aggregation {
             accumulator,
             terminal,

@@ -360,7 +360,7 @@ pub fn tile_to_canonical(tile: Tile) -> String {
             }
             format!("{}", Value::Function(bindings))
         }
-        Tile::Record(fields) => {
+        Tile::Record { fields, .. } => {
             // A tuple lowers to a record with `_0`/`_1`/… fields, so the two
             // render differently: positionally when every field is an index,
             // and `name: value` otherwise. Both orders are the field name's,

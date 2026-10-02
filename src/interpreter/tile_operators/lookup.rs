@@ -447,7 +447,7 @@ impl TileProducer for CheckedLookupProducer {
                     // One key: the scalar form `m[k]?`, the key pivoted to one column where
                     // it is a product. An empty column is a key that has not arrived, so
                     // there is nothing to answer.
-                    Tile::Scalar(_) | Tile::Record(_) => {
+                    Tile::Scalar(_) | Tile::Record { .. } => {
                         let keys = scalar_tile_to_column_value(key_tile);
                         if keys.is_empty() {
                             return empty;
@@ -485,7 +485,7 @@ impl TileProducer for CheckedLookupProducer {
                     return empty;
                 };
                 // The row shape, on the other hand, `Self::paired` has already checked.
-                let Tile::Record(fields) = codomain.as_ref() else {
+                let Tile::Record { fields, .. } = codomain.as_ref() else {
                     panic!(
                         "CheckedLookup: input rows are `(collection, key)` pairs; got {codomain:?}"
                     )
@@ -501,7 +501,7 @@ impl TileProducer for CheckedLookupProducer {
                 // so the scalar pair stream is not charged a copy of its keys per pull.
                 let key_col = match key_tile {
                     Tile::Scalar(col) => Cow::Borrowed(col),
-                    record @ Tile::Record(_) => {
+                    record @ Tile::Record { .. } => {
                         Cow::Owned(scalar_tile_to_column_value(record.clone()))
                     }
                     other => panic!(

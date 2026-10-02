@@ -43,9 +43,9 @@ const EXPECTED: [&str; 8] = [
 /// With `reads_n`, the second writer reads the final value of `n`. Its loop never
 /// runs, so `MapResultToConst` never pulls that value (see the laziness comment in
 /// `MapResultToConstProducer::get_impl`), and the `StoreDenseRead` under the
-/// `ExtractFinal` stays subscribed to the store's fan-out without ever releasing.
-/// That binding is unchanged across the reload, so it is kept, and it pins the
-/// fan-out's intersection at nothing.
+/// `ExtractFinal` reads the store's fan-out without taking anything. It releases once the
+/// loop is done: `MapResultToConst` releases its constant when its consumer releases
+/// everything.
 ///
 /// `mark` is the edit: it changes only the second writer.
 fn feed(source: &str, reads_n: bool, mark: &str) -> String {
@@ -153,8 +153,8 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
 }
 
-/// PINNED FAILURE. Every value decided before the swap is emitted a second time
-/// after it.
+/// PINNED FAILURE. The value at the cut is emitted twice, as in
+/// [`a_feed_repeats_the_position_the_recurrence_still_reads`].
 ///
 /// Correct at every cut from 0 to 10 pulls:
 ///
@@ -162,26 +162,27 @@ fn strings(values: &[&str]) -> Vec<String> {
 /// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
 /// ```
 ///
-/// Pinned: cuts 0 and 1 are correct, and cuts 2 to 10 replay the prefix. Three of
-/// them:
+/// Pinned: cuts 0 and 1 are correct, and each cut from 2 to 10 repeats the last value
+/// decided before the swap:
 ///
 /// ```text
-/// 2 pulls:  ["a", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 4 pulls:  ["a", "ab", "abc", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 10 pulls: ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh",
-///            "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
+/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
+/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
 /// ```
 ///
-/// The kept store's fan-out has a subscriber that never releases (see [`feed`]),
-/// so `FanOutShared::released` stays empty. The rebuilt tap reader is seeded with
-/// that, and the store has retained every tick, so the whole prefix is re-read.
+/// The second writer reads `n` without taking anything (see [`feed`]), and releases the
+/// store's fan-out once its empty loop is done, so the kept fan-out's release is what the
+/// recurrence has read: the rebuilt tap reader starts one position behind its predecessor.
 #[test]
-fn a_feed_replays_its_prefix_when_an_unpulled_sibling_holds_its_store() {
+fn a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut() {
     let pinned: Vec<Vec<String>> = (0..=10)
         .map(|pulls| match pulls {
             0 | 1 => strings(&EXPECTED),
-            // The values decided before the swap, then the whole feed again.
-            _ => strings(&[&EXPECTED[..(pulls - 1).min(8)], &EXPECTED[..]].concat()),
+            // The last value decided before the swap, twice.
+            _ => {
+                let decided = (pulls - 1).min(EXPECTED.len());
+                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
+            }
         })
         .collect();
     assert_cuts_pinned(&emitted_at_each_cut(true), &pinned);
@@ -226,8 +227,8 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
     assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
 }
 
-/// PINNED FAILURE through the real binary. The new version prints the values the
-/// old version already printed.
+/// PINNED FAILURE through the real binary. The new version prints again the last value
+/// the old version printed.
 ///
 /// With `a` and `b` sent before the reload and `c` after, correct:
 ///
@@ -238,13 +239,14 @@ fn a_feed_repeats_the_position_the_recurrence_still_reads() {
 /// Pinned:
 ///
 /// ```text
-/// ["a", "ab", "a", "ab", "abc"]
+/// ["a", "ab", "ab", "abc"]
 /// ```
 ///
-/// The program of `a_feed_replays_its_prefix_when_an_unpulled_sibling_holds_its_store`,
-/// over `stdin`, reloaded through `--control` at a quiet point between lines.
+/// The program of
+/// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
+/// `stdin`, reloaded through `--control` at a quiet point between lines.
 #[test]
-fn a_stdin_feed_replays_when_its_other_writer_is_edited() {
+fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
     let (reply, out) = stdin_across_reload(
         &feed("stdin()", true, ""),
         &feed("stdin()", true, "!"),
@@ -263,7 +265,7 @@ fn a_stdin_feed_replays_when_its_other_writer_is_edited() {
         .collect();
     assert_eq!(
         printed,
-        vec!["a", "ab", "a", "ab", "abc"],
+        vec!["a", "ab", "ab", "abc"],
         "the printed values changed. If the replay was fixed, pin the correct \
          [\"a\", \"ab\", \"abc\"] instead: {out}"
     );

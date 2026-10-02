@@ -1,55 +1,63 @@
-//! The two rewrites a **correlated** comprehension's `curry` site needs.
+//! A **correlated** comprehension's `curry` site, rewritten through `strength`.
 //!
 //! An inner comprehension whose body reads the outer binder runs once per outer row, and
 //! `lambda_elim` writes that as `curry(𝑔)` over the outer collection, where `𝑔` takes the pair
-//! `(outer value, inner element)`. Both rewrites read that pair.
+//! `(outer value, inner element)`. Op-conversion has no operator for `curry`, so planning
+//! rewrites each site to the combinators it compiles:
 //!
-//! **The inner source is named** ([`name_correlated_sources`]). The collection `curry`
-//! produces is over the second half of the pair, and the term does not say what its domain
-//! is: `𝑔` reaches the inner source only by applying it at the pair's `.1`, never by naming
-//! it.
+//! ```text
+//! curry(𝑔)  ⟹  ⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)
+//! ```
 //!
-//! A type answers only where it **gives** that domain. A list literal's is an index range,
-//! which `extent_of` reads straight off as a bound [`IterateExtent`] can enumerate. A map's
-//! is the present-key refinement `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`, and `extent_of`
-//! strips the refinement and answers the whole key type — unbounded, so nothing can iterate
-//! it, and the refinement that would have narrowed it is carried and never executed. The
-//! domain is in the data, so the term has to name it, and the site is rewritten to
-//! [`Builtin::CurryOver`], which does.
+//! `𝐾 : 𝐷 ⤇ 𝐷` is the collection the inner comprehension ranges over, holding its keys as its
+//! values, so `strength` ([`Builtin::Strength`]) pairs each outer value with each key, and
+//! `map(𝑔)` runs `𝑔` over the pairs. It is the rule `simplify` applies to a generator over a
+//! sum (`src/ccl/design/optimization.md`, "A generator over a sum composes with its source"),
+//! with a collection that is the same for every row: `const` shares one collection between
+//! all of them.
 //!
-//! **The filter riding the pair is emitted** ([`emit_pair_filter`]). `lambda_elim` puts a
-//! filter on the inner binder onto the pair, as a refinement on the product whose own
+//! **The filter riding the pair is emitted first** ([`emit_pair_filter`]). `lambda_elim` puts
+//! a filter on the inner binder onto the pair, as a refinement on the product whose own
 //! `__elem` binds both halves. Applying it is what is left: a refinement is a fact about the
 //! domain, and only a term filters. The site is a morphism under `curry` rather than an
 //! iteration site, so `planning::iterate`'s `iterate`-then-`restrict` chain never reaches
 //! it, and `filter_values` is emitted here instead.
 //!
-//! **A body that never applies the inner source leaves nothing to name**, and is the second
-//! of the two routes rather than a failure of the first. `sum([r for v in xs])` under a
-//! correlated site reads the outer binder alone, so `𝑔` is `.0` and the source occurs
-//! nowhere in the term. Such a site keeps its `curry`, and op-conversion reads the domain
-//! off the type instead.
+//! **`𝐾` is the inner source where the body names one.** `𝑔` reaches the inner source only by
+//! applying it at the pair's `.1`, and that source re-viewed at its own domain,
+//! `map_domain(𝑠)`, is `𝐾`. A type cannot stand in for it in general: a list literal's
+//! domain is an index range, which `extent_of` reads straight off as a bound
+//! [`IterateExtent`] can enumerate, but a map's is the present-key refinement
+//! `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`, whose keys are in the data.
 //!
-//! A map whose body never applies it is therefore served by neither — but that is not a
-//! property of these two routes. The same program without an enclosing comprehension fails
-//! as well (`a_map_comprehension_that_ignores_the_element_does_not_compile`): a collection
-//! reached only through its carried `collection_contains` is a gap this module neither
-//! creates nor closes.
+//! **A body that never applies the inner source leaves nothing to name.** `sum([r for v in
+//! xs])` under a correlated site reads the outer binder alone, so `𝑔` is `.0` and the source
+//! occurs nowhere in the term. `𝐾` is then `iterate` over the type's domain, which answers
+//! for a list literal. A map read that way is refused by name.
+//!
+//! **A dependent site stays one node.** A correlated filter narrows the inner domain by the
+//! outer value, so `curry(𝑔)`'s type is `(𝑟 : 𝑋) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑊)`, and the chain has
+//! no spelling for it. Such a site becomes `(𝐾, 𝑔) ▷ curry_over` under that type
+//! ([`Builtin::CurryOver`]), and op-conversion builds the operators the chain compiles to.
+//!
+//! A map whose body never applies it is therefore not served — but that is not a property of
+//! this rewrite. The same program without an enclosing comprehension fails as well
+//! (`a_map_comprehension_that_ignores_the_element_does_not_compile`): a collection reached
+//! only through its carried `collection_contains` is a gap this module neither creates nor
+//! closes.
 
 use super::*;
 use std::rc::Rc;
 
 use crate::ccl::TypedExpr;
+use crate::ccl::lambda_elim::zip_pair;
 
 use super::predicates::fn_of_bare_predicate;
 
-/// Rewrite every correlated curry site to name its inner source.
+/// Emit the filter riding every correlated `curry` site's pair ([`emit_pair_filter`]).
 ///
-/// Runs before the iteration-site walk, so the `map_domain` this mints is marked like any
-/// other iteration source.
-pub(super) fn name_correlated_sources(expr: &mut Expr) {
-    // Before the naming below, which reads the pair domain's second component: a filter
-    // riding that component is part of the domain this site iterates.
+/// Runs before planning's first `simplify`, which reads the pair domain the filter leaves.
+pub(super) fn emit_correlated_filters(expr: &mut Expr) {
     let node_id = expr.node_id();
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && is_builtin(function, Builtin::Curry)
@@ -64,61 +72,151 @@ pub(super) fn name_correlated_sources(expr: &mut Expr) {
             function.ty = Type::fun(argument.ty.clone(), expr.ty.clone());
         }
     }
+    expr.walk_children_mut(emit_correlated_filters);
+}
+
+/// Rewrite every correlated `curry` site through `strength`.
+///
+/// Runs after planning's first `simplify`, so a `curry` exponential eta reduces is gone
+/// first, and before the iteration-site walk, so the `map_domain` this mints is marked like
+/// any other iteration source.
+pub(super) fn pair_correlated_sites(expr: &mut Expr) -> Result<(), String> {
     let rewritten = {
         let _g = provenance::enter(
             expr.node_id(),
             "planning.correlated",
             provenance::Nature::Machinery,
         );
-        name_inner_source(expr)
+        through_strength(expr)?
     };
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
     }
-    expr.walk_children_mut(name_correlated_sources);
+    let mut result = Ok(());
+    expr.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = pair_correlated_sites(child);
+        }
+    });
+    result
 }
 
-/// `curry(𝑔)` rewritten to `(map_domain(𝑠), 𝑔) ▷ curry_over`, where `𝑠` is the collection
-/// `𝑔` applies at the pair's second component.
-///
-/// `map_domain` and not `𝑠` itself: [`Builtin::CurryOver`] reads the domain off its source's
-/// codomain, and a collection carries values there. Re-viewing it at its own domain is what
-/// puts the keys where they are read.
-fn name_inner_source(expr: &Expr) -> Option<Expr> {
+/// `curry(𝑔)` rewritten to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`, `𝐾` being the
+/// collection the site ranges over (the module doc says which). `None` where `expr` is not a
+/// correlated site: a `curry` of a builtin is a partial application, which op-conversion
+/// compiles as one.
+fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     let TypedExprNode::Apply {
         argument: g,
         function,
     } = &expr.node
     else {
-        return None;
+        return Ok(None);
     };
-    if !is_builtin(function, Builtin::Curry) {
-        return None;
+    if !is_builtin(function, Builtin::Curry) || matches!(g.node, TypedExprNode::Builtin(_)) {
+        return Ok(None);
     }
-    let Some(Type::Tuple(pair)) = g.ty.domain().map(|d| d.peel_refinements().clone()) else {
-        return None;
+    let Some(Type::Tuple(pair)) = g.ty.domain() else {
+        return Err(format!(
+            "a curried morphism takes the pair of what it is curried over and what it \
+             iterates, so its domain is a two-element tuple; got {}",
+            g.ty
+        ));
     };
-    let [_, component] = pair.as_slice() else {
-        return None;
+    let [enclosing, component] = pair.as_slice() else {
+        return Err(format!(
+            "a curried morphism's domain pairs exactly two, got {}",
+            g.ty
+        ));
     };
     // The component states what the element is, which includes a filter reading only the
-    // element; the source's domain is its keys before any filter. The filter rides the pair
-    // as well, which is the copy planning applies, so the source is matched — and its keys
-    // re-viewed — at the component's membership alone.
-    let inner_domain = &collection_domain(component);
-    let source = inner_source(g, inner_domain)?;
-    let source_ty = Type::data_fun(inner_domain.clone(), inner_domain.clone());
-    // A **recorded copy**: the source stays where it is inside `𝑔`, which applies it at each
-    // element, and this second occurrence re-views it at its domain. `Clone` re-mints the
-    // ids and the frame records the parentage, as entry iteration's kept collection does.
-    let copy = {
-        let _frame = provenance::copy_frame("planning.correlated_source");
-        source.clone()
+    // element; the domain ranged over is the keys before any filter. The filter rides the
+    // pair as well, which [`emit_pair_filter`] has applied, so the collection is matched — and
+    // its keys enumerated — at the component's membership alone.
+    let inner_domain = collection_domain(component);
+    let keys = match inner_source(g, &inner_domain) {
+        Some(source) => {
+            // A **recorded copy**: the source stays where it is inside `𝑔`, which applies it
+            // at each element, and this second occurrence re-views it at its domain. `Clone`
+            // re-mints the ids and the frame records the parentage, as entry iteration's kept
+            // collection does.
+            let copy = {
+                let _frame = provenance::copy_frame("planning.correlated_source");
+                source.clone()
+            };
+            apply_primitive(
+                copy,
+                Builtin::MapDomain,
+                Type::data_fun(inner_domain.clone(), inner_domain.clone()),
+            )
+        }
+        None if inner_domain
+            .refinements()
+            .iter()
+            .any(|r| r.is_collection_membership()) =>
+        {
+            return Err(format!(
+                "a correlated inner comprehension over a collection its body never applies is \
+                 not supported yet: its domain {inner_domain} is a present-key proof over the \
+                 whole key type, which nothing enumerates"
+            ));
+        }
+        None => make_iterate(trivially_true_predicate(inner_domain.clone())),
     };
-    let keys = apply_primitive(copy, Builtin::MapDomain, source_ty.clone());
-    let pair = Expr::tuple(vec![keys, g.as_ref().clone_preserving_ids()])
-        .with_ty(Type::Tuple(vec![source_ty, g.ty.clone()]));
-    Some(apply_primitive(pair, Builtin::CurryOver, expr.ty.clone()))
+    // **A dependent site** — a correlated filter narrows the inner domain by the outer
+    // value, `(𝑟 : 𝑋) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑊)` — has no spelling as a chain: the narrowed
+    // domain names the chain's input, which no element after the first takes. It stays one
+    // node, `(𝐾, 𝑔) ▷ curry_over`, under `curry`'s own type, and op-conversion builds the
+    // same operators the chain compiles to.
+    if matches!(&expr.ty, Type::Fun { name: Some(_), .. }) {
+        let keys_ty = keys.ty.clone();
+        let pair = Expr::tuple(vec![keys, g.as_ref().clone_preserving_ids()])
+            .with_ty(Type::Tuple(vec![keys_ty, g.ty.clone()]));
+        return Ok(Some(apply_primitive(
+            pair,
+            Builtin::CurryOver,
+            expr.ty.clone(),
+        )));
+    }
+    let Some(curried) = expr.ty.codomain() else {
+        unreachable!("`curry(𝑔)` is a function, got {}", expr.ty)
+    };
+    let Type::Fun { fun_kind, .. } = &expr.ty else {
+        unreachable!("`curry(𝑔)` is a function, got {}", expr.ty)
+    };
+    let collection = keys.ty.clone();
+    let strengthened = Type::fun_like(
+        &collection,
+        inner_domain.clone(),
+        Type::Tuple(vec![enclosing.clone(), inner_domain.clone()]),
+    );
+    // Over the collection's own domain. `curry(𝑔)`'s type can be dependent — a correlated
+    // filter narrows the inner domain by the outer value, `(𝑟 : 𝑋) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑊)` —
+    // and only the whole chain stands under that binder.
+    let mapped = curried;
+    let with_keys = zip_pair(
+        id().with_ty(Type::fun(enclosing.clone(), enclosing.clone())),
+        apply_primitive(
+            keys,
+            Builtin::Const,
+            Type::fun(enclosing.clone(), collection.clone()),
+        ),
+        fun_kind,
+    );
+    let strength = Expr::builtin(Builtin::Strength).with_ty(Type::fun(
+        Type::Tuple(vec![enclosing.clone(), collection]),
+        strengthened.clone(),
+    ));
+    // `map`'s stamp takes the pairs `strength` makes, which is what the rewritten chain feeds
+    // it; `𝑔` keeps the pair type it was written at, as it did under `curry`.
+    let map = apply_primitive(
+        g.as_ref().clone_preserving_ids(),
+        Builtin::Map,
+        Type::fun(strengthened, mapped),
+    );
+    Ok(Some(
+        Expr::compose(vec![with_keys, strength, map]).with_ty(expr.ty.clone()),
+    ))
 }
 
 /// `component` with only its collection-membership refinements: the domain of the collection

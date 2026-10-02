@@ -297,17 +297,44 @@ fn a_comprehension_over_a_witness_domained_collection_composes_with_it() {
 
 /// A correlated comprehension over a witness-domained collection: the inner comprehension
 /// iterates the outer row and reads it again, so each row's collection is composed with a
-/// function of that row. `[1, 2]` gives `3 + 4` and `[3, 4, 5]` gives `8 + 9 + 10`.
-#[test]
-fn a_correlated_comprehension_over_a_witness_domained_collection() {
-    check_scalar(
-        indoc! {r"
-            def f(xs: List(List(Int))):
-                sum([sum([v + max(r) for v in r]) for r in xs])
-            f(box([box([1,2]), box([3,4,5])]))
-        "},
-        Value::Int(34),
-    );
+/// function of that row, through `strength` (`src/ccl/design/optimization.md`, "A generator
+/// over a sum composes with its source").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// `[1, 2]` gives `3 + 4` and `[3, 4, 5]` gives `8 + 9 + 10`.
+#[case::rows(
+    indoc! {r"
+        def f(xs: List(List(Int))):
+            sum([sum([v + max(r) for v in r]) for r in xs])
+        f(box([box([1,2]), box([3,4,5])]))
+    "},
+    34
+)]
+// A row holding nothing pairs nothing, and its sum is the identity: `[1, 2]` gives
+// `(1 + 3) + (2 + 3)` and `[]` gives 0.
+#[case::an_empty_row(
+    indoc! {r"
+        def f(xs: List(List(Int))):
+            sum([sum([v + sum(r) for v in r]) for r in xs])
+        f(box([box([1,2]), box([])]))
+    "},
+    9
+)]
+// Values that are collections of their own pair with their row whole. `[[1, 2], [3]]` gives
+// `(3 + 3) + (3 + 3)` and `[[4]]` gives `4 + 4`.
+#[case::values_holding_a_level(
+    indoc! {r"
+        def f(xs: List(List(List(Int)))):
+            sum([sum([sum(v) + max([sum(u) for u in r]) for v in r]) for r in xs])
+        f(box([box([box([1, 2]), box([3])]), box([box([4])])]))
+    "},
+    20
+)]
+fn a_correlated_comprehension_over_a_witness_domained_collection(
+    #[case] code: &str,
+    #[case] total: i64,
+) {
+    check_scalar(code, Value::Int(total));
 }
 
 /// **A `let`-bound row reaches a jagged position written in place.** Inlining moves a

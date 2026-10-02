@@ -33,6 +33,43 @@ pub enum TileGuard {
 }
 
 impl TileGuard {
+    /// The part of this guard naming a record's scalar field at some of the rows of a level:
+    /// cells a producer stops returning once released, though their row stays open
+    /// (`src/interpreter/design-operators.md`, "The release contract"). Everything else
+    /// becomes empty, so `None` where there is no such part.
+    pub(crate) fn released_cells(&self) -> Option<TileGuard> {
+        fn walk(guard: &TileGuard, under_a_level: bool) -> TileGuard {
+            match guard {
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                    TileGuard::Function(FunctionGuard::Codomain(Box::new(walk(inner, true))))
+                }
+                TileGuard::Record(fields) => TileGuard::Record(
+                    fields
+                        .iter()
+                        .map(|(name, field)| {
+                            let part = match field {
+                                TileGuard::Scalar(_) if under_a_level => field.clone(),
+                                TileGuard::Scalar(_) => TileGuard::Scalar(Predicate::False),
+                                other => walk(other, under_a_level),
+                            };
+                            (name.clone(), part)
+                        })
+                        .collect(),
+                ),
+                TileGuard::Or(arms) => {
+                    TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, under_a_level)).collect())
+                }
+                TileGuard::Function(FunctionGuard::Domain(_)) => {
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::False))
+                }
+                TileGuard::Scalar(_) => TileGuard::Scalar(Predicate::False),
+                TileGuard::Aggregation(_) => TileGuard::Aggregation(Predicate::False),
+            }
+        }
+        let part = walk(self, false);
+        (!part.is_empty()).then_some(part)
+    }
+
     /// A keyless leaf named under every path, or under none.
     pub fn leaf(whole: bool) -> Predicate {
         match whole {

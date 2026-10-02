@@ -1763,22 +1763,6 @@ fn convert_impl_inner(
                 }
             }
             while let [elem, after @ ..] = rest {
-                // `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose` — each row's own collection `𝑆` composed with
-                // `𝑔` at that row, which is what a generator over a sum that reads its
-                // enclosing scope eliminates to.
-                if let [next, ..] = after
-                    && as_builtin(next) == Some(Builtin::Compose)
-                    && let Some((source, curried)) = zip_pair(elem)
-                    && let TypedExprNode::Apply {
-                        argument: morphism,
-                        function,
-                    } = &curried.node
-                    && as_builtin(function) == Some(Builtin::Curry)
-                {
-                    result = Some(compose_per_row(source, morphism, result.take(), ctx)?);
-                    rest = &after[1..];
-                    continue;
-                }
                 result = Some(convert_impl(elem, result.take(), ctx)?);
                 rest = after;
             }
@@ -2444,77 +2428,32 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             };
-            let inner = convert_impl(source, None, ctx)?;
-            let pairs = Box::new(Product::shared_at(outer, inner, ctx.level()));
-            // The morphism runs once per pair, over the inner iteration `Product` appends.
+            // `⟨id, const(𝐾)⟩ ▷ zip ≫ strength`, the chain planning writes where the site's
+            // type is not dependent: each row beside the one collection every row reads.
+            let keys = convert_impl(source, None, ctx)?;
+            let with_keys = Box::new(MapResultToConst::new_at(
+                outer,
+                keys,
+                MapResultToConstMode::ZipRight,
+                ctx.level(),
+            ));
+            let pairs = strength_at(with_keys, ctx.level())?;
+            // The morphism runs once per pair, over the iteration `strength` appends.
             convert_lifted(morphism, Some(pairs), ctx)
         }
 
-        // **A correlated inner comprehension**: `curry(𝑔)` composed onto the outer collection,
-        // where `𝑔` takes the pair `(outer value, inner element)` because the inner body reads
-        // the outer binder. Running `𝑔` once per pair and grouping by the outer row is a
-        // collection per row, which is what [`Product`] emits and what `𝑔` then compiles over
-        // like any other morphism over a stream. An uncorrelated inner comprehension never
-        // reaches here: its body closes over nothing outer, so lambda elimination leaves a
-        // `const` and no pair.
-        //
-        // The inner side comes from the type, which is what makes it the same set for every
-        // row. A per-row inner collection is the same output shape from a different builder
-        // (`src/interpreter/design-operators.md`, "Where a collection is materialized").
+        // A curried morphism composed onto a collection is a correlated inner comprehension,
+        // which planning rewrites through `strength` (`src/ccl/planning/correlated.rs`). One
+        // reaching here is a site planning did not rewrite.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Curry)
                 && input.is_some()
                 && as_builtin(argument).is_none() =>
         {
-            let outer = expect_input(input, "curry")?;
-            // **The domain read off the type is the whole of what this site iterates**, so a
-            // refinement on it is one nothing here applies: `extent_of` strips it. A filter
-            // on the pair is planning's to emit as a term (`planning/correlated.rs`), and one
-            // left standing would drop silently. A present-key proof on the inner component
-            // says the domain is in the data, which the type cannot enumerate; planning names
-            // such a source, and one it did not name reaches here.
-            let domain = argument.ty.domain();
-            let unapplied = |what: &str| {
-                ConversionError::Unsupported(format!(
-                    "a correlated inner comprehension whose {what} is not supported yet: the \
-                     inner domain is read off the type {}, which cannot apply it",
-                    argument.ty
-                ))
-            };
-            if domain.as_ref().is_some_and(|d| !d.refinements().is_empty()) {
-                return Err(unapplied("pair carries a filter planning did not emit"));
-            }
-            let Some(Type::Tuple(pair)) = domain else {
-                return Err(ConversionError::TypeError(format!(
-                    "a curried morphism takes the pair of what it is curried over and what it \
-                     iterates, so its domain is a two-element tuple; got {}",
-                    argument.ty
-                )));
-            };
-            let [_, inner] = pair.as_slice() else {
-                return Err(ConversionError::TypeError(format!(
-                    "a curried morphism's domain pairs exactly two, got {}",
-                    argument.ty
-                )));
-            };
-            if inner
-                .refinements()
-                .iter()
-                .any(|r| r.is_collection_membership())
-            {
-                return Err(unapplied("source is a collection planning did not name"));
-            }
-            if !inner.refinements().is_empty() {
-                return Err(unapplied("inner domain carries a filter"));
-            }
-            let inner = ctx.extent_of(inner)?;
-            let pairs = Box::new(Product::shared_at(
-                outer,
-                Box::new(IterateExtent::new(inner)),
-                ctx.level(),
-            ));
-            // 𝑔 runs once per pair, over the inner iteration `Product` appends.
-            convert_lifted(argument, Some(pairs), ctx)
+            Err(ConversionError::Unsupported(format!(
+                "a curried morphism planning did not rewrite through `strength`: `{}`",
+                symbolic(expr)
+            )))
         }
 
         TypedExprNode::Apply { argument, function } => {
@@ -2618,6 +2557,11 @@ fn convert_impl_inner(
             let input = expect_input(input, &format!("Builtin({})", b.name()))?;
             match b {
                 Builtin::Id => Ok(input),
+                // `strength`: each enclosing value paired with each value of its own
+                // collection, under that value's key. Its input is the pair `⟨id, 𝑆⟩ ▷ zip`
+                // made, one per row of the level it is converted at, so the two halves are
+                // that pair's fields.
+                Builtin::Strength => strength_at(input, ctx.level()),
                 // Entering a **described** sum is the identity at runtime. A sum's value is
                 // a domain paired with a collection over it, and a collection carries its
                 // own domain — so a described witness is recoverable from the value and
@@ -3126,7 +3070,7 @@ fn list_levels(elts: &[&Expr], elt_extent: &Extent) -> Result<(Tile, Tiling), Co
                 tiles.insert(name.clone(), tile);
                 tilings.insert(name.clone(), tiling);
             }
-            Ok((Tile::Record(tiles), Tiling::Record(tilings)))
+            Ok((Tile::record(tiles), Tiling::Record(tilings)))
         }
         _ => {
             let mut values = Vec::with_capacity(elts.len());
@@ -5158,6 +5102,22 @@ fn proj_field(
     )))
 }
 
+/// `strength` over `input`, a pair `(𝑥, 𝐶)` at each row of `level`: each `𝑥` beside each value
+/// of its row's collection `𝐶`, under that value's key.
+fn strength_at(
+    input: Box<dyn TileOperator>,
+    level: CurryLevel,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let pair = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+    let rows = proj_field(pair.branch(), 0, level)?;
+    let collections = proj_field(pair.branch(), 1, level)?;
+    Ok(Box::new(Product::per_row_values_at(
+        rows,
+        collections,
+        level,
+    )))
+}
+
 /// The builtin under a `curry`, if `expr` is `curry(b)` — `Apply { argument: Builtin(b),
 /// function: Builtin(Curry) }`. A partial application of a tupled builtin is the only shape
 /// `Curry` takes that op-conversion compiles.
@@ -5502,40 +5462,6 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
         [source, default] => Some((source, default)),
         _ => None,
     }
-}
-
-/// `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose` over the rows `input`: at each row `𝑥`, the collection
-/// `𝑆(𝑥)` with `𝑔(𝑥, 𝑣)` in place of each value `𝑣` (`src/ccl/design/optimization.md`, "A
-/// generator over a sum composes with its source").
-///
-/// [`Product::per_row_values_at`] pairs each row with the values of its own collection, keyed
-/// by that collection's keys, and `𝑔` runs once per pair over the level that adds.
-fn compose_per_row(
-    source: &Expr,
-    morphism: &Expr,
-    input: Option<Box<dyn TileOperator>>,
-    ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let rows = expect_input(input, "compose")?;
-    let fan = Rc::new(FanOut::new(Box::new(Memo::new(rows))));
-    let collections = convert_impl(source, Some(fan.branch()), ctx)?;
-    let paired = ctx.level();
-    match collections.tiling().values_at(paired) {
-        Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level() => {}
-        other => {
-            return Err(ConversionError::Unsupported(format!(
-                "composing a function with each row's own collection pairs the row with the \
-                 collection's values, which a column can hold only when they carry no level; \
-                 got {other}"
-            )));
-        }
-    }
-    let pairs = Box::new(Product::per_row_values_at(
-        fan.branch(),
-        collections,
-        paired,
-    ));
-    convert_lifted(morphism, Some(pairs), ctx)
 }
 
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
@@ -6138,7 +6064,7 @@ mod variant_ctor_tests {
             panic!("expected Function, got {tile:?}");
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
-        let Tile::Record(fields) = *codomain else {
+        let Tile::Record { fields, .. } = *codomain else {
             panic!("expected a record codomain, got {codomain:?}");
         };
         // Each row keeps its own outer `time` (10, 20) paired with its own commit
