@@ -1777,7 +1777,7 @@ fn a_block_writing_only_a_read_only_store_mate_of_an_await_rejected() {
 // programs can agree on every number and differ in how many stores they built.
 // ---------------------------------------------------------------------------
 
-/// The `Transact` carriers in a planned program, as `domain[keys]`, **outermost
+/// The `Transact`s in a planned program, as `domain[keys]`, **outermost
 /// first**. Reads the *structure* the value tests cannot see — a `Txn` domain is a
 /// commit store, an extent domain an induction loop, and the order is the nesting.
 fn stores_in(ast: &cambra::ccl::Expr) -> Vec<String> {
@@ -1974,7 +1974,7 @@ fn a_defer_fed_by_a_read_only_block_is_consumed_inside_its_store() {
 /// nesting: `cnt` is an induction accumulator a commit decision reads, so its letrec has
 /// to be outside the store that reads it. With two stores to be outside of, the fold
 /// stays **outermost**, wrapping the whole nest rather than interleaving — which is why
-/// the carriers come out induction-first. `a` accumulates 1 + 2 = 3 as `cnt` reaches 2;
+/// the `Transact`s come out induction-first. `a` accumulates 1 + 2 = 3 as `cnt` reaches 2;
 /// `b` is untouched by any of it.
 #[test]
 fn a_cross_domain_read_coexists_with_a_second_store() {
@@ -2028,7 +2028,7 @@ fn a_writer_source_may_be_computed_from_an_earlier_store_s_await() {
 /// A cross-domain accumulator that itself **depends on an await** does not go
 /// outermost. `acc` is seeded from `await_final(a)`, so its letrec has to be inside
 /// `a`'s store — while still being outside `b`'s store, which reads it. The store list
-/// is the assertion: the induction carrier sits *between* the two commit stores rather
+/// is the assertion: the induction `Transact` sits *between* the two commit stores rather
 /// than wrapping both.
 ///
 /// The two demands cannot conflict. `a`'s writers all precede the await (a later

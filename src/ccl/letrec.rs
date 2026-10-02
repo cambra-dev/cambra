@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::ccl::{Builtin, Name, TypedBinding, TypedExpr, TypedExprNode};
+use crate::ccl::{Builtin, Name, ProjKey, TypedBinding, TypedExpr, TypedExprNode};
 
 /// A non-causal cycle in a letrec group's reference graph: following these
 /// bindings' bodies leads back to the start without ever passing through a
@@ -162,10 +162,11 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
             // elements naming the group would read one at a position derived from the
             // other's output, which is outside the accessor.
             //
-            // A selector is a projection, which picks a component and reads no position.
-            // Any other group-free morphism there could compute the position the accessor
-            // consults — a shift `𝑓: D ⇒ D` ahead of the history reads it at `𝑓(𝑝)` — so
-            // it is not admitted.
+            // A selector is the projection onto the enclosing component of the
+            // `(enclosing, position)` parameter, `.0`, which reads no position; a deeper
+            // nest selects with several. Any other group-free morphism there could compute
+            // the position the accessor consults — `.1` is the position itself, and a shift
+            // `𝑓: D ⇒ D` ahead of the history reads it at `𝑓(𝑝)` — so it is not admitted.
             let names_the_group = |e: &TypedExpr| {
                 let mut r = BTreeSet::new();
                 collect_noncausal_refs(e, live, &mut r);
@@ -176,7 +177,7 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
             };
             elts[..at]
                 .iter()
-                .all(|e| matches!(&e.node, TypedExprNode::Proj(_)))
+                .all(|e| matches!(&e.node, TypedExprNode::Proj(ProjKey::Index(0))))
                 && !elts[at + 1..].iter().any(names_the_group)
                 && is_causal_history_slot(&elts[at], live)
         }

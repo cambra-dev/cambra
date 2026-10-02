@@ -257,7 +257,7 @@ pub(super) fn outer_binding_write_error(span: Span, name: &str) -> LoweringError
 /// cannot sequence.
 ///
 /// A mutable variable scoped to one iteration is a recurrence nested inside the loop's,
-/// which is the carrier a nest builds ([`body_introduced_mut_vars`]). Two introductions
+/// which is the nested `Transact` a nest builds ([`body_introduced_mut_vars`]). Two introductions
 /// are not that: a **transactional** one, sequenced by commit time rather than by the loop
 /// around it, and one in a *generator* body, whose statements the yield path lowers
 /// without a recurrence.
@@ -885,64 +885,6 @@ pub(super) fn first_outer_plain_assign<'a>(
     })
 }
 
-/// Recursively search `stmts` for any assignment that mutates a name
-/// in `mutation_scope`, descending into the bodies of nested `if` /
-/// `for` statements.  Returns the first such name found.
-///
-/// Used by [`lower_middle_stmt`] to distinguish "this for-body has no
-/// supported mutation pattern" from "this for-body has a mutation
-/// pattern we don't yet support (nested inside control flow)", so the
-/// latter can produce a targeted error rather than the generic
-/// generator-for fallback's "must end in yield" message.
-pub(super) fn find_nested_mutation_var(
-    stmts: &[Spanned<ChlStmt>],
-    mutation_scope: &HashSet<String>,
-) -> Option<String> {
-    for stmt in stmts {
-        if let Some(name) = mutation_target_name(stmt)
-            && mutation_scope.contains(name)
-        {
-            return Some(name.to_string());
-        }
-        match &stmt.node {
-            ChlStmt::If {
-                branches,
-                else_body,
-            } => {
-                for branch in branches {
-                    if let Some(n) = find_nested_mutation_var(&branch.body, mutation_scope) {
-                        return Some(n);
-                    }
-                }
-                if let Some(else_body) = else_body
-                    && let Some(n) = find_nested_mutation_var(else_body, mutation_scope)
-                {
-                    return Some(n);
-                }
-            }
-            ChlStmt::Match { arms, .. } => {
-                for arm in arms {
-                    if let Some(n) = find_nested_mutation_var(&arm.body, mutation_scope) {
-                        return Some(n);
-                    }
-                }
-            }
-            ChlStmt::For { body, .. } => {
-                if let Some(n) = find_nested_mutation_var(body, mutation_scope) {
-                    return Some(n);
-                }
-            }
-            _ => {}
-        }
-        if let Some(inner) = block_value_stmt(stmt)
-            && let Some(n) = find_nested_mutation_var(std::slice::from_ref(inner), mutation_scope)
-        {
-            return Some(n);
-        }
-    }
-    None
-}
-
 /// The `for` statement a loop-lowering entry point is lowering: everything the
 /// statement itself says, as against the continuation and the generator defer
 /// the caller supplies.
@@ -969,7 +911,7 @@ pub(super) struct ForSite<'a> {
 ///
 /// [`for_body_has_with`] asks only about the body's own statements, which is what
 /// routes a loop carrying a transaction. This asks the transitive question an inner
-/// loop needs: a commit site anywhere inside it is one the nested carrier cannot key.
+/// loop needs: a commit site anywhere inside it is one the nested `Transact` cannot key.
 fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
     stmts.iter().any(|stmt| match &stmt.node {
         ChlStmt::With { .. } => true,
@@ -1026,7 +968,7 @@ fn lower_nested_loop(
         outer_bindings,
         for_span,
     } = site;
-    // A commit site is keyed on the loop that encloses it, and a nested carrier does
+    // A commit site is keyed on the loop that encloses it, and a nested `Transact` does
     // not yet carry one: `transact_phase` strips each `Begin` against a single
     // enclosing loop, and the accumulator scan does not enter a `with` block, so an
     // inner loop around one loses its own iteration rather than sequencing it. Refuse
@@ -1083,7 +1025,7 @@ fn lower_nested_loop(
                 name: iter_var.into(),
                 ty: Type::Hole,
                 user_annotation: None,
-                transparency: crate::ccl::BindingTransparency::Transparent,
+                transparency: BindingTransparency::Transparent,
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -1098,7 +1040,7 @@ fn lower_nested_loop(
 /// A `:=` naming something the loop does not already accumulate declares a mutable
 /// variable scoped to one iteration of this loop. Its sequencing domain is whatever
 /// writes it — an inner `for`, or the rest of this body — so it is a recurrence nested
-/// inside this one, which is the carrier a nest already builds.
+/// inside this one, which is the nested `Transact` a nest already builds.
 ///
 /// A later `:=` to the same name is a write to what the first one introduced, so only the
 /// first statement index is recorded.

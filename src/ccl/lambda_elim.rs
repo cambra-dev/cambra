@@ -1409,6 +1409,14 @@ fn elim_lambda_impl(
             let calls: Vec<(Name, Expr)> = bindings
                 .iter()
                 .map(|(b, _)| {
+                    debug_assert!(
+                        !crate::ccl::ccl_utils::is_free_in_type(param, &b.ty),
+                        "a nested recurrence's history type does not depend on the enclosing \
+                         parameter `{param}`, so each reference to it is typed `𝑃 ⇒ 𝑇`: `{}` \
+                         has type {}",
+                        b.name,
+                        b.ty
+                    );
                     let hist_ty = Type::fun(param_ty.clone(), b.ty.clone());
                     let call = Expr::apply(
                         Expr::var(param).with_ty(param_ty.clone()),

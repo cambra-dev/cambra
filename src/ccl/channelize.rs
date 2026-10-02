@@ -581,22 +581,43 @@ fn contains_defer(expr: &Expr) -> bool {
 /// per position of that loop — which is what the loop's tap holds. Inside a **nest** the
 /// enclosing tap holds the inner loop's whole tap collection per enclosing position, one
 /// level per level the feed sits under, so the contribution arrives curried. Flattening
-/// each level away is what makes the channel the innermost positions rather than the
-/// groups they fall into.
-fn flatten_nested_contribution(mut value: Expr) -> Expr {
-    while let Type::Fun {
-        fun_kind: FunKind::Data(_),
-        domain: outer,
-        codomain: inner,
-        ..
-    } = value.ty.peel_refinements()
-        && let Type::Fun {
+/// each of those levels away is what makes the channel the innermost positions rather than
+/// the groups they fall into.
+///
+/// The levels a feed sits under are the contribution's levels beyond one over `element`,
+/// what one `<<` appends. A fed value may hold collections of its own, and those levels are
+/// the element's: `out << [[1, 2], [3]]` appends a collection of collections whole, so
+/// nothing of it is flattened.
+fn flatten_nested_contribution(mut value: Expr, element: Option<&Type>) -> Expr {
+    let Some(element) = element else {
+        assert!(
+            data_levels(&value.ty) < 2,
+            "a nested feed contribution needs its handle's element type to say which of its \
+             levels are positions: {}",
+            value.ty
+        );
+        return value;
+    };
+    let surplus = data_levels(&value.ty).saturating_sub(data_levels(element) + 1);
+    for _ in 0..surplus {
+        let Type::Fun {
+            fun_kind: FunKind::Data(_),
+            domain: outer,
+            codomain: inner,
+            ..
+        } = value.ty.peel_refinements()
+        else {
+            unreachable!("`data_levels` counted this level")
+        };
+        let Type::Fun {
             fun_kind: FunKind::Data(_),
             domain: keys,
             codomain: elem,
             ..
         } = inner.peel_refinements()
-    {
+        else {
+            unreachable!("`data_levels` counted this level")
+        };
         let flattened = Type::data_fun(
             Type::Tuple(vec![(**outer).clone(), (**keys).clone()]),
             (**elem).clone(),
@@ -604,6 +625,18 @@ fn flatten_nested_contribution(mut value: Expr) -> Expr {
         value = apply_primitive(value, Builtin::Uncurry, flattened);
     }
     value
+}
+
+/// How many data-function levels `ty` nests, outermost first.
+fn data_levels(ty: &Type) -> usize {
+    match ty.peel_refinements() {
+        Type::Fun {
+            fun_kind: FunKind::Data(_),
+            codomain,
+            ..
+        } => 1 + data_levels(codomain),
+        _ => 0,
+    }
 }
 
 /// Return `true` if `expr` contains any `Feed(target, …)` or
@@ -765,6 +798,11 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
         },
         _ => None,
     }
+}
+
+/// The element type of a feed handle: what one `<<` appends.
+fn handle_element(ty: &Type) -> Option<Type> {
+    ty.as_feed().map(|(_, element)| element.clone())
 }
 
 /// the channel domain carried by an assembled channel's
@@ -1477,6 +1515,14 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
             {
                 chan_names.insert(binding.name.clone(), n);
             }
+            // And each defer's element type, which says how many of a contribution's levels
+            // are the loops it was fed under ([`flatten_nested_contribution`]).
+            let mut elements: HashMap<Name, Type> = HashMap::new();
+            if let Some(element) =
+                handle_element(&binding.ty).or_else(|| handle_element(&bound_expr.ty))
+            {
+                elements.insert(binding.name.clone(), element);
+            }
             let mut defer_names = vec![binding.name];
             let mut current_body = *body;
             loop {
@@ -1491,6 +1537,11 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
                             handle_chan_dom(&b.ty).or_else(|| handle_chan_dom(&be.ty))
                         {
                             chan_names.insert(b.name.clone(), n);
+                        }
+                        if let Some(element) =
+                            handle_element(&b.ty).or_else(|| handle_element(&be.ty))
+                        {
+                            elements.insert(b.name.clone(), element);
                         }
                         defer_names.push(b.name);
                         current_body = *inner;
@@ -1517,7 +1568,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
             // defer whose handle survives in a type does not.
             let _g =
                 provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
-            channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
+            channelize_cluster(&defer_names, &chan_names, &elements, body_rewritten, ctx)
         }
         TypedExprNode::Let {
             binding,
@@ -1697,6 +1748,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, DeferEr
 fn channelize_cluster(
     defer_names: &[Name],
     chan_names: &HashMap<Name, Name>,
+    elements: &HashMap<Name, Type>,
     body: Expr,
     ctx: &mut ChannelizeCtx,
 ) -> Result<Expr, DeferError> {
@@ -1712,7 +1764,14 @@ fn channelize_cluster(
         // feeds.
         let mut feeds = Vec::new();
         let mut define: Option<Expr> = None;
-        rewritten = extract_for_defer(rewritten, name, &mut feeds, &mut define, false)?;
+        rewritten = extract_for_defer(
+            rewritten,
+            name,
+            elements.get(name),
+            &mut feeds,
+            &mut define,
+            false,
+        )?;
         let channel = match (feeds.is_empty(), define) {
             (true, None) => return Err(DeferError::NoFeedOrDefine(name.base().to_string())),
             (true, Some(d)) => d,
@@ -1944,14 +2003,14 @@ fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
         return inner;
     }
     let ty = inner.ty.clone();
-    // A freshly-minted cluster carrier — not a rebuild of an input node, so it
+    // A freshly-minted cluster `LetRec` — not a rebuild of an input node, so it
     // draws a fresh `NodeId` through the canonical `Expr::new` constructor.
-    let mut carrier = Expr::new(TypedExprNode::LetRec {
+    let mut cluster = Expr::new(TypedExprNode::LetRec {
         bindings: group,
         body: Box::new(inner),
     });
-    carrier.ty = ty;
-    carrier
+    cluster.ty = ty;
+    cluster
 }
 
 /// Collect every free `Var` name in `expr` into `out`, respecting
@@ -2322,6 +2381,7 @@ fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
 fn extract_for_defer(
     expr: Expr,
     defer_name: &Name,
+    element: Option<&Type>,
     feeds: &mut Vec<Expr>,
     define: &mut Option<Expr>,
     in_inner_scope: bool,
@@ -2332,13 +2392,14 @@ fn extract_for_defer(
     // — deep enough trees overflow a test thread's default stack. Every level goes
     // through this wrapper, so each one checks the remaining headroom.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        extract_for_defer_impl(expr, defer_name, feeds, define, in_inner_scope)
+        extract_for_defer_impl(expr, defer_name, element, feeds, define, in_inner_scope)
     })
 }
 
 fn extract_for_defer_impl(
     expr: Expr,
     defer_name: &Name,
+    element: Option<&Type>,
     feeds: &mut Vec<Expr>,
     define: &mut Option<Expr>,
     in_inner_scope: bool,
@@ -2370,7 +2431,7 @@ fn extract_for_defer_impl(
             // hoisted out of a loop by the letrec phase, or any collection
             // feed. It is not lifted (that would double-wrap it as
             // `Fun(Unit, Fun(D, T))`); it joins the channel union directly.
-            let value = flatten_nested_contribution(*value);
+            let value = flatten_nested_contribution(*value, element);
             let mut vty = &value.ty;
             while let Type::Refinement(inner, _) = vty {
                 vty = inner;
@@ -2421,6 +2482,7 @@ fn extract_for_defer_impl(
             body: Box::new(extract_for_defer(
                 *body,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2431,8 +2493,14 @@ fn extract_for_defer_impl(
             bound_expr,
             body,
         } => {
-            let bound_expr =
-                extract_for_defer(*bound_expr, defer_name, feeds, define, in_inner_scope)?;
+            let bound_expr = extract_for_defer(
+                *bound_expr,
+                defer_name,
+                element,
+                feeds,
+                define,
+                in_inner_scope,
+            )?;
             let body = if &binding.name == defer_name {
                 // Inner let shadows the defer name; do not descend.
                 *body
@@ -2444,7 +2512,8 @@ fn extract_for_defer_impl(
                 // with `let n = … in for-loop`) would float out to the
                 // cluster's bind site with `n` unbound.
                 let prev_len = feeds.len();
-                let new_body = extract_for_defer(*body, defer_name, feeds, define, in_inner_scope)?;
+                let new_body =
+                    extract_for_defer(*body, defer_name, element, feeds, define, in_inner_scope)?;
                 // Wrap each feed extracted during the body walk with this
                 // let-binding — but only when the feed actually references the
                 // binding. A channel that escapes the scope where the binding
@@ -2500,6 +2569,7 @@ fn extract_for_defer_impl(
             expr: Box::new(extract_for_defer(
                 *e,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2507,6 +2577,7 @@ fn extract_for_defer_impl(
             body: Box::new(extract_for_defer(
                 *body,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2548,6 +2619,7 @@ fn extract_for_defer_impl(
                 let new_lambda_body = extract_for_defer(
                     *lambda_body,
                     defer_name,
+                    element,
                     &mut lambda_feeds,
                     &mut lambda_define,
                     true,
@@ -2558,6 +2630,7 @@ fn extract_for_defer_impl(
                 let new_argument = extract_for_defer(
                     *argument.clone(),
                     defer_name,
+                    element,
                     feeds,
                     define,
                     in_inner_scope,
@@ -2587,10 +2660,22 @@ fn extract_for_defer_impl(
                     argument: Box::new(new_argument),
                 }
             } else {
-                let new_function =
-                    extract_for_defer(*function, defer_name, feeds, define, in_inner_scope)?;
-                let new_argument =
-                    extract_for_defer(*argument, defer_name, feeds, define, in_inner_scope)?;
+                let new_function = extract_for_defer(
+                    *function,
+                    defer_name,
+                    element,
+                    feeds,
+                    define,
+                    in_inner_scope,
+                )?;
+                let new_argument = extract_for_defer(
+                    *argument,
+                    defer_name,
+                    element,
+                    feeds,
+                    define,
+                    in_inner_scope,
+                )?;
                 TypedExprNode::Apply {
                     function: Box::new(new_function),
                     argument: Box::new(new_argument),
@@ -2601,6 +2686,7 @@ fn extract_for_defer_impl(
         TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(extract_for_defer(
             *value,
             defer_name,
+            element,
             feeds,
             define,
             in_inner_scope,
@@ -2610,6 +2696,7 @@ fn extract_for_defer_impl(
             value: Box::new(extract_for_defer(
                 *value,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2620,6 +2707,7 @@ fn extract_for_defer_impl(
             left: Box::new(extract_for_defer(
                 *left,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2628,6 +2716,7 @@ fn extract_for_defer_impl(
             right: Box::new(extract_for_defer(
                 *right,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2638,6 +2727,7 @@ fn extract_for_defer_impl(
             Box::new(extract_for_defer(
                 *inner,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2647,6 +2737,7 @@ fn extract_for_defer_impl(
             input: Box::new(extract_for_defer(
                 *input,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2655,12 +2746,12 @@ fn extract_for_defer_impl(
         },
         TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::List(elts) => TypedExprNode::List(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::Compose(elts) => {
@@ -2816,6 +2907,7 @@ fn extract_for_defer_impl(
                         let new_body = extract_for_defer(
                             *body,
                             defer_name,
+                            element,
                             &mut lambda_feeds,
                             &mut lambda_define,
                             true,
@@ -2870,6 +2962,7 @@ fn extract_for_defer_impl(
                         new_elts.push(extract_for_defer(
                             elt,
                             defer_name,
+                            element,
                             feeds,
                             define,
                             in_inner_scope,
@@ -2881,7 +2974,7 @@ fn extract_for_defer_impl(
         }
         TypedExprNode::Copair(elts) => TypedExprNode::Copair(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::Record(fields) => {
@@ -2889,7 +2982,7 @@ fn extract_for_defer_impl(
             for (n, e) in fields {
                 new_fields.push((
                     n,
-                    extract_for_defer(e, defer_name, feeds, define, in_inner_scope)?,
+                    extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope)?,
                 ));
             }
             TypedExprNode::Record(new_fields)
@@ -2912,7 +3005,14 @@ fn extract_for_defer_impl(
             let body = if &param.name == defer_name {
                 *body
             } else {
-                extract_for_defer(*body, defer_name, &mut local_feeds, &mut local_define, true)?
+                extract_for_defer(
+                    *body,
+                    defer_name,
+                    element,
+                    &mut local_feeds,
+                    &mut local_define,
+                    true,
+                )?
             };
             if local_define.is_some() {
                 return Err(DeferError::NestedDefinition);
@@ -2964,6 +3064,7 @@ fn extract_for_defer_impl(
                 let body = extract_for_defer(
                     body,
                     defer_name,
+                    element,
                     &mut branch_feeds,
                     &mut branch_define,
                     true,
@@ -3063,6 +3164,7 @@ fn extract_for_defer_impl(
             payload: Box::new(extract_for_defer(
                 *payload,
                 defer_name,
+                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -3078,9 +3180,11 @@ fn extract_for_defer_impl(
         TypedExprNode::LetRec { mut bindings, body } => {
             for (_, def) in bindings.iter_mut() {
                 let taken = std::mem::take(def);
-                *def = extract_for_defer(taken, defer_name, feeds, define, in_inner_scope)?;
+                *def =
+                    extract_for_defer(taken, defer_name, element, feeds, define, in_inner_scope)?;
             }
-            let body = extract_for_defer(*body, defer_name, feeds, define, in_inner_scope)?;
+            let body =
+                extract_for_defer(*body, defer_name, element, feeds, define, in_inner_scope)?;
             TypedExprNode::LetRec {
                 bindings,
                 body: Box::new(body),

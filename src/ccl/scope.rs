@@ -337,7 +337,7 @@ where
             }
         }
 
-        // Post-planning carrier. No binder: a writer body is already point-free
+        // Post-planning `Transact`. No binder: a writer body is already point-free
         // and receives its mutable variable snapshots positionally, so the keys are
         // field labels rather than binders (see the module docs).
         N::Transact { keys, writers, .. } => {

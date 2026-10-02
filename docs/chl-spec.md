@@ -3472,8 +3472,8 @@ with parser-level support that lowering rejects:
   ("while loop lowering").
 - **Nested `for` loops with mutable variables** — a nested loop that
   writes a mutable variable of the loop around it lowers and plans to a
-  carrier per enclosing row, which operator conversion does not realize
-  yet. A nested loop that writes no mutable variable declared outside it
+  nested `Transact` per enclosing position, which operator conversion does
+  not realize yet. A nested loop that writes no mutable variable declared outside it
   is rejected at lowering.
 - **A mutable variable introduced inside a transaction block** — a `with
   begin():` block may write mutable variables declared outside it but not

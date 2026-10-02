@@ -543,7 +543,7 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream `CommitTs ⇀ V` out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
 - **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the cross-endpoint read. Given a `trigger` stream (the positions to sample at, e.g. an HTTP request stream) and the store, it latches the store's current value for each trigger position the first time that position is observed — indexed by the *trigger*, not the commit clock. Reading several mutable variables latches them all from one store render, so a multi-variable read is one snapshot. The dual of the changelog store's own driver: the store latches a private accumulator per *source* step, `AsOf` latches the store per *trigger* step.
 
-A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` carrier serves both engines.
+A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` serves both engines.
 
 ### The store is a changelog, not a function
 

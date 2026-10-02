@@ -2152,7 +2152,7 @@ fn run_passes(
     }
 
     // Recognition: lower each causal group — now in its point-free normal
-    // form — onto the domain-parameterized `Transact` carrier (a
+    // form — onto the domain-parameterized `Transact` (a
     // `get_prev_txn` transaction group → `Transact{Txn}`; a `get_prev_seq`
     // induction group → `Transact{iteration extent}`) so planning stages the
     // writer sources and operator conversion picks the engine on the domain.

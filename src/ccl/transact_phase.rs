@@ -2,7 +2,7 @@
 //! writer of a `Mut(V, Txn)` mutable variable into a **`get_prev_txn`-guarded `LetRec`** —
 //! histories + commit records over the [`Type::Txn`] commit domain — which
 //! [`crate::ccl::planning::plan_loops`] then destructures into the
-//! `Transact{keys, writers, domain: Txn}` carrier the commit engine consumes.
+//! `Transact{keys, writers, domain: Txn}` node the commit engine consumes.
 //! This unifies the transaction path with the induction path (`For`/`MutWrite`
 //! → a `get_prev_seq` `LetRec` → recognition → `Transact` → engine).
 //!
@@ -634,7 +634,7 @@ struct FeedSite {
 /// Each writer travels with the [`NodeId`] of the `with begin():` statement its
 /// block was stripped from — the node its products parent on, which rides beside
 /// [`WriterSite`] rather than on it because that type is shared IR that planning
-/// rebuilds from a `Transact` carrier. `site_feeds[j]` holds site `j`'s feeds, so
+/// rebuilds from a `Transact`. `site_feeds[j]` holds site `j`'s feeds, so
 /// the two vectors stay index-parallel.
 type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
 
@@ -662,8 +662,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // letrec phase applies through `flatten_spine`.
     let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
     // A statement whose effect is a `Let` hides that binding from the rest of
-    // the spine, which is where this phase places the store carriers that read
-    // it. Lift it onto the spine first.
+    // the spine, which is where this phase places the stores' `Transact`s that
+    // read it. Lift it onto the spine first.
     let expr = crate::ccl::mut_elim::lift_bindings_out_of_effect_position(expr);
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
@@ -745,7 +745,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // Fold induction loops whose accumulator a commit decision reads out of the
     // continuation and into an *outer* induction letrec: `commits(r)` is bound
     // inside the transaction letrec, so an accumulator it reads must be in scope
-    // there — i.e. bound further out. Recognition then nests the two carriers in
+    // there — i.e. bound further out. Recognition then nests the two `Transact`s in
     // dependency order (induction outer, transaction inner) with no cross-domain
     // group logic. Each read accumulator is threaded through the writer source (a
     // `zip` of the loop iter and the accumulator's per-position view), which the
@@ -820,8 +820,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, String> {
     // Each writer travels with the statement node its block was stripped from, so
     // `plan_store` can parent that site's commit record on it. The parent rides
     // beside `WriterSite` rather than on it: `WriterSite` is shared IR that
-    // planning rebuilds from a `Transact` carrier, and what a recording names is
-    // not a fact about the carrier.
+    // planning rebuilds from a `Transact`, and what a recording names is
+    // not a fact about the `Transact`.
     let mut per_store: Vec<StoreWriters> = (0..groups.len())
         .map(|_| (Vec::new(), Vec::new()))
         .collect();
@@ -2926,7 +2926,7 @@ struct HoistedFeed {
 /// The continuation rebinds each key variable's `let x = init` to a
 /// `final_or_default(hist_x, init)` read over its history and hoists each
 /// in-block feed to `Feed(defer, tap)`. `recognize` inverts this straight into
-/// the `Transact{keys, writers, domain: Txn}` carrier.
+/// the `Transact{keys, writers, domain: Txn}` node.
 ///
 /// **Inverse pair:** the per-writer commit-record shape this emits — the
 /// positional `{F_TIME, F_WRITE_TARGETS, F_DECISION}` record and the
@@ -3306,7 +3306,7 @@ impl StorePlan {
             .collect()
     }
 
-    /// The node this store's carrier parents on: the **outermost** declaration among
+    /// The node this store's `Transact` parents on: the **outermost** declaration among
     /// its keys, in first-occurrence order.
     ///
     /// A store's letrec replaces no single node — it is what those declarations and
@@ -3314,7 +3314,7 @@ impl StorePlan {
     /// first key's dropped `MutDecl` is the honest answer anyway: it is a real node
     /// this phase removed rather than a stand-in, and it is where a reader asking
     /// where the transaction structure came from should land.
-    fn carrier_parent(&self, key_init: &HashMap<Name, MutVarDecl>, tail: &Expr) -> NodeId {
+    fn transact_parent(&self, key_init: &HashMap<Name, MutVarDecl>, tail: &Expr) -> NodeId {
         self.key_names
             .first()
             .map(|k| key_init[k].decl)
@@ -3467,7 +3467,7 @@ fn walk_spine(
                 // copy the borrow forces is the only live one. Preserving keeps the
                 // ids `plan_store` recorded against each site's `with begin():`
                 // statement and each key's declaration; freshening here would
-                // re-parent that whole tree on the carrier and throw the finer
+                // re-parent that whole tree on the `Transact` and throw the finer
                 // attribution away.
                 let bindings: Vec<(TypedBinding, Expr)> = store
                     .bindings
@@ -3475,8 +3475,8 @@ fn walk_spine(
                     .map(|(b, e)| (b.clone(), e.clone_preserving_ids()))
                     .collect();
                 let _g = provenance::enter(
-                    store.carrier_parent(key_init, &inner),
-                    "transact.carrier",
+                    store.transact_parent(key_init, &inner),
+                    "transact.store",
                     provenance::Nature::Expansion,
                 );
                 inner = close_recurrence_group(bindings, reads, store.feed_views(), inner);
@@ -3706,7 +3706,7 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
         // The group-level wrappers — each trailing final read and the feed hoists
         // — sit in the shared body inside *every* folded loop's letrec, so no
         // single loop can be their parent. The outermost folded statement is, by the
-        // argument [`StorePlan::carrier_parent`] makes for the store carrier: it is
+        // argument [`StorePlan::transact_parent`] makes for the store's `Transact`: it is
         // a real node this phase removed, and it is the first of the statements
         // this group collectively replaced.
         let outermost = parents.first().copied().unwrap_or_else(|| inner.node_id());
@@ -3722,7 +3722,7 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
     }
     // One single-binding letrec per folded loop, each parented on the statement
     // that loop was folded out of — the same node `transact.cross_domain_fold`
-    // recorded its binding against, so the carrier and its contents agree.
+    // recorded its binding against, so the letrec and its contents agree.
     for ((b, def), parent) in bindings.into_iter().zip(parents).rev() {
         let _g = provenance::enter(
             parent,

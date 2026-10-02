@@ -25,7 +25,7 @@
 //!
 //! [`crate::ccl::planning::plan_loops`] runs **after `lambda_elim`**, on the group's point-free
 //! normal form, and lowers each group onto the domain-parameterized
-//! [`TypedExprNode::Transact`] carrier (`let __hist = Transact{…} in …`),
+//! [`TypedExprNode::Transact`] node (`let __hist = Transact{…} in …`),
 //! whose induction domain op-conversion compiles to the changelog induction
 //! store (the `Txn` domain, to the commit operator).
 //!
@@ -41,7 +41,7 @@
 //! re-checked at recognition's wall by the point-free matcher
 //! ([`crate::ccl::letrec::check_letrec_causal`]).
 //!
-//! `Transact` is recognition's **output** carrier, born post-elim and spanning
+//! `Transact` is recognition's **output** node, born post-elim and spanning
 //! recognition → planning → op-conversion: it separates the mutable variable's *keys*
 //! (each with its `init`) from the *writer body*, which is what lets `planning`
 //! iterate-wrap the writer source and op-conversion build the engine. (Retiring
@@ -560,7 +560,7 @@ fn push_continuation_into_case(e: &mut Expr) -> Option<Expr> {
 /// A-normalization makes that body start with a binding whenever any operand
 /// is compound (`let __anf = [unit] in for … do …`). The binding's scope then
 /// ends at the statement, so anything later in the spine that reads it — a
-/// store carrier `transact_phase` places at the tail, a write the letrec phase
+/// store's `Transact`, which `transact_phase` places at the tail, a write the letrec phase
 /// moves — names a binder it sits outside of.
 ///
 /// [`flatten_spine`] performs the same reassociation gated on the statement
@@ -3233,12 +3233,12 @@ mod tests {
     }
 
     /// Recognition lowers the group onto the domain-parameterized `Transact`
-    /// carrier: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
+    /// node: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
     /// `commit(⟨writes: (x)⟩) | `abort } in (__hist.x, x) ▷ final_or_default``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
     /// rewritten to a history-record projection.
     #[test]
-    fn recognition_builds_the_transact_carrier() {
+    fn recognition_builds_the_transact() {
         let (tree, _, _) = direct_mirror_sum();
         // Recognition consumes the point-free normal form, so run the elim
         // (+simplify) pass between the phase and the recognizer, as the
@@ -3248,11 +3248,8 @@ mod tests {
         let s = symbolic(&out);
         assert!(!s.contains("letrec"), "letrec must be consumed: {s}");
         assert!(!s.contains("get_prev_seq"), "guard must be consumed: {s}");
-        assert!(!s.contains("loop"), "the Loop carrier is retired: {s}");
-        assert!(
-            s.contains("transact"),
-            "should build a Transact carrier: {s}"
-        );
+        assert!(!s.contains("loop"), "the Loop node is retired: {s}");
+        assert!(s.contains("transact"), "should build a Transact: {s}");
         assert!(
             s.contains("variant_wrap(`commit)") && s.contains("writes:") && s.contains("`abort"),
             "writer body must terminate in a `` `commit(⟨writes⟩) | `abort `` decision: {s}"

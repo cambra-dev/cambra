@@ -632,7 +632,7 @@ fn hash_payload<'a>(
             parameter,
         } => {
             hash_type(domain, env, free, h);
-            // A nested carrier is a different node from a top-level one with the same
+            // A nested `Transact` is a different node from a top-level one with the same
             // writers, so the writer parameter contributes.
             parameter.is_some().hash(h);
             if let Some(t) = parameter {
