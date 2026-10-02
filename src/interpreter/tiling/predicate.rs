@@ -241,12 +241,26 @@ impl Predicate {
                 .iter()
                 .filter_map(Predicate::max_released_position)
                 .max(),
-            // A union's arms are tag-keyed, so they are walked by value rather
-            // than sharing the `Or` arm's positional vector.
-            Predicate::Union { tags, rest: false } => tags
-                .values()
-                .filter_map(Predicate::max_released_position)
-                .max(),
+            // A union key is ordered by its tag, then within the tag, so the largest
+            // position covered lies under the last tag named, and it is a key of the union:
+            // the bound within that tag wrapped in the tag. A position of one tag alone is
+            // not a position of the union's domain, and compares with none of its keys.
+            //
+            // A region naming its last tag whole is not a drive's prefix: a drive releases
+            // `at_or_below_in(𝑡(𝑣))`, which bounds its head tag, and a drive that finishes
+            // releases everything. Such a region comes from a consumer that is not a drive,
+            // a feed's arms say, which nothing places a drive over, so it has no watermark.
+            Predicate::Union { tags, rest: false } => {
+                let (tag, within) = tags.iter().max_by(|(a, _), (b, _)| a.cmp(b))?;
+                if within.is_true() {
+                    return None;
+                }
+                let inner = within.max_released_position()?;
+                Some(Position::new(Value::Union {
+                    tag: tag.clone(),
+                    inner: Box::new(inner.value().clone()),
+                }))
+            }
             // Every tag it does not name is whole, so there is no watermark to read.
             Predicate::Union { rest: true, .. } => None,
             // A qualified predicate names a position under one enclosing path, and the

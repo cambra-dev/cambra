@@ -557,7 +557,8 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
 | `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
-| `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. Over an induction accumulator's own history it compiles to `StoreFinalRead`, which samples the settled store; over any other stream, to `ExtractFinal`. A `Txn` history's final is `final_read`, a different term |
+| `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
+| `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead` |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_read` over the mutable variable's history binding, which compiles to `StoreFinalRead`. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
@@ -778,9 +779,9 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator
-   or bare side-effect loop needs no letrec at all. Trailing induction reads → `final_or_default(history,
-   init)`; a `Txn` read fed out of a read-only block → a broadcast of the history over the
-   enclosing loop, which planning latches through the as-of read.
+   or bare side-effect loop needs no letrec at all. Trailing induction reads →
+   `final_read(history)`; a `Txn` read fed out of a read-only block → a broadcast of the history
+   over the enclosing loop, which planning latches through the as-of read.
 
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
@@ -1125,7 +1126,7 @@ loops' domains — the read is that accumulator's **final** value, the same scal
 transaction. The phase distinguishes the two by the site's *enclosing-loop write set*
 (`RawSite::enclosing_writes`, from `loop_induction_writes`): an accumulator in it is co-indexed
 (zipped into the source); one not in it is broadcast — its read is bound to the loop's
-`final_or_default` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
+`final_read` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
 a `Constant` broadcast (via `MapResultToConst`) over the transaction domain.
 
 The one engine subtlety is **driving** that broadcast to convergence. The final's `StoreFinalRead`
@@ -1274,7 +1275,7 @@ then the refusal is a compile error rather than a wrong answer
 **A mutable variable no `with begin():` block mentions** is a key of no store, so it has no history
 binding to read and its await resolves to the seed directly (`resolve_writer_free_awaits`) — the
 empty-history case, known empty statically. An all-deny history is the other case: it does build a
-store, and its `final_or_default` reports the seed as that store's default.
+store, and its `final_read` reports the seed, since nothing was written over it.
 
 ## Not yet implemented
 

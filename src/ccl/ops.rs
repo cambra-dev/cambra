@@ -486,13 +486,9 @@ pub enum Builtin {
     /// an aggregate fold (no identity element), so it does not
     /// participate in `AggregateKind`.
     ///
-    /// Used by `lower_mutation_loop` to expose the scalar final
-    /// accumulator of a Record-bodied loop, whose external type is
-    /// `Fun(D, Record({step, __to_<defer>*}))`: the after-loop scalar acc is
-    /// `(acc_stream ▷ Proj("step"), init) ▷ FinalOrDefault`.  The
-    /// default is the pre-loop accumulator binding, so an
-    /// empty-source loop (`for i in []: x += 1; x`) yields `init`
-    /// rather than panicking or returning empty.
+    /// Lambda elimination emits it for a guard-`Case`, whose trailing `true` arm supplies
+    /// the default. A loop's trailing read is not one: it samples the store
+    /// ([`Self::FinalRead`]).
     ///
     /// TODO: Make the ordering requirement on this explicit.  Right now
     /// all of our types can be implicitly ordered, but that might not
@@ -595,11 +591,9 @@ pub enum Builtin {
     /// *completeness*; every other fed-out mutable variable read is an arbitrary as-of
     /// sample ([`Self::AsOf`]). It is a surface marker in the sense the `For` /
     /// `Begin` / `MutWrite` nodes are: [`crate::ccl::transact_phase`] consumes it,
-    /// replacing each occurrence with `final_or_default(hist_x, init)` over the
-    /// mutable variable's history binding — the single sanctioned application of
-    /// [`Self::FinalOrDefault`] to a commit history. So it never reaches
-    /// op-conversion, and its arm there is a deliberate error like
-    /// [`Self::BeginTxn`]'s.
+    /// replacing each occurrence with [`Self::FinalRead`] over the mutable variable's
+    /// history binding. So it never reaches op-conversion, and its arm there is a
+    /// deliberate error like [`Self::BeginTxn`]'s.
     AwaitFinal,
 
     /// `copair : (Fun(A, B), Fun(C, D)) → Fun(Variant({.0: A, .1: C}), dedup(B, D))`
@@ -627,10 +621,11 @@ pub enum Builtin {
     /// Minted post-inference, so it carries its own recorded type and has no scheme.
     AsOfRead,
 
-    /// `final_read : (Txn ⇒ 𝑉) ⇒ 𝑉` — the **terminal read** of a transactional mutable
-    /// variable: its value at the position its own writers finish.
-    /// [`crate::ccl::transact_phase`] mints it for a surface [`Self::AwaitFinal`] marker,
-    /// naming the mutable variable's history binding.
+    /// `final_read : (𝐷 ⇒ 𝑉) ⇒ 𝑉` — the **terminal read** of a mutable variable: its value
+    /// at the position its own writers finish, over its sequencing domain 𝐷 (`Txn`, or a
+    /// loop's induction domain). [`crate::ccl::transact_phase`] mints it for a surface
+    /// [`Self::AwaitFinal`] marker, and [`crate::ccl::mut_elim`] for a loop's trailing read,
+    /// each naming the mutable variable's history binding.
     ///
     /// Like [`Self::AsOfRead`] it is a *sample* of the carried value rather than a
     /// reduction of a stream, so it takes no seed operand — tick 0 of every store is its

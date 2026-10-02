@@ -609,7 +609,7 @@ The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md
   forwarding `domain_predicate`.
 
   **A release is not always an ack, though — supersession reclaims too.** The writer decides only the driver's *newest* live position, so every older one is abandoned and is released immediately rather than at the item's finish. That keeps a contended item's cost flat: the body re-renders the driver's whole live window each pull, so a window that grew one row per retry would make K retries cost K rows retained and K² body rows evaluated. The bound is `MAX_LIVE_ATTEMPTS`, asserted in the driver and measured at six contending writers — a window of 2 with the supersession release, 6 without it, over an item that lost five times. It also means the driver cannot read "a row was released" as "the item finished" — only the release of its **newest live row** is the ack, exactly as a release from the body alone is not one.
-- **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: `Scalar(V)`, the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_or_default` over an induction accumulator's own history. It samples through the same `store_current` as `AsOf` and differs only in what fixes the position — a trigger's arrival there, the store's closure here — so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. A universal release retires it and releases the store branch; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
+- **`StoreFinalRead` / `StoreFinalReadProducer`** — the **settled read** of a store key: the key's carried value at the position its own writers finish, or the store's seed if nothing wrote it, in the tiling of `V` (`Tiling::from_extent`), so a collection-valued key arrives as a level, as every store read hands it out. Two terms reduce to it, differing in what mints them rather than in what they sample: a surface `await_final` on a `Txn` key, and `final_read`, an induction accumulator's trailing read. It samples through the same `store_current` as `AsOf` and differs only in what fixes the position — a trigger's arrival there, the store's closure here — so it is neither a reduction nor a projection of the history, and needs no seed operand. Empty (and so non-terminal) until the store reports the key settled — `closed_keys.contains(key) || terminal`, so it settles once every writer that can write the key has drained rather than waiting on a store-mate's. A universal release retires it and releases the store branch; other readers hold their own guards through the fan, which the fan intersects, so the store still reclaims a version only once all of them have released it.
 - **`StoreValueStream` / `StoreValueStreamProducer`** — projects one key's commit-value stream, commit time ⇀ `V`, out of the store changelog, carrying the value forward across ticks that wrote other keys (the step interpolation), so its own output is a `DataFunction` with a decided value at every tick. It backs the in-block reply tap (`carry_forward: false` — one entry per committed transaction) and the read-your-writes mutable variable carry (`carry_forward: true`).
 - **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the cross-endpoint read. Given a `trigger` stream (the positions to sample at, e.g. an HTTP request stream) and the store, it latches the store's current value for each trigger position the first time that position is observed — indexed by the *trigger*, not the commit clock. Reading several mutable variables latches them all from one store render, so a multi-variable read is one snapshot. The dual of the changelog store's own driver: the store latches a private accumulator per *source* step, `AsOf` latches the store per *trigger* step.
 
@@ -837,8 +837,8 @@ The pipeline always bottoms out at one of three consumer shapes:
 
 1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
    `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), FinalOrDefault)`
-   (compiles to `ExtractFinal`, or to `StoreFinalRead` over an induction accumulator's own
-   history).
+   (compiles to `ExtractFinal`), or `final_read` of an accumulator's history (compiles to
+   `StoreFinalRead`).
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`
    at `compile_program`.
@@ -992,8 +992,8 @@ watermark every position at or below has been decided through. A position a key'
 is a **carry** for that key: decided, and holding its latest earlier value. The frontier bounds the
 domain without being one of its positions, because a reclaim trims the domain and a store resuming
 its predecessor's run is decided through positions it never ran. The rendered `Tile::Store` holds
-the seed, the domain and the frontier per row, so projecting one row of a nested carrier is the
-ordinary row retain. The seed is the base of the step function rather than a point of its
+the seed, the domain and the frontier per row, so projecting one row of a nested induction store is
+the ordinary row retain. The seed is the base of the step function rather than a point of its
 domain, because a changelog is keyed by the positions writes land at and no position stands below
 the first. A fold that finds no change at or below the position it asks about resolves to the
 seed.
@@ -1001,7 +1001,8 @@ seed.
 A store opens on the pull its seed arrives, not at subscribe. A seed is ordinary dataflow: `b :=
 a` after a loop over `a` settles once that loop reaches its final position, which takes as many
 pulls as it has positions. The store reads its seed streams at the head of every `get`, and
-`Engines::store_at` opens the engine at the first value they carry. Until then the store renders
+`Engines::store_at` opens the engine once every key's seed carries a value, a store waiting on
+the slowest of them (`a_store_waits_for_every_accumulators_seed`). Until then the store renders
 an undecided frontier and the driver holds its first position back.
 
 The store consumes the body's `` {`commit{writes} | `abort} `` decisions (`decision_at_index`
@@ -1021,13 +1022,10 @@ Positions are the source's keys, each a `Position` ordered within its domain, so
 over a map runs with the map's keys as its positions. They are ascending but not contiguous. A
 restricted source (`for l in [x for x in xs if p(x)]`) carries its extent's keys, the filtered ones
 marked deleted. The decode reads only the surviving positions and the recurrence runs over exactly
-those, so the watermark bounds the next position from below rather than naming it. A filtered
-position is still decided, as a carry: the driver states every position it has read past complete
-on the body input (`DriverWindow::render`), and the store steps a carry over a complete position
-that holds no decision. Without that the frontier would move only at surviving positions, and a
-filtered row after the last survivor would never be decided, so a read of the store over the
-loop's extent would never emit or release it. Iterating the extent densely and gating the write
-would need the store to recover a filter the source's refined extent already carries. A product
+those, so the watermark bounds the next position from below rather than naming it. The store
+decides no filtered position, and every read of the store runs over the positions it decided, so
+no read emits one. Iterating the extent densely and gating the write would need the store to
+recover a filter the source's refined extent already carries. A product
 source is keyed by a record and a concatenation by a union, so a loop over a product runs its pairs
 in lexicographic order and one over a concatenation runs each part in turn.
 
@@ -1053,14 +1051,22 @@ store tile and the source tile. The driver decodes the source into `(path, item)
 (`decode_source_paths`), since an async source's domain arrives unordered and compacts as its
 consumed prefix is released.
 
-### One carrier at every depth
+The driver releases the source prefix it has consumed: every position it has emitted, and every
+filtered row it has read past. A filtered row stays in the source tile, marked deleted, and no
+decision or ack ever names it, so the driver releases it once the source calls it complete along
+with every position before it (`source_read_through`). Releasing a prefix the source has not
+called complete would name a position still to arrive, and a drive placed across a reload
+resumes past whatever its predecessor released. The transaction driver releases filtered rows by
+the same rule.
+
+### One induction store at every depth
 
 `Engines` is a tree with one node per collection level above the stores and an engine at each
 leaf. A loop inside one loop has one level, a loop inside two has two, and a loop on its own has
 none and is reached at the empty path. The depth lives in the tree, so the code walking it has no
 depth-specific case:
 
-- `render_carrier_tile` walks the tree, and `store_tile` assembles a run of engines into one
+- `render_engines` walks the tree, and `store_tile` assembles a run of engines into one
   `Tile::Store` whose per-key changelogs group CSR-wise by store.
 - `decided_paths` reads a body's decisions as paths, one component per level, in drive order, and
   `open_at` opens the store a path names.
@@ -1095,11 +1101,12 @@ seed. A **carry** read (`carry_forward: true`, an accumulator) resolves at every
 **tap** read (`carry_forward: false`) appears only at the positions whose own change wrote the
 key (`store_delta_at`).
 
-The trailing read of an accumulator, `final_or_default(history, init)`, is a `StoreFinalRead`:
-the key's value once the store has settled, sampled from the store rather than reduced from a
-stream. A store resuming mid-fold has not decided its predecessor's positions, so a reduction
-over its history would find nothing and answer with the declared init instead of the value
-carried in.
+The trailing read of an accumulator, `final_read(history)`, is a `StoreFinalRead`: the key's
+value once the store has settled, sampled from the store rather than reduced from a stream, and
+the seed where the loop ran no position. `mut_elim` mints it as a sample, as `transact_phase`
+mints `await_final`'s, because a reduction is the wrong term for it: a store resuming mid-fold
+has not decided its predecessor's positions, so a reduction over its history would find nothing
+and answer with the declared init instead of the value carried in.
 
 A co-iterated read (`for r in …: cnt += 1; with begin(): store := store + cnt`) consumes the
 dense read directly.
@@ -1134,9 +1141,9 @@ through the same seed decode and decision merge.
 
 ### Reclaiming the changelog
 
-A carrier reclaims its changelog as it runs, at any depth. Each reader releases what its consumer
-has taken; the drive releases through the frontier; the `FanOut` in front of the store meets the
-branches; and `InductionStoreProducer::release_impl` hands the meet to
+An induction store reclaims its changelog as it runs, at any depth. Each reader releases what its
+consumer has taken; the drive releases through the frontier; the `FanOut` in front of the store
+meets the branches; and `InductionStoreProducer::release_impl` hands the meet to
 `CommitEngine::gc_released_prefix`, one store at a time. The meet cannot advance past a branch that
 has released nothing, so a reader holding its branch until it retires holds every version of every
 key for the length of the run. The flat trailing read therefore releases as it goes:

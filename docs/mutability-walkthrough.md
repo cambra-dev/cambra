@@ -597,8 +597,7 @@ in letrec
          in (__prev.0, __pos ▷ [1, 2, 3])
             ▷ (λ __p : (Int, Int) → { true → `commit((writes: (__p.0 + __p.1)));
                                       true → `abort(unit) })
-   in let x : Int = (__hist ≫ variant_project(`commit) ≫ .writes ≫ .0, x)
-                    ▷ final_or_default
+   in let x : Int = (__hist ≫ variant_project(`commit) ≫ .writes ≫ .0) ▷ final_read
    in x
 ```
 
@@ -613,8 +612,8 @@ Four things to read off it:
   scaffolding — it is the *same* shape B's writer produced above, which is what lets one
   node and one set of planning patterns serve both domains. The tagged sum is what makes
   "no write" unable to carry a write set.
-- The trailing `x` became `final_or_default(history, seed)` — well-defined because the loop
-  ends.
+- The trailing `x` became `final_read(history)`: the value the store holds once the loop has
+  run, which is the seed where it ran no position.
 
 ### `channelize` — the append half
 
@@ -672,7 +671,7 @@ shaped for a consumer that refuses to rebuild a body.
 let x : Int = 0
 in let __hist : {acc#8: ([0, 2] ⤇ Int)} =
      transact (acc = x) { [acc]⇒[acc] over iterate ≫ [1, 2, 3] do <the decision body, verbatim> }
-in let x : Int = (__hist.acc#8, x) ▷ final_or_default
+in let x : Int = __hist.acc#8 ▷ final_read
 in x
 ```
 
@@ -717,10 +716,9 @@ is why two writers' taps to one defer do not smear across the shared clock.
 
 Two wrappers sit on top of that, and neither is mutability-specific:
 
-- a **scalar** read of an accumulator — `x` after the loop — is `final_or_default(stream,
-  seed)`. Over an induction accumulator's own history it compiles to `StoreFinalRead`, which
-  samples the key's carried value once the store has settled rather than reducing a stream.
-  `await_final(x)` is a different term, `final_read`, and reaches `StoreFinalRead` too;
+- a **scalar** read of an accumulator — `x` after the loop — is `final_read(history)`, as
+  `await_final(x)` is. It compiles to `StoreFinalRead`, which samples the key's carried value
+  once the store has settled rather than reducing a stream;
 - a **co-iterated** read consumes the stream directly, since it is already a `𝐷 ⇀ 𝑉`.
 
 The exception is a `Txn` variable read *out of* a block: `rewrite_as_of_reads` turned that
@@ -783,7 +781,7 @@ What is new is the **progress algebra** — which is exactly the split §2's tab
 | a position present | its value is known | a write landed *at* that tick |
 | a position absent | **unknown** — may still arrive | **decided-absent**: the value holds from the latest earlier change |
 | how you read it | index the position | **fold** the changelog |
-| how much exists | the domain predicate | `frontier` — `at_or_below(w)`: the history is `w + 1` ticks long, trailing carries included |
+| how much exists | the domain predicate | `frontier` — each row's watermark `w`, read as `at_or_below(w)`: every position up to `w` is decided, trailing carries included |
 | `⊕` | run the keys together | append the changes, `max` the frontiers, `or` the terminal flags, union the closed keys |
 
 ### One shape, two engines

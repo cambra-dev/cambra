@@ -7,7 +7,7 @@ use rstest_log::rstest;
 
 use cambra::{
     ccl::context::{GlobalContext, Phase, ReuseTally},
-    interpreter::{Tile, Value},
+    interpreter::{DataSink, TestSink, Value},
     live_program::{LiveProgram, ReloadReport},
 };
 
@@ -787,6 +787,77 @@ fn a_main_output_accumulator_carries_across_the_swap() {
     assert!(
         flat.contains("Ints([6,],)"),
         "want 1+1+2+2; the whole run was: {out}"
+    );
+}
+
+/// An accumulator over a **concatenation** carries across the swap. The loop's positions
+/// are keys of a union, the tag naming the operand, so the position the swap resumes above
+/// is one too: `stdin`'s second line, under its tag. Read as that line's bare index it
+/// compares with none of the union's keys.
+///
+/// Four lines and the literal's one element, the rule changing from `+1` to `+2` after
+/// the second line: `1 + 1 + 2 + 2 + 2`.
+#[test]
+fn an_accumulator_over_a_concatenation_carries_across_the_swap() {
+    let (reply, out) = stdin_across_reload(
+        indoc! {r#"
+            n := 0
+            for line in stdin() ++ ["end"]:
+                n := n + 1
+            n
+        "#},
+        indoc! {r#"
+            n := 0
+            for line in stdin() ++ ["end"]:
+                n := n + 2
+            n
+        "#},
+        "a\nb",
+        "c\nd",
+    );
+    assert!(
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Ints([8,],)"),
+        "want 1+1+2+2+2; the whole run was: {out}"
+    );
+}
+
+/// An accumulator over a **product** carries across the swap. The loop's positions are
+/// records, one field per factor, ordered field by field, so the swap resumes above a record
+/// position.
+///
+/// Each line pairs with both of `[1, 2]`. Two lines before the swap count four positions at
+/// `+1`, and two after count four at `+2`: `4 + 8`.
+#[test]
+fn an_accumulator_over_a_product_carries_across_the_swap() {
+    let (reply, out) = stdin_across_reload(
+        indoc! {r#"
+            n := 0
+            for pair in [(line, k) for line in stdin() for k in [1, 2]]:
+                n := n + 1
+            n
+        "#},
+        indoc! {r#"
+            n := 0
+            for pair in [(line, k) for line in stdin() for k in [1, 2]]:
+                n := n + 2
+            n
+        "#},
+        "a\nb",
+        "c\nd",
+    );
+    assert!(
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
+    );
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Ints([12,],)"),
+        "want 4 + 8; the whole run was: {out}"
     );
 }
 
@@ -3024,7 +3095,7 @@ fn a_fold_over_a_fixed_collection_resumes_where_it_stopped() {
 /// A fold's value is final once the tile is terminal, which for an induction
 /// store means every position of its extent is decided.
 fn drive_main_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
-    let Value::String(s) = drive_main_to_scalar(ctx, live) else {
+    let Value::String(s) = drive_main_to_value(ctx, live) else {
         panic!("a string fold's value is a string");
     };
     s.to_string()
@@ -3032,7 +3103,7 @@ fn drive_main_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> St
 
 /// [`drive_main_to_terminal`] for a fold whose value is an `Int`.
 fn drive_main_int(ctx: &mut GlobalContext, live: &mut LiveProgram) -> i64 {
-    let Value::Int(n) = drive_main_to_scalar(ctx, live) else {
+    let Value::Int(n) = drive_main_to_value(ctx, live) else {
         panic!("an integer fold's value is an integer");
     };
     n
@@ -3041,7 +3112,7 @@ fn drive_main_int(ctx: &mut GlobalContext, live: &mut LiveProgram) -> i64 {
 /// [`drive_main_to_terminal`] for a program whose value is a `Map`, as its
 /// entries in key order.
 fn drive_main_map(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Vec<(String, i64)> {
-    let Value::Function(bindings) = drive_main_to_scalar(ctx, live) else {
+    let Value::Function(bindings) = drive_main_to_value(ctx, live) else {
         panic!("a map's value is a function from keys to values");
     };
     let mut out: Vec<(String, i64)> = bindings
@@ -3061,7 +3132,7 @@ fn drive_main_record_map(
     ctx: &mut GlobalContext,
     live: &mut LiveProgram,
 ) -> Vec<(String, Vec<(String, i64)>)> {
-    let Value::Function(bindings) = drive_main_to_scalar(ctx, live) else {
+    let Value::Function(bindings) = drive_main_to_value(ctx, live) else {
         panic!("a map's value is a function from keys to values");
     };
     let mut out: Vec<(String, Vec<(String, i64)>)> = bindings
@@ -3085,9 +3156,11 @@ fn drive_main_record_map(
     out
 }
 
-/// Pull the program's value until it is terminal, and take the scalar it settles
-/// at.
-fn drive_main_to_scalar(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Value {
+/// Pull the program's value until it is terminal, and read the value it settles at.
+///
+/// A collection-valued store key is handed out as a level, so the tile is read the way a
+/// sink reads it rather than as one cell.
+fn drive_main_to_value(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Value {
     for _ in 0..500 {
         ctx.scheduler().check_for_notifications();
         let producer = live
@@ -3096,10 +3169,9 @@ fn drive_main_to_scalar(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Valu
         let guard = producer.tiling().universal_guard();
         let tile = producer.get(guard);
         if tile.is_terminal() {
-            let Tile::Scalar(column) = tile else {
-                panic!("a fold's value is a scalar, got {tile:?}");
-            };
-            return column.index_at(0);
+            let sink = TestSink::default();
+            sink.process(&tile);
+            return sink.value().unwrap_or_else(|e| panic!("{e}: {tile:?}"));
         }
     }
     panic!("the fold never settled");
@@ -4028,9 +4100,8 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
 /// retired version released in full.
 ///
 /// `bind_let` rebuilds a binding whose subscribers released it in full, and this is
-/// the case that rebuild is for. `base` is read by the accumulator's init and by
-/// the trailing read's default, so a completed fold leaves both done with it and
-/// the `Memo` under it drops what it held.
+/// the case that rebuild is for. `base` is read by the accumulator's init, so a
+/// completed fold leaves it done with it and the `Memo` under it drops what it held.
 /// `p` is new in the replacement, so its seed is compiled rather than taken from a
 /// carried value, and compiling it reaches `base`. Keeping `base` there hands the store a
 /// branch that answers empty, and a store opens only once its seed carries a value — so
@@ -4143,19 +4214,16 @@ fn an_exact_annotation_on_a_loaded_collection_names_what_differs() {
 /// A filter edit over a live source offers the replacement only the rows some reader of the
 /// retired version still holds (`src/ccl/design/program-evolution.md`, "3. Build the rest and
 /// wire it to its input"). `10` and `20` arrive while the filter is `z > 99`, so the loop runs
-/// neither, and the reload edits the filter to `z > 5` before `1000` arrives.
-///
-/// - Under the transaction loop every reader has released both rows, so the replacement folds
-///   only `1000`.
-/// - Under the induction loop the read of `x` still holds position 1, the newest it has seen,
-///   since the final value may be there. So the replacement is offered `20` and folds it: 1020.
+/// neither, and the reload edits the filter to `z > 5` before `1000` arrives. The drive reads
+/// past both rows and releases them, and no other reader holds the source: the trailing read
+/// of `x` samples the store. So the replacement folds only `1000`.
 #[rstest]
 #[case::induction(indoc! {r#"
     x := 0
     for i in [z for z in source1() if z > THRESHOLD]:
         x := x + i
     x
-"#}, 1020)]
+"#}, 1000)]
 #[case::transaction(indoc! {r#"
     pool: Mut(Int, Txn) := 0
     for r in [z for z in source1() if z > THRESHOLD]:
@@ -4175,9 +4243,9 @@ fn a_filter_edit_offers_only_the_rows_a_reader_holds(#[case] program: &str, #[ca
 
 /// A filter edit over a live source folds each row once. `10`, `200` and `20` arrive while the
 /// filter is `z > 99`, so the loop folds `200` at position 1. The reload edits the filter to `z >
-/// 5`, `1000` arrives, and the value is the carried `200` plus the rows the replacement is
-/// offered: `20`, which the read of `x` still holds as the newest position, and `1000`. The
-/// replacement starts above position 1, since every reader has released it.
+/// 5`, `1000` arrives, and the value is the carried `200` plus the one row the replacement is
+/// offered, `1000`. The replacement starts above position 2, since every reader has released
+/// the three rows before it.
 #[test]
 fn a_filter_edit_over_a_live_source_folds_each_row_once() {
     let program = indoc! {r#"
@@ -4192,5 +4260,5 @@ fn a_filter_edit_over_a_live_source_folds_each_row_once() {
         &[10, 200, 20],
         &[1000],
     );
-    assert_eq!(value, 1220);
+    assert_eq!(value, 1200);
 }

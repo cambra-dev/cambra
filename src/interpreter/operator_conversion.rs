@@ -320,9 +320,8 @@ enum StoreReadKind {
     InductionChangelog,
 }
 
-/// How to read one key (variable) of a transactional store. The scalar-read
-/// reduction to the current/final value (`final_or_default` → `ExtractFinal`) is
-/// expressed in the CCL, not here.
+/// How to read one key (variable) of a transactional store. The trailing read of a key
+/// (`final_read` → `StoreFinalRead`) is expressed in the CCL, not here.
 #[derive(Clone)]
 struct KeyReadInfo {
     /// What identifies this variable across versions, or `None` for a key that is
@@ -367,8 +366,8 @@ impl StoreReadInfo {
 
 /// A built transactional store, registered under its `__hist` binder so each
 /// per-variable read (`__hist.k`) can branch the shared fan and project key
-/// `k`. The scalar-read reduction (`final_or_default` → `ExtractFinal`) is
-/// expressed in the CCL, not here.
+/// `k`. The trailing read of a key (`final_read` → `StoreFinalRead`) is expressed in the
+/// CCL, not here.
 #[derive(Clone)]
 struct StoreReadInfo {
     /// The [`content_hash`] of the `Transact` node this store was built from, in
@@ -2103,24 +2102,6 @@ fn convert_impl_inner(
         {
             expect_no_input(input, "final_or_default")?;
             match &argument.node {
-                // Over an **induction accumulator's own history**, the final value is a
-                // read of the store rather than a reduction of a stream: the store holds
-                // it at its frontier, and where the loop ran no position at all it holds
-                // the seed — which is the variable's init, or the value a retired
-                // version handed over, so the default has nothing left to supply. Taking
-                // it from the store is also what keeps a resumed loop honest: the
-                // positions its predecessor decided are not its own domain, so a stream
-                // over them would be empty and the default would answer with the
-                // declared init instead of the value carried in.
-                TypedExprNode::Tuple(elts)
-                    if elts.len() == 2
-                        && let Some((store, field)) = as_store_read(&elts[0], ctx)
-                        && ctx
-                            .lookup_store(&store)
-                            .is_some_and(|info| info.kind == StoreReadKind::InductionChangelog) =>
-                {
-                    convert_store_settled_read(&store, &field, ctx)
-                }
                 TypedExprNode::Tuple(elts) if elts.len() == 2 => {
                     let stream_op = convert_impl(&elts[0], None, ctx)?;
                     let default_op = convert_impl(&elts[1], None, ctx)?;
@@ -2214,26 +2195,38 @@ fn convert_impl_inner(
             ))
         }
 
-        // `final_read` is the terminal read of a commit key: a sample of the key's carried
-        // value at the position its own writers finish. Unlike `as_of_read` it needs no
-        // pairing — the position comes from the store's closure, not from a reading loop —
-        // so it is compiled here, to a `StoreFinalRead` over the store branch.
+        // `final_read` is the terminal read of a store key: a sample of the key's carried
+        // value at the position its own writers finish, a commit key's `await_final` or an
+        // induction accumulator's trailing read. Unlike `as_of_read` it needs no pairing —
+        // the position comes from the store's closure, not from a reading loop — so it is
+        // compiled here, to a `StoreFinalRead` over the store branch.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalRead) =>
         {
-            expect_no_input(input, "final_read")?;
+            // A collection-valued key's read stands in function position like any other
+            // collection-typed `Apply` (the arm below): an input is a domain to look it up at.
+            if let Some(input) = input {
+                if !expr.ty.is_collection() {
+                    return Err(ConversionError::Unsupported(
+                        "final_read requires empty input".into(),
+                    ));
+                }
+                let collection = convert_impl_inner(expr, None, ctx)?;
+                return Ok(Box::new(MapResult::new_at(input, collection, ctx.level())));
+            }
             let Some((store_name, field)) = as_store_read(argument, ctx) else {
                 return Err(ConversionError::Unsupported(
                     "final_read's operand is not a store history binding — `transact_phase` \
-                     mints it naming one (src/ccl/design/mutability.md, \"`await_final`\")"
+                     and `mut_elim` mint it naming one (src/ccl/design/mutability.md, \
+                     \"`await_final`\")"
                         .into(),
                 ));
             };
-            convert_store_final_read(&store_name, &field, ctx)
+            convert_store_settled_read(&store_name, &field, ctx)
         }
 
         // `await_final` is a surface marker: `transact_phase` replaces each occurrence
-        // with `final_or_default` over the mutable variable's history binding (or, for a
+        // with `final_read` over the mutable variable's history binding (or, for a
         // writer-free mutable variable, with its seed). Reaching this arm means a marker
         // escaped that phase — a compiler bug, not an unsupported program, since the
         // phase asserts its own absence on the way out.
@@ -4285,19 +4278,19 @@ fn build_induction_store(
     build_induction_store_single(keys, w, domain, paths, ctx)
 }
 
-/// The parts of a carrier's store that come from its writer site: the read keys' extents,
+/// The parts of a `Transact`'s store that come from its writer site: the read keys' extents,
 /// the write keys, the reply-tap fields, and the per-key state tiling.
 ///
 /// A tap is a write-only changelog key appended after the accumulators — a per-position
 /// event rather than a carried mutable variable (`carried: None`), holding
 /// `` {`fired{𝑉} | `idle} `` and omitted from the delta where it is `` `idle ``. `keys_map`
 /// arrives holding the accumulators and leaves holding the taps beside them.
-fn carrier_store_parts(
+fn store_parts(
     w: &WriterSite,
     taps: Vec<(String, Type)>,
     keys_map: &mut HashMap<String, KeyReadInfo>,
     ctx: &mut OpConversionContext,
-) -> Result<CarrierStoreParts, ConversionError> {
+) -> Result<StoreParts, ConversionError> {
     let read_extents: Vec<Extent> = w
         .read_keys
         .iter()
@@ -4342,7 +4335,7 @@ to the other's value",
         .iter()
         .map(|(field, info)| (field.clone(), Tiling::Scalar(info.value_extent.clone())))
         .collect();
-    Ok(CarrierStoreParts {
+    Ok(StoreParts {
         read_extents,
         write_keys,
         tap_fields,
@@ -4350,8 +4343,8 @@ to the other's value",
     })
 }
 
-/// What [`carrier_store_parts`] assembles.
-struct CarrierStoreParts {
+/// What [`store_parts`] assembles.
+struct StoreParts {
     /// Per read key, the extent its value has — in body-parameter order.
     read_extents: Vec<Extent>,
     /// Keys written, in decision-`writes` order: the accumulators, then the tap keys.
@@ -4485,7 +4478,7 @@ resolves to the other's value",
     // A reply (`out << e`) rides this loop body as `__to_<defer>` decision taps — the same
     // shape a commit writer carries (see `build_commit_store`) — so the write keys, the tap
     // fields and the per-key state come from the shared assembly.
-    let parts = carrier_store_parts(w, taps, &mut keys_map, ctx)?;
+    let parts = store_parts(w, taps, &mut keys_map, ctx)?;
 
     // As in `build_commit_store`: the store, its fan branches and its driver are
     // all minted after the writer's own subexpressions have been converted, so
@@ -4622,34 +4615,11 @@ fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, String)> 
     Some((name.clone(), field.clone()))
 }
 
-/// Compile a surface `await_final(x)` — a [`Builtin::FinalRead`] naming `x`'s history
-/// binding — as a [`StoreFinalRead`] over the store branch.
-///
-/// A commit store only: `transact_phase` never mints a `FinalRead` for an induction
-/// accumulator, whose trailing read is `final_or_default` over its history. That reaches
-/// the same [`convert_store_settled_read`] from `final_or_default`'s applied arm.
-fn convert_store_final_read(
-    store_name: &Name,
-    field: &str,
-    ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let info = ctx.lookup_store(store_name).ok_or_else(|| {
-        ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
-    })?;
-    if info.kind != StoreReadKind::Commit {
-        return Err(ConversionError::Unsupported(format!(
-            "final_read on {store_name}.{field}, which is not a commit store — a terminal \
-             read is only minted for a `Mut(V, Txn)` key"
-        )));
-    }
-    convert_store_settled_read(store_name, field, ctx)
-}
-
 /// A key's value once its store has settled — [`StoreFinalRead`] over the store fan.
 ///
 /// Shared by the two terminal reads, which differ in what mints them and not in what
-/// they sample: a surface `await_final` on a `Txn` key, and `final_or_default` over an
-/// induction accumulator's own history.
+/// they sample: a surface `await_final` on a `Txn` key, and the trailing read of an
+/// induction accumulator.
 fn convert_store_settled_read(
     store_name: &Name,
     field: &str,
@@ -4671,10 +4641,8 @@ fn convert_store_settled_read(
 }
 
 /// Compile a per-variable read `__hist.field` off a registered transactional
-/// store. `plan_loops` wraps a scalar accumulator read in `final_or_default(stream,
-/// init)`, so the current/final value (via [`ExtractFinal`]) is selected
-/// downstream, not here. A surface `await_final` is not this read — it is
-/// [`convert_store_final_read`], which samples a settled key rather than projecting a
+/// store. A trailing read is not this read — it is `final_read`, compiled by
+/// [`convert_store_settled_read`], which samples a settled key rather than projecting a
 /// stream for something else to reduce.
 fn convert_store_read(
     store_name: &Name,
@@ -4706,8 +4674,8 @@ fn convert_store_read(
         // folded at every position the store decided. An **accumulator**
         // (`carry_forward: true`) is dense `D ⇀ V`: every position folds the latest write
         // ≤ it, and a leading carry folds to the store's seed. A co-iterated read consumes
-        // it directly; a trailing scalar read never reaches here, since `final_or_default`
-        // over the accumulator's own history compiles to `StoreFinalRead`. A **reply tap**
+        // it directly; a trailing scalar read never reaches here, since it is a `final_read`
+        // of the accumulator's history, which compiles to `StoreFinalRead`. A **reply tap**
         // (`carry_forward: false`) is the feed's per-position value stream: only the
         // positions where the tap fired, keyed by loop position — the same `Fun(D, V)` the
         // sink reads.

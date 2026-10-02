@@ -321,7 +321,7 @@ and [loop planning](mutability.md#loop-planning-plan_loops-letrec-patterns--tran
 `mut_elim` and `transact_phase` turn mutable state into such groups; `channelize` also constructs
 `Feed`-kind groups for assembled channels. A mutable history definition reads
 strictly earlier positions through `get_prev_seq` or `get_prev_txn`; trailing reads use
-`final_or_default`. Feed outputs can be carried through the group's decision record before
+`final_read`. Feed outputs can be carried through the group's decision record before
 channelization gathers them. The symbolic form is
 `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 
