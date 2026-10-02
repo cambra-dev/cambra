@@ -2,10 +2,10 @@
 //! comprehension.
 //!
 //! The filter refines the *inner* collection's domain, so the surviving elements
-//! differ per group. Planning inserts a `map_filter` at the site where a morphism's
-//! codomain refines the collection its domain carries (`src/ccl/planning/map_filter.rs`),
-//! and it compiles to a `Filter` whose predicate holds the partition's two levels, so the
-//! mask is over each group's own keys (`src/interpreter/tile_operators/combinators.rs`).
+//! differ per group. Planning inserts `map(filter_values(𝑞))` at the site where a
+//! morphism's codomain refines the collection its domain carries
+//! (`src/ccl/planning/per_group_filter.rs`), and it compiles to a `Filter` one level in, so
+//! the mask is over each group's own keys (`src/interpreter/tile_operators/combinators.rs`).
 //!
 //! No sale in `north` passes the filter, so its group survives the filter holding
 //! nothing and `sum` over it answers the identity. Reaching that answer takes a group

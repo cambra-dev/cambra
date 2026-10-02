@@ -692,7 +692,10 @@ impl UncurryProducer {
                 .fold(self.input.tiling().empty_guard(), |all, arm| {
                     all.union(&self.split_pair_guard(arm, level))
                 }),
-            g => todo!("Uncurry cannot honor the release guard {g:?}"),
+            // `TileProducer::release` checks a guard against the producer's tiling, and
+            // Uncurry's tiling is a collection at every level this walks, so a guard reaching
+            // here is a function guard or a union of them.
+            g => unreachable!("Uncurry's tiling is a collection at {level}, released by {g:?}"),
         }
     }
 }
@@ -702,9 +705,9 @@ impl UncurryProducer {
 ///
 /// The filter masks the keys at one level, which the caller states from where it is in the
 /// program: an entry's own values may be collections too, so the level to filter is not the
-/// innermost one. A `filter_values` masks the keys its elements stand at, and a
-/// `map_filter` the keys of each element collection, one level further in. The predicate
-/// takes one of two forms.
+/// innermost one. A `filter_values` masks the keys its elements stand at, and under `map`
+/// those are the keys of each element collection, one level further in. The predicate takes
+/// one of two forms.
 ///
 /// - **A function value**, at the outermost level. It is applied to the input's keys, and
 ///   the answer is the mask over them.
@@ -1376,7 +1379,7 @@ struct ProductProducer {
     outer: Box<dyn TileProducer>,
     inner: Box<dyn TileProducer>,
     /// The levels both sides carry above the one being paired. The pair is formed at the
-    /// level the inner side *adds*, which is the outer's deepest — so a carrier inside a
+    /// level the inner side *adds*, which is the outer's deepest — so an inner loop inside a
     /// deeper nest pairs beneath the levels it leaves standing rather than at the top,
     /// where a key value repeats across enclosing rows and names no single row.
     level: CurryLevel,
@@ -1500,20 +1503,21 @@ impl TileProducer for ProductProducer {
             });
         // Beneath a standing level both sides fill the row, so a row there is complete
         // where both call it complete; the outer side's statement alone is about half of it.
+        // Each side's completeness at a level includes what the levels above it state, since
+        // completeness is downward-closed ([`Tile::completion_at`]), so the two closures are
+        // what intersect: a side that settles a path one level higher than the other states
+        // it nowhere at this level.
         for depth in (0..self.level.index()).map(CurryLevel::new) {
-            let (
-                Tile::DataFunction {
-                    domain_predicate: inner_complete,
-                    ..
-                },
-                Tile::DataFunction {
-                    domain_predicate, ..
-                },
-            ) = (inner_tile.values_at(depth), tile.values_at_mut(depth))
+            let complete = outer_tile
+                .completion_at(depth)
+                .intersect(&inner_tile.completion_at(depth));
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = tile.values_at_mut(depth)
             else {
-                unreachable!("the levels above the pair are collections on both sides")
+                unreachable!("the levels above the pair are collections")
             };
-            *domain_predicate = domain_predicate.intersect(inner_complete);
+            *domain_predicate = complete;
         }
         tile.remove_guarded(self.obsolete_guard().clone());
         tile
@@ -2607,6 +2611,80 @@ mod tests {
             producer.outer.obsolete_guard().is_empty(),
             "the row still has a pair: {:?}",
             producer.outer.obsolete_guard()
+        );
+    }
+
+    /// Beneath standing levels a path is complete where both sides call it complete, each
+    /// counting what the levels above say. The outer side settles the standing key 0 at the
+    /// outermost level and states nothing one level down; the inner side settles `[0, 0]` one
+    /// level down. Both are complete at `[0, 0]`, so the output says so there.
+    #[test]
+    fn product_beneath_standing_levels_reads_each_sides_closure() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let single = |codomain: Tile, stated: Predicate| {
+            Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![0]),
+                Box::new(codomain),
+                stated,
+                BitSet::new(),
+            )
+        };
+        let outer_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+        );
+        let outer = single(
+            single(
+                single(Tile::Scalar(ColumnValue::Ints(vec![100])), Predicate::True),
+                Predicate::False,
+            ),
+            Predicate::True,
+        );
+        let inner_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int()))),
+            ),
+        );
+        let inner = single(
+            single(
+                single(
+                    single(Tile::Scalar(ColumnValue::Ints(vec![7])), Predicate::True),
+                    Predicate::True,
+                ),
+                Predicate::True,
+            ),
+            Predicate::False,
+        );
+        let out_tiling = outer_tiling.append_level(
+            uint(),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), int()),
+                (tuple_field(1), uint()),
+            ]))),
+        );
+        let mut producer = ProductProducer {
+            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
+            inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
+            level: CurryLevel::new(2),
+            empty_level: out_tiling.values_at(CurryLevel::new(2)).empty_at_no_rows(),
+            pair: out_tiling.deepest_values().clone(),
+            shared: None,
+        };
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = out.values_at(CurryLevel::new(1))
+        else {
+            panic!("a standing level, got {out:?}")
+        };
+        assert!(
+            domain_predicate.contains_path(&[Value::UInt(0), Value::UInt(0)]),
+            "both sides are complete at [0, 0]: {out:?}"
         );
     }
 

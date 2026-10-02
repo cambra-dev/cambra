@@ -1379,8 +1379,8 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         // collection is the argument restricted to `{𝐷 | 𝑝}` and only `curry_ty` records it.
         // With 𝑓 and the suffix both absent the rewrite would leave `id`, which
         // `try_compose_identity` removes, and the filter would be gone. `map(id)` carries the
-        // narrowing, and planning materializes it as a `map_filter`
-        // (`planning/map_filter.rs`).
+        // narrowing, and planning materializes it as a per-group filter
+        // (`planning/per_group_filter.rs`).
         //
         // With 𝑓 present the narrowing reads the argument while `map` receives 𝑓's result,
         // so no type spells it; that shape fails the post-elimination type check as it does

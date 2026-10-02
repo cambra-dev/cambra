@@ -615,12 +615,14 @@ impl TileProducer for MapResultProducer {
 }
 
 /// Takes a function input and returns a function with the same structure
-/// but with a constant codomain swapped or zipped in, as determined by the [`MapResultToConstMode`]
-/// param.
+/// but with a constant swapped or zipped in for its values at one level, as determined by
+/// the [`MapResultToConstMode`] param.
 ///
-/// `input` must be a `DataFunction` tile; `constant` must be a Scalar.
+/// The level is the caller's to state ([`MapResultToConst::new_at`]), as
+/// [`MapResult`]'s is: a value at it may be a collection of its own, whose levels are part
+/// of the value rather than of the iteration.
 pub struct MapResultToConst {
-    /// Output tiling matches `input` tiling, transforming the codomain to `constant`.
+    /// Output tiling matches `input` tiling, with the values at `level` transformed.
     base: OperatorBase,
     /// The function input to iterate over.
     input: Box<dyn TileOperator>,
@@ -628,6 +630,8 @@ pub struct MapResultToConst {
     constant: Box<dyn TileOperator>,
     /// Whether to zip with the constant instead of replacing with the constant.
     mode: MapResultToConstMode,
+    /// The level whose values the constant replaces or pairs with.
+    level: CurryLevel,
 }
 
 /// The type fof MapResultToConst operation to perform
@@ -642,28 +646,28 @@ pub enum MapResultToConstMode {
 }
 
 impl MapResultToConst {
-    /// Create a new `MapResultToConst` operator that maps any codomain to the given constant.
-    pub fn new(
+    /// Replace, or pair with the constant, each of `input`'s values at `level`: the
+    /// iteration the node sits in, which the caller states from where it is in the program.
+    pub fn new_at(
         input: Box<dyn TileOperator>,
         constant: Box<dyn TileOperator>,
         mode: MapResultToConstMode,
+        level: CurryLevel,
     ) -> Self {
-        let tiling = match mode {
-            MapResultToConstMode::Replace => {
-                change_tiling_result(input.tiling(), |_| constant.tiling().clone())
-            }
-            MapResultToConstMode::ZipLeft => change_tiling_result(input.tiling(), |e| {
-                Tiling::tuple(&[constant.tiling().clone(), Tiling::Scalar(e.clone())])
-            }),
-            MapResultToConstMode::ZipRight => change_tiling_result(input.tiling(), |e| {
-                Tiling::tuple(&[Tiling::Scalar(e.clone()), constant.tiling().clone()])
-            }),
+        let values = input.tiling().values_at(level).clone();
+        let constant_tiling = constant.tiling().clone();
+        let result = match mode {
+            MapResultToConstMode::Replace => constant_tiling,
+            MapResultToConstMode::ZipLeft => Tiling::tuple(&[constant_tiling, values]),
+            MapResultToConstMode::ZipRight => Tiling::tuple(&[values, constant_tiling]),
         };
+        let tiling = with_values_at(input.tiling(), level, result);
         Self {
             base: OperatorBase::new(tiling),
             input,
             constant,
             mode,
+            level,
         }
     }
 }
@@ -698,6 +702,7 @@ impl TileOperator for MapResultToConst {
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
+            level: self.level,
         })
     }
 }
@@ -707,6 +712,7 @@ struct MapResultToConstProducer {
     input: Box<dyn TileProducer>,
     constant: Box<dyn TileProducer>,
     mode: MapResultToConstMode,
+    level: CurryLevel,
 }
 
 impl MapResultToConstProducer {
@@ -722,10 +728,10 @@ impl MapResultToConstProducer {
         let mut live = input.clone();
         live.compact();
         let mut out = self.tiling().empty_tile();
-        // The levels the output shares with the input are the input's whole chain, since the
-        // constant replaces what sits below it. A collection constant adds levels of its own
-        // beneath those, and nothing in the input names them.
-        for level in (0..self.input.tiling().levels()).map(CurryLevel::new) {
+        // The levels the output shares with the input are the ones above `self.level`, since
+        // the constant replaces or pairs with what sits there. A collection constant adds
+        // levels of its own beneath those, and nothing in the input names them.
+        for level in (0..self.level.index()).map(CurryLevel::new) {
             let held: Vec<Predicate> = live
                 .paths_at(level)
                 .iter()
@@ -819,11 +825,10 @@ impl TileProducer for MapResultToConstProducer {
         // A collection constant repeated down a column states each copy's completeness without
         // knowing which row holds it, so it is qualified by the rows that do
         // (`src/interpreter/design-operators.md`, "The completeness contract").
-        let input_levels = self.input.tiling().levels();
-        let held = (input_levels > 0).then(|| {
+        let held = self.level.enclosing().map(|rows| {
             Predicate::union_all(
                 input_tile
-                    .paths_at(CurryLevel::new(input_levels - 1))
+                    .paths_at(rows)
                     .iter()
                     .map(|path| Predicate::exactly(path))
                     .collect(),
@@ -832,17 +837,19 @@ impl TileProducer for MapResultToConstProducer {
         // Stated over tiles rather than columns: `Replace` never reads the values, and the
         // two `Zip` modes pair with them whatever they carry — a level included, which a
         // column has nowhere to put.
-        map_tile_result(input_tile, move |values| {
-            let mut const_tile = repeat_tile(constant_tile, values.rows());
-            if let Some(held) = &held {
-                const_tile.map_level_predicates(&mut |depth, pred| pred.qualified_by(held, depth));
-            }
-            match mode {
-                MapResultToConstMode::Replace => const_tile,
-                MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
-                MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
-            }
-        })
+        let mut output = input_tile;
+        let slot = output.values_at_mut(self.level);
+        let values = std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0)));
+        let mut const_tile = repeat_tile(constant_tile, values.rows());
+        if let Some(held) = &held {
+            const_tile.map_level_predicates(&mut |depth, pred| pred.qualified_by(held, depth));
+        }
+        *slot = match mode {
+            MapResultToConstMode::Replace => const_tile,
+            MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
+            MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
+        };
+        output
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1633,6 +1640,59 @@ mod tests {
         let _ = producer.get(producer.tiling().universal_guard());
     }
 
+    /// At a level above the innermost, `MapResultToConst` replaces each value there whole:
+    /// over groups `0 ↦ [1]` and `1 ↦ [2, 3]` at level 1, each group becomes one constant,
+    /// rather than each element.
+    #[test]
+    fn map_result_to_const_replaces_each_value_at_its_level() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let groups = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let operator = MapResultToConst::new_at(
+            Box::new(Constant::collection(groups.clone(), in_tiling.clone())),
+            Box::new(Constant::new(Value::Int(7), int())),
+            MapResultToConstMode::Replace,
+            CurryLevel::new(1),
+        );
+        assert_eq!(
+            operator.tiling(),
+            &Tiling::data_function(uint(), Tiling::Scalar(int()))
+        );
+        let mut producer = MapResultToConstProducer {
+            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), operator.tiling()),
+            input: Box::new(TestTileProducer::new(groups, in_tiling)),
+            constant: Box::new(TestTileProducer::new(
+                Tile::Scalar(ColumnValue::Ints(vec![7])),
+                Tiling::Scalar(int()),
+            )),
+            mode: MapResultToConstMode::Replace,
+            level: CurryLevel::new(1),
+        };
+        let out = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            out,
+            Tile::data_function(
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 7]))),
+                Predicate::True,
+                BitSet::new(),
+            )
+        );
+    }
+
     /// While its constant is not terminal, `MapResultToConst` emits no rows and states what
     /// its input states except beneath the rows it holds live: it neither takes back a
     /// filtered key it called complete nor claims the live key it has not emitted.
@@ -1670,6 +1730,7 @@ mod tests {
                 c_tiling,
             )),
             mode: MapResultToConstMode::Replace,
+            level: CurryLevel::new(1),
         };
         let first = producer.get(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));

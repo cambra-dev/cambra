@@ -1181,13 +1181,39 @@ mod tests {
         let out = zip.get(out_tiling.universal_guard());
         let guard = out.to_guard();
         zip.release(guard.clone());
+        // Key 0 is open, since the collection arm can still grow under it. The release
+        // contract releases a field with no keys of its own along with its key, so the
+        // scalar arm is released nothing yet, and the collection arm is released the inner
+        // key it delivered beneath key 0.
+        let covers = |log: &Rc<std::cell::RefCell<Vec<TileGuard>>>, path: &[Value]| {
+            log.borrow().iter().any(|g| g.covers_path(path))
+        };
+        assert!(
+            !covers(&released0, &[Value::UInt(0)]),
+            "the scalar arm was released an open key: {:?}, from {guard:?}",
+            released0.borrow()
+        );
+        assert!(
+            covers(&released1, &[Value::UInt(0), Value::UInt(3)]),
+            "the collection arm was not released its inner key: {:?}, from {guard:?}",
+            released1.borrow()
+        );
+        // Releasing key 0 whole reaches both arms as key 0.
+        zip.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::UInt(0)),
+        )));
         for (log, tiling) in [(&released0, &arm0_tiling), (&released1, &arm1_tiling)] {
             for g in log.borrow().iter() {
                 assert!(
                     g.check_from(tiling),
-                    "{g:?} is not a guard over the arm's tiling {tiling}, from {guard:?}"
+                    "{g:?} is not a guard over the arm's tiling {tiling}"
                 );
             }
+            assert!(
+                covers(log, &[Value::UInt(0)]),
+                "an arm was not released key 0: {:?}",
+                log.borrow()
+            );
         }
     }
 }

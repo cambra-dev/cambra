@@ -289,40 +289,40 @@ impl Tile {
     /// keeps the statement for its open row and the tile keeps one per level.
     fn drop_covered_completion(&mut self) {
         // Only a statement naming an enclosing path can be covered by one above it, and most
-        // tiles state none, so they answer here without copying a predicate.
-        let mut level = &*self;
-        let qualified = loop {
-            let Tile::DataFunction {
-                codomain,
-                domain_predicate,
-                ..
-            } = level
-            else {
-                break false;
-            };
-            if domain_predicate.qualifies() {
-                break true;
+        // tiles state none, so they answer here without copying a predicate. A record stands
+        // over the same rows, so a collection in one of its fields is a level at the record's
+        // depth, as `map_level_predicates` reads it.
+        fn states_a_qualified(tile: &Tile) -> bool {
+            match tile {
+                Tile::DataFunction {
+                    codomain,
+                    domain_predicate,
+                    ..
+                } => domain_predicate.qualifies() || states_a_qualified(codomain),
+                Tile::Record(fields) => fields.values().any(states_a_qualified),
+                _ => false,
             }
-            level = codomain;
-        };
-        if !qualified {
+        }
+        if !states_a_qualified(self) {
             return;
         }
         fn walk(tile: &mut Tile, above: &mut Vec<Predicate>) {
-            let Tile::DataFunction {
-                codomain,
-                domain_predicate,
-                ..
-            } = tile
-            else {
-                return;
-            };
-            if let Some(kept) = domain_predicate.without_covered(above) {
-                *domain_predicate = kept;
+            match tile {
+                Tile::DataFunction {
+                    codomain,
+                    domain_predicate,
+                    ..
+                } => {
+                    if let Some(kept) = domain_predicate.without_covered(above) {
+                        *domain_predicate = kept;
+                    }
+                    above.push(domain_predicate.clone());
+                    walk(codomain, above);
+                    above.pop();
+                }
+                Tile::Record(fields) => fields.values_mut().for_each(|field| walk(field, above)),
+                _ => {}
             }
-            above.push(domain_predicate.clone());
-            walk(codomain, above);
-            above.pop();
         }
         walk(self, &mut Vec::new());
     }
@@ -590,21 +590,6 @@ impl Tile {
     /// a key's group once per row that asks for it — and what collapsing a family of groups
     /// into one does, which is the whole of applying a keyed collection at a single key.
     pub fn regroup_rows(&self, groups: &[Vec<usize>]) -> Tile {
-        let regrouped = self.regroup_rows_raw(groups);
-        debug_assert!(
-            valid_over(&regrouped, level_offsets_of(&regrouped).len()),
-            "Invalid collection: {regrouped:?}"
-        );
-        regrouped
-    }
-
-    /// [`regroup_rows`](Self::regroup_rows) with no well-formedness check, for a caller
-    /// that is mid-repair.
-    ///
-    /// Putting a key's two arrivals side by side leaves the level holding that key twice,
-    /// which no collection admits — and which [`collapse_grown_groups`] makes one key again on the
-    /// way back up. Checking here would reject the intermediate rather than the result.
-    fn regroup_rows_raw(&self, groups: &[Vec<usize>]) -> Tile {
         let Tile::DataFunction {
             domain,
             codomain,
@@ -630,13 +615,18 @@ impl Tile {
                 moved.insert(to);
             }
         }
-        Tile::DataFunction {
+        let regrouped = Tile::DataFunction {
             row_starts: ColumnValue::UInts(starts),
             domain: domain.select_indices(picked.iter().copied(), picked.len()),
             codomain: Box::new(codomain.select_rows(&picked)),
             domain_predicate: domain_predicate.clone(),
             deleted: moved,
-        }
+        };
+        debug_assert!(
+            valid_over(&regrouped, level_offsets_of(&regrouped).len()),
+            "Invalid collection: {regrouped:?}"
+        );
+        regrouped
     }
 
     /// Keep the keys `mask` names, dropping the rest — a filter along the *key* axis,
@@ -1804,6 +1794,18 @@ impl Tile {
                 (from..to).contains(&last)
             })
             .unwrap_or(0);
+        // The prefix names the owner's keys by value, at or below the head, while the head is
+        // the last key in storage order. A merge appends the keys each delivery brings, so the
+        // two orders can differ, and a held key above the head would be held and not named.
+        // There is a prefix only where the head is the owner's greatest key.
+        let below = Predicate::below(head.clone());
+        let (from, to) = self.row_run(owner);
+        if (from..to).any(|i| {
+            let key = domain.index_at(i);
+            key != head && !below.contains(&key)
+        }) {
+            return None;
+        }
         // The prefix names every key below the head, held or not, so each one it has not
         // been handed has to be one that never arrives: the statement calls it complete. A
         // held key whose value is a scalar is whole already, so holding it is enough.
@@ -2503,11 +2505,10 @@ fn valid_over_settled(
             }
             let key_paths = row_paths.map(|paths| tile.key_paths(paths));
             // Which keys are settled, each on its own: a row beneath one is a row the level
-            // above calls complete.
+            // above calls complete. The step [`Tile::completion_at`] takes per level.
             let (settled, complete): (Vec<bool>, Predicate) = match &key_paths {
                 Some(paths) => {
-                    let complete = Predicate::qualified(above.clone(), Predicate::True)
-                        .union(domain_predicate);
+                    let complete = above.descend(1).union(domain_predicate);
                     (
                         paths.iter().map(|p| complete.contains_path(p)).collect(),
                         complete,
@@ -4423,6 +4424,94 @@ mod tests {
             held,
             vec![(key(0), 10), (key(1), 20), (key(2), 30), (key(3), 40)]
         );
+    }
+
+    /// A collection inside a record field is a level at the record's depth, so the statement
+    /// it makes beneath a row its parent already calls complete is dropped there too. The
+    /// outer key 0 is complete, so the field's statement under `[0]` is covered and only the
+    /// one under the open row `[1]` survives.
+    #[test]
+    fn covered_completion_is_dropped_inside_a_record_field() {
+        let under = |row: usize, here: Predicate| {
+            Predicate::qualified(Predicate::exactly(&[Value::UInt(row)]), here)
+        };
+        let open_row = under(1, Predicate::below(Value::UInt(5)));
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Record(HashMap::from([(
+                tuple_field(0),
+                Tile::grouped(
+                    ColumnValue::UInts(vec![0, 1]),
+                    ColumnValue::UInts(vec![3, 4]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
+                    under(0, Predicate::True).union(&open_row),
+                    BitSet::new(),
+                ),
+            )]))),
+            Predicate::point(Value::UInt(0)),
+            BitSet::new(),
+        );
+        tile.drop_covered_completion();
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            unreachable!("built as a collection")
+        };
+        let Tile::Record(fields) = codomain.as_ref() else {
+            unreachable!("built as a record")
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &fields[&tuple_field(0)]
+        else {
+            unreachable!("built as a collection")
+        };
+        assert_eq!(domain_predicate, &open_row);
+    }
+
+    /// A group whose keys sit out of value order, `[0, 2, 1]`, has no prefix ending at its
+    /// last key: that prefix would leave the held key 2 unnamed.
+    #[test]
+    fn a_group_held_out_of_order_names_every_key_it_holds() {
+        let tile = two_level_uint_int(
+            vec![0],
+            vec![0],
+            vec![0, 2, 1],
+            vec![100, 120, 110],
+            Predicate::False,
+        );
+        let guard = tile.to_guard();
+        for key in [0, 1, 2] {
+            assert!(
+                guard.covers_path(&[Value::UInt(0), Value::UInt(key)]),
+                "key {key} is held but not named: {guard:?}"
+            );
+        }
+    }
+
+    /// Two deliveries that interleave under one outer key merge into the group `[0, 2, 1]`,
+    /// and the merge's guard names all three.
+    #[test]
+    fn a_merge_of_interleaving_deliveries_names_every_key_it_holds() {
+        let mut tile = two_level_uint_int(
+            vec![0],
+            vec![0],
+            vec![0, 2],
+            vec![100, 120],
+            Predicate::False,
+        );
+        tile.merge(two_level_uint_int(
+            vec![0],
+            vec![0],
+            vec![1],
+            vec![110],
+            Predicate::False,
+        ));
+        let guard = tile.to_guard();
+        for key in [0, 1, 2] {
+            assert!(
+                guard.covers_path(&[Value::UInt(0), Value::UInt(key)]),
+                "key {key} is held but not named: {guard:?}"
+            );
+        }
     }
 
     #[test]
