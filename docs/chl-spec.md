@@ -155,8 +155,8 @@ reserved for future use.
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
-> **[Decided]**), `import` (built-in modules — the `http` module surface,
-> **[Decided]**; general modules remain future work, §9), and `assert` and its
+> **[Decided]**), `import`, `use`, `as`, `pub`, `run`, `param` and `this` (modules,
+> **[Decided]**, [9. Modules [Decided]](#9-modules-decided)), and `assert` and its
 > `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names
 > for other purposes. (`with`, `:=`, `match`, `case` and `where` are
@@ -187,6 +187,10 @@ surface level.
 <<  <<=
 (  )  [  ]  {  }  ,  :  .  ;  \  `
 ```
+
+> **Direction [Decided].** `::` joins the set. It separates a qualifier from the name it
+> qualifies: a module, a run, or a Module-typed parameter from its member (`cart::total`,
+> [9.6 Qualified references](#96-qualified-references)).
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
 a mutable variable. It is *not* Python's walrus operator: it is an
@@ -238,6 +242,8 @@ why the refinement separator moved off `|`.
 
 `@` introduces a decorator on the line above a declaration. `LoadFrom` is the
 only one ([8.8 `@LoadFrom`](#88-loadfrom)), so `@` never appears in any other position.
+`Discard` is a second, **[Decided]** and unimplemented
+([8.9 `@Discard` [Decided]](#89-discard-decided)).
 
 ### 1.10 Semicolons
 
@@ -260,11 +266,15 @@ top_block  ::= ( statement )* EOF
 ```
 
 A source file is one **top-level block**: a sequence of statements
-sharing a single lexical scope. There is deliberately no "module"
-concept in this spec — CHL has no imports or namespaces (§12), and
-semantically the top level behaves exactly like any nested block
-(§4). (The parser's root AST node is still named `Module`, after
-Python's `ast.Module`; the name is historical.)
+sharing a single lexical scope. Semantically the top level behaves
+exactly like any nested block (§4). (The parser's root AST node is
+named `Module`, after Python's `ast.Module`.)
+
+> **Direction [Decided].** A source file is a **module**. Importing one
+> asserts that it performs no IO and reaches its one shared run; running one
+> creates a run of its own. The engine runs one root module. Modules are
+> specified in [9. Modules [Decided]](#9-modules-decided), whose statements (`import`, `run`, `param`,
+> and `pub` on a member) extend this grammar.
 
 ### 2.2 Statements
 
@@ -362,7 +372,10 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 > (**[Decided]**, §3.7 — today an annotation *requires* a value), and
 > out-of-line collection definition through a subscript target,
 > `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
-> no-subscript-target rule above). (`mut_assign_stmt` and `with_stmt`
+> no-subscript-target rule above). The module statements `import_stmt`,
+> `run_stmt` and `param_stmt`, and `pub` before a member's introducing
+> statement, are **[Decided]** ([9. Modules [Decided]](#9-modules-decided)).
+> (`mut_assign_stmt` and `with_stmt`
 > above are already implemented — §4.3, §8; they are in the grammar, not
 > this list.)
 
@@ -791,7 +804,7 @@ Operators absent on purpose: `/` (no fractional type), `%`, `>>`,
 > (§1.8), and there is no fractional literal (§1.7), so a quantity that
 > wants a fraction has nothing to write it with. Everything else is
 > **[Open]** — what `Real` denotes (exact rationals, a decimal, or the
-> `f64` §12 rules out), whether `/` is total or partial at zero
+> `f64` §13 rules out), whether `/` is total or partial at zero
 > (*Partiality*, §3), whether `//` survives beside it, and how an `Int`
 > literal acquires the type in a `Real`-typed position.
 
@@ -1331,6 +1344,14 @@ outright:
   constructor. `` `ok(1) `` and `` `ok("s") `` are each fine alone; if both
   flow into one variant, the mismatch is reported where they join.
 
+> **Direction [Decided] — labels and tags belong to a module.** With
+> modules, the flat space is one per module: a tag or a record field label
+> written unqualified means the current module's, and `m::ok` or
+> `r.m::f` names module `m`'s
+> ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+> Within one file this changes nothing. Nominal variants, whose tags live
+> inside their type, are **[Tentative]**.
+
 This is the polymorphic-variant model, and the **backtick** plays the role
 capitalization plays in languages that capitalize constructors. Tags are
 structural and undeclared, so name resolution cannot tell `some(v)` from a
@@ -1851,7 +1872,7 @@ silently discard every update at the iteration boundary, which is the one thing
 the old value, so a per-iteration rebind reads the binding's *initial* value on
 every iteration.
 
-*Currently unsupported* (see §12): nested for-loops with mutable
+*Currently unsupported* (see §13): nested for-loops with mutable
 variables, mutable variables introduced inside a loop body or a `with
 begin():` block, and `while` loops.
 
@@ -2076,6 +2097,12 @@ There is no `global` / `nonlocal` mechanism — closure capture is the
 only way for a function to refer to outer names, and capture is
 read-only.
 
+> **Direction [Decided].** The top-level scope is its module's. Import
+> names, run names, and parameters are in scope throughout the module,
+> as type aliases are, and another module's member is reached by a
+> qualified name, `m::f`, including through a parameter of `Module{…}` type
+> ([9.6 Qualified references](#96-qualified-references)).
+
 ---
 
 ## 6. Types (informal sketch)
@@ -2096,7 +2123,7 @@ marked one carries its status per "How to read this document".)
 - `Int` — signed 64-bit integer.
 - `Real` — a fractional number (**[Tentative]**, §3.3). The checker has no
   fractional type, there is no fractional literal (§1.7), and `/` is not
-  even lexed (§1.8, §12).
+  even lexed (§1.8, §13).
 - `Bool` — `True` or `False`.
 - `String` — UTF-8 string.
 - `{}` — unit type, one inhabitant, and its only CHL spelling (§6.6). There is
@@ -2135,6 +2162,9 @@ marked one carries its status per "How to read this document".)
   is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
   function. Whether the function is a collection or a callable capability
   is inferred, never written (§6.3).
+- `Module{name: T, Name <: U, …}` — the type of a module's public members,
+  through which one module is passed to another (**[Decided]**,
+  [9.8 Module types](#98-module-types)).
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
@@ -2846,10 +2876,11 @@ unique across the program.
 > `bad_request` / `conflict`), with the record literal as the escape
 > hatch for other codes — no new language surface. They live in an
 > **`http` module** (**[Decided]**): programs write `import http`,
-> then `http.ok(…)` / `http.not_found(…)`, and the north-star
-> programs address the source the same way, `http.serve(…)`. Modules
-> are records, so a module can be passed as one; the general module
-> system (user modules, multi-file) remains future work (§9). A response feed's
+> then `http::ok(…)` / `http::not_found(…)`, and address the source the
+> same way, `http::serve(…)`. `http` is a module of the std root
+> ([9.16 The std root](#916-the-std-root)).
+> The north-star programs still spell these `http.ok` and `http.serve`.
+> A response feed's
 > element type would be per-endpoint: a bare serializable value,
 > answered as a 200 carrying it (`txn_kv` writes `String` bodies; the
 > north-star `storefront` `/stats` answers with its revenue map
@@ -3291,7 +3322,7 @@ qty_units: Int
 
 This is the one declaration that carries an annotation and no value — the
 decorator is where the value comes from. A bare `y: T` elsewhere is a parse error
-([4. Statement semantics](#4-statement-semantics)). `LoadFrom` is the only decorator CHL has.
+([4. Statement semantics](#4-statement-semantics)). `LoadFrom` is the only decorator CHL has today ([1.9 Decorators](#19-decorators)).
 
 A load is a declaration, so it appears where declarations do: the top level, or a
 `def` body. A `for` body and a `with begin():` block take statements rather than
@@ -3366,7 +3397,563 @@ the next version. A name a version loads and does not declare is gone after that
 version, which is why recompiling a migrating source unchanged is refused: there
 is no longer anything of that name to load.
 
-## 9. Sinks
+### 8.9 `@Discard` [Decided]
+
+`@Discard` decorates a declaration head with no value, where the declaration stood. It marks that
+what the version this source replaces held there is intentionally gone:
+
+```python
+@Discard
+stock                         # the predecessor's `stock` is intentionally gone
+```
+
+A reload that drops a variable holding state is refused without one. The name resolves at its own
+position, outward, as `@LoadFrom`'s does. On a `run` or an `import` statement the tombstone covers
+every variable of that run
+([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)).
+
+**A tombstone resolves against the ancestry**, not only the version it replaces: every version the
+running program descends from, through each reload and each branch it was created from. A tombstone
+is valid when some version in the ancestry held the address, whether or not the immediate
+predecessor does, so it may stay in the source across any number of reloads. A tombstone naming an
+address no version in the ancestry held is an error, and so is one compiled with no ancestry at all.
+The running program keeps the record of every address its ancestry held, for as long as it runs.
+
+`@Discard` replaces retiring a variable by loading it into an unused binding.
+
+---
+
+## 9. Modules [Decided]
+
+A **module** is one `.cambra` file. Nothing in this section is implemented. A module is used in one
+of two ways:
+
+- **Importing** it brings its public members into scope. Importing asserts that the module performs
+  no IO, and every importer reaches one shared run of it
+  ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+- **Running** it performs all of its computation, public and private: its state, its sources and
+  sinks, and its loops. A module may be run any number of times, each run with its own name, its own
+  arguments, and its own state.
+
+The engine runs one **root module**, the top-level definitions of everything that should run. The
+root runs other modules, which may run others in turn. A reload replaces the root and the module
+sources, so adding, removing, and changing what runs are all edits to source.
+
+Within a module the top level is sequential, as in a single file (§4): a value member names only
+members above it. A module's public members are reached from another module as `m::f`, and one
+module is handed to another as a value of a **Module type**, the structural type of its public
+members ([9.8 Module types](#98-module-types)).
+
+### 9.1 Vocabulary
+
+- **Module path.** The `::`-separated identifier sequence that names a module, `shop::cart`. A
+  module's identity across compilations is its path.
+- **Root module.** The module the engine runs. Its run path is empty.
+- **Run.** One running of a module, declared by a `run` statement. A run has a **run name** in the
+  module that declares it and a **run path** from the root: `eu`, or `eu::inv` for a run `eu`
+  declares.
+- **Shared run.** The one run of an imported module that every importer reaches. Its run path is
+  the module path ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+- **Member.** A binding at a module's top level. Bindings inside a `def`, a loop, or a block are
+  **locals**.
+- **Public member.** A member declared with `pub`. Every other member is private to its module.
+- **Parameter.** A value a run supplies, declared by a `param` statement.
+- **Module type.** The structural type of a module's public members, `Module{…}`
+  ([9.8 Module types](#98-module-types)).
+- **Module interface.** What checking records about a module for the modules that use it: its
+  public members' contracts, its parameters, and whether it performs IO
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+
+### 9.2 Imports
+
+```ebnf
+import_stmt ::= "import" module_path ["as" ident] [use_clause]
+use_clause  ::= "use" use_list
+use_list    ::= use_item ("," use_item)* | "(" use_item ("," use_item)* [","] ")"
+use_item    ::= ident ["as" ident]
+module_path ::= ident ("::" ident)*
+```
+
+- `import a::b` binds the last segment, `b`. `import a::b as c` binds `c`. This departs from
+  Python, where `import a.b` binds `a`. The module name an import binds appears in the statement.
+- `import a::b use f, T as U` binds `b`, and also binds `f` and `U` to the public members `f` and
+  `T` of `a::b`. A `use` item binds an unqualified name; the module name stays bound beside it.
+- An import reaches every public member of the module's shared run. Importing a module that
+  performs IO is an error ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+- There is no wildcard `use`. Adding a public member to a module never changes what an importer's
+  names mean.
+- Every module path is absolute from the module root ([9.15 Module files](#915-module-files)).
+  There are no relative imports, so moving a file does not change what the file itself imports.
+- There is no re-export. `pub` is refused on an `import`, so a module's public members are the ones
+  it declares and the runs it marks `pub run`.
+
+### 9.3 Runs
+
+```ebnf
+run_stmt ::= ["pub"] "run" module_path ["(" [arg ("," arg)* [","]] ")"] ["as" ident] [use_clause]
+arg      ::= ident "=" expr
+```
+
+```python
+run audit                                             # named `audit`
+run storefront(port="8080", region="eu", audit=audit) as eu
+run inventory as inv use stock                        # binds `inv`, and `stock` to `inv::stock`
+```
+
+- A run's name defaults to the module path's last segment, as an import's does. `as` overrides it.
+- Every run has a name, because the name is the run's identity: its state, its routes, and what a
+  reload pairs it with. Two runs in one module with the same name are an error, fixed by `as`.
+  Renaming a module file renames every run that relies on the default, so a long-lived run names
+  itself with `as`.
+- Every `run` statement is its own run, and nothing deduplicates them. Two modules that each write
+  `run audit` give the root two audit runs, each with its own state. Sharing one run takes passing
+  it as an argument ([9.9 Running](#99-running)).
+- A `use` clause on a run binds unqualified names to the run's public members, as an import's
+  does.
+- Arguments are keyword-only, one per parameter without a default. A module with no parameters is
+  run without parentheses.
+- An argument is an expression over the running module's scope. An import name or run name there
+  denotes its run as a value of its Module type, which is how a module is passed to another.
+- The **run dependency graph** of a module has an edge from each of its runs to every run its
+  arguments name, `y` or a `pub run` reached as `y::z`. It must be acyclic. `run svc(peer=y) as x`
+  and `run svc(peer=x) as y` are each legal alone and form a cycle together, which the module graph
+  does not see because both runs are of one module. A cycle is an error with a label at each `run`
+  statement in it.
+- A run name is bound in the declaring module. `eu::x` reaches the run's public member `x`.
+- A run needs no `import`. A run name and an import name in one module may not coincide. Importing a
+  module and running it are two runs: the import reaches the shared run, and the `run` statement
+  declares another.
+- `pub run` makes the run reachable through the declaring module's own runs: `shop::eu::stock` for a
+  `pub run … as eu` inside a run `shop`.
+
+### 9.4 Parameters
+
+```ebnf
+param_stmt ::= "param" ident [":" type] ["=" expr]
+             | "param" Ident ["<:" type] ["=" type]      (* Ident: a capitalized identifier *)
+```
+
+```python
+import audit_api
+
+param port: String
+param region: String = "us"
+param audit: audit_api::AuditLog   # Module{events: Feed(audit_api::Event)}
+param Receipt <: {id: String}
+param payments: Module{charge: {amount: Int} => Receipt}
+```
+
+- A **type parameter** is a capitalized parameter, since `Caps` means type
+  ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
+  It names a type that varies with the run. The module is checked with it as an opaque type, known
+  only through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run
+  supplies it as an argument, `Receipt=stripe::Receipt`, or leaves it to be inferred from the other
+  arguments.
+- A value parameter is an immutable value. Its type is its annotation, or inferred from the module's
+  uses the way a function parameter's is.
+- A parameter of Module type is how a module takes another module. The argument is an import name
+  or a run name, and Module subtyping is the check ([9.8 Module types](#98-module-types)). The
+  parameter is a qualifier: `audit::events` reaches the argument's member.
+- A parameter's type is the only thing checking reads about its argument
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). An interface is an
+  alias of a Module type, usually exported by a library both sides import.
+- A parameter is in scope throughout its module. A member with the same spelling is an error naming
+  both sites. A local may shadow a value parameter, except one of Module type
+  ([9.6 Qualified references](#96-qualified-references)). A type parameter follows the scoping of a
+  type alias ([6.7 Type-alias statements](#67-type-alias-statements)).
+- The root module has no required parameters. The engine runs it, and no `run` statement supplies
+  arguments, so a root parameter takes its default. A root with a parameter that has no default is
+  an error that says to run the module from a root instead. Running one module alone takes a root of
+  one `run` statement, so what runs, and with which arguments, is always source that a reload
+  replaces.
+
+### 9.5 Visibility
+
+`pub` prefixes the statement that introduces a member:
+
+```python
+pub def quote(item, qty): …
+pub limit: Int = 10
+pub Qty = {Int where _ >= 0}
+pub stock: Mut(Map(String, Int), Txn) := []
+pub run inventory as inv
+```
+
+- A member without `pub` is private. Only its own module can name it.
+- `pub` on `:=` is accepted on the statement that introduces a `Txn` mutable variable and refused on
+  a later write to it. It is refused on an induction variable
+  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+- `pub` is refused on `import`, `param`, `op=`, `<<=`, `for`, `if`, `match`, `with`, expression
+  statements, and anywhere but a module's top level.
+- A public name is bound exactly once at its module's top level. A later binding of the same
+  spelling, public or private, is an error naming both sites. Without this rule the exported binding
+  would be whichever one was in scope at the end of the module, and a shadowing edit far from the
+  `pub` would change the module's interface.
+- Private names keep the ordinary top-level shadowing of
+  [5. Scoping and binding](#5-scoping-and-binding).
+- Types need not be annotated on public members. An unannotated member's contract is its inferred
+  type ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+
+### 9.6 Qualified references
+
+Three kinds of name reach another module's members: an import name, a run name, and a parameter of
+Module type. `::` separates the name from the member, and `.` stays record projection
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). With
+`import shop::cart`, `run shop::cart as c`, and `param p: Module{count: Mut(Int, Txn)}`:
+
+| Written | Position | Means |
+| --- | --- | --- |
+| `cart::total` | value | the public member `total` of `shop::cart`'s shared run |
+| `cart::Item` | type | the public type alias `Item` of `shop::cart` |
+| `c::count` | value, write target | the public member `count` of the run `c` |
+| `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
+| `p::count` | value, write target | the member `count` of the run passed as `p` |
+| `cart` | value | `shop::cart`'s shared run, as a value of its Module type ([9.8 Module types](#98-module-types)) |
+| `c` | value | the run `c`, as a value of its Module type |
+| `cart::hidden` | any | error: `hidden` is private to `shop::cart`, with a secondary label at its declaration |
+| `cart::missing` | any | error: `shop::cart` has no member `missing` |
+
+- Import names, run names, and Module-typed parameters cannot be shadowed. A binder anywhere in the
+  module spelled like one of them is an error. `m::f` names a module, so a value binder spelled `m`
+  would give one spelling two meanings in one scope.
+- Import names and run names are in scope throughout their module, including above the statement.
+  They are static facts rather than evaluations, so no order constrains them. Type aliases follow
+  the same rule ([6.7 Type-alias statements](#67-type-alias-statements)).
+- A qualified member is a named callee. `cart::total(x)` is a call to the member it resolves to,
+  including the special forms and `Mut`-parameter call shapes that dispatch on the callee. Through
+  a parameter, `p::f(x)` takes its call shape from `f`'s type in the parameter's Module type.
+- A qualified generic member keeps its polymorphism: `n::id(1)` and `n::id("a")` both check.
+- Names bound by `use` are ordinary names and may be shadowed by locals. A member of the importing
+  module with the same spelling is an error naming both sites.
+
+### 9.7 Importing asserts no IO
+
+An imported module runs once, however many modules import it. That run is the module's **shared
+run**: every importer reaches the same members, and its state exists once in the program. Its run
+path is the module path, so it never collides with a run a `run` statement names.
+
+Importing a module asserts that the module performs no IO. A module performs IO when it opens a
+source or binds a sink, or when it runs a module that performs IO. Importing one is an error at the
+`import`, with a secondary label at the IO site. The check is per module: a module that serves a
+route is run, whatever else it exports.
+
+```python
+# inventory.cambra: performs no IO, so it can be imported
+stock: Mut(Map(String, Int), Txn) := []
+pub def reserve(sku, qty) requires Transaction:
+    …
+pub InStock = {String where _ in stock.keys()}   # intended; not supported today
+```
+
+`InStock` is intended and not supported today, in one file as across modules: the compiler cannot
+name a mutable map's key set in a type. Every importer of `inventory` reaches one `stock` and, once
+that lands, one `InStock`. `run inventory as eu_inv` is a
+separate run with its own `stock`, and `eu_inv::InStock` is a different type from
+`inventory::InStock`.
+
+A module with a parameter that has no default cannot be imported, since an import supplies no
+arguments.
+
+### 9.8 Module types
+
+A **Module type** is the structural type of a module's public members. It is written like a record
+type, with `Module` before the braces:
+
+```python
+pub AuditLog = Module{events: Feed(Event)}
+param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt}
+```
+
+| Public member | Entry |
+| --- | --- |
+| value, `def` | `name: T`, at its contract, which may be polymorphic |
+| feed | `name: Feed(T)` |
+| `Txn` mutable variable | `name: Mut(V, Txn)` |
+| `pub run` | `name: Module{…}`, the run's own Module type |
+| type alias | `Name = T` for an exact type, or `Name <: T` for one known through a bound |
+| private member | none |
+
+A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
+([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal
+([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+
+`Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
+in 𝐴 is a subtype of its type in 𝐵, a `Mut` member's type is equal, since `Mut` is invariant, and a
+type member satisfies 𝐵's bound. Width subtyping lets a consumer name only the members it uses:
+
+```python
+# storefront.cambra
+param audit: audit_api::AuditLog     # Module{events: Feed(audit_api::Event)}
+
+# deploy.cambra
+run audit
+run storefront(audit=audit) as eu    # the run `audit` has `events` and may have more
+```
+
+An import name or run name denotes its run as a Module value in one position only: a run argument.
+A Module value stored in data or returned from a function is **[Open]**
+([9.19 Open questions](#919-open-questions)). A Module-typed parameter therefore names exactly one
+run in each run of its module. A `Txn` member reached through it is a bare variable reference, as
+through a run name.
+
+### 9.9 Running
+
+Each run performs its module's top level, with its parameters bound to its arguments:
+
+- Its mutable variables and feeds are its own. `eu::stock` and `us::stock` are two variables.
+- Its sources open and its routes serve while it runs. The `(port, method, path)` triple of every
+  route is unique across all runs. A conflict is an error at both `run` statements.
+- Its own runs run with it, and their run paths extend its own.
+
+State is shared between runs in two ways. Every module that imports a module reaches its one shared
+run, and a module passes one run to others as an argument:
+
+```python
+run audit
+run storefront(port="8080", audit=audit) as eu
+run storefront(port="8081", audit=audit) as us   # eu and us feed one `audit::events`
+```
+
+A program of modules means what the same code means written in one file, with each member spelled
+by its qualified name. For mutable state, modules add visibility and nothing else:
+
+- A public mutable variable is a `Txn` variable. It is read and written through a qualified
+  reference inside a `with begin():` block ([8.3 Reads](#83-reads)).
+- A qualified reference is a bare variable reference, so `eu::stock` may be passed to a `Mut`
+  parameter under the downward-only discipline of
+  [8.1 Mutation is explicit: the `:=` operator](#81-mutation-is-explicit-the--operator).
+- A public feed is fed and read through a qualified reference. Append merges commutatively, so
+  several writers are a feed's semantics.
+- A module that keeps its state private and exports functions over it relies on functions that
+  capture mutable variables ([4.1 `def` — function definition](#41-def--function-definition)) and
+  that run inside their caller's transaction
+  ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
+  Exporting only functions that read is how a module publishes state other modules cannot write.
+
+### 9.10 Induction variables stay in their module
+
+An induction variable is read and written only in the module that declares it. `pub` on one is
+refused.
+
+An induction variable's history is ordered by its writes in program text, and a read sees the value
+at its own position in that text:
+
+```python
+cnt := 0
+for x in [1, 2]:
+    cnt += x
+mid = cnt          # 3
+for y in [10, 20]:
+    cnt += y
+cnt                # 33
+```
+
+Within one module the source is that order. Between modules no source order exists
+([9.11 The module graph](#911-the-module-graph)), so a read or a write of another module's
+induction variable would have no defined position in its history. A `Txn` variable has no such
+problem: its order is the commit order the transaction engine decides at run time, not program text.
+
+- A module passes its own induction variable to another module's function, `lib::bump(cnt)`. The
+  call sits in the caller's program order, so the writes it makes have their place.
+- A module publishes an induction variable's progression by feeding it out, `pub counts: Feed(Int)`
+  with `counts << cnt` in the loop. A feed's order is its own, and several readers are its
+  semantics.
+
+### 9.11 The module graph
+
+The **module graph** has an edge from each module to every module it imports or runs. The graph must
+be acyclic. A cycle is an error listing the statements that form it, each labeled in its own file. A
+module that runs itself, directly or through others, is such a cycle. Mutually recursive modules
+wait on `rec` ([4.3 Assignment forms](#43-assignment-forms)).
+
+Modules have no order among themselves. Members of different modules never share a scope, and
+neither the order of statements nor the order in which files are found affects what a program means.
+
+### 9.12 Field labels and tags belong to a module
+
+A record field label and a variant tag belong to a module. An unqualified label or tag always means
+the current module's: `f1` written in `mod1` is `mod1`'s `f1`, which `this::f1` also spells.
+`mod2::f1` is `mod2`'s label, a different field:
+
+```python
+# in mod1
+r: {f1: Int, mod2::f1: String, this::f2: Bool} = …
+r.f1           # Int; the same field as r.this::f1
+r.mod2::f1     # String
+```
+
+The qualifier is `this`, an import name, or a run name. Record and variant types stay structural
+([3.15 Variant constructors](#315-variant-constructors)), and two modules agree on a type by naming
+the same labels. `{audit_api::app: String}` written in `storefront` is the type `audit_api` writes
+as `{app: String}`. Within one file this changes nothing.
+
+- **[Open]** — a syntax that aliases another module's label or tag, so the importer writes it
+  unqualified.
+- **[Tentative]** — **nominal variants**, whose tags live inside the nominal type and follow its
+  scoping rather than the module's. Their syntax is **[Open]**. The built-in `Option(T)` waits on
+  them: its `` `some `` and `` `none `` belong to the std root, so a user module that writes
+  `` `some(1) `` builds its own tag, which no `Option` admits.
+- **[Open]** — which module owns the labels of data from outside the program, such as the fields
+  of an HTTP request body.
+
+A type alias is the only type member a module has. Exporting one exports a spelling for a structural
+type, and the user's type is the same type.
+
+### 9.13 Private-in-public
+
+A public member's type may mention private members. A public alias's refinement may name a private
+value, and a public function's inferred type may carry a refinement over one:
+
+```python
+catalog = ["tee" -> 25, "mug" -> 12]          # private
+pub SKU = {String where _ in catalog.keys()}  # public, over a private value
+```
+
+An importer writes `inventory::SKU` and cannot write `inventory::catalog`. The alias's predicate was
+resolved in `inventory`, so it still refers to `inventory`'s `catalog`. Diagnostics render it as
+`inventory::catalog`. Visibility restricts which names a module's source may write. It does not
+restrict what a type may mention.
+
+### 9.14 Checking a module on its own
+
+A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
+runs that check and prints the module's interface.
+
+- **Parameters are typed binders.** A value parameter has its annotated type or the type its uses
+  infer. A type parameter is opaque apart from its bound.
+- **Imports are read through interfaces.** A module sees another module's public contracts and
+  whether it performs IO, never its bodies.
+- **A public member's contract is its type.** An annotated member's contract is the annotation,
+  checked against the body. An unannotated member's contract is its inferred type, refinements and
+  all.
+- **A run is checked at the `run` statement.** Each argument is checked against its parameter's
+  type. An argument's Module type is built from its members' contracts, so passing a module compares
+  contracts with the parameter's type, and no body is involved.
+
+The check covers parsing, name resolution, and typing, plus the module's own `run` statements:
+their argument types and the run dependency graph ([9.3 Runs](#93-runs)). Its guarantee: **a module
+that checks cannot be made to fail by a use that checks, in any of these.** Every error a use causes
+there is reported at the use, against a contract, with a secondary label at the library line the
+requirement comes from.
+
+Some checks run only once the program is assembled from its root, because they need the bodies of
+called functions or the full set of runs: the mutable-variable and transaction rules of
+[8. Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds), feed routing, the
+dataflow shapes the compiler can emit, and route uniqueness across runs. One of these can refuse
+code inside a module that checked. The error is reported at the code it names, with the run whose
+copy failed, and with a secondary label at the `run` statement that created that run, or at each
+`import` that reaches a shared run.
+
+**[Planned]** — the guarantee needs every inferred type to state each requirement its body imposes.
+A trait requirement on a generic parameter is the exception today: it is enforced only when a
+concrete type reaches the parameter.
+
+An inferred contract changes when its body changes. Every user in the engine is rechecked on reload,
+so a breaking change surfaces there. A library author sees it in the interface `cambra check`
+prints. An annotation is how an author fixes the contract.
+
+### 9.15 Module files
+
+- The **module root** is the directory containing the root file.
+- Module path `a::b::c` names the file `<root>/a/b/c.cambra`. A directory is not a module.
+  `a.cambra` and `a/b.cambra` are two independent modules, and importing `a` does not make `a::b`
+  available.
+- A submodule is not a member of its parent, and no statement makes it one, since there is no
+  re-export. A module that uses `a::b` imports it by its own path. Importing a module loads no file
+  that no statement names.
+- Each segment is a lowercase-initial identifier. `Caps` means type
+  ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)),
+  so `m::X` is a type member and `X` is never a module. A segment beginning with `__` is refused,
+  since user code cannot bind that namespace.
+- A missing file is an error at the statement naming it.
+- The match is case-sensitive, including on a case-insensitive file system. `import cart` does not
+  load `Cart.cambra`.
+- Two module paths resolving to one file, through a symlink for example, are refused. The file would
+  have two identities, and two shared runs.
+
+### 9.16 The std root
+
+The compiler's own modules live under a **std root** and are imported like any other: `import http`,
+then `http::serve(…)` and `http::ok(…)` ([7.4 Sources](#74-sources)). The std root's top-level
+names (`http`, …) are reserved, and a user module at one of those paths is refused.
+
+A builtin source, sink, or special form a std module provides is recognized by what a name resolves
+to, not by how it is spelled. After `import http as web`, `reqs, resps = web::serve(…)` is the same
+form as `http::serve(…)`, and the bare name `http_serve` is gone. Its address arguments are string
+literals. **[Planned]** — an address passed as a parameter, fixed per run, needs a link-time
+constant, a value fixed once a run's arguments are bound, which the language does not define yet.
+Until it does, two runs of a module that serves a route serve the same address and conflict.
+
+The prelude (`sum`, `max`, `groupby`, `stdin`, `defer`, `box`, `begin`, …) stays unqualified and in
+scope in every module.
+
+### 9.17 No trailing expressions
+
+A trailing value expression is an error in every module, since what a module does is its sinks. A
+script-shaped root therefore needs an output sink, which [10. Sinks](#10-sinks) does not yet define.
+
+### 9.18 Reloading a program of modules
+
+A reload replaces the source of every module, the root's included, and the running program carries
+its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
+
+- **State belongs to runs.** Each run's state is its own. A reload pairs the runs of the two
+  versions by run path, and shared runs by module path. A run the new version adds starts from its
+  declared initial values. A run present in both takes over its state, whether its module's source,
+  its arguments, or both changed.
+- **Removing a run is deleting stateful code.** A reload that drops a run holding state is refused
+  unless the new version marks the removal with `@Discard`
+  ([8.9 `@Discard` [Decided]](#89-discard-decided)), as it must for any deleted variable. A shared
+  run is removed when the last import of its module is, so its tombstone takes the form of the
+  `import` statement:
+
+  ```python
+  @Discard
+  run storefront as us          # everything `us` held is intentionally gone
+
+  @Discard
+  import inventory              # the shared run of `inventory` is intentionally gone
+  ```
+
+- **Renaming a run is a load.** `@LoadFrom(eu)` on a `run` statement moves the whole run's state to
+  the new name:
+
+  ```python
+  @LoadFrom(eu)
+  run storefront(port="8080", region="eu") as eu_west
+  ```
+
+- **`@LoadFrom` names a qualified variable.** `@LoadFrom(eu::stock)` loads a variable of another run
+  of the predecessor. An unqualified `@LoadFrom(x)` resolves within its own run first, then outward
+  as [8.8 `@LoadFrom`](#88-loadfrom) describes.
+- **Moving a stateful member to another module moves it to another run.** It needs `@LoadFrom`
+  naming its old run path, or the reload is refused as for any variable the new version does not
+  declare.
+- **Renaming a module file** renames every run that relies on the default run name, which moves its
+  state. A run named with `as` is unaffected.
+
+### 9.19 Open questions
+
+- **Read-only export.** A public `Txn` variable is writable by every module that reaches it. A
+  modifier such as `pub(read)` would let a module publish it for reading while its writes, and so
+  its invariants, stay local. Until then a module exports functions that read.
+- **An induction variable's final value.** `pub` on an induction variable could export the value
+  after all its writes, which has a position independent of program order. Refused for now.
+- **Packages.** Dependencies outside the module root, a search path of roots, versioning, and a
+  manifest. The rules of [9.15 Module files](#915-module-files) extend to several roots with a
+  collision between roots refused.
+- **Givens and instances across modules.** Transactions as contextual parameters are locally scoped.
+  General typeclass instances will need a rule for which module's instances are visible where, and a
+  coherence rule.
+- **Discarding and redeclaring one address.** A version that both writes `@Discard stock` and
+  declares `stock` could mean a reset to the declared initial value, or be an error.
+- **First-class Module values.** A Module value is written only as a run argument. Storing one in
+  data, returning one from a function, or choosing between two at run time would make a qualified
+  reference's target depend on a value, which static resolution does not cover.
+
+---
+
+## 10. Sinks
 
 Sinks can be declared anywhere in the program, but all external side
 effects are lifted to the boundary of the program.  The program returns
@@ -3376,9 +3963,9 @@ is discarded.
 
 Sinks may observe the indices of collections passed to them if needed.
 
-## 10. Errors and recovery
+## 11. Errors and recovery
 
-### 10.1 Lex errors
+### 11.1 Lex errors
 
 The lexer reports four error kinds and stops emitting tokens at the
 first one:
@@ -3389,7 +3976,7 @@ first one:
 - **`InconsistentIndent`** — dedented to a level not on the indent
   stack.
 
-### 10.2 Parse errors and recovery
+### 11.2 Parse errors and recovery
 
 The parser uses chumsky's error-recovery infrastructure to produce
 multiple diagnostics per file. Two recovery layers:
@@ -3405,7 +3992,7 @@ A parse always returns a `ParseResult<T>` carrying *both* a partial AST
 [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)
 for the recovery design and error-rendering details.
 
-### 10.3 Semantic errors
+### 11.3 Semantic errors
 
 If the parse succeeds, the compiler may still reject the program for
 semantic reasons:
@@ -3423,7 +4010,7 @@ expression or statement.
 
 ---
 
-## 11. Examples
+## 12. Examples
 
 The canonical examples live in [`tests/programs/`](../tests/programs/)
 — one directory per program, each with its `program.cambra` source and
@@ -3447,7 +4034,7 @@ one capability each so a failure names one gap.
 
 ---
 
-## 12. Reserved for future work
+## 13. Reserved for future work
 
 The following are deliberately omitted from CHL today, in some cases
 with parser-level support that lowering rejects:
@@ -3474,12 +4061,9 @@ with parser-level support that lowering rejects:
 - **Recursion** — self-reference in `def` is not yet wired through;
   self-referential *value* bindings get the explicit `rec` form
   (**[Decided]**, §4.3).
-- **Imports / multiple files** — CHL is single-file today. Importing
-  *built-in* modules is decided ahead of the rest (`import http`, the
-  HTTP Direction note in §7.4); user modules, multi-file programs, and
-  the general namespace story arrive together later — that is when the
-  full *module* concept earns a place in this spec (§2.1 deliberately
-  avoids it now).
+- **Imports / multiple files** — CHL is single-file today. Modules,
+  imports, runs, and parameters are **[Decided]** and specified in
+  [9. Modules [Decided]](#9-modules-decided).
 - **Classes / `try`** — not in the language. `with` **is** a keyword
   (§1.6), but only for transaction blocks `with begin():` (§8.2); it does
   not carry Python's general context-manager meaning.
