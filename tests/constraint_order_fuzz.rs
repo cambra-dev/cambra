@@ -1,11 +1,9 @@
 //! Fuzz the solver for constraint arrival-order independence.
 //!
-//! The solver's design leans on constraint arrival order not mattering, and
-//! record-then-sweep makes that a property of the algorithm rather than of any
-//! one constraint (`src/ccl/design/type-inference.md`, "1. Algorithm Overview").
-//! No unit test states the property, because a single case cannot: it is over
-//! *every* permutation of a constraint set, and the sets where it fails are the
-//! ones nobody thought to write down.
+//! Constraint arrival-order independence is an intended solver property
+//! (`src/ccl/design/type-inference.md`, "Constraint-order checks"). These generated
+//! cases test that property across sampled permutations; they do not prove it
+//! for every constraint set or ordering.
 //!
 //! This applies the same constraint **set** in permuted orders, coalesces every
 //! variable, and asserts the outcomes agree. A violation is typing that depends
