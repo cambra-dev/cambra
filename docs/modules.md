@@ -1,7 +1,7 @@
 # Modules
 
-> **Status: [Sketched].** A proposed implementation. Only the first item of the [Implementation
-> stack](#implementation-stack) is implemented.
+> **Status: [Sketched].** A proposed implementation. The first two items of the [Implementation
+> stack](#implementation-stack) are implemented.
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -456,8 +456,8 @@ One PR per item, each updating the spec and design docs it touches:
 1. **Spans carry a `FileId`; `SourceMap`; multi-file diagnostic rendering.** Every compilation is
    still one file. The inspector wire gains `file` and the goldens are re-blessed.
 2. **Syntax.** The seven keywords, `import`, `run`, and `param` statements with `use` clauses,
-   `@Discard`, and a visibility flag on introducing statements. Lowering refuses the new statements
-   with an unsupported error.
+   `@Discard`, `pub` on introducing statements, and `::` in qualified names, labels, and tags. Lowering
+   refuses each of them with an unsupported error (`src/ccl/lower/module_syntax.rs`).
 3. **Loading and the module graph.** Path resolution, per-file parsing, module paths in the
    `SourceMap`, cycle refusal, link order.
 4. **Imports.** `Name::Member`, `Unique::home`, per-module lowering and uniquification, interfaces,
