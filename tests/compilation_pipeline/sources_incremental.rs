@@ -702,7 +702,7 @@ x";
 
 /// A transaction loop over a live source filtered to nothing releases every row it reads
 /// past. No block runs, so no commit acknowledges a row, and a row the filter removes is
-/// consumed when the drive reads past it.
+/// consumed when the drive reads past it, once the source calls it complete.
 #[test_log::test]
 fn test_filtered_rows_of_a_live_transaction_source_are_released() {
     let code = "\
@@ -727,6 +727,9 @@ await_final(pool)";
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     ctx.scheduler().check_for_notifications();
     pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
@@ -1077,9 +1080,9 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
     );
 }
 
-/// Pull `producer` `laps` times over a live source holding `rows` at positions `0..`,
-/// releasing everything each pull answers as a sink does, and answer what the source has
-/// released.
+/// Pull `producer` `laps` times over a live source holding `rows` at positions `0..`, which it
+/// calls complete, releasing everything each pull answers as a sink does, and answer what the
+/// source has released.
 fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) -> Predicate {
     let mut ctx = GlobalContext::default();
     let test_source = Rc::new(RefCell::new(TestDataSource::new(
@@ -1097,6 +1100,9 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
         .map(|(i, v)| (Value::UInt(i), Value::Int(*v)))
         .collect();
     test_source.borrow_mut().add_data(&rows);
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(rows.len() - 1)));
     ctx.scheduler().check_for_notifications();
     for _ in 0..laps {
         let tile = producer.get(producer.tiling().universal_guard());

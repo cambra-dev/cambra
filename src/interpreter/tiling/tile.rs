@@ -95,18 +95,19 @@ pub enum Tile {
     /// silently misreading a store. See `src/ccl/design/mutability.md`.
     Store {
         /// One changelog per store key: a [`Tile::Record`] whose fields are the key
-        /// space, each field a [`Tile::DataFunction`] over one row — the commit ticks at
-        /// which that key was written, ascending, against the values written there.
-        /// A tick a key's changelog omits did not write it, so its value holds. Each
-        /// changelog is a collection of writes, so its `domain_predicate` is the store's
-        /// `frontier`: at a decided tick, a write it holds and a write it omits are both
-        /// final. The key's value at a tick is the fold over its changelog.
+        /// space, each field a [`Tile::DataFunction`] with one run per store row — the
+        /// positions at which that key was written in that row, ascending, against the
+        /// values written there. A position a key's changelog omits did not write it, so its
+        /// value holds. Each changelog is a collection of writes, so it is complete where
+        /// its row has decided (`decided`, below): at a decided position, a write it holds
+        /// and a write it omits are both final. The key's value at a position is the fold
+        /// over its changelog.
         ///
-        /// A key's values are one scalar column, one cell per tick
+        /// A key's values are one scalar column, one cell per change
         /// (`commit_operator::changelog_value`), so a collection-valued key holds each
         /// collection it was written as one materialized map value. Carrying its elements
-        /// as a level beneath the tick is `TODO(store-key-levels)`. A write set spanning
-        /// several keys lands as one tick in each of their changelogs.
+        /// as a level beneath the change is `TODO(store-key-levels)`. A write set spanning
+        /// several keys lands as one change in each of their changelogs.
         state: Box<Tile>,
         /// The store's value before any change — one entry per key, the codomain
         /// record over one row. It is the base of the step function, not a point of
@@ -152,7 +153,7 @@ pub enum Tile {
         /// domain and leaves the frontier, and a store resuming its predecessor's run is
         /// decided through positions it never ran.
         ///
-        /// Per row, the way `seed` and `decided` are, because the rows of a nested carrier
+        /// Per row, the way `seed` and `decided` are, because the rows of a nested store
         /// are different stores that got to different places. Projecting one row out is then
         /// the ordinary row retain, with no watermark to recover. Closing the domain is the
         /// separate `terminal` axis, so a closed store keeps its watermarks.
@@ -2742,7 +2743,7 @@ fn valid_over_settled(
                     }
                 }
         }
-        // A store is vectorized over `rows` rows, one per store: a flat carrier is one
+        // A store is vectorized over `rows` rows, one per store: a flat store is one
         // row, and a nested one a row per enclosing row. Each row holds its **domain**, the
         // positions it decided, and a record of per-key changelogs sparse against it, and
         // both ascend within the row. The fold ([`store_value_at`] et al.) and the

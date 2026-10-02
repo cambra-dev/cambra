@@ -3,8 +3,8 @@
 //! Rewrites every direct-mirror mutation loop — `ExprStmt(For {…}, cont)`
 //! with [`TypedExprNode::MutWrite`]s in the body — into a **causal
 //! `LetRec`**: the accumulators' history over the loop's induction domain,
-//! recursion causal by [`Builtin::GetPrevSeq`], trailing reads rewritten to
-//! `final_or_default` over the completed history. This is the induction slice
+//! recursion causal by [`Builtin::GetPrevSeq`], trailing reads rewritten to a
+//! [`Builtin::FinalRead`] of the completed history. This is the induction slice
 //! of the phase in `src/ccl/design/mutability.md` ("mut_elim: eliminating
 //! overwrite mutability"); transactions join it in a later step.
 //!
@@ -1336,8 +1336,8 @@ fn hist_field_view(
 /// - `bindings` — the guarded history bindings (plus, for a transaction, its
 ///   commit-record and tap bindings), whose causality is asserted here so neither
 ///   caller can forget to;
-/// - `reads` — one `let x = final_or_default(⟨history⟩, init)` per key, the trailing
-///   read that reduces a history to the value the continuation names. Prepended in
+/// - `reads` — one `let x = final_read(⟨history⟩)` per key, the trailing read that
+///   samples a history at the value the continuation names. Prepended in
 ///   reverse so the first is outermost;
 /// - `feeds` — the in-group feeds to route ([`hoist_feeds`], whose source-order
 ///   invariant this preserves by hoisting *outside* the reads).
@@ -1562,7 +1562,7 @@ impl AccumulatorVariable {
 pub(crate) struct InductionFold {
     /// `(__hist, λ r → …)` — the guarded induction history binding.
     pub binding: (TypedBinding, Expr),
-    /// Trailing final-value lets (`let x_final = final_or_default(…)`) to prepend
+    /// Trailing final-value lets (`let x_final = final_read(…)`) to prepend
     /// to the continuation, in accumulator order.
     pub reads: Vec<(TypedBinding, Expr)>,
     /// `(acc, x_final)` renames to apply to the continuation before recursing.
@@ -1766,11 +1766,13 @@ pub(crate) fn fold_induction_loop(
     let mut lambda = Expr::lambda(r.clone(), domain_ty.clone(), lambda_body);
     lambda.ty = hist_ty.clone();
 
-    // Trailing reads: one extracted final value per accumulator —
-    // `(__hist ≫ .writes ≫ .acc, x0) ▷ final_or_default` — paired with the
-    // `(acc → fresh-final)` rename the caller applies to its continuation (so a
-    // later loop over the same variable accumulates from the extracted value).
-    // The read's default is the accumulator's pre-loop binding.
+    // Trailing reads: one final value per accumulator — `final_read(__hist ≫ .writes ≫
+    // .acc)`, the accumulator's carried value where the loop finishes — paired with the
+    // `(acc → fresh-final)` rename the caller applies to its continuation (so a later
+    // loop over the same variable accumulates from the read value). A sample of the
+    // history rather than a reduction of a stream: where the loop runs no position the
+    // store holds its seed, which is the pre-loop value or the one a retired version
+    // handed on, so there is no default to supply.
     let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
     let mut renames: Vec<(Name, Name)> = Vec::new();
     for acc in accs.iter() {
@@ -1785,12 +1787,9 @@ pub(crate) fn fold_induction_loop(
             &acc.name.field_key(),
             vty,
         );
-        let view_ty = view.ty.clone();
-        let mut arg = Expr::tuple(vec![view, tvar(&acc.name, vty.clone())]);
-        arg.ty = Type::Tuple(vec![view_ty, vty.clone()]);
-        let mut f = Expr::builtin(Builtin::FinalOrDefault);
-        f.ty = Type::fun(arg.ty.clone(), vty.clone());
-        let mut read = Expr::apply(arg, f);
+        let mut f = Expr::builtin(Builtin::FinalRead);
+        f.ty = Type::fun(view.ty.clone(), vty.clone());
+        let mut read = Expr::apply(view, f);
         read.ty = vty.clone();
 
         let x_final = Name::fresh(acc.name.base());
@@ -3216,7 +3215,7 @@ mod tests {
     }
 
     /// The phase turns the loop into a causal letrec: the history binding
-    /// causal by `get_prev_seq`, the trailing read via `final_or_default`,
+    /// causal by `get_prev_seq`, the trailing read a `final_read` of the history,
     /// and no marker residue.
     #[test]
     fn phase_emits_causal_letrec() {
@@ -3226,15 +3225,15 @@ mod tests {
         assert!(s.contains("letrec"), "should emit a letrec: {s}");
         assert!(s.contains("get_prev_seq"), "recursion must be causal: {s}");
         assert!(
-            s.contains("final_or_default"),
-            "trailing read must extract the final value: {s}"
+            s.contains("▷ final_read") && !s.contains("final_or_default"),
+            "trailing read must sample the final value: {s}"
         );
         assert!(!contains_marker(&out), "no For/MutWrite residue: {s}");
     }
 
     /// Recognition lowers the group onto the domain-parameterized `Transact`
     /// node: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
-    /// `commit(⟨writes: (x)⟩) | `abort } in (__hist.x, x) ▷ final_or_default``, with
+    /// `commit(⟨writes: (x)⟩) | `abort } in __hist.x ▷ final_read``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
     /// rewritten to a history-record projection.
     #[test]
@@ -3255,8 +3254,8 @@ mod tests {
             "writer body must terminate in a `` `commit(⟨writes⟩) | `abort `` decision: {s}"
         );
         assert!(
-            s.contains("__hist.") && s.contains("final_or_default"),
-            "trailing read must project the history record and reduce it: {s}"
+            s.contains("__hist.x ▷ final_read"),
+            "trailing read must sample the history record's key: {s}"
         );
     }
 

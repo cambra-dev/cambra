@@ -76,8 +76,8 @@ use crate::interpreter::tiling::{
 };
 
 /// The domains of `tiling`'s levels, outermost first, down to and including a store's
-/// positions: what a path through a carrier or its source runs through.
-fn carrier_levels(tiling: &Tiling) -> Vec<Extent> {
+/// positions: what a path through an induction store or its source runs through.
+fn path_levels(tiling: &Tiling) -> Vec<Extent> {
     let mut levels = Vec::new();
     let mut at = tiling;
     loop {
@@ -511,11 +511,11 @@ impl CommitEngine {
 /// `complete` is one predicate per level of the body's decision stream, outermost first:
 /// the row levels above the stores, then the positions within one. That is the drive's to
 /// say, from its source, because a row has to be answerable while it is still the one being
-/// run, and every level answers for its own rows. A carrier with no rows above it has one
+/// run, and every level answers for its own rows. An induction store with no rows above it has one
 /// level and one store.
-fn render_carrier_tile(engines: &Engines, tiling: &Tiling, complete: &[Predicate]) -> Tile {
+fn render_engines(engines: &Engines, tiling: &Tiling, complete: &[Predicate]) -> Tile {
     // A level's predicate means complete at every depth beneath it, so the outermost
-    // saying `True` says the whole carrier is done: every level below is complete too, and
+    // saying `True` says the whole induction store is done: every level below is complete too, and
     // every store in the render is terminal. Spread here rather than at each level, so a
     // consumer reading one level does not have to re-derive it from the level above.
     let done = complete.first().is_some_and(Predicate::is_true);
@@ -526,12 +526,12 @@ fn render_carrier_tile(engines: &Engines, tiling: &Tiling, complete: &[Predicate
     } else {
         complete
     };
-    render_carrier_level(engines, tiling, complete, done, &[])
+    render_engines_level(engines, tiling, complete, done, &[])
 }
 
-/// One level of [`render_carrier_tile`]'s walk, with `terminal` the whole carrier's and
+/// One level of [`render_engines`]'s walk, with `terminal` the whole induction store's and
 /// `above` the path of the row this level stands under.
-fn render_carrier_level(
+fn render_engines_level(
     engines: &Engines,
     tiling: &Tiling,
     complete: &[Predicate],
@@ -539,7 +539,7 @@ fn render_carrier_level(
     above: &[Value],
 ) -> Tile {
     let (level_complete, beneath) = complete.split_first().unwrap_or_else(|| {
-        unreachable!("a carrier states completion at every level of its decision stream")
+        unreachable!("an induction store states completion at every level of its decision stream")
     });
     let Tiling::DataFunction {
         domain: enclosing,
@@ -551,10 +551,10 @@ fn render_carrier_level(
         // because there is no level above it to be reached from.
         debug_assert!(
             beneath.is_empty(),
-            "a carrier with no rows above it states completion once, got {complete:?}"
+            "an induction store with no rows above it states completion once, got {complete:?}"
         );
         let Engines::Store(engine) = engines else {
-            panic!("a carrier with no rows above it holds one store, got a level")
+            panic!("an induction store with no rows above it holds one store, got a level")
         };
         // One store, whether or not its seed has arrived: there is no level above to key it
         // by, so the node exists from the start and an unopened one renders as what it
@@ -570,26 +570,26 @@ fn render_carrier_level(
         );
     };
     let Engines::Rows(rows) = engines else {
-        panic!("a carrier with rows above it holds one engine per row, got a bare store")
+        panic!("an induction store with rows above it holds one engine per row, got a bare store")
     };
-    // A **standing** level: each of its rows holds a carrier of its own, rendered by the
+    // A **standing** level: each of its rows holds an induction store of its own, rendered by the
     // same walk, and answering for its own rows out of the same per-level statement.
     // A level called complete is complete at every depth beneath it, which is why the
-    // carrier level below can state its own for the running row alone.
+    // induction store level below can state its own for the running row alone.
     if store_tiling.is_data_function() {
         let mut starts = Vec::with_capacity(rows.len());
         let mut merged: Option<Tile> = None;
         for (row, below) in rows {
             let path = [above, std::slice::from_ref(row)].concat();
-            let piece = render_carrier_level(below, store_tiling, beneath, terminal, &path);
+            let piece = render_engines_level(below, store_tiling, beneath, terminal, &path);
             starts.push(merged.as_ref().map_or(0, |t| match t {
                 Tile::DataFunction { domain, .. } => domain.len(),
                 _ => 0,
             }));
             match &mut merged {
                 None => merged = Some(piece),
-                // One standing row's carrier follows the previous one's rather than
-                // describing the same rows: two standing rows key their carriers
+                // One standing row's induction store follows the previous one's rather than
+                // describing the same rows: two standing rows key their induction stores
                 // independently, so running them together makes one row whose keys
                 // descend where the second restarts.
                 Some(acc) => acc.merge_rows(piece),
@@ -604,16 +604,16 @@ fn render_carrier_level(
             ..
         }) = merged
         else {
-            // No enclosing row opened yet, so there is nothing beneath to assemble. The
+            // No enclosing position opened yet, so there is nothing beneath to assemble. The
             // whole tiling's empty tile, not the level below's: a standing level short
             // here is a tile that does not match what it declares.
             //
-            // It still carries what every level calls complete. A carrier that opened no
+            // It still carries what every level calls complete. An induction store that opened no
             // row has still been told which rows will gain no position — the source put
             // none under them — and `empty_tile` says `False` at every level, which is the
             // other thing: a level that has delivered nothing and may yet. Dropped, the
             // reduction above never answers a row and the loop around it waits forever.
-            return empty_carrier(tiling, complete, terminal);
+            return empty_engines_tile(tiling, complete, terminal);
         };
         return Tile::data_function(
             ColumnValue::from_values(enclosing_rows, enclosing),
@@ -657,7 +657,7 @@ fn render_carrier_level(
 /// indexing.
 ///
 /// `engines` are the stores this node stands over — one per row of the level above it, or
-/// the single store of a carrier with no rows above it — each with the path of the row it
+/// the single store of an induction store with no rows above it — each with the path of the row it
 /// stands at, which the empty path is for a lone store. Their changelogs run together
 /// CSR-wise under one node per key, because a changelog is a collection whose rows are the
 /// stores; a lone store is the one-row case of that and needs no separate shape.
@@ -775,9 +775,9 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
 /// and `terminal` on the store beneath them.
 ///
 /// [`Tiling::empty_tile`] states `False` at every level, which says a level has delivered
-/// nothing and may yet. A carrier that opened no row says something else at the levels its
+/// nothing and may yet. An induction store that opened no row says something else at the levels its
 /// drive has heard about: those rows will gain no position at all.
-fn empty_carrier(tiling: &Tiling, complete: &[Predicate], terminal: bool) -> Tile {
+fn empty_engines_tile(tiling: &Tiling, complete: &[Predicate], terminal: bool) -> Tile {
     let mut tile = tiling.empty_tile();
     for (level, pred) in complete.iter().enumerate() {
         if let Tile::DataFunction {
@@ -796,10 +796,10 @@ fn empty_carrier(tiling: &Tiling, complete: &[Predicate], terminal: bool) -> Til
 /// A recurrence's engines, nested one node per collection level above the store.
 ///
 /// This is the shape of the tile it renders to — a [`Tile::Store`] under as many
-/// [`Tile::DataFunction`] levels as the carrier has — so the two do not have to be held in
-/// step by hand. A flat store is [`Engines::Store`] alone; a nested carrier is one
-/// [`Engines::Rows`] over its enclosing rows; a carrier beneath a standing level is two,
-/// and a third needs no arm added. That is what makes nesting unbounded here rather than
+/// [`Tile::DataFunction`] levels as the induction store has — so the two do not have to be held in
+/// step by hand. A flat store is [`Engines::Store`] alone; a nested store is one
+/// [`Engines::Rows`] over its enclosing positions; an induction store beneath a standing level is
+/// two, and a third needs no arm added. That is what makes nesting unbounded here rather than
 /// a depth the code counts.
 ///
 /// **Positions are a store's own.** A composite `(enclosing, inner)` position exists only
@@ -820,7 +820,7 @@ pub enum Engines {
 }
 
 impl Engines {
-    /// The tree a carrier of `tiling` starts with: a row set per collection level above
+    /// The tree an induction store of `tiling` starts with: a row set per collection level above
     /// its stores, and nothing opened.
     ///
     /// The shape is read off the tiling rather than off a depth the caller counts, so the
@@ -898,7 +898,7 @@ impl Engines {
     }
 
     /// Every open store, with the path of rows that reaches it — the empty path for a
-    /// carrier with no rows above it.
+    /// induction store with no rows above it.
     ///
     /// A callback rather than an iterator: the path is rebuilt as the walk descends, so
     /// handing it out would mean allocating one per store.
@@ -927,7 +927,7 @@ impl Engines {
     ///
     /// The render walks this tree, so a row the release names whole has to leave the tree in
     /// the same step: dropped from the render alone, the next render would rebuild it from
-    /// the engine still holding it. A row is named whole once every branch of the carrier's
+    /// the engine still holding it. A row is named whole once every branch of the induction store's
     /// `FanOut` names it, as the drive does for each row it has finished.
     pub fn remove_covered(&mut self, guard: &TileGuard) {
         fn walk(at: &mut Engines, path: &mut Vec<Value>, guard: &TileGuard) {
@@ -1125,7 +1125,7 @@ pub fn store_decided_positions(decided: &Tile, row: usize) -> Vec<Position> {
         .collect()
 }
 
-/// The decided-position collection for a store over `rows.len()` enclosing rows, stating
+/// The decided-position collection for a store over `rows.len()` enclosing positions, stating
 /// `complete`: a row's decided set is final where the row has decided.
 fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent, complete: Predicate) -> Tile {
     let mut starts = Vec::with_capacity(rows.len());
@@ -1404,7 +1404,7 @@ pub fn full_store_tiling(domain: Extent, values: HashMap<String, Tiling>) -> Til
     }
 }
 
-/// The store a nested carrier is currently adding to — its last enclosing row.
+/// The store a nested store is currently adding to — its last enclosing position.
 ///
 /// A flat store is returned unchanged, so a reader that does not care which it has may
 /// call this unconditionally. An empty collection answers with the empty store it tiles
@@ -1418,8 +1418,8 @@ pub fn current_row_store(store: &Tile) -> Tile {
     };
     match domain.len() {
         0 => codomain.as_ref().clone(),
-        // A level whose values are another level stands above the carrier: the store sits beneath
-        // it, so the descent continues into the last row's group rather than stopping at
+        // A level whose values are another level stands above the induction store: the store sits
+        // beneath it, so the descent continues into the last row's group rather than stopping at
         // the collection standing there.
         n if codomain.is_data_function() => current_row_store(&last_row_group(store, n - 1)),
         n => store_row(codomain, n - 1, n),
@@ -1437,10 +1437,10 @@ fn last_row_group(level: &Tile, row: usize) -> Tile {
         .into_owned()
 }
 
-/// The **path** a carrier has decided through: its last row at each level, and that
+/// The **path** an induction store has decided through: its last row at each level, and that
 /// store's last position.
 ///
-/// A carrier with no rows above it answers with a path of one component, its own frontier.
+/// An induction store with no rows above it answers with a path of one component, its own frontier.
 /// The path is the drive's cursor and nothing else's: it is not a tile key, so no predicate
 /// is written over it.
 pub fn frontier_path(store: &Tile) -> Option<Path> {
@@ -1472,14 +1472,14 @@ pub fn frontier_path(store: &Tile) -> Option<Path> {
 /// that states per-row completeness. The path is rebuilt here only as the drive's own
 /// cursor for picking what to run next; it is never a tile key.
 ///
-/// `levels` is how long a path is: the row levels above the carrier's stores, then the
-/// position within one. A carrier with no rows above it has one. It is the carrier's own
-/// statement rather than a count of the source's levels, because an item that is itself a
-/// collection carries its own levels beneath the positions, and counting those names a
+/// `levels` is how long a path is: the row levels above the induction store's stores, then the
+/// position within one. An induction store with no rows above it has one. It is the induction
+/// store's own statement rather than a count of the source's levels, because an item that is itself
+/// a collection carries its own levels beneath the positions, and counting those names a
 /// path too deep.
 ///
 /// Sorted, because an async source's domain arrives unordered and the drive takes
-/// positions in path order.
+/// positions in path order. A row the source marks deleted is no item.
 fn decode_source_paths(tile: &Tile, levels: usize) -> Vec<(Path, Tile)> {
     #[allow(clippy::too_many_arguments)]
     fn walk(
@@ -1495,12 +1495,18 @@ fn decode_source_paths(tile: &Tile, levels: usize) -> Vec<(Path, Tile)> {
             domain,
             codomain,
             domain_predicate,
+            deleted,
             ..
         } = level
         else {
             return;
         };
         for k in run {
+            // A restricted source still carries its extent's keys, the filtered ones
+            // deleted. Reading them makes the drive run an item the source does not have.
+            if deleted.contains(k) {
+                continue;
+            }
             prefix.push(domain.index_at(k));
             // Completeness is downward-closed: a path some level calls complete is
             // complete at every depth beneath it, whatever those levels state.
@@ -1553,10 +1559,18 @@ fn decode_source_paths(tile: &Tile, levels: usize) -> Vec<(Path, Tile)> {
         &mut out,
     );
     out.sort_by(|(a, _), (b, _)| a.cmp(b));
+    // A path names one item. The two drivers resolve a repeated one differently (the
+    // induction driver's map keeps the last, the transaction driver's search the first), so
+    // a source delivering a surviving path twice has no single meaning here.
+    debug_assert!(
+        out.windows(2).all(|w| w[0].0 < w[1].0),
+        "an iteration source delivered a surviving path twice: {:?}",
+        out.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
     out
 }
 
-/// One enclosing row's store, projected out of a nested carrier's collection of them.
+/// One enclosing position's store, projected out of a nested store's collection of them.
 ///
 /// Every field of a vectorized store is per row the way every other tile's is, so this is
 /// the ordinary row retain — which is what lets the fold, the frontier and the seed
@@ -1574,7 +1588,7 @@ pub fn store_row(store: &Tile, row: usize, rows: usize) -> Tile {
         // Every caller has descended to the level whose values are the stores, and a
         // `Tiling::Store` renders as a `Tile::Store` even when empty. Returning the input
         // unchanged instead hands back the *whole* level, which reads as a one-row answer
-        // and silently folds one enclosing row's writes into the next.
+        // and silently folds one enclosing position's writes into the next.
         unreachable!("store_row takes a row of a vectorized store, got {store:?}")
     };
     let keep = bit_vec::BitVec::from_fn(rows, |i| i == row);
@@ -2159,7 +2173,7 @@ fn decode_source_positioned(tile: &Tile) -> Vec<(Position, Tile)> {
         .collect()
 }
 
-/// A seed stream's value, at the empty path: a carrier with no rows above it is one store
+/// A seed stream's value, at the empty path: an induction store with no rows above it is one store
 /// over the whole extent, and the whole tile is its one seed.
 ///
 /// A seed a pull does not carry is absent rather than reported: the store opens on a later
@@ -2210,20 +2224,20 @@ pub struct InductionStore {
     /// positions.
     ///
     /// A carry at a row's first position folds to this, so a store cannot open without it.
-    /// A carrier with no rows above it has one store and so one seed, keyed by the empty
+    /// An induction store with no rows above it has one store and so one seed, keyed by the empty
     /// path.
     seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
     base: OperatorBase,
 }
 
 impl InductionStore {
-    /// Assemble a carrier's store over `output_tiling` — a collection level per row above
+    /// Assemble an induction store over `output_tiling` — a collection level per row above
     /// its stores, and none for the one [`full_store_tiling`] builds.
     ///
     /// `seed_ops` gives each accumulator's value before any position, keyed by the row it
     /// opens; `write_keys` follows the commit store's writer convention, the accumulators
     /// followed by tap keys. `resumed_after` is where a predecessor store stopped, which
-    /// only a carrier with no rows above it has.
+    /// only an induction store with no rows above it has.
     pub fn new(
         seed_ops: Vec<(Value, Box<dyn TileOperator>)>,
         write_keys: Vec<Value>,
@@ -2233,7 +2247,7 @@ impl InductionStore {
     ) -> Self {
         assert!(
             resumed_after.is_none() || !output_tiling.is_data_function(),
-            "a carrier with rows above it does not resume: the store around it is what \
+            "an induction store with rows above it does not resume: the store around it is what \
              hands its variables on"
         );
         Self {
@@ -2370,20 +2384,20 @@ struct InductionStoreProducer {
     /// Wakes this store's readers when a pull changes what it answers.
     notifier: ChangeNotifier,
     base: ProducerBase,
-    /// Per accumulator key, the per-row seed stream. A carrier with no rows above it has
+    /// Per accumulator key, the per-row seed stream. An induction store with no rows above it has
     /// one row, the empty path, so its seed arrives there.
     seed_producers: Vec<(Value, Box<dyn TileProducer>)>,
     /// What the body says is complete, one predicate per level of its decision stream,
     /// outermost first: the row levels above the stores, then the positions within one. The
-    /// drive is what knows, from its source; the store carries it to the read. A carrier
+    /// drive is what knows, from its source; the store carries it to the read. An induction store
     /// with no rows above it has the one entry — its positions.
     complete_rows: Vec<Predicate>,
-    /// One engine per store, nested one level per collection level above it. A carrier
+    /// One engine per store, nested one level per collection level above it. An induction store
     /// with no rows above it is [`Engines::Store`]; a nested one is [`Engines::Rows`],
     /// each row holding its own seed and changelog rather than a share of one flat log.
     engines: Engines,
     /// The last position a predecessor store reached, which this one's store is decided
-    /// through from the moment it opens. Only a carrier with no rows above it resumes —
+    /// through from the moment it opens. Only an induction store with no rows above it resumes —
     /// a nested one's rows belong to the store around it — so this is `None` wherever the
     /// engine tree has levels, and every row opens undecided.
     resumed_after: Option<Position>,
@@ -2393,7 +2407,7 @@ struct InductionStoreProducer {
     /// The full-store output tiling — for a debug-time shape check on the rendered
     /// store tile.
     output_tiling: Tiling,
-    /// The highest path this carrier has stepped, for the check that rows open in
+    /// The highest path this induction store has stepped, for the check that rows open in
     /// ascending path order and never reopen. Survives [`Engines::remove_covered`], which
     /// moves [`decided_path`](Self::decided_path) back when it drops the rows it names.
     #[cfg(debug_assertions)]
@@ -2404,12 +2418,12 @@ impl InductionStoreProducer {
     /// The store at `row`, opened at `seed` if this is the pull that reaches it.
     ///
     /// Every store opens here, whatever its depth: `resumed_after` is a position of the
-    /// carrier's own store and a nested carrier does not resume, so it is `None` wherever
+    /// induction store's own store and a nested store does not resume, so it is `None` wherever
     /// `row` names one.
     fn open_at(&mut self, row: &Path, seed: &HashMap<Value, Value>) -> &mut CommitEngine {
         debug_assert!(
             row.is_empty() || self.resumed_after.is_none(),
-            "a carrier with rows above it does not resume, so its rows open undecided; \
+            "an induction store with rows above it does not resume, so its rows open undecided; \
              row {row:?} would open at {:?}",
             self.resumed_after
         );
@@ -2423,15 +2437,15 @@ impl InductionStoreProducer {
     /// names it.
     ///
     /// A **prefix of the path**, because that is what a sequential drive delivers and so
-    /// what has been consumed: the enclosing rows before the head entirely, and within the
+    /// what has been consumed: the enclosing positions before the head entirely, and within the
     /// head row everything up to its last decided position. Saying it as a `Codomain`
     /// instead would claim that prefix in *every* row, including rows that have delivered
     /// nothing — and a release is a promise never to ask again.
     fn consumed_guard(&self, decided: &Path) -> TileGuard {
-        domain_prefix_over(decided.to_vec(), &carrier_levels(self.tiling()))
+        domain_prefix_over(decided.to_vec(), &path_levels(self.tiling()))
     }
 
-    /// The path this carrier has decided through: the last row it opened at each level,
+    /// The path this induction store has decided through: the last row it opened at each level,
     /// down to that store's watermark. `None` before anything is decided.
     ///
     /// The drive is sequential, so the last row of a level is the one still running and
@@ -2455,7 +2469,7 @@ impl InductionStoreProducer {
 
     /// Each row's value before any of its positions, read from the per-key seed streams.
     ///
-    /// A carrier with no rows above it takes the position alone, so its seed is one value
+    /// An induction store with no rows above it takes the position alone, so its seed is one value
     /// and it seeds the empty path.
     ///
     /// Read fresh each pull rather than latched. The stream releases behind the drive, but
@@ -2523,18 +2537,17 @@ impl InductionStoreProducer {
         )
     }
 
-    /// This carrier's engines as a tile, each store `terminal` once the recurrence is final
-    /// (the accumulator can no longer change, so a downstream `ExtractFinal` /
-    /// `final_or_default` resolves).
+    /// This induction store's engines as a tile, each store `terminal` once the recurrence is final
+    /// (the accumulator can no longer change, so a downstream `StoreFinalRead` resolves).
     ///
     /// A store waiting for its seed contributes nothing: an undecided frontier, no change,
     /// and no value before any position. That is what it holds, and it is what the driver
     /// reads to know not to emit yet.
     fn render_store(&self) -> Tile {
-        let store = render_carrier_tile(&self.engines, self.tiling(), &self.complete_rows);
+        let store = render_engines(&self.engines, self.tiling(), &self.complete_rows);
         debug_assert!(
             store.check_from(&self.output_tiling),
-            "rendered induction store tile does not match the carrier's tiling"
+            "rendered induction store tile does not match the induction store's tiling"
         );
         store
     }
@@ -2545,10 +2558,10 @@ impl TileProducer for InductionStoreProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         // Read the seeds before the body. A store opens the moment both its row and its
-        // seed are known, and for the carrier's own store — the empty path — the row is
+        // seed are known, and for the induction store's own store — the empty path — the row is
         // known from the start, so it opens here. It has to: the driver reads the
         // accumulator's value before the first position out of this store, and a store
-        // that is not open carries none. A nested carrier's rows are named by decisions
+        // that is not open carries none. A nested store's rows are named by decisions
         // instead, so none of its seeds lands at the empty path and they wait below.
         // An open store of its own has read its seed, and nothing more of it is wanted.
         let row_seeds = match &self.engines {
@@ -2577,7 +2590,7 @@ impl TileProducer for InductionStoreProducer {
         // the store's rule independent of that rate.
         let started_at = self.decided_path();
         // A decision names the store it belongs to and the position within it, as the path
-        // down the levels the recurrence is indexed by. A carrier with no rows above it
+        // down the levels the recurrence is indexed by. An induction store with no rows above it
         // has paths of one component, which is the whole of that statement at depth zero:
         // one store, at the empty path.
         let Tile::Scalar(union_col) = body_tile.deepest_values().clone() else {
@@ -2625,8 +2638,8 @@ impl TileProducer for InductionStoreProducer {
                     self.stepped_through
                         .as_ref()
                         .is_none_or(|high| path > *high),
-                    "a carrier steps its decisions in ascending path order and never reopens \
-                     a row: stepping {path:?} at or below {:?}, the highest path already \
+                    "an induction store steps its decisions in ascending path order and never \
+                     reopens a row: stepping {path:?} at or below {:?}, the highest path already \
                      stepped",
                     self.stepped_through
                 );
@@ -2652,7 +2665,7 @@ impl TileProducer for InductionStoreProducer {
         }
         // The body says what is complete at every level of its decision stream, and the
         // store publishes each level on its own so a read can answer a row as a whole. Every
-        // level is read: a standing level's rows are not the carrier's, the loop around a
+        // level is read: a standing level's rows are not the induction store's, the loop around a
         // standing level waits on that level's own last row, and the innermost level is the
         // positions a store will gain no more of.
         //
@@ -2705,13 +2718,13 @@ impl TileProducer for InductionStoreProducer {
         // strands the recurrence and a never-terminating loop's changelog stays at
         // O(keys) plus the slowest reader's lag.
         //
-        // A release names a region of the carrier, one arm per level ([`domain_prefix`]),
+        // A release names a region of the induction store, one arm per level ([`domain_prefix`]),
         // so the prefix each store may reclaim is its own: the positions of that store the
         // guard covers. Asked of the store's own decided positions rather than of the
         // predicate, because a qualified predicate answers about a **path** and a
         // watermark is a value — which is why [`Predicate::max_released_position`] declines
-        // one. A carrier with no rows above it is the same walk over one store at the empty
-        // path, where the guard is unqualified and every decided position it covers is a
+        // one. An induction store with no rows above it is the same walk over one store at the
+        // empty path, where the guard is unqualified and every decided position it covers is a
         // prefix.
         let mut at: Vec<Value> = Vec::new();
         self.engines.for_each_store_mut(&mut |rows, engine| {
@@ -2999,7 +3012,9 @@ impl TileProducer for StoreValueStreamProducer {
 /// projection of the history, and needs no seed operand, because the store holds its
 /// seed beside its changelog.
 pub struct StoreFinalRead {
-    /// Output tiling `Scalar(V)` — a terminal read is one value, not a stream.
+    /// Output tiling [`Tiling::from_extent`] of `V`: a terminal read is one value, not a
+    /// stream, and a collection-valued key's value is handed out as a level, the way every
+    /// other store read hands it out ([`read_tiling`]).
     base: OperatorBase,
     /// The commit store (a [`Tile::Store`] fan branch).
     store_op: Box<dyn TileOperator>,
@@ -3011,7 +3026,7 @@ pub struct StoreFinalRead {
 impl StoreFinalRead {
     pub fn new(store_op: Box<dyn TileOperator>, key: Value, value_extent: Extent) -> Self {
         Self {
-            base: OperatorBase::new(Tiling::Scalar(value_extent.clone())),
+            base: OperatorBase::new(Tiling::from_extent(&value_extent)),
             store_op,
             key,
             value_extent,
@@ -3081,7 +3096,7 @@ impl TileProducer for StoreFinalReadProducer {
         // release the `FanOut`'s meet cannot advance past this branch until the read retires,
         // which holds every version of every key for the length of the loop.
         if let Some(frontier) = store_frontier(&store) {
-            let levels = carrier_levels(self.store_producer.tiling());
+            let levels = path_levels(self.store_producer.tiling());
             self.store_producer
                 .release(domain_prefix_over(vec![frontier.into_value()], &levels));
         }
@@ -3104,10 +3119,7 @@ impl TileProducer for StoreFinalReadProducer {
         // decided frontier, or the seed where nothing wrote it — and, for an induction
         // store that ran no position at all, where nothing is decided either.
         let value = store_value_now(&store, &self.key);
-        Tile::Scalar(ColumnValue::from_values(
-            value.into_iter().collect(),
-            &self.value_extent,
-        ))
+        stored_value_tile(value.into_iter().collect(), &self.value_extent)
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // A universal release from the one consumer of a scalar retires this read, and
@@ -4202,10 +4214,11 @@ struct InductionDriverProducer {
     /// item cursor, and it is not recoverable from the window, which a release compacts
     /// emitted rows away from.
     emitted_through: Option<Path>,
-    /// Highest source path released back upstream. The driver never re-reads
-    /// a position it has emitted, so that prefix is reclaimable; a co-iterated
-    /// reader keeps its own positions live through the source's cross-producer
-    /// release intersection.
+    /// Highest source path released back upstream. The driver never re-reads a position it
+    /// has emitted and never reads a filtered one, so every emitted position, and every
+    /// filtered one it has read past ([`source_read_through`]), is reclaimable; a co-iterated
+    /// reader keeps its own positions live through the source's cross-producer release
+    /// intersection.
     source_released_through: Option<Path>,
     /// Whether the whole source has been released (`True`) after the loop
     /// finished — the finite loop's `get_released_predicate() == True`
@@ -4239,26 +4252,32 @@ impl InductionDriverProducer {
     ///
     /// Both releases name a **path prefix** ([`domain_prefix_over`]), which for a drive with no
     /// rows above it is the watermark: everything up to the frontier.
-    fn reclaim_consumed(&mut self, frontier: Option<&Path>, done: bool) {
+    fn reclaim_consumed(
+        &mut self,
+        frontier: Option<&Path>,
+        read_through: Option<Path>,
+        done: bool,
+    ) {
         // The drive only ever folds at the *frontier*, and the store's GC preserves the
         // carry source a live position reads inside a released prefix — so releasing
         // through the frontier never strands the fold, and without it the store's
         // `FanOut`-intersected release watermark could never advance past this cycle
         // branch and the changelog would grow with the loop.
         if let Some(frontier) = frontier {
-            let levels = carrier_levels(self.store_producer.tiling());
+            let levels = path_levels(self.store_producer.tiling());
             self.store_producer
                 .release(domain_prefix_over(frontier.to_vec(), &levels));
         }
-        // The source prefix this drive has consumed. It only ever reads the position it is
-        // about to emit and never re-reads an earlier one.
-        if let Some(through) = self.emitted_through.clone()
+        // The source prefix this drive has consumed: what it has emitted, and the filtered
+        // rows it has read past. It only ever reads the position it is about to emit and
+        // never re-reads an earlier one.
+        if let Some(through) = self.emitted_through.clone().max(read_through)
             && !self
                 .source_released_through
                 .as_ref()
                 .is_some_and(|r| *r >= through)
         {
-            let levels = carrier_levels(self.source_producer.tiling());
+            let levels = path_levels(self.source_producer.tiling());
             self.source_producer
                 .release(domain_prefix_over(through.to_vec(), &levels));
             self.source_released_through = Some(through);
@@ -4390,7 +4409,7 @@ impl TileProducer for InductionDriverProducer {
 
         // Every position of a complete source has been emitted: the body input is final,
         // and that terminality propagates through the body's decision stream to close the
-        // carrier's frontier. A complete source holds every path it will ever deliver, so
+        // induction store's frontier. A complete source holds every path it will ever deliver, so
         // "no delivered path above the cursor" means "there is no next" — the question a
         // restricted source needs asked, since the position one past the cursor may simply
         // not be in its domain.
@@ -4420,7 +4439,18 @@ impl TileProducer for InductionDriverProducer {
             self.wakeups.request(self.consumer.clone());
         }
         self.stated = Some(stated);
-        self.reclaim_consumed(frontier.as_ref(), done);
+        let read_through = source_read_through(
+            &src,
+            pending
+                .as_ref()
+                .and_then(Path::split_position)
+                .map(|(_, at)| Position::new(at.clone()))
+                .as_ref(),
+            &self.source_complete,
+            &self.window.domain,
+        )
+        .map(one_component);
+        self.reclaim_consumed(frontier.as_ref(), read_through, done);
         self.render(done)
     }
 
@@ -4554,6 +4584,7 @@ impl TileOperator for TransactDriver {
             ),
             current: self.resumed_after.clone(),
             latest_emit: None,
+            source_released_through: self.resumed_after.clone(),
         })
     }
 }
@@ -4593,6 +4624,9 @@ struct TransactDriverProducer {
     /// is a pure function of that pair, so re-emitting at an unchanged pair would
     /// duplicate a domain position against the body's `Memo`.
     latest_emit: Option<(Position, Position)>,
+    /// The source prefix this driver has released, by a finish or by reading past a
+    /// filtered row, so a pull that reads nothing new does not repeat the release.
+    source_released_through: Option<Position>,
 }
 
 /// The most rows this driver's live window may hold: the attempt the writer has
@@ -4609,6 +4643,31 @@ struct TransactDriverProducer {
 const MAX_LIVE_ATTEMPTS: usize = 2;
 
 impl TransactDriverProducer {
+    /// The source's positions, which a release's prefix is spelled over: a concatenation
+    /// keys them by a union.
+    fn source_positions(&self) -> Extent {
+        let Tiling::DataFunction { domain, .. } = self.source_producer.tiling() else {
+            unreachable!("a transaction source is a collection of items")
+        };
+        domain.clone()
+    }
+
+    /// Release the source through `through`, unless an earlier release already reaches it.
+    fn release_source_through(&mut self, through: Option<Position>) {
+        if let Some(through) = through
+            && !self
+                .source_released_through
+                .as_ref()
+                .is_some_and(|r| *r >= through)
+        {
+            let prefix =
+                Predicate::at_or_below_in(through.value().clone(), &self.source_positions());
+            self.source_producer
+                .release(TileGuard::Function(FunctionGuard::Domain(prefix)));
+            self.source_released_through = Some(through);
+        }
+    }
+
     /// The two standing facts about the live window, checked on both sides of the
     /// only two things that move it: an emit, and the release that advances the
     /// item cursor.
@@ -4672,6 +4731,22 @@ impl TileProducer for TransactDriverProducer {
         let next_item = items
             .iter()
             .find(|(pos, _)| self.current.as_ref().is_none_or(|c| pos > c));
+        // A filtered row is finished once the drive reads past it: nothing attempts it, so no
+        // ack releases it. The attempt in flight, if any, is the next item, so it stays
+        // offered.
+        let complete = match &src {
+            Tile::DataFunction {
+                domain_predicate, ..
+            } => domain_predicate.clone(),
+            _ => Predicate::False,
+        };
+        let read_through = source_read_through(
+            &src,
+            next_item.map(|(pos, _)| pos),
+            &complete,
+            &self.source_positions(),
+        );
+        self.release_source_through(read_through);
         let store = self
             .store_producer
             .get(self.store_producer.tiling().universal_guard());
@@ -4767,18 +4842,9 @@ impl TileProducer for TransactDriverProducer {
             // just finished has finished too. Releasing it is what makes the
             // source's own release state this drive's progress record, so a
             // replacement drive is offered what this one did not finish and
-            // nothing it did — see `src/ccl/design/program-evolution.md`,
-            // "Where a producer registering now starts". The prefix is spelled over the
-            // source's positions, which a concatenation keys by a union.
-            let Tiling::DataFunction {
-                domain: positions, ..
-            } = self.source_producer.tiling()
-            else {
-                unreachable!("a transaction source is a collection of items")
-            };
-            let prefix = Predicate::at_or_below_in(finished.into_value(), positions);
-            self.source_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(prefix)));
+            // nothing it did or read past — see `src/ccl/design/program-evolution.md`,
+            // "Where a producer registering now starts".
+            self.release_source_through(Some(finished));
         }
         self.window.acknowledge(pred);
         self.debug_assert_window_invariants();
@@ -4885,6 +4951,29 @@ fn last_position_below(
     positions.into_iter().filter(|p| p < bound).max()
 }
 
+/// The highest position of `src` a drive has read past without running it: one the tile
+/// holds, filtered rows included, below `next` (the next position the drive will run, or
+/// `None` when there is none), and which the source calls complete along with every position
+/// before it.
+///
+/// A filtered row stays in the tile, marked deleted, and the drive never runs it, so no
+/// decision or ack releases it; the drive releases it on reading past it. The completeness
+/// condition keeps that release a prefix of positions that have arrived: a source delivering
+/// out of order may still send a position below one it holds, and a drive placed across a
+/// reload resumes past whatever its predecessor released.
+fn source_read_through(
+    src: &Tile,
+    next: Option<&Position>,
+    complete: &Predicate,
+    positions: &Extent,
+) -> Option<Position> {
+    domain_positions(src)
+        .into_iter()
+        .filter(|p| next.is_none_or(|n| p < n))
+        .filter(|p| complete.subsumes(&Predicate::at_or_below_in(p.value().clone(), positions)))
+        .max()
+}
+
 /// Every position of a collection tile's domain. Empty for any other tile.
 fn domain_positions(tile: &Tile) -> Vec<Position> {
     let Tile::DataFunction { domain, .. } = tile else {
@@ -4979,7 +5068,7 @@ fn body_decision_at(
 
 /// [`body_decision_at`] once the row is known. The induction store finds the row by walking
 /// the decision stream's levels ([`decided_paths`]) rather than by looking a position up:
-/// an inner position repeats across enclosing rows, so only the path identifies a
+/// an inner position repeats across enclosing positions, so only the path identifies a
 /// decision.
 fn decision_at_index(
     union_col: &ColumnValue,
@@ -5733,7 +5822,7 @@ mod tests {
     }
 
     /// Depth is not counted anywhere: a second level of rows is the same arm again, which
-    /// is what lets a nest three deep reuse the carrier a nest two deep uses.
+    /// is what lets a nest three deep reuse the induction store a nest two deep uses.
     #[test]
     fn engines_nest_to_any_depth_with_one_arm() {
         let mut engines = Engines::Rows(Vec::new());
@@ -5958,6 +6047,122 @@ mod tests {
                 tile: self.tile.clone(),
             })
         }
+    }
+
+    /// A live loop source whose rows a filter has removed: every row of `items` is marked
+    /// deleted, the source calls them complete, and the tile is not terminal. It records
+    /// every release it receives.
+    struct FilteredLiveSource {
+        tiling: Tiling,
+        tile: Tile,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+
+    impl FilteredLiveSource {
+        fn new(items: &[i64]) -> Self {
+            let tiling =
+                Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(value_extent()));
+            let tile = Tile::data_function(
+                ColumnValue::from_uints((0..items.len()).collect()),
+                Box::new(Tile::Scalar(ColumnValue::from_values(
+                    items.iter().map(|n| int(*n)).collect(),
+                    &value_extent(),
+                ))),
+                Predicate::at_or_below(Value::UInt(items.len() - 1)),
+                (0..items.len()).collect(),
+            );
+            Self {
+                tiling,
+                tile,
+                released: Rc::default(),
+            }
+        }
+    }
+
+    impl TileOperator for FilteredLiveSource {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(RecordingSourceProducer {
+                base: ProducerBase::new(RecordingSourceProducer::alloc_id(), &self.tiling),
+                tile: self.tile.clone(),
+                released: self.released.clone(),
+            })
+        }
+    }
+
+    struct RecordingSourceProducer {
+        base: ProducerBase,
+        tile: Tile,
+        released: Rc<RefCell<Vec<TileGuard>>>,
+    }
+
+    impl TileProducer for RecordingSourceProducer {
+        fn base(&self) -> &ProducerBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut ProducerBase {
+            &mut self.base
+        }
+        // A `Restrict` keeps a filtered row's key, marked deleted, in every tile it
+        // emits, so this offers the tile as built.
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.clone()
+        }
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.released.borrow_mut().push(obsolete_guard);
+        }
+    }
+
+    /// The induction driver releases the rows a filter removed once it reads past them, as
+    /// the transaction driver does: no decision is emitted for one, so no store release ever
+    /// reaches it. Over a live source filtered to nothing, it releases both rows.
+    #[test]
+    fn induction_driver_releases_filtered_rows_it_reads_past() {
+        let acc = acct("acc");
+        let store = InductionStore::new(
+            vec![(acc.clone(), Box::new(Constant::new(int(0), value_extent())))],
+            vec![acc.clone()],
+            Vec::new(),
+            full_store_tiling(Extent::Base(BaseType::UInt), store_values(&["acc"])),
+            None,
+        );
+        let set_body = store.body_input_setter();
+        let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+        let source = FilteredLiveSource::new(&[10, 20]);
+        let released = source.released.clone();
+        let driver = InductionDriver::new(
+            fan.branch(),
+            Box::new(source),
+            vec![acc.clone()],
+            vec![value_extent()],
+            value_extent(),
+            Extent::Base(BaseType::UInt),
+            None,
+        );
+        set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
+        let mut op = fan.branch();
+        let guard = op.tiling().universal_guard();
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
+        for _ in 0..4 {
+            producer.get(producer.tiling().universal_guard());
+            sched.check_for_notifications();
+        }
+        let both = |g: &TileGuard| (0..2).all(|p| g.covers_path(&[Value::UInt(p)]));
+        assert!(
+            released.borrow().iter().any(both),
+            "the driver releases both filtered rows: {:?}",
+            released.borrow()
+        );
     }
 
     /// The `commit` payload extent for a single-key writer: `{writes: {acc: value}}`.
@@ -8491,6 +8696,27 @@ mod tests {
         // An undecided store (nothing committed yet) has no current value.
         let undecided = store_tile(&["alice"], &[("alice", 100)], &[], Predicate::False);
         assert_eq!(store_current(&undecided, &acct("alice")), None);
+    }
+
+    #[test]
+    fn decode_source_positioned_skips_deleted_rows() {
+        // A `Restrict` marks a row deleted and keeps its key, so the decode is what drops
+        // it: the recurrence runs over the positions the source still has.
+        let mut deleted = BitSet::new();
+        deleted.insert(1);
+        let tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10, 20, 30]))),
+            Predicate::True,
+            deleted,
+        );
+        assert_eq!(
+            decode_source_positioned(&tile),
+            vec![
+                (pos(0), Tile::Scalar(ColumnValue::from_ints(vec![10]))),
+                (pos(2), Tile::Scalar(ColumnValue::from_ints(vec![30]))),
+            ],
+        );
     }
 
     #[test]

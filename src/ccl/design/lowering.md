@@ -57,7 +57,7 @@ outer-scope name is a lowering error that points at `:=`.
 The recurrence is **not** built at lowering. The unified `mut_elim` rewrites
 every `For`+`MutWrite` loop into a guarded `LetRec` — the accumulators' history
 over the loop's induction domain, guarded by `get_prev_seq`, with trailing reads
-lowered to `final_or_default` — and `planning::plan_loops` lowers that onto the
+lowered to `final_read` — and `planning::plan_loops` lowers that onto the
 domain-parameterized `Transact`, which operator conversion compiles to a
 position-driven `InductionStore` changelog. In-loop feeds (`<<`, and `yield` in a generator) are hoisted to
 `Feed(defer, view)` and routed as ordinary channels by `channelize`, the

@@ -309,12 +309,14 @@ impl PartialOrd for Value {
     }
 }
 
-/// A value standing at a **position** of some ordered domain: a commit-clock tick, an
-/// iteration position of a loop extent, or a nested loop's `(outer, inner)` pair.
+/// A value standing at a **position** of some ordered domain: a commit-clock tick, or an
+/// iteration position of a loop extent, a product's record or a concatenation's tagged key
+/// included. A nested loop's point is a [`Path`] of positions, one per level, rather than
+/// one position.
 ///
 /// A domain's positions are values of one type, and [`Value`]'s comparison is total
-/// within a type — lexicographic over a record's sorted fields, so a pair orders the way
-/// the nest that produced it runs. This wrapper is that comparison as an [`Ord`], which is
+/// within a type — lexicographic over a record's sorted fields, so a product's position
+/// orders the way the product's own loop runs. This wrapper is that comparison as an [`Ord`], which is
 /// what an ordered map keyed by position needs. Comparing positions of two different
 /// domains panics, naming the store or stream whose domain is not one domain.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -369,18 +371,18 @@ impl PartialOrd for Position {
     }
 }
 
-/// The **path** to a position inside a nested carrier: one component per collection level
+/// The **path** to a position inside a nested store: one component per collection level
 /// above the store, then the position within it.
 ///
-/// A flat carrier's path is one component. A nested one adds its enclosing row, and a
-/// carrier beneath a standing level adds that too — so depth lives in the path's length
+/// A flat store's path is one component. A nested one adds its enclosing position, and an
+/// induction store beneath a standing level adds that too — so depth lives in the path's length
 /// and nowhere in the code that handles it.
 ///
 /// A path, rather than an `(enclosing, inner)` [`Value`] record, because the nesting says
 /// which store a position belongs to, so the position does not have to, and
 /// a tile keyed or guarded by a path names it as levels rather than as a product domain.
 ///
-/// Paths of one carrier have one component per level, so they are the same length and
+/// Paths of one induction store have one component per level, so they are the same length and
 /// order lexicographically, each component compared as a [`Position`] of its own level.
 /// This is **drive order**, which is not the order a release guard reads a path in: a
 /// guard names a region, one arm per level, and asks whether it covers the path

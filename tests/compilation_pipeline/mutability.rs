@@ -2917,9 +2917,9 @@ fn nested_shapes_reach_realization(#[case] code: &str) {
     indoc! {r#"
         let s : Int = 0
         in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0 ≫ .0) { [s]⇒[s] over ((iterate ≫ [10, 20]) ▷ map_domain, .1 ≫ [10, 20]) ▷ curry_over do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : ((Int, Int) ⇒ Int) = (__hist ≫ .s, .0) ▷ zip ≫ final_or_default
+        in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
         in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : Int = (__hist.s, 0) ▷ final_or_default
+        in let s : Int = __hist.s ▷ final_read
         in s
     "#}
 )]
@@ -2934,9 +2934,9 @@ fn nested_shapes_reach_realization(#[case] code: &str) {
     indoc! {r#"
         let s : Int = 0
         in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0 ≫ .0) { [s]⇒[s] over .1 do .1 ≫ (true ▷ const ▷ filter_values ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const) }
-        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = (__hist ≫ .s, .0) ▷ zip ≫ final_or_default
+        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
         in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : Int = (__hist.s, 0) ▷ final_or_default
+        in let s : Int = __hist.s ▷ final_read
         in s
     "#}
 )]

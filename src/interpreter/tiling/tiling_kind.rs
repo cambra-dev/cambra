@@ -230,7 +230,7 @@ impl Tiling {
             // write any of them. The key space is the record's, so it is present from
             // the start even though nothing has been written.
             // Vectorized like every other tile: a flat store stands at one row, and a
-            // nested carrier's collection of them at one per enclosing row.
+            // nested store's collection of them at one per enclosing row.
             Tiling::Store { domain, codomain } => Tile::Store {
                 state: Box::new(self.store_state().empty_at_rows(rows)),
                 seed: Box::new(codomain.empty_at_rows(rows)),
