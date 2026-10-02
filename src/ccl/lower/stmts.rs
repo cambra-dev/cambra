@@ -1561,6 +1561,9 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         // through `ParseResult::errors` before this message is ever read.
         ChlExpr::Error => "a malformed expression",
         // The forms with their own arms in `lower_type_expr` never reach here.
+        ChlExpr::Qualified(_) => {
+            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
+        }
         ChlExpr::Name(_)
         | ChlExpr::BraceRecord(_)
         | ChlExpr::BraceGroup(_)

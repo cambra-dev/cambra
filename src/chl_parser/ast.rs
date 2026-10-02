@@ -309,6 +309,59 @@ pub enum Stmt {
     /// `return value` (only valid inside a function body; not enforced here).
     Return(Option<Spanned<Expr>>),
 
+    /// `import a::b as c use f, T as U` — bind the shared run of a module
+    /// (`docs/chl-spec.md`, "9.2 Imports").
+    Import {
+        path: ModulePath,
+        alias: Option<Spanned<SmolStr>>,
+        uses: Vec<UseItem>,
+    },
+
+    /// `run m(arg=e, …) as n use f` — declare a run of a module
+    /// (`docs/chl-spec.md`, "9.3 Runs"). `args` is empty for both `run m` and
+    /// `run m()`.
+    Run {
+        path: ModulePath,
+        args: Vec<RunArg>,
+        alias: Option<Spanned<SmolStr>>,
+        uses: Vec<UseItem>,
+    },
+
+    /// `param x: T = e`, or `param T <: B = U` for a type parameter
+    /// (`docs/chl-spec.md`, "9.4 Parameters").
+    ///
+    /// A capitalized name is a type parameter. The parser accepts only the
+    /// exact annotation on a value parameter and only the bounded one on a type
+    /// parameter, so the annotation's mode always agrees with the name's case.
+    Param {
+        name: Spanned<SmolStr>,
+        annotation: Option<TypeAnnotation>,
+        default: Option<Spanned<Expr>>,
+    },
+
+    /// `@Discard` on the line above a declaration head: what the version this
+    /// source replaces held there is intentionally gone (`docs/chl-spec.md`,
+    /// "8.9 `@Discard` \[Decided\]").
+    Discard(DiscardHead),
+
+    /// `pub` before the statement that introduces a member (`docs/chl-spec.md`,
+    /// "9.5 Visibility").
+    ///
+    /// `keyword` is the span of `pub` itself. It is where the statement starts,
+    /// except on a [`Stmt::LoadFrom`], whose `pub` stands on the declaration line
+    /// below the decorator: `@LoadFrom(qty)` above `pub held: Int`.
+    ///
+    /// **Invariant:** in a parse with no errors, the inner statement is a
+    /// [`Stmt::Assign`], [`Stmt::AnnAssign`], [`Stmt::MutAssign`],
+    /// [`Stmt::LoadFrom`], [`Stmt::FunctionDef`] or [`Stmt::Run`]. The parser
+    /// reports `pub` on any other statement as a parse error. Whether a `:=`
+    /// introduces a mutable variable, and whether the statement stands at a
+    /// module's top level, are left to lowering.
+    Pub {
+        keyword: Span,
+        stmt: Box<Spanned<Stmt>>,
+    },
+
     /// `pass` — no-op statement that holds a place where a block is required.
     Pass,
 
@@ -322,6 +375,57 @@ pub enum Stmt {
     /// unreachable. Mixing recovered ASTs into the compilation pipeline
     /// without first surfacing the parse errors is a caller bug.
     Error,
+}
+
+/// A module path, `shop::cart` (`docs/chl-spec.md`, "9.1 Vocabulary").
+///
+/// **Invariant:** at least one segment, each beginning with a lowercase letter
+/// and none with `__` (`docs/chl-spec.md`, "9.15 Module files"). The parser
+/// refuses any other path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModulePath {
+    pub segments: Vec<Spanned<SmolStr>>,
+}
+
+impl ModulePath {
+    /// The span from the first segment to the last.
+    pub fn span(&self) -> Span {
+        let first = self.segments.first().expect("a module path has a segment");
+        let last = self.segments.last().expect("a module path has a segment");
+        first.span.join(last.span)
+    }
+}
+
+/// One name a `use` clause binds: `f`, or `T as U` (`docs/chl-spec.md`, "9.2
+/// Imports").
+///
+/// **Invariant:** `alias`, when present, has the case of `name`: a type member
+/// is bound to a capitalized name and a value member to a lowercase one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseItem {
+    pub name: Spanned<SmolStr>,
+    pub alias: Option<Spanned<SmolStr>>,
+}
+
+/// One keyword argument of a [`Stmt::Run`]: `port="8080"`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunArg {
+    pub name: Spanned<SmolStr>,
+    pub value: Spanned<Expr>,
+}
+
+/// The declaration head a [`Stmt::Discard`] marks gone.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DiscardHead {
+    /// `stock` — a variable.
+    Name(Spanned<SmolStr>),
+    /// `run m as n` — a run, and every variable it held.
+    Run {
+        path: ModulePath,
+        alias: Option<Spanned<SmolStr>>,
+    },
+    /// `import m` — the shared run of `m`, and every variable it held.
+    Import { path: ModulePath },
 }
 
 /// One branch of an [`Stmt::If`]: a guard and the body to run when it holds.
@@ -352,6 +456,9 @@ pub struct MatchArm {
 pub struct MatchPattern {
     pub tag: SmolStr,
     pub tag_span: Span,
+    /// The module the tag belongs to, as in [`Expr::VariantCtor`]'s
+    /// `tag_qualifier`.
+    pub tag_qualifier: Vec<Spanned<SmolStr>>,
     pub payload: PayloadPattern,
 }
 
@@ -477,6 +584,11 @@ pub enum Expr {
 
     /// A bare identifier — variable or function name.
     Name(SmolStr),
+
+    /// A qualified reference, `cart::total` or `shop::eu::stock`: a member
+    /// reached through an import name, a run name, or a Module-typed parameter
+    /// (`docs/chl-spec.md`, "9.6 Qualified references").
+    Qualified(QualifiedName),
 
     /// A binary operation: `lhs op rhs`.
     BinOp {
@@ -622,6 +734,10 @@ pub enum Expr {
         target: Box<Spanned<Expr>>,
         attr: SmolStr,
         attr_span: Span,
+        /// The module the label belongs to, `mod2` in `r.mod2::f1`, as in
+        /// [`RecordField::qualifier`]. Empty for the current module's label, and
+        /// always empty for a positional key.
+        attr_qualifier: Vec<Spanned<SmolStr>>,
     },
 
     /// A backtick-introduced variant arm: `` `tag(payload) `` in a term,
@@ -643,6 +759,10 @@ pub enum Expr {
         /// The tag name.
         tag: SmolStr,
         tag_span: Span,
+        /// The module the tag belongs to, `mod2` in `` mod2::`tag ``. Empty for
+        /// the current module's tag (`docs/chl-spec.md`, "9.12 Field labels and
+        /// tags belong to a module").
+        tag_qualifier: Vec<Spanned<SmolStr>>,
         /// The payload, or `None` for the bare form `` `tag ``. A term's bare
         /// form lowers to a `Unit` payload — a nullary constructor is not a
         /// *distinct* kind of tag, just one whose payload carries no
@@ -748,7 +868,23 @@ pub enum Lit {
 pub struct RecordField {
     pub name: SmolStr,
     pub name_span: Span,
+    /// The module the label belongs to, `catalog` in `catalog::price=25`. Empty
+    /// for the current module's label.
+    pub qualifier: Vec<Spanned<SmolStr>>,
     pub value: Spanned<Expr>,
+}
+
+/// A name with a non-empty `::` qualifier, `cart::total` (an [`Expr::Qualified`]).
+///
+/// The qualifier's first segment may be `this`, which names the current module
+/// (`docs/chl-spec.md`, "9.12 Field labels and tags belong to a module"). `this`
+/// is a keyword, so no binder can take that spelling. The parser accepts it
+/// wherever a qualifier stands; what each qualifier may name is a question for
+/// name resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QualifiedName {
+    pub qualifier: Vec<Spanned<SmolStr>>,
+    pub name: Spanned<SmolStr>,
 }
 
 /// A comprehension body, shared by [`Expr::ListComp`] and [`Expr::GenExp`].

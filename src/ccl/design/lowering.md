@@ -288,3 +288,15 @@ one tree.
 
 A walker slices the statements above one by position, and those slices stay unfiltered. They
 carry binder names (`collect_stmt_names`), and a dropped statement binds nothing either way.
+
+## Module syntax — refused before lowering
+
+`import`, `run`, `param`, `@Discard`, `pub`, qualified names, and qualified labels and tags parse
+([chl-spec.md](../../../docs/chl-spec.md), "9. Modules [Decided]") and do not lower yet.
+`refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module, every block and every
+expression, and reports one `LoweringError::Unsupported` per construct. `lower_stmts` lowers nothing
+when it reports, so no statement walker or expression arm has a rule for these forms. The arms that
+must name `Expr::Qualified` are `unreachable!`.
+
+A module that uses module syntax therefore reports only those refusals, and none of the lowering
+errors its other statements would raise.

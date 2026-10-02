@@ -18,16 +18,17 @@
 //! by concurrent HTTP handlers is only correct if its state is transactional)
 //! and `hit_counter` (the request-stream aggregate).
 //!
-//! **Currently blocked at parsing.**  The `\` lambda lexes and the variant tags
-//! both lex and parse (`docs/chl-spec.md`, "3.15 Variant constructors"), so the
-//! first unsupported construct is `import http` — modules, which have no
-//! grammar.  Behind it: the `requires Transaction` contextual-parameter clause,
+//! **Currently blocked at parsing.**  The `\` lambda lexes, the variant tags
+//! both lex and parse (`docs/chl-spec.md`, "3.15 Variant constructors"), and
+//! `import http` parses, so the first unsupported construct is the
+//! `requires Transaction` contextual-parameter clause, which has no grammar.
+//! Behind it: `import http` (refused by lowering until modules lower),
 //! `with begin()` / `abort()`, map-index assignment, structured requests, and
-//! `restrict` / `count`.  This pins the `import` parse failure.
+//! `restrict` / `count`.  This pins the `requires` parse failure.
 
 use super::common::expect_compile_error;
 
 #[test]
 fn txn_kv_currently_blocked_at_parsing() {
-    expect_compile_error(include_str!("program.cambra"), "import http");
+    expect_compile_error(include_str!("program.cambra"), "requires Transaction");
 }

@@ -85,6 +85,22 @@ pub enum Token {
     Match,
     #[token("case", priority = 3)]
     Case,
+    // The module keywords (`docs/chl-spec.md`, "9. Modules [Decided]").
+    #[token("import", priority = 3)]
+    Import,
+    #[token("use", priority = 3)]
+    Use,
+    #[token("as", priority = 3)]
+    As,
+    #[token("pub", priority = 3)]
+    Pub,
+    #[token("run", priority = 3)]
+    Run,
+    #[token("param", priority = 3)]
+    Param,
+    /// The qualifier naming the current module's own labels, `this::f1`.
+    #[token("this", priority = 3)]
+    This,
 
     // -- Multi-char operators (must precede their single-char prefixes) ---
     #[token("<<=")]
@@ -188,6 +204,11 @@ pub enum Token {
     /// mutable intro `x: T := e` is `Colon` (before `T`) then `ColonEq`.
     #[token(":=")]
     ColonEq,
+    /// Path separator `::`, between a qualifier and the name it qualifies
+    /// (`cart::total`, `shop::cart`). Longer-match wins over two `Colon`s; no
+    /// expression puts a `:` directly after a `:`, so the two never compete.
+    #[token("::")]
+    ColonColon,
     #[token(".")]
     Dot,
     /// Variant-arm introducer `` ` `` (`` `some(1) ``, `` { `some{Int} | `none } ``).
@@ -260,6 +281,13 @@ impl fmt::Display for Token {
             Token::With => "with",
             Token::Match => "match",
             Token::Case => "case",
+            Token::Import => "import",
+            Token::Use => "use",
+            Token::As => "as",
+            Token::Pub => "pub",
+            Token::Run => "run",
+            Token::Param => "param",
+            Token::This => "this",
             // Operators (multi-char before single-char)
             Token::LShiftEq => "<<=",
             Token::LShift => "<<",
@@ -298,6 +326,7 @@ impl fmt::Display for Token {
             Token::Comma => ",",
             Token::Colon => ":",
             Token::ColonEq => ":=",
+            Token::ColonColon => "::",
             Token::Dot => ".",
             Token::Backtick => "`",
             Token::Semi => ";",
@@ -437,6 +466,22 @@ impl Level {
     }
 }
 
+/// Whether a statement whose head is `tok` opens its block from that keyword,
+/// rather than from an assignment's right-hand side.
+fn opens_block_at_line_start(tok: &Token) -> bool {
+    matches!(
+        tok,
+        Token::If
+            | Token::Elif
+            | Token::Else
+            | Token::For
+            | Token::Def
+            | Token::With
+            | Token::Match
+            | Token::Case
+    )
+}
+
 /// Tokenise `source`, the text of `file`, into a layout-resolved token stream.
 ///
 /// Caller-visible invariants of the returned stream:
@@ -473,6 +518,9 @@ pub fn tokenize(file: FileId, source: &str) -> Result<Vec<(Token, Span)>, LexErr
     // Whether the current line's first token is a block keyword, which is what
     // separates a block that starts its line from one that does not.
     let mut line_opens_at_first_token = false;
+    // Whether the current line's first token is `pub`, so that its second token
+    // is the statement's head.
+    let mut line_head_after_pub = false;
     // The indent of the line the current *logical* line started on. A bracketed
     // header spans several physical lines, and the floor a block right-hand side
     // opens belongs to the statement, not to the physical line its `:` lands on.
@@ -516,17 +564,13 @@ pub fn tokenize(file: FileId, source: &str) -> Result<Vec<(Token, Span)>, LexErr
                     Level::Fixed(_) => return Err(LexError::InconsistentIndent { span: *span }),
                 }
             }
-            line_opens_at_first_token = matches!(
-                tok,
-                Token::If
-                    | Token::Elif
-                    | Token::Else
-                    | Token::For
-                    | Token::Def
-                    | Token::With
-                    | Token::Match
-                    | Token::Case
-            );
+            // `pub` prefixes the statement it marks, so the token after it is
+            // the one that says whether the statement opens a block itself.
+            line_head_after_pub = matches!(tok, Token::Pub);
+            line_opens_at_first_token = opens_block_at_line_start(tok);
+        } else if line_head_after_pub {
+            line_head_after_pub = false;
+            line_opens_at_first_token = opens_block_at_line_start(tok);
         }
         at_line_start = false;
 

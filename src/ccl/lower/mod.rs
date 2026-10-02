@@ -100,6 +100,7 @@ mod exprs;
 mod functions;
 mod http;
 mod loops;
+mod module_syntax;
 mod stmts;
 mod transactions;
 
@@ -900,6 +901,9 @@ fn lower_expr_inner(
             }
             Ok(Expr::var(name.to_string()))
         }
+        ChlExpr::Qualified(_) => {
+            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
+        }
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
         ChlExpr::Compare {
             left,
@@ -938,9 +942,14 @@ fn lower_expr_inner(
             for RecordField {
                 name,
                 name_span,
+                qualifier,
                 value,
             } in fields
             {
+                debug_assert!(
+                    qualifier.is_empty(),
+                    "a qualified label is refused before lowering (`refuse_module_syntax`)"
+                );
                 let field_name = name.as_str().to_string();
                 if out.iter().any(|(k, _)| k == &field_name) {
                     return Err(LoweringError::unsupported(
@@ -994,7 +1003,12 @@ fn lower_expr_inner(
             target,
             attr,
             attr_span,
+            attr_qualifier,
         } => {
+            debug_assert!(
+                attr_qualifier.is_empty(),
+                "a qualified label is refused before lowering (`refuse_module_syntax`)"
+            );
             let key = if attr.starts_with(|c: char| c.is_ascii_digit()) {
                 // Only magnitude can fail here: the parser admits an integer literal,
                 // so the digits are a non-negative number, but not necessarily one a
@@ -1020,7 +1034,16 @@ fn lower_expr_inner(
         // pair. The `VariantCtor` itself is this expression's root, so
         // `lower_expr` re-tags it `Source`; only the synthesized payload is
         // manufactured and tagged here.
-        ChlExpr::VariantCtor { tag, payload, .. } => {
+        ChlExpr::VariantCtor {
+            tag,
+            tag_qualifier,
+            payload,
+            ..
+        } => {
+            debug_assert!(
+                tag_qualifier.is_empty(),
+                "a qualified tag is refused before lowering (`refuse_module_syntax`)"
+            );
             let payload = match payload {
                 Some(ChlVariantPayload::Term(p)) => lower_expr(p, ctx)?,
                 // Braces are a *type*'s field list; in a term the payload is
@@ -1118,8 +1141,14 @@ fn lower_expr_inner(
 /// `channelize` removes all `Feed` nodes and then collapses the `ExprStmt` to
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
-    let mut errors: Vec<LoweringError> = Vec::new();
-    let value = lower_stmts_recovering(module, ctx, &mut errors);
+    // Module syntax parses and does not lower yet; a module using it lowers
+    // nothing, so no lowering site has to account for it.
+    let mut errors = module_syntax::refuse_module_syntax(module);
+    let value = if errors.is_empty() {
+        lower_stmts_recovering(module, ctx, &mut errors)
+    } else {
+        None
+    };
     // A block lowers its statements last to first, so they report in that order.
     // The reader reads first to last.
     errors.sort_by_key(|e| {
