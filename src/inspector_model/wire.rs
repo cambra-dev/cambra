@@ -368,13 +368,14 @@ pub struct Diagnostic {
     pub severity: String,
     /// The compiler stage that produced it — `"parse"`, `"lower"`, `"infer"`, …
     ///
-    /// A `CompileError` variant, not a pane: no value of it appears in
+    /// A `CompileError` variant, or for an internal compiler error the phase that
+    /// failed; not a pane: no value of it appears in
     /// [`PANES`](crate::ccl::panes::PANES). This is the one place the word
     /// "stage" is the right one.
     pub stage: String,
     /// The human-readable message (reuses the variant's rendered text).
     pub message: String,
-    /// The primary source span, when one is known.
+    /// The primary source span; `None` only for an internal compiler error.
     ///
     /// One span, not a list: a diagnostic is built from one `CompileError`,
     /// which carries at most one range. Pointing at several ranges with distinct
@@ -386,36 +387,17 @@ pub struct Diagnostic {
 impl Diagnostic {
     /// Build a [`Diagnostic`] from a single [`CompileError`].
     ///
-    /// The message is the variant's `Display` rendering, which is the same
-    /// single-line text the terminal path puts in its ariadne label, so the two
-    /// renderers say the same thing. Two variants have no `Display` and use
-    /// `Debug` instead: [`InferError`](crate::ccl::infer::InferError), whose
-    /// `Debug` *is* its message by convention (`infer_report` renders it that
-    /// way), and `ConversionError`.
-    ///
-    /// The span is the error's own wherever it carries one. `Infer`'s is
-    /// resolved at the `compile_program` boundary and arrives on the variant;
-    /// the rest read theirs off the error. A variant with no span degrades to
-    /// `span: None` — still renderable, but the consumer has nothing to
-    /// underline, which is why the ones that can carry a span do.
+    /// The message is the one the terminal report labels its span with, so the two
+    /// renderers say the same thing. The span is `None` only for an internal
+    /// compiler error, which points at no source.
     ///
     /// [`CompileError`]: crate::ccl::context::CompileError
     pub fn from_compile_error(error: &crate::ccl::context::CompileError) -> Self {
-        use crate::ccl::context::CompileError;
-        let (stage, message, span) = match error {
-            CompileError::Parse(e) => ("parse", e.to_string(), Some(e.span())),
-            CompileError::Lower(e) => ("lower", e.to_string(), Some(e.span())),
-            CompileError::ChannelizeDefers(e) => ("channelizeDefers", e.to_string(), None),
-            CompileError::Infer { error, span } => ("infer", format!("{error:?}"), *span),
-            CompileError::LambdaElim(e) => ("lambdaElim", e.to_string(), None),
-            CompileError::Conversion(e) => ("conversion", format!("{e:?}"), None),
-            CompileError::Unsupported(msg) => ("unsupported", msg.clone(), None),
-        };
         Diagnostic {
             severity: "error".to_string(),
-            stage: stage.to_string(),
-            message,
-            span,
+            stage: error.stage().to_string(),
+            message: error.message(),
+            span: error.span(),
         }
     }
 }

@@ -79,6 +79,35 @@ pub struct ReloadReport {
     pub unreadable: Vec<UnreadablePrefix>,
 }
 
+/// Why a `/diff` or `/reload` was refused.
+#[derive(Debug)]
+pub enum ReloadError {
+    /// The version does not compile. Each error's span names a file of the
+    /// version's own [`SourceMap`].
+    Compile(Vec<CompileError>),
+    /// The version cannot replace the running one, or the running one cannot be
+    /// compared against: the reason, already rendered, since it points at no one
+    /// span of the version.
+    Refused(String),
+}
+
+impl ReloadError {
+    /// The refusal as text, rendering compile errors against `sources`, the map of
+    /// the version that was refused.
+    pub fn render(&self, sources: &SourceMap) -> String {
+        match self {
+            ReloadError::Compile(errs) => render_errors(errs, sources),
+            ReloadError::Refused(reason) => format!("error: {reason}\n"),
+        }
+    }
+}
+
+impl From<Vec<CompileError>> for ReloadError {
+    fn from(errs: Vec<CompileError>) -> Self {
+        ReloadError::Compile(errs)
+    }
+}
+
 /// What one [`LiveProgram::diff_against`] question answered.
 ///
 /// The two answers a [`ReloadReport`] carries, minus what only a reload can say,
@@ -176,7 +205,7 @@ impl LiveProgram {
         ctx: &GlobalContext,
         sources: &SourceMap,
         phase: Phase,
-    ) -> Result<DiffReport, Vec<CompileError>> {
+    ) -> Result<DiffReport, ReloadError> {
         // A version identical to the running one declares the same variables, so
         // none of them is new and the report is empty without being asked.
         let Some(diff) = self.difference(ctx, sources, phase)? else {
@@ -211,7 +240,7 @@ impl LiveProgram {
     /// spans name files of [`Self::sources`], whose [`FileId`]s mean nothing in
     /// `sources`: rendered there they would point into the wrong text, or at no
     /// file at all. So those are rendered here, against their own map, and
-    /// returned as one spanless error.
+    /// returned as a [`ReloadError::Refused`].
     ///
     /// [`FileId`]: crate::chl_parser::FileId
     fn difference(
@@ -219,15 +248,15 @@ impl LiveProgram {
         ctx: &GlobalContext,
         sources: &SourceMap,
         phase: Phase,
-    ) -> Result<Option<String>, Vec<CompileError>> {
+    ) -> Result<Option<String>, ReloadError> {
         let old = ctx
             .sources_and_sinks()
             .compile_to(self.sources(), phase)
             .map_err(|errs| {
-                vec![CompileError::Unsupported(format!(
+                ReloadError::Refused(format!(
                     "the running version no longer compiles:\n{}",
                     render_errors(&errs, self.sources())
-                ))]
+                ))
             })?;
         let new = ctx.sources_and_sinks().compile_to(sources, phase)?;
         let d = diff(&old, &new);
@@ -288,7 +317,7 @@ impl LiveProgram {
         ctx: &mut GlobalContext,
         sources: &SourceMap,
         main_consumer: MainConsumerFactory<'_>,
-    ) -> Result<ReloadReport, Vec<CompileError>> {
+    ) -> Result<ReloadReport, ReloadError> {
         let diff = self
             .difference(ctx, sources, Phase::AsOfRead)?
             .unwrap_or_else(|| no_difference(Phase::AsOfRead));
@@ -394,7 +423,7 @@ may move between loops.{remedy}",
                     render(&absent),
                 ));
             }
-            return Err(vec![CompileError::Unsupported(paragraphs.join("\n\n"))]);
+            return Err(ReloadError::Refused(paragraphs.join("\n\n")));
         }
 
         // Read before teardown, off the same planned tree the guard used, so this

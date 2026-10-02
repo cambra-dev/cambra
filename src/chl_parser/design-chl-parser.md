@@ -253,7 +253,7 @@ The handshake is:
 - `lower_stmts` itself returns a `LoweringResult { value, errors }` shaped
   like `ParseResult`. Statement-level recovery means an unsupported
   construct in one top-level statement doesn't shadow lowering errors in
-  other statements.
+  other statements. The errors are in source order.
 - [`compile_program`] returns `Result<_, Vec<CompileError>>`. Each
   `CompileError` is single-stage (`Parse(ParseError)`, `Lower(LoweringError)`,
   …); the `Vec` is the union of every error collected before bailing.

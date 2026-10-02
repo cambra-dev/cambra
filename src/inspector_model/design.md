@@ -276,19 +276,17 @@ pane before the failure; all of them are dropped. Shipping them needs `compile_p
 its partial panes rather than one error, so the change is mostly outside this module; it is carried
 as `TODO(degraded-panes)` on `InspectorPayload::degraded`.
 
-A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span. One
-span, not a list of labelled ranges: a diagnostic is built from one error, which carries at most one
-range, so a label list could only repeat the message against the span already there. Pointing at
-several ranges with distinct texts is a different type, and needs a producer holding those texts.
-The
-message is the error's `Display` rendering — the same single line the terminal's ariadne label
-carries — so the two renderers say the same thing rather than one of them shipping a struct dump.
-Two variants have no `Display` and use `Debug`: `InferError`, whose `Debug` is its message by
-convention, and `ConversionError`.
+A `Diagnostic` is a `CompileError` with the compiler stage that raised it, a message and a span,
+read off `CompileError::stage`, `message` and `span`. One span, not a list of labelled ranges: a
+diagnostic is built from one error, which carries at most one range, so a label list could only
+repeat the message against the span already there. Pointing at several ranges with distinct texts
+is a different type, and needs a producer holding those texts. The message is the text the
+terminal's ariadne report labels the span with, so the two renderers say the same thing.
 
-The span is the error's own wherever it has one. `Parse` and `Lower` read theirs off the error,
-`Infer`'s is resolved at the `compile_program` boundary; `ChannelizeDefers`, `LambdaElim`,
-`Conversion` and `Unsupported` carry none, so a consumer has nothing to underline for them.
+Every `CompileError` but `Internal` carries a span. `Parse` and `Lower` are raised holding one; every
+later variant is raised at a node and resolved to a span at the `compile_program` boundary. An
+`Internal` error is a compiler limitation in a phase whose tree lowering never saw, and its
+diagnostic has `span: null`.
 
 `meta` carries `payloadKind` — `"program"` for a compiled program, `"failed"` for a degraded
 payload — and `schema`. Neither kind is a pane id, so one word never names both a pipeline position

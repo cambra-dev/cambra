@@ -868,6 +868,13 @@ fn check_predicates(
 /// writer in Infer mode, a reader in Check mode — removes it rather than making it
 /// cheaper.
 pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
+    // Check-mode failures are compiler bugs (a pass produced an ill-typed tree), and
+    // every caller of this entry `.expect()`s them, so the blame nodes go unread.
+    check_located(expr).map_err(|errs| errs.into_iter().map(|e| e.error).collect())
+}
+
+/// [`check`], keeping the node each error was raised at.
+pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     let mut cloned = expr.clone_preserving_ids();
     let mut ctx = CheckCtx::new(cloned.node_id());
     // Most rules *accumulate* into `ctx.errors` (see `require_sub`) so the walk keeps
@@ -884,13 +891,7 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
     if ctx.errors.is_empty() {
         Ok(())
     } else {
-        // Check-mode failures are compiler bugs (a pass produced an ill-typed
-        // tree), and every caller either `.expect()`s them or renders them
-        // without source context, so the blame nodes are dropped here rather
-        // than plumbed through `typecheck`/`check_pre_channelize`. They are
-        // recorded per error, so surfacing them is a signature change away when
-        // a caller wants an underlined report.
-        Err(ctx.errors.into_iter().map(|e| e.error).collect())
+        Err(ctx.errors)
     }
 }
 
