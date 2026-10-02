@@ -237,8 +237,7 @@ mod tests {
             terminal: ColumnValue::Bools(bit_vec::BitVec::from_elem(1, true)),
         };
         let store = Tile::Store {
-            changes: ColumnValue::from_uints(vec![]),
-            deltas: ColumnValue::from_ints(vec![]),
+            state: Box::new(Tile::Record(std::collections::HashMap::new())),
             frontier: Predicate::True,
             terminal: true,
             closed_keys: vec![],

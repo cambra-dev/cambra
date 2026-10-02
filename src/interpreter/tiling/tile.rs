@@ -95,9 +95,9 @@ pub enum Tile {
         /// space, each field a [`Tile::DataFunction`] over one row — the commit ticks at
         /// which that key was written, ascending, against the values written there.
         /// A tick a key's changelog omits did not write it, so its value holds. Each
-        /// changelog's own `domain_predicate` is `False`: read as a collection, a decided
-        /// tick it omits would be absent, and `frontier` is the one statement of which
-        /// ticks are decided.
+        /// changelog is a collection of writes, so its `domain_predicate` is the store's
+        /// `frontier`: at a decided tick, a write it holds and a write it omits are both
+        /// final. The key's value at a tick is the fold over its changelog.
         ///
         /// A key's values are one scalar column, one cell per tick
         /// (`commit_operator::changelog_value`), so a collection-valued key holds each
@@ -965,8 +965,7 @@ impl Tile {
     }
 
     /// A store key's changelog: the commit ticks that wrote it, ascending, against the
-    /// values written there. `None` for a tile that is not a store, and for a key outside
-    /// its key space.
+    /// values written there. `None` for a key outside its key space.
     ///
     /// This and [`Self::store_keys`] are the only way into a store's state, so the record
     /// of collections it is encoded as stays this module's business — a reader folds the
@@ -987,12 +986,10 @@ impl Tile {
         self.store_state().keys()
     }
 
-    /// The per-key changelogs of a store, empty for any other tile.
+    /// The per-key changelogs of a store.
     fn store_state(&self) -> &HashMap<String, Tile> {
-        static NONE: std::sync::LazyLock<HashMap<String, Tile>> =
-            std::sync::LazyLock::new(HashMap::new);
         let Tile::Store { state, .. } = self else {
-            return &NONE;
+            panic!("a store's state is read off a store: {self:?}")
         };
         match &**state {
             Tile::Record(keys) => keys,
