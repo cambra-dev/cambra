@@ -1,91 +1,14 @@
-//! The **specialization key**: a canonical, polarity-complete fingerprint of a
-//! monomorphization use's instantiation type.
+//! Specialization keys retain two directed views of a use's live instantiation.
 //!
-//! # Why this is not a `Type`
+//! Each view follows only the bound list selected by its current polarity;
+//! [`KeyView::union`] accumulates contributions without narrowing. Keep the views
+//! separate: merging them loses the direction in which a contribution arrived.
 //!
-//! A resolved [`Type`] answers "what should be stamped on this node". That answer
-//! is *deliberately* lossy: a domain is a negative position, so it resolves from
-//! upper bounds — from what the definition body demands — and a position the body
-//! never touches is narrowed away entirely, while a refinement sitting on the
-//! argument's *lower* bounds is invisible unless
-//! [`compact_type`](super::compact_type)'s opposite-polarity fallback happens to
-//! fire at that exact position.
-//!
-//! A specialization key answers a different question: "would two uses' clones be
-//! the same code?" That answer must be **complete**, because it decides whether
-//! one use is served by a clone whose interior was resolved against a *different*
-//! use's argument. The clone's interior reads its parameter at a *positive*
-//! position, so it sees exactly the lower-bound refinements a polarity-correct
-//! rendering of the domain drops. Keying on a rendering therefore compares one
-//! polarity's view against a clone built from the other's.
-//!
-//! # Both directed views, not an undirected closure
-//!
-//! The temptation is to "saturate": follow *both* bound lists at every variable.
-//! That is wrong, and instructively so — the bound graph is connected across
-//! unrelated uses (two calls' arguments meet at the shared variable of an
-//! operator's scheme), so an undirected closure walks out of one use and into
-//! every other. Every use of a definition then keys on the union of the whole
-//! program's literals, and they all compare equal: the exact defect this key
-//! exists to remove, arrived at from the other side.
-//!
-//! Polarity has to direct the *traversal*. What the key needs is **both directed
-//! reads** of the use's instantiation type — the root taken once at each polarity:
-//!
-//! - The [`positive`](SpecKey::positive) read is the stamping view: a domain is
-//!   negative, so it follows upper bounds — what the definition body demands —
-//!   while the codomain follows lower bounds, what the definition supplies.
-//! - The [`negative`](SpecKey::negative) read is the **clone's** view: the domain
-//!   flips to positive and follows *lower* bounds — the argument that flowed in —
-//!   while the codomain follows upper bounds, the consumer's demand on the result.
-//!
-//! The negative read is the load-bearing half, because it is the polarity the
-//! clone's interior reads its parameter at. And the pair covers the channels
-//! through which a use's own information enters: the emit-time `arg <: domain`
-//! edge (a *lower* bound of a negative position) and a consumer's
-//! `codomain <: demand` edge (an *upper* bound of a positive position). Both
-//! reads stay directed, so neither leaves the use's own cone.
-//!
-//! **What "covers" does and does not mean.** The two reads flip in lockstep, so
-//! at the *root's* immediate positions they are exact opposites and every bound
-//! list is consulted by one of them. Deeper in, they diverge: a variable `?e`
-//! reached only through `?d`'s lower bounds is visited only by the negative read,
-//! at whatever polarity the traversal arrived with — so `?e`'s other bound list is
-//! read by neither. That is not a hole, because it is precisely the direction the
-//! *clone* reads that position at too: the clone's own resolution walks the same
-//! edges from the same side, so a bound the key cannot see is one the clone cannot
-//! see either, and the two stay in agreement. The guarantee is agreement with the
-//! pin, not omniscience about the graph.
-//!
-//! **The two are kept apart, not merged.** Merging them into one view per position
-//! loses which *direction* a contribution arrived from, and the pin the key is
-//! standing in for is direction-sensitive: a use whose domain must accept a plain
-//! `Int` cannot be served by a specialization whose parameter is refined, even
-//! though the union of both reads is `{Int | …}` on both sides. (This is not
-//! hypothetical — it is what a merged key got wrong for a definition used both
-//! directly and through a generalized wrapper.) Comparing the views separately is
-//! also strictly more discriminating, and over-splitting is a wasted clone while
-//! under-splitting is a miscompile.
-//!
-//! # The remaining rules
-//!
-//! - **Union, never narrow.** Polarity picks which bounds to follow; merging is
-//!   always union. A polarity-correct merge *intersects* record fields and refinement
-//!   sets at one of the two polarities, which is what makes a rendering forget an
-//!   argument's unused fields. A key that narrows can only under-split, and
-//!   under-splitting is a miscompile while over-splitting is a wasted clone.
-//! - **Canonical when under-determined.** A position nothing concrete reached is
-//!   the [`Default`] key, not a freshly-minted `Infer` placeholder. Placeholder
-//!   ids are fresh per resolution, so a key carrying them could never match a
-//!   second time.
-//! - **Conflict-tolerant.** Two atoms, or two history kinds, at one position are
-//!   both recorded. A key is a fingerprint, not a type that has to typecheck —
-//!   the real resolution is what reports the conflict, and a key that raised an
-//!   error would have to pick a specialization anyway.
-//!
-//! The property this buys: *if two uses' keys are equal then the clone coalesced
-//! under either use's pin is the same code*, because every edge the clone's own
-//! resolution can follow is followed, from the same side, by one of the two reads.
+//! [`spec_key`] reads the graph before the use's pin, not from a materialized
+//! clone. The algorithm, equality rules, and traversal memo are specified in
+//! `src/ccl/design/type-inference.md`, "Keying a specialization".
+//! Graph changes and redundant-clone limits are described in
+//! `src/ccl/design/type-inference.md`, "Key timing and precision limits".
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;

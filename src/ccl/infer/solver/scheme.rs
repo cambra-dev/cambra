@@ -646,28 +646,19 @@ fn freshen_watches(
     }
 }
 
-/// Freshen a refinement's predicate: clone the (immutable) predicate term,
-/// freshen its type slots through `cache`, and install a fresh `Rc`. See
-/// [`freshen_above`]'s `Refinement` arm.
+/// Clone a refinement predicate and freshen its type slots through `cache`.
 ///
-/// This does not preserve predicate `Rc` sharing, and unlike the rebuilding
-/// passes it threads no [`PredMemo`](crate::ccl::ccl_utils::PredMemo). The
-/// `Rc::new` is unconditional, so N type slots of one clone that shared an `Rc`
-/// going in come out with N distinct `Rc`s, and planning — whose compile memo is
-/// `Rc`-keyed — compiles each separately. Known and not currently fixed: the
-/// downstream cost is unmeasured, and the fix (memoize on
-/// [`PredicateId`](crate::ccl::PredicateId) with `PredMemo`'s keepalive
-/// discipline, or keep the origin `Rc` when the freshen is vacuous) is chosen
-/// only once that cost is known. See `ccl/design/type-inference.md`, "One known
-/// exception, scoped and unfixed: generic instantiation", for the numbers and
-/// the decision.
+/// This installs a new `Rc` unconditionally and does not use a
+/// [`PredMemo`](crate::ccl::ccl_utils::PredMemo). Occurrences sharing one predicate
+/// before instantiation can therefore become separate allocations. The downstream
+/// cost is unmeasured. Possible remedies are a context-correct memo or retaining
+/// the origin for a vacuous freshen; neither is implemented here. See
+/// `ccl/design/type-inference.md`,
+/// "One known exception, scoped and unfixed: generic instantiation".
 ///
-/// A sharing fix here has to keep one id-set per term: reusing one rebuilt `Rc`
-/// across the slots that shared an `Rc` going in is one term riding many slots,
-/// and returning the origin `Rc` when the freshen is vacuous is the same. Only
-/// producing two *distinct* terms with equal ids is forbidden — and it is
-/// checked: `context.rs`'s `distinct_predicate_terms_never_share_a_node_id`
-/// reports that as a `predicate-vs-predicate` collision.
+/// A sharing change must retain one node-id set per term. Reusing one rebuilt
+/// predicate across slots is valid; two distinct live terms carrying equal ids
+/// are not. The pipeline's predicate-aware node-id check guards that distinction.
 fn freshen_refinement_predicate(
     lim: Level,
     r: &Refinement,
