@@ -1462,6 +1462,32 @@ impl Tile {
         levels
     }
 
+    /// How many values this tile holds: every key of every level and every cell beneath
+    /// them, a record's fields each counted, and a store's changelog entries, decided
+    /// positions, seeds and frontier.
+    pub fn cell_count(&self) -> usize {
+        match self {
+            Tile::Scalar(cv) => cv.len(),
+            Tile::Record(fields) => fields.values().map(Tile::cell_count).sum(),
+            Tile::DataFunction {
+                domain, codomain, ..
+            } => domain.len() + codomain.cell_count(),
+            Tile::Aggregation { accumulator, .. } => accumulator.cell_count(),
+            Tile::Store {
+                state,
+                seed,
+                decided,
+                frontier,
+                ..
+            } => {
+                state.cell_count()
+                    + seed.cell_count()
+                    + decided.cell_count()
+                    + frontier.cell_count()
+            }
+        }
+    }
+
     /// The rows this tile stands over, as it carries them.
     pub fn rows(&self) -> usize {
         match self {
@@ -4660,6 +4686,26 @@ mod tests {
             held,
             vec![(key(0), 10), (key(1), 20), (key(2), 30), (key(3), 40)]
         );
+    }
+
+    /// A tile's cells are its keys at every level and the values beneath them: two groups
+    /// `0 ↦ [3]` and `1 ↦ [4, 5]` hold two outer keys, three inner keys and three values.
+    #[test]
+    fn cell_count_counts_every_level_and_its_values() {
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![3, 4, 5]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40, 50]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        assert_eq!(tile.cell_count(), 8);
+        assert_eq!(Tile::Scalar(ColumnValue::Ints(vec![])).cell_count(), 0);
     }
 
     /// A collection inside a record field is a level at the record's depth, so the statement

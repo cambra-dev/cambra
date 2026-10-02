@@ -32,7 +32,7 @@ use crate::{
         commit_operator::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
-            full_store_tiling, nested_carrier_tiling, store_value_now,
+            full_store_tiling, nested_engines_tiling, store_value_now,
         },
         operator_graph::{record_kept_operators, record_sink},
         tile_operators::{
@@ -152,20 +152,20 @@ fn compile_let_binding(
         parameter,
     } = &bound_expr.node
     {
-        // A **nested** carrier's components all take the enclosing body's parameter, so
+        // A **nested** `Transact`'s components all take the enclosing body's parameter, so
         // it consumes that body's input rather than owning a source of its own: one
-        // branch feeds the carrier, the other carries on to the body that reads it.
+        // branch feeds the `Transact`, the other carries on to the body that reads it.
         if parameter.is_some() {
             let Some(input) = input else {
                 return Err(ConversionError::Unsupported(
-                    "a nested carrier has no enclosing input to run against — its source, \
+                    "a nested `Transact` has no enclosing input to run against — its source, \
                      seed and body are all morphisms of the enclosing body's parameter"
                         .to_string(),
                 ));
             };
             // Memoized, as every shared computed input is: a `FanOut` passes each branch's
             // pull to its input, and this input is the enclosing drive, which every reader
-            // of the carrier pulls once per lap.
+            // of the `Transact` pulls once per lap.
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(input))));
             ctx.bind_nested_store(&binding.name, bound_expr, keys, writers, fan.branch())?;
             return Ok(Some(fan.branch()));
@@ -299,8 +299,8 @@ enum StoreReadKind {
     /// trailing read samples the store instead ([`StoreFinalRead`]).
     InductionChangelog,
     /// A **nested** induction store: the recurrence of an inner loop, run once per
-    /// position of the loop around it, as one store per enclosing row. A read is one inner
-    /// history per enclosing row, which is what the enclosing body consumes it as.
+    /// position of the loop around it, as one store per enclosing position. A read is one inner
+    /// history per enclosing position, which is what the enclosing body consumes it as.
     NestedInductionChangelog,
 }
 
@@ -445,7 +445,7 @@ pub struct OpConversionContext {
     /// which is what tells "aligned to *this* iteration" from "aligned to one outside it".
     /// A **depth** rather than an identity because loops nest linearly and a binding made
     /// inside a loop body leaves scope with it, so two iterations at one depth never have
-    /// a binding in common. Only a nested carrier opens an iteration inside another
+    /// a binding in common. Only a nested `Transact` opens an iteration inside another
     /// ([`build_nested_induction_store`]), which is the one site that raises this.
     ///
     /// Each entry is what that iteration was opened over, which is what lifts a reference
@@ -456,19 +456,19 @@ pub struct OpConversionContext {
 /// A nested iteration open around the term being converted.
 ///
 /// A binding made outside it is keyed by the enclosing positions, and a reference made
-/// inside it runs over this carrier's own. Lifting one to the other is pairing it with the
-/// keys beneath each enclosing row and flattening — the construction that built this
-/// carrier's pairs, with the binding in the enclosing parameter's place.
+/// inside it runs over this `Transact`'s own. Lifting one to the other is pairing it with the
+/// keys beneath each enclosing position and flattening — the construction that built this
+/// `Transact`'s pairs, with the binding in the enclosing parameter's place.
 #[derive(Clone)]
 pub(crate) struct OpenIteration {
-    /// The curried source: one inner collection per enclosing row, which is the keys a
+    /// The curried source: one inner collection per enclosing position, which is the keys a
     /// binding from outside is spread over.
     source: Rc<FanOut>,
-    /// The level the iteration adds beneath its enclosing rows, which a lifted binding is
+    /// The level the iteration adds beneath its enclosing positions, which a lifted binding is
     /// paired at ([`Product::per_row_at`]).
     paired: CurryLevel,
     /// Where the reference reads the pairs **flattened**, the level they are flattened at:
-    /// a nested carrier's seed runs over `(enclosing, position)` pair keys, as the pairs it
+    /// a nested `Transact`'s seed runs over `(enclosing, position)` pair keys, as the pairs it
     /// is converted against do, where its body reads the two levels as two. `None` for the
     /// body.
     flattened_at: Option<CurryLevel>,
@@ -790,13 +790,13 @@ impl OpConversionContext {
                 .all(|name| !self.rebuilt.contains(name))
     }
 
-    /// Register a **nested** carrier: the recurrence of an inner loop, run once per
+    /// Register a **nested** `Transact`: the recurrence of an inner loop, run once per
     /// position of the loop around it.
     ///
     /// Takes the enclosing body's input, because that is what its components are
     /// morphisms of — the seed is where the enclosing accumulator had got to, the source
     /// is one collection per enclosing position, and the body reads whatever it needs
-    /// from the enclosing row as a slot.
+    /// from the enclosing position as a slot.
     fn bind_nested_store(
         &mut self,
         name: &Name,
@@ -807,12 +807,12 @@ impl OpConversionContext {
     ) -> Result<(), ConversionError> {
         let [w] = writers else {
             return Err(ConversionError::Unsupported(format!(
-                "a nested carrier has exactly one writer (recognition folds a conditional \
+                "a nested `Transact` has exactly one writer (recognition folds a conditional \
                  write to one), got {}",
                 writers.len()
             )));
         };
-        // Not reused across versions and not recorded under the node: a nested carrier
+        // Not reused across versions and not recorded under the node: a nested `Transact`
         // is rebuilt with the enclosing body it is a morphism of, and the *enclosing*
         // store is what hands its variables on ([`live_state`](Self::live_state) reads
         // that one). Registering it here is only so `__hist.k` inside the enclosing body
@@ -1722,7 +1722,7 @@ fn convert_impl_inner(
     // `provenance::converting`.
     let _scope = crate::ccl::provenance::converting(expr.node_id());
     trace!("Converting {}", symbolic(expr));
-    // A nested store's read, `__hist ≫ .k`: a morphism of the enclosing row, one inner
+    // A nested store's read, `__hist ≫ .k`: a morphism of the enclosing position, one inner
     // history per row, which is the shape the store's read produces. Its steps take that
     // history's values, as the steps after a top-level store's read do.
     if let Some(read) = as_nested_store_read(expr, ctx) {
@@ -1736,13 +1736,7 @@ fn convert_impl_inner(
     let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
-            // A chain **headed** by a leaf source takes no input, for the reason a leaf
-            // zip arm takes none: the leaf is a source over its own domain and rejects the
-            // fanned iteration. The steps after it consume what it produced either way.
-            let mut result = match elems.first() {
-                Some(head) if is_leaf_zip_arm(head, ctx) => None,
-                _ => input,
-            };
+            let mut result = input;
             let mut rest = elems.as_slice();
             // A nested store's read heads the chain as two elements, `__hist ≫ .k` or its
             // zip with the steps on its values, and is the leaf the rest takes.
@@ -1750,28 +1744,25 @@ fn convert_impl_inner(
                 && head.len() >= 2
                 && let Some(read) = nested_store_read_of(&elems[..2], ctx)
             {
-                let mut op = convert_store_read(&read.store, &read.field, ctx)?;
-                for step in read.steps {
-                    op = convert_impl(step, Some(op), ctx)?;
+                // `__hist ≫ .k ≫ final_read` — an inner loop's trailing read, a sample of
+                // each enclosing position's store as `final_read` of a flat history is of the
+                // one store.
+                if read.steps.is_empty()
+                    && let Some(TypedExprNode::Builtin(Builtin::FinalRead)) =
+                        elems.get(2).map(|e| &e.node)
+                {
+                    result = Some(convert_store_settled_read(&read.store, &read.field, ctx)?);
+                    rest = &elems[3..];
+                } else {
+                    let mut op = convert_store_read(&read.store, &read.field, ctx)?;
+                    for step in read.steps {
+                        op = convert_impl(step, Some(op), ctx)?;
+                    }
+                    result = Some(op);
+                    rest = &elems[2..];
                 }
-                result = Some(op);
-                rest = &elems[2..];
             }
             while let [elem, after @ ..] = rest {
-                // `⟨source, default⟩ ▷ zip ≫ final_or_default` — the per-row reduction,
-                // built from the two legs rather than from the zip they are written as.
-                // A zip keeps the rows both legs hold, and the source holds none for a row
-                // whose loop ran no position; that row's answer is its default, which
-                // pairing has already thrown away. The applied form takes its two legs the
-                // same way, off the `Tuple` elimination leaves there.
-                if let [next, ..] = after
-                    && as_builtin(next) == Some(Builtin::FinalOrDefault)
-                    && let Some((source, default)) = zip_pair(elem)
-                {
-                    result = Some(map_extract_final(source, default, result.take(), ctx)?);
-                    rest = &after[1..];
-                    continue;
-                }
                 result = Some(convert_impl(elem, result.take(), ctx)?);
                 rest = after;
             }
@@ -2794,15 +2785,11 @@ fn convert_impl_inner(
                     Box::new(MapAggregate::new(input, kind)),
                     kind,
                 ))),
-                // Composed rather than applied, so the reduction runs **per enclosing
-                // row** — [`ExtractFinal::per_row_at`], which the `Compose` arm builds from the two
-                // legs of the `zip` in front of it. Reaching here means there was no such
-                // zip, so there is no default to fall back to and no rows to fall back
-                // over.
+                // Composed rather than applied would be a reduction per enclosing position, which
+                // nothing mints: a loop's trailing read is `final_read`, and a guard-`Case`
+                // is applied to its stream and its default.
                 Builtin::FinalOrDefault => Err(ConversionError::Unsupported(format!(
-                    "final_or_default composed over {} — a per-row reduction reads \
-                     `⟨source, default⟩ ▷ zip ≫ final_or_default`, and a source declared \
-                     total carries no default",
+                    "final_or_default composed over {} — only its applied form is a reduction",
                     input.tiling()
                 ))),
                 _ => Err(ConversionError::Unsupported(format!(
@@ -4432,7 +4419,7 @@ fn build_induction_store(
     build_induction_store_single(keys, w, domain, paths, ctx)
 }
 
-/// The parts of a carrier's store that its depth does not change: the read keys' extents,
+/// The parts of a `Transact`'s store that its depth does not change: the read keys' extents,
 /// the write keys, the reply-tap fields, and the per-key state tiling.
 ///
 /// A tap is a write-only changelog key appended after the accumulators — a per-position
@@ -4510,16 +4497,16 @@ struct StoreParts {
     store_values: HashMap<String, Tiling>,
 }
 
-/// A nested carrier's curried source, split into the levels it leaves standing and the two
+/// A nested `Transact`'s curried source, split into the levels it leaves standing and the two
 /// it recurs over.
 ///
-/// A carrier reseeds at one enclosing row and sequences positions within it, which is the
+/// A `Transact` reseeds at one enclosing position and sequences positions within it, which is the
 /// two levels just below the `standing` ones the enclosing context already has, counted
-/// from the top. Everything above stands: the carrier is replicated once per row of it, the
+/// from the top. Everything above stands: the `Transact` is replicated once per row of it, the
 /// way [`Zip::new_at`] and [`VariantWrap::new_at`] leave theirs standing.
 ///
-/// A nest three deep is therefore two carriers, the inner one standing over the outer's
-/// rows — not one carrier whose positions carry three components. The levels below the two
+/// A nest three deep is therefore two `Transact`s, the inner one standing over the outer's
+/// rows — not one `Transact` whose positions carry three components. The levels below the two
 /// are the item's own, where the item is itself a collection.
 fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>, Extent, Extent)> {
     let mut levels: Vec<Extent> = Vec::new();
@@ -4528,7 +4515,7 @@ fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>,
         levels.push(domain.clone());
         at = codomain;
     }
-    // Counted from the top: counting the carrier's two from the bottom would read them off
+    // Counted from the top: counting the `Transact`'s two from the bottom would read them off
     // the item where the item is itself a collection.
     let inner = levels.get(standing + 1)?.clone();
     let row = levels.get(standing)?.clone();
@@ -4536,32 +4523,29 @@ fn split_nested_source(tiling: &Tiling, standing: usize) -> Option<(Vec<Extent>,
     Some((levels, row, inner))
 }
 
-/// Each key's seed, a morphism of the `(enclosing, position)` pairs, converted against them.
-///
-/// At the carrier's own level, not one in: the pairs are flattened, so they hold one level
-/// where the body's input, the driver, holds the carrier's rows and positions as two.
+/// Each key's seed, a morphism of the enclosing position, converted against the enclosing
+/// rows: one seed per row, a row whose inner loop runs no position included.
 fn convert_nested_seeds(
     keys: &[TransactKey],
-    pairs_fan: &Rc<FanOut>,
+    enclosing_fan: &Rc<FanOut>,
     ctx: &mut OpConversionContext,
 ) -> Result<Vec<Box<dyn TileOperator>>, ConversionError> {
     keys.iter()
-        .map(|k| convert_impl(&k.init, Some(pairs_fan.branch()), ctx))
+        .map(|k| convert_impl(&k.init, Some(enclosing_fan.branch()), ctx))
         .collect()
 }
 
-/// Compile a **nested** carrier's components against the enclosing body's input.
+/// Compile a **nested** `Transact`'s components against the enclosing body's input.
 ///
 /// Every component is an ordinary vectorized morphism of the enclosing parameter, so
 /// this needs no machinery the top-level path does not have. What it produces, per
-/// enclosing row:
+/// enclosing position:
 ///
 /// - the **source**, `ᴘ ⇒ (Pos ⥤ item)`, as `Fun(OuterPos, Fun(InnerPos, item))` — one
-///   inner collection per enclosing row, which is why an inner domain may depend on the
+///   inner collection per enclosing position, which is why an inner domain may depend on the
 ///   row and a product domain cannot express these loops;
-/// - each accumulator's **seed**, `(ᴘ, Pos) ⇒ V`. It is constant in its own position
-///   (asserted where the carrier is recognized), so evaluating it at every position and
-///   using it only at an enclosing boundary reads the same value the denotation names.
+/// - each accumulator's **seed**, `ᴘ ⇒ V`, one per enclosing position whether or not the row's
+///   inner loop runs a position, so the store opens every row.
 ///
 /// The body is compiled last: it reads the driver's rows, and the driver is built from
 /// the rest.
@@ -4581,22 +4565,22 @@ fn build_nested_induction_store(
     // drive's progress, which is what keeps a `Memo` off an iteration source.
     let enclosing_fan = Rc::new(FanOut::new(Box::new(Memo::new(enclosing_input))));
 
-    // `ᴘ ⇒ (Pos ⥤ item)` against the enclosing rows: one inner collection per row. Both
+    // `ᴘ ⇒ (Pos ⥤ item)` against the enclosing positions: one inner collection per row. Both
     // source shapes planning emits converge here — a `curry_over` for an inner source the
-    // enclosing row does not name, and a bare projection where the row *is* the
+    // enclosing position does not name, and a bare projection where the row *is* the
     // collection — so neither is matched for.
     let source_nested = convert_impl(&w.source, Some(enclosing_fan.branch()), ctx)?;
-    // The two levels this carrier recurs over, and the levels above it that it leaves
-    // standing, so a carrier inside a deeper nest pairs the loop it belongs to rather than
+    // The two levels this `Transact` recurs over, and the levels above it that it leaves
+    // standing, so a `Transact` inside a deeper nest pairs the loop it belongs to rather than
     // the outermost one. The standing levels are the ones the enclosing context already
-    // stands over: the level the carrier is converted at, less the row it iterates, which is
-    // the level this carrier's source adds beneath it.
+    // stands over: the level the `Transact` is converted at, less the row it iterates, which is
+    // the level this `Transact`'s source adds beneath it.
     let above = ctx.level().enclosing().map_or(0, CurryLevel::index);
     let Some((standing, row_domain, inner_domain)) =
         split_nested_source(source_nested.tiling(), above)
     else {
         return Err(ConversionError::Unsupported(format!(
-            "a nested carrier's source is one inner collection per enclosing row, got {}",
+            "a nested `Transact`'s source is one inner collection per enclosing position, got {}",
             source_nested.tiling()
         )));
     };
@@ -4604,7 +4588,7 @@ fn build_nested_induction_store(
     // The seed and the body take `(ᴘ, Pos)`, so each row's parameter is paired with the
     // keys of **its own** collection. A shared inner side ([`Product::shared_at`]) would pair
     // against one stream, which a nested loop does not have.
-    // The carrier's rows stand beneath the levels left standing, and the pairing adds the
+    // The `Transact`'s rows stand beneath the levels left standing, and the pairing adds the
     // level beneath them: where the program puts this loop, not what the operands' tilings
     // happen to hold.
     let paired = CurryLevel::new(standing.len() + 1);
@@ -4620,7 +4604,7 @@ fn build_nested_induction_store(
     // what elimination gave it and what the seed is a morphism of — not `ᴘ` alone.
     let enclosing_extent = pairs.tiling().deepest_values().extent();
     let pairs_fan = Rc::new(FanOut::new(Box::new(Memo::new(pairs))));
-    // The driver takes the source **curried**, one inner collection per enclosing row,
+    // The driver takes the source **curried**, one inner collection per enclosing position,
     // because that is where per-row completeness is stated: the outer level's
     // `domain_predicate` names the rows that will gain no more items, and flattening to
     // pair keys is what loses it. Without it a row is only complete once the next one
@@ -4636,25 +4620,19 @@ fn build_nested_induction_store(
     let mut store_seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     // A seed runs over the pairs, one iteration deeper than the enclosing body, so a binding
     // made there and read by a seed is lifted onto the pairs, flattened as they are.
-    ctx.iterations.push(OpenIteration {
-        source: source_fan.clone(),
-        paired,
-        flattened_at: Some(CurryLevel::new(standing.len())),
-    });
-    let seeds = convert_nested_seeds(keys, &pairs_fan, ctx);
-    ctx.iterations.pop();
+    let seeds = convert_nested_seeds(keys, &enclosing_fan, ctx);
     for (k, seed) in keys.iter().zip(seeds?) {
         let field = k.name.field_key();
         let rk = store_key(&field, Value::Unit);
-        // A nested seed is `(ᴘ, Pos) ⇒ V`, so the accumulator's own type is its codomain.
+        // A nested seed is `ᴘ ⇒ V`, so the accumulator's own type is its codomain.
         let value_ty = k.init.ty.codomain().ok_or_else(|| {
             ConversionError::TypeError(format!(
-                "a nested carrier's seed is a morphism of the enclosing parameter, got {}",
+                "a nested `Transact`'s seed is a morphism of the enclosing parameter, got {}",
                 k.init.ty
             ))
         })?;
         let value_extent = ctx.extent_of(&value_ty)?;
-        // Fanned, because a nested carrier's seed has two readers: the driver snapshots
+        // Fanned, because a nested `Transact`'s seed has two readers: the driver snapshots
         // the body with it at an enclosing boundary, and the store folds a carry to it at
         // a position that writes nothing. One reader would leave the other disagreeing —
         // which is the shape of every "write between the loops" case.
@@ -4664,7 +4642,7 @@ fn build_nested_induction_store(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
-                // An accumulator, so it carries within an enclosing row. It hands nothing
+                // An accumulator, so it carries within an enclosing position. It hands nothing
                 // across versions of its own: the *enclosing* store holds this variable,
                 // and two stores claiming one identity is what `live_state` asserts
                 // against.
@@ -4688,22 +4666,22 @@ fn build_nested_induction_store(
         .and_then(|c| c.codomain())
         .ok_or_else(|| {
             ConversionError::TypeError(format!(
-                "a nested carrier's source is `ᴘ ⇒ (Pos ⥤ item)`, got {}",
+                "a nested `Transact`'s source is `ᴘ ⇒ (Pos ⥤ item)`, got {}",
                 w.source.ty
             ))
         })?;
     let item_extent = ctx.extent_of(&item_ty)?;
-    let parts = carrier_store_parts(w, taps, &mut keys_map, ctx)?;
+    let parts = store_parts(w, taps, &mut keys_map, ctx)?;
 
     let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
-    // One store per enclosing row, each seeded from that row's own seed: a nested
+    // One store per enclosing position, each seeded from that row's own seed: a nested
     // recurrence restarts per row, so a flat log over pair positions would carry the
     // previous row's last write into a position that writes nothing.
     let store = InductionStore::new(
         store_seed_ops,
         parts.write_keys,
         parts.tap_fields,
-        nested_carrier_tiling(
+        nested_engines_tiling(
             nested_source.tiling(),
             standing.len(),
             &pair_domain,
@@ -4714,7 +4692,7 @@ fn build_nested_induction_store(
     let set_body = store.body_input_setter();
     let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
     // The two things a nested drive adds: the enclosing parameter its body takes, and
-    // where each accumulator restarts at an enclosing row boundary. The positions it
+    // where each accumulator restarts at an enclosing position boundary. The positions it
     // sequences are the inner half of the pair domain.
     let (nested, positions) = InductionDriver::nested_parts(
         pairs_fan.branch(),
@@ -4734,7 +4712,7 @@ fn build_nested_induction_store(
         None,
     );
     // The body runs one iteration deeper than everything around it: its input is this
-    // carrier's positions, where a binding made in the enclosing body is keyed by the
+    // `Transact`'s positions, where a binding made in the enclosing body is keyed by the
     // enclosing one. A reference to such a binding is lifted rather than read through,
     // which is what the depth tells the `Var` arm.
     ctx.iterations.push(OpenIteration {
@@ -5035,10 +5013,14 @@ fn convert_store_settled_read(
     })?;
     let (runtime_key, value_extent) = (key.runtime_key.clone(), key.value_extent.clone());
     let fan = info.fan.clone();
-    Ok(Box::new(StoreFinalRead::new(
+    // A nested store is one store per enclosing position, so its settled read is one per row:
+    // the levels standing above the stores are the store tiling's collection levels.
+    let levels_above = fan.tiling().levels();
+    Ok(Box::new(StoreFinalRead::per_row_at(
         fan.branch(),
         runtime_key,
         value_extent,
+        levels_above,
     )))
 }
 
@@ -5081,7 +5063,7 @@ fn convert_store_read(
         // (`carry_forward: false`) is the feed's per-position value stream: only the
         // positions where the tap fired, keyed by loop position — the same `Fun(D, V)` the
         // sink reads.
-        // A nested store's read is one inner history **per enclosing row**, which is how
+        // A nested store's read is one inner history **per enclosing position**, which is how
         // the enclosing body consumes it: `final_or_default` reduces it row by row, and its
         // default is that row's seed. The store *is* a collection of stores, so the read
         // produces that shape rather than regrouping a flat one afterwards — which it
@@ -5506,54 +5488,6 @@ fn zip_pair(expr: &Expr) -> Option<(&Expr, &Expr)> {
     }
 }
 
-/// The per-row reduction `⟨source, default⟩ ▷ zip ≫ final_or_default`, built from its two
-/// legs over the shared input.
-///
-/// The legs take the fanned input on the rule a zip's arms follow: a leaf source is over
-/// its own domain and takes none ([`is_leaf_zip_arm`]), which is what an inner loop's
-/// history is.
-fn map_extract_final(
-    source: &Expr,
-    default: &Expr,
-    input: Option<Box<dyn TileOperator>>,
-    ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let input = expect_input(input, "final_or_default")?;
-    let fan = Rc::new(FanOut::new(Box::new(Memo::new(input))));
-    let source_input = (!is_leaf_zip_arm(source, ctx)).then(|| fan.branch());
-    let source_op = convert_impl(source, source_input, ctx)?;
-    let default_input = (!is_leaf_zip_arm(default, ctx)).then(|| fan.branch());
-    let default_op = convert_impl(default, default_input, ctx)?;
-    // One default per row, and the rows are the iteration this reduction is converted
-    // inside. None is one reduction rather than a family of them, which is
-    // `ExtractFinal`'s shape and reaches the applied arm.
-    let rows = ctx.level().index();
-    if rows == 0 {
-        return Err(ConversionError::Unsupported(format!(
-            "final_or_default composed over a default of {} — a per-row reduction takes one \
-             default per row",
-            default_op.tiling()
-        )));
-    }
-    // Each row's positions sit beneath it, one level below the rows the default keys.
-    if !matches!(
-        source_op.tiling().values_at(CurryLevel::new(rows)),
-        Tiling::DataFunction { .. }
-    ) {
-        return Err(ConversionError::Unsupported(format!(
-            "final_or_default composed over a source of {} and a default of {} — a per-row \
-             reduction's source holds each row's positions beneath the rows its default keys",
-            source_op.tiling(),
-            default_op.tiling()
-        )));
-    }
-    Ok(Box::new(ExtractFinal::per_row_at(
-        source_op,
-        default_op,
-        CurryLevel::new(rows),
-    )))
-}
-
 /// Whether a `zip` arm is a **leaf source** over its own domain — a store read
 /// `__hist.k` or an `as_of((trigger, store))` read — rather than an
 /// iteration-driven morphism. Such an arm is converted with *no* input (it would
@@ -5562,7 +5496,7 @@ fn map_extract_final(
 /// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a reply
 /// combining the request with a store read (`zip((trigger, as_of(store)))`).
 fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
-    // A nested store's read, `__hist ≫ .k` — one inner history per enclosing row, over the
+    // A nested store's read, `__hist ≫ .k` — one inner history per enclosing position, over the
     // store's own rows.
     if as_nested_store_read(expr, ctx).is_some() {
         return true;
@@ -5589,7 +5523,7 @@ struct NestedStoreRead<'a> {
 }
 
 /// `expr` as a read of a **nested** induction store's key: `__hist ≫ .k`, a morphism of the
-/// enclosing row (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence
+/// enclosing position (`src/ccl/design/ir.md`, "`Transact` — the domain-parameterized recurrence
 /// carrier"). Steps on the read history's values are spelled the way `plan_loops` spells
 /// them for a per-row value, `(__hist ≫ .k, steps ▷ const) ▷ zip ≫ compose`.
 fn as_nested_store_read<'a>(
@@ -5629,9 +5563,9 @@ fn nested_store_read_of<'a>(
             };
             Some(read)
         }
-        [carrier, proj] => {
+        [hist, proj] => {
             let (TypedExprNode::Var(store), TypedExprNode::Proj(ProjKey::Field(field))) =
-                (&carrier.node, &proj.node)
+                (&hist.node, &proj.node)
             else {
                 return None;
             };

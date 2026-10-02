@@ -158,6 +158,10 @@ fn converse_group_by_key<K: PartialOrd>(
 }
 
 impl TileProducer for ConverseProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(2 * self.held.len())
+    }
+
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -1465,6 +1469,16 @@ fn every_row_holding(outer: &Tile, elements: &ColumnValue, complete: bool) -> Ti
 }
 
 impl TileProducer for ProductProducer {
+    /// A shared inner side's elements, read once and held for every row.
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(
+            self.shared
+                .as_ref()
+                .and_then(|shared| shared.elements.as_ref())
+                .map_or(0, ColumnValue::len),
+        )
+    }
+
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {

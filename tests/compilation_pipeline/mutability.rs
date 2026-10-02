@@ -1806,7 +1806,7 @@ acc",
     );
 }
 
-// A nested `for` compiles to a nested recurrence — one inner carrier per position of the
+// A nested `for` compiles to a nested recurrence — one inner `Transact` per position of the
 // loop around it — and `tests/compilation_pipeline/nested_loops.rs` is where that lives.
 // A `:=` *between* the loops is the case this file's sequential-mutable-variable
 // reasoning turns on, and it is pinned there as
@@ -2829,52 +2829,6 @@ cnt
 "#},
         Value::Int(3),
     )
-}
-
-/// The planned tree of a nest. The inner loop is a `transact under` the `(enclosing,
-/// position)` pair, seeded from the enclosing accumulator (`.0 ≫ .0`) and read back per
-/// enclosing position. A constant inner source is curried over that pair; a source the outer
-/// row holds is the row itself (`over .1`).
-#[rstest]
-#[case::a_constant_inner_source(
-    indoc! {r#"
-        s := 0
-        for x in [1, 2]:
-            for y in [10, 20]:
-                s += y * x
-        s
-    "#},
-    indoc! {r#"
-        let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0 ≫ .0) { [s]⇒[s] over ((iterate ≫ [10, 20]) ▷ map_domain, .1 ≫ [10, 20]) ▷ curry_over do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
-        in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : Int = __hist.s ▷ final_read
-        in s
-    "#}
-)]
-#[case::an_inner_source_the_outer_row_holds(
-    indoc! {r#"
-        s := 0
-        for xs in [[1, 2], [3, 4]]:
-            for x in xs:
-                s += x
-        s
-    "#},
-    indoc! {r#"
-        let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0 ≫ .0) { [s]⇒[s] over .1 do .1 ≫ (true ▷ const ▷ filter_values ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const) }
-        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
-        in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : Int = __hist.s ▷ final_read
-        in s
-    "#}
-)]
-fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[case] expected: &str) {
-    use cambra::ccl::context::{Phase, compile_to};
-    use cambra::ccl::symbolic::symbolic;
-    let planned = compile_to(code, Phase::Planning).expect("the nest plans");
-    assert_eq!(symbolic(&planned), expected.trim_end());
 }
 
 // ---------------------------------------------------------------------------

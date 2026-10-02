@@ -625,7 +625,8 @@ pub enum Builtin {
     /// at the position its own writers finish, over its sequencing domain 𝐷 (`Txn`, or a
     /// loop's induction domain). [`crate::ccl::transact_phase`] mints it for a surface
     /// [`Self::AwaitFinal`] marker, and [`crate::ccl::mut_elim`] for a loop's trailing read,
-    /// each naming the mutable variable's history binding.
+    /// each naming the mutable variable's history binding. An inner loop's is one read per
+    /// enclosing position.
     ///
     /// Like [`Self::AsOfRead`] it is a *sample* of the carried value rather than a
     /// reduction of a stream, so it takes no seed operand — tick 0 of every store is its

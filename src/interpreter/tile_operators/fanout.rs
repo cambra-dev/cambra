@@ -646,19 +646,37 @@ impl FanOutProducer {
 impl TileProducer for FanOutProducer {
     impl_producer_base!();
 
+    /// A cyclic fan-out's cached snapshot, shared by every branch, so counted at the first.
+    fn state_info(&self) -> ProducerStateInfo {
+        if self.index() != 0 {
+            return ProducerStateInfo::default();
+        }
+        let shared = self.shared();
+        let shared = shared.borrow();
+        ProducerStateInfo::holding(
+            shared
+                .reentrancy
+                .as_ref()
+                .map_or(0, |re| re.cached_tile.cell_count()),
+        )
+    }
+
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         if self.index() == 0 {
-            InspectNode::new(self.name())
-                .with_tiling(self.tiling().to_string())
-                .child(
-                    "input",
-                    self.shared()
-                        .borrow()
-                        .producer
-                        .as_ref()
-                        .unwrap()
-                        .inspect(opts),
-                )
+            let node = InspectNode::new(self.name()).with_tiling(self.tiling().to_string());
+            let node = match self.state_info().values {
+                0 => node,
+                held => node.with_held_values(held),
+            };
+            node.child(
+                "input",
+                self.shared()
+                    .borrow()
+                    .producer
+                    .as_ref()
+                    .unwrap()
+                    .inspect(opts),
+            )
         } else {
             InspectNode::leaf(format!("→ {}", self.name()))
         }
@@ -877,6 +895,10 @@ struct MemoProducer {
 }
 
 impl TileProducer for MemoProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.cached_tile.cell_count())
+    }
+
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {

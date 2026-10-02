@@ -12,7 +12,7 @@
 //! catches a change in how a case fails, which an ignored one cannot.
 //!
 //! Two of the six are the nest's own — a `with begin():` inside one has no commit site
-//! the carrier keys. The other four are not about nesting at all, and each gives the
+//! the nested `Transact` keys. The other four are not about nesting at all, and each gives the
 //! program without a nested loop that fails the same way.
 
 use std::time::Duration;
@@ -120,8 +120,8 @@ fn nesting_is_unbounded(#[case] program: &str, #[case] total: i64) {
 // ---------------------------------------------------------------------------
 
 /// Two accumulators whose histories have **different domains** in one loop nest: `a`
-/// over the outer positions, `b` over the inner ones. They cannot share a carrier, so
-/// this is what says a nest is several carriers rather than one carrier with a wider
+/// over the enclosing positions, `b` over the inner ones. They cannot share a `Transact`, so
+/// this is what says a nest is several `Transact`s rather than one with a wider
 /// key set. `a` counts 3 outer rows, `b` sums 10+20 three times.
 #[test]
 fn accumulators_at_two_depths_keep_their_own_domains() {
@@ -163,7 +163,7 @@ fn jagged_inner_sources_need_a_witness_domained_source() {
 
 /// A mutable variable introduced **between** the loops. Its history is over the inner
 /// positions at each outer one, and it is read once per outer row after the inner loop —
-/// which is the inner carrier's own final read. It needs no rule of its own: the
+/// which is the inner `Transact`'s own final read. It needs no rule of its own: the
 /// introduction seeds the read-your-writes environment and the inner fold replaces that
 /// entry with its final read.
 #[test]
@@ -387,7 +387,7 @@ fn a_collection_valued_field_of_differing_lengths_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Crossed with the other carrier
+// Crossed with the commit store
 // ---------------------------------------------------------------------------
 
 /// A nested loop whose inner body writes a **transactional** mutable variable is
@@ -398,7 +398,7 @@ fn a_collection_valued_field_of_differing_lengths_is_refused() {
 /// `Begin` against that one loop — and the accumulator scan does not enter a `with`
 /// block, so an inner loop around a transaction contributes no accumulator and its own
 /// iteration is simply lost. The program then commits one outer row's writes and
-/// answers 30 where 60 is right. When a nested carrier keys its own commit sites this
+/// answers 30 where 60 is right. When a nested `Transact` keys its own commit sites this
 /// becomes a value test expecting 60.
 #[test]
 fn a_nested_loop_around_a_transaction_is_refused() {
@@ -437,7 +437,7 @@ fn a_flat_loop_around_a_transaction_still_commits() {
 /// second.
 ///
 /// A generator's yield rides the enclosing decision, so the record the fields attach to
-/// sits under the `letrec` the inner carrier binds — which is why `attach_feed_fields`
+/// sits under the `letrec` the inner `Transact` binds — which is why `attach_feed_fields`
 /// descends through a `letrec` as it does through a `let`.
 #[test]
 fn a_nested_loop_inside_a_generator_yields_per_outer_row() {
@@ -456,7 +456,7 @@ fn a_nested_loop_inside_a_generator_yields_per_outer_row() {
 }
 
 // ---------------------------------------------------------------------------
-// Crossed with feeds and the commit carrier
+// Crossed with feeds and the commit store
 // ---------------------------------------------------------------------------
 //
 // A loop body may carry induction accumulators, a commit site and feeds together, so a
@@ -505,7 +505,7 @@ fn a_statement_may_follow_the_inner_loop() {
     );
 }
 
-/// The commit carrier meeting an induction accumulator inside one nest: the block reads
+/// The commit store meeting an induction accumulator inside one nest: the block reads
 /// `cnt`, which advances at the outer level, so the decision needs a cross-domain read
 /// at a position the nest names rather than a single loop's. Refused with the rest of
 /// the transactional nest cases; the value is what it should answer — 100 − (10+20)·1 −
@@ -531,7 +531,7 @@ fn a_commit_site_reading_an_outer_accumulator_is_refused() {
 // Where the inner run starts: seed against carry
 // ---------------------------------------------------------------------------
 //
-// A nested accumulator restarts at each enclosing row from **where the enclosing one had
+// A nested accumulator restarts at each enclosing position from **where the enclosing one had
 // got to**, and carries within the row. In the base cases those two are the same number:
 // the enclosing writer writes back exactly the inner final, so a row's seed equals the
 // previous row's last value and an engine that carried instead of reseeding would answer
@@ -601,10 +601,10 @@ fn a_row_whose_inner_writes_nothing_keeps_its_seed() {
 }
 
 /// An inner source with **no positions at all**, so no row of the nest runs one. Every
-/// enclosing row still answers, at the value the accumulator carried into it.
+/// enclosing position still answers, at the value the accumulator carried into it.
 ///
 /// Distinct from [`a_row_whose_inner_writes_nothing_keeps_its_seed`], where the row runs
-/// positions and writes at none of them: the carrier opens a row there. Here it opens
+/// positions and writes at none of them: the induction store opens a row there. Here it opens
 /// none, so the inner history holds no row at all and the trailing read answers from its
 /// default — which is why that read takes its rows from the default rather than from the
 /// history it reduces.
@@ -641,7 +641,7 @@ fn an_inner_source_with_no_positions_answers_from_the_seed(
 }
 
 /// The same at **depth three**, where the innermost source runs nothing. The rule is the
-/// same at every level, so a carrier that opened no row still says which of its rows will
+/// same at every level, so an induction store that opened no row still says which of its rows will
 /// gain no position — and every walk that rebuilds a level carries that statement,
 /// including the ones whose base case is a level with no rows at all.
 #[rstest]
@@ -679,7 +679,7 @@ fn an_empty_innermost_source_answers_from_the_seed_at_depth_three(
 }
 
 /// Two nests in sequence, the first of which runs no inner position. The second is an
-/// ordinary nest, so what this adds is that a carrier that opened no row leaves the one
+/// ordinary nest, so what this adds is that an induction store that opened no row leaves the one
 /// after it unaffected.
 #[test]
 fn a_nest_that_runs_nothing_is_followed_by_one_that_runs() {
@@ -698,7 +698,7 @@ fn a_nest_that_runs_nothing_is_followed_by_one_that_runs() {
     );
 }
 
-/// A conditional **around** the inner loop, so one enclosing row runs no inner positions
+/// A conditional **around** the inner loop, so one enclosing position runs no inner positions
 /// whatever its guard would have said. 10, then 20 →21→23, then 33 →34→36.
 #[test]
 fn a_skipped_inner_loop_keeps_the_write_between_the_loops() {
@@ -824,7 +824,7 @@ fn a_filtered_outer_source() {
 ///
 /// A `Let` is where sharing is decided — op-conversion compiles one into a fan-out so
 /// several uses draw on one operator — so the binding cannot be inlined into the inner
-/// carrier's components: a collection-valued one would become several tiles over
+/// `Transact`'s components: a collection-valued one would become several tiles over
 /// unrelated domains, and a non-recomputable one would be built twice. It has to stay a
 /// binding, which means the machinery has to know *which* iteration it is aligned to.
 ///
@@ -848,31 +848,12 @@ fn a_per_iteration_binding_read_by_the_inner_loop() {
 
 /// A refinement on the **inner** source that reads the outer binder — a correlated
 /// filter, so the inner domain differs per outer row and is narrower than the collection
-/// it filters. Answers 8 once it compiles: 2+3, then 3, then nothing.
+/// it filters. Answers 8 once it compiles: 2+3, then 3, then nothing. Pinned as it fails;
+/// the cause and its fix are the vault issue `refinements-dependent-projection-of-a-refined-pair`.
 ///
-/// Nesting is not what breaks: a correlated filter with no aggregate over it,
-/// `[[v for v in [1, 2, 3] if v > r] for r in [1, 2]]`, fails the same way with no loop
-/// in the program. `comprehensions.rs` covers each half — `case::correlated_filter`
-/// filters but sums, `a_correlated_inner_comprehension_without_an_aggregate` keeps the
-/// collection but does not filter — and crossing them is what has no coverage. The
-/// aggregate is what hides it: `sum` consumes the inner collection, so its refined
-/// domain never has to survive as a value type.
-///
-/// **The defect** is one rule: a function type whose codomain references a Pi binder it
-/// does not name. Here the writer's parameter is a refined pair whose predicate relates
-/// its components, so projecting the position component drops the predicate — it names
-/// the *other* component — while the cast that establishes the filtered domain states it
-/// against the parameter. Making that projection dependent reproduces the cast's domain
-/// exactly and carries the program to 8, but a dependent type on a value node's slot
-/// flows into every type derived from it, and four sites derive one without the binder:
-/// `ccl_utils::typed_compose`, `lambda_elim::arm_compose`, `simplify`'s exponential-beta
-/// mint (which says so in its own comment) and `planning::loops` reading a curried
-/// history's codomain unopened. Fixing them one at a time does not converge — the groupby
-/// partition shape exercises the same derivations — so the rule has to be applied
-/// consistently rather than patched. A correlated predicate also reads the enclosing
-/// binder in its *term*, which `planning::predicates` rejects by assertion as breaking
-/// the value-function property its structural producer/consumer match rests on; that
-/// invariant has to be restated before the case can land.
+/// The inner history's type depends on the enclosing parameter, which lambda elimination's
+/// `debug_assertions`-gated check refuses. Without that check the tree reaches a type
+/// mismatch further on.
 #[test]
 fn a_correlated_filter_on_the_inner_source() {
     check_compile_error(
@@ -883,7 +864,11 @@ fn a_correlated_filter_on_the_inner_source() {
                     total += y
             total
         "},
-        "Type mismatch for Compose[1]",
+        if cfg!(debug_assertions) {
+            "history type does not depend on the enclosing parameter"
+        } else {
+            "Type mismatch for Compose[1]"
+        },
     );
 }
 
@@ -921,7 +906,7 @@ fn a_tuple_accumulator_across_a_nest() {
 
 /// An empty source at **any** level of a nest of **any** depth. Every statement the empty
 /// case depends on is made per level: the drive's completion at each row level,
-/// `empty_carrier` at each level of its `complete`, and a per-row `ExtractFinal`'s meet at
+/// `empty_engines_tile` at each level of its `complete`, and a per-row `ExtractFinal`'s meet at
 /// each level down to its rows. A fourth level therefore needs no fourth rule.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
@@ -1133,7 +1118,7 @@ fn a_nest_runs_its_positions_in_order(#[case] program: &str, #[case] expected: &
 }
 
 /// An inner loop may write a variable the enclosing body introduced without reading it:
-/// each enclosing row's `y` ends at the inner loop's last write, 20.
+/// each enclosing position's `y` ends at the inner loop's last write, 20.
 #[test]
 fn an_inner_loop_may_write_a_variable_it_never_reads() {
     check_scalar(
@@ -1221,7 +1206,7 @@ fn an_inner_seed_reads_a_binding_of_the_enclosing_body(#[case] program: &str, #[
 }
 
 /// A collection bound in the enclosing body and read inside the inner loop: the binding is
-/// paired with each enclosing row's inner keys at the level the inner loop adds, beneath
+/// paired with each enclosing position's inner keys at the level the inner loop adds, beneath
 /// which it keeps its own. (2 + 1) + (2 + 2) + (4 + 1) + (4 + 2), with `sum(a)` 3 then 6.
 #[test]
 fn a_collection_bound_in_the_enclosing_body_is_read_inside_the_nest() {
@@ -1254,7 +1239,7 @@ fn a_write_between_the_loops_may_read_the_enclosing_binder() {
     );
 }
 
-/// A write between the loops that only some enclosing rows make.
+/// A write between the loops that only some enclosing positions make.
 #[test]
 fn a_conditional_write_between_the_loops_seeds_each_inner_run() {
     check_scalar(
@@ -1289,7 +1274,7 @@ fn a_conditional_write_between_the_loops_may_read_the_enclosing_binder() {
 }
 
 /// A seed zipping two computed legs, the carried value and a binding of the enclosing
-/// body: converted at the carrier's level, since the pairs it reads are flattened.
+/// body: converted at the `Transact`'s level, since the pairs it reads are flattened.
 #[test]
 fn an_inner_seed_combines_the_carried_value_with_an_enclosing_binding() {
     check_scalar(
@@ -1366,4 +1351,92 @@ fn an_inner_seed_combines_the_carried_value_with_an_enclosing_binding() {
 "}, 2063)]
 fn the_shapes_lowering_admits_run(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
+}
+
+/// A long nest's stores hold the same state however many enclosing positions it runs: each
+/// row's store is reclaimed once its readers release it, and each store's history once it is
+/// folded past (`src/interpreter/design-operators.md`, "Reclaiming the changelog"). Over
+/// `for y in [1, 2]` inside 10, 30 and 90 enclosing positions, the stores never hold more than
+/// 10 values at once.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+fn a_long_nest_holds_the_same_store_state_at_any_length() {
+    let held = |n: usize| {
+        let xs: Vec<String> = (1..=n).map(|i| i.to_string()).collect();
+        let code = format!(
+            indoc! {"
+                total := 0
+                for x in [{}]:
+                    for y in [1, 2]:
+                        total += x * y
+                total
+            "},
+            xs.join(", ")
+        );
+        peak_held_values(&code)
+            .get("InductionStore")
+            .copied()
+            .expect("the nest has stores")
+    };
+    let short = held(10);
+    assert!(
+        short <= 10,
+        "the stores held {short} values over 10 positions"
+    );
+    assert_eq!(
+        held(30),
+        short,
+        "30 enclosing positions hold more than 10 do"
+    );
+    assert_eq!(
+        held(90),
+        short,
+        "90 enclosing positions hold more than 10 do"
+    );
+}
+
+/// The planned tree of a nest. The inner loop is a `transact under` the `(enclosing,
+/// position)` pair, seeded per enclosing position and read back per enclosing position with
+/// `final_read`. A constant inner source is curried over that pair; a source the outer row
+/// holds is the row itself (`over .1`).
+#[rstest]
+#[case::a_constant_inner_source(
+    indoc! {r#"
+        s := 0
+        for x in [1, 2]:
+            for y in [10, 20]:
+                s += y * x
+        s
+    "#},
+    indoc! {r#"
+        let s : Int = 0
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over ((iterate ≫ [10, 20]) ▷ map_domain, .1 ≫ [10, 20]) ▷ curry_over do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
+        in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let s : Int = __hist.s ▷ final_read
+        in s
+    "#}
+)]
+#[case::an_inner_source_the_outer_row_holds(
+    indoc! {r#"
+        s := 0
+        for xs in [[1, 2], [3, 4]]:
+            for x in xs:
+                s += x
+        s
+    "#},
+    indoc! {r#"
+        let s : Int = 0
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (true ▷ const ▷ filter_values ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const) }
+        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
+        in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let s : Int = __hist.s ▷ final_read
+        in s
+    "#}
+)]
+fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[case] expected: &str) {
+    use cambra::ccl::context::{Phase, compile_to};
+    use cambra::ccl::symbolic::symbolic;
+    let planned = compile_to(code, Phase::Planning).expect("the nest plans");
+    assert_eq!(symbolic(&planned), expected.trim_end());
 }

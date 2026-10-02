@@ -38,12 +38,55 @@ use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
 };
+use cambra::pretty_graph::VizOptions;
+use cambra::pretty_tree::InspectNode;
 
 use crate::panic_message::panic_message;
 
 // ---------------------------------------------------------------------------
 // Helpers — CCL pipeline path
 // ---------------------------------------------------------------------------
+
+/// The most values each kind of operator held at any lap of running `code` to its end, by
+/// the operator's name less its instance (`InductionStore`, `Memo`, …), summed over the
+/// instances of that kind at each lap ([`TileProducer::state_info`]).
+///
+/// What a test of how much state a program keeps reads: a count that grows with how far
+/// the program has run, where its data does not, is state it never gives back.
+pub(crate) fn peak_held_values(code: &str) -> HashMap<String, usize> {
+    fn held(node: &InspectNode, by_kind: &mut HashMap<String, usize>) {
+        if let Some(values) = node.held_values {
+            let kind = node.label.split('#').next().unwrap_or(&node.label);
+            *by_kind.entry(kind.to_string()).or_default() += values;
+        }
+        for (_, child) in &node.children {
+            held(child, by_kind);
+        }
+    }
+    let mut ctx = GlobalContext::default();
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
+    let producer = compiled
+        .main_mut()
+        .and_then(|o| o.producer.as_mut())
+        .expect("a `main` output");
+    let universal = producer.tiling().universal_guard();
+    let mut peak: HashMap<String, usize> = HashMap::new();
+    for _ in 0..4096 {
+        ctx.scheduler().check_for_notifications();
+        let tile = producer.get(universal.clone());
+        let mut now = HashMap::new();
+        held(&producer.inspect(&VizOptions::default()), &mut now);
+        for (kind, values) in now {
+            let at = peak.entry(kind).or_default();
+            *at = (*at).max(values);
+        }
+        if tile.is_terminal() {
+            return peak;
+        }
+    }
+    panic!("{code}: stopped short of a terminal tile");
+}
 
 /// Lower `code` through the CCL pipeline (parse → `ccl::lower` → `ccl::infer`
 /// → `compile_ccl` → subscribe → get) and return the resulting [`Tile`].

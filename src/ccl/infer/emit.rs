@@ -2577,9 +2577,9 @@ pub(super) fn emit_transact<C: Typing>(
         // rather than claiming `False`.
         // A nested `Transact`'s seed is where the inner loop starts at each enclosing
         // position — the enclosing accumulator — so it is a morphism of the enclosing
-        // context rather than a closed value.
+        // position rather than a closed value, and not of the position the loop runs over.
         let seeded = match parameter {
-            Some(p) => fun(p.clone(), value_ty.clone()),
+            Some(p) => fun(enclosing_component(p), value_ty.clone()),
             None => value_ty.clone(),
         };
         ctx.require_sub(&init_ty, &seeded, &|| "transact init".to_string())?;
@@ -2600,13 +2600,16 @@ pub(super) fn emit_transact<C: Typing>(
     // enclosing half of its `(enclosing, position)` parameter.
     Ok(match parameter {
         None => Type::Record(fields),
-        Some(p) => {
-            let Type::Tuple(parts) = p.peel_refinements() else {
-                panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {p}")
-            };
-            fun(parts[0].clone(), Type::Record(fields))
-        }
+        Some(p) => fun(enclosing_component(p), Type::Record(fields)),
     })
+}
+
+/// The enclosing half of a nested `Transact`'s `(enclosing, position)` parameter.
+fn enclosing_component(parameter: &Type) -> Type {
+    let Type::Tuple(parts) = parameter.peel_refinements() else {
+        panic!("a nested `Transact`'s parameter is the (enclosing, position) pair: {parameter}")
+    };
+    parts[0].clone()
 }
 
 #[cfg(test)]
