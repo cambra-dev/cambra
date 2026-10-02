@@ -11,9 +11,9 @@ use crate::interpreter::{FunctionGuard, TileGuard, Tiling};
 /// level an operator that replaces a codomain acts at. An operator acts at one level and
 /// leaves the rest standing.
 ///
-/// **A level index, not a count of the levels above.** The two are the same number. A site
-/// that re-derives `levels() − k` for its own `k` reads a level its operator was not built
-/// with, so the level is stated once, at construction, and read back from there. See
+/// **The level is stated once, at construction, and read back from there.** The index is
+/// also the number of levels above, so a site could re-derive it as `levels() − k` for its own
+/// `k`; one that does reads a level its operator was not built with. See
 /// `src/interpreter/design-operators.md`, "Curry levels".
 ///
 /// [`Tile::DataFunction`]: crate::interpreter::Tile::DataFunction

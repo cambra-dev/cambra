@@ -57,7 +57,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 #[case("[y.0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::Record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::record(HashMap::from([
             (
                 tuple_field(0),
                 Tile::Scalar(ColumnValue::Records(HashMap::from([
@@ -369,6 +369,22 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
         await_final(n)
     "#},
     28
+)]
+// A map that differs per transaction: each writes `m[r] := 10 * r`, so the first sums
+// `{0: 1, 1: 10}` as `(1 + 1) + (10 + 1)` = 13 and the second `{0: 1, 1: 10, 2: 20}` as
+// `(1 + 2) + (10 + 2) + (20 + 2)` = 37. Pairing every row with one row's collection gives
+// another total.
+#[case::a_map_each_transaction_changes(
+    indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(0, 1)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                m[r] := 10 * r
+                n := n + sum([v + r for v in m])
+        await_final(n)
+    "#},
+    50
 )]
 // `{x: 1, y: 2}` summed as `(1 + r) + (2 + r)` for `r` in 1, 2, 3.
 #[case::record_field(
@@ -818,9 +834,9 @@ fn a_correlated_filter_inside_a_transaction() {
 }
 
 /// A correlated inner comprehension over a **map** whose body never reads the element is
-/// refused by name. Its body never applies the source, so planning has none to name, and
-/// the inner domain is read off the type, where a map's keys are a present-key proof over
-/// the whole key type rather than anything enumerable.
+/// refused by name. Its body never applies the source, so planning has none to name, and the
+/// type gives the inner domain as a membership refinement over the whole key type, which
+/// nothing enumerates.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
@@ -829,7 +845,8 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
             c = map([("a", 1), ("b", 2)])
             sum([sum([r for v in c]) for r in [1, 2]])
         "#},
-        "source is a collection planning did not name",
+        "a correlated inner comprehension over a collection its body never applies is not \
+         supported yet",
     );
 }
 

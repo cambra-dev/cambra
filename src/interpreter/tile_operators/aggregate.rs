@@ -358,7 +358,7 @@ impl TileProducer for MapExtractAggregateProducer {
         // non-terminal keys of that level go. Keeping the levels is what leaves a deeper
         // fold's grouping intact for the fold above it.
         let slot = output.deepest_values_mut();
-        let folded = std::mem::replace(slot, Tile::Record(HashMap::new()));
+        let folded = std::mem::replace(slot, Tile::record(HashMap::new()));
         let Tile::Aggregation {
             accumulator,
             terminal,
@@ -440,7 +440,7 @@ fn build_levels_from_paths(
     let mut starts: Vec<Vec<usize>> = vec![Vec::new(); depth.saturating_sub(1)];
     let mut last: Vec<Option<Vec<Value>>> = vec![None; depth];
     for path in paths {
-        // A path may stop short of the innermost level: a key standing with nothing beneath.
+        // A path may stop short of the innermost level: a key with nothing beneath.
         for level in 0..path.len() {
             let prefix = &path[..=level];
             if last[level].as_deref() == Some(prefix) {
@@ -590,7 +590,7 @@ impl TileOperator for MapAggregate {
             input: input_producer,
             kind: self.kind,
             accumulators: HashMap::new(),
-            standing: HashSet::new(),
+            emptied_keys: HashSet::new(),
         })
     }
 }
@@ -606,9 +606,9 @@ struct MapAggregateProducer {
     accumulators: HashMap<Vec<Value>, Tile>,
     /// Keys above the accumulators whose every accumulator was released without the key
     /// itself: a key is there only through what it maps to, and a release naming part of
-    /// what lies beneath leaves it standing, holding nothing unreleased
+    /// what lies beneath leaves it in place, holding nothing unreleased
     /// (`src/interpreter/design-operators.md`, "The completeness contract").
-    standing: HashSet<Vec<Value>>,
+    emptied_keys: HashSet<Vec<Value>>,
 }
 
 impl TileProducer for MapAggregateProducer {
@@ -618,7 +618,7 @@ impl TileProducer for MapAggregateProducer {
             .iter()
             .map(|(path, acc)| path.len() + acc.cell_count())
             .sum();
-        ProducerStateInfo::holding(accumulators + self.standing.len())
+        ProducerStateInfo::holding(accumulators + self.emptied_keys.len())
     }
 
     impl_producer_base!();
@@ -729,7 +729,7 @@ impl TileProducer for MapAggregateProducer {
         };
         let mut paths: Vec<&[Value]> = entries.iter().map(|(path, _)| path.as_slice()).collect();
         paths.extend(
-            self.standing
+            self.emptied_keys
                 .iter()
                 .filter(|key| !entries.iter().any(|(path, _)| path.starts_with(key)))
                 .map(Vec::as_slice),
@@ -760,7 +760,7 @@ impl TileProducer for MapAggregateProducer {
             g if g.is_empty() => {}
             g if g.is_universal() => {
                 self.accumulators.clear();
-                self.standing.clear();
+                self.emptied_keys.clear();
                 self.input.release(self.input.tiling().universal_guard());
             }
             // The guard is a region over the accumulators' own paths, whatever shape it
@@ -782,11 +782,11 @@ impl TileProducer for MapAggregateProducer {
                     for len in 1..path.len() {
                         let key = &path[..len];
                         if !g.covers_path(key) {
-                            self.standing.insert(key.to_vec());
+                            self.emptied_keys.insert(key.to_vec());
                         }
                     }
                 }
-                self.standing.retain(|key| !g.covers_path(key));
+                self.emptied_keys.retain(|key| !g.covers_path(key));
                 let levels = self.tiling().levels();
                 let input = self.input.tiling();
                 self.input
@@ -914,7 +914,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            standing: HashSet::new(),
+            emptied_keys: HashSet::new(),
         };
 
         let first = producer.get(out_tiling.universal_guard());
@@ -998,7 +998,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            standing: HashSet::new(),
+            emptied_keys: HashSet::new(),
         };
         producer.get(out_tiling.universal_guard());
         assert!(
@@ -1055,7 +1055,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            standing: HashSet::new(),
+            emptied_keys: HashSet::new(),
         };
         producer.get(out_tiling.universal_guard());
         let second = producer.get(out_tiling.universal_guard());
@@ -1115,7 +1115,7 @@ mod tests {
             input: Box::new(spy),
             kind: AggregateKind::Sum,
             accumulators: HashMap::new(),
-            standing: HashSet::new(),
+            emptied_keys: HashSet::new(),
         };
         let out = producer.get(out_tiling.universal_guard());
         let Tile::Aggregation { terminal, .. } = out.values_at(CurryLevel::new(2)) else {

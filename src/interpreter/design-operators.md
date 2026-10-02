@@ -150,7 +150,7 @@ A `Record` between two levels is a level reference too, not a leaf. Its fields s
 keys the record does, so a collection in one of them is a level under those keys, and a
 `Codomain` naming a record carries a `Record` guard whose fields are read the same way. A key
 is released once every field under it is complete, so a scalar field beside a still-growing
-collection holds the key.
+collection holds the key, though its cell is released on its own (next paragraph).
 
 A keyless field beneath a level is named by the rows above it: `Scalar(Qualified { enclosing:
 𝑅, here: True })` is that field's cell under the rows 𝑅. This is the only way a guard names
@@ -400,12 +400,14 @@ Every operator must obey it in both directions, because a violation yields **wro
 
 An operator must therefore **reject a guard it cannot honor rather than ignore it**. The guard accumulates in `obsolete_guard` whether or not `release_impl` acts on it, so dropping one silently leaves the operator free to re-emit that region — from its own state, or by re-reading an input it never passed the release to. Every `release_impl` is exhaustive; an operator with no sub-region to reclaim piecewise checks the guard with `TileGuard::expect_universal_or_empty`. Rejecting fires where the guard arrives, which does not depend on anything pulling afterwards — the `get` post-condition only fires if something does.
 
-A keyless field's cell beneath a level goes with its key. A record tile's fields stand over
-the same rows, so a tile cannot hold a row without its cell. A release naming the cell under an
-open key is recorded, and the producer returns the cell until the key is released
-(`Tile::remove_guarded`), so a consumer still holding the row receives the cell again, a value
-it already has. A consumer that can take that repeat may release the key later. `Memo` cannot:
-see [A `Memo` releases everything it takes](#a-memo-releases-everything-it-takes).
+A keyless field's cell beneath a level is released at its row. A scalar cell is whole once it
+is there, so `to_guard` names it at the row holding it, even while a sibling field, a collection
+still growing, keeps the row open. The row then holds no cell of that field, which a record tile
+states per field (`Tile::Record`'s `absent`), as an empty top-level scalar does for the one row
+it has. A producer rebuilds a row from inputs released by whole key, so it would hold the cell
+again; `TileProducer::get` leaves a released cell out of what every producer returns. An operator
+whose input lacks a row because it gave that row's cell back keeps the row with the field absent
+(`Zip`).
 
 ### Guard operations are exact
 
@@ -437,10 +439,10 @@ open groups, which grow by key, and join-shaped values, an aggregation's accumul
 which combine. A scalar cell left there is one the input will deliver again, and debug builds
 report it where `Memo` takes it (`Tile::holds_a_plain_value`).
 
-`to_guard` meets this by naming, by its whole path, every key whose level calls it complete, so a
-scalar cell beside a collection goes with its key once that key is complete. A cell under a key
-that is still open cannot be named without its key (the keyless-field rule above), so a `Memo`
-over such a row is a gap the check reports.
+`to_guard` meets this by naming, by its whole path, every key whose level calls it complete, and
+every scalar cell at the row holding it, whether or not its key is complete (the keyless-field
+rule above). A scalar beside a growing collection is released as it arrives, and the input
+leaves it out of what it delivers afterwards.
 
 ### What a producer holds
 
@@ -468,7 +470,7 @@ released or not. A consumer that needs a statement after releasing the region it
 the statement itself.
 
 `TileProducer::get` checks this in debug builds against the producer's previous output
-(`assert_complete_region_unchanged`):
+(`completeness_violation`):
 
 1. every region the last output called complete, less what was released, the new one still
    calls complete;
@@ -578,7 +580,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
-| `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces each value of a function input at the level op-conversion states with the same constant (or zips it in, per its mode), preserving the levels above it. A value at that level may itself be a collection, which the constant replaces or pairs with whole. A collection constant is one row, and each element gets a copy of its group (`repeat_tile`). The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
+| `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces each value of a function input at the level op-conversion states with the same constant (or zips it in, per its mode), preserving the levels above it. A value at that level may itself be a collection, which the constant replaces or pairs with whole. A scalar constant must be present (terminal) before it can be broadcast: a still-absent one (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. A collection constant streams: each row holds what has arrived of it and is left open until it is complete, and the constant is released once everything is. |
 | `ToScalar` | `DataFunction(Unit → Scalar)` | `Scalar` | Unwraps a `DataFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
 | `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product whole, and releases what its consumer released of the field it selects and every other field whole (`guard_at_field`). |
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
@@ -745,10 +747,9 @@ while their arms carry one level and two.
 | a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
 | `map(𝑓)` | 𝑓 one level in |
 | an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
-| `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
-| `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose` | 𝑆 at the level it is converted at, over the rows; 𝑔 one level in, over the iteration `Product` appends |
-| a top-level carrier | its body at level 1, over the store's own domain |
-| a nested carrier | its source and its seed (over the flattened pairs) at the carrier's level, its body one level in |
+| `curry_over(𝐾, 𝑔)` | 𝑔 one level in, over the iteration `strength` appends; 𝐾 is a root |
+| a top-level `Transact` | its body at level 1, over the store's own domain |
+| a nested `Transact` | its source and its seeds at the `Transact`'s level, a seed being one value per enclosing position; its body one level in |
 | every other node, composition included | the level it is converted at |
 
 The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
@@ -891,22 +892,25 @@ stream, where `𝑔` takes the pair of the outer value and the inner element. Th
 carries the correlation: an uncorrelated body never forms one, leaving a `const` that is
 computed once and broadcast.
 
-Compiling it is the pairing. [`Product`] gives each outer row a group holding the whole inner
-domain, one level deeper than the outer collection — a collection per row — and `𝑔` then compiles over
-that like any other morphism over a stream, its result inheriting the grouping.
-The inner source does not mention the outer binder, so every row iterates the same domain and
-the pairing is a cartesian product (`Product::shared_at`). While the inner side is still
-arriving, each row is paired with the elements it holds so far and left open: no row is complete
-until the inner side is, since every row can gain its next element. Every row reads the whole
-inner side, so it is released only when everything is. A source that differs per row is the same
-output shape from a different builder
-([Where a collection is materialized](#where-a-collection-is-materialized)), where the per-row
-collection arrives as a value rather than being selected by the binder.
-`Product::per_row_values_at` pairs each row with its own collection's values, where
-`Product::per_row_at` pairs it with the keys, and keeps the keys as the paired level. It compiles
-`⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose`, the shape a generator over a sum takes when its element
-function reads the enclosing scope (`src/ccl/design/optimization.md`, "A generator over a sum
-composes with its source").
+Compiling it is the pairing. The inner source does not mention the outer binder, so every row
+iterates the same collection 𝐾, and planning writes the site as
+`⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)` (`src/ccl/planning/correlated.rs`). `const` puts 𝐾
+beside each row (`MapResultToConst`), and `strength` gives each row a group holding 𝐾's values,
+one level deeper than the outer collection. `𝑔` then compiles over the pairs like any other
+morphism over a stream, its result inheriting the grouping. While 𝐾 is still arriving, each row
+holds what has arrived and is left open: no row is complete until 𝐾 is, since every row can gain
+its next element. Every row reads the whole of 𝐾, so `MapResultToConst` releases it only when
+everything is.
+
+`strength` compiles to `Product::per_row_values_at`, which pairs each row with the values of its
+own collection and keeps that collection's keys as the paired level; `Product::per_row_at` pairs a
+row with the keys instead. The operands are the two fields of the pair `strength` takes, the row
+and its collection, and a collection whose values are collections pairs with whole. `simplify`
+emits the same `strength` for a generator over a sum whose element function reads the enclosing
+scope, where each row's collection is its own (`src/ccl/design/optimization.md`, "A generator over
+a sum composes with its source"). A per-row collection that arrives as a value rather than being
+selected by the binder has the same output shape
+([Where a collection is materialized](#where-a-collection-is-materialized)).
 
 Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
 comprehension is aggregated, and a comprehension that yields a collection per row leaves the
@@ -919,10 +923,12 @@ received. So a comprehension nested 𝑛 deep pairs 𝑛−1 times on the way in
 folds 𝑛 times on the way out, and no operator sees a shape it did not already handle at
 depth two.
 
-**Where the inner domain comes from is what the term has to say**, and planning decides which
-of two shapes op-conversion sees (`src/ccl/planning/correlated.rs`). A site whose source
-planning named is [`Builtin::CurryOver`], whose first operand compiles as its own iteration; a
-site it left alone keeps its `curry`, and op-conversion reads the domain off the type.
+**Where the inner domain comes from is what the term has to say**, and planning names it
+(`src/ccl/planning/correlated.rs`): 𝐾 is the inner source re-viewed at its keys,
+`map_domain(𝑠)`, where the body applies one, and `iterate` over the type's domain where it does
+not. A site whose type is dependent, a correlated filter narrowing the inner domain by the outer
+value, stays one node, [`Builtin::CurryOver`], which op-conversion compiles to the same
+operators.
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
@@ -936,8 +942,8 @@ arrive beneath the same row once decided. A one-level stream is the same rule at
 A **filter** on the inner source rides the pair it filters, as a refinement `lambda_elim`
 writes on the product. Planning emits it as `filter_values` — a term, which is what applies
 it, since this site is a morphism under `curry` rather than one the iterate-then-restrict
-chain reaches. A keyed collection's carried present-key proof is a different kind of
-refinement and stays on the binder whose lookup reads it.
+chain reaches. A keyed collection's membership refinement is a different kind of refinement
+and stays on the binder whose lookup reads it.
 
 [`Filter`] reads the resulting mask **positionally**: the predicate compiled over the same
 pairs, so its flat codomain is one boolean per entry in entry order, which is the mask
@@ -1232,7 +1238,9 @@ reader's lag, independent of how many positions have run and of how many rows.
 because the rules below make which versions a later fold can reach the store's question, and the
 store is the side that holds the answer. A release naming a row of a read names the same row of
 the induction store, since the two tilings agree on every level above the store, so one forward
-serves either depth.
+serves either depth. `StoreFinalRead` under rows holds one value where the induction store holds a
+store, so it passes on a row's release only once that row's value is released whole
+(`through_shared_levels`).
 
 **A reclaim keeps the carry source a live position reads.** For each key the entry kept from the
 released prefix is its latest write at or below the boundary, and it is kept only where some
@@ -1267,18 +1275,19 @@ The driver's own release runs outward, to the iteration source. It reclaims the 
 `emitted_through` advances and releases the source in full once the source is complete and every
 delivered position has been emitted, which ends the driver.
 
-**A nested induction store's pair-keyed inputs release as the drive passes them.** The enclosing
-parameter (`pairs`) and each accumulator's reseed are streams keyed by the body's
-`(enclosing, position)` pairs. The driver reads them only at positions past its cursor, so it
-releases each through `emitted_through`; the store reads a row's seed only to open that row, so it
-releases its seed streams through the path it has decided. Both name the region as a prefix of the
-pair-keyed domain, `domain_prefix` over the path with its last two components composed back into
-the pair, which `Predicate::at_or_below` spells as a staircase over the pair's fields. The seed and
-reseed streams are one stream behind a `FanOut`, so either consumer holding its branch would pin
-the pair stream, and the operators pairing it (`Uncurry`, `Product`) would re-deliver the
-whole run on every pull. `Uncurry` forwards a release of pairs as the inner keys they name under
-their outer keys, under whatever standing rows qualify it, so the row being run is reclaimed as it
-goes rather than when it finishes.
+**A nested induction store's inputs release as the drive passes them.** The enclosing parameter
+(`pairs`) is keyed by the body's `(enclosing, position)` pairs, and the driver reads it only at
+positions past its cursor, so it releases it through `emitted_through`. The region is
+`domain_prefix` over the path with its last two components composed back into the pair, which
+`Predicate::at_or_below` spells as a staircase over the pair's fields. Each accumulator's seed is
+keyed by the enclosing positions and read once per row: the driver reads it as the reseed at a
+row's first position, and the store reads it to open the row. The driver therefore releases the
+rows through its cursor's, and the store the rows through the path it has decided
+(`release_seeds_through`). Seed and reseed are one stream behind a `FanOut`, so either consumer
+holding its branch pins it. The pairs are built from the enclosing input by `Product` and
+`Uncurry`, which re-deliver the whole run on every pull unless it is released. `Uncurry` forwards a
+release of pairs as the inner keys they name under their outer keys, under whatever standing rows
+qualify it, so the row being run is reclaimed as it goes rather than when it finishes.
 
 ## Open Challenges
 

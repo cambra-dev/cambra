@@ -233,7 +233,11 @@ fn test_inner_join(#[case] code: &str) {
         let ColumnValue::Records(mut domain_fields) = domain else {
             panic!("expected Records domain, got {domain:?}");
         };
-        let Tile::Record(mut codomain_fields) = *codomain else {
+        let Tile::Record {
+            fields: mut codomain_fields,
+            ..
+        } = *codomain
+        else {
             panic!("expected Record codomain, got {codomain:?}");
         };
         let ColumnValue::UInts(d0) = domain_fields.remove("_0").expect("domain._0") else {
@@ -1374,7 +1378,7 @@ fn a_collection_per_row_over_a_streamed_source() {
         let Tile::DataFunction { codomain, .. } = sort_function_by_domain(tile) else {
             panic!("a collection of rows")
         };
-        let Tile::Record(fields) = *codomain else {
+        let Tile::Record { fields, .. } = *codomain else {
             panic!("each row is a pair")
         };
         innermost_ints(&fields[&tuple_field(1)])

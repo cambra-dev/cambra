@@ -349,21 +349,33 @@ pub enum Builtin {
     EmptyMap,
     /// `curry : ((A, B) → C) → (A → (B → C))`.
     Curry,
-    /// `curry_over : ((𝐷 ⤇ 𝐾), ((𝐴, 𝐾) ⇒ 𝑉)) ⇒ (𝐴 ⇒ (𝐾 ⤇ 𝑉))` — [`Curry`](Self::Curry)
-    /// with the domain of the collection it produces **named by a source**.
+    /// `curry_over : (𝐾 : 𝐷 ⤇ 𝐷, (𝐴, 𝐷) ⇒ 𝑉) ⇒ (𝐴 ⇒ (𝐷 ⤇ 𝑉))` — [`Curry`](Self::Curry)
+    /// with the collection 𝐾 its result ranges over **named**, for a site whose type is
+    /// dependent.
     ///
-    /// A curried morphism's collection is over the second half of its pair domain, and a
-    /// `curry` alone leaves that domain to the type. A type gives it only sometimes: a list
-    /// literal's is an index range, while a map's is
-    /// `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)}`, whose extent is all of `𝐾` (`extent_of`
-    /// strips refinements) and whose refinement is carried and never executed
-    /// (`src/ccl/ops.rs`, `Builtin::CollectionContains`). The domain is then in the data,
-    /// and this is the term that says which data.
+    /// Planning rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`
+    /// (`src/ccl/planning/correlated.rs`). A correlated filter narrows the inner domain by the
+    /// outer value, `(𝑟 : 𝐴) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑉)`, and that chain cannot carry the
+    /// dependency: the narrowed domain names the chain's input, which no element after the
+    /// first takes. Such a site stays this one node under `curry`'s own type, and
+    /// op-conversion builds the operators the chain compiles to.
     ///
-    /// **Born in planning**, by the recognizer in `src/ccl/planning/correlated.rs`, and so
-    /// carries no scheme: it stamps its own type, as planning's [`MapDomain`](Self::MapDomain)
-    /// mint does.
+    /// **Born in planning**, and so carries no scheme: it stamps its own type, as planning's
+    /// [`MapDomain`](Self::MapDomain) mint does.
     CurryOver,
+    /// `strength : (𝑋, Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝑋, 𝑉)` — pair a value with each
+    /// value of a collection, keeping the collection's keys: the tensorial strength of the
+    /// collection functor. The witness is the same on both sides, so the sum states the type
+    /// with no further type former.
+    ///
+    /// **Born in simplify and in planning**, and so carries no scheme. Simplify rewrites a
+    /// collection composed with a curried function of the enclosing value
+    /// (`⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose ⟹ ⟨id, 𝑆⟩ ▷ zip ≫ strength ≫ map(𝑔)`), and planning
+    /// rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`
+    /// (`src/ccl/planning/correlated.rs`). Each stamps its own type, which the post-inference
+    /// check holds to the rule above (`check_strength` in `src/ccl/infer/check.rs`). Compiles to
+    /// `Product::per_row_values_at`.
+    Strength,
     /// `const : A → (B → A)` — lift a value to a constant function.
     Const,
     /// `zip : ((A → B), (A → C)) → (A → (B, C))` — point-free product/fanout.
@@ -819,6 +831,7 @@ impl Builtin {
             Self::EmptyMap => "empty_map",
             Self::Curry => "curry",
             Self::CurryOver => "curry_over",
+            Self::Strength => "strength",
             Self::Const => "const",
             Self::Zip => "zip",
             Self::Apply => "apply",

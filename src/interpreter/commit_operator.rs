@@ -581,10 +581,10 @@ fn render_engines_level(
     let Engines::Rows(rows) = engines else {
         panic!("an induction store with rows above it holds one engine per row, got a bare store")
     };
-    // A **standing** level: each of its rows holds an induction store of its own, rendered by the
-    // same walk, and answering for its own rows out of the same per-level statement.
-    // A level called complete is complete at every depth beneath it, which is why the
-    // induction store level below can state its own for the running row alone.
+    // A **standing** level: each of its rows holds the engines of the levels beneath it,
+    // rendered by the same walk and answering for its own rows out of the same per-level
+    // statement. A level called complete is complete at every depth beneath it, which is why
+    // the level below can state its own for the running row alone.
     if store_tiling.is_data_function() {
         let mut starts = Vec::with_capacity(rows.len());
         let mut merged: Option<Tile> = None;
@@ -711,7 +711,7 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
             let Tiling::DataFunction { codomain, .. } = log else {
                 unreachable!("a store key's changelog tiling is a collection")
             };
-            let runtime = store_key(&key, Value::Unit);
+            let runtime = store_key(&key);
             let mut starts = Vec::with_capacity(engines.len());
             let mut positions: Vec<Value> = Vec::new();
             let mut written: Vec<Value> = Vec::new();
@@ -762,8 +762,8 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
         .map(|(_, engine)| engine.decided_positions.clone())
         .collect();
     Tile::Store {
-        state: Box::new(Tile::Record(state)),
-        seed: Box::new(Tile::Record(seed_fields)),
+        state: Box::new(Tile::record(state)),
+        seed: Box::new(Tile::record(seed_fields)),
         decided: Box::new(decided_positions_tile(&decided, &domain, decided_through)),
         frontier: Box::new(store_frontier_rows(
             engines
@@ -880,10 +880,12 @@ impl Engines {
         let Engines::Rows(rows) = self else {
             panic!("a path naming row {row} descends a level, got a store")
         };
-        let at = match rows.iter().position(|(r, _)| r == row) {
+        // The drive reaches rows in ascending order and a released row leaves, so the row
+        // asked for is almost always the last.
+        let at = match rows.iter().rposition(|(r, _)| r == row) {
             Some(at) => at,
             None => {
-                debug_assert!(
+                assert!(
                     rows.last().is_none_or(|(last, _)| {
                         Position::new(row.clone()) > Position::new(last.clone())
                     }),
@@ -1008,7 +1010,7 @@ fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
         // A decided collection is a value at every row it has, the empty map included, so
         // there is no emptiness to test past the domain being closed.
         Tile::DataFunction { .. } => Ok(materialized_row(tile.clone())),
-        Tile::Scalar(_) | Tile::Record(_) => {
+        Tile::Scalar(_) | Tile::Record { .. } => {
             let column = materialize_collections(tile.clone());
             if column.is_empty() {
                 Err(SeedNotReady::Empty)
@@ -1032,7 +1034,8 @@ fn is_whole_value(tile: &Tile) -> bool {
             domain_predicate, ..
         } => matches!(domain_predicate, Predicate::True),
         Tile::Scalar(_) => true,
-        Tile::Record(fields) => fields.values().all(is_whole_value),
+        // A row holding no cell of a field gave that cell back, so the value is not whole.
+        Tile::Record { fields, absent } => absent.is_empty() && fields.values().all(is_whole_value),
         _ => false,
     }
 }
@@ -1218,7 +1221,7 @@ pub fn fold_changelog_key_ascending(
 pub fn store_snapshot_at(tile: &Tile, t: &Position) -> HashMap<Value, Value> {
     tile.store_keys()
         .filter_map(|name| {
-            let key = store_key(name, Value::Unit);
+            let key = store_key(name);
             Some((key.clone(), store_value_at(tile, t, &key)?))
         })
         .collect()
@@ -1890,7 +1893,8 @@ struct CommitProducer {
     /// aligned with [`Self::writer_terminal`]. The two together give per-key
     /// closure: a key is closed once every writer listing it is terminal.
     writer_write_keys: Vec<Vec<Value>>,
-    /// The concrete part of the tick-0 state, which `seed_producers` completes.
+    /// The concrete part of the tick-0 state, which `seed_producers` completes. Emptied once
+    /// the store opens, since the engine holds the seed from then on.
     seed: HashMap<Value, Value>,
     /// Per scalar key, the stream giving its value before any commit.
     seed_producers: Vec<(Value, Box<dyn TileProducer>)>,
@@ -2004,8 +2008,20 @@ impl TileProducer for CommitProducer {
         // waits on that reader's own released prefix.
         // Through the end of the prefix the meet covers, not its highest point: a tick the
         // meet skips is still read, and so is everything after it.
-        if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard
-            && let Some(engine) = &mut self.engine
+        //
+        // A store's readers name its commit ticks, so a region of the store is a `Domain`
+        // guard. Any other shape names nothing this store can reclaim, and ignoring it would
+        // leave the store re-emitting what was released.
+        let pred = match &obsolete_guard {
+            TileGuard::Function(FunctionGuard::Domain(pred)) => pred,
+            g if g.is_empty() => return,
+            g if g.is_universal() => &Predicate::True,
+            other => panic!(
+                "a commit store is released by a region of its commit ticks, a `Domain` guard; \
+                 got {other:?}"
+            ),
+        };
+        if let Some(engine) = &mut self.engine
             && let Some(through) = engine
                 .decided_positions
                 .iter()
@@ -2037,6 +2053,8 @@ impl CommitProducer {
             }
             if resolved == self.seed_producers.len() {
                 self.engine = Some(CommitEngine::new(seed));
+                // The engine holds the seed from here, so the concrete part is not kept twice.
+                self.seed.clear();
                 // The seed is read once, at the store's opening, so it is released there.
                 for (_, producer) in &mut self.seed_producers {
                     producer.release(producer.tiling().universal_guard());
@@ -2085,12 +2103,13 @@ impl CommitProducer {
             // `emit_transact_writer` types the writer's output to match, so a
             // non-`Record` value on a collection proposal tile is
             // impossible.
-            let Tile::Record(fields) = *codomain else {
+            let Tile::Record { fields, absent } = *codomain else {
                 unreachable!(
                     "the proposal stream's codomain is a {{snap, reads, writes}} record \
                      (proposal_stream_tiling / emit_transact_writer); got a non-Record codomain"
                 );
             };
+            crate::interpreter::tile_operators::assert_no_absent_cells(&absent);
             let snaps = record_field(&fields, F_SNAP);
             let reads = record_field(&fields, F_READS);
             let writes = record_field(&fields, F_WRITES);
@@ -2582,9 +2601,9 @@ struct InductionStoreProducer {
 impl InductionStoreProducer {
     /// The store at `row`, opened at `seed` if this is the pull that reaches it.
     ///
-    /// Every store opens here, whatever its depth: `resumed_after` is a position of the
-    /// induction store's own store and a nested store does not resume, so it is `None` wherever
-    /// `row` names one.
+    /// Every store opens here, whatever its depth: `resumed_after` is a position of the one
+    /// store at the empty path, and a store under a row does not resume, so it is `None`
+    /// wherever `row` names one.
     fn open_at(&mut self, row: &Path, seed: &HashMap<Value, Value>) -> &mut CommitEngine {
         debug_assert!(
             row.is_empty() || self.resumed_after.is_none(),
@@ -2759,8 +2778,8 @@ impl TileProducer for InductionStoreProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         // Read the seeds before the body. A store opens the moment both its row and its
-        // seed are known, and for the induction store's own store — the empty path — the row is
-        // known from the start, so it opens here. It has to: the driver reads the
+        // seed are known, and for the store at the empty path, an induction store with no rows
+        // above it, the row is known from the start, so it opens here. It has to: the driver reads the
         // accumulator's value before the first position out of this store, and a store
         // that is not open carries none. A nested store's rows open below, at a row's first
         // decision or once the body calls it complete, so none of its seeds lands at the
@@ -2901,8 +2920,9 @@ impl TileProducer for InductionStoreProducer {
         // so a settled read resolves: a level's predicate means complete at every depth
         // beneath it. Each row's watermark in `frontier` stays where it is, spanning a
         // trailing run of carries, so `store_frontier` does not undercount to the latest
-        // change position when the tail is all carry. The driver closes its body-input domain once a complete source
-        // has been fully emitted, and that rides the body chain down to here.
+        // change position when the tail is all carry. The driver closes its body-input domain
+        // once a complete source has been fully emitted, and that rides the body chain down to
+        // here.
         for level in 0..self.complete_rows.len() {
             let Tile::DataFunction {
                 domain_predicate, ..
@@ -2912,15 +2932,13 @@ impl TileProducer for InductionStoreProducer {
             };
             self.complete_rows[level] = self.complete_rows[level].union(domain_predicate);
         }
-        // Reading a terminal body stream as "the whole extent is decided" rests on
-        // the loop above having consumed all of it. It stops at the first position it
-        // cannot decode as a decision, so a terminal stream with an undecodable row
-        // and decisions past it would close the frontier early and drop them without
-        // a sound.
-        // Undecided is a **path**, not a position: an inner position repeats across rows,
-        // so only the path says which decision is meant. `decided_paths` is in drive order,
-        // so the first past the cursor is the lowest.
-        // The walk re-reads every decision, so it runs where the assertion does.
+        // Reading a terminal body stream as "the whole extent is decided" rests on the loop
+        // above having consumed all of it. That loop stops at the first position it cannot
+        // decode as a decision, so a terminal stream with an undecodable row and decisions
+        // past it would close the frontier early and drop them without a sound. The check
+        // reads paths, since an inner position repeats across rows; `decided_paths` is in
+        // drive order, so the first past the cursor is the lowest. It re-reads every
+        // decision, so it is compiled only where the assertion is.
         #[cfg(debug_assertions)]
         {
             let through = self.decided_path();
@@ -3396,14 +3414,16 @@ impl TileProducer for StoreFinalReadProducer {
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // Under rows the output's levels are the store's, so a release of rows names the
         // same rows of the store, whose stores those rows' readers are then done with.
+        // Beneath the rows the output holds a value where the store holds a store, so only a
+        // release of a row's whole value reaches its store ([`through_shared_levels`]).
         if self.levels_above > 0 {
-            match obsolete_guard {
-                g if g.is_universal() => self
-                    .store_producer
-                    .release(self.store_producer.tiling().universal_guard()),
-                g if g.is_empty() => {}
-                g => self.store_producer.release(g),
-            }
+            let input = self.store_producer.tiling().clone();
+            self.store_producer
+                .release(crate::interpreter::tiling::through_shared_levels(
+                    obsolete_guard,
+                    self.levels_above,
+                    &input,
+                ));
             return;
         }
         // A universal release from the one consumer of a scalar retires this read, and
@@ -3451,9 +3471,7 @@ impl StoreFinalReadProducer {
             .enumerate()
             .filter_map(|(k, v)| v.filter(|_| whole[k]))
             .collect();
-        // The level keeps the rows answered: its stores stand in as a column holding
-        // nothing for the retain, and the answers take their place.
-        **stores = Tile::Scalar(ColumnValue::Units(n));
+        // The level keeps the rows answered, and the answers take their stores' place.
         let level = out.values_at_mut(rows);
         level.retain_keys(&whole);
         let Tile::DataFunction { codomain, .. } = level else {
@@ -4109,7 +4127,7 @@ impl AsOfProducer {
             AsOfOutput::Scalar { value_extent, .. } => {
                 stored_value_tile(cols.into_iter().next().unwrap_or_default(), value_extent)
             }
-            AsOfOutput::Record { fields } => Tile::Record(
+            AsOfOutput::Record { fields } => Tile::record(
                 fields
                     .iter()
                     .zip(cols)
@@ -4605,10 +4623,10 @@ impl DriverWindow {
             column.map_level_predicates(&mut |depth, pred| pred.qualified_by(&held_rows, depth));
             column
         });
-        let slots = Tile::Record(fields);
+        let slots = Tile::record(fields);
         let codomain = match &self.nested {
             None => slots,
-            Some(n) => Tile::Record(HashMap::from([
+            Some(n) => Tile::record(HashMap::from([
                 (
                     tuple_field(0),
                     column_of_rows(
@@ -4661,8 +4679,8 @@ impl DriverWindow {
             );
         };
         // One run per level above the positions, contiguous because the drive is
-        // sequential — order-dependent logic is what these induction stores exist for, so there is
-        // nothing to reorder. A level's key begins a new run wherever the path down to it
+        // sequential — order-dependent logic is what an induction store exists for, so there
+        // is nothing to reorder. A level's key begins a new run wherever the path down to it
         // differs from the previous row's, so a nest of any depth is one walk.
         let depth = nested.rows.len();
         let paths: Vec<&Path> = self
@@ -4934,7 +4952,7 @@ impl InductionDriver {
     ///
     /// `standing` are the levels the induction store sits under and leaves standing; `pair_domain`
     /// is the `(enclosing, inner)` domain the writer sequences its positions in, whose
-    /// enclosing component is the induction store's own row level.
+    /// enclosing component is the level of the induction store's rows.
     pub fn nested_parts(
         pairs_op: Box<dyn TileOperator>,
         reseed_ops: Vec<Box<dyn TileOperator>>,
@@ -5035,7 +5053,6 @@ impl TileOperator for InductionDriver {
             source_fully_released: false,
             source_complete: Vec::new(),
             stated: Vec::new(),
-            #[cfg(debug_assertions)]
             reseeded: None,
         })
     }
@@ -5090,8 +5107,7 @@ struct InductionDriverProducer {
     stated: Vec<Predicate>,
     /// The last row this drive reseeded and the snapshot it reseeded it at, until the
     /// store's frontier enters that row, for the check that the reseed is the store's seed
-    /// there.
-    #[cfg(debug_assertions)]
+    /// there. Checked once per row, so it costs a seed read per row.
     reseeded: Option<(Path, Vec<Value>)>,
 }
 
@@ -5221,8 +5237,8 @@ impl TileProducer for InductionDriverProducer {
         // curried source names it as levels already, and the pair-keyed streams have their
         // pair exploded to match. Two spellings of one position would match neither.
         //
-        // How many levels stand above the induction store's own rows is the induction store's own
-        // statement, not a count of the source's levels: an item that is itself a
+        // How many levels stand above the positions is the drive's own statement
+        // ([`NestedBody::rows`]), not a count of the source's levels: an item that is itself a
         // collection — a nest whose elements are collections — carries its own levels
         // beneath the positions, and counting those names a path one level too deep.
         let levels_above = self.window.levels_above();
@@ -5299,7 +5315,6 @@ impl TileProducer for InductionDriverProducer {
         // accumulator at its reseed stream's, which is one stream behind a `FanOut`. The two
         // are visible together once the store's frontier is inside the row the drive
         // reseeded.
-        #[cfg(debug_assertions)]
         if let Some((row, reseed)) = self.reseeded.take() {
             match frontier.as_ref().and_then(Path::split_position) {
                 Some((rows, _)) if rows == &row[..] => {
@@ -5308,7 +5323,7 @@ impl TileProducer for InductionDriverProducer {
                         .iter()
                         .map(|k| store_seed_value(&store, k))
                         .collect();
-                    debug_assert!(
+                    assert!(
                         seeds
                             .iter()
                             .zip(&reseed)
@@ -5427,7 +5442,6 @@ impl TileProducer for InductionDriverProducer {
                     .unwrap_or_else(|| unreachable!("a delivered path names a position"));
                 let inner = Position::new(at.clone());
                 let row = self.nested.is_some().then(|| Path::from(rows.to_vec()));
-                #[cfg(debug_assertions)]
                 if boundary && let Some(row) = &row {
                     self.reseeded = Some((row.clone(), snapshot.clone()));
                 }
@@ -6014,9 +6028,9 @@ fn body_input_tiling(
 pub struct NestedBody {
     /// The collection levels above the positions, outermost first.
     ///
-    /// The last is the induction store's own enclosing positions; anything before it **stands
-    /// above** — levels the induction store sits under and leaves standing, which a nest deeper
-    /// than two has. Depth lives in this list's length and nowhere in the code that walks it.
+    /// The last is the enclosing positions, one row of the induction store each; anything
+    /// before it **stands above** — levels the induction store sits under and leaves standing,
+    /// which a nest deeper than two has. Depth lives in this list's length and nowhere in the code that walks it.
     pub rows: Vec<Extent>,
     /// The enclosing parameter `(ᴘ, Pos)` the body takes beside its slots.
     pub param: Extent,
@@ -6518,7 +6532,7 @@ impl TransactWriterProducer {
             // Absolute positions: the live window is `[committed_base, …)`; the
             // released prefix has been compacted away. Positions never renumber.
             ColumnValue::from_uints((self.committed_base..self.committed_base + n).collect()),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 (
                     F_SNAP.to_string(),
                     Tile::Scalar(ColumnValue::from_values(
@@ -6951,7 +6965,7 @@ mod tests {
     /// ([`store_key`](crate::interpreter::operator_conversion::store_key)), which is the
     /// shape `body_decision_at` reads the write set's names back from.
     fn acct(name: &str) -> Value {
-        store_key(name, Value::Unit)
+        store_key(name)
     }
 
     /// Build a read/write set or initial state from `(account, balance)` pairs.
@@ -7070,7 +7084,7 @@ mod tests {
         let Tile::Store { seed, .. } = &tile else {
             panic!("a render is a store: {tile:?}")
         };
-        let Tile::Record(seeds) = seed.as_ref() else {
+        let Tile::Record { fields: seeds, .. } = seed.as_ref() else {
             panic!("a store's seed is a record per key: {seed:?}")
         };
         assert_eq!(
@@ -7157,7 +7171,7 @@ mod tests {
             else {
                 panic!("renders a store")
             };
-            let Tile::Record(logs) = &**state else {
+            let Tile::Record { fields: logs, .. } = &**state else {
                 panic!("a store's state is a record of changelogs")
             };
             let of = |t: &Tile| match t {
@@ -7474,7 +7488,7 @@ mod tests {
             else {
                 panic!("AddIfBody input is a collection");
             };
-            let Tile::Record(fields) = *codomain else {
+            let Tile::Record { fields, .. } = *codomain else {
                 panic!("AddIfBody input codomain is a Record {{_0: prev, _1: item}}");
             };
             let prev = record_field(&fields, &tuple_field(0));
@@ -8087,7 +8101,7 @@ mod tests {
         }
 
         const KEYS: u64 = 4;
-        let key = |i: usize| store_key(&format!("k{i}"), Value::Unit);
+        let key = |i: usize| store_key(&format!("k{i}"));
         let read_int = |m: &HashMap<Value, Value>, k: usize| match &m[&key(k)] {
             Value::Int(n) => *n,
             other => unreachable!("key holds an int, got {other:?}"),
@@ -8234,7 +8248,7 @@ mod tests {
 
     /// A store key's seed — its value before any change.
     fn seed_of(tile: &Tile, key: &str) -> Option<Value> {
-        store_seed_value(tile, &store_key(key, Value::Unit))
+        store_seed_value(tile, &store_key(key))
     }
 
     /// A store key's changelog as `(tick, value)` pairs.
@@ -8296,7 +8310,7 @@ mod tests {
         let seed: HashMap<Value, Value> = tile
             .store_keys()
             .filter_map(|name| {
-                let key = store_key(name, Value::Unit);
+                let key = store_key(name);
                 Some((key.clone(), store_seed_value(tile, &key)?))
             })
             .collect();
@@ -8305,7 +8319,7 @@ mod tests {
                 let delta = tile
                     .store_keys()
                     .filter_map(|name| {
-                        let key = store_key(name, Value::Unit);
+                        let key = store_key(name);
                         Some((key.clone(), store_delta_at(tile, &tick, &key)?))
                     })
                     .collect();
@@ -8854,7 +8868,7 @@ mod tests {
     fn proposal_tile(emitted: &[EmittedProposal], base: usize, terminal: bool) -> Tile {
         Tile::data_function(
             ColumnValue::from_uints((base..base + emitted.len()).collect()),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 (
                     F_SNAP.to_string(),
                     Tile::Scalar(ColumnValue::from_values(
@@ -9681,7 +9695,7 @@ mod tests {
         // A column of record values, and a record of columns over the fields.
         let units = ColumnValue::from_ints(vec![2, 1]);
         let boxed = seed(Tile::Scalar(ColumnValue::Records(field(units.clone()))));
-        let struct_of_arrays = seed(Tile::Record(field(Tile::Scalar(units))));
+        let struct_of_arrays = seed(Tile::record(field(Tile::Scalar(units))));
 
         // The seed is a map, so its bindings carry no order; compare the entries.
         let entries = |seed: Value| {
@@ -9758,8 +9772,8 @@ mod tests {
             })
             .collect();
         let tile = Tile::Store {
-            state: Box::new(Tile::Record(state)),
-            seed: Box::new(Tile::Record(seed_record)),
+            state: Box::new(Tile::record(state)),
+            seed: Box::new(Tile::record(seed_record)),
             // The domain a hand-built store stands over: its change positions, since
             // these fixtures record no carry.
             decided: Box::new(one_row_decided(ColumnValue::from_uints(
@@ -9978,13 +9992,13 @@ mod tests {
         };
         let store = |state: Tile| Tile::Store {
             state: Box::new(state),
-            seed: Box::new(Tile::Record(HashMap::new())),
+            seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(vec![]))),
             frontier: Box::new(one_row_decided(ColumnValue::from_uints(vec![]))),
             terminal: false,
             closed_keys: Vec::new(),
         };
-        let one_key = |log: Tile| store(Tile::Record(HashMap::from([("a".to_string(), log)])));
+        let one_key = |log: Tile| store(Tile::record(HashMap::from([("a".to_string(), log)])));
         // Non-ascending change ticks.
         assert!(!validate_tile(&one_key(log(vec![2, 1], vec![1, 2]))));
         // More values than ticks to hold them.
@@ -9995,8 +10009,8 @@ mod tests {
         ))));
         // A position decided above the frontier, and one decided with no frontier at all.
         let decided_through = |decided: Vec<usize>, frontier: Vec<usize>| Tile::Store {
-            state: Box::new(Tile::Record(HashMap::new())),
-            seed: Box::new(Tile::Record(HashMap::new())),
+            state: Box::new(Tile::record(HashMap::new())),
+            seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(decided))),
             frontier: Box::new(one_row_decided(ColumnValue::from_uints(frontier))),
             terminal: false,
@@ -10618,7 +10632,7 @@ mod tests {
             Predicate::at_or_below(Value::UInt(0)),
             BitSet::new(),
         );
-        let seed = Tile::Record(HashMap::from([
+        let seed = Tile::record(HashMap::from([
             (tuple_field(0), open),
             (
                 tuple_field(1),

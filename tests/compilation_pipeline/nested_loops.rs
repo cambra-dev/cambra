@@ -851,9 +851,8 @@ fn a_per_iteration_binding_read_by_the_inner_loop() {
 /// it filters. Answers 8 once it compiles: 2+3, then 3, then nothing. Pinned as it fails;
 /// the cause and its fix are the vault issue `refinements-dependent-projection-of-a-refined-pair`.
 ///
-/// The inner history's type depends on the enclosing parameter, which lambda elimination's
-/// `debug_assertions`-gated check refuses. Without that check the tree reaches a type
-/// mismatch further on.
+/// The inner history's type depends on the enclosing parameter, which lambda elimination
+/// refuses.
 #[test]
 fn a_correlated_filter_on_the_inner_source() {
     check_compile_error(
@@ -864,11 +863,7 @@ fn a_correlated_filter_on_the_inner_source() {
                     total += y
             total
         "},
-        if cfg!(debug_assertions) {
-            "history type does not depend on the enclosing parameter"
-        } else {
-            "Type mismatch for Compose[1]"
-        },
+        "history type does not depend on the enclosing parameter",
     );
 }
 
@@ -1398,8 +1393,8 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
 
 /// The planned tree of a nest. The inner loop is a `transact under` the `(enclosing,
 /// position)` pair, seeded per enclosing position and read back per enclosing position with
-/// `final_read`. A constant inner source is curried over that pair; a source the outer row
-/// holds is the row itself (`over .1`).
+/// `final_read`. A constant inner source is paired with each enclosing position through
+/// `strength`; a source the outer row holds is the row itself (`over .1`).
 #[rstest]
 #[case::a_constant_inner_source(
     indoc! {r#"
@@ -1411,7 +1406,7 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over ((iterate ≫ [10, 20]) ▷ map_domain, .1 ≫ [10, 20]) ▷ curry_over do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over (id, (iterate ≫ [10, 20]) ▷ map_domain ▷ const) ▷ zip ≫ strength ≫ (.1 ≫ [10, 20]) ▷ map do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
         in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
         in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
         in let s : Int = __hist.s ▷ final_read

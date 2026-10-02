@@ -1834,12 +1834,6 @@ recurrences rather than one with a wider key set.
 A `<<` feed from inside the nest appends at the innermost position, so the channel it
 builds carries one value per position of the nest rather than one per group.
 
-Four nested shapes do not compile yet: a filter on the inner source that reads the
-outer binder, a `with begin():` transaction inside a nested `for`, a concatenation (`++`)
-as the inner source, and an inner source whose rows are of differing length. Rows of
-differing length are of differing type, so that collection is a sum, and iterating a sum
-is a separate missing piece.
-
 Accumulation **requires `:=`**. Because a plain `=` never mutates, a plain
 `=` to an outer-scope name inside a loop body is a lowering error — left to
 mean anything it could only be a silently-discarded per-iteration shadow,

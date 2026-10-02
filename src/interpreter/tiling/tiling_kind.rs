@@ -211,7 +211,7 @@ impl Tiling {
         match self {
             Tiling::Scalar(e) => Tile::Scalar(ColumnValue::from_values(Vec::new(), e)),
             Tiling::Record(m) => {
-                Tile::Record(transform_hashmap_values(m, |t| t.empty_at_rows(rows)))
+                Tile::record(transform_hashmap_values(m, |t| t.empty_at_rows(rows)))
             }
             Tiling::DataFunction { domain, codomain } => Tile::grouped(
                 ColumnValue::UInts(vec![0; rows]),

@@ -1884,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_by_everything_is_the_rectangle_itself() {
+    fn qualified_by_everything_is_the_unqualified_predicate() {
         let here = Predicate::at_or_below(u(1));
         assert_eq!(Predicate::qualified(Predicate::True, here.clone()), here);
     }
@@ -1902,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rectangle_answers_for_the_key_under_every_enclosing_path() {
+    fn an_unqualified_predicate_answers_for_the_key_under_every_enclosing_path() {
         let rect = Predicate::at_or_below(u(1));
         assert!(rect.contains_path(&under(0, 1)));
         assert!(
@@ -1965,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn boxes_sharing_a_component_join_into_one() {
+    fn qualified_predicates_sharing_a_component_join_into_one() {
         let (a, b) = (
             Predicate::qualified(only(1), only(0)),
             Predicate::qualified(only(1), only(1)),
@@ -1988,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn boxes_sharing_no_component_join_as_a_union() {
+    fn qualified_predicates_sharing_no_component_join_as_a_union() {
         let (a, b) = (
             Predicate::qualified(only(0), only(0)),
             Predicate::qualified(only(1), only(1)),
@@ -2001,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn boxes_meet_componentwise() {
+    fn qualified_predicates_meet_componentwise() {
         let a = Predicate::qualified(Predicate::at_or_below(u(1)), Predicate::at_or_below(u(1)));
         let b = Predicate::qualified(only(1), Predicate::at_or_below(u(0)));
         assert_eq!(
@@ -2012,18 +2012,18 @@ mod tests {
     }
 
     #[test]
-    fn a_rectangle_meets_a_box_by_narrowing_its_keys() {
-        let box_ = Predicate::qualified(only(1), Predicate::at_or_below(u(1)));
-        let rect = Predicate::at_or_below(u(0));
+    fn an_unqualified_predicate_meets_a_qualified_one_by_narrowing_its_keys() {
+        let qualified = Predicate::qualified(only(1), Predicate::at_or_below(u(1)));
+        let unqualified = Predicate::at_or_below(u(0));
         assert_eq!(
-            box_.intersect(&rect),
+            qualified.intersect(&unqualified),
             Predicate::qualified(only(1), Predicate::at_or_below(u(0))),
             "the enclosing path it already named, over the keys both admit"
         );
     }
 
     #[test]
-    fn one_box_less_another_leaves_the_rows_it_did_not_name() {
+    fn removing_a_qualified_predicate_leaves_the_rows_it_did_not_name() {
         // Everything of the 2×2 grid, less the keys `≤ 0` under enclosing row 1.
         let all = Predicate::True;
         let taken = Predicate::qualified(only(1), Predicate::at_or_below(u(0)));
@@ -2047,10 +2047,10 @@ mod tests {
     }
 
     #[test]
-    fn a_union_drops_the_box_a_rectangle_already_covers() {
-        let rect = Predicate::at_or_below(u(1));
-        let box_ = Predicate::qualified(only(1), only(0));
-        assert_eq!(rect.union(&box_), rect);
+    fn a_union_drops_a_qualified_predicate_an_unqualified_one_covers() {
+        let unqualified = Predicate::at_or_below(u(1));
+        let qualified = Predicate::qualified(only(1), only(0));
+        assert_eq!(unqualified.union(&qualified), unqualified);
     }
 
     #[test]
@@ -2335,7 +2335,7 @@ mod tests {
     /// arms differ in both fields, so they do not join, and each holds half of the componentwise
     /// predicate's `_1` range.
     #[test]
-    fn a_union_subsumes_a_box_its_arms_cover_only_together() {
+    fn a_union_subsumes_a_componentwise_predicate_its_arms_cover_only_together() {
         let low = record_pred(&[
             ("_0", uint_intervals(&[0, 1])),
             ("_1", uint_intervals(&[0, 1, 2])),
@@ -2391,7 +2391,7 @@ mod tests {
     /// Rows stated one at a time, each a componentwise predicate qualified by its own enclosing
     /// row, join into one componentwise predicate where their keys agree, not one arm per row.
     #[test]
-    fn rows_stated_one_at_a_time_join_into_one_box() {
+    fn rows_stated_one_at_a_time_join_into_one_componentwise_predicate() {
         let row = |r: usize| Predicate::qualified(Predicate::point(u(r)), uint_intervals(&[0, 1]));
         let rows = (1..4).fold(row(0), |acc, r| acc.union(&row(r)));
         assert_eq!(
@@ -2416,10 +2416,10 @@ mod tests {
         }
     }
 
-    /// A column of pairs filling a rectangle is one record, whichever way it is assembled:
+    /// A column of pairs filling a product is one record, whichever way it is assembled:
     /// read whole, or unioned in one point at a time.
     #[test]
-    fn pairs_filling_a_rectangle_join_into_one_record() {
+    fn pairs_filling_a_product_join_into_one_record() {
         let square = pairs(&[0, 0, 1, 1], &[0, 1, 0, 1]);
         let whole = Predicate::from_column_value(&square);
         assert_eq!(arm_count(&whole), 1, "{whole:?}");
