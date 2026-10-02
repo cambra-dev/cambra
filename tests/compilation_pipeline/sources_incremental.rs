@@ -724,7 +724,7 @@ await_final(pool)";
     pull_laps(ctx.scheduler(), &mut *producer, 3, |t| *t != empty);
     assert_eq!(
         test_source.borrow().get_released_predicate(),
-        Predicate::LessThanEq(Value::UInt(1)),
+        Predicate::at_or_below(Value::UInt(1)),
         "both filtered rows are released while the source is live"
     );
 

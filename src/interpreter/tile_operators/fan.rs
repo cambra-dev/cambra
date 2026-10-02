@@ -334,19 +334,23 @@ impl TileProducer for ZipProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.inputs.iter_mut().for_each(|i| {
-            i.release(match &obsolete_guard {
-                g if g.is_universal() => i.tiling().universal_guard(),
-                g if g.is_empty() => i.tiling().empty_guard(),
-                TileGuard::Function(FunctionGuard::Domain(p)) => {
-                    TileGuard::Function(FunctionGuard::Domain(p.clone()))
-                }
-                TileGuard::Function(FunctionGuard::Codomain(g)) => {
-                    TileGuard::Function(FunctionGuard::Codomain(g.clone()))
-                }
-                g => unimplemented!("Zip cannot honor the release guard {g:?}"),
-            })
-        });
+        let level = self.level.index();
+        for (name, input) in self.names.iter().zip(self.inputs.iter_mut()) {
+            let guard = match &obsolete_guard {
+                g if g.is_universal() => input.tiling().universal_guard(),
+                g if g.is_empty() => input.tiling().empty_guard(),
+                // A zip pairs its arms at the same positions, so the levels above the pair
+                // name the same keys of every arm; at the pair each arm is one field of the
+                // record, and takes that field's part.
+                g => crate::interpreter::tiling::onto_record_field(
+                    g.clone(),
+                    level,
+                    name,
+                    input.tiling(),
+                ),
+            };
+            input.release(guard);
+        }
     }
 }
 
@@ -984,7 +988,7 @@ mod tests {
         let (spy_a, log_a) = ReleaseSpy::new(filtered_collection(), input_tiling.clone());
         let (spy_b, log_b) = ReleaseSpy::new(filtered_collection(), input_tiling);
         let mut zip = ZipProducer {
-            depth: 1,
+            level: CurryLevel::new(1),
             base: ProducerBase::new(ZipProducer::alloc_id(), &output_tiling),
             names: vec!["a".to_string(), "b".to_string()],
             inputs: vec![Box::new(spy_a), Box::new(spy_b)],

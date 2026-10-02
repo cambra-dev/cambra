@@ -1535,50 +1535,98 @@ impl Tile {
         (0..offsets.len()).map(move |row| level_run(offsets, row, domain.len()))
     }
 
-    /// A guard naming exactly the rows [`compact`](Self::compact) removes from this collection,
-    /// or `None` when it removes none or the tile is no collection.
+    /// A guard naming exactly the rows [`compact`](Self::compact) removes from this tile, at
+    /// every level, or `None` when it removes none.
     ///
     /// An operator that compacts its input and emits what is left releases this to the input,
     /// since no consumer of its output sees those rows, so no consumer's guard can name them.
+    /// A row deleted beneath the top level is named by its key path, so the guard leaves the
+    /// same key under its siblings alone.
     ///
     /// # Panics
     ///
-    /// When a removed row has no exact spelling as a guard: a deleted key of a collection under
-    /// an enclosing row, or a deleted row inside a nested group. A `Domain` guard names a key
-    /// under every enclosing row, those still to arrive included, and a `Codomain` guard is read
-    /// against every group, so either would release the key where it may still be live. Naming
-    /// a key beneath the path that reaches it needs a predicate qualified by that path, which
-    /// these guards do not have.
+    /// When the tile stands over several rows and removes one: its rows' paths lie above it,
+    /// so no guard it can build names a key under one row and not the others. Also when an
+    /// aggregate's accumulator holds a deleted row, which its own guard has no spelling for.
     pub fn deleted_keys_guard(&self) -> Option<TileGuard> {
-        let Tile::DataFunction {
-            domain,
-            codomain,
-            deleted,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        assert!(
-            !codomain.holds_deleted_rows(),
-            "compacting drops a row deleted inside a nested group, and no guard names a key \
-             beneath the path that reaches it, so the row cannot be released: {self:?}"
-        );
-        if deleted.is_empty() {
+        if !self.holds_deleted_rows() {
             return None;
         }
         assert_eq!(
             self.rows(),
             1,
-            "compacting drops a deleted key of a collection under an enclosing row, and a \
+            "compacting drops a deleted row of a tile under several enclosing rows, and a \
              `Domain` guard would release that key under every row, so it cannot be released: \
              {self:?}"
         );
-        let dropped: Vec<usize> = deleted.iter().collect();
-        let keys = domain.select_indices(dropped.iter().copied(), dropped.len());
-        Some(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::from_column_value(&keys),
-        )))
+        self.deleted_guard_under(&[Vec::new()])
+    }
+
+    /// [`Self::deleted_keys_guard`] for a tile whose rows are reached by `row_paths`.
+    fn deleted_guard_under(&self, row_paths: &[Vec<Value>]) -> Option<TileGuard> {
+        match self {
+            Tile::DataFunction {
+                domain,
+                codomain,
+                deleted,
+                ..
+            } => {
+                let paths = self.key_paths(row_paths);
+                let mut arms = Vec::new();
+                if !deleted.is_empty() {
+                    // At the top level a key is its own path, so the keys spell the region.
+                    let here = if row_paths.iter().all(Vec::is_empty) {
+                        let dropped: Vec<usize> = deleted.iter().collect();
+                        Predicate::from_column_value(
+                            &domain.select_indices(dropped.iter().copied(), dropped.len()),
+                        )
+                    } else {
+                        Predicate::union_all(
+                            deleted
+                                .iter()
+                                .map(|k| Predicate::exactly(&paths[k]))
+                                .collect(),
+                        )
+                    };
+                    arms.push(TileGuard::Function(FunctionGuard::Domain(here)));
+                }
+                if let Some(inner) = codomain.deleted_guard_under(&paths) {
+                    arms.push(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                        inner,
+                    ))));
+                }
+                (!arms.is_empty()).then(|| TileGuard::flatten_or(arms))
+            }
+            Tile::Record(fields) => {
+                let named: HashMap<&String, TileGuard> = fields
+                    .iter()
+                    .filter_map(|(name, field)| Some((name, field.deleted_guard_under(row_paths)?)))
+                    .collect();
+                (!named.is_empty()).then(|| {
+                    TileGuard::Record(
+                        fields
+                            .iter()
+                            .map(|(name, field)| {
+                                let guard = named
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_else(|| empty_guard_of(field));
+                                (name.clone(), guard)
+                            })
+                            .collect(),
+                    )
+                })
+            }
+            Tile::Aggregation { accumulator, .. } => {
+                assert!(
+                    !accumulator.holds_deleted_rows(),
+                    "compacting drops a row deleted inside an aggregate's accumulator, which \
+                     the aggregate's guard has no spelling for: {self:?}"
+                );
+                None
+            }
+            Tile::Scalar(_) | Tile::Store { .. } => None,
+        }
     }
 
     /// Whether any collection in this tile, at any level, marks a row deleted.
@@ -2101,6 +2149,23 @@ mod tests {
     #[should_panic(expected = "a `Domain` guard would release that key under every row")]
     fn deleted_keys_guard_refuses_a_key_deleted_under_one_of_several_rows() {
         two_rows_of_two_keys(&[1]).deleted_keys_guard();
+    }
+
+    /// A key deleted inside one group is named by its path, so the same key under the
+    /// group's sibling is left alone.
+    #[test]
+    fn deleted_keys_guard_names_a_nested_deleted_key_by_its_path() {
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(two_rows_of_two_keys(&[1])),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let guard = tile.deleted_keys_guard().expect("the deleted key is named");
+        let path = |outer: usize, inner: usize| [Value::UInt(outer), Value::UInt(inner)];
+        assert!(guard.covers_path(&path(0, 1)), "{guard:?}");
+        assert!(!guard.covers_path(&path(1, 1)), "{guard:?}");
+        assert!(!guard.covers_path(&path(0, 0)), "{guard:?}");
     }
 
     // ── Merging a collection delivered row by row ─────────────────────────────

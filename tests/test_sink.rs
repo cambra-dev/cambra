@@ -472,7 +472,7 @@ fn a_sink_accumulates_across_two_deliveries() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(1))]);
     src.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::UInt(0)));
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let code = indoc! {r#"
@@ -546,7 +546,7 @@ fn a_sink_accumulates_across_a_reload() {
         (Value::UInt(1), Value::Int(2)),
     ]);
     src.borrow_mut()
-        .set_yield_predicate(Predicate::LessThanEq(Value::UInt(1)));
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     pump(&mut ctx);
 
     live.reload(&mut ctx, &version(100), &consumer)

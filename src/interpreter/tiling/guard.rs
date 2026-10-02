@@ -343,6 +343,64 @@ pub(crate) fn through_shared_levels(guard: TileGuard, levels: usize, input: &Til
     }
 }
 
+/// `guard`, released against a record of fields standing at `level` beneath collection
+/// levels every field shares, restated for the operand that holds field `field`: the shared
+/// levels pass through, and at the record the operand gets its own field's part.
+///
+/// A guard at the record naming it whole names every field whole, and a record guard names
+/// each field's part by that field. Any other non-empty shape at the record is not a region of
+/// a record, and fails rather than being answered with a smaller guard. `operand` is the
+/// operand's own tiling.
+pub(crate) fn onto_record_field(
+    guard: TileGuard,
+    level: usize,
+    field: &str,
+    operand: &Tiling,
+) -> TileGuard {
+    fn walk(
+        guard: TileGuard,
+        depth: usize,
+        level: usize,
+        field: &str,
+        operand: &Tiling,
+    ) -> TileGuard {
+        if depth == level {
+            let values = operand.values_at(CurryLevel::new(depth));
+            return match guard {
+                g if g.is_universal() => values.universal_guard(),
+                TileGuard::Record(mut fields) => {
+                    fields.remove(field).unwrap_or_else(|| values.empty_guard())
+                }
+                TileGuard::Or(arms) => TileGuard::flatten_or(
+                    arms.into_iter()
+                        .map(|arm| walk(arm, depth, level, field, operand))
+                        .collect(),
+                ),
+                g if g.is_empty() => values.empty_guard(),
+                g => unreachable!(
+                    "a guard at a record of fields is universal, empty, a record or a union of \
+                     those, got {g:?} at level {level}"
+                ),
+            };
+        }
+        match guard {
+            TileGuard::Or(arms) => TileGuard::flatten_or(
+                arms.into_iter()
+                    .map(|arm| walk(arm, depth, level, field, operand))
+                    .collect(),
+            ),
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => TileGuard::Function(
+                FunctionGuard::Codomain(Box::new(walk(*inner, depth + 1, level, field, operand))),
+            ),
+            other => other,
+        }
+    }
+    match walk(TileGuard::flatten_or(vec![guard]), 0, level, field, operand) {
+        g if g.is_empty() => operand.empty_guard(),
+        g => g,
+    }
+}
+
 /// Whether two guards name the same place — the same nesting, down to the predicate.
 fn same_place(a: &TileGuard, b: &TileGuard) -> bool {
     match (a, b) {
@@ -664,7 +722,7 @@ impl TileGuard {
             // `to_guard` is `Function(Domain(_))`), so no `Codomain` arm.
             //
             // Its positions are a level like any other, so the levels it was reached
-            // through go down with it: a carrier holds one store per row, and a release
+            // through go down with it: an induction store holds one store per row, and a release
             // naming the positions of *one* of them qualifies its predicate by that row.
             // Checked against the store's own domain alone, such a predicate reads as
             // unqualified and is refused.
