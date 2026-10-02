@@ -248,9 +248,9 @@ often as it does in the program.
 A multi-argument function's parameters bind nothing — `uncurry_params` substitutes
 `__arg_tuple_N ▷ .i` for every occurrence — so uid equality cannot answer for them. They resolve
 through the projection's two spans instead, the occurrence on the `Apply` and the declaration on its
-`Proj` child ([ir.md](../ccl/design/ir.md#a-substituted-parameters-site-rides-its-projection)). The
-projection is identified by its `lower.uncurry_proj` tag, so an author-written `t.0` is not mistaken
-for one.
+`Proj` child
+([ir.md](../ccl/design/ir.md#source-locations-on-substituted-parameter-projections)). The projection is
+identified by its `lower.uncurry_proj` tag, so an author-written `t.0` is not mistaken for one.
 
 **What does not resolve.** A `Feed`, `Define` or `MutWrite` names a binder bound elsewhere, and that
 name is a field rather than a node, so the only span available is the whole node's. A use span
