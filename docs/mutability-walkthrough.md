@@ -718,17 +718,8 @@ Two wrappers sit on top of that, and neither is mutability-specific:
 
 - a **scalar** read of an accumulator — `x` after the loop — is `final_read(history)`, as
   `await_final(x)` is. It compiles to `StoreFinalRead`, which samples the key's carried value
-  once the store has settled rather than reducing a stream;
-%%%%%%% diff from: mztsntnu c7ca87aa "Address review (#254 round 2)" (parents of rebased revision)
-\\\\\\\        to: vyktnzwl eda5b0ab "Realize a nested `for` loop's recurrence as one induction store per enclosing row" (rebased revision)
- - a **scalar** read of an accumulator — `x` after the loop — is `final_or_default(stream,
-   seed)`. Over an induction accumulator's own history it compiles to `StoreFinalRead`, which
--  samples the key's carried value once the store has settled rather than reducing a stream.
--  `await_final(x)` is a different term, `final_read`, and reaches `StoreFinalRead` too;
-+  samples the key's carried value once the store has settled rather than reducing a stream;
-+  under a nest, where there is one history per enclosing row, it compiles to `ExtractFinal`
-+  per row. `await_final(x)` is a different term, `final_read`, and reaches `StoreFinalRead`
-+  too;
+  once the store has settled rather than reducing a stream. An inner loop's is the same term,
+  and compiles to `StoreFinalRead` per enclosing position;
 - a **co-iterated** read consumes the stream directly, since it is already a `𝐷 ⇀ 𝑉`.
 
 The exception is a `Txn` variable read *out of* a block: `rewrite_as_of_reads` turned that
@@ -815,7 +806,7 @@ against the direction of the `get` that causes it.
 |---|---|---|
 | store | `InductionStore` | `CommitOperator` + `TransactWriter` |
 | driver | `InductionDriver` | `TransactDriver` |
-| readers | `StoreDenseRead`, `StoreFinalRead` (`ExtractFinal` per row under a nest) | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
+| readers | `StoreDenseRead`, `StoreFinalRead` (one per enclosing position under a nest) | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
 
 **Why the driver is a separate operator.** The accumulator has to reach the body, and the
 only sanctioned route is a tile pulled along an edge. Splitting the roles puts it on one:

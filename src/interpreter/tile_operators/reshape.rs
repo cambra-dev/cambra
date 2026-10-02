@@ -115,6 +115,10 @@ struct PermuteRecordDomainProducer {
 }
 
 impl TileProducer for PermuteRecordDomainProducer {
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
     impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

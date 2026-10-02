@@ -1814,11 +1814,11 @@ state (`total := 0; for x in xs: total += x; yield total`).
 
 **Nested loops.** A `for` inside a `for` body is a recurrence of its own, running
 once per position of the loop around it. An accumulator declared before the outer
-loop is carried through both: at each outer position the inner recurrence starts
+loop is carried through both: at each enclosing position the inner recurrence starts
 from the value the accumulator holds there, and the outer one takes the value the
 inner left. The rule is per level rather than per depth, so a nest is unbounded in
 depth. The inner body may read the outer binder, and the inner source may be the outer
-element itself, which gives each outer position its own inner domain.
+element itself, which gives each enclosing position its own inner domain.
 
 ```
 total := 0
@@ -1834,10 +1834,11 @@ recurrences rather than one with a wider key set.
 A `<<` feed from inside the nest appends at the innermost position, so the channel it
 builds carries one value per position of the nest rather than one per group.
 
-Three nested shapes do not compile yet: a filter on the inner source that reads the
-outer binder, a `with begin():` transaction inside a nested `for`, and an inner source
-whose rows are of differing length. Rows of differing length are of differing type, so
-that collection is a sum, and iterating a sum is a separate missing piece.
+Four nested shapes do not compile yet: a filter on the inner source that reads the
+outer binder, a `with begin():` transaction inside a nested `for`, a concatenation (`++`)
+as the inner source, and an inner source whose rows are of differing length. Rows of
+differing length are of differing type, so that collection is a sum, and iterating a sum
+is a separate missing piece.
 
 Accumulation **requires `:=`**. Because a plain `=` never mutates, a plain
 `=` to an outer-scope name inside a loop body is a lowering error — left to
