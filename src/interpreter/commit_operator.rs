@@ -344,11 +344,11 @@ impl CommitEngine {
                 let tile = Tile::data_function(
                     ticks,
                     Box::new(Tile::Scalar(column)),
-                    // **A changelog claims nothing decided.** Read as a collection, a
-                    // decided tick missing from it would be absent, where the store reads
-                    // it as a tick that left this key's value standing. The store's
-                    // `frontier` is the one statement of what is decided.
-                    Predicate::False,
+                    // A changelog is a collection of writes, so it is complete exactly
+                    // where the store has decided: a decided tick it holds wrote this key,
+                    // and a decided tick it omits did not, and neither changes. The key's
+                    // value at a tick is the fold over the changelog, never a lookup in it.
+                    self.frontier_predicate(),
                     BitSet::new(),
                 );
                 (key, tile)
@@ -4631,8 +4631,7 @@ mod tests {
             vec![(acc.clone(), Box::new(Constant::new(int(0), value_extent())))],
             vec![acc.clone()],
             Vec::new(),
-            key_extent(),
-            value_extent(),
+            store_values(&["acc"]),
             0,
         );
         let set_body = store.body_input_setter();
@@ -6926,9 +6925,8 @@ mod tests {
                     Box::new(Tile::Scalar(ColumnValue::from_ints(
                         log.iter().map(|(_, b)| *b).collect(),
                     ))),
-                    // As `CommitEngine` renders one: the store's frontier is the only
-                    // statement of what is decided.
-                    Predicate::False,
+                    // As `CommitEngine` renders one: complete where the store has decided.
+                    frontier.clone(),
                     BitSet::new(),
                 );
                 (account.to_string(), tile)
