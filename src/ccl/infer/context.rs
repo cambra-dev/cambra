@@ -41,6 +41,11 @@ pub(super) struct Binding {
     /// code) happens during the coalesce walk
     /// ([`specialize_use`](super::solve::specialize_use)).
     pub(super) scheme: PolyScheme,
+    /// Whether the binder is a generalized `let`, which is what makes a `let`
+    /// naming it polymorphic too ([`should_generalize`]). Not readable off
+    /// `scheme`: a monomorphic `let`'s variables sit above the enclosing level as
+    /// well, since its right-hand side is emitted one level up.
+    pub(super) generalized: bool,
 }
 
 /// Inference's lexical scope, read as the environment a solver query runs in.
@@ -68,13 +73,17 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
 /// Whether a `let` bound to `def` at `level` should be **generalized** —
 /// typed polymorphically, with each use [`PolyScheme::instantiate`]ing a fresh
 /// copy and the coalesce walk specializing per distinct use instantiation
-/// ([`specialize_use`](super::solve::specialize_use)). Requires both of:
+/// ([`specialize_use`](super::solve::specialize_use)). Requires all of:
 ///
-/// - **A function definition** (`def` is a `Lambda`). Let-polymorphism
-///   generalizes function definitions; value bindings stay monomorphic and
-///   *shared* — specializing a value would duplicate it, which breaks
-///   structures that rely on sharing (e.g. a deferred-feed value used in
-///   `y ++ y`).
+/// - **A function definition, or a name of a generalized binding.** `def` is a
+///   `Lambda`, or a `Var` that `generalized` says names a generalized `let`.
+///   Let-polymorphism generalizes function definitions; value bindings stay
+///   monomorphic and *shared* — specializing a value would duplicate it, which
+///   breaks structures that rely on sharing (e.g. a deferred-feed value used in
+///   `y ++ y`). A name of a generalized binding duplicates nothing: a use of the
+///   alias specializes a copy of the `Var`, which specializes the binding it
+///   names (`docs/chl-spec.md`, "6.8 Polymorphic types"). Each caller answers
+///   `generalized` from its own scope.
 /// - **A capability, not a collection.** The rule above by *node*, restated by
 ///   [`FunKind`](crate::ccl::ty::FunKind): a data function is a value binding
 ///   however it is spelled. A `groupby` lowers to a `Lambda` whose type still
@@ -96,16 +105,23 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
 /// and a generator/collection-producing UDF generalizes to one specialization
 /// *per distinct element type*, which `inline` then leaves shared (cached)
 /// rather than duplicated.
-pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
-    matches!(def.node, TypedExprNode::Lambda { .. })
-        && !matches!(
+pub(super) fn should_generalize(
+    def: &Expr,
+    level: Level,
+    generalized: impl FnOnce(&Name) -> bool,
+) -> bool {
+    let polymorphic_form = match &def.node {
+        TypedExprNode::Lambda { .. } => !matches!(
             def.ty,
             Type::Fun {
                 fun_kind: crate::ccl::ty::FunKind::Data(..),
                 ..
             }
-        )
-        && type_level(&def.ty) > level
+        ),
+        TypedExprNode::Var(name) => generalized(name),
+        _ => false,
+    };
+    polymorphic_form && type_level(&def.ty) > level
 }
 
 /// Emission context for Cambra's inference algorithm (Pass 1).
@@ -536,6 +552,7 @@ impl Typing for InferCtx {
             name,
             Binding {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
+                generalized: false,
             },
         );
         let r = self.under_binder(name, f);
@@ -554,7 +571,9 @@ impl Typing for InferCtx {
     }
 
     fn is_generalizable(&self, def: &Expr) -> bool {
-        should_generalize(def, self.level)
+        should_generalize(def, self.level, |name| {
+            self.scopes.lookup(name).is_some_and(|b| b.generalized)
+        })
     }
 
     fn scoped_let<R>(
@@ -595,7 +614,13 @@ impl Typing for InferCtx {
             PolyScheme::poly(self.level + 1, bound_ty.clone())
         };
         self.scopes.push_scope();
-        self.scopes.bind(name, Binding { scheme });
+        self.scopes.bind(
+            name,
+            Binding {
+                scheme,
+                generalized: generalize,
+            },
+        );
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
