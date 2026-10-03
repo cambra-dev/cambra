@@ -342,9 +342,8 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
-| `Filter` | Predicate: any tiling of type `A → bool` <br>Data: `DataFunction(extent → Scalar(A))` | Same as input | Filters a function tile by a boolean predicate: keeps only domain elements where the predicate on the value evaluates to `true`. <br>TODO can probably remove this in favor of Restrict |
+| `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the input's level at the predicate's innermost depth, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` and `map_filter` both compile to it. <br>TODO the function form can probably be replaced by Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `DataFunction(A → *)` | Same as input | Filters a function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
-| `MapFilter` | Predicate: `K ⤇ I ⤇ bool` <br>Data: `K ⤇ I ⤇ V` | Same as input | Filters the **inner** collections one outer key at a time — the survivors differ per key, which `Filter` and `Restrict` cannot express because they narrow a collection's own keys. The predicate's innermost values are the mask over the inner keys directly, so the outer level is untouched and `Tile::retain_keys` re-cuts the inner runs. Planning emits it where a refinement rides an inner collection's keys under the outer key's binder, which is what a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produces. |
 | `Aggregate` | `DataFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `DataFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile. Constructed with an `only_terminal` flag: when `true` it emits only once the aggregation is marked terminal (the `only_terminal: false` path is currently `todo!()`). |
 | `MapAggregate` | `DataFunction(domain → codomain)` | `DataFunction(domain → Aggregation)` | Performs a per-key aggregation |
@@ -583,8 +582,9 @@ domain, one level deeper than the outer collection — a collection per row — 
 that like any other morphism over a stream, its result inheriting the grouping.
 The inner source does not mention the outer binder, so every row iterates the same domain and
 the pairing is a cartesian product. A source that differs per row is the same output shape
-from a different builder ([Where a collection is materialized](#where-a-collection-is-materialized)),
-where the per-row collection arrives as a value rather than being selected by the binder.
+from a different builder
+([Where a collection is materialized](#where-a-collection-is-materialized)), where the per-row
+collection arrives as a value rather than being selected by the binder.
 
 Nothing downstream of the pairing is required. `MapAggregate` consumes the grouping where the
 comprehension is aggregated, and a comprehension that yields a collection per row leaves the
@@ -606,6 +606,27 @@ site it left alone keeps its `curry`, and op-conversion reads the domain off the
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
 its key sits. A tile that cannot answer every key answers none, since an undecided key would
 have to re-offset the groups it left.
+
+### A correlated filter rides the pair
+
+A **filter** on the inner source rides the pair it filters, as a refinement `lambda_elim`
+writes on the product. Planning emits it as `filter_values` — a term, which is what applies
+it, since this site is a morphism under `curry` rather than one the iterate-then-restrict
+chain reaches. A keyed collection's carried present-key proof is a different kind of
+refinement and stays on the binder whose lookup reads it.
+
+[`Filter`] reads the resulting mask **positionally**: the predicate compiled over the same
+pairs, so its flat codomain is one boolean per entry in entry order, which is the mask
+`Tile::retain_keys` takes and re-offsets the shortened groups from. Each side is pulled from its
+own branch of the pairs and they need not have reached the same rows. An input with nothing in it
+is already filtered, which is the ordinary end of a pull; anything else out of step is refused
+with a message that says so, rather than reading the mask across the misalignment, which drops
+the wrong entries silently, or answering empty, which waits for an alignment that is not
+coming.
+
+Still not compiled: a correlated filter whose **body reads nothing outer**, whose binder is
+free only in the type, so lambda elimination takes the Pi-const arm and the site never becomes
+a pair at all.
 
 ### Where a collection is materialized
 
