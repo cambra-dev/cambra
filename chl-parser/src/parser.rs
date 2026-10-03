@@ -1595,7 +1595,7 @@ where
 /// lambda. A requirement is a name, optionally applied to its operand types and then
 /// its associated types by name: `Addable(A, B, Output=O)`.
 ///
-/// Spec: `docs/chl-spec.md`, "Trait requirements [Decided]".
+/// Spec: `docs/chl-spec.md`, "Trait requirements".
 fn requires_clause<'src, I, E>(
     expr: E,
 ) -> impl Parser<'src, I, Vec<Spanned<Requirement>>, PErr<'src>> + Clone

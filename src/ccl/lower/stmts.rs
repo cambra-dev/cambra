@@ -10,8 +10,8 @@ use crate::{
         TypedExprNode,
     },
     chl_parser::ast::{
-        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
-        Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
+        AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern,
+        Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
     },
 };
 
@@ -775,12 +775,12 @@ pub(super) fn lower_middle_stmt(
             requires,
             body: fn_body,
         } => {
-            refuse_requires_clause(requires)?;
             let (func_expr, annotation) = lower_def(
                 stmt.span,
                 type_params,
                 params,
                 output.as_ref(),
+                requires,
                 fn_body,
                 ctx,
             )?;
@@ -1334,7 +1334,8 @@ pub(super) fn lower_let_annotation(
 /// Declare `type_params` in the current alias scope, in order, each as an alias of
 /// a fresh [`Type::SharedHole`] that inference resolves to the parameter when it
 /// opens the `Poly`, and each bound lowered with the parameters before it in scope.
-/// Return them as a `Poly`'s parameter list. The caller owns the scope.
+/// Each is also pushed onto [`LoweringContext::type_params_in_scope`]. Return them as
+/// a `Poly`'s parameter list. The caller owns both scopes and restores them.
 pub(super) fn declare_type_params(
     type_params: &[TypeParam],
     ctx: &mut LoweringContext,
@@ -1364,6 +1365,7 @@ pub(super) fn declare_type_params(
             unreachable!("`fresh_shared_hole` mints a `SharedHole`");
         };
         ctx.declare_type_alias(name, hole);
+        ctx.type_params_in_scope.push((name.to_string(), id));
         declared.push(crate::ccl::ty::PolyParam {
             hole: id,
             spelling: name.into(),
@@ -1371,6 +1373,202 @@ pub(super) fn declare_type_params(
         });
     }
     Ok(declared)
+}
+
+/// Lower a `requires` clause over the type parameters in scope
+/// (`docs/chl-spec.md`, "Trait requirements").
+///
+/// Each requirement names a trait the table has, with that trait's operand count and
+/// associated types. An `Equatable` over products is read componentwise, as `==` reads
+/// two products, so it lowers to one requirement per component. After that every
+/// operand is a type parameter or a base type, and one that no instance could accept,
+/// alone or with the other operands' bases, is refused here, since no use could
+/// satisfy it. A requirement on bases only states nothing about a parameter: it is
+/// checked against the table and dropped.
+pub(super) fn lower_requirements(
+    requires: &[Spanned<Requirement>],
+    ctx: &mut LoweringContext,
+) -> Result<Vec<crate::ccl::ty::PolyRequirement>, LoweringError> {
+    use crate::ccl::infer::solver::traits::{Assoc, Trait};
+    let mut out = Vec::new();
+    for req in requires {
+        let name = req.node.name.as_str();
+        if name == "Transaction" {
+            return Err(LoweringError::unsupported(
+                req.node.name_span,
+                "`requires Transaction` is not supported yet: transactions as contextual \
+                 parameters are not implemented",
+            ));
+        }
+        let Some(trait_) = Trait::from_surface_name(name) else {
+            return Err(LoweringError::unsupported(
+                req.node.name_span,
+                format!(
+                    "`{name}` is not a trait; a requirement names one of Addable, Subtractable, \
+                     Multipliable, Divisible, Exponentiable, Negatable, Equatable, Orderable, \
+                     Comparable"
+                ),
+            ));
+        };
+        if req.node.args.len() != trait_.arity() {
+            return Err(LoweringError::unsupported(
+                req.span,
+                format!(
+                    "`{trait_}` is over {} type(s), and this requirement names {}",
+                    trait_.arity(),
+                    req.node.args.len()
+                ),
+            ));
+        }
+        let args = req
+            .node
+            .args
+            .iter()
+            .map(|a| lower_type_expr(a, ctx))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut assoc: Vec<(Assoc, Type)> = Vec::new();
+        for a in &req.node.assoc {
+            let Some(n) =
+                Assoc::from_surface_name(a.name.as_str()).filter(|n| trait_.assocs().contains(n))
+            else {
+                return Err(LoweringError::unsupported(
+                    a.name_span,
+                    format!("`{trait_}` associates no type named `{}`", a.name),
+                ));
+            };
+            if assoc.iter().any(|(m, _)| *m == n) {
+                return Err(LoweringError::unsupported(
+                    a.name_span,
+                    format!("`{n}` is named twice in this requirement"),
+                ));
+            }
+            let ty = lower_type_expr(&a.value, ctx)?;
+            if !is_requirement_operand(&ty, ctx) {
+                return Err(LoweringError::unsupported(
+                    a.value.span,
+                    format!(
+                        "`{n}=…` names a type parameter or a base type; no instance of \
+                         `{trait_}` associates `{ty}`"
+                    ),
+                ));
+            }
+            assoc.push((n, ty));
+        }
+        expand_requirement(trait_, args, assoc, req.span, ctx, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// `ty` for a diagnostic, each type parameter's hole shown by the parameter's name.
+fn with_param_names(ty: &Type, ctx: &LoweringContext) -> Type {
+    let mut out = ty.clone();
+    fn go(ty: &mut Type, ctx: &LoweringContext) {
+        if let Type::SharedHole(id) = ty
+            && let Some((name, _)) = ctx.type_params_in_scope.iter().find(|(_, h)| h == id)
+        {
+            // A display-only leaf: only its spelling is read.
+            *ty = Type::Param(crate::ccl::ty::TypeParam::fresh(name.as_str(), 0, None));
+            return;
+        }
+        ty.walk_children_mut(|child| go(child, ctx));
+    }
+    go(&mut out, ctx);
+    out
+}
+
+/// Whether `ty` may stand at a requirement's position: a type parameter in scope or a
+/// base type.
+fn is_requirement_operand(ty: &Type, ctx: &LoweringContext) -> bool {
+    match ty {
+        Type::SharedHole(id) => ctx.is_type_param_hole(*id),
+        Type::Base(_) => true,
+        _ => false,
+    }
+}
+
+/// Push the requirement `trait_(args, assoc)` onto `out`, reading an `Equatable` over
+/// products componentwise. See [`lower_requirements`].
+fn expand_requirement(
+    trait_: crate::ccl::infer::solver::traits::Trait,
+    args: Vec<Type>,
+    assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    span: Span,
+    ctx: &LoweringContext,
+    out: &mut Vec<crate::ccl::ty::PolyRequirement>,
+) -> Result<(), LoweringError> {
+    let unsatisfiable = |args: &[Type]| {
+        let shown: Vec<String> = args
+            .iter()
+            .map(|t| with_param_names(t, ctx).to_string())
+            .collect();
+        LoweringError::unsupported(
+            span,
+            format!(
+                "no instance of `{trait_}` accepts ({}), so no use could satisfy this \
+                 requirement",
+                shown.join(", ")
+            ),
+        )
+    };
+    if trait_.is_structural()
+        && args
+            .iter()
+            .any(|a| matches!(a, Type::Tuple(_) | Type::Record(_)))
+    {
+        let components: Option<Vec<Vec<Type>>> = match (&args[0], &args[1]) {
+            (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => Some(
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| vec![x.clone(), y.clone()])
+                    .collect(),
+            ),
+            (Type::Record(a), Type::Record(b))
+                if a.len() == b.len() && a.iter().zip(b).all(|((m, _), (n, _))| m == n) =>
+            {
+                Some(
+                    a.iter()
+                        .zip(b)
+                        .map(|((_, x), (_, y))| vec![x.clone(), y.clone()])
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+        let Some(components) = components else {
+            return Err(unsatisfiable(&args));
+        };
+        for component in components {
+            expand_requirement(trait_, component, Vec::new(), span, ctx, out)?;
+        }
+        return Ok(());
+    }
+    if !args.iter().all(|a| is_requirement_operand(a, ctx)) {
+        return Err(unsatisfiable(&args));
+    }
+    let fits = |row: &crate::ccl::infer::solver::traits::TraitInstance| {
+        args.iter()
+            .zip(row.args.iter())
+            .all(|(a, b)| !matches!(a, Type::Base(base) if base != b))
+    };
+    if !trait_.instances().iter().any(fits) {
+        return Err(unsatisfiable(&args));
+    }
+    if args.iter().all(|a| matches!(a, Type::Base(_))) {
+        if assoc.iter().any(|(_, t)| !matches!(t, Type::Base(_))) {
+            return Err(LoweringError::unsupported(
+                span,
+                "a requirement on base types only fixes its associated type to a base type; \
+                 write that type instead of a type parameter",
+            ));
+        }
+        return Ok(());
+    }
+    out.push(crate::ccl::ty::PolyRequirement {
+        trait_,
+        args,
+        assoc,
+    });
+    Ok(())
 }
 
 /// Lower a CHL type *expression* to a CCL [`Type`].
@@ -1559,15 +1757,18 @@ pub(super) fn lower_type_expr_or_poly(
                     ),
                 ));
             }
-            refuse_requires_clause(requires)?;
             let snapshot = ctx.snapshot_type_aliases();
+            let scoped = ctx.type_params_in_scope.len();
             let poly = declare_type_params(type_params, ctx).and_then(|params| {
+                let requires = lower_requirements(requires, ctx)?;
                 let body = lower_type_expr(body, ctx)?;
                 Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
                     params,
+                    requires,
                     body,
                 })))
             });
+            ctx.type_params_in_scope.truncate(scoped);
             ctx.restore_type_aliases(snapshot);
             poly
         }

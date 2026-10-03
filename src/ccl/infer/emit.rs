@@ -101,13 +101,45 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
             Some(binding) => {
-                let (ty, bounded) = binding
-                    .scheme
-                    .instantiate_with_params(ctx.level, &ctx.telescope);
+                let requirements = ctx.requirements.get(name).cloned();
+                let extra: Vec<&Type> = requirements
+                    .iter()
+                    .flat_map(|rs| rs.iter())
+                    .flat_map(|r| r.args.iter().chain(r.assoc.iter().map(|(_, t)| t)))
+                    .collect();
+                let (ty, bounded, extra) =
+                    binding
+                        .scheme
+                        .instantiate_with_params(ctx.level, &ctx.telescope, &extra);
                 for (instantiation, bound) in bounded {
                     ctx.require_sub(&instantiation, &bound, &|| {
                         format!("the bound of a type parameter of `{name}`")
                     })?;
+                }
+                // Each requirement becomes an obligation at this use's types, minted
+                // as an operator's is; the associated type it names receives what the
+                // obligation settles (`src/ccl/design/type-parameters.md`,
+                // "Instantiation").
+                let mut extra = extra.into_iter();
+                for r in requirements.iter().flat_map(|rs| rs.iter()) {
+                    let args: Vec<Type> = extra.by_ref().take(r.args.len()).collect();
+                    let assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)> = r
+                        .assoc
+                        .iter()
+                        .map(|(n, _)| (*n, extra.next().expect("one freshened type per name")))
+                        .collect();
+                    let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
+                    let settled = ctx.require_trait(
+                        r.trait_,
+                        node_id,
+                        &args.iter().collect::<Vec<_>>(),
+                        &[],
+                        assoc.first().map(|(n, _)| *n),
+                        &at,
+                    )?;
+                    if let (Some(settled), Some((_, named))) = (settled, assoc.first()) {
+                        ctx.require_sub(&settled, named, &at)?;
+                    }
                 }
                 ty
             }
@@ -1766,12 +1798,18 @@ pub(super) fn emit_let<C: Typing>(
         Some(Type::Poly(poly)) => Some(std::rc::Rc::clone(poly)),
         _ => None,
     };
-    let bound_ty = ctx.in_let_rhs(|ctx| {
-        if let Some(poly) = &poly {
-            ctx.open_poly(poly);
-        }
-        ctx.subexpr(bound_expr)
+    //
+    // Its `requires` clause is in scope over the right-hand side as assumptions, and
+    // recorded for the binding's uses to instantiate.
+    let (bound_ty, assumptions) = ctx.in_let_rhs(|ctx| {
+        let assumptions = match &poly {
+            Some(poly) => ctx.open_poly(poly),
+            None => Vec::new(),
+        };
+        let ty = ctx.with_assumptions(&assumptions, |ctx| ctx.subexpr(bound_expr))?;
+        Ok((ty, assumptions))
     })?;
+    ctx.record_requirements(&binding.name, assumptions);
     // A `let d = Defer` binding names its channel's domain rigidly — replace
     // the handle's (fresh, otherwise-unconstrained) domain var with the
     // literal nominal `ChanDom(d)`, so every consumer of a read of `d` types

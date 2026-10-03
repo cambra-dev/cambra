@@ -26,7 +26,7 @@ use super::schemes::OperatorSchemes;
 use super::solve::value_type;
 use super::typing::Typing;
 use super::{coalesce_for_error, map_constrain_err};
-use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
+use crate::ccl::infer::solver::traits::{Assoc, Assumption, Trait, TraitObligation};
 
 /// A lexical-scope entry: the binder's polymorphic scheme.
 ///
@@ -196,6 +196,14 @@ pub(super) struct InferCtx {
     /// that would quietly become an ordinary variable, a flexible `T`, and this is
     /// what the normalization checks.
     pub(super) type_param_holes: HashSet<u32>,
+    /// The assumptions in scope at the current emission position: the `requires`
+    /// clauses of the polymorphic annotations whose right-hand sides enclose it.
+    /// Every obligation `require_trait` mints takes those about its trait
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    assumptions: Vec<Rc<Assumption>>,
+    /// Each binding annotated with a `requires` clause, with the clause normalized:
+    /// what a use instantiates beside its scheme ("Instantiation").
+    pub(super) requirements: HashMap<Name, Rc<Vec<Rc<Assumption>>>>,
     /// The binders in lexical scope at the current emission position — what
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
@@ -252,6 +260,8 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             type_param_holes: HashSet::new(),
+            assumptions: Vec::new(),
+            requirements: HashMap::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
         }
@@ -532,6 +542,7 @@ impl Typing for InferCtx {
             operator_node_id,
             operand_exprs.iter().map(|e| (*e).clone()).collect(),
         );
+        obligation.assume(&self.assumptions);
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);
         }
@@ -568,7 +579,25 @@ impl Typing for InferCtx {
         out
     }
 
-    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) {
+    fn with_assumptions<R>(
+        &mut self,
+        assumptions: &[Rc<Assumption>],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let depth = self.assumptions.len();
+        self.assumptions.extend(assumptions.iter().cloned());
+        let r = f(self);
+        self.assumptions.truncate(depth);
+        r
+    }
+
+    fn record_requirements(&mut self, name: &Name, assumptions: Vec<Rc<Assumption>>) {
+        if !assumptions.is_empty() {
+            self.requirements.insert(name.clone(), Rc::new(assumptions));
+        }
+    }
+
+    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) -> Vec<Rc<Assumption>> {
         // In declaration order: a bound names only the parameters before it, whose
         // holes are seeded by the time it is normalized.
         for p in &poly.params {
@@ -585,6 +614,24 @@ impl Typing for InferCtx {
                 p.hole,
             );
         }
+        poly.requires
+            .iter()
+            .map(|r| {
+                Rc::new(Assumption {
+                    trait_: r.trait_,
+                    args: r
+                        .args
+                        .iter()
+                        .map(|t| self.normalize_annotation(t))
+                        .collect(),
+                    assoc: r
+                        .assoc
+                        .iter()
+                        .map(|(n, t)| (*n, self.normalize_annotation(t)))
+                        .collect(),
+                })
+            })
+            .collect()
     }
 
     fn require_sub(

@@ -127,12 +127,35 @@ pub(super) trait Typing {
 
     /// Open a `let`'s polymorphic annotation before its right-hand side is
     /// emitted: mint each type parameter's [`Type::Param`], at the current level
-    /// and over its normalized bound, as what its shared hole normalizes to
-    /// (`src/ccl/design/type-parameters.md`, "Checking a binding against a
-    /// polymorphic type"). Called inside [`in_let_rhs`](Self::in_let_rhs), so a
-    /// parameter sits at the level of the right-hand side's own variables. Check
-    /// never meets a `Poly`: none survives inference.
-    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType);
+    /// and over its normalized bound, as what its shared hole normalizes to, and
+    /// return the `requires` clause with its types normalized, as the assumptions
+    /// the right-hand side is emitted under (`src/ccl/design/type-parameters.md`,
+    /// "Checking a binding against a polymorphic type"). Called inside
+    /// [`in_let_rhs`](Self::in_let_rhs), so a parameter sits at the level of the
+    /// right-hand side's own variables. Check never meets a `Poly`: none survives
+    /// inference.
+    fn open_poly(
+        &mut self,
+        poly: &crate::ccl::ty::PolyType,
+    ) -> Vec<std::rc::Rc<crate::ccl::infer::solver::traits::Assumption>>;
+
+    /// Run `f` with `assumptions` in scope: every trait obligation minted meanwhile
+    /// takes those about its trait as rows beside its instances. Check mints none.
+    fn with_assumptions<R>(
+        &mut self,
+        assumptions: &[std::rc::Rc<crate::ccl::infer::solver::traits::Assumption>],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized;
+
+    /// Record the `requires` clause of the binding `name`, which each use of it
+    /// instantiates. Check instantiates nothing.
+    fn record_requirements(
+        &mut self,
+        name: &Name,
+        assumptions: Vec<std::rc::Rc<crate::ccl::infer::solver::traits::Assumption>>,
+    );
 
     /// `ty` with each shared hole that stands for an opened type parameter replaced
     /// by the parameter, and nothing else changed: what an annotation is reported as

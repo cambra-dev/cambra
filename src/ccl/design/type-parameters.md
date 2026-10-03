@@ -2,9 +2,9 @@
 
 > **Status: [Sketched].** A proposed implementation of
 > [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
-> [Implementation stack](#implementation-stack), items 1 to 3 are implemented: the parser,
-> polymorphic aliases, and type parameters with their bounds. The sections on requirements,
-> `Poly` against `Poly`, and printing describe work not yet done.
+> [Implementation stack](#implementation-stack), items 1 to 4 are implemented: the parser,
+> polymorphic aliases, type parameters with their bounds, and requirements. The sections on
+> `Poly` against `Poly`, printing, and item 7 describe work not yet done.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -40,13 +40,11 @@ pub struct TypeParam {
 }
 
 pub struct PolyType {
-    pub params: Vec<PolyParam>, // each a shared-hole id, a spelling, and a bound
+    pub params: Vec<PolyParam>,         // each a shared-hole id, a spelling, and a bound
+    pub requires: Vec<PolyRequirement>, // each a trait, its operands, its associated types
     pub body: Type,
 }
 ```
-
-Item 4 adds a `requires` list to `PolyType`, each requirement a trait, its operand types (any
-types), its associated types by name, and a span.
 
 The variant names follow the spec's terms, "polymorphic type" and "type parameter". `Var` would be
 a third meaning for one word: `TypedExprNode::Var` is a term variable, and `Type::Infer` holds an
@@ -108,12 +106,8 @@ rather than inside the body's block. `LoweringContext::type_params_in_scope` let
 no value parameter's annotation names is refused after lowering, by walking the binders of the
 lambda chain `uncurry_params` builds.
 
-A `requires` clause lowers in item 4. Until then lowering refuses one on a `def` and on a `Poly`.
-Item 4 resolves each requirement's trait name against the trait table
-([chl-spec.md, "Trait requirements [Decided]"](../../../docs/chl-spec.md#trait-requirements-decided))
-and lowers each argument as an ordinary type expression. `Transaction` stays refused until
-[chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
-is implemented.
+A `requires` clause on a `def` or a `Poly` lowers into the `Poly`'s `requires`, as
+[Lowering requirements](#lowering-requirements) describes.
 
 ---
 
@@ -142,8 +136,10 @@ mentions a parameter.
 
 1. Opens `𝜋` inside `in_let_rhs` (`Typing::open_poly`): mints each parameter's `Param` at the
    right-hand side's level, with its bound normalized at that level, and seeds the shared-hole memo
-   with it under the parameter's hole. Item 4 also pushes `𝜋`'s requirements as **assumptions**
-   here ([Obligations under assumptions](#obligations-under-assumptions)).
+   with it under the parameter's hole. It returns `𝜋`'s requirements normalized, which are in
+   scope as **assumptions** while the right-hand side is emitted
+   ([Obligations under assumptions](#obligations-under-assumptions)) and recorded for the
+   binding's uses.
 2. Emits the right-hand side and records `inferred <: 𝜋.body` through `bind_annotation`, at the
    right-hand side's level, with the parameters opaque. A `def`'s body is a `Hole`, completed from
    the lambda's type.
@@ -190,39 +186,46 @@ such as `𝑇 <: {at: Int}` meeting a wider record, still collides.
 
 ## Obligations under assumptions
 
-A type parameter arriving at an operator's operand is `Offered::Param`. Delivery offers its bound
-in its place, so `x + 1` with `x: T <: Int` resolves as `Int + Int`, and an unbounded parameter fails
-with `MissingRequirement`, naming the parameter and the trait. `link_watches` replays a parameter
-already on a variable when an obligation is linked to it, as it replays a base. That is item 3. The
-rest of this section is item 4.
+An obligation's candidate set holds its trait's **instances** and its **assumptions**: the
+requirements of the `requires` clauses in scope where it is minted (`TraitObligation::assumptions`).
+`emit_let` puts a `Poly`'s requirements in scope over its right-hand side
+(`Typing::with_assumptions`), and `require_trait` gives each obligation those about its trait.
+Lowering leaves every assumption's operands a base or a type parameter
+([Lowering requirements](#lowering-requirements)), so an assumption is matched by equality.
 
-An obligation's candidate set holds **rows**. A row is an instance from the trait's table or an
-**assumption**: a requirement of a `Poly` open where the obligation is minted. `InferCtx` keeps the
-stack of open `Poly`s, and `require_trait` adds their requirements on the obligation's trait. An
-instance row's arguments are bases; an assumption's are any types.
+A contribution arriving at a position narrows both kinds of row:
 
-A contribution arriving at a position keeps the rows whose argument there it **matches**: the same
-base, the same parameter, or the same type former (tuple, record, function, collection, variant)
-with the same arity and labels. Matching compares heads only. When every surviving row agrees on the
-argument at a position, that argument is deposited as an upper bound on the operand variable, the
-polarity [Requirements are read together, once](type-inference.md#requirements-are-read-together-once)
-uses, and ordinary subtyping checks the rest of the structure. A base's row is fully determined by
-its head, so this adds nothing for an instance row.
+| Contribution | Instances | Assumptions |
+| --- | --- | --- |
+| a base | keep the rows with that base there | keep the rows stating that base there |
+| a type parameter an assumption names there (`narrow_param`) | all dropped | keep the rows naming it there |
+| any other type parameter | its bound is offered in its place; with no bound, `MissingRequirement` | as for the bound |
+| a product | answered by `narrow_product`, as before | the component obligations it mints start from the same assumptions |
 
-A product still goes through `narrow_product` for `Equatable`, whose reading is componentwise. An
-assumption `Equatable({T, U}, {T, U})` is therefore also read componentwise when the `Poly` is
-opened: it adds `Equatable(T, T)` and `Equatable(U, U)`, which the component obligations
-`narrow_product` mints are answered by.
+So a requirement covering an operator on a bounded parameter answers it before the bound does. The
+obligation fails when both kinds are empty. A failure that leaves only assumptions reports what they
+accept: `operand 2 is Int, but the only type accepted there is T`.
 
-Deposit of an associated type is unchanged: once every surviving row agrees on it, it is deposited,
-and it may be a parameter. `x + y` under `requires Addable(T, T, Output=T)` gives the sum type `T`.
+Deposit reads both kinds: once every surviving row agrees on an associated type, it is deposited,
+and it may be a parameter, so `a + b` under `requires Addable(T, T, Output=T)` gives the sum type
+`T`. An assumption that leaves `Output` unnamed leaves the position open in the body.
 
-An obligation that a parameter empties reports the missing assumption by name:
-`no requirement states Addable(T, Int); add it to the requires clause`. A requirement that no
-instance row could match at some position, such as `Orderable(List(T), List(T))`, is an error at
-the requirement when the `Poly` is opened, since no use could satisfy it. The sweep intersects
-accepted types, bases and parameters alike, and treats a parameter it settles on as it treats a
-base.
+The sweep of [Requirements are read together, once](type-inference.md#requirements-are-read-together-once)
+skips an obligation that still holds assumptions: its operand is a parameter, which the sweep's base
+intersection cannot read.
+
+### Lowering requirements
+
+`lower_requirements` resolves each requirement against the trait table: the name
+(`Trait::from_surface_name`), the operand count, and each associated type by name
+(`Assoc::from_surface_name`). It reads an `Equatable` over products componentwise, so
+`Equatable({T, U}, {T, U})` lowers to `Equatable(T, T)` and `Equatable(U, U)`. Every operand is then
+a type parameter in scope or a base type, and a requirement no instance row could match given its
+bases, or with any other operand, is refused at the requirement, since no use could satisfy it. A
+requirement on bases only is checked and dropped. `Transaction` is refused until
+[chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
+is implemented. A type parameter that is the associated type of a requirement whose operands are
+determined is itself determined, for the check that every parameter is.
 
 ---
 
@@ -234,9 +237,10 @@ The `Var` arm instantiates every binding through `PolyScheme::instantiate_with_p
    in the use's telescope, through `FreshenCache::params`, and the body freshens through it.
 2. For each parameter with bound `𝐵`, the arm records `𝛼 <: 𝐵[𝛼/𝑃]`, the bound freshened through
    the same cache.
-3. Item 4: for each requirement, the arm calls `require_trait` over the substituted arguments, then
-   records `𝑜 <: 𝛼ₒ` from the obligation's associated variable `𝑜` to the substituted associated
-   type.
+3. For each requirement of the binding's `requires` clause, normalized when the `Poly` was opened
+   and kept in `InferCtx::requirements` by the binding's name, the arm calls `require_trait` over the
+   substituted operands, freshened through the same cache, then records `𝑜 <: 𝛼ₒ` from the
+   obligation's associated variable `𝑜` to the substituted associated type.
 
 A failure in 2 or 3 is blamed on the use. Item 7 adds a secondary label at the bound's or the
 requirement's span, the error shape
@@ -269,11 +273,18 @@ checks such a definition alone with `typecheck_discarded_definition` once its la
 specialized, after which nothing clones from it, as it already checks a definition nothing calls. A
 diagnostic the clones already raised is not repeated.
 
-Item 4: a cloned obligation holding an assumption of the specialized `Poly` is reset to its trait's
-table and redelivered its operands' current lower bounds, so the clone resolves as an ordinary
-monomorphic body. Freshening writes bounds directly and so does not deliver; the redelivery replaces
-it. That the reset obligations resolve follows from the use having satisfied every requirement at
-the same types, and item 7 of the [Implementation stack](#implementation-stack) asserts it.
+An obligation copy holding an assumption about one of the specialized binding's own parameters
+is reset to its trait's instances and the assumptions that name no such parameter
+(`TraitObligation::reset_for_specialization`), and is redelivered its operands' lower bounds once
+the clone is pinned (`redeliver`). Freshening writes bounds directly and so does not deliver; the
+redelivery, which reads the bounds transitively, replaces it. That a reset obligation resolves
+follows from the use having satisfied every requirement at the same types, and item 7 of the
+[Implementation stack](#implementation-stack) asserts it.
+
+A use inside a generic definition checked alone carries that definition's still-opaque parameters
+into the specialization it reaches. The coalesce walk keeps the `requires` clauses of the
+definitions it is checking alone in scope (`CoalesceCtx::assumptions`), and a reset obligation is
+given those as well (`assume_more`).
 
 `spec_key` keys a parameter as an atom by `id`, for the uses inside a definition checked alone.
 
@@ -341,9 +352,9 @@ One change per item, each updating this doc and the spec status it implements:
 3. **`Type::Poly`, `Type::Param`, bounds** (implemented). Lowering of `def` type parameters and of
    `\T -> V`, levels and escape, subtyping, checking a binding against a `Poly`, instantiation of
    bounds, specialization, a generic definition checked alone, the post-inference check, display.
-4. **Requirements.** Assumption rows, head matching and its deposit, the componentwise `Equatable`
-   reading, unsatisfiable requirements, instantiation of requirements, clone reset and redelivery,
-   the sweep.
+4. **Requirements** (implemented). Assumption rows, the componentwise `Equatable` reading,
+   unsatisfiable requirements, instantiation of requirements, clone reset and redelivery, the
+   sweep.
 5. **`Poly` against `Poly`.** The subsumption rule, with Module types as its consumer.
 6. **Printing inferred polymorphic types.**
 7. **A use that checks compiles.** Each generalized definition checked alone; the debug assertion

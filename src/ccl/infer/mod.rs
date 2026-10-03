@@ -653,7 +653,7 @@ pub(crate) fn run(
     // state, so nothing needs to be kept in sync across them.
     // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
-    let errors = coalesce_pass(expr);
+    let errors = coalesce_pass(expr, std::mem::take(&mut sub_ctx.requirements));
     if !errors.is_empty() {
         return Err(errors);
     }
