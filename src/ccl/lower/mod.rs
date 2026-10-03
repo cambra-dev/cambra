@@ -1117,7 +1117,15 @@ fn lower_expr_inner(
             };
             Ok(Expr::variant_ctor(tag.as_str(), payload))
         }
-        ChlExpr::Lambda { params, body } => lower_lambda(expr.span, params, body, ctx),
+        ChlExpr::Lambda {
+            type_params,
+            params,
+            body,
+            requires,
+        } => {
+            refuse_lambda_type_params(type_params, requires)?;
+            lower_lambda(expr.span, params, body, ctx)
+        }
         ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),
         // Ternary `then_expr if cond else else_expr` → Case { [guard → value, true → orelse] }
         ChlExpr::IfExp {

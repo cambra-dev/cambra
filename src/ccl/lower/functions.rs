@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
-    chl_parser::ast::{AnnotationMode, Param, Span, Spanned},
+    chl_parser::ast::{AnnotationMode, Param, Requirement, Span, Spanned, TypeParam},
 };
 
 /// The binder a `=> T` output annotation introduces to check the body's result.
@@ -368,6 +368,60 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
     let _frame = copy_frame("lower.uncurry_proj");
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
     expr
+}
+
+/// Refuse a `def` signature's type parameters and `requires` clause, which the
+/// parser recognises and lowering does not implement yet (`docs/chl-spec.md`,
+/// "6.8 Polymorphic types").
+pub(super) fn refuse_polymorphic_signature(
+    type_params: &[TypeParam],
+    requires: &[Spanned<Requirement>],
+) -> Result<(), LoweringError> {
+    if let Some(param) = type_params.first() {
+        return Err(LoweringError::unsupported(
+            param.name_span,
+            format!(
+                "`{}` is a type parameter, since it is capitalized, and type parameters are \
+                 not supported yet",
+                param.name
+            ),
+        ));
+    }
+    if let Some(requirement) = requires.first() {
+        return Err(LoweringError::unsupported(
+            requirement.span,
+            "a `requires` clause is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse what a lambda value cannot take: a capitalized binder is a type
+/// parameter and a `requires` clause states requirements on them, and only a
+/// polymorphic type in an annotation binds either (`docs/chl-spec.md`,
+/// "Polymorphic type annotations [Decided]").
+pub(super) fn refuse_lambda_type_params(
+    type_params: &[TypeParam],
+    requires: &[Spanned<Requirement>],
+) -> Result<(), LoweringError> {
+    if let Some(param) = type_params.first() {
+        return Err(LoweringError::unsupported(
+            param.name_span,
+            format!(
+                "`{}` is capitalized, so it is a type parameter, which a lambda value does \
+                 not take; only a polymorphic type `\\{} -> …` in an annotation binds one",
+                param.name, param.name
+            ),
+        ));
+    }
+    if let Some(requirement) = requires.first() {
+        return Err(LoweringError::unsupported(
+            requirement.span,
+            "a lambda value takes no `requires` clause; only a polymorphic type in an \
+             annotation states requirements",
+        ));
+    }
+    Ok(())
 }
 
 /// Lower a Python function definition body to a CCL expression.

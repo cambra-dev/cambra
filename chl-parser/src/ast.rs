@@ -252,11 +252,16 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
-    /// `def name(params) => output: body`.
+    /// `def name(type_params, params) => output requires …: body`.
+    ///
+    /// The type parameters are the capitalized leading parameters, kept apart from
+    /// `params` because they are not arguments: `params` alone is the arity.
     FunctionDef {
         name: SmolStr,
+        type_params: Vec<TypeParam>,
         params: Vec<Param>,
         output: Option<Spanned<Expr>>,
+        requires: Vec<Spanned<Requirement>>,
         body: Vec<Spanned<Stmt>>,
     },
 
@@ -346,6 +351,38 @@ pub struct Param {
     pub name: SmolStr,
     pub name_span: Span,
     pub annotation: Option<TypeAnnotation>,
+}
+
+/// A type parameter: a capitalized name with an optional upper bound, `T <: U`.
+///
+/// Spec: `docs/chl-spec.md`, "Type parameters \[Decided\]".
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: SmolStr,
+    pub name_span: Span,
+    pub bound: Option<Spanned<Expr>>,
+}
+
+/// One requirement of a `requires` clause: `Addable(A, B, Output=O)`, or a bare
+/// name such as `Transaction`.
+///
+/// Spec: `docs/chl-spec.md`, "Trait requirements \[Decided\]".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Requirement {
+    pub name: SmolStr,
+    pub name_span: Span,
+    /// The operand types, positionally.
+    pub args: Vec<Spanned<Expr>>,
+    /// The associated types, by name, written after the operands.
+    pub assoc: Vec<AssocArg>,
+}
+
+/// A named argument of a requirement, `Output=O`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssocArg {
+    pub name: SmolStr,
+    pub name_span: Span,
+    pub value: Spanned<Expr>,
 }
 
 /// A user-written type annotation at a binder, and which of the two readings it
@@ -629,10 +666,17 @@ pub enum Expr {
         payload: Option<VariantPayload>,
     },
 
-    /// Lambda: `\params -> body`.
+    /// Lambda: `\params -> body`, or in a type position the polymorphic type
+    /// `\T, U <: B -> V requires …`.
+    ///
+    /// The parser cannot tell the two positions apart, since an annotation is an
+    /// expression: capitalized binders are type parameters and a `requires` clause
+    /// may follow the body in either. Lowering decides what each position accepts.
     Lambda {
+        type_params: Vec<TypeParam>,
         params: Vec<Param>,
         body: Box<Spanned<Expr>>,
+        requires: Vec<Spanned<Requirement>>,
     },
 
     /// Ternary conditional: `then_expr if cond else else_expr`.
