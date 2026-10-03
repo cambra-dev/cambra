@@ -118,10 +118,10 @@ mod tests {
     #[test]
     fn the_agreement_is_where_the_slowest_producer_has_reached() {
         let mut releases = ProducerReleases::default();
-        releases.record("a", &Predicate::LessThanEq(Value::UInt(1)));
-        releases.record("a", &Predicate::LessThanEq(Value::UInt(4)));
-        releases.record("b", &Predicate::LessThanEq(Value::UInt(2)));
-        assert_eq!(releases.agreed(), Predicate::LessThanEq(Value::UInt(2)));
+        releases.record("a", &Predicate::at_or_below(Value::UInt(1)));
+        releases.record("a", &Predicate::at_or_below(Value::UInt(4)));
+        releases.record("b", &Predicate::at_or_below(Value::UInt(2)));
+        assert_eq!(releases.agreed(), Predicate::at_or_below(Value::UInt(2)));
     }
 
     /// A producer registering before the carry reads everything the source holds;
@@ -130,19 +130,19 @@ mod tests {
     #[test]
     fn a_producer_registering_after_the_carry_starts_at_the_agreement() {
         let mut releases = ProducerReleases::default();
-        releases.record("a", &Predicate::LessThanEq(Value::UInt(2)));
+        releases.record("a", &Predicate::at_or_below(Value::UInt(2)));
         assert_eq!(releases.on_registration(), &Predicate::False);
 
         releases.carry_to_new_producers();
         assert_eq!(
             releases.on_registration(),
-            &Predicate::LessThanEq(Value::UInt(2))
+            &Predicate::at_or_below(Value::UInt(2))
         );
 
         // The newcomer counts as having released the agreement even before it
         // releases anything itself, so it neither re-reads what is gone nor holds
         // the agreement back to nothing.
         releases.record("b", &Predicate::False);
-        assert_eq!(releases.agreed(), Predicate::LessThanEq(Value::UInt(2)));
+        assert_eq!(releases.agreed(), Predicate::at_or_below(Value::UInt(2)));
     }
 }

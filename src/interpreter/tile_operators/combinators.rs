@@ -65,6 +65,7 @@ impl TileOperator for Converse {
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            held: Vec::new(),
         })
     }
 
@@ -78,6 +79,23 @@ struct ConverseProducer {
     base: ProducerBase,
     /// The upstream producer whose output is inverted.
     input: Box<dyn TileProducer>,
+    /// Each input row last read, as the path `[value, key]` it stands at in the output. A
+    /// release names output paths, and an input row is released once the path it stands
+    /// at is, which takes its value to read.
+    held: Vec<(Value, Value)>,
+}
+
+impl ConverseProducer {
+    /// The keys of the held input rows `guard` covers. An input row stands at exactly one
+    /// output path, under its own value, so it is released where that path is: under a
+    /// released group, or named beneath one.
+    fn held_rows_covered(&self, guard: &TileGuard) -> Vec<Value> {
+        self.held
+            .iter()
+            .filter(|(value, key)| guard.covers_path(&[value.clone(), key.clone()]))
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
 }
 
 /// Sort row indices by typed key, detect group boundaries, and assemble the nested tile
@@ -116,20 +134,24 @@ fn converse_group_by_key<K: PartialOrd>(
         .collect();
     // The inner keys: the original keys, reordered to match the sorted groups.
     let domain2_col = domain.select_indices(order.into_iter(), n);
+    // A decided input row never moves to another group, so `[k, d]` is final under every
+    // `k` once `d` is: the inner level carries the input's predicate unqualified. A group
+    // is final only when no undecided row remains that could still join it.
+    let outer_predicate = if domain_predicate.is_true() {
+        Predicate::True
+    } else {
+        Predicate::False
+    };
     Tile::data_function(
         domain1_col,
         Box::new(Tile::grouped(
             ColumnValue::UInts(group_starts),
             domain2_col.clone(),
             Box::new(Tile::Scalar(domain2_col)),
-            Predicate::True,
+            domain_predicate,
             output_deleted,
         )),
-        if domain_predicate.as_bool().unwrap_or(false) {
-            Predicate::True
-        } else {
-            Predicate::False
-        },
+        outer_predicate,
         BitSet::new(),
     )
 }
@@ -143,7 +165,7 @@ impl TileProducer for ConverseProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        match input_tile {
+        let mut out = match input_tile {
             Tile::DataFunction {
                 row_starts,
                 domain,
@@ -156,6 +178,13 @@ impl TileProducer for ConverseProducer {
                     1,
                     "converse inverts one mapping, so its input is one collection"
                 );
+                self.held = match &*codomain {
+                    Tile::Scalar(values) => (0..domain.len())
+                        .filter(|row| !deleted.contains(*row))
+                        .map(|row| (values.index_at(row), domain.index_at(row)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
 
                 match *codomain {
                     Tile::Scalar(codomain) => {
@@ -254,20 +283,56 @@ impl TileProducer for ConverseProducer {
                 }
             }
             _ => panic!("Can only converse functions"),
+        };
+        // A group can be released while the input still grows, since `release_impl` frees
+        // only the rows held; a row arriving later with a released value would otherwise
+        // put the group back into a region the consumer has let go. That row is released
+        // upstream on the pull that first holds it: the release reached `release_impl`
+        // before the row arrived, so nothing else frees it.
+        if !self.base.obsolete_guard.is_empty() {
+            let released = self.base.obsolete_guard.clone();
+            let late = self.held_rows_covered(&released);
+            if !late.is_empty() {
+                let rows = late.into_iter().fold(Predicate::False, |all, key| {
+                    all.union(&Predicate::point(key))
+                });
+                self.input
+                    .release(TileGuard::Function(FunctionGuard::Domain(rows)));
+            }
+            out.remove_guarded(released);
         }
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        match obsolete_guard {
-            g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
-            TileGuard::Function(FunctionGuard::Codomain(g)) => {
-                if let TileGuard::Function(FunctionGuard::Domain(p)) = g.as_ref() {
-                    self.input
-                        .release(TileGuard::Function(FunctionGuard::Domain(p.clone())))
-                }
+        let released = match obsolete_guard {
+            g if g.is_universal() => {
+                return self.input.release(self.input.tiling().universal_guard());
             }
-            g => panic!("Converse cannot honor the release guard {g:?}"),
+            ref g => self.held_rows_covered(g),
+        };
+        // A statement beneath the groups that names no group says the same under every one, so it
+        // releases the input rows it names whether or not they have arrived.
+        fn under_every_group(guard: &TileGuard) -> Predicate {
+            match guard {
+                TileGuard::Or(arms) => arms
+                    .iter()
+                    .map(under_every_group)
+                    .fold(Predicate::False, |all, one| all.union(&one)),
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => match inner.as_ref() {
+                    TileGuard::Function(FunctionGuard::Domain(keys)) => keys.unqualified_arms(),
+                    _ => Predicate::False,
+                },
+                _ => Predicate::False,
+            }
         }
+        let rows = released
+            .into_iter()
+            .fold(under_every_group(&obsolete_guard), |all, key| {
+                all.union(&Predicate::point(key))
+            });
+        self.input
+            .release(TileGuard::Function(FunctionGuard::Domain(rows)));
     }
 }
 
@@ -704,13 +769,14 @@ impl TileProducer for FilterProducer {
                 let depth = pred
                     .innermost_depth()
                     .unwrap_or_else(|| unreachable!("the arm matched a collection"));
+                let level = CurryLevel::new(depth);
                 let Tile::DataFunction {
                     domain: pred_keys, ..
-                } = pred.values_at(depth)
+                } = pred.values_at(level)
                 else {
                     unreachable!("innermost_depth names a collection")
                 };
-                let Tile::DataFunction { domain: keys, .. } = input.values_at(depth) else {
+                let Tile::DataFunction { domain: keys, .. } = input.values_at(level) else {
                     panic!(
                         "a filter's predicate masks the level at depth {depth}, which its \
                          input does not hold: {input:?}"
@@ -748,7 +814,7 @@ impl TileProducer for FilterProducer {
                 let mask = pred_column
                     .as_bitvec()
                     .unwrap_or_else(|| panic!("Expected bools"));
-                input.values_at_mut(depth).retain_keys(mask);
+                input.values_at_mut(level).retain_keys(mask);
                 input
             }
             _ => panic!("Invalid Filter input tiles"),
@@ -1629,6 +1695,7 @@ mod tests {
         let mut producer = ConverseProducer {
             base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
+            held: Vec::new(),
         };
         producer.get(producer.tiling().universal_guard())
     }
@@ -1638,6 +1705,53 @@ mod tests {
             Extent::Base(BaseType::Int),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )
+    }
+
+    /// A released group stays released: a row the input delivers later with that group's
+    /// value does not put the group back, and the input is released of that row.
+    #[test]
+    fn a_released_group_is_not_redelivered_when_a_row_joins_it() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let input_at = |keys: Vec<i64>, values: Vec<i64>| {
+            Tile::data_function(
+                ColumnValue::Ints(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let output_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::Base(BaseType::Int),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![10]), one_level_tiling());
+        let mut producer = ConverseProducer {
+            base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
+            input: Box::new(input),
+            held: Vec::new(),
+        };
+        let _ = producer.get(producer.tiling().universal_guard());
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(10)),
+        )));
+        // Row 0 was released upstream; row 1 joins group 10 and row 2 starts group 20.
+        *next.borrow_mut() = input_at(vec![1, 2], vec![10, 20]);
+        let mut out = producer.get(producer.tiling().universal_guard());
+        out.compact();
+        let Tile::DataFunction { domain, .. } = &out else {
+            panic!("converse yields a collection: {out:?}")
+        };
+        assert_eq!(domain, &ColumnValue::Ints(vec![20]), "{out:?}");
+        // The release of group 10 reached `release_impl` before row 1 arrived, so the pull
+        // that first holds row 1 is what releases it, and row 2's group is still live.
+        let upstream = producer.input.obsolete_guard();
+        assert!(
+            upstream.covers_path(&[Value::Int(1)]) && !upstream.covers_path(&[Value::Int(2)]),
+            "{upstream:?}"
+        );
     }
 
     /// Basic converse: `{0→10, 1→20, 2→10}` groups by codomain value.

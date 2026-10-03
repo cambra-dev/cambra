@@ -111,9 +111,9 @@ pub(super) fn insert_iterate_recurse(
     if matches!(&expr.node, TypedExprNode::List(_)) {
         return;
     }
-    // A zipped product pairs its components over the ambient iteration: op-conversion's
-    // `Zip` arm fans the outer input out to each component, so each is compiled with
-    // `input=Some(fan_out_branch)`. The value-position arms below would mark a
+    // A zipped product pairs its components beneath the levels they were applied over:
+    // op-conversion's `Zip` arm fans the outer input out to each component, so each is
+    // compiled with `input=Some(fan_out_branch)`. The value-position arms below would mark a
     // collection-valued component as an iteration site ([`mark_component_source`]),
     // and an `iterate` chain takes no input — the same shape the `Copair` arm's
     // `Data`-kind test keeps a fanned-out `Case` arm away from. Recurse into each

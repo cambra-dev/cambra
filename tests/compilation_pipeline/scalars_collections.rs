@@ -616,7 +616,7 @@ fn arithmetic_and_comparison_on_computed_operands(#[case] code: &str, #[case] ex
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
 #[case(
     "x = [1, 2]; x ++ x ++ x",
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1, 2, 2], vec![
@@ -624,7 +624,7 @@ fn arithmetic_and_comparison_on_computed_operands(#[case] code: &str, #[case] ex
                 ColumnValue::UInts(vec![0, 1]),
                 ColumnValue::UInts(vec![0, 1]),
 
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 #[case(
     "x = [1, 2]; y = x ++ x ++ x; y",
     Tile::data_function(ColumnValue::positional_union(&[0, 0, 1, 1, 2, 2], vec![
@@ -632,7 +632,7 @@ fn arithmetic_and_comparison_on_computed_operands(#[case] code: &str, #[case] ex
                 ColumnValue::UInts(vec![0, 1]),
                 ColumnValue::UInts(vec![0, 1]),
 
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))), Predicate::Union(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 1, 2, 1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
 #[case("sum([1] ++ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case("sum([1 for y in [1] ++ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2])))]
 #[case("sum([1 for y in [1] ++ [2] ++ [3]])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
