@@ -1198,7 +1198,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // specializations; its node type and binder slots are set there, so the
     // generic tail is skipped likewise.
     if let TypedExprNode::Let { bound_expr, .. } = &expr.node
-        && should_generalize(bound_expr, level)
+        && should_generalize(bound_expr, level, |name| {
+            lookup_generalized(&ctx.scope, name).is_some()
+        })
     {
         coalesce_generalized_let(expr, level, ctx);
         return;

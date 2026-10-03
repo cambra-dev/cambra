@@ -309,19 +309,6 @@ hashed tree holds one after inference.
 
 ---
 
-## Polymorphic aliases
-
-An alias `g = f` of a generalized `f` needs no annotation. `should_generalize` admits a `let`
-whose right-hand side is a `Var` naming a generalized binding, asking the scope rather than reading
-levels, since a monomorphic `let`'s variables also sit one level above its binding. The `Var` arm
-instantiates `f`'s scheme inside `g`'s right-hand side, one level up, so `g`'s type holds
-quantifiable variables and `f`'s obligations ride them. A use of `g` specializes a clone of `Var f`,
-which specializes `f` inside the clone's walk, the path [3.1 Let-Polymorphism is Freshening
-(Instantiation)](type-inference.md#31-let-polymorphism-is-freshening-instantiation) describes for a
-generalized function used inside another.
-
----
-
 ## Printing an inferred polymorphic type
 
 `poly_for_display` (`ccl::infer::solver::display`) renders a type as an `InferredPoly`: a

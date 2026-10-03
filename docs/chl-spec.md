@@ -2794,8 +2794,8 @@ requires `Addable` of its operand types ([Trait requirements](#trait-requirement
 `add(1, "s")` is rejected at the call. `def f(a): (a + 1, a + "s")` is rejected at the definition,
 because no type satisfies both of its requirements.
 
-A binding whose right-hand side names a polymorphic binding is polymorphic too (**[Decided]**).
-`g = f` binds `g` at `f`'s type, and each use of `g` instantiates that type as a use of `f` would:
+A binding whose right-hand side names a polymorphic binding is polymorphic too. `g = f` binds `g`
+at `f`'s type, and each use of `g` instantiates that type as a use of `f` would:
 
 ```python
 def add(a, b):
