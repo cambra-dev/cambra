@@ -73,7 +73,7 @@ pub use spec_key::{SpecKey, spec_key};
 /// a binding when its type's level exceeds the binding level).
 pub fn type_level(ty: &Type) -> Level {
     match ty {
-        Type::Infer(v) => v.level,
+        Type::Infer(v) => v.level(),
         // A bounded annotation's level is its bound's: the variable it becomes is
         // minted at the *use* level by `normalize_annotation`, so the bound is all
         // there is to report here.
@@ -114,6 +114,12 @@ pub fn type_level(ty: &Type) -> Level {
         // A witness reference is a leaf (level 0) — naming its binder gives it no
         // solver content.
         Type::WitnessRef(_) => 0,
+        // Unlike a channel domain, a type parameter reports the level it was opened
+        // at: it must not flow to a lower-level variable, and reporting its level is
+        // what routes such an edge to the escape check
+        // (`src/ccl/design/type-parameters.md`, "Levels").
+        Type::Param(param) => param.level(),
+        Type::Poly(poly) => poly.types().map(type_level).max().unwrap_or(0),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -238,7 +244,7 @@ mod tests {
         let s = v.bounds.borrow();
         assert!(s.lower().is_empty());
         assert!(s.upper().is_empty());
-        assert_eq!(v.level, 0);
+        assert_eq!(v.level(), 0);
     }
 
     /// Regression: mutually-constrained inference variables form an `Rc`

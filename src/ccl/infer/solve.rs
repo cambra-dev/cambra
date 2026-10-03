@@ -166,6 +166,12 @@ pub(super) struct CoalesceCtx {
     /// error records them, so an error a use causes inside a clone is reported at the
     /// use that clone serves ([`coalesce_generalized_let`]).
     specializing: Vec<ActiveSpecialization>,
+    /// The levels of the type parameters held opaque by the definitions being checked
+    /// alone, innermost last ([`typecheck_discarded_definition`]). A use there can
+    /// carry one into a specialization of a binding declared further out, so
+    /// [`specialize_use`] raises the clone to the innermost of these
+    /// (`src/ccl/design/type-parameters.md`, "Specialization").
+    opaque_params_at: Vec<Level>,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -370,6 +376,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // Nominal channel domains agree by name (the level is freshening
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
+        (Type::Param(a), Type::Param(b)) => a == b,
         (
             Type::Fun {
                 name: n1,
@@ -900,6 +907,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
         pred_memo: PredMemo::new(),
         discarding: false,
         specializing: Vec::new(),
+        opaque_params_at: Vec::new(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
@@ -1080,7 +1088,9 @@ fn check_scope_valid_go(
 /// Resolve a type that may contain inference variables into a concrete
 /// `Type`, via the compact → simplify → coalesce pipeline.
 pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
-    coalesce_compact(&simplify_type(compact_type(ty)))
+    let compacted = compact_type(ty);
+    crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)?;
+    coalesce_compact(&simplify_type(compacted))
 }
 
 /// Hold [`pin_unobservable_arm_payload`] to its premise: a tag it pinned is one the
@@ -1848,7 +1858,11 @@ fn coalesce_type_predicates_go(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        | Type::Param(_)
         | Type::Infer(_) => {}
+        Type::Poly(poly) => Rc::make_mut(poly)
+            .types_mut()
+            .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
     }
 }
 
@@ -2013,7 +2027,20 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // freshen renames them consistently everywhere it reaches (node types,
     // binder slots, predicate slots, and bound edges alike).
     seed_chan_dom_pairings(&resolved, &clone.ty, cutoff, &mut fresh.chan_doms);
-    freshen_expr_type_slots(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
+    // Inside a definition checked alone, the use's types can hold that definition's
+    // opaque type parameters, which sit deeper than this binding's own variables. The
+    // clone is raised to stand at least as deep, so a parameter flows into it as any
+    // type does rather than reaching a variable below its level, where it would escape.
+    let raise = ctx
+        .opaque_params_at
+        .last()
+        .map_or(0, |at| at.saturating_sub(cutoff + 1));
+    let target = if raise == 0 {
+        FreshenLevel::Preserve
+    } else {
+        FreshenLevel::Raise(raise)
+    };
+    freshen_expr_type_slots(&mut clone, cutoff, target, &mut fresh);
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,
     // this drives the use site's accumulated bounds into the clone's
@@ -2052,7 +2079,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         at_use: use_expr.node_id(),
         copies: Rc::clone(&origins),
     });
-    coalesce_node(&mut clone, cutoff + 1, ctx);
+    coalesce_node(&mut clone, cutoff + 1 + raise, ctx);
     ctx.specializing.pop();
     ctx.scope.extend(suspended);
     if pin_succeeded {
@@ -2148,6 +2175,12 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // Every specialization is the one binding, split by use type, so each
     // carries its transparency.
     let transparency = binding.transparency;
+    // A definition annotated with a polymorphic type holds its type parameters
+    // opaque, opened one level above the binding, while it is checked alone.
+    let has_type_params = matches!(
+        &binding.user_annotation,
+        Some(Type::Poly(poly)) if !poly.params.is_empty()
+    );
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
@@ -2189,7 +2222,13 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // (`src/ccl/design/type-inference.md`, "Checking a definition alone"). Every use has
     // been specialized by now, so nothing clones from it any more and it can be resolved
     // in place.
+    if has_type_params {
+        ctx.opaque_params_at.push(level + 1);
+    }
     let raised = typecheck_discarded_definition(&mut frame.def, level, ctx);
+    if has_type_params {
+        ctx.opaque_params_at.pop();
+    }
     // A use whose instantiation failed reports the definition's defect again at every
     // node of the user that carries it. Where the definition alone raises the defect,
     // it is reported there, once.

@@ -369,23 +369,11 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
     expr
 }
 
-/// Refuse a `def` signature's type parameters and `requires` clause, which the
-/// parser recognises and lowering does not implement yet (`docs/chl-spec.md`,
-/// "6.10 Polymorphic types").
-pub(super) fn refuse_polymorphic_signature(
-    type_params: &[TypeParam],
+/// Refuse a `requires` clause, which the parser recognises and lowering does not
+/// implement yet (`docs/chl-spec.md`, "Trait requirements").
+pub(super) fn refuse_requires_clause(
     requires: &[Spanned<Requirement>],
 ) -> Result<(), LoweringError> {
-    if let Some(param) = type_params.first() {
-        return Err(LoweringError::unsupported(
-            param.name_span,
-            format!(
-                "`{}` is a type parameter, since it is capitalized, and type parameters are \
-                 not supported yet",
-                param.name
-            ),
-        ));
-    }
     if let Some(requirement) = requires.first() {
         return Err(LoweringError::unsupported(
             requirement.span,
@@ -414,6 +402,82 @@ pub(super) fn refuse_capitalized_lambda_binder(params: &[Param]) -> Result<(), L
         )),
         None => Ok(()),
     }
+}
+
+/// A `def` with type parameters is a `let` annotated with a polymorphic type that
+/// binds them, over a `Hole` body: the lambda's own annotations already state the
+/// signature (`src/ccl/design/type-parameters.md`, "Lowering"). The returned
+/// annotation is that `Poly`, or `None` for a `def` with no type parameters. The
+/// type parameters are aliases of their [`Type::Param`]s over the whole definition,
+/// parameter annotations and `=>` result included.
+pub(super) fn lower_def(
+    fn_span: Span,
+    type_params: &[TypeParam],
+    params: &[Param],
+    output: Option<&Spanned<ChlExpr>>,
+    body: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+) -> Result<(Expr, Option<Type>), LoweringError> {
+    if type_params.is_empty() {
+        return Ok((
+            lower_function_body(fn_span, params, output, body, ctx)?,
+            None,
+        ));
+    }
+    let aliases = ctx.snapshot_type_aliases();
+    let scoped = ctx.type_params_in_scope.len();
+    let result = declare_type_params(type_params, ctx).and_then(|declared| {
+        ctx.type_params_in_scope
+            .extend(type_params.iter().map(|p| p.name.to_string()));
+        let func = lower_function_body(fn_span, params, output, body, ctx)?;
+        // Every type parameter is determined by a call's arguments, so each appears
+        // in a value parameter's annotation (`docs/chl-spec.md`, "Type parameters").
+        let mentioned = parameter_annotation_params(&func);
+        if let Some((tp, _)) = type_params
+            .iter()
+            .zip(&declared)
+            .find(|(_, d)| !mentioned.contains(&d.param.id))
+        {
+            return Err(LoweringError::unsupported(
+                tp.name_span,
+                format!(
+                    "type parameter `{}` appears in no parameter's annotation, so no call's \
+                     arguments determine it",
+                    tp.name
+                ),
+            ));
+        }
+        let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
+            params: declared,
+            body: Type::Hole,
+        }));
+        Ok((func, Some(poly)))
+    });
+    ctx.type_params_in_scope.truncate(scoped);
+    ctx.restore_type_aliases(aliases);
+    result
+}
+
+/// The type parameters the annotations on `func`'s parameters name: the binders of
+/// the lambda chain `uncurry_params` builds, one lambda for an uncurried definition
+/// and one per parameter for a `Mut`-parameter one.
+fn parameter_annotation_params(func: &Expr) -> HashSet<crate::ccl::ty::TypeParamId> {
+    fn collect(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
+        if let Type::Param(param) = ty {
+            out.insert(param.id);
+        }
+        ty.walk_children(|child| collect(child, out));
+    }
+    let mut out = HashSet::new();
+    let mut node = func;
+    while let TypedExprNode::Lambda { param, body } = &node.node {
+        collect(&param.ty, &mut out);
+        if let Some(annotation) = &param.user_annotation {
+            collect(annotation, &mut out);
+        }
+        node = body;
+    }
+    out
 }
 
 /// Lower a Python function definition body to a CCL expression.

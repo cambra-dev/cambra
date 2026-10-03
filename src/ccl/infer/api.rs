@@ -386,6 +386,35 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// A binding annotated with a polymorphic type whose right-hand side is not
+    /// polymorphic: a name of a monomorphic binding (`docs/chl-spec.md`,
+    /// "Polymorphic type annotations").
+    MonomorphicPolyBinding {
+        /// The binding's name.
+        name: String,
+    },
+    /// A type parameter would reach something declared outside the definition
+    /// that declares it, whose type is fixed before the parameter is chosen.
+    TypeParamEscapes {
+        /// The parameter's spelling.
+        param: String,
+        /// What the value reaches, where the typing rule knows it.
+        target: Option<EscapeTarget>,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
+    /// An operator applied to a value of a type parameter's type, with no
+    /// requirement stating the trait it needs.
+    MissingRequirement {
+        /// The trait the operator requires, e.g. `Addable`.
+        trait_: String,
+        /// The operand position (0-based) the parameter stands at.
+        position: u8,
+        /// The parameter's spelling.
+        param: String,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// An operator was used at operand types no instance of its trait
     /// accepts — `1 > "a"`, `"a" - "b"`, or a polymorphic function applied at a type
     /// its body's operators cannot handle.
@@ -677,6 +706,9 @@ impl InferError {
             | InferError::IncompatibleBounds { .. }
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
+            | InferError::TypeParamEscapes { .. }
+            | InferError::MissingRequirement { .. }
+            | InferError::MonomorphicPolyBinding { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
         }
     }
@@ -720,6 +752,29 @@ pub struct LocatedInferError {
     pub error: InferError,
     /// The node whose typing rule raised the error.
     pub node_id: crate::ccl::provenance::NodeId,
+}
+
+impl LocatedInferError {
+    /// Name what a [`InferError::TypeParamEscapes`] reaches, for the typing rule that
+    /// knows it; any other error, or one already naming its target, is unchanged.
+    pub(crate) fn with_escape_target(mut self, named: EscapeTarget) -> Self {
+        if let InferError::TypeParamEscapes { target, .. } = &mut self.error
+            && target.is_none()
+        {
+            *target = Some(named);
+        }
+        self
+    }
+}
+
+/// What a value of a type parameter's type reaches when it escapes its definition
+/// ([`InferError::TypeParamEscapes`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EscapeTarget {
+    /// The argument of a call to `function`.
+    Argument { function: String },
+    /// A contribution to the feed `channel`.
+    Feed { channel: String },
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -931,6 +986,43 @@ impl std::fmt::Debug for InferError {
                     position + 1,
                 )
             }
+            InferError::MonomorphicPolyBinding { name } => write!(
+                f,
+                "`{name}` is annotated with a polymorphic type, but its right-hand side is \
+                 monomorphic: only a function definition or a name of a polymorphic binding \
+                 can be polymorphic"
+            ),
+            InferError::TypeParamEscapes { param, target, at } => match target {
+                Some(EscapeTarget::Argument { function }) => write!(
+                    f,
+                    "cannot pass a value of type parameter `{param}` to `{function}`: \
+                     `{function}` is declared outside `{param}`'s definition, so its \
+                     parameter type cannot depend on `{param}`"
+                ),
+                Some(EscapeTarget::Feed { channel }) => write!(
+                    f,
+                    "cannot append a value of type parameter `{param}` to `{channel}`: \
+                     `{channel}` is declared outside `{param}`'s definition, so its element \
+                     type cannot depend on `{param}`"
+                ),
+                None => write!(
+                    f,
+                    "a value of type parameter `{param}` reaches a type fixed outside \
+                     `{param}`'s definition at {at}, so that type cannot depend on `{param}`"
+                ),
+            },
+            InferError::MissingRequirement {
+                trait_,
+                position,
+                param,
+                at,
+            } => write!(
+                f,
+                "No requirement states that `{param}` is {trait_} at {at}: operand {} is the \
+                 type parameter `{param}`, which supports only what its bound and \
+                 `requires` clause state",
+                position + 1,
+            ),
             InferError::UnsatisfiableOperand { requirements } => {
                 writeln!(
                     f,
@@ -1532,6 +1624,16 @@ fn collect_type_errors(
                 )));
             }
         }
+        // Specialization substitutes each use's types for a type parameter, and a
+        // `Poly` annotation leaves with the generalized `let` it annotated, so either
+        // surviving is a compiler bug. Reported at every strictness, like `Hole`.
+        Type::Param(param) => errors.push(InferError::Unsupported(format!(
+            "type parameter `{}` survived inference at `{context_sym}`",
+            param.spelling
+        ))),
+        Type::Poly(_) => errors.push(InferError::Unsupported(format!(
+            "polymorphic type `{ty}` survived inference at `{context_sym}`"
+        ))),
         Type::Fun {
             domain,
             codomain,

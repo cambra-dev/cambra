@@ -1235,7 +1235,9 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
+        | Type::Param(_)
         | Type::Txn => ty.clone(),
+        Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(strip_refinements))),
     }
 }
 

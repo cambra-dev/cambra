@@ -148,7 +148,9 @@ fn blame_node_for_place(
             | Type::SharedHole(_)
             | Type::DataSource(_)
             | Type::ChanDom(_, _)
+            | Type::Param(_)
             | Type::Txn => false,
+            Type::Poly(poly) => poly.types().any(|t| mentions(t, uid)),
         }
     }
     /// The slots that make this node *itself* the place: its own type, an
@@ -243,6 +245,21 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ),
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
+        },
+        ConstrainError::TypeParamEscapes { param } => InferError::TypeParamEscapes {
+            param: param.spelling.to_string(),
+            target: None,
+            at: ctx_label.to_string(),
+        },
+        ConstrainError::MissingRequirement {
+            trait_,
+            position,
+            param,
+        } => InferError::MissingRequirement {
+            trait_: trait_.to_string(),
+            position,
+            param: param.spelling.to_string(),
+            at: ctx_label.to_string(),
         },
         ConstrainError::NoTraitInstance {
             trait_,

@@ -41,6 +41,22 @@ use crate::ccl::FieldKey;
 /// at use sites.
 #[derive(Debug, Clone)]
 pub enum ConstrainError {
+    /// A type parameter would reach a variable of an enclosing scope, where no use
+    /// substitutes for it (`docs/chl-spec.md`, "Type parameters").
+    TypeParamEscapes {
+        /// The escaping parameter.
+        param: Rc<crate::ccl::ty::TypeParam>,
+    },
+    /// An operator was applied to a value of a type parameter's type, and no
+    /// requirement states the trait the operator needs of it.
+    MissingRequirement {
+        /// The trait the operator requires.
+        trait_: Trait,
+        /// The operand position the parameter stands at.
+        position: u8,
+        /// The parameter.
+        param: Rc<crate::ccl::ty::TypeParam>,
+    },
     /// `lhs` and `rhs` cannot be related by the subtyping rules of
     /// [`Type`] — e.g. two distinct primitives, a function compared
     /// to a record, etc.
@@ -925,6 +941,9 @@ fn constrain_go_impl(
         // a channel's nominal domain is reflexively equal to
         // itself (the common read-vs-read case short-circuits here).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) if a == b => Ok(()),
+        // A type parameter is reflexively equal to itself, as the short-circuit above
+        // decides when the edge carries no morphism.
+        (Type::Param(a), Type::Param(b)) if a == b => Ok(()),
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
@@ -1386,7 +1405,7 @@ fn constrain_go_impl(
         // existing lower (`low.ty‹low.ty_subst› <: V‹low.self_subst›`) against
         // the new upper by bridging the holder gap and composing **forward**
         // onto the two content sides.
-        (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
+        (Type::Infer(lv), _) if type_level(rhs) <= lv.level() => {
             let lows = {
                 let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
                 crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
@@ -1457,7 +1476,7 @@ fn constrain_go_impl(
         // edge's forward morphism was reconstructed by inverting its stored
         // inverse, and a non-invertible discharge degraded to `id` twice over.
         // Here the forward morphism is read directly off the edge.
-        (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
+        (_, Type::Infer(rv)) if type_level(lhs) <= rv.level() => {
             let ups = {
                 let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
                 crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
@@ -1511,14 +1530,39 @@ fn constrain_go_impl(
         }
 
         // Level mismatch: variable's level is below the other side's.
-        // Lift the other side down via extrude and retry.
+        // Lift the other side down via extrude and retry. A type parameter cannot be
+        // lifted: below its level no use has substituted for it, so carrying one
+        // down is the parameter escaping its definition.
         (Type::Infer(lv), _) => {
-            let new_rhs = extrude(rhs, false, lv.level, &mut ExtrudeCache::new());
+            if let Some(param) = escaping_param(rhs, lv.level()) {
+                return Err(ConstrainError::TypeParamEscapes { param });
+            }
+            let new_rhs = extrude(rhs, false, lv.level(), &mut ExtrudeCache::new());
             constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
-            let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
+            if let Some(param) = escaping_param(lhs, rv.level()) {
+                return Err(ConstrainError::TypeParamEscapes { param });
+            }
+            let new_lhs = extrude(lhs, true, rv.level(), &mut ExtrudeCache::new());
             constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
+        }
+
+        // A type parameter is a subtype of whatever its bound is a subtype of
+        // (`src/ccl/design/type-parameters.md`, "Subtyping with a type parameter").
+        // After the variable arms, so a variable on either side records an edge, and
+        // before the refinement arm, so `𝑃 <: {Int | 𝑝}` reaches the bound. A refined
+        // `𝑃` on the right stays with the refinement arm, which has no sort for a
+        // parameter and so cannot discharge the refinement. With no bound, nothing
+        // but `𝑃` itself is above `𝑃`.
+        (Type::Param(param), _) if !matches!(rhs.peel_refinements(), Type::Param(q) if q == param) => {
+            match &param.bound {
+                Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
+                None => Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
+            }
         }
 
         // Feed handles are invariant in the payload: feeding writes into
@@ -1767,6 +1811,26 @@ fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
     }
 }
 
+/// A type parameter in `ty`'s structure opened above `target_level`, if one is: the
+/// parameter an edge to a variable at `target_level` would carry out of its
+/// definition. Variables are not entered; an edge reaching one records the
+/// parameter on that variable, where the same check meets it.
+fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::TypeParam>> {
+    match ty {
+        Type::Param(param) if param.level() > target_level => Some(Rc::clone(param)),
+        Type::Infer(_) => None,
+        _ => {
+            let mut found = None;
+            ty.walk_children(|child| {
+                if found.is_none() {
+                    found = escaping_param(child, target_level);
+                }
+            });
+            found
+        }
+    }
+}
+
 /// Lift `ty` so that all its variables live at level ≤ `target_level`.
 ///
 /// When a constraint crosses level boundaries (e.g. an outer-scope variable
@@ -1799,6 +1863,15 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
+        // `constrain_go` refuses an edge carrying a parameter below its level before
+        // it extrudes (`escaping_param`), and the level short-circuit above returns
+        // every other parameter unchanged.
+        Type::Param(param) => unreachable!(
+            "type parameter `{}` reached `extrude` above the target level; the escape \
+             check precedes extrusion",
+            param.spelling
+        ),
+        Type::Poly(_) => unreachable!("a polymorphic type reached `extrude`"),
         Type::Fun {
             name,
             fun_kind,
@@ -1930,6 +2003,61 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             Type::Infer(nvs)
         }
     }
+}
+
+/// `ty` as seen from `level`: every variable it reaches above `level` is moved down to
+/// `level`, through its bounds and kinds transitively, and the returned type's channel
+/// names are at `level` too.
+///
+/// A monomorphic binding's right-hand side is emitted one level above the binding,
+/// where a generalized sibling's is, so its variables and its `defer`'s channel would
+/// otherwise be quantified by that sibling and copied at each of its uses. Bound at
+/// its own level, the binding is one type the sibling shares
+/// (`src/ccl/design/type-inference.md`, "A monomorphic binding's variables sit at its
+/// level"). The transitive walk keeps the level invariant, that a variable's bounds
+/// sit at or below it. A channel's level does not take part in its identity
+/// ([`crate::ccl::ChanLevel`]), so the lowered name is the same channel.
+pub fn lower_levels(ty: &Type, level: Level) -> Type {
+    lower_var_levels(ty, level);
+    let mut ty = ty.clone();
+    lower_chan_levels(&mut ty, level);
+    ty
+}
+
+fn lower_chan_levels(ty: &mut Type, level: Level) {
+    if let Type::ChanDom(_, at) = ty {
+        at.0 = at.0.min(level);
+    }
+    ty.walk_children_mut(|child| lower_chan_levels(child, level));
+}
+
+fn lower_var_levels(ty: &Type, level: Level) {
+    if type_level(ty) <= level {
+        return;
+    }
+    if let Type::Infer(v) = ty {
+        // Lowered before its bounds are walked, which is what ends a cycle.
+        v.lower_level(level);
+        let bounds = v.bounds.borrow();
+        let reached: Vec<Type> = bounds
+            .lower()
+            .iter()
+            .chain(bounds.upper().iter())
+            .map(|b| b.ty.clone())
+            .chain(
+                bounds
+                    .type_kinds
+                    .iter()
+                    .flat_map(|k| k.children().iter().cloned()),
+            )
+            .collect();
+        drop(bounds);
+        for t in &reached {
+            lower_var_levels(t, level);
+        }
+        return;
+    }
+    ty.walk_children(|child| lower_var_levels(child, level));
 }
 
 /// Extrusion for an *invariant* position — a [`Type::History`] payload.
@@ -2186,7 +2314,7 @@ mod tests {
             let Type::Infer(proxy) = out else {
                 panic!("extruding a variable yields a variable, got {out:?}");
             };
-            assert_eq!(proxy.level, 0, "proxy sits at the target level");
+            assert_eq!(proxy.level(), 0, "proxy sits at the target level");
             assert_eq!(
                 proxy.bounds.borrow().type_kinds,
                 vec![TypeKind::UIntRanges],
@@ -2822,7 +2950,7 @@ mod tests {
         let Type::Infer(proxy) = value.as_ref() else {
             panic!("extruded value should be the proxy var, got {value}");
         };
-        assert_eq!(proxy.level, 0);
+        assert_eq!(proxy.level(), 0);
         let Type::Infer(orig) = &v1 else {
             unreachable!("fresh_var yields Type::Infer");
         };

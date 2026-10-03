@@ -415,7 +415,7 @@ fn lower_for_body_stmts_scoped(
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(mut_decl_with_assign_error(stmt.span, &name));
                 }
-                let ann = lower_type_annotation(annotation, ctx)?;
+                let ann = lower_let_annotation(annotation, value, ctx)?;
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
@@ -457,18 +457,24 @@ fn lower_for_body_stmts_scoped(
                 requires,
                 body: fn_body,
             } => {
-                refuse_polymorphic_signature(type_params, requires)?;
+                refuse_requires_clause(requires)?;
                 let name_str = name.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
                     return Err(outer_binding_write_error(stmt.span, &name_str));
                 }
-                let func_expr =
-                    lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
+                let (func_expr, annotation) = lower_def(
+                    stmt.span,
+                    type_params,
+                    params,
+                    output.as_ref(),
+                    fn_body,
+                    ctx,
+                )?;
                 frame_introduced.insert(name_str.clone());
                 prefix.push(PrefixStmt::Bind {
                     name: name_str,
                     value: func_expr,
-                    annotation: None,
+                    annotation,
                     span: stmt.span,
                     transparency: BindingTransparency::Transparent,
                 });
@@ -1340,7 +1346,7 @@ fn lower_loop_body_chain_scoped(
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(mut_decl_with_assign_error(stmt.span, &name));
                 }
-                let ann = lower_type_annotation(annotation, ctx)?;
+                let ann = lower_let_annotation(annotation, value, ctx)?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
             }
