@@ -451,10 +451,13 @@ fn lower_for_body_stmts_scoped(
             }
             ChlStmt::FunctionDef {
                 name,
+                type_params,
                 params,
                 output,
+                requires,
                 body: fn_body,
             } => {
+                refuse_polymorphic_signature(type_params, requires)?;
                 let name_str = name.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
                     return Err(outer_binding_write_error(stmt.span, &name_str));

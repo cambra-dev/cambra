@@ -238,6 +238,34 @@ fn function_def_and_call() {
     "});
 }
 
+/// The `requires Transaction` signatures the north-star programs (`storefront`,
+/// `nonneg_inventory`, `txn_kv`) are written with, and the type parameters and trait
+/// requirements of `docs/chl-spec.md`, "6.10 Polymorphic types".
+#[test]
+fn requires_clauses_and_type_parameters() {
+    must_parse_module(indoc! {"
+        def reserve(sku: String, qty: Int) => Bool requires Transaction:
+            True
+    "});
+    must_parse_module(indoc! {"
+        def put(key: String, value: String) requires Transaction:
+            key
+    "});
+    must_parse_module(indoc! {"
+        def larger(T, a: T, b: T) => T requires Orderable(T, T):
+            b if a < b else a
+    "});
+    must_parse_module(indoc! {"
+        def add(A, B, O, a: A, b: B) => O requires Addable(A, B, Output=O):
+            a + b
+    "});
+    must_parse_module("bigger: forall (T <: {at: Int}) {T, T} => T = larger");
+    must_parse_module(indoc! {"
+        def same(T: Type, a: T) => T:
+            a
+    "});
+}
+
 #[test]
 fn yield_generator() {
     must_parse_module(indoc! {"

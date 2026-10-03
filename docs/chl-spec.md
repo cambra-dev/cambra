@@ -135,6 +135,7 @@ with
 match  case
 pass
 where
+forall requires
 ```
 
 `where` is the refinement predicate separator (§6.4). It is lexed so the name is
@@ -152,21 +153,24 @@ reserved for future use.
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
+`forall` begins a polymorphic type (**[Planned]**,
+[Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
+clause, which ends a `def` signature or a polymorphic type (**[Planned]**,
+[Trait requirements](#trait-requirements)).
+
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
-> `summon` (the transactions-as-contextual-parameters layer — §8.7,
-> **[Decided]**; `requires` also states trait requirements —
-> [Trait requirements](#trait-requirements)), `forall` (polymorphic types, **[Decided]**,
-> [Polymorphic type annotations](#polymorphic-type-annotations)), `import`, `use`, `as`, `pub`,
-> `run`, `param` and `this` (modules, **[Decided]**, [9. Modules [Decided]](#9-modules-decided)),
-> `type` (nominal types, **[Decided]**, [6.8 Nominal types and methods
-> [Decided]](#68-nominal-types-and-methods-decided)), and `assert` and its
+> `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
+> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `import`, `use`, `as`,
+> `pub`, `run`, `param` and `this` (modules, **[Decided]**, [9. Modules
+> [Decided]](#9-modules-decided)), `type` (nominal types, **[Decided]**, [6.8 Nominal types and
+> methods [Decided]](#68-nominal-types-and-methods-decided)), and `assert` and its
 > `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names
-> for other purposes. (`with`, `:=`, `match`, `case` and `where` are
+> for other purposes. (`with`, `:=`, `match`, `case`, `where`, `forall` and `requires` are
 > **already** lexed — the first two carry today's transactions and mutation,
-> §8, `match`/`case` carry tag dispatch, §4.10, and `where` separates a
-> refinement's predicate, §6.4 — so they are not in this list.)
+> §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's predicate,
+> §6.4, and `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10 — so
+> they are not in this list.)
 
 ### 1.7 Literals
 
@@ -350,8 +354,10 @@ for_stmt        ::= "for" assign_target "in" expression ":" block
 
 with_stmt       ::= "with" [ ident "=" ] expression ":" block
 
-def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" [ "=>" expression ] ":" block
-param           ::= ident [ ":" expression ]
+def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
+params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
+value_param     ::= ident [ ( ":" | "<:" ) expression ]
+-- `type_param` and `requires_clause` are in §6.10 (**[Planned]**).
 
 -- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
 -- decorator and the declaration are one statement, which is why a declaration
@@ -1135,6 +1141,11 @@ unwritable on a *lambda* parameter; one parses on a `def` parameter, on a
 returning a pair, §2.4) is unusual but unambiguous — the first `->` closes the binder, the rest is
 body.
 
+A capitalized lambda binder is an error. A capitalized name is a type, bound only by an alias
+([6.7 Type-alias statements](#67-type-alias-statements)), a `def`'s type parameter, or a
+polymorphic type `forall (T) V` (**[Planned]**,
+[Polymorphic type annotations](#polymorphic-type-annotations)).
+
 ### 3.11 List, tuple, record literals
 
 | Form | Denotes |
@@ -1487,7 +1498,7 @@ leaves it inferred and bounded above by `T` (see [Two annotation
 forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
 The two forms may be mixed across a parameter list. A capitalized
 parameter is a type parameter, not a value
-(**[Decided]**, [Type parameters](#type-parameters)). A return-type
+(**[Planned]**, [Type parameters](#type-parameters)). A return-type
 annotation, introduced by `=>`, specifies a fixed output type for the
 function. The inferred type of the function body must be a subtype of
 the annotated output type.
@@ -2269,7 +2280,7 @@ marked one carries its status per "How to read this document".)
   through which one module is passed to another (**[Decided]**,
   [9.8 Module types](#98-module-types)).
 - `forall (T) U` — polymorphic type: for every type `T`, a `U`
-  (**[Decided]**, [6.10 Polymorphic types](#610-polymorphic-types)), written only as a whole `let`
+  (**[Planned]**, [6.10 Polymorphic types](#610-polymorphic-types)), written only as a whole `let`
   annotation.
 
 CHL also supports **refinement types**: a value of the refined type is
@@ -2819,7 +2830,7 @@ The rules, and what each one is doing:
   `:=`, `op=`, `<<=`, a `for` target, a comprehension generator — rejects a
   capitalized binder and names this one. A `def` name is not yet checked; a
   capitalized one binds a value the type language cannot see. A capitalized
-  parameter is a type parameter (**[Decided]**, [Type parameters](#type-parameters)).
+  parameter is a type parameter (**[Planned]**, [Type parameters](#type-parameters)).
 - **The type language's own names are reserved.** `Int`, `UInt`, `String`,
   `Bool`, `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
   `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
@@ -2970,7 +2981,7 @@ monomorphic, and making each field polymorphic on its own is **[Open]**.
 
 #### Type parameters
 
-**[Decided]**
+**[Planned]**
 
 ```ebnf
 def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
@@ -3015,7 +3026,7 @@ first("a", "b")   # T = String
 
 #### Kinds and bounds
 
-**[Decided]**
+**[Planned]**
 
 A type parameter ranges over a **kind**, a set of types. `T: K` states that `T` is one of the types
 in the kind `K`:
@@ -3047,7 +3058,7 @@ With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: I
 
 #### Trait requirements
 
-**[Decided]**
+**[Planned]**
 
 ```ebnf
 requires_clause ::= "requires" requirement ( "," requirement )*
@@ -3096,7 +3107,7 @@ of one listed type, and a tuple or record satisfies `Equatable` only against the
 
 #### Polymorphic type annotations
 
-**[Decided]**
+**[Planned]**
 
 ```ebnf
 poly_type       ::= "forall" "(" type_param ( "," type_param )* ")" expression [ requires_clause ]

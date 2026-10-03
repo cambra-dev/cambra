@@ -85,6 +85,10 @@ pub enum Token {
     Match,
     #[token("case", priority = 3)]
     Case,
+    #[token("forall", priority = 3)]
+    Forall,
+    #[token("requires", priority = 3)]
+    Requires,
 
     // -- Multi-char operators (must precede their single-char prefixes) ---
     #[token("<<=")]
@@ -260,6 +264,8 @@ impl fmt::Display for Token {
             Token::True => "True",
             Token::False => "False",
             Token::Where => "where",
+            Token::Forall => "forall",
+            Token::Requires => "requires",
             Token::And => "and",
             Token::Or => "or",
             Token::Not => "not",
@@ -764,7 +770,7 @@ mod tests {
 
     #[test]
     fn keywords_beat_idents() {
-        let toks = tokens("if elif else for in def not and or True False where");
+        let toks = tokens("if elif else for in def not and or True False where forall requires");
         assert_eq!(
             toks,
             vec![
@@ -780,6 +786,8 @@ mod tests {
                 Token::True,
                 Token::False,
                 Token::Where,
+                Token::Forall,
+                Token::Requires,
                 Token::Newline,
             ]
         );

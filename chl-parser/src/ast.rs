@@ -252,11 +252,16 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
-    /// `def name(params) => output: body`.
+    /// `def name(type_params, params) => output requires …: body`.
+    ///
+    /// The type parameters are the capitalized leading parameters, kept apart from
+    /// `params` because they are not arguments: `params` alone is the arity.
     FunctionDef {
         name: SmolStr,
+        type_params: Vec<TypeParam>,
         params: Vec<Param>,
         output: Option<Spanned<Expr>>,
+        requires: Vec<Spanned<Requirement>>,
         body: Vec<Spanned<Stmt>>,
     },
 
@@ -346,6 +351,48 @@ pub struct Param {
     pub name: SmolStr,
     pub name_span: Span,
     pub annotation: Option<TypeAnnotation>,
+}
+
+/// A type parameter: a capitalized name, optionally with its kind, `T: K`, or its upper
+/// bound, `T <: U`.
+///
+/// Spec: `docs/chl-spec.md`, "Type parameters".
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParam {
+    pub name: SmolStr,
+    pub name_span: Span,
+    pub annotation: Option<KindAnnotation>,
+}
+
+/// What a type parameter's annotation states (`docs/chl-spec.md`, "Kinds and bounds").
+#[derive(Debug, Clone, PartialEq)]
+pub enum KindAnnotation {
+    /// `T: K` — the kind `K` itself.
+    Kind(Spanned<Expr>),
+    /// `T <: U` — the upper bound `U`, which is the kind `SubtypesOf(U)`.
+    Bound(Spanned<Expr>),
+}
+
+/// One requirement of a `requires` clause: `Addable(A, B, Output=O)`, or a bare
+/// name such as `Transaction`.
+///
+/// Spec: `docs/chl-spec.md`, "Trait requirements".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Requirement {
+    pub name: SmolStr,
+    pub name_span: Span,
+    /// The operand types, positionally.
+    pub args: Vec<Spanned<Expr>>,
+    /// The associated types, by name, written after the operands.
+    pub assoc: Vec<AssocArg>,
+}
+
+/// A named argument of a requirement, `Output=O`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssocArg {
+    pub name: SmolStr,
+    pub name_span: Span,
+    pub value: Spanned<Expr>,
 }
 
 /// A user-written type annotation at a binder, and which of the two readings it
@@ -633,6 +680,14 @@ pub enum Expr {
     Lambda {
         params: Vec<Param>,
         body: Box<Spanned<Expr>>,
+    },
+
+    /// Polymorphic type: `forall (T, U <: B) V requires …`
+    /// (`docs/chl-spec.md`, "Polymorphic type annotations").
+    Forall {
+        type_params: Vec<TypeParam>,
+        body: Box<Spanned<Expr>>,
+        requires: Vec<Spanned<Requirement>>,
     },
 
     /// Ternary conditional: `then_expr if cond else else_expr`.

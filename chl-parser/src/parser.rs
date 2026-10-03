@@ -59,9 +59,10 @@ use chumsky::prelude::*;
 use smol_str::SmolStr;
 
 use crate::ast::{
-    AnnotationMode, AssignTarget, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp, CompClause,
-    Comprehension, Expr, IfBranch, Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern,
-    RecordField, Span, Spanned, Stmt, TypeAnnotation, UnaryOp, VariantPayload,
+    AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
+    CompClause, Comprehension, Expr, IfBranch, KindAnnotation, Lit, MatchArm, MatchPattern, Module,
+    Param, PayloadPattern, RecordField, Requirement, Span, Spanned, Stmt, TypeAnnotation,
+    TypeParam, UnaryOp, VariantPayload,
 };
 use crate::lexer::{self, Token};
 
@@ -972,6 +973,47 @@ where
             })
             .boxed();
 
+        // ---- Polymorphic type `forall (T, U <: B) V requires …` (a top-level form) ----
+        //
+        // `docs/chl-spec.md`, "Polymorphic type annotations". The `)` closing the binder
+        // list ends the last binder's kind, so the body follows with no separator. A
+        // `requires` clause after the body belongs to the innermost `forall`.
+        let forall_param = ident_only
+            .then(
+                annotation_mode()
+                    .then(expr.clone())
+                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
+                    .or_not(),
+            )
+            .map(|((name, name_span), annotation)| Param {
+                name,
+                name_span,
+                annotation,
+            })
+            .try_map(|param, _| type_param(param));
+        let forall = just(Token::Forall)
+            .ignore_then(
+                forall_param
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then(expr.clone())
+            .then(requires_clause(expr.clone()).or_not())
+            .map_with(|((type_params, body), requires), e| {
+                Spanned::new(
+                    e.span(),
+                    Expr::Forall {
+                        type_params,
+                        body: Box::new(body),
+                        requires: requires.unwrap_or_default(),
+                    },
+                )
+            })
+            .boxed();
+
         // ---- Pair `k -> v` (single, not chainable) ------------------
         //
         // `a -> b` builds the `Expr::Tuple` the parenthesised spelling builds
@@ -1072,7 +1114,7 @@ where
         // matched expression, which is what lets `if x` (no colon) show
         // *where* the in-progress expression was when the missing `:`
         // was hit.
-        choice((lambda, yield_expr, fun_type))
+        choice((lambda, forall, yield_expr, fun_type))
             .labelled("expression")
             .as_context()
             .boxed()
@@ -1320,22 +1362,28 @@ where
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>()
+                    .try_map(|items, _| split_params(items))
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             )
             .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
+            .then(requires_clause(expr.clone()).or_not())
             .then_ignore(just(Token::Colon))
             .then(block.clone())
-            .map_with(|(((name, params), output), body), e| {
-                Spanned::new(
-                    e.span(),
-                    Stmt::FunctionDef {
-                        name,
-                        params,
-                        output,
-                        body,
-                    },
-                )
-            });
+            .map_with(
+                |((((name, (type_params, params)), output), requires), body), e| {
+                    Spanned::new(
+                        e.span(),
+                        Stmt::FunctionDef {
+                            name,
+                            type_params,
+                            params,
+                            output,
+                            requires: requires.unwrap_or_default(),
+                            body,
+                        },
+                    )
+                },
+            );
 
         // ---- simple statements (must end at NEWLINE) ----------------
         let return_stmt = just(Token::Return)
@@ -1553,6 +1601,137 @@ where
             .ignore_then(rhs)
             .map(AssignTail::Define),
     ))
+}
+
+/// `requires R₀, R₁, …`, the clause that ends a `def` signature or a polymorphic
+/// type. A requirement is a name, optionally applied to its operand types and then
+/// its associated types by name: `Addable(A, B, Output=O)`.
+///
+/// Spec: `docs/chl-spec.md`, "Trait requirements".
+fn requires_clause<'src, I, E>(
+    expr: E,
+) -> impl Parser<'src, I, Vec<Spanned<Requirement>>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    enum Arg {
+        Operand(Spanned<Expr>),
+        Assoc(AssocArg),
+    }
+    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
+    let assoc =
+        ident
+            .then_ignore(just(Token::Eq))
+            .then(expr.clone())
+            .map(|((name, name_span), value)| {
+                Arg::Assoc(AssocArg {
+                    name,
+                    name_span,
+                    value,
+                })
+            });
+    let args = choice((assoc, expr.map(Arg::Operand)))
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen));
+    let requirement = ident
+        .labelled("requirement")
+        .then(args.or_not())
+        .try_map_with(|((name, name_span), args), e| {
+            let mut operands = Vec::new();
+            let mut assocs: Vec<AssocArg> = Vec::new();
+            for arg in args.unwrap_or_default() {
+                match arg {
+                    Arg::Operand(operand) => {
+                        if let Some(first) = assocs.first() {
+                            return Err(Rich::custom(
+                                operand.span,
+                                format!(
+                                    "an operand follows `{}=`; a requirement's associated \
+                                     types come after its operands",
+                                    first.name
+                                ),
+                            ));
+                        }
+                        operands.push(operand);
+                    }
+                    Arg::Assoc(arg) => assocs.push(arg),
+                }
+            }
+            Ok(Spanned::new(
+                e.span(),
+                Requirement {
+                    name,
+                    name_span,
+                    args: operands,
+                    assoc: assocs,
+                },
+            ))
+        });
+    just(Token::Requires).ignore_then(
+        requirement
+            .separated_by(just(Token::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Split a parameter list into its type parameters, the capitalized names, and its
+/// value parameters. Type parameters come first.
+///
+/// Spec: `docs/chl-spec.md`, "Type parameters".
+fn split_params<'src>(
+    items: Vec<Param>,
+) -> Result<(Vec<TypeParam>, Vec<Param>), Rich<'src, Token, Span>> {
+    let mut type_params = Vec::new();
+    let mut params: Vec<Param> = Vec::new();
+    for item in items {
+        if !item.name.starts_with(char::is_uppercase) {
+            params.push(item);
+            continue;
+        }
+        if let Some(first) = params.first() {
+            return Err(Rich::custom(
+                item.name_span,
+                format!(
+                    "type parameter `{}` follows value parameter `{}`; type parameters come \
+                     first",
+                    item.name, first.name
+                ),
+            ));
+        }
+        type_params.push(type_param(item)?);
+    }
+    Ok((type_params, params))
+}
+
+/// Read a parameter as a type parameter: its name must be capitalized, and its
+/// annotation is its kind, `T: K`, or its bound, `T <: U`.
+///
+/// Spec: `docs/chl-spec.md`, "Kinds and bounds".
+fn type_param<'src>(item: Param) -> Result<TypeParam, Rich<'src, Token, Span>> {
+    if !item.name.starts_with(char::is_uppercase) {
+        return Err(Rich::custom(
+            item.name_span,
+            format!(
+                "`{}` is not capitalized, so it is not a type parameter; `forall` binds only \
+                 type parameters",
+                item.name
+            ),
+        ));
+    }
+    Ok(TypeParam {
+        name: item.name,
+        name_span: item.name_span,
+        annotation: item
+            .annotation
+            .map(|TypeAnnotation { mode, ty }| match mode {
+                AnnotationMode::Exact => KindAnnotation::Kind(ty),
+                AnnotationMode::Bounded => KindAnnotation::Bound(ty),
+            }),
+    })
 }
 
 /// `x: T` (exact) or `x <: T` (bounded) — the mode is the only difference.
@@ -2172,7 +2351,7 @@ mod tests {
         // `x + 1 if x > 0 else 0` is the lambda body.
         let e = parse_e("\\x -> x + 1 if x > 0 else 0").node;
         match e {
-            Expr::Lambda { params, body } => {
+            Expr::Lambda { params, body, .. } => {
                 assert_eq!(params.len(), 1);
                 assert!(matches!(body.node, Expr::IfExp { .. }));
             }
@@ -2258,7 +2437,7 @@ mod tests {
     /// (`docs/chl-spec.md`, "3.10 Lambda").
     #[test]
     fn a_lambda_body_can_be_a_pair() {
-        let Expr::Lambda { params, body } = parse_e("\\x -> x -> 1").node else {
+        let Expr::Lambda { params, body, .. } = parse_e("\\x -> x -> 1").node else {
             panic!("expected a Lambda");
         };
         assert_eq!(params.len(), 1);
@@ -2588,6 +2767,7 @@ mod tests {
                 params,
                 output,
                 body,
+                ..
             } => {
                 assert_eq!(name.as_str(), "f");
                 assert_eq!(params.len(), 2);
@@ -2966,5 +3146,187 @@ mod tests {
         assert!(matches!(payload_of("`some(1,)"), Some(Expr::Tuple(v)) if v.len() == 1));
         assert!(payload_of("`a()").is_none());
         assert!(payload_of("`a").is_none());
+    }
+
+    // ---- Type parameters and `requires` (`docs/chl-spec.md`, "6.10 Polymorphic types") ----
+
+    /// The custom message of the first parse error, for the rejections the grammar
+    /// raises itself.
+    fn custom_error(src: &str) -> String {
+        let errors = parse_module(src).errors;
+        errors
+            .iter()
+            .find_map(|e| match e {
+                ParseError::Parse(info) => info.custom.clone(),
+                ParseError::Lex(_) => None,
+            })
+            .unwrap_or_else(|| panic!("expected a custom parse error for {src:?}, got {errors:#?}"))
+    }
+
+    fn def_signature(m: &Module) -> (&[TypeParam], &[Param], &[Spanned<Requirement>]) {
+        match &m.body[0].node {
+            Stmt::FunctionDef {
+                type_params,
+                params,
+                requires,
+                ..
+            } => (type_params, params, requires),
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    /// Capitalized leading parameters are type parameters, kept out of `params`, so
+    /// `params` is the arity.
+    #[test]
+    fn def_type_parameters_are_not_value_parameters() {
+        let m = parse_m(indoc! {"
+            def larger(T, a: T, b: T) => T:
+                b if a < b else a
+        "});
+        let (type_params, params, requires) = def_signature(&m);
+        assert_eq!(type_params.len(), 1);
+        assert_eq!(type_params[0].name.as_str(), "T");
+        assert!(type_params[0].annotation.is_none());
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(requires.is_empty());
+    }
+
+    #[test]
+    fn def_type_parameter_takes_a_bound() {
+        let m = parse_m(indoc! {"
+            def newest(T <: {at: Int}, a: T, b: T) => T:
+                a
+        "});
+        let (type_params, _, _) = def_signature(&m);
+        let Some(KindAnnotation::Bound(bound)) = &type_params[0].annotation else {
+            panic!("expected a bound, got {:?}", type_params[0].annotation);
+        };
+        assert!(
+            matches!(bound.node, Expr::BraceRecord(_)),
+            "{:?}",
+            bound.node
+        );
+    }
+
+    /// `T: K` states the kind; which kinds exist is lowering's to decide.
+    #[test]
+    fn def_type_parameter_takes_a_kind() {
+        let m = parse_m(indoc! {"
+            def f(T: SubtypesOf(Int), x: T):
+                x
+        "});
+        let (type_params, _, _) = def_signature(&m);
+        let Some(KindAnnotation::Kind(kind)) = &type_params[0].annotation else {
+            panic!("expected a kind, got {:?}", type_params[0].annotation);
+        };
+        assert!(matches!(kind.node, Expr::Call { .. }), "{:?}", kind.node);
+    }
+
+    #[test]
+    fn def_requires_clause_follows_the_result() {
+        let m = parse_m(indoc! {"
+            def add(A, B, O, a: A, b: B) => O requires Addable(A, B, Output=O), Transaction:
+                a + b
+        "});
+        let (type_params, params, requires) = def_signature(&m);
+        assert_eq!(type_params.len(), 3);
+        assert_eq!(params.len(), 2);
+        assert_eq!(requires.len(), 2);
+        let addable = &requires[0].node;
+        assert_eq!(addable.name.as_str(), "Addable");
+        assert_eq!(addable.args.len(), 2);
+        assert_eq!(addable.assoc.len(), 1);
+        assert_eq!(addable.assoc[0].name.as_str(), "Output");
+        assert!(matches!(&addable.assoc[0].value.node, Expr::Name(n) if n == "O"));
+        let transaction = &requires[1].node;
+        assert_eq!(transaction.name.as_str(), "Transaction");
+        assert!(transaction.args.is_empty() && transaction.assoc.is_empty());
+    }
+
+    /// Without a result annotation the clause follows the parameter list.
+    #[test]
+    fn def_requires_clause_without_a_result() {
+        let m = parse_m(indoc! {"
+            def put(k: String) requires Transaction:
+                k
+        "});
+        let (_, _, requires) = def_signature(&m);
+        assert_eq!(requires.len(), 1);
+    }
+
+    #[test]
+    fn requires_is_a_keyword() {
+        assert!(!parse_module("requires = 1").errors.is_empty());
+    }
+
+    #[test]
+    fn a_type_parameter_after_a_value_parameter_is_rejected() {
+        let msg = custom_error(indoc! {"
+            def f(x, T):
+                x
+        "});
+        assert!(msg.contains("type parameters come first"), "{msg}");
+    }
+
+    #[test]
+    fn an_operand_after_an_associated_type_is_rejected() {
+        let msg = custom_error(indoc! {"
+            def f(A, a: A) requires Addable(A, Output=A, A):
+                a
+        "});
+        assert!(msg.contains("come after its operands"), "{msg}");
+    }
+
+    /// The `)` closing the binder list ends the last kind, and the `requires` clause
+    /// follows the body.
+    #[test]
+    fn polymorphic_type() {
+        let e = parse_e("forall (T, U <: {id: String}) {T, U} => T requires Orderable(T, T)").node;
+        let Expr::Forall {
+            type_params,
+            body,
+            requires,
+        } = e
+        else {
+            panic!("expected a Forall, got {e:?}");
+        };
+        let names: Vec<&str> = type_params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["T", "U"]);
+        assert!(type_params[0].annotation.is_none());
+        assert!(matches!(
+            type_params[1].annotation,
+            Some(KindAnnotation::Bound(_))
+        ));
+        assert!(
+            matches!(body.node, Expr::FunctionType { .. }),
+            "{:?}",
+            body.node
+        );
+        assert_eq!(requires.len(), 1);
+    }
+
+    #[test]
+    fn polymorphic_type_as_a_binding_annotation() {
+        let m = parse_m("bigger: forall (T) {T, T} => T requires Orderable(T, T) = larger");
+        let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
+            panic!("expected an annotated assignment, got {:?}", m.body[0].node);
+        };
+        assert!(matches!(
+            &annotation.ty.node,
+            Expr::Forall { type_params, requires, .. }
+                if type_params.len() == 1 && requires.len() == 1
+        ));
+    }
+
+    #[test]
+    fn forall_binds_only_type_parameters() {
+        let msg = custom_error("f: forall (x) Int = 1");
+        assert!(msg.contains("`forall` binds only type parameters"), "{msg}");
+    }
+
+    #[test]
+    fn forall_is_a_keyword() {
+        assert!(!parse_module("forall = 1").errors.is_empty());
     }
 }
