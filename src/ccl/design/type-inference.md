@@ -2988,7 +2988,7 @@ A contribution arriving at a position is one of four things, and each has its ow
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
 | **determined, and neither** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
-| a **type parameter** | `T` in `def f(T, x: T)` | its bound is offered in its place; with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
+| a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
 The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
 

@@ -12,6 +12,7 @@ use std::rc::Rc;
 use super::traits::{TraitObligation, TraitObligationId};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
+use crate::ccl::ty::TraitRequirement;
 use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
 use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr};
 
@@ -43,18 +44,44 @@ pub struct PolyScheme {
     /// Scheme body. May contain quantified vars (level > self.level)
     /// and free vars (level ≤ self.level).
     pub body: Type,
+    /// The `requires` clause of a binding annotated with a polymorphic type, over
+    /// its opened type parameters: what each use instantiates as trait obligations
+    /// beside the body (`src/ccl/design/type-parameters.md`, "Instantiation"). Empty
+    /// for every other scheme, whose obligations ride the body's variables.
+    pub requires: Vec<Rc<TraitRequirement>>,
+}
+
+/// One use's copy of a [`PolyScheme`] ([`PolyScheme::instantiate_with_params`]).
+pub struct Instance {
+    /// The body, freshened.
+    pub ty: Type,
+    /// Each type parameter's instantiation with its bound, freshened through the
+    /// same copy: the use records `instantiation <: bound`.
+    pub bounds: Vec<(Type, Type)>,
+    /// The scheme's `requires` clause, freshened through the same copy: the use
+    /// mints an obligation for each.
+    pub requires: Vec<TraitRequirement>,
 }
 
 impl PolyScheme {
     /// A monotype scheme: no quantified variables. Convenience for
     /// scalar operator types like `Bool → Bool`.
     pub fn mono(body: Type) -> Self {
-        Self { level: 0, body }
+        Self::poly(0, body)
     }
 
     /// Construct a polytype with the given quantification cutoff.
     pub fn poly(level: Level, body: Type) -> Self {
-        Self { level, body }
+        Self {
+            level,
+            body,
+            requires: Vec::new(),
+        }
+    }
+
+    /// This scheme stating `requires`, a polymorphic annotation's `requires` clause.
+    pub fn with_requires(self, requires: Vec<Rc<TraitRequirement>>) -> Self {
+        Self { requires, ..self }
     }
 
     /// Mint a fresh copy of `body` with quantified variables replaced
@@ -73,45 +100,53 @@ impl PolyScheme {
     }
 
     /// [`instantiate`](Self::instantiate) for a scheme that may quantify **type
-    /// parameters**, returning beside the type each parameter's instantiation and
-    /// its bound, freshened through the same copy.
+    /// parameters** and state a `requires` clause: the body, each parameter's
+    /// bound, and each requirement, freshened through one copy, so a parameter is
+    /// one variable across all three.
     ///
-    /// The caller records `instantiation <: bound` for each pair: a bound is checked
-    /// at every use, at the use's types (`src/ccl/design/type-parameters.md`,
-    /// "Instantiation"). A variable minted for a parameter stands in `telescope`,
-    /// the use site's, since a parameter has no variable a copy could inherit a
-    /// scope from.
-    pub fn instantiate_with_params(
-        &self,
-        current_level: Level,
-        telescope: &Telescope,
-    ) -> (Type, Vec<(Type, Type)>) {
+    /// The caller records `instantiation <: bound` for each bound and an obligation
+    /// for each requirement: both are checked at every use, at the use's types
+    /// (`src/ccl/design/type-parameters.md`, "Instantiation"). A variable minted for
+    /// a parameter stands in `telescope`, the use site's, since a parameter has no
+    /// variable a copy could inherit a scope from.
+    pub fn instantiate_with_params(&self, current_level: Level, telescope: &Telescope) -> Instance {
         let mut cache = FreshenCache::new();
         cache.param_telescope = Some(telescope.clone());
-        let ty = freshen_above(
-            self.level,
-            &self.body,
-            FreshenLevel::At(current_level),
-            &mut cache,
-        );
-        // Bounds are freshened after the body, so every parameter a bound names
-        // already maps to its instantiation; a parameter is mapped by the arm, not
-        // here, so a bound that names a parameter the body does not is still copied.
-        let mut params: Vec<_> = cache.params.values().cloned().collect();
-        params.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut bounded = Vec::new();
-        for (param, instantiation) in params {
-            if let Some(bound) = &param.bound {
-                let bound = freshen_above(
-                    self.level,
-                    bound,
-                    FreshenLevel::At(current_level),
-                    &mut cache,
-                );
-                bounded.push((instantiation, bound));
+        let at = FreshenLevel::At(current_level);
+        let ty = freshen_above(self.level, &self.body, at, &mut cache);
+        let requires = self
+            .requires
+            .iter()
+            .map(|r| r.map_types(|t| freshen_above(self.level, t, at, &mut cache)))
+            .collect();
+        // A bound can name a parameter nothing freshened yet, which the bound's own
+        // freshening then maps, so the parameters are drained until none is new.
+        let mut bounds = Vec::new();
+        let mut done = std::collections::HashSet::new();
+        loop {
+            let mut pending: Vec<_> = cache
+                .params
+                .values()
+                .filter(|(param, _)| !done.contains(&param.id))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            pending.sort_by(|a, b| a.0.cmp(&b.0));
+            for (param, instantiation) in pending {
+                done.insert(param.id);
+                if let Some(bound) = &param.bound {
+                    let bound = freshen_above(self.level, bound, at, &mut cache);
+                    bounds.push((instantiation, bound));
+                }
             }
         }
-        (ty, bounded)
+        Instance {
+            ty,
+            bounds,
+            requires,
+        }
     }
 
     /// [`instantiate`](Self::instantiate), stamping the *use site's* telescope
@@ -191,6 +226,11 @@ pub struct FreshenCache {
     /// at instantiation. A parameter has no variable of its own whose telescope a
     /// copy could inherit.
     pub param_telescope: Option<Telescope>,
+    /// Obligation copies a specialization reset because they assumed one of the
+    /// specialized binding's own type parameters
+    /// ([`TraitObligation::reset_for_specialization`]). `specialize_use` redelivers
+    /// each once the clone is pinned.
+    pub reset_obligations: Vec<Rc<TraitObligation>>,
 }
 
 impl FreshenCache {
@@ -517,12 +557,24 @@ pub fn freshen_above(
                 .insert(param.id, (Rc::clone(param), out.clone()));
             out
         }
-        // A `Poly` in a type slot is a nested definition's annotation, reached by a
-        // specialization clone. Its parameters are declared ones, which the clone never
-        // re-opens, so only its types are copied.
-        Type::Poly(poly) => Type::Poly(Rc::new(
-            poly.map_types(|t| freshen_above(lim, t, target, cache)),
-        )),
+        // A `Poly` in a type slot is a definition's annotation, which `emit_let` opened
+        // in place, copied with the term it annotates: in a specialization clone, or in
+        // a substitution payload riding a copied bound. A parameter deeper than the
+        // cutoff is re-minted, as its occurrences in the copied body are, through the
+        // same cache. One that freshens to a variable, the specialized binding's own or
+        // an instantiated one in a payload, keeps its name in the `Poly`, whose types
+        // are what freshening made of it; nothing opens or instantiates that copy.
+        Type::Poly(poly) => {
+            let mut out = poly.map_types(|t| freshen_above(lim, t, target, cache));
+            for p in &mut out.params {
+                if let Type::Param(param) =
+                    freshen_above(lim, &Type::Param(Rc::clone(&p.param)), target, cache)
+                {
+                    p.param = param;
+                }
+            }
+            Type::Poly(Rc::new(out))
+        }
         Type::Infer(tv) => {
             if let Some(existing) = cache.vars.get(&tv.uid) {
                 return Type::Infer(Rc::clone(existing));
@@ -723,6 +775,12 @@ fn freshen_watches(
         let copy = TraitObligation::new_from(&obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
         copy.watch(&Type::Infer(Rc::clone(v)), pos);
+        // A specialization clone turns the binding's own type parameters, the ones
+        // one level above the cutoff, into variables; an assumption about one of
+        // them no longer describes the copy.
+        if matches!(target, FreshenLevel::Preserve) && copy.reset_for_specialization(lim + 1) {
+            cache.reset_obligations.push(Rc::clone(&copy));
+        }
         // Phase 2: now that re-entry finds the copy, freshen the output and the
         // input expressions a refinement template builds from.
         copy.set_assoc_types(

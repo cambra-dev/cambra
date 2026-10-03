@@ -154,7 +154,7 @@ reserved for future use.
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
 `requires` begins a `requires` clause, which ends a `def` signature or a polymorphic type
-(**[Planned]**, [Trait requirements](#trait-requirements)).
+([Trait requirements](#trait-requirements)). `requires Transaction` is **[Planned]** (§8.7).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
@@ -331,7 +331,7 @@ with_stmt       ::= "with" [ ident "=" ] expression ":" block
 def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
 params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
 value_param     ::= ident [ ( ":" | "<:" ) expression ]
--- `type_param` and `requires_clause` (**[Planned]**) are in §6.8.
+-- `type_param` and `requires_clause` are in §6.8.
 
 -- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
 -- decorator and the declaration are one statement, which is why a declaration
@@ -2836,7 +2836,7 @@ first("a", "b")   # T = String
   [3.8 Function calls](#38-function-calls) leaves open.
 - **Every type parameter is determined by the arguments.** It appears in a value parameter's
   annotation, or it is the associated type of a requirement whose other positions are determined
-  (**[Planned]**, [Trait requirements](#trait-requirements)). Any other type parameter is an
+  ([Trait requirements](#trait-requirements)). Any other type parameter is an
   error at the definition.
 - **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
   `requires` clause state, and nothing else. `def inc(T, x: T) => T: x + 1` is an error at `+`,
@@ -2873,8 +2873,6 @@ With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: I
 - A type parameter has an upper bound or none. Lower bounds are not provided.
 
 #### Trait requirements
-
-**[Planned]**
 
 ```ebnf
 requires_clause ::= "requires" requirement ( "," requirement )*
@@ -2914,12 +2912,12 @@ is the type that satisfies it.
   and it has no other effect; naming a type parameter as its associated type is an error.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters))
-  is written in the same clause: `requires Transaction, Orderable(T, T)`.
+  is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Planned]**).
 - **The body uses only what the clause states.** An operator whose operand type involves a type
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `a + b` under `T <: Int` and `requires Addable(T, T, Output=T)` is a `T`.
 - **Each call satisfies each requirement at its own instantiation.** A call that does not is
-  rejected at the call, with a secondary label at the requirement.
+  rejected at the call. A secondary label at the requirement is **[Decided]**.
 - Declaring a trait or an instance is **[Open]**.
 
 #### Polymorphic type annotations
@@ -2931,7 +2929,6 @@ poly_type       ::= "\" type_param ( "," type_param )* "->" expression [ require
 In a type position, `\T, U <: B -> V requires …` is the type of a polymorphic value: for every
 `T` and `U` that meet the bounds and requirements, a value of type `V`. A polymorphic `def` has this
 type, with its type parameters moved into the lambda. `first` above has type `\T -> {T, T} => T`.
-The `requires` clause is **[Planned]** ([Trait requirements](#trait-requirements)).
 
 ```python
 pick: \T -> {T, T} => T = first

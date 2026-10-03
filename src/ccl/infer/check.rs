@@ -430,12 +430,20 @@ impl Typing for CheckCtx {
         f(self)
     }
 
-    fn open_poly(&mut self, _poly: &crate::ccl::ty::PolyType) {
+    fn open_poly(&mut self, _poly: &crate::ccl::ty::PolyType) -> crate::ccl::ty::PolyType {
         unreachable!("a polymorphic annotation survived inference into Check");
     }
 
     fn close_poly(&mut self, _poly: &crate::ccl::ty::PolyType) {
         unreachable!("a polymorphic annotation survived inference into Check");
+    }
+
+    fn with_assumptions<R>(
+        &mut self,
+        _assumptions: &[std::rc::Rc<crate::ccl::ty::TraitRequirement>],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        f(self)
     }
 
     fn is_generalizable(&self, _def: &Expr) -> bool {

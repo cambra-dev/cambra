@@ -101,15 +101,34 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
             Some(binding) => {
-                let (ty, bounded) = binding
+                let instance = binding
                     .scheme
                     .instantiate_with_params(ctx.level, &ctx.telescope);
-                for (instantiation, bound) in bounded {
+                for (instantiation, bound) in instance.bounds {
                     ctx.require_sub(&instantiation, &bound, &|| {
                         format!("the bound of a type parameter of `{name}`")
                     })?;
                 }
-                ty
+                // Each requirement becomes an obligation at this use's types, minted
+                // as an operator's is; the associated type it names receives what the
+                // obligation settles (`src/ccl/design/type-parameters.md`,
+                // "Instantiation").
+                for r in &instance.requires {
+                    let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
+                    let named = r.assoc.first();
+                    let settled = ctx.require_trait(
+                        r.trait_,
+                        node_id,
+                        &r.args.iter().collect::<Vec<_>>(),
+                        &[],
+                        named.map(|(n, _)| *n),
+                        &at,
+                    )?;
+                    if let (Some(settled), Some((_, named))) = (settled, named) {
+                        ctx.require_sub(&settled, named, &at)?;
+                    }
+                }
+                instance.ty
             }
         },
 
@@ -1768,11 +1787,21 @@ pub(super) fn emit_let<C: Typing>(
     };
     // The `Poly` stays open through the annotation's reconcile, which normalizes
     // the parameters the annotation names, and is closed on every path out.
-    let scheme_ty = emit_let_bound(binding, bound_expr, poly.as_deref(), ctx);
+    let bound = emit_let_bound(binding, bound_expr, poly.as_deref(), ctx);
     if let Some(poly) = &poly {
         ctx.close_poly(poly);
     }
-    let scheme_ty = scheme_ty?;
+    let (scheme_ty, opened) = bound?;
+    // The annotation is the `Poly` opened from here on, over the completed body: its
+    // parameters and `requires` clause are this binding's own, which its scheme
+    // states to each use (`scoped_let`) and the coalesce walk assumes while it checks
+    // the definition alone.
+    if let Some(opened) = opened {
+        binding.user_annotation = Some(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+            body: scheme_ty.clone(),
+            ..opened
+        })));
+    }
     // The binder slot records the type the variable is *bound at*, not its
     // initializer's type — an exact annotation binds at the annotation, not at
     // what flowed in. Writing it here, for coalesce to resolve in place, is the same
@@ -1797,20 +1826,21 @@ pub(super) fn emit_let<C: Typing>(
 }
 
 /// [`emit_let`]'s right-hand side and annotation: emit the right-hand side one level
-/// deeper, opening `poly` there first, and reconcile it against the binding's
-/// annotation. Returns the type the binding is bound at. `poly` is left open for the
-/// caller to close.
+/// deeper, opening `poly` there first with its `requires` clause in scope as
+/// assumptions, and reconcile it against the binding's annotation. Returns the type
+/// the binding is bound at, and the `Poly` opened. `poly` is left open for the caller
+/// to close.
 fn emit_let_bound<C: Typing>(
     binding: &mut TypedBinding,
     bound_expr: &mut Expr,
     poly: Option<&crate::ccl::ty::PolyType>,
     ctx: &mut C,
-) -> Result<Type, LocatedInferError> {
-    let bound_ty = ctx.in_let_rhs(|ctx| {
-        if let Some(poly) = poly {
-            ctx.open_poly(poly);
-        }
-        ctx.subexpr(bound_expr)
+) -> Result<(Type, Option<crate::ccl::ty::PolyType>), LocatedInferError> {
+    let (bound_ty, opened) = ctx.in_let_rhs(|ctx| {
+        let opened = poly.map(|poly| ctx.open_poly(poly));
+        let assumptions = opened.as_ref().map_or(&[][..], |o| o.requires.as_slice());
+        let ty = ctx.with_assumptions(assumptions, |ctx| ctx.subexpr(bound_expr))?;
+        Ok((ty, opened))
     })?;
     // A `let d = Defer` binding names its channel's domain rigidly — replace
     // the handle's (fresh, otherwise-unconstrained) domain var with the
@@ -1902,7 +1932,7 @@ fn emit_let_bound<C: Typing>(
         }
         None => bound_ty,
     };
-    Ok(scheme_ty)
+    Ok((scheme_ty, opened))
 }
 
 /// Run `f` with every `(name, ty)` pair bound monomorphically, innermost-last

@@ -369,20 +369,6 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
     expr
 }
 
-/// Refuse a `requires` clause, which the parser recognises and lowering does not
-/// implement yet (`docs/chl-spec.md`, "Trait requirements").
-pub(super) fn refuse_requires_clause(
-    requires: &[Spanned<Requirement>],
-) -> Result<(), LoweringError> {
-    if let Some(requirement) = requires.first() {
-        return Err(LoweringError::unsupported(
-            requirement.span,
-            "a `requires` clause is not supported yet",
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse what a lambda value cannot take: a capitalized binder is a type
 /// parameter and a `requires` clause states requirements on them, and only a
 /// polymorphic type in an annotation binds either (`docs/chl-spec.md`,
@@ -422,10 +408,11 @@ pub(super) fn lower_def(
     type_params: &[TypeParam],
     params: &[Param],
     output: Option<&Spanned<ChlExpr>>,
+    requires: &[Spanned<Requirement>],
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
-    if type_params.is_empty() {
+    if type_params.is_empty() && requires.is_empty() {
         return Ok((
             lower_function_body(fn_span, params, output, body, ctx)?,
             None,
@@ -434,12 +421,31 @@ pub(super) fn lower_def(
     let aliases = ctx.snapshot_type_aliases();
     let scoped = ctx.type_params_in_scope.len();
     let result = declare_type_params(type_params, ctx).and_then(|declared| {
-        ctx.type_params_in_scope
-            .extend(type_params.iter().map(|p| p.name.to_string()));
+        let requires = lower_requirements(requires, ctx)?;
         let func = lower_function_body(fn_span, params, output, body, ctx)?;
-        // Every type parameter is determined by a call's arguments, so each appears
-        // in a value parameter's annotation (`docs/chl-spec.md`, "Type parameters").
-        let mentioned = parameter_annotation_params(&func);
+        // Every type parameter is determined by a call's arguments: it appears in a
+        // value parameter's annotation, or it is the associated type of a requirement
+        // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
+        let mut mentioned = parameter_annotation_params(&func);
+        loop {
+            let before = mentioned.len();
+            for r in &requires {
+                let operands_known = r.args.iter().all(|a| match a {
+                    Type::Param(param) => mentioned.contains(&param.id),
+                    _ => true,
+                });
+                if operands_known {
+                    for (_, t) in &r.assoc {
+                        if let Type::Param(param) = t {
+                            mentioned.insert(param.id);
+                        }
+                    }
+                }
+            }
+            if mentioned.len() == before {
+                break;
+            }
+        }
         if let Some((tp, _)) = type_params
             .iter()
             .zip(&declared)
@@ -456,6 +462,7 @@ pub(super) fn lower_def(
         }
         let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
             params: declared,
+            requires,
             body: Type::Hole,
         }));
         Ok((func, Some(poly)))

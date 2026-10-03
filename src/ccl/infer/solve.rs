@@ -15,6 +15,7 @@ use crate::ccl::infer::solver::{
 };
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
+use crate::ccl::ty::TraitRequirement;
 use crate::ccl::{
     BindingTransparency, Expr, Level, Name, Pattern, Type, TypedBinding, TypedExprNode,
 };
@@ -154,6 +155,14 @@ pub(super) struct CoalesceCtx {
     /// the mark and read as surviving, though they die with the clone. Asking each
     /// frame what it is, at the moment it is created, is immune to that.
     discarding: bool,
+    /// The assumptions in scope at the walk's position: the `requires` clauses of
+    /// the generic definitions being resolved in place, whose type parameters are
+    /// still opaque ([`typecheck_discarded_definition`]). A use there reaches a
+    /// specialization with those parameters, and the copy's
+    /// [reset](crate::ccl::infer::solver::traits::TraitObligation::reset_for_specialization)
+    /// obligations are answered by these (`src/ccl/design/type-parameters.md`,
+    /// "Specialization").
+    assumptions: Vec<Rc<TraitRequirement>>,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -914,6 +923,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
         errors: Vec::new(),
         pred_memo: PredMemo::new(),
         discarding: false,
+        assumptions: Vec::new(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
@@ -2038,6 +2048,19 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     let mut cache = ConstrainCache::new();
     let pinned = constrain_subtype(&clone.ty, &use_expr.ty, &mut cache)
         .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
+    // An obligation the copy reset, having assumed one of the binding's own type
+    // parameters, resolves against its trait's instances at the use's types, which
+    // the pin has just delivered to its operands' variables
+    // (`src/ccl/design/type-parameters.md`, "Specialization").
+    //
+    // A use inside a generic definition resolved in place can carry that
+    // definition's opaque type parameters, which its own assumptions answer.
+    let pinned = pinned.and_then(|()| {
+        fresh.reset_obligations.iter().try_for_each(|obligation| {
+            obligation.assume_more(&ctx.assumptions);
+            obligation.redeliver(&mut cache)
+        })
+    });
     if let Err(e) = &pinned {
         let e = e.clone();
         // Blamed on the use site, which is the node whose demanded type the pin
@@ -2144,6 +2167,12 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // Every specialization is the one binding, split by use type, so each
     // carries its transparency.
     let transparency = binding.transparency;
+    // The `requires` clause `emit_let` left on the opened annotation: the assumptions
+    // the definition is checked alone under.
+    let requires = match &binding.user_annotation {
+        Some(Type::Poly(poly)) => poly.requires.clone(),
+        _ => Vec::new(),
+    };
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
@@ -2158,11 +2187,11 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         unreachable!("the binding's frame still tops the scope after a balanced body walk");
     };
 
-    // Every definition is checked alone, with its quantified variables flexible
-    // (`src/ccl/design/type-inference.md`, "Checking a definition alone"). Every use has
-    // been specialized by now, so nothing clones from it any more and it can be resolved
-    // in place.
-    let raised = typecheck_discarded_definition(&mut frame.def, level, ctx);
+    // Every definition is checked alone, with its quantified variables flexible and its
+    // type parameters opaque (`src/ccl/design/type-inference.md`, "Checking a definition
+    // alone"). Every use has been specialized by now, so nothing clones from it any more
+    // and it can be resolved in place.
+    let raised = typecheck_discarded_definition(&mut frame.def, level, &requires, ctx);
     // A held error is the definition's when the definition alone raises it too: of the
     // same kind at the node it was copied from, or the same defect, which a node a
     // nested specialization minted has no other way to show.
@@ -2266,14 +2295,22 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
 /// call, so `ctx.scope` is already what was in scope where the definition was
 /// written. `level` is the enclosing `let`'s level, and the definition — like
 /// every `let` RHS — was emitted one deeper (`in_let_rhs`).
+///
+/// `assumptions` is the definition's `requires` clause, in scope while it is walked:
+/// its type parameters stay opaque here, so a use inside it can specialize another
+/// generic definition at them.
 fn typecheck_discarded_definition(
     def: &mut Expr,
     level: Level,
+    assumptions: &[Rc<TraitRequirement>],
     ctx: &mut CoalesceCtx,
 ) -> Vec<(NodeId, InferError)> {
     let before = ctx.errors.len();
     let was_discarding = std::mem::replace(&mut ctx.discarding, true);
+    let depth = ctx.assumptions.len();
+    ctx.assumptions.extend(assumptions.iter().cloned());
     coalesce_node(def, level + 1, ctx);
+    ctx.assumptions.truncate(depth);
     ctx.discarding = was_discarding;
     let raised = ctx.errors[before..]
         .iter()
