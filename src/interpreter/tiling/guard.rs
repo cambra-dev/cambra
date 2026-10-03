@@ -833,6 +833,13 @@ pub enum FunctionGuard {
 /// nothing, since it names no key, or everything, since a path's end reads as "and all of
 /// this key" — so it is rejected rather than given one of them.
 pub fn domain_prefix(path: Vec<Value>) -> TileGuard {
+    domain_prefix_over(path, &[])
+}
+
+/// [`domain_prefix`] over the domains of the levels the path runs through, outermost first,
+/// which a union key's prefix needs to name the tags before it ([`Predicate::at_or_below_in`]).
+/// A level with no domain given takes the bound its key alone spells.
+pub fn domain_prefix_over(path: Vec<Value>, levels: &[Extent]) -> TileGuard {
     assert!(
         !path.is_empty(),
         "a path prefix names at least one key; an empty path is neither the empty guard \
@@ -845,9 +852,11 @@ pub fn domain_prefix(path: Vec<Value>) -> TileGuard {
         .map(|(level, key)| {
             // Every level but the last is bounded below its key, that key's own row being
             // only partly done; the last takes its key whole.
-            let bound = match level == last {
-                true => Predicate::at_or_below(key.clone()),
-                false => Predicate::below(key.clone()),
+            let bound = match (level == last, levels.get(level)) {
+                (true, Some(extent)) => Predicate::at_or_below_in(key.clone(), extent),
+                (false, Some(extent)) => Predicate::below_in(key.clone(), extent),
+                (true, None) => Predicate::at_or_below(key.clone()),
+                (false, None) => Predicate::below(key.clone()),
             };
             let at = Predicate::qualified(Predicate::exactly(&path[..level]), bound);
             CurryLevel::new(level).wrap_guard(TileGuard::Function(FunctionGuard::Domain(at)))

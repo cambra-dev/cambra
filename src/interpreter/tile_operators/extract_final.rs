@@ -11,17 +11,13 @@ use bit_vec::BitVec;
 // ExtractFinal / ExtractFinalProducer
 // ---------------------------------------------------------------------------
 
-/// Extracts the final value from a changelog store's dense read (or any
-/// `DataFunction`) output, converting the accumulated `DataFunction` tiling
-/// back to a `Scalar` — the scalar-final read of a mutation loop's accumulator.
+/// Extracts the final value of a `DataFunction` stream, the codomain at its highest
+/// position once the stream is terminal, as a `Scalar`: `final_or_default(stream, default)`
+/// over any stream but an induction accumulator's own history, whose final the store holds
+/// ([`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead)).
 ///
-/// When the source becomes terminal but emits no values (the empty-source
-/// case, e.g. `for i in []: x += 1`), the `default` operator's scalar value
-/// is emitted instead.  This keeps mutation loops total: the post-loop
-/// accumulator always has a defined value, equal to the loop's initial
-/// value when the body never ran.
-///
-/// Used as the terminal stage of a loop: `ExtractFinal(body.step, init)`.
+/// When the source becomes terminal but emits no values, the `default` operator's scalar
+/// value is emitted instead, so the read is total.
 pub struct ExtractFinal {
     /// Operator producing the `DataFunction` tiling to extract from.
     source: Box<dyn TileOperator>,

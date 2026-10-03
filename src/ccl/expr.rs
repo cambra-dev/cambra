@@ -2175,9 +2175,9 @@ pub struct TransactKey {
     /// variable projects [`Name::field_key`] of the history record (`__hist.k`).
     pub name: Name,
     /// The initial value (the scalar seed), evaluated once outside every writer's
-    /// scope: the value the key holds before its domain's first position. The key's history is `Fun(domain, V)`; a read is
-    /// its latest value `V` (`final_or_default(history, init)`, defaulting to
-    /// `init` when the mutable variable ran zero positions).
+    /// scope: the value the key holds before its domain's first position. The key's history
+    /// is `Fun(domain, V)`; a trailing read samples its value `V` where the store finishes
+    /// (`final_read(history)`), which is `init` when the mutable variable ran zero positions.
     pub init: TypedExpr,
 }
 

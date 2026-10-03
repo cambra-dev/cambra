@@ -13,7 +13,7 @@ use intervalsets::{
 
 use crate::{
     ccl::{BaseType, FieldKey, TagMap},
-    interpreter::{ColumnValue, Extent, Tile, UnionArm, Value, transform_hashmap_values},
+    interpreter::{ColumnValue, Extent, Position, Tile, UnionArm, Value, transform_hashmap_values},
 };
 
 /// Whether two predicates admit the same values, whatever each is spelled as.
@@ -224,32 +224,43 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    /// The largest position this predicate covers, for a prefix-style release of
-    /// a monotone `UInt` domain — a commit clock or an iteration's positions.
+    /// The largest position this predicate covers, for a prefix-style release of a
+    /// monotone domain — a commit clock or an iteration's positions.
     ///
-    /// `None` for a predicate with no concrete upper bound (`True`, `False`,
-    /// non-`UInt`). `True` is the terminal release, after which the consumer
-    /// pulls no more, so there is no position to advance past.
-    pub fn max_released_position(&self) -> Option<usize> {
+    /// `None` for a predicate with no concrete upper bound (`True`, `False`). `True` is
+    /// the terminal release, after which the consumer pulls no more, so there is no
+    /// position to advance past.
+    pub fn max_released_position(&self) -> Option<Position> {
         match self {
             Predicate::Intervals(iset) => iset
                 .intervals()
                 .iter()
-                .filter_map(|iv| match iv.rval() {
-                    Some(&Value::UInt(k)) => Some(k),
-                    _ => None,
-                })
+                .filter_map(|iv| iv.rval().cloned().map(Position::new))
                 .max(),
             Predicate::Or(arms) => arms
                 .iter()
                 .filter_map(Predicate::max_released_position)
                 .max(),
-            // A union's arms are tag-keyed, so they are walked by value rather
-            // than sharing the `Or` arm's positional vector.
-            Predicate::Union { tags, rest: false } => tags
-                .values()
-                .filter_map(Predicate::max_released_position)
-                .max(),
+            // A union key is ordered by its tag, then within the tag, so the largest
+            // position covered lies under the last tag named, and it is a key of the union:
+            // the bound within that tag wrapped in the tag. A position of one tag alone is
+            // not a position of the union's domain, and compares with none of its keys.
+            //
+            // A region naming its last tag whole is not a drive's prefix: a drive releases
+            // `at_or_below_in(𝑡(𝑣))`, which bounds its head tag, and a drive that finishes
+            // releases everything. Such a region comes from a consumer that is not a drive,
+            // a feed's arms say, which nothing places a drive over, so it has no watermark.
+            Predicate::Union { tags, rest: false } => {
+                let (tag, within) = tags.iter().max_by(|(a, _), (b, _)| a.cmp(b))?;
+                if within.is_true() {
+                    return None;
+                }
+                let inner = within.max_released_position()?;
+                Some(Position::new(Value::Union {
+                    tag: tag.clone(),
+                    inner: Box::new(inner.value().clone()),
+                }))
+            }
             // Every tag it does not name is whole, so there is no watermark to read.
             Predicate::Union { rest: true, .. } => None,
             // A qualified predicate names a position under one enclosing path, and the
@@ -1080,7 +1091,24 @@ impl Predicate {
     /// construction [`domain_prefix`](super::domain_prefix) takes across levels, taken across
     /// fields.
     pub fn at_or_below(v: Value) -> Predicate {
-        Predicate::up_to(v, true)
+        Predicate::up_to(v, true, None)
+    }
+
+    /// [`at_or_below`](Self::at_or_below) over the domain `extent`, which names the tags a
+    /// union key's prefix takes whole.
+    ///
+    /// A union key `𝑡(𝑣)` is ordered by its tag, then within the tag, so its prefix is every
+    /// tag before `𝑡` whole, `𝑣`'s own prefix under `𝑡`, and no tag after: `≤ 1(𝑣)` over a
+    /// three-tag union is `tagged({0: True, 1: ≤ 𝑣})` with no `rest`. Every tag is named,
+    /// since one `rest` covers every unnamed tag alike and cannot tell those before `𝑡` from
+    /// those after it. A record key's fields recurse with their own domains.
+    pub fn at_or_below_in(v: Value, extent: &Extent) -> Predicate {
+        Predicate::up_to(v, true, Some(extent))
+    }
+
+    /// [`below`](Self::below) over the domain `extent`.
+    pub(crate) fn below_in(v: Value, extent: &Extent) -> Predicate {
+        Predicate::up_to(v, false, Some(extent))
     }
 
     /// Everything ordered strictly below `v`.
@@ -1089,16 +1117,33 @@ impl Predicate {
     /// covered, so it is excluded rather than taken whole. A record is a staircase, as in
     /// [`at_or_below`](Self::at_or_below).
     pub(crate) fn below(v: Value) -> Predicate {
-        Predicate::up_to(v, false)
+        Predicate::up_to(v, false, None)
     }
 
-    fn up_to(v: Value, inclusive: bool) -> Predicate {
+    fn up_to(v: Value, inclusive: bool, extent: Option<&Extent>) -> Predicate {
         // A prefix of a union domain is the tags ordered before the bound's whole, part of its
-        // own, and none after, which one `rest` for every unnamed tag cannot spell.
-        assert!(
-            !matches!(v, Value::Union { .. }),
-            "a union key has no prefix spelling without its domain's tags: {v:?}"
-        );
+        // own, and none after. One `rest` for every unnamed tag cannot spell that, so the
+        // domain's tags have to be named, which takes the domain.
+        if let Value::Union { tag, inner } = v {
+            let Some(Extent::Union(arms)) = extent else {
+                panic!(
+                    "a union key has no prefix spelling without its domain's tags: \
+                     `{tag}({inner}) over {extent:?}"
+                )
+            };
+            let tags = arms
+                .iter()
+                .filter_map(|(t, e)| match t.cmp(&tag) {
+                    Ordering::Less => Some((t.clone(), Predicate::True)),
+                    Ordering::Equal => Some((
+                        t.clone(),
+                        Predicate::up_to((*inner).clone(), inclusive, Some(e)),
+                    )),
+                    Ordering::Greater => None,
+                })
+                .collect();
+            return Predicate::tagged(TagMap::from_arms(tags), false);
+        }
         // `Unit` is the one value of its type: `≤ ()` is everything and `< ()` nothing.
         if v == Value::Unit {
             return match inclusive {
@@ -1129,7 +1174,14 @@ impl Predicate {
                             let field = fields[*name].clone();
                             let p = match j.cmp(&i) {
                                 Ordering::Less => Predicate::point(field),
-                                Ordering::Equal => Predicate::up_to(field, inclusive && last),
+                                Ordering::Equal => Predicate::up_to(
+                                    field,
+                                    inclusive && last,
+                                    match extent {
+                                        Some(Extent::Record(fs)) => fs.get(*name),
+                                        _ => None,
+                                    },
+                                ),
                                 Ordering::Greater => Predicate::True,
                             };
                             ((*name).clone(), p)
@@ -1560,6 +1612,7 @@ mod tests {
     use intervalsets::ops::Contains;
 
     use super::*;
+    use crate::interpreter::tuple_field;
     use crate::interpreter::{
         BaseType, ColumnValue, Extent, Value,
         tiling::tests::{bool_ext, int, range},
@@ -1740,6 +1793,64 @@ mod tests {
         assert!(deeper.contains_path(&[u(1), u(9), u(0)]));
         assert!(!deeper.contains_path(&[u(2), u(9), u(0)]));
         assert!(!deeper.contains_path(&[u(1), u(9), u(1)]));
+    }
+
+    fn tagged_uint(tag: usize, v: usize) -> Value {
+        Value::Union {
+            tag: FieldKey::Index(tag),
+            inner: Box::new(u(v)),
+        }
+    }
+
+    /// A union key's prefix is the tags before its own whole, its own up to the key, and
+    /// none after, which is what a loop over a concatenation releases as it runs.
+    #[test]
+    fn a_union_key_prefix_takes_the_tags_before_it_whole() {
+        let domain = Extent::Union(TagMap::from_positional(vec![
+            Extent::Base(BaseType::UInt);
+            3
+        ]));
+        let upto = Predicate::at_or_below_in(tagged_uint(1, 2), &domain);
+        let below = Predicate::below_in(tagged_uint(1, 2), &domain);
+        for (key, in_upto, in_below) in [
+            (tagged_uint(0, 9), true, true),
+            (tagged_uint(1, 1), true, true),
+            (tagged_uint(1, 2), true, false),
+            (tagged_uint(1, 3), false, false),
+            (tagged_uint(2, 0), false, false),
+        ] {
+            assert_eq!(upto.contains(&key), in_upto, "≤ 1(2) at {key:?}");
+            assert_eq!(below.contains(&key), in_below, "< 1(2) at {key:?}");
+        }
+    }
+
+    /// A record key's fields take their own domains, so a union-valued field's prefix names
+    /// the tags before it too.
+    #[test]
+    fn a_record_key_prefix_spells_a_union_field_over_its_domain() {
+        let domain = Extent::Record(HashMap::from([
+            (
+                tuple_field(0),
+                Extent::Union(TagMap::from_positional(vec![
+                    Extent::Base(BaseType::UInt);
+                    3
+                ])),
+            ),
+            (tuple_field(1), Extent::Base(BaseType::UInt)),
+        ]));
+        let pair = |a: Value, b: usize| {
+            Value::Record(HashMap::from([(tuple_field(0), a), (tuple_field(1), u(b))]))
+        };
+        let upto = Predicate::at_or_below_in(pair(tagged_uint(1, 2), 5), &domain);
+        for (key, inside) in [
+            (pair(tagged_uint(0, 9), 99), true),
+            (pair(tagged_uint(1, 1), 99), true),
+            (pair(tagged_uint(1, 2), 5), true),
+            (pair(tagged_uint(1, 2), 6), false),
+            (pair(tagged_uint(2, 0), 0), false),
+        ] {
+            assert_eq!(upto.contains(&key), inside, "≤ (1(2), 5) at {key:?}");
+        }
     }
 
     /// `as_at_or_below` reads back the watermark `at_or_below` was built from, and nothing

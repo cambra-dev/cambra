@@ -240,12 +240,11 @@ mod tests {
             accumulator: ints(vec![6]),
             terminal: ColumnValue::Bools(bit_vec::BitVec::from_elem(1, true)),
         };
-        let store = Tile::Store {
-            state: Box::new(Tile::Record(std::collections::HashMap::new())),
-            frontier: Predicate::True,
-            terminal: true,
-            closed_keys: vec![],
-        };
+        let store = crate::interpreter::commit_operator::full_store_tiling(
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::UInt),
+            std::collections::HashMap::new(),
+        )
+        .empty_tile();
         assert!(matches!(
             tile_rows(&aggregation(), 1),
             Err(SinkReadError::NotASinkTiling(_))

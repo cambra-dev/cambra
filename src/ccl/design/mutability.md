@@ -69,13 +69,12 @@ closes a cycle well-founded by monotone lattice convergence rather than causal d
 | `with begin():` transaction | `Txn`, an anonymous total order issued by the runtime | `get_prev_txn` |
 | `while` loop *(future)* | a prefix of `Nat` bounded by the running condition | `get_prev_seq` over a self-ceiling domain |
 
-A **product** loop source is unsupported. A comprehension across two sources
-(`[e for x in xs for y in ys]`, join or not) is keyed by `(𝑖, 𝑗)`, and the induction recurrence is
-sequenced by `UInt` position throughout: the driver pairs items with `UInt` domain keys, the commit
-engine's ticks are positions, and the dense read folds tick `𝑝 + 1` at each. Supporting one means
-giving the recurrence a sequencing order over `(𝑖, 𝑗)`. Op-conversion rejects such a source until
-it has one, because the driver's decode drops a non-`UInt` key instead of failing on it, so an
-unguarded product domain is a loop that runs zero times.
+A loop runs in its source's key order, because the store is keyed by the source's positions. A
+comprehension across two sources (`[e for x in xs for y in ys]`, join or not) is keyed by
+`(𝑖, 𝑗)`, so a loop over one runs its pairs lexicographically. A concatenation `xs ++ ys` is keyed
+by a tagged union, so a loop over one runs each part in turn. A source that delivers out of that
+order, as a product or a concatenation with a streamed part does, is still run in it
+(`src/interpreter/design-operators.md`, "The driver").
 
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
 inferred, always spelled at the introduction). A `:=` inside a `for` body introduces one whose
@@ -558,9 +557,10 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_txn` | `(𝐼 ⤇ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
 | `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
-| `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractFinal`). Over a `Txn` history it is only ever the surface [`await_final`](#await_final)'s read — a fed-out read is an `as_of_read`, a different term |
+| `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
+| `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead` |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
-| `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_or_default` over the mutable variable's history binding. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
+| `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_read` over the mutable variable's history binding, which compiles to `StoreFinalRead`. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
 `begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
@@ -779,9 +779,9 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator
-   or bare side-effect loop needs no letrec at all. Trailing induction reads → `final_or_default(history,
-   init)`; a `Txn` read fed out of a read-only block → a broadcast of the history over the
-   enclosing loop, which planning latches through the as-of read.
+   or bare side-effect loop needs no letrec at all. Trailing induction reads →
+   `final_read(history)`; a `Txn` read fed out of a read-only block → a broadcast of the history
+   over the enclosing loop, which planning latches through the as-of read.
 
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
 
@@ -997,15 +997,14 @@ causal matcher (`letrec::check_letrec_causal`).
 ### The runtime engines
 
 - **`InductionDriver` + `InductionStore` (+ `StoreDenseRead`)** — the induction loop, as a cycle
-  through a `FanOut::new_cyclic`. The store consumes the body's decisions and writes a
-  `Tile::Store` changelog (`init` at position 0; a `commit: false` position carries the prior
-  value forward); the driver reads that changelog back to produce the body's `(prev…, item)`
-  input, taking the next position from the decided frontier and the prev-accumulator from the
-  value at it. The accumulator therefore crosses between them as a tile, like every other
-  operator-to-operator value, at one position per pull. `StoreDenseRead` then folds the
-  changelog over the loop domain to the dense `𝐷 ⇀ 𝑉` stream (serving both a scalar-final
-  `ExtractFinal` and a co-iterated `zip_arms_at`). A single always-commit or commit-gated writer
-  over a finite *or* async domain.
+  through a `FanOut::new_cyclic`. The store consumes the body's decisions into a `Tile::Store`
+  changelog (a `commit: false` position is a carry, holding the prior value, and the init is the
+  store's seed rather than a change); the driver reads the changelog back to produce the body's
+  `(prev…, item)` input, taking the next position from the decided frontier and the previous
+  accumulator from the value at it. The accumulator crosses between them as a tile, one position
+  per pull. `StoreDenseRead` folds the changelog at every decided position into the dense
+  `𝐷 ⇀ 𝑉` history a co-iterated read consumes; the trailing read is `StoreFinalRead`. One
+  writer, over a finite or async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ {key: value}`, one changelog per key. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
@@ -1026,14 +1025,12 @@ causal matcher (`letrec::check_letrec_causal`).
   singleton-trigger case of the same `AsOf`, latching at its own arrival like any other: the
   position is arbitrary whatever the trigger's domain, and a program that means the final value
   spells it [`await_final`](#await_final).
-- **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
-  store changelog, on either of two axes selected by `carry_forward`: the **carry** stream (a
-  position at every commit tick) backs the **in-block reply tap** (`out << e` inside a block) and is
-  the fold `AsOf` samples; the **change** stream (only the ticks that wrote the key) is what
-  `ExtractFinal` reduces for an [`await_final`](#await_final), which is how that read closes when the
-  key's own writers do. No new engine either way — the same `final_or_default → ExtractFinal` path a
-  post-loop **induction** accumulator and a **broadcast source** (a sibling loop's final, fed into a
-  commit decision) already take, applied to a `Txn` history.
+- **`StoreValueStream`** — projects one key's commit-value stream, commit time ⇀ `V`, by folding the
+  store changelog, on the axis the key's registration fixes: a mutable variable's **carry** stream
+  gains a position at every commit tick and is the fold `AsOf` samples; an **in-block reply tap**
+  (`out << e` inside a block) appears only at the ticks that wrote it. The terminal read
+  [`await_final`](#await_final) does not come through here: it is `final_read`, compiling to
+  `StoreFinalRead`, which samples the key once its own writers have drained.
 
 The two loop engines are **not interchangeable**: the commit operator is built for an open commit
 clock and mis-drives an incremental/live source, while the induction accumulator is the ordered loop recurrence.
@@ -1129,28 +1126,28 @@ loops' domains — the read is that accumulator's **final** value, the same scal
 transaction. The phase distinguishes the two by the site's *enclosing-loop write set*
 (`RawSite::enclosing_writes`, from `loop_induction_writes`): an accumulator in it is co-indexed
 (zipped into the source); one not in it is broadcast — its read is bound to the loop's
-`final_or_default` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
+`final_read` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
 a `Constant` broadcast (via `MapResultToConst`) over the transaction domain.
 
-The one engine subtlety is **driving** that broadcast to convergence. The final's `ExtractFinal` is
-empty until the sibling loop's `InductionStore` drains (one position per body pull), and nothing external
-re-pulls the writer: the store's own convergence loop stops once the commit frontier stalls, and the
-frontier cannot advance until this writer commits, which needs the value still converging. The writer
-resolves this the same way the mutable writer resolves its own one-step-per-pull convergence (see #291): when
-its decision body is not ready, it re-arms itself on the scheduler's **deferred-wakeup queue**
+The one engine subtlety is **driving** that broadcast to convergence. The final's `StoreFinalRead`
+is empty until the sibling loop's `InductionStore` drains (one position per body pull), and nothing
+external re-pulls the writer: the store's own convergence loop stops once the commit frontier
+stalls, and the frontier cannot advance until this writer commits, which needs the value still
+converging. The writer resolves this the same way it resolves its own one-step-per-pull convergence:
+when its decision body is not ready, it re-arms itself on the scheduler's **deferred-wakeup queue**
 (`WakeupQueue::request`) and returns non-terminal, keeping its pending body-input row so a re-pull
-reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each demand-driven
-re-pull advances the sibling loop one step until the decision is ready — no blocking loop inside
-`get`, and it composes with an async sibling source (the source's own notification drives the
-re-pulls). A fed-out read *of* the result mutable variable is an `AsOf` (an in-block reply tap, or a trailing
-standalone read), which demand-drives this convergence: each committed reply pulls the writer, which
-advances the sibling loop, exactly as an in-block reply drives the writer in the co-indexed case. The
-co-indexed and non-cross paths are untouched.
+reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each
+demand-driven re-pull advances the sibling loop one step until the decision is ready — no blocking
+loop inside `get`, and it composes with an async sibling source (the source's own notification
+drives the re-pulls). A fed-out read *of* the result mutable variable is an `AsOf` (an in-block
+reply tap, or a trailing standalone read), which demand-drives this convergence: each committed
+reply pulls the writer, which advances the sibling loop, exactly as an in-block reply drives the
+writer in the co-indexed case. The co-indexed and non-cross paths are untouched.
 
-(The asymmetry: the broadcast **source** — the sibling induction loop's accumulator — does
-have a final, read via `ExtractFinal`, because an induction loop terminates and its final value is
-denotable. The result **mutable variable** does not: a `Txn` mutable variable has no final-value term, so reads of it
-are `AsOf`, never `ExtractFinal`.)
+(The asymmetry: the broadcast **source** — the sibling induction loop's accumulator — has a final,
+read via `StoreFinalRead`, because an induction loop terminates and its final value is denotable. A
+read of the result **mutable variable** is an `AsOf` sample; its final exists only as an explicit
+[`await_final`](#await_final).)
 
 ## Replies: live cross-endpoint reads and commit-ordered taps
 
@@ -1210,7 +1207,7 @@ position, and this read's position is where `𝑥`'s writers finish. `await_fina
 `final_read(𝑥.history)`, which op-conversion compiles to `StoreFinalRead` over the store branch.
 That operator takes the same sample the fed-out as-of read does, through the same `store_current`;
 the two differ in what fixes the position — a trigger's arrival there, the store's own closure here.
-Neither term carries a seed operand, because tick 0 of every store is its keys' seeds.
+Neither term carries a seed operand, because every store carries its keys' seeds.
 
 **Completion is per key, not per store.** A store closes a key once every writer whose *static*
 write footprint contains it has drained — `Tile::Store`'s `closed_keys`, computed over the store's
@@ -1278,7 +1275,7 @@ then the refusal is a compile error rather than a wrong answer
 **A mutable variable no `with begin():` block mentions** is a key of no store, so it has no history
 binding to read and its await resolves to the seed directly (`resolve_writer_free_awaits`) — the
 empty-history case, known empty statically. An all-deny history is the other case: it does build a
-store, and its `final_or_default` reports the seed as that store's default.
+store, and its `final_read` reports the seed, since nothing was written over it.
 
 ## Not yet implemented
 
@@ -1344,7 +1341,7 @@ uses one realization: the changelog `InductionStore`. Plain, conditional, and fe
 over finite or async extents all route through it. The
 driver reads its source by absolute domain position (async domains arrive unordered), reclaims the
 consumed prefix as it advances, and carries reply feeds as taps tagged `` `fired ``/`` `idle `` — see
-*Induction stores as a changelog* in `../../interpreter/design-operators.md`.
+[*Induction stores as a changelog*](../../interpreter/design-operators.md#induction-stores-as-a-changelog-inductionstore-and-storedenseread).
 
 The value-`Case` positions ride the same union-of-restricts:
 

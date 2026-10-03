@@ -1697,11 +1697,11 @@ fn trailing_hidden_writer_loop_compiles() {
 // ---------------------------------------------------------------------------
 // Compound (tuple / record) mutable variables
 //
-// A mutable variable holds one `Value`, so a tuple/record accumulator is a boxed
-// `Scalar(Record)` in the changelog, while a tuple/record *literal* compiles to
+// A mutable variable holds one `Value`, so a tuple/record accumulator is a materialized
+// `Scalar(Record)` in the changelog, while a tuple/record literal compiles to
 // a struct-of-arrays `Record` tiling. The two representations are reconciled at
-// the mutable variable boundaries (`read_initial_scalar` seeding, `flat_merge` decision
-// values, `ExtractFinal` extent-match) via `scalar_tile_to_column_value` /
+// the mutable variable boundaries (`seed_value` seeding, `flat_merge` decision
+// values, `ExtractFinal` extent-match) via `materialize_collections` /
 // `column_value_to_tile`. These pin that a compound induction accumulator folds,
 // reads-its-own-writes, and carries correctly.
 // ---------------------------------------------------------------------------
@@ -1792,67 +1792,96 @@ acc",
     );
 }
 
-/// A `mut` loop over a **product** domain is rejected at op-conversion, at every
-/// spelling: let-bound, inline, joined, and over a source. A comprehension across
-/// two sources is keyed by `(i, j)`, and the induction recurrence is sequenced by
-/// `UInt` position end to end — the driver pairs items with `UInt` domain keys,
-/// `CommitEngine` ticks are positions, and `StoreDenseRead` folds tick `p + 1`.
-///
-/// Pinned because the failure is otherwise silent-adjacent. The driver's decode
-/// (`decode_source_positioned`) drops a non-`UInt` key rather than failing on it,
-/// so an unguarded product domain is an empty position set, which the driver reads
-/// as an exhausted source: a loop that runs zero times. What stopped that before
-/// this check was a tile-shape panic and an `unreachable!` further downstream —
-/// loud, but neither names the construct and neither is guaranteed to be reached
-/// first.
+/// A `mut` loop over a **product** domain runs its positions in pair order, at every
+/// spelling: let-bound, inline, and joined. Its positions are records, and the drive and its
+/// readers release what they have consumed as a staircase over the fields
+/// (`Predicate::at_or_below`). A loop over a **map** is the one-field case: its positions are
+/// keys, released as bounds like any other ([`a_mut_loop_over_a_map_carries_its_accumulator`]).
 #[rstest]
-#[case(
+#[case::let_bound(
     indoc! {r#"
         xs = [1, 2]
         ys = [10, 20]
         prod = [x + y for x in xs for y in ys]
         n := 0
         for l in prod:
-            n := n + 1
+            n := n + l
         n
-    "#}
+    "#},
+    66
 )]
-#[case(
+#[case::inline(
     indoc! {r#"
         xs = [1, 2]
         ys = [10, 20]
         n := 0
         for l in [x + y for x in xs for y in ys]:
-            n := n + 1
+            n := n + l
         n
-    "#}
+    "#},
+    66
 )]
-// The join spelling. Its domain is *refined* as well as a product, and it is the
-// case that reaches this check only because the filtered-source fix lets it past
-// the post-planning `typecheck`.
-#[case(
+// The join spelling, whose domain is refined as well as a product.
+#[case::joined(
     indoc! {r#"
         xs = [1, 2, 3]
         ys = [2, 3, 4]
         n := 0
         for l in [x for x in xs for y in ys if x == y]:
-            n := n + 1
+            n := n + l
         n
-    "#}
+    "#},
+    5
 )]
-// One side a live source: the product is `([0, 1], source(stdin))`, so neither
-// factor being a `UIntRange` is what decides it.
-#[case(
+// Order-dependent: the drive runs `(1, 3) (1, 4) (2, 3) (2, 4)`.
+#[case::in_pair_order(
     indoc! {r#"
-        xs = ["a", "b"]
-        n := 0
-        for l in [x + y for x in xs for y in stdin()]:
-            n := n + 1
-        n
-    "#}
+        acc := 0
+        for d in [x * 10 + y for x in [1, 2] for y in [3, 4]]:
+            acc := acc * 100 + d
+        acc
+    "#},
+    13142324
 )]
-fn a_mut_loop_over_a_product_domain_is_rejected(#[case] code: &str) {
-    expect_compile_error(code, "must be indexed by iteration position");
+fn a_mut_loop_over_a_product_domain_runs_in_pair_order(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A `mut` loop over a **concatenation** runs each part's positions in turn, inline and
+/// let-bound. `xs ++ ys` is keyed by a tagged union of its parts' positions, whose prefix
+/// takes every part before the bound's whole (`Predicate::at_or_below_in`).
+#[rstest]
+#[case::inline(
+    indoc! {r#"
+        acc := 0
+        for v in [1, 2] ++ [3]:
+            acc += v
+        acc
+    "#},
+    6
+)]
+#[case::let_bound(
+    indoc! {r#"
+        acc := 0
+        xs = [1, 2] ++ [3]
+        for v in xs:
+            acc += v
+        acc
+    "#},
+    6
+)]
+// Order-dependent, over three parts.
+#[case::in_part_order(
+    indoc! {r#"
+        acc := 0
+        for v in [1, 2] ++ [3] ++ [4, 5]:
+            acc := acc * 10 + v
+        acc
+    "#},
+    12345
+)]
+fn a_mut_loop_over_a_concatenation_runs_in_part_order(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
 
 /// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where
@@ -2888,9 +2917,9 @@ fn nested_shapes_reach_realization(#[case] code: &str) {
     indoc! {r#"
         let s : Int = 0
         in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0 ≫ .0) { [s]⇒[s] over ((iterate ≫ [10, 20]) ▷ map_domain, .1 ≫ [10, 20]) ▷ curry_over do true ▷ const ▷ filter_values ≫ (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : ((Int, Int) ⇒ Int) = (__hist ≫ .s, .0) ▷ zip ≫ final_or_default
+        in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
         in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : Int = (__hist.s, 0) ▷ final_or_default
+        in let s : Int = __hist.s ▷ final_read
         in s
     "#}
 )]
@@ -2905,9 +2934,9 @@ fn nested_shapes_reach_realization(#[case] code: &str) {
     indoc! {r#"
         let s : Int = 0
         in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0 ≫ .0) { [s]⇒[s] over .1 do .1 ≫ (true ▷ const ▷ filter_values ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const) }
-        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = (__hist ≫ .s, .0) ▷ zip ≫ final_or_default
+        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
         in true ▷ const ▷ filter_values ≫ (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ false ▷ const ▷ filter_values ≫ `abort(unit) ▷ const }
-        in let s : Int = (__hist.s, 0) ▷ final_or_default
+        in let s : Int = __hist.s ▷ final_read
         in s
     "#}
 )]
@@ -2916,6 +2945,168 @@ fn a_nest_plans_to_a_transact_under_the_enclosing_pair(#[case] code: &str, #[cas
     use cambra::ccl::symbolic::symbolic;
     let planned = compile_to(code, Phase::Planning).expect("the nest plans");
     assert_eq!(symbolic(&planned), expected.trim_end());
+}
+
+// ---------------------------------------------------------------------------
+// A loop's iteration domain
+// ---------------------------------------------------------------------------
+//
+// A `mut` loop runs at its source's own keys, so a map drives one as a list does. A
+// `groupby` does not yet, for a reason that arises before its domain is reached. Each case
+// names the comprehension over the same collection, which compiles.
+
+/// A `mut` loop over a **map**, whose keys are its positions. The store records the
+/// positions it was driven at — `"a"` then `"b"` — and folds the accumulator over them,
+/// so a domain that cannot be enumerated from its type is a loop like any other.
+/// `sum([v for v in m])` over the same map answers 3 as well.
+#[test]
+fn a_mut_loop_over_a_map_carries_its_accumulator() {
+    check_scalar(
+        indoc! {r#"
+            m = map([("a", 1), ("b", 2)])
+            total := 0
+            for v in m:
+                total += v
+            total
+        "#},
+        cambra::interpreter::Value::Int(3),
+    );
+}
+
+/// A `mut` loop over a collection whose **rows are collections**, rectangular and jagged. Each
+/// row is one position, so the loop runs once per row rather than once per element: a count
+/// answers the number of rows, and `max(r)` reads each row at its own domain.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::rectangular(
+    indoc! {r"
+        total := 0
+        for r in [[1], [2]]:
+            total += 1
+        total
+    "},
+    2
+)]
+#[case::jagged(
+    indoc! {r"
+        total := 0
+        for r in [box([1]), box([2, 3])]:
+            total += 1
+        total
+    "},
+    2
+)]
+#[case::jagged_rows_read_at_their_own_domain(
+    indoc! {r"
+        total := 0
+        for r in [box([1]), box([2, 3])]:
+            total += max(r)
+        total
+    "},
+    4
+)]
+fn a_mut_loop_over_nested_collections_runs_once_per_row(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A `mut` loop over a **`groupby`**, which fails earlier and louder than the map: the
+/// partition's key binder escapes into an open bound during inference rather than
+/// reaching the domain check at all. Recorded beside the map case because both are "a
+/// loop over a collection whose domain is not a position", and only one of them says
+/// so. Answers 150 when both are lifted.
+#[test]
+fn a_mut_loop_over_a_groupby_escapes_its_key_binder() {
+    check_compile_error(
+        indoc! {r#"
+            sales = [(region="west", amount=100), (region="east", amount=50)]
+            total := 0
+            for g in groupby(sales, \r -> r.region):
+                total += sum([s.amount for s in g])
+            total
+        "#},
+        "is free in the lower bound",
+    );
+}
+
+/// A second loop's accumulator seeded from the first loop's result, over a source long
+/// enough that the seed takes many pulls to settle.
+///
+/// A seed is ordinary dataflow: it settles over as many pulls as the loop feeding it takes
+/// positions, and the pull it settles on is the one that opens the store. Reading it at
+/// subscribe would bound a program by how much its seed's input can deliver before the
+/// runtime has started; the cases straddle eight positions to catch a read bounded there.
+#[rstest]
+#[case::seven(7, 28 + 100)]
+#[case::eight(8, 36 + 100)]
+#[case::twenty(20, 210 + 100)]
+fn a_later_accumulator_seeds_from_a_long_loops_result(#[case] n: i64, #[case] expected: i64) {
+    let items = (1..=n)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                a := 0
+                for x in [{items}]:
+                    a += x
+                b := a
+                for y in [100]:
+                    b += y
+                b
+            "#},
+            items = items,
+        ),
+        cambra::interpreter::Value::Int(expected),
+    );
+}
+
+/// A loop that runs no position answers with its seed, however many pulls the seed takes
+/// to settle: the body is done on the first pull, and the store still has to read the seed
+/// it answers with.
+#[rstest]
+#[case::filtered_empty("[z for z in [1, 2] if z > 5]")]
+#[case::contradictory_filters("[z for z in [1, 2] if z > 5 if z < 0]")]
+fn a_loop_that_runs_no_position_answers_with_a_late_seed(#[case] source: &str) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                a := 0
+                for x in [1, 2, 3]:
+                    a += x
+                b := a
+                for y in {source}:
+                    b += y
+                b
+            "#},
+            source = source,
+        ),
+        cambra::interpreter::Value::Int(6),
+    );
+}
+
+/// Two accumulators in one loop whose seeds settle on different pulls.
+///
+/// `b` seeds from a loop that takes many pulls to reach its final; `c` seeds from a
+/// literal, which is there on the first. A store holds one value per key before any
+/// position, so it cannot open until every key has one — opening on the first seed to
+/// arrive leaves the slow one with no value at all, and nothing asks again.
+#[test]
+fn a_store_waits_for_every_accumulators_seed() {
+    check_scalar(
+        indoc! {r#"
+            a := 0
+            for x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                a += x
+            b := a
+            c := 100
+            for y in [1, 2]:
+                b += y
+                c += y
+            b + c
+        "#},
+        cambra::interpreter::Value::Int(58 + 103),
+    );
 }
 
 /// An inner loop whose only statement is a call that writes nothing is dropped, as a flat
