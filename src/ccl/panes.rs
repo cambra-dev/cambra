@@ -889,7 +889,7 @@ mod tests {
     ///
     /// The interesting programs are the ones that drive a *whole-program*
     /// rewrite, where naming one node is least obviously applicable: a
-    /// transaction is disassembled into a commit carrier whose pieces have no
+    /// transaction is disassembled into a `Transact` whose pieces have no
     /// single source node, and a defer cluster becomes a `LetRec` assembled from
     /// contributions scattered across the body. Both are covered by recording
     /// against the node each product stands in for — the `with begin():`

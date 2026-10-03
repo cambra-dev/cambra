@@ -479,7 +479,23 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // … }` — the shared keys with their seeds, then one writer clause per
         // concurrent writer. Reads of a key are the record projection
         // `__hist.k` elsewhere in the tree, not shown here.
-        TypedExprNode::Transact { keys, writers, .. } => {
+        //
+        // A **nested** `Transact` renders `transact under 𝑃 (…) { … }`, where `𝑃` is the
+        // writers' parameter: every component is a morphism of it rather than a closed
+        // value, so the seeds and the source read differently from a top-level
+        // `Transact`'s. Two `Transact`s that differ only in that are different nodes —
+        // `content_hash` hashes the slot — so rendering them alike is what makes a
+        // nested one unreadable beside a flat one.
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            parameter,
+            ..
+        } => {
+            let under = match parameter {
+                Some(p) => format!("under {} ", ty_at(p, opts)),
+                None => String::new(),
+            };
             let key_strs: Vec<_> = keys
                 .iter()
                 .map(|k| format!("{} = {}", k.name, fmt(&k.init, Precedence::Lowest, opts)))
@@ -491,7 +507,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (
                 Precedence::Lowest,
                 format!(
-                    "transact ({}) {{ {} }}",
+                    "transact {under}({}) {{ {} }}",
                     key_strs.join(", "),
                     writer_strs.join("; ")
                 ),
@@ -1089,6 +1105,7 @@ in x"
                 body: Expr::var("i"),
             }],
             domain: Type::Base(BaseType::Int),
+            parameter: None,
         }),
         "transact (i = 0) { [i]⇒[i] over xs do i }"
     )]
@@ -1112,8 +1129,31 @@ in x"
                 body: Expr::tuple(vec![Expr::var("x"), Expr::var("y")]),
             }],
             domain: Type::Base(BaseType::Int),
+            parameter: None,
         }),
         "transact (x = 0, y = 1) { [x, y]⇒[x, y] over xs do (x, y) }"
+    )]
+    // Transact, nested: the writers' parameter renders before the keys, because every
+    // component below is a morphism of it rather than a closed value.
+    #[case(
+        TypedExpr::new(TypedExprNode::Transact {
+            keys: vec![TransactKey {
+                name: "i".into(),
+                init: Expr::proj_index(0),
+            }],
+            writers: vec![WriterSite {
+                read_keys: vec!["i".into()],
+                write_keys: vec!["i".into()],
+                source: Expr::var("xs"),
+                body: Expr::var("i"),
+            }],
+            domain: Type::Base(BaseType::Int),
+            parameter: Some(Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::Int),
+            ])),
+        }),
+        "transact under (Int, Int) (i = .0) { [i]⇒[i] over xs do i }"
     )]
     // LetRec: bindings separated by `; `, `in` continuation as in Let
     #[case(

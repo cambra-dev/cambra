@@ -387,7 +387,7 @@ CHL source
   → channelize         APPEND elimination → the letrec's output channels
   → live-read rewrite  fed-out mutable variable reads → AsOf
   → lambda_elim        the LetRec travels through; bodies become point-free
-  → plan_loops         point-free letrec patterns → the `Transact` carrier
+  → plan_loops         point-free letrec patterns → the `Transact`
   → planning           the rest of `planning` — joins, group-by, and the iteration
                        staging that wraps every source as `iterate ≫ …`. Nothing
                        mut-specific
@@ -611,7 +611,7 @@ Four things to read off it:
 - **The writer body is a decision**, `` `commit(writes) `` or `` `abort ``, even though this
   write is unconditional (both guards are `true`). That is not induction-specific
   scaffolding — it is the *same* shape B's writer produced above, which is what lets one
-  carrier and one set of planning patterns serve both domains. The tagged sum is what makes
+  node and one set of planning patterns serve both domains. The tagged sum is what makes
   "no write" unable to carry a write set.
 - The trailing `x` became `final_or_default(history, seed)` — well-defined because the loop
   ends.
@@ -652,7 +652,7 @@ read into `as_of`.
 
 Planning then runs in two passes over the same tree, and the listings below are after
 **both** — which is why each writer's source reads `iterate ≫ [1, 2, 3]`. `plan_loops`
-recognises the carrier and leaves the source bare (`over [1, 2, 3]`); the general planning
+builds the `Transact` and leaves the source bare (`over [1, 2, 3]`); the general planning
 pass that follows is what stages it. Only the first pass is mutability-specific.
 
 `plan_loops` recurses into the continuation first (later loops and nested groups live
@@ -903,6 +903,6 @@ between them is the letrec's shape:
 5. Mutability is **a type**, and a read is **an explicit operation** at the rule that
    emits the operand — which is what makes the handle positions enumerable and lets
    invariance do its own job.
-6. Everything meets one carrier (`Transact`) and is dispatched to an engine **by its
+6. Everything meets one node (`Transact`) and is dispatched to an engine **by its
    domain** — two stores over one engine, each closing its recurrence through a cyclic
    fan so the accumulator crosses between operators as a tile like everything else.

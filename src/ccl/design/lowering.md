@@ -58,7 +58,7 @@ The recurrence is **not** built at lowering. The unified `mut_elim` rewrites
 every `For`+`MutWrite` loop into a guarded `LetRec` — the accumulators' history
 over the loop's induction domain, guarded by `get_prev_seq`, with trailing reads
 lowered to `final_or_default` — and `planning::plan_loops` lowers that onto the
-domain-parameterized `Transact` carrier, which operator conversion compiles to a
+domain-parameterized `Transact`, which operator conversion compiles to a
 position-driven `InductionStore` changelog. In-loop feeds (`<<`, and `yield` in a generator) are hoisted to
 `Feed(defer, view)` and routed as ordinary channels by `channelize`, the
 feed-routing step (channelize) of mutability elimination. A generator with loop-carried state
@@ -78,8 +78,9 @@ statement-position `Case` — a faithful mirror, no path computation at lowering
 (mutability is a type-level fact lowering does not have). `find_mutation_loop_vars`
 recurses into the branches so `for x in src: if p: total += x` classifies as a
 mutation loop; the branch merge (the write leg and its carry) is compiled downstream
-in `mut_elim` (`transform_chain`). A `for` or a `with begin():` nested inside an `if`
-inside a loop body stays rejected.
+in `mut_elim` (`transform_chain`). A `for` inside such an `if` lowers as a nested loop does
+at the body's top level. A `with begin():` nested inside an `if` inside a loop body stays
+rejected.
 
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
