@@ -454,7 +454,6 @@ fn lower_for_body_stmts_scoped(
                 requires,
                 body: fn_body,
             } => {
-                refuse_requires_clause(requires)?;
                 let name_str = name.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
                     return Err(outer_binding_write_error(stmt.span, &name_str));
@@ -464,6 +463,7 @@ fn lower_for_body_stmts_scoped(
                     type_params,
                     params,
                     output.as_ref(),
+                    requires,
                     fn_body,
                     ctx,
                 )?;

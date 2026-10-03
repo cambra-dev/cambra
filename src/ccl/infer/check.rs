@@ -434,8 +434,26 @@ impl Typing for CheckCtx {
         ty.clone()
     }
 
-    fn open_poly(&mut self, _poly: &crate::ccl::ty::PolyType) {
+    fn open_poly(
+        &mut self,
+        _poly: &crate::ccl::ty::PolyType,
+    ) -> Vec<std::rc::Rc<crate::ccl::infer::solver::traits::Assumption>> {
         unreachable!("a polymorphic annotation survived inference into Check");
+    }
+
+    fn with_assumptions<R>(
+        &mut self,
+        _assumptions: &[std::rc::Rc<crate::ccl::infer::solver::traits::Assumption>],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        f(self)
+    }
+
+    fn record_requirements(
+        &mut self,
+        _name: &Name,
+        _assumptions: Vec<std::rc::Rc<crate::ccl::infer::solver::traits::Assumption>>,
+    ) {
     }
 
     fn is_generalizable(&self, _def: &Expr) -> bool {

@@ -81,11 +81,16 @@ impl PolyScheme {
     /// "Instantiation"). A variable minted for a parameter stands in `telescope`,
     /// the use site's, since a parameter has no variable a copy could inherit a
     /// scope from.
+    ///
+    /// `extra` are further types freshened through the same copy, returned in order:
+    /// the operands and associated types of the binding's `requires` clause, which
+    /// the caller instantiates as obligations.
     pub fn instantiate_with_params(
         &self,
         current_level: Level,
         telescope: &Telescope,
-    ) -> (Type, Vec<(Type, Type)>) {
+        extra: &[&Type],
+    ) -> (Type, Vec<(Type, Type)>, Vec<Type>) {
         let mut cache = FreshenCache::new();
         cache.param_telescope = Some(telescope.clone());
         let ty = freshen_above(
@@ -111,7 +116,11 @@ impl PolyScheme {
                 bounded.push((instantiation, bound));
             }
         }
-        (ty, bounded)
+        let extra = extra
+            .iter()
+            .map(|t| freshen_above(self.level, t, FreshenLevel::At(current_level), &mut cache))
+            .collect();
+        (ty, bounded, extra)
     }
 
     /// [`instantiate`](Self::instantiate), stamping the *use site's* telescope
@@ -191,6 +200,11 @@ pub struct FreshenCache {
     /// at instantiation. A parameter has no variable of its own whose telescope a
     /// copy could inherit.
     pub param_telescope: Option<Telescope>,
+    /// Obligation copies a specialization reset because they assumed one of the
+    /// specialized binding's own type parameters
+    /// ([`TraitObligation::reset_for_specialization`]). `specialize_use` redelivers
+    /// each once the clone is pinned.
+    pub reset_obligations: Vec<Rc<TraitObligation>>,
 }
 
 impl FreshenCache {
@@ -717,6 +731,12 @@ fn freshen_watches(
         let copy = TraitObligation::new_from(&obligation);
         cache.obligations.insert(obligation.uid, Rc::clone(&copy));
         copy.watch(&Type::Infer(Rc::clone(v)), pos);
+        // A specialization clone turns the binding's own type parameters, the ones
+        // one level above the cutoff, into variables; an assumption about one of
+        // them no longer describes the copy.
+        if matches!(target, FreshenLevel::Preserve) && copy.reset_for_specialization(lim + 1) {
+            cache.reset_obligations.push(Rc::clone(&copy));
+        }
         // Phase 2: now that re-entry finds the copy, freshen the output and the
         // input expressions a refinement template builds from.
         copy.set_assoc_types(

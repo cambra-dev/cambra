@@ -1366,16 +1366,36 @@ static TYPE_PARAM_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub struct PolyType {
     /// The type parameters, in declaration order, each with its bound.
     pub params: Vec<PolyParam>,
+    /// The `requires` clause, each requirement over the parameters' holes.
+    pub requires: Vec<PolyRequirement>,
     /// The type the parameters are quantified over.
     pub body: Type,
 }
 
+/// One requirement of a [`PolyType`]'s `requires` clause, as lowering checked it: each
+/// operand a base type or a type parameter's hole, an `Equatable` over products
+/// already read componentwise (`docs/chl-spec.md`, "Trait requirements").
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PolyRequirement {
+    pub trait_: crate::ccl::infer::solver::traits::Trait,
+    /// One per operand position.
+    pub args: Vec<Type>,
+    /// The associated types the clause names.
+    pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+}
+
 impl PolyType {
-    /// Every type this `Poly` holds: each bound in declaration order, then the body.
+    /// Every type this `Poly` holds: each bound in declaration order, each
+    /// requirement's operands and associated types, then the body.
     pub fn types(&self) -> impl Iterator<Item = &Type> {
         self.params
             .iter()
             .filter_map(|p| p.bound.as_ref())
+            .chain(
+                self.requires
+                    .iter()
+                    .flat_map(|r| r.args.iter().chain(r.assoc.iter().map(|(_, t)| t))),
+            )
             .chain(std::iter::once(&self.body))
     }
 
@@ -1384,6 +1404,11 @@ impl PolyType {
         self.params
             .iter_mut()
             .filter_map(|p| p.bound.as_mut())
+            .chain(
+                self.requires
+                    .iter_mut()
+                    .flat_map(|r| r.args.iter_mut().chain(r.assoc.iter_mut().map(|(_, t)| t))),
+            )
             .chain(std::iter::once(&mut self.body))
     }
 
@@ -1398,6 +1423,15 @@ impl PolyType {
                     hole: p.hole,
                     spelling: p.spelling.clone(),
                     bound: p.bound.as_ref().map(&mut f),
+                })
+                .collect(),
+            requires: self
+                .requires
+                .iter()
+                .map(|r| PolyRequirement {
+                    trait_: r.trait_,
+                    args: r.args.iter().map(&mut f).collect(),
+                    assoc: r.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
                 })
                 .collect(),
             body: f(&self.body),
@@ -2208,7 +2242,26 @@ fn fmt_type(
                     None => p.spelling.to_string(),
                 })
                 .collect();
-            write!(f, "\\{} -> {}", params.join(", "), at(&poly.body, binders))
+            write!(f, "\\{} -> {}", params.join(", "), at(&poly.body, binders))?;
+            let requires: Vec<String> = poly
+                .requires
+                .iter()
+                .map(|r| {
+                    let mut args: Vec<String> =
+                        r.args.iter().map(|t| at(t, binders).to_string()).collect();
+                    args.extend(
+                        r.assoc
+                            .iter()
+                            .map(|(n, t)| format!("{n}={}", at(t, binders))),
+                    );
+                    format!("{}({})", r.trait_, args.join(", "))
+                })
+                .collect();
+            if requires.is_empty() {
+                Ok(())
+            } else {
+                write!(f, " requires {}", requires.join(", "))
+            }
         }
         Type::Txn => write!(f, "Txn"),
         Type::History {

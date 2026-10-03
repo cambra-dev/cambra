@@ -366,7 +366,7 @@ pub struct TypeParam {
 /// One requirement of a `requires` clause: `Addable(A, B, Output=O)`, or a bare
 /// name such as `Transaction`.
 ///
-/// Spec: `docs/chl-spec.md`, "Trait requirements \[Decided\]".
+/// Spec: `docs/chl-spec.md`, "Trait requirements".
 #[derive(Debug, Clone, PartialEq)]
 pub struct Requirement {
     pub name: SmolStr,

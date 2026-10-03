@@ -417,7 +417,9 @@ pub struct LoweringContext {
     /// parameter is scoped like an alias declared in its definition's block, and a
     /// same-named alias in the body is an error rather than a shadow
     /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
-    pub(super) type_params_in_scope: Vec<String>,
+    /// Each is its spelling and the shared hole that stands for it, which is what
+    /// tells a requirement's operand that is a type parameter from any other hole.
+    pub(super) type_params_in_scope: Vec<(String, u32)>,
 
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
@@ -813,7 +815,12 @@ impl LoweringContext {
 
     /// Whether `name` is a type parameter of a definition being lowered.
     pub(super) fn is_type_param(&self, name: &str) -> bool {
-        self.type_params_in_scope.iter().any(|n| n == name)
+        self.type_params_in_scope.iter().any(|(n, _)| n == name)
+    }
+
+    /// Whether the shared hole `id` stands for a type parameter in scope.
+    pub(super) fn is_type_param_hole(&self, id: u32) -> bool {
+        self.type_params_in_scope.iter().any(|(_, h)| *h == id)
     }
 
     /// Record that `def name` carries a pass-by-reference `Mut` parameter, so it

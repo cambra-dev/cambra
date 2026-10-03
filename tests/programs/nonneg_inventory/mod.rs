@@ -12,9 +12,9 @@
 //! **Currently blocked at parsing.**  The store type's refinement brace, the
 //! store literal's `->` entry pair, and `reserve`'s `requires Transaction` clause
 //! all parse now (`docs/chl-spec.md`, "6.4 Refinement syntax", "2.4 Atoms" and
-//! "Trait requirements [Decided]"), so the first unsupported construct is the
-//! `assert` statement, which is not lexed.  Behind it: lowering refuses the
-//! `requires` clause, then `Map(…)` as an annotation form, map lookup,
+//! "Trait requirements"), so the first unsupported construct is the
+//! `assert` statement, which is not lexed.  Behind it: lowering refuses
+//! `requires Transaction`, then `Map(…)` as an annotation form, map lookup,
 //! `with begin():`, and record terms.  This pins the `assert` parse failure.
 //!
 //! Expected output once fully unblocked: `` `some(1) `` (5 − 2 − 2, third
