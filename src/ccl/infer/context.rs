@@ -189,11 +189,18 @@ pub(super) struct InferCtx {
     /// that shared an id across a `let` RHS boundary would silently take the first
     /// level it saw.
     shared_holes: RefCell<HashMap<u32, Type>>,
+    /// The shared holes that stand for type parameters before inference
+    /// ([`crate::ccl::ty::PolyParam::hole`]), collected at inference entry in
+    /// debug builds. Opening a `Poly` seeds [`shared_holes`](Self::shared_holes)
+    /// with each parameter's [`Type::Param`]; one of these holes normalized before
+    /// that would quietly become an ordinary variable, a flexible `T`, and this is
+    /// what the normalization checks.
+    pub(super) type_param_holes: HashSet<u32>,
     /// The binders in lexical scope at the current emission position — what
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
-    telescope: Telescope,
+    pub(super) telescope: Telescope,
     /// What each [opaque](crate::ccl::BindingTransparency::Opaque) binder was
     /// bound at, kept past the binder's scope.
     ///
@@ -244,6 +251,7 @@ impl InferCtx {
             lit_singletons: HashMap::new(),
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
+            type_param_holes: HashSet::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
         }
@@ -288,12 +296,24 @@ impl InferCtx {
             // one reuses it. That identity is the entire mechanism — it is how a
             // desugaring relates two positions whose common type only inference
             // will learn (see [`Type::SharedHole`]).
-            Type::SharedHole(id) => self
-                .shared_holes
-                .borrow_mut()
-                .entry(*id)
-                .or_insert_with(|| Type::Infer(InferVar::fresh_in(self.level, telescope)))
-                .clone(),
+            //
+            // A type parameter's hole is seeded with its `Type::Param` when its `Poly`
+            // is opened, before anything in the definition is normalized, so it never
+            // mints a variable here.
+            Type::SharedHole(id) => {
+                let mut holes = self.shared_holes.borrow_mut();
+                if let Some(existing) = holes.get(id) {
+                    return existing.clone();
+                }
+                debug_assert!(
+                    !self.type_param_holes.contains(id),
+                    "type parameter hole _#{id} was normalized before its `Poly` was opened; \
+                     it would have become a flexible variable",
+                );
+                let fresh = Type::Infer(InferVar::fresh_in(self.level, telescope));
+                holes.insert(*id, fresh.clone());
+                fresh
+            }
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
             // the *only* place `BoundedHole` is consumed; every other pass either
@@ -409,7 +429,15 @@ impl InferCtx {
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
             | Type::Txn
+            // A type parameter stands for itself in its definition's body.
+            | Type::Param(_)
             | Type::Infer(_) => ty.clone(),
+            // `emit_let` opens a `Poly` annotation itself, normalizing its bounds
+            // and body, and lowering admits a `Poly` only as a `let` annotation.
+            Type::Poly(_) => unreachable!(
+                "a polymorphic type reached `normalize_annotation`; lowering admits one only \
+                 as a `let` annotation, which `emit_let` opens"
+            ),
         }
     }
 }
@@ -523,6 +551,40 @@ impl Typing for InferCtx {
 
     fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {
         crate::ccl::infer::emit::emit_annotation_predicates(ty, self)
+    }
+
+    fn resolve_type_params(&self, ty: &Type) -> Type {
+        fn go(ty: &mut Type, holes: &HashMap<u32, Type>) {
+            if let Type::SharedHole(id) = ty
+                && let Some(param @ Type::Param(_)) = holes.get(id)
+            {
+                *ty = param.clone();
+                return;
+            }
+            ty.walk_children_mut(|child| go(child, holes));
+        }
+        let mut out = ty.clone();
+        go(&mut out, &self.shared_holes.borrow());
+        out
+    }
+
+    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) {
+        // In declaration order: a bound names only the parameters before it, whose
+        // holes are seeded by the time it is normalized.
+        for p in &poly.params {
+            let bound = p.bound.as_ref().map(|b| self.normalize_annotation(b));
+            let param = crate::ccl::ty::TypeParam::fresh(p.spelling.clone(), self.level, bound);
+            let previous = self
+                .shared_holes
+                .borrow_mut()
+                .insert(p.hole, Type::Param(param));
+            assert!(
+                previous.is_none(),
+                "type parameter `{}` (hole _#{}) was normalized before its `Poly` was opened",
+                p.spelling,
+                p.hole,
+            );
+        }
     }
 
     fn require_sub(

@@ -1001,6 +1001,8 @@ pub fn reset_fun_kind_var_counter() {
 /// | `History` (`history_kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`history_kind: Append`) | Type checker only | "Feed channel `domain ⤇ value`: the defer binding's post-channelize collection type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
+/// | `Poly(𝜋)` | Lowering | "A written polymorphic type `\𝑇 -> 𝑉`" — only as a `let` annotation | Inference, which opens it at the `let` and instantiates it at each use (flagged by `collect_type_errors` if it survives) |
+/// | `Param(𝑇)` | Type checker only | "A type parameter, opaque inside the binding that declares it" | Specialization, which substitutes each use's types (flagged by `collect_type_errors` if it survives) |
 ///
 /// A type is **concrete** when none of those variants occurs anywhere in it, nor
 /// a [`FunKind::Var`]: it is what a checked program exhibits, and what every pass
@@ -1278,8 +1280,142 @@ pub enum Type {
     /// Named for the *reference*: the witness itself is the [`Witness`] in the function's
     /// slot ([`FunKind::Data`]), classified by a [`TypeKind`].
     WitnessRef(WitnessId),
+    /// A **type parameter**, `T` in `def f(T, x: T)`: opaque inside the binding that
+    /// declares it, a subtype only of itself and of its bound, and instantiated as a
+    /// fresh inference variable at each use.
+    ///
+    /// Minted by emission when it opens the [`Type::Poly`] that declares the
+    /// parameter, and carrying what the solver reads of it, as [`Type::Infer`]'s
+    /// variable does. Before inference a type parameter is a [`Type::SharedHole`],
+    /// which normalization replaces with this leaf.
+    ///
+    /// See `src/ccl/design/type-parameters.md`.
+    Param(Rc<TypeParam>),
+    /// A **written polymorphic type**, `\T, U <: B -> V`: type parameters with their
+    /// bounds over a body type. Lowering produces one only as a whole `let`
+    /// annotation; a `def` with type parameters is a `let` annotated with one whose
+    /// body is [`Type::Hole`], since the lambda's own annotations already state its
+    /// signature.
+    ///
+    /// See `src/ccl/design/type-parameters.md`.
+    Poly(Rc<PolyType>),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
+}
+
+/// A type parameter as inference opened it: [`Type::Param`]. Equality, ordering and
+/// hashing are by `id`.
+#[derive(Debug)]
+pub struct TypeParam {
+    pub id: TypeParamId,
+    /// The name the user wrote, for display.
+    pub spelling: SmolStr,
+    /// The level of the right-hand side the declaring `Poly` annotates, which is
+    /// where that right-hand side's own inference variables sit.
+    pub level: crate::ccl::Level,
+    /// The upper bound, normalized at `level`, or `None`.
+    pub bound: Option<Type>,
+}
+
+impl TypeParam {
+    /// A type parameter no other has been minted equal to.
+    pub fn fresh(
+        spelling: impl Into<SmolStr>,
+        level: crate::ccl::Level,
+        bound: Option<Type>,
+    ) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            spelling: spelling.into(),
+            level,
+            bound,
+        })
+    }
+}
+
+impl PartialEq for TypeParam {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for TypeParam {}
+impl PartialOrd for TypeParam {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TypeParam {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+impl std::hash::Hash for TypeParam {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+/// Globally unique identity of a [`TypeParam`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeParamId(pub u32);
+
+static TYPE_PARAM_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// The content of a [`Type::Poly`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PolyType {
+    /// The type parameters, in declaration order, each with its bound.
+    pub params: Vec<PolyParam>,
+    /// The type the parameters are quantified over.
+    pub body: Type,
+}
+
+impl PolyType {
+    /// Every type this `Poly` holds: each bound in declaration order, then the body.
+    pub fn types(&self) -> impl Iterator<Item = &Type> {
+        self.params
+            .iter()
+            .filter_map(|p| p.bound.as_ref())
+            .chain(std::iter::once(&self.body))
+    }
+
+    /// [`types`](Self::types), mutably.
+    pub fn types_mut(&mut self) -> impl Iterator<Item = &mut Type> {
+        self.params
+            .iter_mut()
+            .filter_map(|p| p.bound.as_mut())
+            .chain(std::iter::once(&mut self.body))
+    }
+
+    /// This `Poly` with `f` applied to each bound and to the body; the parameters
+    /// keep their identities.
+    pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> PolyType {
+        PolyType {
+            params: self
+                .params
+                .iter()
+                .map(|p| PolyParam {
+                    hole: p.hole,
+                    spelling: p.spelling.clone(),
+                    bound: p.bound.as_ref().map(&mut f),
+                })
+                .collect(),
+            body: f(&self.body),
+        }
+    }
+}
+
+/// One type parameter a [`PolyType`] declares, with its upper bound if it has one.
+/// A bound names only the parameters before it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PolyParam {
+    /// The [`Type::SharedHole`] id that stands for the parameter in the bounds and
+    /// body after it, and in the annotations of the definition it annotates. Opening
+    /// the `Poly` is what gives every occurrence its [`Type::Param`].
+    pub hole: u32,
+    /// The name the user wrote.
+    pub spelling: SmolStr,
+    pub bound: Option<Type>,
 }
 
 /// **Which binder a witness is** — its name, and the whole of its identity.
@@ -2061,6 +2197,19 @@ fn fmt_type(
         Type::Infer(var) => write!(f, "?{}", var.uid),
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
+        Type::Param(param) => write!(f, "{}", param.spelling),
+        // The spec's notation, `\T, U <: B -> V`.
+        Type::Poly(poly) => {
+            let params: Vec<String> = poly
+                .params
+                .iter()
+                .map(|p| match &p.bound {
+                    Some(bound) => format!("{} <: {}", p.spelling, at(bound, binders)),
+                    None => p.spelling.to_string(),
+                })
+                .collect();
+            write!(f, "\\{} -> {}", params.join(", "), at(&poly.body, binders))
+        }
         Type::Txn => write!(f, "Txn"),
         Type::History {
             value,
@@ -3006,6 +3155,7 @@ impl Type {
                 value.without_pi_names(),
                 *history_kind,
             ),
+            Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(Type::without_pi_names))),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -3014,6 +3164,7 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::Param(_)
             | Type::Txn => self.clone(),
         }
     }
@@ -3105,7 +3256,11 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::Param(_)
             | Type::Txn => {}
+            // A `Poly`'s bounds are its children as its body is: a pass that rewrites
+            // types (uniquify's α-renaming, `subst`) must reach a refinement in a bound.
+            Type::Poly(poly) => poly.types().for_each(f),
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.
@@ -3162,7 +3317,9 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::Param(_)
             | Type::Txn => {}
+            Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.

@@ -332,7 +332,7 @@ with_stmt       ::= "with" [ ident "=" ] expression ":" block
 def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
 params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
 value_param     ::= ident [ ( ":" | "<:" ) expression ]
--- `type_param` and `requires_clause` are in §6.8. Lowering refuses both.
+-- `type_param` and `requires_clause` are in §6.8. Lowering refuses `requires_clause`.
 
 -- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
 -- decorator and the declaration are one statement, which is why a declaration
@@ -1079,7 +1079,7 @@ returning a pair, §2.4) is unusual but unambiguous — the first `->` closes th
 body.
 
 A capitalized binder is a type parameter, and only a polymorphic type `\T -> V` in an annotation
-binds one ([Polymorphic type annotations](#polymorphic-type-annotations-decided)). A lambda value
+binds one ([Polymorphic type annotations](#polymorphic-type-annotations)). A lambda value
 with a capitalized binder or a `requires` clause is an error.
 
 ### 3.11 List, tuple, record literals
@@ -1425,8 +1425,8 @@ surrounding scope. `p: T` fixes the parameter's type at `T`; `p <: T`
 leaves it inferred and bounded above by `T` (see [Two annotation
 forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
 The two forms may be mixed across a parameter list. A capitalized
-parameter is a type parameter, not a value, and lowering refuses it as
-unsupported ([Type parameters](#type-parameters-decided)). A return-type
+parameter is a type parameter, not a value
+([Type parameters](#type-parameters)). A return-type
 annotation, introduced by `=>`, specifies a fixed output type for the
 function. The inferred type of the function body must be a subtype of
 the annotated output type.
@@ -2148,8 +2148,8 @@ marked one carries its status per "How to read this document".)
   is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
   function. Whether the function is a collection or a callable capability
   is inferred, never written (§6.3).
-- `\T -> U` — polymorphic type: for every type `T`, a `U` (**[Decided]**,
-  [6.8 Polymorphic types](#68-polymorphic-types)).
+- `\T -> U` — polymorphic type: for every type `T`, a `U`
+  ([6.8 Polymorphic types](#68-polymorphic-types)), written only as a whole `let` annotation.
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
@@ -2695,8 +2695,7 @@ The rules, and what each one is doing:
   `:=`, `op=`, `<<=`, a `for` target, a comprehension generator — rejects a
   capitalized binder and names this one. A `def` name is not yet checked; a
   capitalized one binds a value the type language cannot see. A capitalized
-  parameter is a type parameter, which lowering refuses as unsupported
-  ([Type parameters](#type-parameters-decided)).
+  parameter is a type parameter ([Type parameters](#type-parameters)).
 - **The type language's own names are reserved.** `Int`, `UInt`, `String`,
   `Bool`, `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
   `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
@@ -2723,7 +2722,7 @@ which is the difference between naming a type and naming a type constructor. A
 parameterised left-hand side is currently an "invalid assignment target" parse
 error. If added, a parameterised alias takes this head form: `\T -> V` in a type
 position is a polymorphic type, not a type constructor
-([Polymorphic type annotations](#polymorphic-type-annotations-decided)).
+([Polymorphic type annotations](#polymorphic-type-annotations)).
 
 The north-star `storefront` exercises four aliases, two of them refined.
 
@@ -2762,11 +2761,11 @@ them together. A binding whose right-hand side is a call, a collection, a tuple 
 of a monomorphic binding is monomorphic. A tuple or record of polymorphic functions is therefore
 monomorphic, and making each field polymorphic on its own is **[Open]**.
 
-The subsections below are **[Decided]** and not implemented. The parser recognises their syntax:
-type parameters, bounds, `requires` clauses, and `\T -> V` in a type position. Lowering refuses
-each as unsupported.
+Type parameters, bounds and polymorphic type annotations are implemented. Trait requirements and
+the subsection after them are **[Decided]** and not implemented: a `requires` clause parses, and
+lowering refuses it as unsupported, so a type parameter supports only what its bound states.
 
-#### Type parameters [Decided]
+#### Type parameters
 
 ```ebnf
 def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
@@ -2780,26 +2779,27 @@ result annotation, the `requires` clause, and the body. Type parameters precede 
 parameters.
 
 ```python
-def larger(T, a: T, b: T) => T requires Orderable(T, T):
-    b if a < b else a
+def first(T, a: T, b: T) => T:
+    a
 
-larger(3, 7)       # T = Int
-larger("a", "b")   # T = String
+first(3, 7)       # T = Int
+first("a", "b")   # T = String
 ```
 
-- **A type parameter is not an argument.** `larger` takes two arguments. Each call infers the
+- **A type parameter is not an argument.** `first` takes two arguments. Each call infers the
   type parameters from its arguments. Supplying one explicitly is **[Open]**: it would be a named
   component in an otherwise positional call, which
   [3.8 Function calls](#38-function-calls) leaves open.
 - **Every type parameter is determined by the arguments.** It appears in a value parameter's
   annotation, or it is the associated type of a requirement whose other positions are determined
-  ([Trait requirements](#trait-requirements-decided)). Any other type parameter is an error at the
-  definition.
+  (**[Decided]**, [Trait requirements](#trait-requirements-decided)). Any other type parameter is an
+  error at the definition.
 - **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
   `requires` clause state, and nothing else. `def inc(T, x: T) => T: x + 1` is an error at `+`,
   because no requirement states that `T` and `Int` are `Addable`.
-- **Two type parameters have no common type.** With `a: T` and `b: U`, `b if a < b else a` is an
+- **Two type parameters have no common type.** With `a: T` and `b: U`, `a if c else b` is an
   error: no type the program can write covers both, unless one parameter's bound names the other.
+  The definition is rejected whether or not anything calls it.
 - **A type parameter does not leave its definition.** A value of type `T` flowing into something
   declared outside the `def`, as in `outer << x` with `x: T`, is an error naming `T`. Outside the
   definition no use has substituted a type for it.
@@ -2807,21 +2807,21 @@ larger("a", "b")   # T = String
   ([6.7 Type-alias statements](#67-type-alias-statements)). It shadows an outer alias of the same
   name. An alias of the same name declared in the body is an error naming both.
 
-#### Bounds [Decided]
+#### Bounds
 
 `T <: U` restricts `T` to subtypes of `U`. The body uses a value of type `T` as a `U`. The caller
 receives its own type for `T`.
 
 ```python
-def newest(T <: {at: Int}, a: T, b: T) => T:
-    b if a.at < b.at else a
+def stamped(T <: {at: Int}, a: T) => {Int, T}:
+    (a.at, a)
 
-latest = newest((at=1, sku="tee"), (at=2, sku="mug"))
-latest.sku   # String: T is the arguments' record type, sku included
+pair = stamped((at=2, sku="mug"))
+pair.1.sku   # "mug": T is the argument's record type, sku included
 ```
 
-With `a: {at: Int}` and a `{at: Int}` result instead, `latest` is `{at: Int}` and `latest.sku` is an
-error.
+With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: Int}` and
+`pair.1.sku` is an error. A call whose argument is not below the bound is rejected at the call.
 
 - A bound names only the type parameters before it. A bound naming its own parameter is a recursive
   type, which [6.7 Type-alias statements](#67-type-alias-statements) leaves unwritable.
@@ -2872,7 +2872,7 @@ is the type that satisfies it.
   rejected at the call, with a secondary label at the requirement.
 - `^+` has no nameable trait. Declaring a trait or an instance is **[Open]**.
 
-#### Polymorphic type annotations [Decided]
+#### Polymorphic type annotations
 
 ```ebnf
 poly_type       ::= "\" type_param ( "," type_param )* "->" expression [ requires_clause ]
@@ -2880,11 +2880,11 @@ poly_type       ::= "\" type_param ( "," type_param )* "->" expression [ require
 
 In a type position, `\T, U <: B -> V requires …` is the type of a polymorphic value: for every
 `T` and `U` that meet the bounds and requirements, a value of type `V`. A polymorphic `def` has this
-type, with its type parameters moved into the lambda. `larger` above has type
-`\T -> {T, T} => T requires Orderable(T, T)`.
+type, with its type parameters moved into the lambda. `first` above has type `\T -> {T, T} => T`.
+The `requires` clause is **[Decided]**, as in [Trait requirements](#trait-requirements-decided).
 
 ```python
-bigger: \T -> {T, T} => T requires Orderable(T, T) = larger
+pick: \T -> {T, T} => T = first
 ```
 
 - **It annotates a polymorphic binding.** A monomorphic binding with a polymorphic annotation is an
@@ -2895,15 +2895,15 @@ bigger: \T -> {T, T} => T requires Orderable(T, T) = larger
 - **It is written only as a whole annotation.** Inside another type, as in
   `{\T -> T => T} => Int`, it would type a function that takes a polymorphic argument. That is
   **[Open]** and an error.
-- **An alias may name it.** `Larger = \T -> {T, T} => T requires Orderable(T, T)` declares an alias
-  of a polymorphic type, and `bigger: Larger = larger` uses it as a whole annotation
+- **An alias may name it.** `Pick = \T -> {T, T} => T` declares an alias of a polymorphic type,
+  and `pick: Pick = first` uses it as a whole annotation
   ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
   the nested case above.
 - **It is never a type constructor.** `\T -> V` does not denote a function from types to types. A
   parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
   ([6.7 Type-alias statements](#67-type-alias-statements)).
-- **A diagnostic prints an inferred polymorphic type in this notation.** A part of the type the
-  notation cannot write, such as whether a function is a collection
+- **A diagnostic prints an inferred polymorphic type in this notation** (**[Decided]**). A part of
+  the type the notation cannot write, such as whether a function is a collection
   ([6.3 Direction: collection types](#63-direction-collection-types-decided)), is marked in the
   printed type, not dropped.
 

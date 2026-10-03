@@ -150,7 +150,7 @@ Key shape choices:
   It does not chain, since nothing associates a third component, so
   `a -> b -> c` is a parse error.
 - **Type parameters are split out of the parameter list.** A capitalized parameter is a type
-  parameter ([docs/chl-spec.md](../docs/chl-spec.md), "Type parameters [Decided]"), so
+  parameter ([docs/chl-spec.md](../docs/chl-spec.md), "Type parameters"), so
   `Stmt::FunctionDef` and `Expr::Lambda` carry `type_params: Vec<TypeParam>` beside `params`, and
   `params` alone is the arity. The split happens as the list is parsed (`split_params`), which
   rejects a type parameter after a value parameter and an exact annotation on one; a type
@@ -160,8 +160,8 @@ Key shape choices:
   `requires Addable(A, B, Output=O), Transaction` into `Vec<Spanned<Requirement>>`, operands
   first and associated types by name after them. It follows a `def`'s `=>` result, and a lambda's
   body; the parser cannot tell a type-position lambda from a value one, so lowering decides what
-  each accepts ([docs/chl-spec.md](../docs/chl-spec.md), "Polymorphic type annotations
-  [Decided]"). A clause after a lambda body belongs to the innermost lambda.
+  each accepts ([docs/chl-spec.md](../docs/chl-spec.md), "Polymorphic type annotations"). A
+  clause after a lambda body belongs to the innermost lambda.
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.

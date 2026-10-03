@@ -133,6 +133,45 @@ pub enum PartialKind {
 // Coalesce: CompactGraph → ccl::Type
 // ---------------------------------------------------------------------------
 
+/// Collapse contributions at one position that a type parameter's bound relates.
+///
+/// Atoms are otherwise incomparable, so `𝑈` and `𝑇` meeting at a position collide.
+/// Under `𝑈 <: 𝑇` they do not: the join of the two is `𝑇` and the meet `𝑈`
+/// (`src/ccl/design/type-parameters.md`, "Subtyping with a type parameter"). At a
+/// positive position this keeps the contribution every other one is below, at a
+/// negative one the contribution below every other, and leaves the set alone when
+/// none is. "Below" follows a parameter's bound chain to an equal type; a bound that
+/// is a subtype of a contribution without equalling it is not recognized, so that
+/// position still collides.
+fn collapse_by_param_bounds(all: &mut Vec<Type>, polarity: bool) {
+    fn below(x: &Type, y: &Type) -> bool {
+        if x == y {
+            return true;
+        }
+        match x {
+            Type::Param(param) => param.bound.as_ref().is_some_and(|b| below(b, y)),
+            _ => false,
+        }
+    }
+    if all.len() < 2 || !all.iter().any(|t| matches!(t, Type::Param(_))) {
+        return;
+    }
+    let extreme = all.iter().position(|candidate| {
+        all.iter().all(|other| {
+            if polarity {
+                below(other, candidate)
+            } else {
+                below(candidate, other)
+            }
+        })
+    });
+    if let Some(i) = extreme {
+        let keep = all.swap_remove(i);
+        all.clear();
+        all.push(keep);
+    }
+}
+
 /// Materialize a CompactType into `ccl::Type`.
 ///
 /// Multiple atom contributions at the same position is an error
@@ -461,6 +500,7 @@ fn coalesce_compact_go(
     let mut all = Vec::new();
     all.append(&mut atoms);
     all.append(&mut shapes);
+    collapse_by_param_bounds(&mut all, polarity);
 
     let inner = match all.len() {
         0 => {

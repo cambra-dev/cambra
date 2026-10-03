@@ -2755,6 +2755,7 @@ A contribution arriving at a position is one of four things, and each has its ow
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
 | **determined, and neither** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
+| a **type parameter** | `T` in `def f(T, x: T)` | its bound is offered in its place; with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
 The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
 
@@ -2833,6 +2834,10 @@ A variable's lower bounds are written in exactly four places, and delivery is wi
 * `constrain_go`'s concrete arm — delivers the contribution directly.
 * `constrain_go`'s var-var arm — propagates the watch *downward*, toward the variables feeding the watched one, and delivers what they already know.
 * `extrude`'s proxy seeding, and `freshen_above`'s clone — both seed bounds by direct writes rather than through `constrain_go`.
+
+`link_watches` replays what the lower variable already carries when it links an obligation to it: its
+bases, and its type parameters, so an operator on an unbounded parameter is refused whichever edge
+arrives first.
 
 That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` covers the four writers, a case per mechanism.
 

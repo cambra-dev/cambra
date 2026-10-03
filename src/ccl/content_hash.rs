@@ -330,6 +330,18 @@ fn hash_type_in<'a>(
         // spelling, not the whole `Name`: a channel binder carries a
         // run-varying `uid`, exactly like a free term variable.
         T::ChanDom(name, _level) => name.base().hash(state),
+        // A type parameter's identity is per-compilation, like a binder's `uid`, so
+        // its spelling is what is folded. None survives inference, so this is
+        // reached only by a hash of a pre-inference tree.
+        T::Param(param) => param.spelling.hash(state),
+        T::Poly(poly) => {
+            for p in &poly.params {
+                p.spelling.hash(state);
+            }
+            for t in poly.types() {
+                hash_type_in(t, env, wenv, free, state);
+            }
+        }
         // `SharedHole`'s id joins `Infer`'s uid as an identity that is only
         // meaningful inside the tree that minted it (ids are per
         // `LoweringContext`), so it says nothing about content: two programs

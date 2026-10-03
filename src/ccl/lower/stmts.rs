@@ -11,7 +11,7 @@ use crate::{
     },
     chl_parser::ast::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, MatchArm, PayloadPattern, Span,
-        Spanned, Stmt as ChlStmt, TypeAnnotation,
+        Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
     },
 };
 
@@ -585,7 +585,7 @@ pub(super) fn lower_middle_stmt(
                     ),
                 ));
             }
-            let annotation_ty = lower_type_annotation(annotation, ctx)?;
+            let annotation_ty = lower_let_annotation(annotation, value, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
@@ -775,10 +775,21 @@ pub(super) fn lower_middle_stmt(
             requires,
             body: fn_body,
         } => {
-            refuse_polymorphic_signature(type_params, requires)?;
-            let func_expr = lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
+            refuse_requires_clause(requires)?;
+            let (func_expr, annotation) = lower_def(
+                stmt.span,
+                type_params,
+                params,
+                output.as_ref(),
+                fn_body,
+                ctx,
+            )?;
+            let name = name.as_str().to_string();
             Ok(ctx.tag_image(
-                Expr::let_bind(name.as_str().to_string(), func_expr, body),
+                match annotation {
+                    Some(poly) => Expr::let_bind_annotated(name, func_expr, body, poly),
+                    None => Expr::let_bind(name, func_expr, body),
+                },
                 stmt.span,
             ))
         }
@@ -1287,6 +1298,81 @@ pub(super) fn lower_type_annotation(
     })
 }
 
+/// Lower a `let` binder's annotation. An exact annotation may be a polymorphic
+/// type, and then the right-hand side must be one that can be polymorphic: a
+/// lambda, or a name, which inference refuses if it names a monomorphic binding
+/// (`docs/chl-spec.md`, "Polymorphic type annotations"). A bounded
+/// polymorphic annotation is refused by [`lower_type_annotation`].
+pub(super) fn lower_let_annotation(
+    annotation: &TypeAnnotation,
+    value: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    let ty = lower_type_expr_or_poly(&annotation.ty, ctx)?;
+    if annotation.mode == AnnotationMode::Bounded {
+        if matches!(ty, Type::Poly(_)) {
+            return Err(LoweringError::unsupported(
+                annotation.ty.span,
+                "a polymorphic annotation is exact: write `g: \\T -> V = …`, not `g <: …`",
+            ));
+        }
+        return Ok(Type::BoundedHole(Box::new(ty)));
+    }
+    if matches!(ty, Type::Poly(_))
+        && !matches!(value.node, ChlExpr::Lambda { .. } | ChlExpr::Name(_))
+    {
+        return Err(LoweringError::unsupported(
+            value.span,
+            "a binding annotated with a polymorphic type must be polymorphic: its \
+             right-hand side is a lambda or a name of a polymorphic binding, and a call or \
+             a collection is monomorphic",
+        ));
+    }
+    Ok(ty)
+}
+
+/// Declare `type_params` in the current alias scope, in order, each as an alias of
+/// a fresh [`Type::SharedHole`] that inference resolves to the parameter when it
+/// opens the `Poly`, and each bound lowered with the parameters before it in scope.
+/// Return them as a `Poly`'s parameter list. The caller owns the scope.
+pub(super) fn declare_type_params(
+    type_params: &[TypeParam],
+    ctx: &mut LoweringContext,
+) -> Result<Vec<crate::ccl::ty::PolyParam>, LoweringError> {
+    let mut declared: Vec<crate::ccl::ty::PolyParam> = Vec::new();
+    for tp in type_params {
+        let name = tp.name.as_str();
+        if is_builtin_type_name(name) {
+            return Err(LoweringError::unsupported(
+                tp.name_span,
+                format!("`{name}` is a built-in type and cannot name a type parameter"),
+            ));
+        }
+        if declared.iter().any(|p| p.spelling == name) {
+            return Err(LoweringError::unsupported(
+                tp.name_span,
+                format!("type parameter `{name}` is declared twice"),
+            ));
+        }
+        let bound = tp
+            .bound
+            .as_ref()
+            .map(|b| lower_type_expr(b, ctx))
+            .transpose()?;
+        let hole = ctx.fresh_shared_hole();
+        let Type::SharedHole(id) = hole else {
+            unreachable!("`fresh_shared_hole` mints a `SharedHole`");
+        };
+        ctx.declare_type_alias(name, hole);
+        declared.push(crate::ccl::ty::PolyParam {
+            hole: id,
+            spelling: name.into(),
+            bound,
+        });
+    }
+    Ok(declared)
+}
+
 /// Lower a CHL type *expression* to a CCL [`Type`].
 ///
 /// Recognised forms:
@@ -1310,6 +1396,28 @@ pub(super) fn lower_type_annotation(
 /// - A function type `T => U` — a [`Type::Fun`] compute function
 ///   (`docs/chl-spec.md`, "6. Types (informal sketch)").
 pub(super) fn lower_type_expr(
+    annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    let ty = lower_type_expr_or_poly(annotation, ctx)?;
+    if matches!(ty, Type::Poly(_)) {
+        return Err(LoweringError::unsupported(
+            annotation.span,
+            "a polymorphic type is written only as a whole `let` annotation or as an \
+             alias of one; inside another type it would be a higher-rank type, which is \
+             not supported",
+        ));
+    }
+    Ok(ty)
+}
+
+/// [`lower_type_expr`], admitting a polymorphic type `\T -> V` at the root: the
+/// one form a `let` annotation and an alias's right-hand side may take that no
+/// other type position may (`docs/chl-spec.md`, "Polymorphic type annotations").
+/// Every nested position lowers through `lower_type_expr`, so a
+/// polymorphic type inside another type, written or reached through an alias, is
+/// refused there.
+pub(super) fn lower_type_expr_or_poly(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
@@ -1435,11 +1543,33 @@ pub(super) fn lower_type_expr(
             "a comparison is a refinement's predicate, and a refinement is written in \
              braces with `where`: `{Int where _ >= 0}`",
         )),
-        ChlExpr::Lambda { type_params, .. } if !type_params.is_empty() => {
-            Err(LoweringError::unsupported(
-                annotation.span,
-                "polymorphic types `\\T -> …` are not supported yet",
-            ))
+        ChlExpr::Lambda {
+            type_params,
+            params,
+            body,
+            requires,
+        } if !type_params.is_empty() => {
+            if let Some(param) = params.first() {
+                return Err(LoweringError::unsupported(
+                    param.name_span,
+                    format!(
+                        "`{}` is a value parameter, and a polymorphic type `\\T -> V` \
+                         binds only type parameters",
+                        param.name
+                    ),
+                ));
+            }
+            refuse_requires_clause(requires)?;
+            let snapshot = ctx.snapshot_type_aliases();
+            let poly = declare_type_params(type_params, ctx).and_then(|params| {
+                let body = lower_type_expr(body, ctx)?;
+                Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+                    params,
+                    body,
+                })))
+            });
+            ctx.restore_type_aliases(snapshot);
+            poly
         }
         other => Err(LoweringError::unsupported(
             annotation.span,
@@ -1658,6 +1788,16 @@ pub(super) fn pre_declare_type_aliases(
             ));
             continue;
         }
+        if ctx.is_type_param(name) {
+            errors.push(LoweringError::unsupported(
+                stmt.span,
+                format!(
+                    "`{name}` is a type parameter of the enclosing definition, and an alias \
+                     of the same name in its body would hide it"
+                ),
+            ));
+            continue;
+        }
         if !declared.insert(name) {
             errors.push(LoweringError::unsupported(
                 stmt.span,
@@ -1668,7 +1808,7 @@ pub(super) fn pre_declare_type_aliases(
             ));
             continue;
         }
-        match lower_type_expr(rhs, ctx) {
+        match lower_type_expr_or_poly(rhs, ctx) {
             Ok(ty) => ctx.declare_type_alias(name, ty),
             // The inner error names the form in surface words
             // ([`describe_type_form`]), so it composes into one sentence.

@@ -378,6 +378,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // Nominal channel domains agree by name (the level is freshening
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
+        (Type::Param(a), Type::Param(b)) => a == b,
         (
             Type::Fun {
                 name: n1,
@@ -576,6 +577,12 @@ struct SpecializeFrame {
     /// re-walks a definition whose uses merely failed, and reports its body's
     /// conflicts a second time.
     demanded: bool,
+    /// Whether the binding declares type parameters: it is annotated with a
+    /// polymorphic type. Such a definition is checked alone even when demanded,
+    /// after its last specialization, since a clone substitutes each use's types
+    /// for the parameters and so cannot see an error that only the parameters,
+    /// held opaque, expose (`src/ccl/design/type-parameters.md`, "Specialization").
+    generic: bool,
     /// Specializations minted so far, scanned linearly.
     /// A candidate use's [`SpecKey`] is compared against each entry's — both
     /// computed by the *same* procedure at the *same* point in the pin's lifecycle
@@ -1986,7 +1993,11 @@ fn coalesce_type_predicates_go(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        | Type::Param(_)
         | Type::Infer(_) => {}
+        Type::Poly(poly) => std::rc::Rc::make_mut(poly)
+            .types_mut()
+            .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
     }
 }
 
@@ -2278,6 +2289,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // Every specialization is the one binding, split by use type, so each
     // carries its transparency.
     let transparency = binding.transparency;
+    let generic = matches!(binding.user_annotation, Some(Type::Poly(_)));
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
@@ -2285,6 +2297,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             cutoff: level,
             inside_discarded: ctx.discarding,
             demanded: false,
+            generic,
             specs: Vec::new(),
         })));
     coalesce_node(&mut body, level, ctx);
@@ -2302,6 +2315,10 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             frame.name,
             frame.specs.len(),
         );
+        typecheck_discarded_definition(&mut frame.def, level, ctx);
+    } else if frame.generic {
+        // Every use has been specialized, so nothing clones from the definition any
+        // more and it can be resolved in place, with its type parameters opaque.
         typecheck_discarded_definition(&mut frame.def, level, ctx);
     }
 
@@ -2354,12 +2371,13 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
 /// Resolve a generalized definition that no use demanded, for its diagnostics
 /// alone: the definition is dead code and is dropped as soon as this returns.
 ///
-/// A definition that *is* used never comes here, and must not: its quantified
-/// variables carry no use-site bounds, and coalescing it in place would resolve
-/// it under-determined *and* overwrite the bound-bearing variables its per-use
-/// clones freshen from (see [`coalesce_node`]). Neither objection survives the
-/// absence of uses — nothing was cloned from this definition, and the binding
-/// goes out of scope here, so nothing can clone it later. What is left is the
+/// A used definition comes here only once every use has been specialized, and
+/// only if it declares type parameters ([`SpecializeFrame::generic`]): coalescing
+/// a definition in place overwrites the bound-bearing variables its per-use clones
+/// freshen from (see [`coalesce_node`]), which is harmless only after the last
+/// clone. An unused definition comes here unconditionally, since nothing was
+/// cloned from it, and the binding goes out of scope here, so nothing can clone it
+/// later. What is left is the
 /// under-determination, which inference tolerates (`Type::Infer`'s invariant)
 /// and which no strict check ever sees, because the resolved types are dropped
 /// with the definition.

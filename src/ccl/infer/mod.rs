@@ -199,7 +199,9 @@ fn blame_node_for_place(
             | Type::SharedHole(_)
             | Type::DataSource(_)
             | Type::ChanDom(_, _)
+            | Type::Param(_)
             | Type::Txn => false,
+            Type::Poly(poly) => poly.types().any(|t| mentions(t, uid)),
         }
     }
     /// The slots that make this node *itself* the place: its own type, an
@@ -294,6 +296,20 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ),
             found: Box::new(coalesce_for_error(&lhs)),
             expected: Some(Box::new(coalesce_for_error(&rhs))),
+        },
+        ConstrainError::TypeParamEscapes { param } => InferError::TypeParamEscapes {
+            param: param.spelling.to_string(),
+            at: ctx_label.to_string(),
+        },
+        ConstrainError::MissingRequirement {
+            trait_,
+            position,
+            param,
+        } => InferError::MissingRequirement {
+            trait_: trait_.to_string(),
+            position,
+            param: param.spelling.to_string(),
+            at: ctx_label.to_string(),
         },
         ConstrainError::NoTraitInstance {
             trait_,
@@ -507,6 +523,24 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
     lit_singleton(&Lit::Bool(b))
 }
 
+/// Every shared hole a `Poly` annotation in `expr` declares as a type parameter
+/// ([`InferCtx::type_param_holes`](context::InferCtx)).
+fn type_param_holes(expr: &Expr) -> std::collections::HashSet<u32> {
+    fn in_type(ty: &Type, out: &mut std::collections::HashSet<u32>) {
+        if let Type::Poly(poly) = ty {
+            out.extend(poly.params.iter().map(|p| p.hole));
+        }
+        ty.walk_children(|child| in_type(child, out));
+    }
+    fn in_expr(expr: &Expr, out: &mut std::collections::HashSet<u32>) {
+        expr.walk_type_slots(|ty| in_type(ty, out));
+        expr.walk_children(|child| in_expr(child, out));
+    }
+    let mut out = std::collections::HashSet::new();
+    in_expr(expr, &mut out);
+    out
+}
+
 /// Run Cambra's type inference on `expr`.
 ///
 /// Two-pass: emit constraints, then coalesce. Source types come from
@@ -527,6 +561,9 @@ pub(crate) fn run(
         // node whose rule raised it, and the root is the outermost such node.
         InferCtx::new(translated, expr.node_id())
     };
+    if cfg!(debug_assertions) {
+        sub_ctx.type_param_holes = type_param_holes(expr);
+    }
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.

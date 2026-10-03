@@ -442,6 +442,33 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// A binding annotated with a polymorphic type whose right-hand side is not
+    /// polymorphic: a name of a monomorphic binding (`docs/chl-spec.md`,
+    /// "Polymorphic type annotations").
+    MonomorphicPolyBinding {
+        /// The binding's name.
+        name: String,
+    },
+    /// A type parameter would reach something declared outside the definition
+    /// that declares it.
+    TypeParamEscapes {
+        /// The parameter's spelling.
+        param: String,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
+    /// An operator applied to a value of a type parameter's type, with no
+    /// requirement stating the trait it needs.
+    MissingRequirement {
+        /// The trait the operator requires, e.g. `Addable`.
+        trait_: String,
+        /// The operand position (0-based) the parameter stands at.
+        position: u8,
+        /// The parameter's spelling.
+        param: String,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// An operator was used at operand types no instance of its trait
     /// accepts — `1 > "a"`, `"a" - "b"`, or a polymorphic function applied at a type
     /// its body's operators cannot handle.
@@ -699,6 +726,9 @@ impl InferError {
             | InferError::IncompatibleBounds { .. }
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
+            | InferError::TypeParamEscapes { .. }
+            | InferError::MissingRequirement { .. }
+            | InferError::MonomorphicPolyBinding { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
         }
     }
@@ -969,6 +999,30 @@ impl std::fmt::Debug for InferError {
                     position + 1,
                 )
             }
+            InferError::MonomorphicPolyBinding { name } => write!(
+                f,
+                "`{name}` is annotated with a polymorphic type, but its right-hand side is \
+                 monomorphic: only a function definition or a name of a polymorphic binding \
+                 can be polymorphic"
+            ),
+            InferError::TypeParamEscapes { param, at } => write!(
+                f,
+                "Type parameter `{param}` escapes its definition at {at}: a value of type \
+                 `{param}` reaches something declared outside the definition, where no use \
+                 substitutes a type for it"
+            ),
+            InferError::MissingRequirement {
+                trait_,
+                position,
+                param,
+                at,
+            } => write!(
+                f,
+                "No requirement states that `{param}` is {trait_} at {at}: operand {} is the \
+                 type parameter `{param}`, which supports only what its bound and \
+                 `requires` clause state",
+                position + 1,
+            ),
             InferError::UnsatisfiableOperand { requirements } => {
                 writeln!(
                     f,
@@ -1570,6 +1624,16 @@ fn collect_type_errors(
                 )));
             }
         }
+        // Specialization substitutes each use's types for a type parameter, and a
+        // `Poly` annotation leaves with the generalized `let` it annotated, so either
+        // surviving is a compiler bug. Reported at every strictness, like `Hole`.
+        Type::Param(param) => errors.push(InferError::Unsupported(format!(
+            "type parameter `{}` survived inference at `{context_sym}`",
+            param.spelling
+        ))),
+        Type::Poly(_) => errors.push(InferError::Unsupported(format!(
+            "polymorphic type `{ty}` survived inference at `{context_sym}`"
+        ))),
         Type::Fun {
             domain,
             codomain,
