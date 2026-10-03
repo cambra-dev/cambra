@@ -135,6 +135,7 @@ with
 match  case
 pass
 where
+requires
 ```
 
 `where` is the refinement predicate separator (§6.4). It is lexed so the name is
@@ -152,20 +153,22 @@ reserved for future use.
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
+`requires` begins a `requires` clause, which ends a `def` signature or a polymorphic type
+([Trait requirements](#trait-requirements-decided)). The clause parses, and lowering refuses it as
+unsupported.
+
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
-> `summon` (the transactions-as-contextual-parameters layer — §8.7,
-> **[Decided]**; `requires` also states trait requirements —
-> [Trait requirements](#trait-requirements-decided)), `import` (built-in
-> modules — the `http` module surface, **[Decided]**; general modules remain
-> future work, §9), and `assert` and its
+> `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
+> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `import`
+> (built-in modules — the `http` module surface, **[Decided]**; general modules
+> remain future work, §9), and `assert` and its
 > `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names
-> for other purposes. (`with`, `:=`, `match`, `case` and `where` are
+> for other purposes. (`with`, `:=`, `match`, `case`, `where` and `requires` are
 > **already** lexed — the first two carry today's transactions and mutation,
-> §8, `match`/`case` carry tag dispatch, §4.10, and `where` is reserved ahead
-> of the refinement syntax that will use it, §6.4 — so they are not in this
-> list.)
+> §8, `match`/`case` carry tag dispatch, §4.10, `where` is reserved ahead
+> of the refinement syntax that will use it, §6.4, and `requires` begins a
+> `requires` clause, §6.8 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -326,8 +329,10 @@ for_stmt        ::= "for" assign_target "in" expression ":" block
 
 with_stmt       ::= "with" [ ident "=" ] expression ":" block
 
-def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" [ "=>" expression ] ":" block
-param           ::= ident [ ":" expression ]
+def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
+params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
+value_param     ::= ident [ ( ":" | "<:" ) expression ]
+-- `type_param` and `requires_clause` are in §6.8. Lowering refuses both.
 
 -- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
 -- decorator and the declaration are one statement, which is why a declaration
@@ -1073,6 +1078,10 @@ unwritable on a *lambda* parameter; one parses on a `def` parameter, on a
 returning a pair, §2.4) is unusual but unambiguous — the first `->` closes the binder, the rest is
 body.
 
+A capitalized binder is a type parameter, and only a polymorphic type `\T -> V` in an annotation
+binds one ([Polymorphic type annotations](#polymorphic-type-annotations-decided)). A lambda value
+with a capitalized binder or a `requires` clause is an error.
+
 ### 3.11 List, tuple, record literals
 
 | Form | Denotes |
@@ -1416,8 +1425,8 @@ surrounding scope. `p: T` fixes the parameter's type at `T`; `p <: T`
 leaves it inferred and bounded above by `T` (see [Two annotation
 forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
 The two forms may be mixed across a parameter list. A capitalized
-parameter is a type parameter, not a value (**[Decided]**,
-[Type parameters](#type-parameters-decided)). A return-type
+parameter is a type parameter, not a value, and lowering refuses it as
+unsupported ([Type parameters](#type-parameters-decided)). A return-type
 annotation, introduced by `=>`, specifies a fixed output type for the
 function. The inferred type of the function body must be a subtype of
 the annotated output type.
@@ -2686,8 +2695,8 @@ The rules, and what each one is doing:
   `:=`, `op=`, `<<=`, a `for` target, a comprehension generator — rejects a
   capitalized binder and names this one. A `def` name is not yet checked; a
   capitalized one binds a value the type language cannot see. A capitalized
-  parameter binds a value today and is a type parameter under
-  [Type parameters](#type-parameters-decided) (**[Decided]**).
+  parameter is a type parameter, which lowering refuses as unsupported
+  ([Type parameters](#type-parameters-decided)).
 - **The type language's own names are reserved.** `Int`, `UInt`, `String`,
   `Bool`, `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
   `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
@@ -2741,7 +2750,9 @@ Every other binding is **monomorphic**: it has one type, shared by every use and
 them together. A binding whose right-hand side is a call, a collection, a tuple or record, or a name
 is monomorphic.
 
-The subsections below are **[Decided]** and not implemented.
+The subsections below are **[Decided]** and not implemented. The parser recognises their syntax:
+type parameters, bounds, `requires` clauses, and `\T -> V` in a type position. Lowering refuses
+each as unsupported.
 
 #### A name of a polymorphic binding is polymorphic [Decided]
 

@@ -1752,7 +1752,7 @@ impl Interp {
 
     /// Apply a lambda written at the call site.
     fn apply(&mut self, lambda: &Spanned<Expr>, arg: Value) -> Result<Value, Error> {
-        let Expr::Lambda { params, body } = &lambda.node else {
+        let Expr::Lambda { params, body, .. } = &lambda.node else {
             return err("expected a lambda");
         };
         let [param] = params.as_slice() else {

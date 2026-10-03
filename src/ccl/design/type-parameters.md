@@ -1,8 +1,9 @@
 # Type parameters
 
 > **Status: [Sketched].** A proposed implementation of
-> [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Nothing
-> here is implemented. [Implementation stack](#implementation-stack) lists the changes in order.
+> [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
+> [Implementation stack](#implementation-stack), item 1, the parser, is implemented; nothing past
+> it is.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -294,10 +295,10 @@ A diagnostic renders a generalized binding's scheme as a `Poly`:
 
 One change per item, each updating this doc and the spec status it implements:
 
-1. **Parser.** `requires` lexed as a keyword; `type_params` and `requires` on `FunctionDef`; named
-   arguments in a type-position application; `<:` on a type-position lambda's binders. Lowering
-   refuses each new form as unsupported. A capitalized `def` parameter stops being a value
-   parameter.
+1. **Parser** (implemented). `requires` lexed as a keyword; `type_params` and `requires` on
+   `FunctionDef` and `Lambda`; a requirement's associated types by name; `<:` on a lambda's type
+   parameters. Lowering refuses each new form as unsupported. A capitalized `def` parameter stops
+   being a value parameter.
 2. **Polymorphic aliases.**
 3. **`Type::Poly`, `Type::Param`, bounds.** Lowering of `def` type parameters and of
    `\T -> V`, levels and escape, subtyping, checking a binding against a `Poly`, instantiation of
