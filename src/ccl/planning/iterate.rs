@@ -420,10 +420,11 @@ pub(super) fn wrap_with_iterate(
         if all_witnesses_realized(&domain_ty, discharged) {
             return;
         }
-        // Otherwise nothing materialized this witness — its kind names no candidate to
-        // realize, so it needs the runtime witness — and falling through hands it to
-        // `extent_of`, which rejects it by name rather than dropping the restriction
-        // silently.
+        // Otherwise the witness is the value's to carry, and iterating one is what has no
+        // source yet: every site starts from `IterateExtent` over an extent read off the
+        // type, and a carried witness bounds its keys without enumerating them. Falling
+        // through hands it to `extent_of`, which rejects it by name rather than dropping the
+        // restriction silently.
         if !matches!(domain_ty, Type::Refinement(..)) {
             return;
         }
