@@ -119,6 +119,7 @@ The output references built-in primitives via the `Builtin` enum carried by `Typ
 | `Builtin::Map` | `map` | post-composition: `map(g)` applied to a curried function |
 | `Builtin::MapDomain` | `map_domain` | domain-to-domain identity stream |
 | `Builtin::Compose` | `compose` | composition as a first-class morphism |
+| `Builtin::Strength` | `strength` | simplify-introduced pairing of a value with each value of a collection, under its key: `strength : (𝑋, Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝑋, 𝑉)` |
 | `Builtin::Restrict` | `restrict` | planning-introduced mid-chain filter; a codomain-parametric function transformer: `restrict(p) : (𝐷 ⤇ Bool) ⇒ (𝐷 ⤇ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⤇ 𝑇)`. The predicate is a collection — one `Bool` per element of `𝐷` — and so is the upstream: every restrict chain is led by an iteration source, which `make_iterate` declares `Data`, and the kind rides through from there. It narrows the **domain** of an upstream `𝐷 ⤇ 𝑇` to the subset satisfying `𝑝`, preserving the value `𝑇` on the codomain (*not* the unsound `𝐷 ⤇ {𝑑: 𝐷 \| 𝑝(𝑑)}`). Because its domain is a function type it is **applied to** its upstream (`upstream ▷ (𝑝 ▷ restrict)`), never composed as a CCC morphism. (Where planning emits it, and how op-conversion compiles the application, is covered under Planning below.) Chain-head iteration is the separate `Iterate` variant. |
 | `Builtin::Iterate` | `iterate` | planning-introduced chain-head iteration source: `iterate(p) : {𝑑: 𝐷 \| 𝑝(𝑑)} ⤇ {𝑑: 𝐷 \| 𝑝(𝑑)}` (or `𝐷 ⤇ 𝐷` when `p` is the trivially-true `true ▷ const`). `planning` emits one at the head of every iteration site (aggregate arguments, the stream side of `FinalOrDefault`, top-level function-valued results, sink-bound record fields, mutation-loop sources, …). Op-conversion's Iterate arm requires `input=None`; it compiles `Apply(p, Iterate)` to an `IterateExtent` tile (plus a `Restrict` filter when `p` is non-trivial). Mid-chain filtering is the separate `Restrict` variant. |
 | `Builtin::Converse` | `converse` | grouping by key |
@@ -167,8 +168,20 @@ inner lambda is the element function `𝑓`, over the source's values, which car
 
 Where `𝑓` reads nothing from the enclosing scope, elimination leaves
 `⟨𝑆, 𝑓 ▷ const⟩ ▷ zip ≫ compose`, which `simplify` rewrites to `𝑆 ≫ map(𝑓)`, or to `𝑆` where `𝑓`
-is `id`. Where `𝑓` reads the enclosing scope, the `curry` over `(𝑋, 𝑉)` needs each row paired with
-its own collection's values, which operator conversion does not build yet.
+is `id`. Where `𝑓` reads the enclosing scope, elimination leaves `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose`
+with `𝑔` over `(𝑋, 𝑉)`, which `simplify` rewrites to `⟨id, 𝑆⟩ ▷ zip ≫ strength ≫ map(𝑔)`.
+`strength : (𝑋, Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉) ⇒ Σ (𝐷 : 𝐾). 𝐷 ⤇ (𝑋, 𝑉)` pairs a value with each value of a
+collection under that value's key, so the witness binds once, by the outer sum, and no dependent
+pair is needed. Operator conversion compiles it to `Product::per_row_values_at`, which pairs each
+row with the values of its own collection. Both rules are scoped to an `𝑆` whose values are a
+sum, because planning's recurrence recognition reads a history through the unrewritten form.
+
+A correlated inner comprehension over a collection every row reads is the same shape with that
+collection constant: planning rewrites its `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫
+map(𝑔)`, where `𝐾` is the collection the inner comprehension ranges over
+(`src/ccl/planning/correlated.rs`). A site whose type is dependent stays one node,
+`(𝐾, 𝑔) ▷ curry_over`, since the chain has no spelling for a domain narrowed by its input
+(`src/ccl/ops.rs`, `Builtin::CurryOver`).
 
 #### A pair naming a sum's witness is refused
 

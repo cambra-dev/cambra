@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use bit_set::BitSet;
+
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::{
@@ -193,11 +195,47 @@ impl TileProducer for ZipProducer {
         // intersection on a `cyclic: bool` constructor flag (mirroring
         // `FanOut::new` vs `FanOut::new_cyclic`) and keeping the simpler
         // "all inputs agree" path for zips that can't lag.
-        let mut tiles: Vec<Tile> = self
+        // An input's own deleted rows are dropped here and reach no consumer, so each input is
+        // released through its own (below); a row only absent from another input may still
+        // arrive there, so it is not.
+        let (mut tiles, dropped): (Vec<Tile>, Vec<Option<TileGuard>>) = self
             .inputs
             .iter_mut()
-            .map(|i| i.get(i.tiling().universal_guard()))
+            .map(|i| {
+                let mut tile = i.get(i.tiling().universal_guard());
+                let dropped = tile.deleted_keys_guard();
+                // Presence is read off the key columns, so a key an arm has dropped is gone
+                // from them first.
+                tile.compact();
+                (tile, dropped)
+            })
+            .unzip();
+        // A scalar arm gives back each row's value once its consumer has taken it, while a
+        // sibling holding a level keeps the row open (`src/interpreter/design-operators.md`,
+        // "The release contract"). Such a row stays, holding no cell of that field; only a
+        // row an arm lacks without having released it is one the arms disagree on.
+        let released: Vec<Option<TileGuard>> = self
+            .names
+            .iter()
+            .zip(self.inputs.iter())
+            .map(|(name, input)| {
+                // In canonical form, where a release of every cell under a key names the
+                // key, which is what a path is read against.
+                (!input.tiling().values_at(self.level).holds_a_level()).then(|| {
+                    TileGuard::flatten_or(vec![crate::interpreter::tiling::onto_record_field(
+                        self.obsolete_guard().clone(),
+                        self.level.index(),
+                        name,
+                        input.tiling(),
+                    )])
+                })
+            })
             .collect();
+        let gave_back = |arm: usize, path: &[Value]| {
+            released[arm]
+                .as_ref()
+                .is_some_and(|guard| guard.covers_path(path))
+        };
 
         // Every level above the pair has to agree before anything pairs beneath it. The
         // arms are pulled from their own branches, so one may already hold a row under a
@@ -219,13 +257,20 @@ impl TileProducer for ZipProducer {
             let present: Vec<HashSet<Vec<Value>>> = (0..=above.index())
                 .map(|depth| {
                     let level = CurryLevel::new(depth);
-                    tiles
+                    let held: Vec<HashSet<Vec<Value>>> = tiles
                         .iter()
                         .map(|tile| tile.paths_at(level).into_iter().collect())
-                        .reduce(|acc: HashSet<Vec<Value>>, held| {
-                            acc.intersection(&held).cloned().collect()
+                        .collect();
+                    let rows = depth == above.index();
+                    held.iter()
+                        .flatten()
+                        .filter(|path| {
+                            held.iter().enumerate().all(|(arm, paths)| {
+                                paths.contains(*path) || (rows && gave_back(arm, path))
+                            })
                         })
-                        .expect("Zip has at least one input")
+                        .cloned()
+                        .collect()
                 })
                 .collect();
             let keep = |path: &[Value]| present[path.len() - 1].contains(path);
@@ -253,7 +298,22 @@ impl TileProducer for ZipProducer {
                 // fully-valid concrete rows.
                 let mut presence: Option<Predicate> = None;
                 let mut domain_pred: Option<Predicate> = None;
-                for t in tiles.iter() {
+                // Beneath a standing level the rows were aligned by path above, so only the
+                // outermost keys of a flat pair are read here.
+                let flat = self.level.index() == 1;
+                let outermost: Vec<Value> = match flat {
+                    true => tiles
+                        .iter()
+                        .flat_map(|t| match t {
+                            Tile::DataFunction { domain, .. } => {
+                                (0..domain.len()).map(|k| domain.index_at(k)).collect()
+                            }
+                            _ => Vec::new(),
+                        })
+                        .collect(),
+                    false => Vec::new(),
+                };
+                for (arm, t) in tiles.iter().enumerate() {
                     let Tile::DataFunction {
                         domain,
                         domain_predicate,
@@ -262,7 +322,17 @@ impl TileProducer for ZipProducer {
                     else {
                         panic!("Zip: cannot mix function and non-function tiles")
                     };
-                    let p = Predicate::from_column_value(domain);
+                    let mut p = Predicate::from_column_value(domain);
+                    if flat && released[arm].is_some() {
+                        let given: Vec<Predicate> = outermost
+                            .iter()
+                            .filter(|key| gave_back(arm, std::slice::from_ref(*key)))
+                            .map(|key| Predicate::exactly(std::slice::from_ref(key)))
+                            .collect();
+                        if !given.is_empty() {
+                            p = p.union(&Predicate::union_all(given));
+                        }
+                    }
                     presence = Some(match presence {
                         None => p,
                         Some(prev) => prev.intersect(&p),
@@ -278,13 +348,8 @@ impl TileProducer for ZipProducer {
                 // Filter each tile to the intersection of present positions
                 // (compute "to_remove" as that tile's domain minus the
                 // intersection, then drop those rows).
-                let mut skeleton: Option<Tile> = None;
-                let mut codomains: Vec<Tile> = Vec::with_capacity(tiles.len());
-                // An input's own deleted rows are dropped below and reach no consumer, so each
-                // input is released through its own; a row only absent from another input may
-                // still arrive there, so it is not.
-                let dropped: Vec<Option<TileGuard>> =
-                    tiles.iter().map(Tile::deleted_keys_guard).collect();
+                let rows_level = self.level.enclosing().expect("a pair stands beneath a row");
+                let mut filtered_tiles: Vec<Tile> = Vec::with_capacity(tiles.len());
                 // A pair is complete where every arm's key is: each level above the pair
                 // states the meet of the arms' statements, not the skeleton arm's alone,
                 // which calls a row complete that another arm is still filling.
@@ -311,40 +376,80 @@ impl TileProducer for ZipProducer {
                             .remove_guarded(TileGuard::Function(FunctionGuard::Domain(to_remove)));
                     }
                     filtered.compact();
+                    filtered_tiles.push(filtered);
+                }
+                // The skeleton holds every row: an arm short of one has given it back.
+                let skeleton_at = (0..filtered_tiles.len())
+                    .max_by_key(|&arm| filtered_tiles[arm].paths_at(rows_level).len())
+                    .expect("Zip has at least one input");
+                let rows = filtered_tiles[skeleton_at].paths_at(rows_level);
+                let skeleton_levels: Vec<(ColumnValue, ColumnValue)> = filtered_tiles[skeleton_at]
+                    .key_levels()[..self.level.index()]
+                    .iter()
+                    .map(|(starts, keys)| ((*starts).clone(), (*keys).clone()))
+                    .collect();
+                let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
+                let mut absent: HashMap<String, BitSet> = HashMap::new();
+                for (arm, filtered) in filtered_tiles.iter_mut().enumerate() {
+                    let held = filtered.paths_at(rows_level);
                     // Lift the values out, leaving the chain of keys behind: what stays is
                     // the output's own shape, and every input has to agree on it.
-                    codomains.push(std::mem::replace(
+                    let values = std::mem::replace(
                         filtered.values_at_mut(self.level),
-                        Tile::Record(HashMap::new()),
-                    ));
-                    // Presence is intersected over the outermost keys only, so arms that
-                    // disagree beneath them would pair one arm's values under another's keys.
-                    assert!(
-                        skeleton.as_ref().is_none_or(|s: &Tile| {
-                            s.key_levels()[..self.level.index()]
-                                == filtered.key_levels()[..self.level.index()]
-                        }),
-                        "Zip: inputs disagree on the {} levels above the pair, after \
-                         aligning them: {skeleton:?} against {filtered:?}",
-                        self.level.index(),
+                        Tile::record(HashMap::new()),
                     );
-                    skeleton.get_or_insert(filtered);
+                    if held == rows {
+                        // Presence is intersected over the outermost keys only, so arms that
+                        // disagree beneath them would pair one arm's values under another's
+                        // keys.
+                        assert!(
+                            filtered.key_levels()[..self.level.index()]
+                                .iter()
+                                .map(|(starts, keys)| ((*starts).clone(), (*keys).clone()))
+                                .eq(skeleton_levels.iter().cloned()),
+                            "Zip: inputs disagree on the {} levels above the pair, after \
+                             aligning them: {skeleton_levels:?} against {filtered:?}",
+                            self.level.index(),
+                        );
+                        codomains.push(values);
+                        continue;
+                    }
+                    let at: HashMap<&Vec<Value>, usize> =
+                        held.iter().enumerate().map(|(i, p)| (p, i)).collect();
+                    let cells: Vec<Option<usize>> = rows
+                        .iter()
+                        .map(|path| {
+                            let cell = at.get(path).copied();
+                            assert!(
+                                cell.is_some() || gave_back(arm, path),
+                                "Zip: arm {arm} lacks row {path:?}, which it has not given back"
+                            );
+                            cell
+                        })
+                        .collect();
+                    let (aligned, missing) = align_keyless(values, &cells);
+                    if let Some(missing) = missing {
+                        absent.insert(self.names[arm].clone(), missing);
+                    }
+                    codomains.push(aligned);
                 }
+                let skeleton = filtered_tiles.swap_remove(skeleton_at);
 
                 let names = &self.names;
-                let codomain_record = Tile::Record(
-                    codomains
+                let codomain_record = Tile::Record {
+                    fields: codomains
                         .into_iter()
                         .enumerate()
                         .map(move |(i, cv)| (names[i].clone(), cv))
                         .collect(),
-                );
+                    absent,
+                };
                 for (input, dropped) in self.inputs.iter_mut().zip(dropped) {
                     if let Some(dropped) = dropped {
                         input.release(dropped);
                     }
                 }
-                let mut out = skeleton.expect("Zip has at least one input");
+                let mut out = skeleton;
                 *out.values_at_mut(self.level) = codomain_record;
                 for (at, meet) in standing.into_iter().enumerate() {
                     let Tile::DataFunction {
@@ -386,6 +491,47 @@ impl TileProducer for ZipProducer {
             };
             input.release(guard);
         }
+    }
+}
+
+/// A value with no level of its own, rearranged onto the rows `cells` names: row `r` takes
+/// the value's cell `cells[r]`, and holds none where that is `None`. A scalar answers the
+/// rows it holds none at, for the record it is a field of to state; a record states its own
+/// fields'.
+fn align_keyless(values: Tile, cells: &[Option<usize>]) -> (Tile, Option<BitSet>) {
+    match values {
+        Tile::Scalar(column) => {
+            let picked: Vec<usize> = cells.iter().flatten().copied().collect();
+            let missing: BitSet = (0..cells.len()).filter(|&r| cells[r].is_none()).collect();
+            let n = picked.len();
+            (
+                Tile::Scalar(column.select_indices(picked.into_iter(), n)),
+                (!missing.is_empty()).then_some(missing),
+            )
+        }
+        Tile::Record { fields, absent } => {
+            assert!(
+                absent.is_empty(),
+                "Zip: a record arm holding no cell of a field at a row is aligned field by \
+                 field, which this one already is: {absent:?}"
+            );
+            let mut absent = HashMap::new();
+            let fields = fields
+                .into_iter()
+                .map(|(name, field)| {
+                    let (aligned, missing) = align_keyless(field, cells);
+                    if let Some(missing) = missing {
+                        absent.insert(name.clone(), missing);
+                    }
+                    (name, aligned)
+                })
+                .collect();
+            (Tile::Record { fields, absent }, None)
+        }
+        other => panic!(
+            "Zip: an arm short of rows the others hold gave them back, which only an arm \
+             holding no level does: {other:?}"
+        ),
     }
 }
 
@@ -502,7 +648,7 @@ impl TileProducer for MakeRecordProducer {
                 (name.clone(), tile)
             })
             .collect();
-        Tile::Record(fields)
+        Tile::record(fields)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -698,7 +844,8 @@ impl TileProducer for SelectFieldProducer {
         // The record stands at the chain's deepest values, so the field takes its place and
         // every level above it is left where it was.
         let slot = tile.deepest_values_mut();
-        let Tile::Record(mut fields) = std::mem::replace(slot, Tile::Record(HashMap::new())) else {
+        let Tile::Record { mut fields, .. } = std::mem::replace(slot, Tile::record(HashMap::new()))
+        else {
             panic!("SelectField({}) expected a record tile", self.name);
         };
         *slot = fields.remove(&self.name).unwrap_or_else(|| {
@@ -729,7 +876,9 @@ impl TileProducer for SelectFieldProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
+    use crate::interpreter::tile_operators::test_helpers::{
+        QuietSpy, ReleaseSpy, TestTileProducer,
+    };
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
     use bit_set::BitSet;
 
@@ -985,7 +1134,7 @@ mod tests {
         let input_tiling =
             Tiling::Record(HashMap::from([("xs".to_string(), field_tiling.clone())]));
         let (spy, log) = ReleaseSpy::new(
-            Tile::Record(HashMap::from([("xs".to_string(), filtered_collection())])),
+            Tile::record(HashMap::from([("xs".to_string(), filtered_collection())])),
             input_tiling.clone(),
         );
         let mut producer = SelectFieldProducer {
@@ -1117,7 +1266,11 @@ mod tests {
             "output keys should be the intersection of input presences"
         );
 
-        let Tile::Record(field_tiles) = *codomain else {
+        let Tile::Record {
+            fields: field_tiles,
+            ..
+        } = *codomain
+        else {
             panic!("expected Record values");
         };
         assert_eq!(
@@ -1170,8 +1323,8 @@ mod tests {
                 ),
             ])),
         );
-        let (spy0, released0) = ReleaseSpy::new(arm0, arm0_tiling.clone());
-        let (spy1, released1) = ReleaseSpy::new(arm1, arm1_tiling.clone());
+        let (spy0, released0) = QuietSpy::new(arm0, arm0_tiling.clone());
+        let (spy1, released1) = QuietSpy::new(arm1, arm1_tiling.clone());
         let mut zip = ZipProducer {
             base: ProducerBase::new(ZipProducer::alloc_id(), &out_tiling),
             names: vec![tuple_field(0), tuple_field(1)],
@@ -1181,22 +1334,40 @@ mod tests {
         let out = zip.get(out_tiling.universal_guard());
         let guard = out.to_guard();
         zip.release(guard.clone());
-        // Key 0 is open, since the collection arm can still grow under it. The release
-        // contract releases a field with no keys of its own along with its key, so the
-        // scalar arm is released nothing yet, and the collection arm is released the inner
-        // key it delivered beneath key 0.
+        // Key 0 is open, since the collection arm can still grow under it. The scalar arm's
+        // value there is whole once delivered, so it is released at its row — for that arm,
+        // its key 0 — and the collection arm is released the inner key it delivered beneath
+        // key 0.
         let covers = |log: &Rc<std::cell::RefCell<Vec<TileGuard>>>, path: &[Value]| {
-            log.borrow().iter().any(|g| g.covers_path(path))
+            log.borrow()
+                .iter()
+                .any(|g| TileGuard::flatten_or(vec![g.clone()]).covers_path(path))
         };
         assert!(
-            !covers(&released0, &[Value::UInt(0)]),
-            "the scalar arm was released an open key: {:?}, from {guard:?}",
+            covers(&released0, &[Value::UInt(0)]),
+            "the scalar arm was not released its taken value: {:?}, from {guard:?}",
             released0.borrow()
         );
         assert!(
             covers(&released1, &[Value::UInt(0), Value::UInt(3)]),
             "the collection arm was not released its inner key: {:?}, from {guard:?}",
             released1.borrow()
+        );
+        // The row stays while its collection is open, holding no cell of the scalar field.
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = zip.get(out_tiling.universal_guard())
+        else {
+            panic!("the zip is a collection")
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![0]), "key 0 stays");
+        let Tile::Record { absent, .. } = codomain.as_ref() else {
+            panic!("the pair is a record: {codomain:?}")
+        };
+        assert_eq!(
+            absent.get(&tuple_field(0)),
+            Some(&BitSet::from_iter([0])),
+            "the scalar field's cell at key 0 was released: {codomain:?}"
         );
         // Releasing key 0 whole reaches both arms as key 0.
         zip.release(TileGuard::Function(FunctionGuard::Domain(

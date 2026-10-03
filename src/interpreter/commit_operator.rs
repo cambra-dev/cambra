@@ -762,8 +762,8 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
         .map(|(_, engine)| engine.decided_positions.clone())
         .collect();
     Tile::Store {
-        state: Box::new(Tile::Record(state)),
-        seed: Box::new(Tile::Record(seed_fields)),
+        state: Box::new(Tile::record(state)),
+        seed: Box::new(Tile::record(seed_fields)),
         decided: Box::new(decided_positions_tile(&decided, &domain, decided_through)),
         frontier: Box::new(store_frontier_rows(
             engines
@@ -1008,7 +1008,7 @@ fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
         // A decided collection is a value at every row it has, the empty map included, so
         // there is no emptiness to test past the domain being closed.
         Tile::DataFunction { .. } => Ok(materialized_row(tile.clone())),
-        Tile::Scalar(_) | Tile::Record(_) => {
+        Tile::Scalar(_) | Tile::Record { .. } => {
             let column = materialize_collections(tile.clone());
             if column.is_empty() {
                 Err(SeedNotReady::Empty)
@@ -1032,7 +1032,7 @@ fn is_whole_value(tile: &Tile) -> bool {
             domain_predicate, ..
         } => matches!(domain_predicate, Predicate::True),
         Tile::Scalar(_) => true,
-        Tile::Record(fields) => fields.values().all(is_whole_value),
+        Tile::Record { fields, .. } => fields.values().all(is_whole_value),
         _ => false,
     }
 }
@@ -2085,7 +2085,7 @@ impl CommitProducer {
             // `emit_transact_writer` types the writer's output to match, so a
             // non-`Record` value on a collection proposal tile is
             // impossible.
-            let Tile::Record(fields) = *codomain else {
+            let Tile::Record { fields, .. } = *codomain else {
                 unreachable!(
                     "the proposal stream's codomain is a {{snap, reads, writes}} record \
                      (proposal_stream_tiling / emit_transact_writer); got a non-Record codomain"
@@ -4109,7 +4109,7 @@ impl AsOfProducer {
             AsOfOutput::Scalar { value_extent, .. } => {
                 stored_value_tile(cols.into_iter().next().unwrap_or_default(), value_extent)
             }
-            AsOfOutput::Record { fields } => Tile::Record(
+            AsOfOutput::Record { fields } => Tile::record(
                 fields
                     .iter()
                     .zip(cols)
@@ -4605,10 +4605,10 @@ impl DriverWindow {
             column.map_level_predicates(&mut |depth, pred| pred.qualified_by(&held_rows, depth));
             column
         });
-        let slots = Tile::Record(fields);
+        let slots = Tile::record(fields);
         let codomain = match &self.nested {
             None => slots,
-            Some(n) => Tile::Record(HashMap::from([
+            Some(n) => Tile::record(HashMap::from([
                 (
                     tuple_field(0),
                     column_of_rows(
@@ -6518,7 +6518,7 @@ impl TransactWriterProducer {
             // Absolute positions: the live window is `[committed_base, …)`; the
             // released prefix has been compacted away. Positions never renumber.
             ColumnValue::from_uints((self.committed_base..self.committed_base + n).collect()),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 (
                     F_SNAP.to_string(),
                     Tile::Scalar(ColumnValue::from_values(
@@ -7070,7 +7070,7 @@ mod tests {
         let Tile::Store { seed, .. } = &tile else {
             panic!("a render is a store: {tile:?}")
         };
-        let Tile::Record(seeds) = seed.as_ref() else {
+        let Tile::Record { fields: seeds, .. } = seed.as_ref() else {
             panic!("a store's seed is a record per key: {seed:?}")
         };
         assert_eq!(
@@ -7157,7 +7157,7 @@ mod tests {
             else {
                 panic!("renders a store")
             };
-            let Tile::Record(logs) = &**state else {
+            let Tile::Record { fields: logs, .. } = &**state else {
                 panic!("a store's state is a record of changelogs")
             };
             let of = |t: &Tile| match t {
@@ -7474,7 +7474,7 @@ mod tests {
             else {
                 panic!("AddIfBody input is a collection");
             };
-            let Tile::Record(fields) = *codomain else {
+            let Tile::Record { fields, .. } = *codomain else {
                 panic!("AddIfBody input codomain is a Record {{_0: prev, _1: item}}");
             };
             let prev = record_field(&fields, &tuple_field(0));
@@ -8854,7 +8854,7 @@ mod tests {
     fn proposal_tile(emitted: &[EmittedProposal], base: usize, terminal: bool) -> Tile {
         Tile::data_function(
             ColumnValue::from_uints((base..base + emitted.len()).collect()),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 (
                     F_SNAP.to_string(),
                     Tile::Scalar(ColumnValue::from_values(
@@ -9681,7 +9681,7 @@ mod tests {
         // A column of record values, and a record of columns over the fields.
         let units = ColumnValue::from_ints(vec![2, 1]);
         let boxed = seed(Tile::Scalar(ColumnValue::Records(field(units.clone()))));
-        let struct_of_arrays = seed(Tile::Record(field(Tile::Scalar(units))));
+        let struct_of_arrays = seed(Tile::record(field(Tile::Scalar(units))));
 
         // The seed is a map, so its bindings carry no order; compare the entries.
         let entries = |seed: Value| {
@@ -9758,8 +9758,8 @@ mod tests {
             })
             .collect();
         let tile = Tile::Store {
-            state: Box::new(Tile::Record(state)),
-            seed: Box::new(Tile::Record(seed_record)),
+            state: Box::new(Tile::record(state)),
+            seed: Box::new(Tile::record(seed_record)),
             // The domain a hand-built store stands over: its change positions, since
             // these fixtures record no carry.
             decided: Box::new(one_row_decided(ColumnValue::from_uints(
@@ -9978,13 +9978,13 @@ mod tests {
         };
         let store = |state: Tile| Tile::Store {
             state: Box::new(state),
-            seed: Box::new(Tile::Record(HashMap::new())),
+            seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(vec![]))),
             frontier: Box::new(one_row_decided(ColumnValue::from_uints(vec![]))),
             terminal: false,
             closed_keys: Vec::new(),
         };
-        let one_key = |log: Tile| store(Tile::Record(HashMap::from([("a".to_string(), log)])));
+        let one_key = |log: Tile| store(Tile::record(HashMap::from([("a".to_string(), log)])));
         // Non-ascending change ticks.
         assert!(!validate_tile(&one_key(log(vec![2, 1], vec![1, 2]))));
         // More values than ticks to hold them.
@@ -9995,8 +9995,8 @@ mod tests {
         ))));
         // A position decided above the frontier, and one decided with no frontier at all.
         let decided_through = |decided: Vec<usize>, frontier: Vec<usize>| Tile::Store {
-            state: Box::new(Tile::Record(HashMap::new())),
-            seed: Box::new(Tile::Record(HashMap::new())),
+            state: Box::new(Tile::record(HashMap::new())),
+            seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(decided))),
             frontier: Box::new(one_row_decided(ColumnValue::from_uints(frontier))),
             terminal: false,
@@ -10618,7 +10618,7 @@ mod tests {
             Predicate::at_or_below(Value::UInt(0)),
             BitSet::new(),
         );
-        let seed = Tile::Record(HashMap::from([
+        let seed = Tile::record(HashMap::from([
             (tuple_field(0), open),
             (
                 tuple_field(1),

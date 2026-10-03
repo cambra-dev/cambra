@@ -57,7 +57,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 #[case("[y.0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
-    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::Record(HashMap::from([
+    Tile::data_function(ColumnValue::UInts(vec![0, 1]), Box::new(Tile::record(HashMap::from([
             (
                 tuple_field(0),
                 Tile::Scalar(ColumnValue::Records(HashMap::from([
@@ -337,6 +337,72 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
         ),
         Value::Int(total),
     );
+}
+
+/// A comprehension over a transactional collection read whose element function also reads
+/// the loop binder: each transaction's collection is composed with a function of that
+/// transaction's row (`src/ccl/design/optimization.md`, "A generator over a sum composes with
+/// its source").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// `{a: 1}` summed as `1 + r` for `r` in 1, 2.
+#[case::store_read(
+    indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                n := n + sum([v + r for v in m])
+        await_final(n)
+    "#},
+    5
+)]
+// `{a: 1, b: 10}` after the write, summed as `(1 + r) + (10 + r)`.
+#[case::after_a_keyed_write(
+    indoc! {r#"
+        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                m["b"] := 10
+                n := n + sum([v + r for v in m])
+        await_final(n)
+    "#},
+    28
+)]
+// A map that differs per transaction: each writes `m[r] := 10 * r`, so the first sums
+// `{0: 1, 1: 10}` as `(1 + 1) + (10 + 1)` = 13 and the second `{0: 1, 1: 10, 2: 20}` as
+// `(1 + 2) + (10 + 2) + (20 + 2)` = 37. Pairing every row with one row's collection gives
+// another total.
+#[case::a_map_each_transaction_changes(
+    indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(0, 1)]))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2]:
+            with begin():
+                m[r] := 10 * r
+                n := n + sum([v + r for v in m])
+        await_final(n)
+    "#},
+    50
+)]
+// `{x: 1, y: 2}` summed as `(1 + r) + (2 + r)` for `r` in 1, 2, 3.
+#[case::record_field(
+    indoc! {r#"
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        n: Mut(Int, Txn) := 0
+        for r in [1, 2, 3]:
+            with begin():
+                n := n + sum([v + r for v in s.b])
+        await_final(n)
+    "#},
+    21
+)]
+fn a_comprehension_over_a_transactional_map_reads_its_enclosing_scope(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
 }
 
 /// A collection-valued field of a transactional record, iterated inside a transaction.
@@ -768,9 +834,9 @@ fn a_correlated_filter_inside_a_transaction() {
 }
 
 /// A correlated inner comprehension over a **map** whose body never reads the element is
-/// refused by name. Its body never applies the source, so planning has none to name, and
-/// the inner domain is read off the type, where a map's keys are a present-key proof over
-/// the whole key type rather than anything enumerable.
+/// refused by name. Its body never applies the source, so planning has none to name, and the
+/// type gives the inner domain as a present-key proof over the whole key type, which nothing
+/// enumerates.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
@@ -779,7 +845,8 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
             c = map([("a", 1), ("b", 2)])
             sum([sum([r for v in c]) for r in [1, 2]])
         "#},
-        "source is a collection planning did not name",
+        "a correlated inner comprehension over a collection its body never applies is not \
+         supported yet",
     );
 }
 

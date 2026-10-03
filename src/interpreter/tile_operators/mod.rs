@@ -394,7 +394,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 walk(codomain, label, level + 1, &keys, &complete, nodes, entries);
                 nodes.insert((label.to_vec(), level), CompletionNode { complete });
             }
-            Tile::Record(fields) => {
+            Tile::Record { fields, .. } => {
                 for (field, field_tile) in fields {
                     let mut label = label.to_vec();
                     label.push(field.clone());
@@ -491,7 +491,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 else {
                     unreachable!("matched as a store")
                 };
-                let Tile::Record(logs) = &**state else {
+                let Tile::Record { fields: logs, .. } = &**state else {
                     unreachable!("a store's state is a record of per-key changelogs")
                 };
                 let part = |name: &str| {
@@ -584,6 +584,11 @@ fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
             TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
                 walk(inner, label, depth + 1, level)
             }
+            // The values of the level itself: a record field's cell, named at the rows its
+            // leaf admits.
+            TileGuard::Function(FunctionGuard::Codomain(inner)) if depth == level => {
+                released_cells_at(inner, label)
+            }
             TileGuard::Function(FunctionGuard::Domain(pred)) if depth <= level => {
                 pred.descend(level - depth)
             }
@@ -591,6 +596,26 @@ fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
         }
     }
     walk(guard, label, 0, level)
+}
+
+/// The paths whose value under record fields `label` `guard` names: a keyless leaf's rows.
+fn released_cells_at(guard: &TileGuard, label: &[String]) -> Predicate {
+    match guard {
+        TileGuard::Or(arms) => arms
+            .iter()
+            .map(|arm| released_cells_at(arm, label))
+            .fold(Predicate::False, |all, one| all.union(&one)),
+        TileGuard::Record(fields) => match label.split_first() {
+            Some((field, rest)) => fields
+                .get(field)
+                .map_or(Predicate::False, |g| released_cells_at(g, rest)),
+            None => Predicate::False,
+        },
+        TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) if label.is_empty() => {
+            TileGuard::leaf_rows(pred).clone()
+        }
+        _ => Predicate::False,
+    }
 }
 
 /// Assert that `result` leaves unchanged everything `last` called complete, apart from
@@ -798,7 +823,14 @@ pub trait TileProducer {
 
     /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
-        let result = self.get_impl(projection_guard);
+        let mut result = self.get_impl(projection_guard);
+        // A scalar field's cell released while its row stays open is left out here rather
+        // than by each producer: a producer rebuilds a row from inputs released by whole key,
+        // so it has the cell again, and its consumer has it already
+        // (`src/interpreter/design-operators.md`, "The release contract").
+        if let Some(cells) = self.obsolete_guard().released_cells() {
+            result.remove_guarded(cells);
+        }
         // A release says that data is never requested and never returned again.
         // Being pulled afterwards is fine — the answer is whatever lies outside
         // the released region, which after a universal release is nothing at all
@@ -1104,7 +1136,7 @@ pub(crate) mod test_helpers {
             Tile::DataFunction {
                 row_starts: ColumnValue::UInts(vec![0]),
                 domain: ColumnValue::UInts(vec![0]),
-                codomain: Box::new(Tile::Record(HashMap::from([
+                codomain: Box::new(Tile::record(HashMap::from([
                     ("n".to_string(), Tile::Scalar(n)),
                     (
                         "xs".to_string(),
@@ -1131,8 +1163,8 @@ pub(crate) mod test_helpers {
         );
     }
 
-    /// A [`TileProducer`] that answers with a fixed tile and records every release
-    /// guard it is handed, for asserting that a release *propagates*.
+    /// A [`TileProducer`] that answers with a fixed tile, less what it has been released, and
+    /// records every release guard it is handed, for asserting that a release *propagates*.
     pub(crate) struct ReleaseSpy {
         pub(crate) base: ProducerBase,
         pub(crate) tile: Tile,

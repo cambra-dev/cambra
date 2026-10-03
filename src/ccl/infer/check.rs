@@ -15,8 +15,8 @@ use crate::ccl::provenance;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, BindingTransparency, Expr, FieldKey, Level, Name, Refinement, RefinementSet, Type,
-    TypedBinding, TypedExpr, TypedExprNode,
+    BaseType, BindingTransparency, Builtin, Expr, FieldKey, Level, Name, Refinement, RefinementSet,
+    Type, TypedBinding, TypedExpr, TypedExprNode,
 };
 
 use super::emit::{
@@ -732,6 +732,14 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             expr.ty.clone()
         }
 
+        // `strength` is minted after inference with a type stamped by hand
+        // (`simplify::try_compose_with_strength`), so nothing resolved it: its rule is
+        // checked rather than trusted.
+        TypedExprNode::Builtin(Builtin::Strength) => {
+            check_strength(&expr.ty, &label, ctx);
+            expr.ty.clone()
+        }
+
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
         // which left these unchecked).
@@ -958,6 +966,45 @@ fn check_predicates(
     expr.walk_children(|child| check_predicates(child, ctx, visited));
 }
 
+/// The rule for [`Builtin::Strength`]: `(𝑋, 𝐶) ⇒ 𝐶′`, where `𝐶′` is `𝐶` over the same keys,
+/// and the same witness for a sum, holding `(𝑥, 𝑣)` for each value `𝑣` of `𝐶`. Recorded into
+/// `ctx.errors`, as `require_sub` records.
+fn check_strength(ty: &Type, label: &str, ctx: &mut CheckCtx) {
+    let expected = match ty {
+        Type::Fun { domain, .. } => match domain.as_ref() {
+            Type::Tuple(parts) => match parts.as_slice() {
+                [x, collection] => match (collection.domain(), collection.codomain()) {
+                    (Some(keys), Some(values)) => Some((
+                        Type::fun_like(
+                            collection,
+                            keys.clone(),
+                            Type::Tuple(vec![x.clone(), values.clone()]),
+                        ),
+                        ty.codomain().expect("a function has a codomain"),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some((expected, recorded)) = expected else {
+        let error = ctx.raise(InferError::TypeMismatch {
+            found: Box::new(ty.clone()),
+            expected: None,
+            ctx: format!("{label}: strength takes a value paired with a collection"),
+        });
+        ctx.errors.push(error);
+        return;
+    };
+    let at = || format!("{label}: strength pairs each value of its collection");
+    // Both directions: the result is the collection's own shape, not a sub- or supertype.
+    let _ = ctx.require_sub(&expected, &recorded, &at);
+    let _ = ctx.require_sub(&recorded, &expected, &at);
+}
+
 /// Run the post-inference structural type-check over `expr`.
 ///
 /// Drives the shared per-node typing rules in Check mode over a throwaway
@@ -1085,6 +1132,42 @@ mod tests {
                 .any(|e| matches!(e.error, InferError::ExpectedFunction { .. })),
             "expected an ExpectedFunction, got {:?}",
             ctx.errors
+        );
+    }
+
+    /// `strength`'s stamped type is checked rather than trusted: its result must be the
+    /// collection's own shape, the same witness included, holding pairs. A result holding the
+    /// collection's values alone is reported.
+    #[test]
+    fn strength_is_checked_against_its_collection() {
+        let int = Type::Base(BaseType::Int);
+        let collection = Type::sum_over(
+            crate::ccl::TypeKind::Enumerated(vec![Type::UIntRange(2)]),
+            None,
+            int.clone(),
+        );
+        let keys = collection.domain().expect("a sum is a collection");
+        let pairs = Type::fun_like(
+            &collection,
+            keys.clone(),
+            Type::Tuple(vec![int.clone(), int.clone()]),
+        );
+        let domain = Type::Tuple(vec![int.clone(), collection.clone()]);
+        let errors_for = |result: Type| {
+            let mut node =
+                Expr::builtin(Builtin::Strength).with_ty(Type::fun(domain.clone(), result));
+            let mut ctx = CheckCtx::new(node.node_id());
+            let _ = check_node(&mut node, &mut ctx);
+            ctx.errors
+        };
+        let right = errors_for(pairs);
+        assert!(
+            right.is_empty(),
+            "the stamped type is the rule's: {right:?}"
+        );
+        assert!(
+            !errors_for(collection.clone()).is_empty(),
+            "a result holding the values alone is reported"
         );
     }
 }

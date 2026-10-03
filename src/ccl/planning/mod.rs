@@ -107,8 +107,9 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // predicate compilation — sees one shape rather than needing a `Case` case.
     let discharged = conditionals::realize_conditional_collections(&mut expr)?;
     groupby::recognize_groupby_sites(&mut expr);
-    correlated::name_correlated_sources(&mut expr);
+    correlated::emit_correlated_filters(&mut expr);
     let mut expr = simplify(expr);
+    correlated::pair_correlated_sites(&mut expr)?;
     // Constant-fold before the iteration walk so a collection literal's elements are
     // already values when op conversion reads them. It runs after `simplify` because
     // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the

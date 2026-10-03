@@ -70,7 +70,7 @@ impl FunctionDef {
         let FunctionDef::Insert = self else {
             panic!("{self} takes a column argument; a level reaching it is a shape error")
         };
-        let Tile::Record(mut fields) = input else {
+        let Tile::Record { mut fields, .. } = input else {
             panic!("insert takes the tupled `(collection, key, value)`, got {input:?}")
         };
         let Some(Extent::Function {
@@ -717,7 +717,7 @@ mod tests {
             crate::interpreter::Predicate::True,
             bit_set::BitSet::new(),
         );
-        let argument = Tile::Record(HashMap::from([
+        let argument = Tile::record(HashMap::from([
             (tuple_field(0), level),
             // Row 0 writes `a := [7]`, which it holds; row 1 writes `b := [8, 9]`, which it
             // does not.
@@ -760,7 +760,7 @@ mod tests {
             crate::interpreter::Predicate::True,
             bit_set::BitSet::new(),
         );
-        let argument = Tile::Record(HashMap::from([
+        let argument = Tile::record(HashMap::from([
             (tuple_field(0), level),
             // Row 0 writes `b`, which it holds; row 1 writes `c`, which it does not.
             (

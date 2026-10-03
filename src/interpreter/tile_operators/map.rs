@@ -552,7 +552,14 @@ impl MapResultProducer {
             input_tile.values_at_mut(level),
             Tile::Scalar(ColumnValue::Units(0)),
         );
-        *input_tile.values_at_mut(level) = if arguments.holds_a_level()
+        *input_tile.values_at_mut(level) = if arguments.rows() == 0 {
+            // **No rows, no application.** The result has a row per argument, so it is the
+            // empty one whatever the function is, built from the tiling. Applying instead
+            // reads the arguments as a column, and an argument holding a level that no
+            // computable function takes has none: a record with a collection field, which is
+            // a transaction body's row once a universal release has emptied it.
+            self.tiling().values_at(level).empty_at_no_rows()
+        } else if arguments.holds_a_level()
             && let Tile::Scalar(f) = &function_tile
             && let Some(Value::ComputableFunction(f)) = f.as_single()
         {
@@ -621,6 +628,9 @@ impl TileProducer for MapResultProducer {
 /// The level is the caller's to state ([`MapResultToConst::new_at`]), as
 /// [`MapResult`]'s is: a value at it may be a collection of its own, whose levels are part
 /// of the value rather than of the iteration.
+///
+/// A collection constant streams: each row holds what has arrived of it, and no row is
+/// complete until it is. Every row reads all of it, so it is released once everything is.
 pub struct MapResultToConst {
     /// Output tiling matches `input` tiling, with the values at `level` transformed.
     base: OperatorBase,
@@ -725,18 +735,8 @@ impl MapResultToConstProducer {
     /// constant is terminal, so until then no level calls it complete
     /// (`src/interpreter/design-operators.md`, "The completeness contract").
     fn empty_beneath_live_rows(&self, input: &Tile) -> Tile {
-        let mut live = input.clone();
-        live.compact();
         let mut out = self.tiling().empty_tile();
-        // The levels the output shares with the input are the ones above `self.level`, since
-        // the constant replaces or pairs with what sits there. A collection constant adds
-        // levels of its own beneath those, and nothing in the input names them.
         for level in (0..self.level.index()).map(CurryLevel::new) {
-            let held: Vec<Predicate> = live
-                .paths_at(level)
-                .iter()
-                .map(|path| Predicate::exactly(path))
-                .collect();
             let (
                 Tile::DataFunction {
                     domain_predicate: stated,
@@ -750,12 +750,49 @@ impl MapResultToConstProducer {
             else {
                 unreachable!("MapResultToConst keeps its input's collection levels")
             };
-            *out_stated = match held.is_empty() {
-                true => stated.clone(),
-                false => stated.minus(&Predicate::flatten_or(held)),
-            };
+            *out_stated = stated.clone();
         }
+        self.open_live_rows(&Self::live_paths(input, self.level), &mut out);
         out
+    }
+
+    /// The path of every live row of `input` at each level above `level`, as one predicate
+    /// per level.
+    fn live_paths(input: &Tile, level: CurryLevel) -> Vec<Predicate> {
+        let mut live = input.clone();
+        live.compact();
+        (0..level.index())
+            .map(|depth| {
+                let held: Vec<Predicate> = live
+                    .paths_at(CurryLevel::new(depth))
+                    .iter()
+                    .map(|path| Predicate::exactly(path))
+                    .collect();
+                match held.is_empty() {
+                    true => Predicate::False,
+                    false => Predicate::flatten_or(held),
+                }
+            })
+            .collect()
+    }
+
+    /// Leave every path in `live` (one predicate per level above `self.level`) out of what
+    /// `out`'s levels call complete. The levels the output shares with the input are the ones
+    /// above `self.level`, since the constant replaces or pairs with what sits there; a
+    /// collection constant adds levels of its own beneath those, and nothing in the input
+    /// names them.
+    fn open_live_rows(&self, live: &[Predicate], out: &mut Tile) {
+        for (depth, held) in live.iter().enumerate() {
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = out.values_at_mut(CurryLevel::new(depth))
+            else {
+                unreachable!("MapResultToConst keeps its input's collection levels")
+            };
+            if *held != Predicate::False {
+                *domain_predicate = domain_predicate.minus(held);
+            }
+        }
     }
 }
 
@@ -798,28 +835,31 @@ impl TileProducer for MapResultToConstProducer {
             }
             return self.empty_beneath_live_rows(&input_tile);
         }
-        let constant_tile = {
-            // The broadcast value must be fully known before we can replicate it
-            // across the input's domain: `repeat` fabricates nothing, it copies a
-            // single present value. A constant that is still absent (e.g. a scalar
-            // read from a sibling induction loop that has not yet converged) yields
-            // an empty output — the consumer re-pulls once it lands, rather than us
-            // inventing a value for the unknown positions.
-            //
-            // This is one half of a single invariant — "never fabricate a position
-            // from a not-yet-converged sibling read." The other half is the
-            // co-presence truncate in `binop::zip_arithmetic`/`zip_concat`: a binop
-            // over a lagging operand combines only the common prefix instead of
-            // returning the longer side's tail. Keep the two in step.
-            let ct = self.constant.get(c_tiling.universal_guard());
-            if !ct.is_terminal() {
-                return match input_tile.is_data_function() {
-                    true => self.empty_beneath_live_rows(&input_tile),
-                    false => self.tiling().empty_tile(),
-                };
-            }
-            ct
-        };
+        let streams = c_tiling.is_data_function();
+        let constant_guard = c_tiling.universal_guard();
+        let constant_tile = self.constant.get(constant_guard);
+        // A **scalar** constant must be fully known before it is replicated across the
+        // input's domain: `repeat` fabricates nothing, it copies a single present value. A
+        // constant that is still absent (e.g. a scalar read from a sibling induction loop
+        // that has not yet converged) yields an empty output — the consumer re-pulls once it
+        // lands, rather than us inventing a value for the unknown positions.
+        //
+        // This is one half of a single invariant — "never fabricate a position from a
+        // not-yet-converged sibling read." The other half is the co-presence truncate in
+        // `binop::zip_arithmetic`/`zip_concat`: a binop over a lagging operand combines only
+        // the common prefix instead of returning the longer side's tail. Keep the two in step.
+        //
+        // A **collection** constant fabricates nothing by streaming: it states which of its
+        // keys are complete, so each row is handed what it holds so far, and a row is complete
+        // only once the constant is ([`Self::open_live_rows`]).
+        if !constant_tile.is_terminal() && !streams {
+            return match input_tile.is_data_function() {
+                true => self.empty_beneath_live_rows(&input_tile),
+                false => self.tiling().empty_tile(),
+            };
+        }
+        let growing =
+            (!constant_tile.is_terminal()).then(|| Self::live_paths(&input_tile, self.level));
 
         let mode = self.mode;
         // A collection constant repeated down a column states each copy's completeness without
@@ -849,12 +889,34 @@ impl TileProducer for MapResultToConstProducer {
             MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
             MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
         };
+        if let Some(live) = &growing {
+            self.open_live_rows(live, &mut output);
+        }
+        // Each row is rebuilt from the input and the constant on every pull, so what a
+        // consumer has released beneath a row still open comes back unless it is left out.
+        output.remove_guarded(self.obsolete_guard().clone());
         output
     }
 
+    /// The input shares the output's levels down to `level`, and beneath them the output
+    /// holds the constant too, so only a release naming a whole value there reaches the
+    /// input ([`through_shared_levels`]): the output is rebuilt from the input's rows on
+    /// every pull, and a row the input gave back could not be rebuilt for what of it is still
+    /// held here.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // TODO once we have guards that express codomain predicates, handle them here
-        self.input.release(obsolete_guard);
+        let upstream = crate::interpreter::tiling::through_shared_levels(
+            obsolete_guard,
+            self.level.index(),
+            self.input.tiling(),
+        );
+        let done = upstream.is_universal();
+        self.input.release(upstream);
+        // The constant is re-read on every pull, and every row reads all of it, so it is
+        // released once there will be no next pull, which is what a universal release says.
+        if done {
+            self.constant
+                .release(self.constant.tiling().universal_guard());
+        }
     }
 }
 /// Produces a `DataFunction` tile that maps each domain element of a data
@@ -1505,7 +1567,7 @@ mod tests {
         // f = {5 ↦ (n: 1, xs: [7 ↦ 70])}, complete at every level.
         let f = Tile::data_function(
             ColumnValue::UInts(vec![5]),
-            Box::new(Tile::Record(HashMap::from([
+            Box::new(Tile::record(HashMap::from([
                 ("n".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
                 (
                     "xs".to_string(),
@@ -1542,7 +1604,7 @@ mod tests {
         let Tile::DataFunction { codomain, .. } = &out else {
             panic!("expected a collection, got {out:?}")
         };
-        let Tile::Record(fields) = &**codomain else {
+        let Tile::Record { fields, .. } = &**codomain else {
             panic!("expected a record codomain, got {codomain:?}")
         };
         let Tile::DataFunction {
@@ -1691,6 +1753,51 @@ mod tests {
                 BitSet::new(),
             )
         );
+    }
+
+    /// An argument with no rows yields no rows, even where it holds a level the function
+    /// could not take as a column: a record whose field is a collection, applied a lookup
+    /// table.
+    #[test]
+    fn map_result_over_no_arguments_is_empty_whatever_they_hold() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let row = Tiling::Record(HashMap::from([
+            ("a".to_string(), Tiling::Scalar(int())),
+            (
+                "b".to_string(),
+                Tiling::data_function(uint(), Tiling::Scalar(int())),
+            ),
+        ]));
+        let in_tiling = Tiling::data_function(uint(), row.clone());
+        let function = Constant::new(
+            Value::Function(Vec::new()),
+            Extent::Function {
+                domain: Box::new(row.extent()),
+                codomain: Box::new(int()),
+            },
+        );
+        let operator = MapResult::new_at(
+            Box::new(Constant::collection(
+                in_tiling.empty_at_no_rows(),
+                in_tiling.clone(),
+            )),
+            Box::new(function),
+            CurryLevel::new(1),
+        );
+        let fn_tiling = operator.function.tiling().clone();
+        let fn_tile = Tile::Scalar(ColumnValue::single(Value::Function(Vec::new())));
+        let mut producer = MapResultProducer {
+            base: ProducerBase::new(MapResultProducer::alloc_id(), operator.tiling()),
+            input: Box::new(TestTileProducer::new(
+                in_tiling.empty_at_no_rows(),
+                in_tiling,
+            )),
+            function: Box::new(TestTileProducer::new(fn_tile, fn_tiling)),
+            level: CurryLevel::new(1),
+        };
+        let out = producer.get(producer.tiling().universal_guard());
+        assert!(out.is_empty(), "no argument, no result: {out:?}");
     }
 
     /// While its constant is not terminal, `MapResultToConst` emits no rows and states what

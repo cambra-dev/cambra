@@ -308,6 +308,11 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
         expr,
         try_let_morphism_inline,
     );
+    changed |= ruled(
+        "simplify.compose_with_strength",
+        expr,
+        try_compose_with_strength,
+    );
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
@@ -685,6 +690,91 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
                 None => Type::Hole,
             };
             vec![source, apply_primitive(*f, Builtin::Map, mapped_ty)]
+        },
+    )
+}
+
+/// Composition with a curried function of the enclosing value, through **strength**:
+/// `⟨𝑆, curry(𝑔)⟩ ▷ zip ≫ compose  ⟹  ⟨id, 𝑆⟩ ▷ zip ≫ strength ≫ map(𝑔)`.
+///
+/// At each input `𝑥` the left side is `𝑆(𝑥) ≫ (𝑣 ↦ 𝑔(𝑥, 𝑣))`. The right side pairs `𝑥` with
+/// each value of `𝑆(𝑥)` under that value's own key ([`Builtin::Strength`]) and maps `𝑔` over
+/// the pairs, which is the same collection. `lambda_elim` leaves the left side for a generator
+/// over a sum whose element function reads the enclosing scope (`compose_sum_generators`), the
+/// counterpart of [`try_compose_constant_function`]'s shape where the function reads nothing.
+/// Conversion has no operator for a bare `compose`, and the right side is combinators it
+/// compiles.
+///
+/// Scoped as [`try_compose_constant_function`] is, to an `𝑆` whose values are a sum.
+fn try_compose_with_strength(expr: &mut Expr) -> bool {
+    fn curried_function(left: &Expr) -> Option<(&Expr, &Expr)> {
+        let TypedExprNode::Apply { argument, function } = &left.node else {
+            return None;
+        };
+        if !is_builtin(function, Builtin::Zip) {
+            return None;
+        }
+        let TypedExprNode::Tuple(parts) = &argument.node else {
+            return None;
+        };
+        let [source, curried] = parts.as_slice() else {
+            return None;
+        };
+        if !source.ty.codomain().is_some_and(|c| c.sum().is_some()) {
+            return None;
+        }
+        let TypedExprNode::Apply {
+            argument: g,
+            function: curry,
+        } = &curried.node
+        else {
+            return None;
+        };
+        is_builtin(curry, Builtin::Curry).then_some((source, g.as_ref()))
+    }
+    try_pairwise_in_compose(
+        expr,
+        |left, right| is_builtin(right, Builtin::Compose) && curried_function(left).is_some(),
+        |left, _right, _mint_kind| {
+            let Type::Fun {
+                fun_kind,
+                domain: enclosing,
+                ..
+            } = &left.ty
+            else {
+                unreachable!("a zip of two functions is a function")
+            };
+            let (fun_kind, enclosing) = (fun_kind.clone(), (**enclosing).clone());
+            let TypedExprNode::Apply { argument, .. } = left.node else {
+                unreachable!("matched as a zip above")
+            };
+            let TypedExprNode::Tuple(mut parts) = argument.node else {
+                unreachable!("matched as a pair above")
+            };
+            let curried = parts.pop().expect("matched as a pair above");
+            let source = parts.pop().expect("matched as a pair above");
+            let TypedExprNode::Apply { argument: g, .. } = curried.node else {
+                unreachable!("matched as a curry above")
+            };
+            let collection = source
+                .ty
+                .codomain()
+                .expect("the source is a function to a collection");
+            let (Some(keys), Some(values), Some(result)) =
+                (collection.domain(), collection.codomain(), g.ty.codomain())
+            else {
+                unreachable!("a sum is a collection, and `𝑔` a function")
+            };
+            let paired = Type::Tuple(vec![enclosing.clone(), values.clone()]);
+            let strengthened = Type::fun_like(&collection, keys.clone(), paired);
+            let mapped = Type::fun_like(&collection, keys.clone(), result.clone());
+            let row_and_collection = Type::Tuple(vec![enclosing.clone(), collection]);
+            let id = id().with_ty(Type::fun(enclosing.clone(), enclosing));
+            let with_row = zip_pair(id, source, &fun_kind);
+            let strength = Expr::builtin(Builtin::Strength)
+                .with_ty(Type::fun(row_and_collection, strengthened.clone()));
+            let map = apply_primitive(*g, Builtin::Map, Type::fun(strengthened, mapped));
+            vec![with_row, strength, map]
         },
     )
 }
