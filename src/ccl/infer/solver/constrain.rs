@@ -41,6 +41,22 @@ use crate::ccl::FieldKey;
 /// at use sites.
 #[derive(Debug, Clone)]
 pub enum ConstrainError {
+    /// A type parameter would reach a variable of an enclosing scope, where no use
+    /// substitutes for it (`docs/chl-spec.md`, "Type parameters").
+    TypeParamEscapes {
+        /// The escaping parameter.
+        param: Rc<crate::ccl::ty::TypeParam>,
+    },
+    /// An operator was applied to a value of a type parameter's type, and no
+    /// requirement states the trait the operator needs of it.
+    MissingRequirement {
+        /// The trait the operator requires.
+        trait_: Trait,
+        /// The operand position the parameter stands at.
+        position: u8,
+        /// The parameter.
+        param: Rc<crate::ccl::ty::TypeParam>,
+    },
     /// `lhs` and `rhs` cannot be related by the subtyping rules of
     /// [`Type`] — e.g. two distinct primitives, a function compared
     /// to a record, etc.
@@ -927,6 +943,9 @@ fn constrain_go_impl(
         // a channel's nominal domain is reflexively equal to
         // itself (the common read-vs-read case short-circuits here).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) if a == b => Ok(()),
+        // A type parameter is reflexively equal to itself, as the short-circuit above
+        // decides when the edge carries no morphism.
+        (Type::Param(a), Type::Param(b)) if a == b => Ok(()),
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
@@ -1512,14 +1531,39 @@ fn constrain_go_impl(
         }
 
         // Level mismatch: variable's level is below the other side's.
-        // Lift the other side down via extrude and retry.
+        // Lift the other side down via extrude and retry. A type parameter cannot be
+        // lifted: below its level no use has substituted for it, so carrying one
+        // down is the parameter escaping its definition.
         (Type::Infer(lv), _) => {
+            if let Some(param) = escaping_param(rhs, lv.level) {
+                return Err(ConstrainError::TypeParamEscapes { param });
+            }
             let new_rhs = extrude(rhs, false, lv.level, &mut ExtrudeCache::new());
             constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
+            if let Some(param) = escaping_param(lhs, rv.level) {
+                return Err(ConstrainError::TypeParamEscapes { param });
+            }
             let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
             constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
+        }
+
+        // A type parameter is a subtype of whatever its bound is a subtype of
+        // (`src/ccl/design/type-parameters.md`, "Subtyping with a type parameter").
+        // After the variable arms, so a variable on either side records an edge, and
+        // before the refinement arm, so `𝑃 <: {Int | 𝑝}` reaches the bound. A refined
+        // `𝑃` on the right stays with the refinement arm, which has no sort for a
+        // parameter and so cannot discharge the refinement. With no bound, nothing
+        // but `𝑃` itself is above `𝑃`.
+        (Type::Param(param), _) if !matches!(rhs.peel_refinements(), Type::Param(q) if q == param) => {
+            match &param.bound {
+                Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
+                None => Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
+            }
         }
 
         // Feed handles are invariant in the payload: feeding writes into
@@ -1768,6 +1812,26 @@ fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
     }
 }
 
+/// A type parameter in `ty`'s structure opened above `target_level`, if one is: the
+/// parameter an edge to a variable at `target_level` would carry out of its
+/// definition. Variables are not entered; an edge reaching one records the
+/// parameter on that variable, where the same check meets it.
+fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::TypeParam>> {
+    match ty {
+        Type::Param(param) if param.level > target_level => Some(Rc::clone(param)),
+        Type::Infer(_) => None,
+        _ => {
+            let mut found = None;
+            ty.walk_children(|child| {
+                if found.is_none() {
+                    found = escaping_param(child, target_level);
+                }
+            });
+            found
+        }
+    }
+}
+
 /// Lift `ty` so that all its variables live at level ≤ `target_level`.
 ///
 /// When a constraint crosses level boundaries (e.g. an outer-scope variable
@@ -1800,6 +1864,15 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
+        // `constrain_go` refuses an edge carrying a parameter below its level before
+        // it extrudes (`escaping_param`), and the level short-circuit above returns
+        // every other parameter unchanged.
+        Type::Param(param) => unreachable!(
+            "type parameter `{}` reached `extrude` above the target level; the escape \
+             check precedes extrusion",
+            param.spelling
+        ),
+        Type::Poly(_) => unreachable!("a polymorphic type reached `extrude`"),
         Type::Fun {
             name,
             fun_kind,

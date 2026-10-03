@@ -114,6 +114,12 @@ pub fn type_level(ty: &Type) -> Level {
         // A witness reference is a leaf (level 0) — naming its binder gives it no
         // solver content.
         Type::WitnessRef(_) => 0,
+        // Unlike a channel domain, a type parameter reports the level it was opened
+        // at: it must not flow to a lower-level variable, and reporting its level is
+        // what routes such an edge to the escape check
+        // (`src/ccl/design/type-parameters.md`, "Levels").
+        Type::Param(param) => param.level,
+        Type::Poly(poly) => poly.types().map(type_level).max().unwrap_or(0),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

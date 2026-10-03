@@ -355,7 +355,7 @@ pub struct Param {
 
 /// A type parameter: a capitalized name with an optional upper bound, `T <: U`.
 ///
-/// Spec: `docs/chl-spec.md`, "Type parameters \[Decided\]".
+/// Spec: `docs/chl-spec.md`, "Type parameters".
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeParam {
     pub name: SmolStr,

@@ -2,8 +2,9 @@
 
 > **Status: [Sketched].** A proposed implementation of
 > [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
-> [Implementation stack](#implementation-stack), items 1 and 2, the parser and polymorphic aliases,
-> are implemented; nothing past them is.
+> [Implementation stack](#implementation-stack), items 1 to 3 are implemented: the parser,
+> polymorphic aliases, and type parameters with their bounds. The sections on requirements,
+> `Poly` against `Poly`, and printing describe work not yet done.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -27,31 +28,25 @@ notation ([Printing an inferred polymorphic type](#printing-an-inferred-polymorp
 ```rust
 pub enum Type {
     // ...
-    Poly(Rc<PolyType>),
     Param(Rc<TypeParam>),
-}
-
-pub struct PolyType {
-    pub params: Vec<Rc<TypeParam>>,
-    pub requires: Vec<Requirement>,
-    pub body: Type,
+    Poly(Rc<PolyType>),
 }
 
 pub struct TypeParam {
-    pub id: TypeParamId,           // identity; equality and hashing use it
-    pub spelling: SmolStr,         // the name the user wrote, for display
-    pub span: Span,
-    pub level: Cell<Option<Level>>,
-    pub bound: Option<Type>,
+    pub id: TypeParamId,      // identity; equality, ordering and hashing use it
+    pub spelling: SmolStr,    // the name the user wrote, for display
+    pub level: Level,         // the level of the right-hand side the `Poly` annotates
+    pub bound: Option<Type>,  // normalized at `level`
 }
 
-pub struct Requirement {
-    pub trait_: Trait,
-    pub args: Vec<Type>,           // one per operand position, any type
-    pub assoc: Vec<(Assoc, Type)>, // `Output=O`
-    pub span: Span,
+pub struct PolyType {
+    pub params: Vec<PolyParam>, // each a shared-hole id, a spelling, and a bound
+    pub body: Type,
 }
 ```
+
+Item 4 adds a `requires` list to `PolyType`, each requirement a trait, its operand types (any
+types), its associated types by name, and a span.
 
 The variant names follow the spec's terms, "polymorphic type" and "type parameter". `Var` would be
 a third meaning for one word: `TypedExprNode::Var` is a term variable, and `Type::Infer` holds an
@@ -62,14 +57,27 @@ once modules land, and, when the spec decides them, a record
 field or a function's domain. The representation does not limit where it appears; the solver does
 ([Where a polymorphic type may appear](#where-a-polymorphic-type-may-appear)).
 
-A `Param` leaf points at its own declaration, not at its `Poly`. A parameter's bound rides in the
-leaf because the solver relates types where no scope is in hand: a specialization's pin and a trait
-deposit run during coalesce and call `constrain_subtype` without one. A bound names only the
-parameters before it ([chl-spec.md, "Bounds [Decided]"](../../../docs/chl-spec.md#bounds-decided)),
-so the `Rc`s through bounds are acyclic, and a `Poly` owning its parameters closes no cycle either.
+A `Param` leaf carries what the solver reads of the parameter, its level and bound, as an `Infer`
+leaf's variable carries its own. The solver needs them where no scope is in hand: a
+specialization's pin and a trait deposit run during coalesce and call `constrain_subtype` without
+one.
 
-`level` is set when a `Poly` is opened for checking ([Levels](#levels)). Lowering cannot set it,
-because levels are an inference notion.
+Neither fact exists when lowering writes a type parameter. Levels are an inference notion, and a
+bound's refinement names are resolved by `uniquify`, which runs after lowering and rewrites the
+bound in place as a type slot of the `Poly` (`walk_children` visits a `Poly`'s bounds and body).
+So before inference a type parameter is a `Type::SharedHole`, as `Hole` stands for an inference
+variable: lowering writes a fresh shared hole for each parameter and records its id in the `Poly`.
+Opening the `Poly` mints the `Param` leaf and seeds the shared-hole memo with it, and normalization
+then turns every occurrence into that leaf
+([Checking a binding against a polymorphic type](#checking-a-binding-against-a-polymorphic-type)).
+
+A shared hole normalized before its `Poly` is opened would become an ordinary variable, a
+flexible `T`. By construction one cannot be: a parameter occurs only inside the right-hand side its
+`Poly` opens first. In debug builds inference entry collects every `Poly`'s parameter holes, and
+normalizing one that is not yet seeded panics.
+
+A `Param`'s bound can hold inference variables whose bounds hold the `Param`. Arena teardown clears
+every variable's bounds, which breaks that cycle as it breaks the cycles among variables.
 
 ---
 
@@ -79,43 +87,49 @@ The parser gives `Stmt::FunctionDef` a `type_params` field beside `params`, and 
 Type parameters stay out of `params` because the parameter count is the arity: it sizes the argument
 tuple and fixes how many lambdas a `Mut`-parameter function's chain has (`uncurry_params`).
 
-A type-position `\T, U <: B -> V requires …` lowers to a `Type::Poly` in an alias scope of its own:
+`declare_type_params` declares each parameter in order as an alias of a fresh `Type::SharedHole`,
+after lowering its bound with the parameters before it in scope, and records the hole's id in the
+`Poly`. It refuses a built-in name and a name declared twice.
 
-1. Each parameter in order is declared as an alias of a fresh `Type::Param`, after lowering its
-   bound with the parameters before it in scope.
-2. Each requirement's trait name resolves against the trait table
-   ([chl-spec.md, "Trait requirements [Decided]"](../../../docs/chl-spec.md#trait-requirements-decided)),
-   and each argument lowers as an ordinary type expression. `Transaction` is refused as unsupported
-   until
-   [chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
-   is implemented. An unknown trait name or a wrong operand count is a lowering error.
-3. `V` lowers in that scope and becomes the body.
+A type-position `\T, U <: B -> V` lowers to a `Type::Poly` in an alias scope of its own:
+`lower_type_expr_or_poly` declares the parameters and lowers `V` as the body. That function admits a
+`Poly` at the root, and `lower_type_expr`, which every other position and every nested position
+uses, refuses one, so a polymorphic type inside another type is refused whether written or reached
+through an alias. `lower_let_annotation` lowers a `let` binder's annotation through
+`lower_type_expr_or_poly`, and so does an alias's right-hand side; a bounded `<:` polymorphic
+annotation is refused there.
 
-A `def` with type parameters lowers to a `let` whose binding is annotated with the `Poly` its
-signature denotes: the type parameters and `requires` clause as above, and the body
-`{𝐴₀, …} => 𝑅` from the value parameters' annotations and the `=>` result. The definition's alias
-scope covers the parameter annotations and the result as well as the body. Today the body's alias
-scope opens inside `lower_stmts_inner`, after which `uncurry_params` lowers the parameter
-annotations in the enclosing scope, so the scope moves out to `lower_function_body`. The lambda's
-own parameter annotations name the same `Param`s as the `Poly`.
+A `def` with type parameters lowers through `lower_def` to a `let` annotated with a `Poly` over a
+`Hole` body: the lambda's own annotations already state the signature, and `emit_let` completes the
+hole from the lambda's type. The parameters are aliases over the whole definition, parameter
+annotations and `=>` result included, so the alias scope opens around `lower_function_body`
+rather than inside the body's block. `LoweringContext::type_params_in_scope` lets
+`pre_declare_type_aliases` refuse an alias in the body that would hide a parameter. A parameter that
+no value parameter's annotation names is refused after lowering, by walking the binders of the
+lambda chain `uncurry_params` builds.
 
-A type parameter that no value parameter's annotation mentions, and that is not a requirement's
-associated type, is a lowering error.
+A `requires` clause lowers in item 4. Until then lowering refuses one on a `def` and on a `Poly`.
+Item 4 resolves each requirement's trait name against the trait table
+([chl-spec.md, "Trait requirements [Decided]"](../../../docs/chl-spec.md#trait-requirements-decided))
+and lowers each argument as an ordinary type expression. `Transaction` stays refused until
+[chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
+is implemented.
 
 ---
 
 ## Levels
 
 Emission opens a `Poly` when it checks a right-hand side against it ([Checking a
-binding against a polymorphic type](#checking-a-binding-against-a-polymorphic-type)): it sets each
-parameter's `level` to the level the right-hand side is emitted at, one above the binding, which is
-where the right-hand side's own inference variables sit.
+binding against a polymorphic type](#checking-a-binding-against-a-polymorphic-type)): it mints
+each parameter at the level the right-hand side is emitted at, one above the binding, which is where
+the right-hand side's own inference variables sit.
 
 `type_level` reports a parameter's level. `ChanDom` reports 0 so that it flows outward through
-bounds; a type parameter must not ([chl-spec.md, "Type parameters
-[Decided]"](../../../docs/chl-spec.md#type-parameters-decided)). Recording an edge that carries a
-parameter outward needs `extrude`, and `extrude` meeting a parameter above its target level fails
-with `TypeParamEscapes`, naming the parameter and its definition. It never mints a proxy.
+bounds; a type parameter must not ([chl-spec.md, "Type
+parameters"](../../../docs/chl-spec.md#type-parameters)). An edge that carries a parameter to a
+variable below its level reaches `constrain_go`'s level-mismatch arms, which check for one
+(`escaping_param`) before extruding and fail with `TypeParamEscapes`, naming the parameter.
+`extrude` never mints a proxy for a parameter.
 
 `freshen_level` reports the level too, so `freshen_above` does not short-circuit past a type that
 mentions a parameter.
@@ -126,20 +140,23 @@ mentions a parameter.
 
 `emit_let` with an exact annotation `Poly(𝜋)`:
 
-1. Opens `𝜋`: sets the parameters' levels and pushes `𝜋`'s requirements as **assumptions**, which
-   stay in scope while the right-hand side is emitted
-   ([Obligations under assumptions](#obligations-under-assumptions)).
-2. Emits the right-hand side and records `inferred <: 𝜋.body` through `bind_annotation`, with the
-   parameters opaque.
-3. Binds the name at `Poly(𝜋)` and generalizes. `should_generalize` admits a `let` annotated with a
-   `Poly`, and the coalesce walk asks the same predicate, so emission and specialization agree on
-   which `let`s are polymorphic.
+1. Opens `𝜋` inside `in_let_rhs` (`Typing::open_poly`): mints each parameter's `Param` at the
+   right-hand side's level, with its bound normalized at that level, and seeds the shared-hole memo
+   with it under the parameter's hole. Item 4 also pushes `𝜋`'s requirements as **assumptions**
+   here ([Obligations under assumptions](#obligations-under-assumptions)).
+2. Emits the right-hand side and records `inferred <: 𝜋.body` through `bind_annotation`, at the
+   right-hand side's level, with the parameters opaque. A `def`'s body is a `Hole`, completed from
+   the lambda's type.
+3. Binds the name at the completed body and generalizes. The body mentions the parameters above the
+   binding's level, so `should_generalize` admits the `let` through its level test, and the
+   coalesce walk asks the same predicate.
 
 A right-hand side that would be monomorphic without the annotation, a call or a collection, is an
-error at the annotation ([chl-spec.md, "Polymorphic type annotations
-[Decided]"](../../../docs/chl-spec.md#polymorphic-type-annotations-decided)). Lowering refuses a
-call or a collection, whose shape is syntactic. A name bound to a monomorphic binding is refused at
-emission, where the binding's scheme is known.
+error at the annotation ([chl-spec.md, "Polymorphic type
+annotations"](../../../docs/chl-spec.md#polymorphic-type-annotations)). Lowering refuses a call
+or a collection, whose shape is syntactic. A name bound to a monomorphic binding is refused at
+emission, where the binding's scheme is known: `MonomorphicPolyBinding`, or an annotation mismatch
+when the reconcile in step 2 fails first.
 
 A `def` and `g: \T -> V requires … = e` take this one path. For `g = f` with `e` a `Var`, step 2
 instantiates `f` against `V`, which is the check that `f` is at least as general as `g`'s type.
@@ -160,13 +177,24 @@ instantiates `f` against `V`, which is the check that `f` is at least as general
 
 The bound rule is placed after the variable arms and before the refinement arm, so
 `𝑃 <: {Int | 𝑝}` reaches `𝑃`'s bound. `𝑃 <: {𝑃 | 𝑝}` stays in the refinement arm, which has no SMT
-sort for a parameter and fails. A type-kind constraint on a variable whose lower bound is `𝑃` is
-answered by `𝑃`'s bound. `compact` treats a parameter as an atom, so a position with lower bounds
-`𝑃` and `𝑄`, neither bounded by the other, is `IncompatibleBounds`.
+sort for a parameter and fails.
+
+`compact` treats a parameter as an atom (`AtomKey::Param`), so two parameters at one position
+collide as two bases do. `collapse_by_param_bounds` resolves the case a bound relates: at a positive
+position it keeps the contribution every other is below through a bound chain, at a negative one the
+contribution below every other. Under `𝑈 <: 𝑇` the join of `𝑇` and `𝑈` is `𝑇`. "Below" follows a
+bound chain to an equal type only, so a bound that is a strict subtype of another contribution,
+such as `𝑇 <: {at: Int}` meeting a wider record, still collides.
 
 ---
 
 ## Obligations under assumptions
+
+A type parameter arriving at an operator's operand is `Offered::Param`. Delivery offers its bound
+in its place, so `x + 1` with `x: T <: Int` resolves as `Int + Int`, and an unbounded parameter fails
+with `MissingRequirement`, naming the parameter and the trait. `link_watches` replays a parameter
+already on a variable when an obligation is linked to it, as it replays a base. That is item 3. The
+rest of this section is item 4.
 
 An obligation's candidate set holds **rows**. A row is an instance from the trait's table or an
 **assumption**: a requirement of a `Poly` open where the obligation is minted. `InferCtx` keeps the
@@ -200,17 +228,18 @@ base.
 
 ## Instantiation
 
-The `Var` arm instantiates a binding whose type is `Poly(𝜋)`:
+The `Var` arm instantiates every binding through `PolyScheme::instantiate_with_params`:
 
-1. Each parameter maps to a fresh variable `𝛼` at the use's level, through a `params` map in
-   `FreshenCache`, and `𝜋.body` freshens through it.
-2. For each parameter with bound `𝐵`, the arm records `𝛼 <: 𝐵[𝛼/𝑃]`.
-3. For each requirement, the arm calls `require_trait` over the substituted arguments, then records
-   `𝑜 <: 𝛼ₒ` from the obligation's associated variable `𝑜` to the substituted associated type.
-4. The map is recorded in a table keyed by the use's `NodeId`, which the coalesce walk reads.
+1. Each type parameter above the scheme's cutoff maps to a fresh variable `𝛼` at the use's level,
+   in the use's telescope, through `FreshenCache::params`, and the body freshens through it.
+2. For each parameter with bound `𝐵`, the arm records `𝛼 <: 𝐵[𝛼/𝑃]`, the bound freshened through
+   the same cache.
+3. Item 4: for each requirement, the arm calls `require_trait` over the substituted arguments, then
+   records `𝑜 <: 𝛼ₒ` from the obligation's associated variable `𝑜` to the substituted associated
+   type.
 
-A failure in 2 or 3 is blamed on the use, with a secondary label at the bound's or the requirement's
-span, the error shape
+A failure in 2 or 3 is blamed on the use. Item 7 adds a secondary label at the bound's or the
+requirement's span, the error shape
 [chl-spec.md, "A use that checks compiles [Decided]"](../../../docs/chl-spec.md#a-use-that-checks-compiles-decided)
 states.
 
@@ -218,23 +247,35 @@ states.
 
 ## Specialization
 
-`specialize_use` reads the use's map and seeds `FreshenCache::params` with it before freshening the
-clone, next to `seed_chan_dom_pairings`. Freshening meets a parameter in three ways:
+A specialization clone is freshened with `FreshenLevel::Preserve`, and the level of a parameter says
+whose it is:
 
 | Parameter | Freshened to |
 | --- | --- |
-| of the specialized binding's `Poly` | the use's `𝛼` |
-| of another `Poly` above the cutoff, as in a nested definition's annotation | a new `TypeParam`, its bound freshened, so the nested `Poly` is α-renamed |
-| at or below the cutoff, an enclosing definition's | itself |
+| at the cutoff's next level: the specialized binding's own | a fresh variable at that level |
+| deeper: a definition's nested in the clone | a new `TypeParam`, at the same level and with its bound freshened |
+| at or below the cutoff: an enclosing definition's | itself |
 
-A cloned obligation holding an assumption of the specialized `Poly` is reset to its trait's table
-and is redelivered its operands' current lower bounds, so the clone resolves as an ordinary
+The clone's pin, two-way against the use's instantiation type, ties each fresh variable to the
+use's types where the parameter stands in the signature. Where it stands only in a bound, as for a
+parameter `x <: T`, the variable takes the types flowing in through the pinned parameter. No
+per-use table is kept: cloning re-mints node identities, so a table keyed by a use's `NodeId` would
+miss the uses inside a clone.
+
+Each use substitutes its own types, so an error that only the opaque parameters expose, such as
+two unrelated parameters meeting at one position, never shows in a clone.
+`SpecializeFrame::generic` marks a binding annotated with a `Poly`, and `coalesce_generalized_let`
+checks such a definition alone with `typecheck_discarded_definition` once its last use is
+specialized, after which nothing clones from it, as it already checks a definition nothing calls. A
+diagnostic the clones already raised is not repeated.
+
+Item 4: a cloned obligation holding an assumption of the specialized `Poly` is reset to its trait's
+table and redelivered its operands' current lower bounds, so the clone resolves as an ordinary
 monomorphic body. Freshening writes bounds directly and so does not deliver; the redelivery replaces
 it. That the reset obligations resolve follows from the use having satisfied every requirement at
 the same types, and item 7 of the [Implementation stack](#implementation-stack) asserts it.
 
-A never-called definition is coalesced in place by `typecheck_discarded_definition`, with its
-parameters as atoms. `spec_key` keys a parameter as an atom by `id` for the uses inside it.
+`spec_key` keys a parameter as an atom by `id`, for the uses inside a definition checked alone.
 
 ---
 
@@ -251,8 +292,9 @@ another type, and the rules are:
 | `𝑋 <: Poly(𝜋)`, `𝑋` not a `Poly` | refused: `𝑋` would have to be generalized where it stands |
 
 The spec leaves a polymorphic type nested inside another type **[Open]**. Until it decides, lowering
-refuses one, and the first two rows serve Module-type member checks once modules land.
-A refused case is an error, never an approximation.
+refuses one, and the first two rows serve Module-type member checks once modules land. Until item
+5, `compact`, `extrude` and `spec_key` treat a `Poly` reaching them as unreachable. A refused case is
+an error, never an approximation.
 
 ---
 
@@ -262,7 +304,8 @@ A `Poly` or `Param` in the tree that survives inference is a compiler defect.
 `collect_type_errors` reports one at every strictness, as it reports `Hole`. A specialized binding
 is rebuilt as monomorphic `let`s, so its `Poly` annotation leaves with it. `Display for Type`
 renders a `Poly` in the spec's notation and a parameter by its spelling. `hash_type_in` hashes a
-parameter by `id`, and a `Poly` by its parameters' positions, so α-equivalent `Poly`s hash equal.
+parameter by its spelling, as it hashes a channel domain, since an identity is per-compilation; no
+hashed tree holds one after inference.
 
 ---
 
@@ -295,9 +338,9 @@ One change per item, each updating this doc and the spec status it implements:
    parameters. Lowering refuses each new form as unsupported. A capitalized `def` parameter stops
    being a value parameter.
 2. **Polymorphic aliases** (implemented).
-3. **`Type::Poly`, `Type::Param`, bounds.** Lowering of `def` type parameters and of
+3. **`Type::Poly`, `Type::Param`, bounds** (implemented). Lowering of `def` type parameters and of
    `\T -> V`, levels and escape, subtyping, checking a binding against a `Poly`, instantiation of
-   bounds, specialization, the post-inference check, display.
+   bounds, specialization, a generic definition checked alone, the post-inference check, display.
 4. **Requirements.** Assumption rows, head matching and its deposit, the componentwise `Equatable`
    reading, unsatisfiable requirements, instantiation of requirements, clone reset and redelivery,
    the sweep.

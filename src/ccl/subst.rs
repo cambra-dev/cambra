@@ -1167,7 +1167,13 @@ impl Subst {
             // A witness reference is a type-level binder occurrence, never a term
             // binder the substitution acts on.
             | Type::WitnessRef(_)
+            // A type parameter names no term binder; its bound is a child of the
+            // `Poly` that declares it, reached by the arm below.
+            | Type::Param(_)
             | Type::Infer(_) => {}
+            Type::Poly(poly) => Rc::make_mut(poly)
+                .types_mut()
+                .for_each(|t| self.rewrite_type_go(t, memo)),
 
             // a nominal channel domain names its defer
             // binder, so a handle rename (`x ↦ y` on beta-reduction /
@@ -1437,7 +1443,9 @@ impl Subst {
             | Type::Txn
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::Param(_)
             | Type::Infer(_) => ty.clone(),
+            Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(|t| self.apply_type_inner(t)))),
 
             // **A witness reference crosses a scope change here.** The reference names the
             // binder of the sum it was written under; where this substitution records a
@@ -1625,8 +1633,10 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        | Type::Param(_)
         | Type::WitnessRef(_) => false,
         Type::Infer(_) => true,
+        Type::Poly(poly) => poly.types().any(type_contains_infer),
         Type::Fun {
             fun_kind,
             domain,
@@ -1694,7 +1704,14 @@ fn collect_type_fv(
         | Type::SharedHole(_)
         // A witness reference is type-level, never a free term variable.
         | Type::WitnessRef(_)
+        // So is a type parameter; its bound is a child of the `Poly` below.
+        | Type::Param(_)
         | Type::Infer(_) => {}
+        Type::Poly(poly) => {
+            for t in poly.types() {
+                collect_type_fv(t, bound, visited, out);
+            }
+        }
         Type::Fun {
             name,
             fun_kind,
@@ -1987,7 +2004,11 @@ impl<'a> PiWalk<'a> {
             | Type::Txn
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::Param(_)
             | Type::Infer(_) => {}
+            Type::Poly(poly) => Rc::make_mut(poly)
+                .types_mut()
+                .for_each(|t| self.ty(t, depth)),
             Type::BoundedHole(t) => self.ty(t, depth),
             Type::Fun {
                 domain, codomain, ..
@@ -2143,7 +2164,9 @@ pub fn references_enclosing_function(ty: &Type) -> bool {
             | Type::Txn
             | Type::Hole
             | Type::SharedHole(_)
+            | Type::Param(_)
             | Type::Infer(_) => false,
+            Type::Poly(poly) => poly.types().any(|t| ty_scan(t, depth, visited)),
             Type::BoundedHole(t) => ty_scan(t, depth, visited),
             Type::Fun {
                 domain, codomain, ..

@@ -952,7 +952,7 @@ where
         //
         // In a type position the same form is a polymorphic type,
         // `\T, U <: B -> V requires …` (`docs/chl-spec.md`, "Polymorphic type
-        // annotations [Decided]"): capitalized binders are type parameters, and a
+        // annotations"): capitalized binders are type parameters, and a
         // type parameter's bound is parsed at the pair's key level, so the bound
         // stops at the `->` that closes the binder list. A `requires` clause after
         // the body belongs to the innermost lambda.
@@ -1670,7 +1670,7 @@ where
 /// value parameters. Type parameters come first, and a type parameter takes only a
 /// bound, `T <: U`.
 ///
-/// Spec: `docs/chl-spec.md`, "Type parameters [Decided]".
+/// Spec: `docs/chl-spec.md`, "Type parameters".
 fn split_params<'src>(
     items: Vec<Param>,
 ) -> Result<(Vec<TypeParam>, Vec<Param>), Rich<'src, Token, Span>> {

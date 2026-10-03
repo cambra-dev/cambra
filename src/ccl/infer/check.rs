@@ -430,6 +430,14 @@ impl Typing for CheckCtx {
         f(self)
     }
 
+    fn resolve_type_params(&self, ty: &Type) -> Type {
+        ty.clone()
+    }
+
+    fn open_poly(&mut self, _poly: &crate::ccl::ty::PolyType) {
+        unreachable!("a polymorphic annotation survived inference into Check");
+    }
+
     fn is_generalizable(&self, _def: &Expr) -> bool {
         // Check never generalizes — by the time it runs, polymorphic `let`s
         // have been monomorphized into concrete per-type specializations.
