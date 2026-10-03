@@ -2,6 +2,7 @@
 // parents need specialized child types before resolving their own type.
 // See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 
+use crate::ccl::infer::api::RelatedPositions;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -97,12 +98,14 @@ fn push_coalesce_err(
             errors.push(LocatedInferError {
                 error: new_err,
                 node_id: blame,
+                related: RelatedPositions::default(),
             });
         }
     } else {
         errors.push(LocatedInferError {
             error: new_err,
             node_id: blame,
+            related: RelatedPositions::default(),
         });
     }
 }
@@ -1010,10 +1013,11 @@ fn check_scope_valid_go(
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
                 at: symbolic(expr),
-                ty: expr.ty.clone(),
+                ty: Box::new(expr.ty.clone()),
                 unbound: vec!["a witness reference free in its node's type".to_string()],
             },
             node_id: expr.node_id(),
+            related: RelatedPositions::default(),
         });
     }
     let mut witnesses = witnesses.to_vec();
@@ -1025,10 +1029,11 @@ fn check_scope_valid_go(
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
                 at: symbolic(expr),
-                ty: expr.ty.clone(),
+                ty: Box::new(expr.ty.clone()),
                 unbound: unbound.iter().map(|n| n.to_string()).collect(),
             },
             node_id: expr.node_id(),
+            related: RelatedPositions::default(),
         });
     }
     match &expr.node {
@@ -2052,6 +2057,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // cache is long gone, and sharing one cache across pins could only
     // conflate edges between independent specializations.
     let mut cache = ConstrainCache::new();
+    let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
+    cache.at(use_origin, use_origin);
     let pinned = constrain_subtype(&clone.ty, &use_expr.ty, &mut cache)
         .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
     // An obligation the copy reset, having assumed one of the binding's own type
@@ -2076,10 +2083,14 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         let e = e.clone();
         // Blamed on the use site, which is the node whose demanded type the pin
         // failed to satisfy, and the node this specialization's recording names.
-        ctx.errors.push(LocatedInferError {
-            error: map_constrain_err(e, "monomorphization specialization"),
-            node_id: use_expr.node_id(),
-        });
+        ctx.errors.push(
+            LocatedInferError {
+                error: map_constrain_err(e, "monomorphization specialization"),
+                node_id: use_expr.node_id(),
+                related: RelatedPositions::default(),
+            }
+            .with_failure(cache.take_failure()),
+        );
     }
 
     // Coalesce the clone re-entrantly, in the definition site's scope: every
@@ -2289,10 +2300,17 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         {
             continue;
         }
-        at_uses.push(LocatedInferError {
-            error: h.error.error.clone(),
-            node_id: at_use,
-        });
+        // Labelled where the body failed: the definition's node the specialization's node
+        // copies, which has a source position where a re-minted node has none.
+        let in_body = crate::ccl::infer_var::Origin::Node(h.origin.unwrap_or(h.error.node_id));
+        at_uses.push(
+            LocatedInferError {
+                error: h.error.error.clone(),
+                node_id: at_use,
+                related: h.error.related.clone(),
+            }
+            .with_failure((None, Some(in_body))),
+        );
     }
     ctx.errors.extend(at_uses);
 

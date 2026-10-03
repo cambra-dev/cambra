@@ -207,6 +207,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
                         unreachable!("a join or meet is not a parameter of its own")
                     }
                 },
+                None,
             )
         })
         .collect();
@@ -231,6 +232,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
                 .map(|(name, _)| *name)
                 .zip(assoc_tys.iter().cloned())
                 .collect(),
+            at: None,
         };
         // A requirement about no parameter is one the definition already answered
         // at concrete types.

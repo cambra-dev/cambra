@@ -1331,7 +1331,13 @@ pub(super) fn declare_type_params(
         let param = crate::ccl::ty::TypeParam::declared(name);
         ctx.declare_type_alias(name, Type::Param(Rc::clone(&param)));
         ctx.type_params_in_scope.push(name.to_string());
-        declared.push(crate::ccl::ty::PolyParam { param, kind });
+        declared.push(crate::ccl::ty::PolyParam {
+            param,
+            kind,
+            bound_at: tp.annotation.as_ref().map(|a| match a {
+                KindAnnotation::Kind(k) | KindAnnotation::Bound(k) => k.span,
+            }),
+        });
     }
     Ok(declared)
 }
@@ -1620,6 +1626,7 @@ fn expand_requirement(
                     .map(crate::ccl::infer::solver::traits::canonical_type)
                     .collect(),
                 assoc,
+                at: Some(span),
             }));
             return Ok(());
         }
@@ -1660,6 +1667,7 @@ fn expand_requirement(
         trait_,
         args,
         assoc,
+        at: Some(span),
     }));
     Ok(())
 }

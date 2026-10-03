@@ -1,6 +1,6 @@
 # Diagnostics
 
-How an inference diagnostic writes the types it reports.
+How an inference diagnostic writes the types it reports, and the source positions it labels.
 
 ---
 
@@ -53,3 +53,48 @@ write, which lowers to a different term than the one the checker holds.
 
 `a_written_type_prints_as_an_annotation_that_lowers_back` (`ccl/chl_print.rs`) checks the rows
 marked "yes", and `tests/compilation_pipeline/chl_types.rs` checks each row end to end.
+
+---
+
+## Secondary labels
+
+An error is reported at the node whose rule drew the failing edge, and each other position the
+edge involves is a secondary label (`LocatedInferError::related`): `x = id((sku=1))` then
+`x.at` is reported at `x.at`, with "the value comes from here" at `id((sku=1))`.
+
+- **Origins on bounds.** `Bound::origin` records where a bound's bounding side came from: for a
+  lower bound, the expression the value came from; for an upper bound, what demanded it. An
+  `Origin` is a node, or the span of a bound or requirement written in a `Poly`
+  (`PolyParam::bound_at`, `TraitRequirement::at`), which has no node. A span is no part of a
+  type's identity: equality and hashing of those two types leave it out.
+- **The walk carries them.** `ConstrainCache` holds the origins of the edge being walked, set by
+  its caller (`ConstrainCache::at`): emission sets the node under emission, and a
+  specialization's pin sets the use. Recording a bound stores its bounding side's origin, and
+  closing an edge over a stored bound walks on with that bound's origin on its side. Freshening
+  and extrusion copy origins, so a definition's bounds point into its body at every use. The
+  first edge to fail records its two origins (`ConstrainCache::take_failure`).
+- **Trait obligations.** An obligation demands from where it was stated
+  (`TraitObligation::required_at`): its operator, or the requirement it was instantiated from. A
+  failed narrowing records the obligation as the demand and the contribution's origin as the
+  value.
+- **Written demands.** The `Var` arm checks a parameter's bound and instantiates a requirement
+  under `Typing::with_demand_at`, so a failure points at the bound or the requirement as written.
+- **Rendering.** `compile_program` resolves a node through the lowering projection and keeps a
+  label whose span lies outside the primary span, reading "required here" or "the value comes
+  from here".
+
+Not covered:
+
+- A concrete type carries no origin, so a value meeting a demand without passing through an
+  inference variable has no value label: `x = (sku=1)` then `x.at`
+  (`a_concrete_value_meeting_a_demand_directly_has_no_label`).
+- An obligation does not record which contribution narrowed its candidates, so a conflict between
+  two operands labels only the later operand's source: `a = id("s")`, `b = id(1)`, then `a + b`
+  labels `id(1)` and not `id("s")`.
+- An error raised at coalesce, such as an incompatible join or a use whose instantiation does not
+  resolve, has no edge and so no label. The exception is an error a specialization raises that is
+  the use's
+  ([type-inference.md, "Checking a definition alone"](type-inference.md#checking-a-definition-alone)):
+  it is reported at the use, labelled "required here" where the body failed.
+- The inspector's diagnostic carries one span (`inspector_model::wire::Diagnostic`), so it shows
+  no secondary label.

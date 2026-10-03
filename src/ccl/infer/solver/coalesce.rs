@@ -1329,6 +1329,7 @@ mod tests {
                 field("at", prim(BaseType::Int)),
                 field("sku", prim(BaseType::Int)),
             ])),
+            None,
         );
         let at = record(&[field("at", prim(BaseType::Int))]);
         let ct = position(true, &[Type::Param(t), at.clone()]);
@@ -1338,8 +1339,8 @@ mod tests {
     /// Under `U <: T`, the join of the two is `T` and the meet `U`.
     #[test]
     fn a_bound_chain_orders_two_parameters() {
-        let t = crate::ccl::ty::TypeParam::opened("T", 1, None);
-        let u = crate::ccl::ty::TypeParam::opened("U", 1, Some(Type::Param(Rc::clone(&t))));
+        let t = crate::ccl::ty::TypeParam::opened("T", 1, None, None);
+        let u = crate::ccl::ty::TypeParam::opened("U", 1, Some(Type::Param(Rc::clone(&t))), None);
         let parts = [Type::Param(Rc::clone(&t)), Type::Param(Rc::clone(&u))];
         assert_eq!(
             coalesce_compact_go(&position(true, &parts), true, &[]).unwrap(),
@@ -1361,6 +1362,7 @@ mod tests {
                 field("at", prim(BaseType::Int)),
                 field("sku", prim(BaseType::Int)),
             ])),
+            None,
         );
         let at = record(&[field("at", prim(BaseType::Int))]);
         let ct = position(false, &[Type::Param(Rc::clone(&t)), at]);
@@ -1373,7 +1375,7 @@ mod tests {
     /// An unbounded parameter has no common type with anything else.
     #[test]
     fn an_unbounded_parameter_beside_a_type_collides() {
-        let t = crate::ccl::ty::TypeParam::opened("T", 1, None);
+        let t = crate::ccl::ty::TypeParam::opened("T", 1, None, None);
         let ct = position(true, &[Type::Param(t), prim(BaseType::Int)]);
         assert!(matches!(
             coalesce_compact_go(&ct, true, &[]),

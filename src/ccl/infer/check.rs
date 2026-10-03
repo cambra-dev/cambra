@@ -548,6 +548,14 @@ impl Typing for CheckCtx {
         Ok(ann.clone())
     }
 
+    fn with_demand_at<R>(
+        &mut self,
+        _origin: Option<crate::ccl::infer_var::Origin>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        f(self)
+    }
+
     fn bind_poly_annotation(
         &mut self,
         inferred: &Type,

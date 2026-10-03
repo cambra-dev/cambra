@@ -1321,6 +1321,9 @@ pub struct TypeParam {
     /// ([`PolyParam::bound`]), normalized at its level. A declared parameter's kind is
     /// its [`PolyParam::kind`], where the passes before inference rewrite it.
     pub bound: Option<Type>,
+    /// For an opened parameter, where its bound was written: the secondary label of a
+    /// use that fails it.
+    pub bound_at: Option<chl_parser::ast::Span>,
 }
 
 impl TypeParam {
@@ -1331,6 +1334,7 @@ impl TypeParam {
             spelling: spelling.into(),
             opened_at: None,
             bound: None,
+            bound_at: None,
         })
     }
 
@@ -1339,12 +1343,14 @@ impl TypeParam {
         spelling: impl Into<SmolStr>,
         level: crate::ccl::Level,
         bound: Option<Type>,
+        bound_at: Option<chl_parser::ast::Span>,
     ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
             spelling: spelling.into(),
             opened_at: Some(level),
             bound,
+            bound_at,
         })
     }
 
@@ -1416,7 +1422,10 @@ pub struct PolyType {
 /// the candidate set of each obligation minted while the definition it annotates is
 /// emitted (`src/ccl/design/type-parameters.md`, "Obligations under assumptions"), and
 /// freshened at a use, an obligation that use must satisfy.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Equality and hashing leave out [`at`](Self::at): where a requirement was written
+/// does not make it a different requirement.
+#[derive(Debug, Clone)]
 pub struct TraitRequirement {
     pub trait_: crate::ccl::infer::solver::traits::Trait,
     /// One per operand position.
@@ -1424,6 +1433,23 @@ pub struct TraitRequirement {
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    /// Where the requirement was written, for the secondary label of a use that fails
+    /// it; `None` for one no `requires` clause states.
+    pub at: Option<chl_parser::ast::Span>,
+}
+
+impl PartialEq for TraitRequirement {
+    fn eq(&self, other: &Self) -> bool {
+        self.trait_ == other.trait_ && self.args == other.args && self.assoc == other.assoc
+    }
+}
+impl Eq for TraitRequirement {}
+impl std::hash::Hash for TraitRequirement {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.trait_.hash(state);
+        self.args.hash(state);
+        self.assoc.hash(state);
+    }
 }
 
 impl TraitRequirement {
@@ -1433,6 +1459,7 @@ impl TraitRequirement {
             trait_: self.trait_,
             args: self.args.iter().map(&mut f).collect(),
             assoc: self.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
+            at: self.at,
         }
     }
 
@@ -1493,6 +1520,7 @@ impl PolyType {
                 .map(|p| PolyParam {
                     param: Rc::clone(&p.param),
                     kind: p.kind.map_children(&mut f),
+                    bound_at: p.bound_at,
                 })
                 .collect(),
             requires: self
@@ -1507,7 +1535,10 @@ impl PolyType {
 
 /// One type parameter a [`PolyType`] declares, with the kind it ranges over. A kind
 /// names only the parameters before it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Equality and hashing leave out [`bound_at`](Self::bound_at): where a bound was
+/// written does not make it a different type.
+#[derive(Debug, Clone)]
 pub struct PolyParam {
     /// The declared parameter, which the kinds after it, the body, and the
     /// annotations of the definition the `Poly` annotates name.
@@ -1515,14 +1546,34 @@ pub struct PolyParam {
     /// [`TypeKind::Type`], or [`TypeKind::SubtypesOf`] for a bounded parameter;
     /// lowering writes no other (`docs/chl-spec.md`, "Kinds and bounds").
     pub kind: TypeKind,
+    /// Where the bound was written.
+    pub bound_at: Option<chl_parser::ast::Span>,
+}
+
+impl PartialEq for PolyParam {
+    fn eq(&self, other: &Self) -> bool {
+        self.param == other.param && self.kind == other.kind
+    }
+}
+impl Eq for PolyParam {}
+impl std::hash::Hash for PolyParam {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.param.hash(state);
+        self.kind.hash(state);
+    }
 }
 
 impl PolyParam {
     /// `param` with kind `SubtypesOf(bound)`, or `Type` with no bound.
-    pub fn with_bound(param: Rc<TypeParam>, bound: Option<Type>) -> PolyParam {
+    pub fn with_bound(
+        param: Rc<TypeParam>,
+        bound: Option<Type>,
+        bound_at: Option<chl_parser::ast::Span>,
+    ) -> PolyParam {
         PolyParam {
             param,
             kind: bound.map_or(TypeKind::Type, |b| TypeKind::SubtypesOf(Box::new(b))),
+            bound_at,
         }
     }
 

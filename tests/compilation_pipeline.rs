@@ -48,6 +48,8 @@ mod probes;
 mod records;
 #[path = "compilation_pipeline/scalars_collections.rs"]
 mod scalars_collections;
+#[path = "compilation_pipeline/secondary_labels.rs"]
+mod secondary_labels;
 #[path = "compilation_pipeline/sources_incremental.rs"]
 mod sources_incremental;
 #[path = "compilation_pipeline/sums.rs"]
