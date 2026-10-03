@@ -73,11 +73,11 @@ One level is the base case, so an operator that appends a level is closed under 
 output. `Tiling::append_level` is the same step on the static shape.
 
 The appended level is whole for every parent it names, since a caller appends only once it holds
-each group entire. A one-level tile's keys therefore become final, each now holding a whole group
-where it held one value. A deeper tile's outermost keys own groups of the levels already beneath
-them, which a later tile can add to, because `merge` matches a key both sides hold and merges
-their groups. Such a tile keeps the completeness it arrived with. Removals ride through level for
-level, and the appended level has removed nothing.
+each group entire. The innermost level's keys therefore become final, each now holding a whole
+group, and beneath standing levels each is named by its path. The levels above keep the
+completeness they arrived with: a later tile can add to their groups, because `merge` matches a
+key both sides hold and merges their groups. Removals ride through level for level, and the
+appended level has removed nothing.
 
 Tiles representing collections (`DataFunction`) support logical deletes by storing a `BitSet` of
 deleted values. These are set by filtering operators like `Restrict` and compacted away by stateful
@@ -221,16 +221,20 @@ into the enclosing paths it is qualified by and the keys it admits under them, a
 
 A level's `domain_predicate` names whole paths from its tile's root. An operator that takes a
 row's group out to work on it alone reads the group's statements over the group's own paths, and
-one that puts a group back under a different row restates what the group carries:
+one that puts a group back under a different row, or changes the levels around it, restates what
+the group carries:
 
 | Move | Restatement |
 |------|-------------|
 | Take row 𝑟's group out (`Tile::group_at`) | `within(𝑟)`, or `True` where the level above calls 𝑟 complete |
 | Place a group under row 𝑟 (`Tile::regroup_beneath`) | `beneath(𝑟)` |
 | Attach a column of groups to the rows 𝑅 it stands under | `qualified_by(𝑅)`; `Tile::qualify_codomain_by_keys` for a column under one row's keys |
+| Insert a level before a path component | `with_level_inserted` |
+| Merge two levels into one keyed by pairs | `with_levels_paired`, and `with_levels_unpaired` for a release handed back |
 
-`Tile::map_level_predicates` applies one to every level of a chain, through record fields. A
-group placed without restating names paths under other rows, which the check in
+`Tile::map_level_predicates` applies one to every level of a chain, through record fields, and
+`TileGuard::map_level_predicates` to every level a guard names. A group placed without
+restating names paths under other rows, which the check in
 [The completeness contract](#the-completeness-contract) reports as a change to a complete path.
 
 ### Componentwise predicates and prefixes
@@ -278,6 +282,28 @@ so a component that destructures instead of reading its own level reads `domain`
 keys are complete; the rows an operator groups by, and their completeness, belong to
 `CurryLevel::enclosing`. At depth two the enclosing level is the outermost one, so reading
 the wrong one gives the same answer there and a different one at depth three and below.
+
+**Completeness is downward-closed.** A key a level calls complete is complete at every depth
+beneath it, so an element is final as soon as *some* level on its path calls that prefix
+final. An operator that reduces one group per row — `MapAggregate` is the case — therefore
+asks every level on the path rather than the outermost alone. Asking the outermost is sound
+only while the statement says the same of every row: under a nested induction store the enclosing
+positions stay open for as long as the drive runs, while the row being run is decided, so an
+aggregate inside the nest would never settle.
+
+Operators split into two families by what they replace at their level:
+
+- **Replacing the values beneath it** — `Zip`, `VariantWrap`. Their tiling is
+  `with_values_at(input, level, new_values)` and the producer writes `*values_at_mut(level)`.
+  Nothing is grouped, so nothing is split per row.
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`. Each takes
+  the level apart one row of the level above at a time and puts it back with
+  `Tile::regroup_beneath`, handing it the empty level its own output tiling derives
+  (`Tile::per_group` derives it on the call), so a row that has been reached by nothing still
+  answers at the right shape. Operands pulled from their own branches need not hold the same rows,
+  nor hold them at the same positions, so an operator with several finds each row in the others by
+  its path (`Tile::rows_by_path`). A union's standing rows are its arms' together, each arm holding
+  its own share.
 
 ### CCL types vs. tilings
 
@@ -333,6 +359,19 @@ way; an operator putting a value into a column asks it, a column having nowhere 
 maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
 and `materialize_collections` turns this form back into maps where one value is required.
 
+A pair an operator *forms* follows the same rule, and states it at construction. `Product` pairs
+each row's element with the keys under it: where the element is a plain value the pair rides
+materialized in one column, and where it carries a level — a nest whose elements are collections —
+the pair is a `Tiling::Record` whose `_0` keeps its levels. `Uncurry` reads the rule from the other
+end: it flattens two levels into a pair-keyed one and leaves the values it finds exactly as they
+are, because materializing a level-carrying value is what has no column to go in.
+
+**A variant's payload is the one place a collection rides as a value.** An arm holds one cell per
+position, so `VariantWrap` materializes the collection into it (at the level the payload's own type
+names, not the input's innermost) and `VariantProject` opens it back into levels. An applied
+`` `𝑐(𝑥) `` is one variant value, so a collection-valued `𝑥` is one cell. The cell is emitted once
+the collection is complete, since a materialized value cannot grow.
+
 ---
 
 ## The release contract
@@ -348,8 +387,9 @@ An operator must therefore **reject a guard it cannot honor rather than ignore i
 A keyless field's cell beneath a level goes with its key. A record tile's fields stand over
 the same rows, so a tile cannot hold a row without its cell. A release naming the cell under an
 open key is recorded, and the producer returns the cell until the key is released
-(`Tile::remove_guarded`). No consumer can have dropped the cell while it holds the row, so
-the value it receives again is one it already has, matched by key.
+(`Tile::remove_guarded`), so a consumer still holding the row receives the cell again, a value
+it already has. A consumer that can take that repeat may release the key later. `Memo` cannot:
+see [A `Memo` releases everything it takes](#a-memo-releases-everything-it-takes).
 
 ### Guard operations are exact
 
@@ -359,8 +399,10 @@ representation cannot spell is a gap in the guard algebra. The fix is a spelling
 then the operation fails loudly (`todo!`, `unimplemented!`). It never answers a smaller region,
 and never a larger one.
 
-A consumer may release less than it has finished with, since what it releases is its own promise.
-An operator computing a guard from the guards it received has no such choice:
+A consumer may release less than it has finished with, since what it releases is its own promise,
+provided it can take the unreleased data again ([A `Memo` releases everything it
+takes](#a-memo-releases-everything-it-takes)). An operator computing a guard from the guards it
+received has no such choice:
 
 - An understated guard fails to forward a release the operator could make, which strands upstream
   state. A `FanOut` forwards the meet of its branches, so one understated meet blocks
@@ -369,6 +411,20 @@ An operator computing a guard from the guards it received has no such choice:
 - Either one is a different region from then on. `TileProducer::release` compares the spelling of
   the accumulated guard to decide whether a release added anything, and every later union and
   meet is computed from that spelling.
+
+### A `Memo` releases everything it takes
+
+`Memo` merges every delivery into its cache, and a merge takes each position once: a position
+delivered again is rejected by `Tile::merge`, whether or not the two values agree. So `Memo`
+releases, with `Tile::to_guard`, everything it merges. What that release leaves are the keys of
+open groups, which grow by key, and join-shaped values, an aggregation's accumulator or a store,
+which combine. A scalar cell left there is one the input will deliver again, and debug builds
+report it where `Memo` takes it (`Tile::holds_a_plain_value`).
+
+`to_guard` meets this by naming, by its whole path, every key whose level calls it complete, so a
+scalar cell beside a collection goes with its key once that key is complete. A cell under a key
+that is still open cannot be named without its key (the keyless-field rule above), so a `Memo`
+over such a row is a gap the check reports.
 
 ## The completeness contract
 
@@ -490,13 +546,13 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: any tiling whose deepest codomain is `Scalar(A)` | The data's levels, then the function's below the one applied, over the function's codomain | Applies a function to the data's **deepest codomain**, element-wise. Application consumes the function's outermost level, and whatever sits below that level becomes further levels of the output, because a tile holds one flat level list. So a one-level function leaves the data's shape alone and changes only its deepest codomain, while the two-level lookup a keyed collection presents contributes its inner level: a collection of keys yields one group per key, and a `Scalar` key yields just that key's group — the single-key lookup `groupby(c, k)(v)`, one level shallower because the scalar contributes none of its own. A key absent from a *settled* grouping is the empty group; absent from an unsettled one it is simply not answered yet, which the function's `domain_predicate` distinguishes. A row whose key the function has not answered is **withheld** — dropped from the output, and its outermost-level owner subtracted from the output's `domain_predicate` — and answered on a later pull. The **data** input tracks the consumer's release; the **function** operand is re-read whole on every pull, so it is released only on a universal release. |
-| `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces every codomain value of a function input with the same constant (or zips it in, per its mode), preserving the domain. A collection constant is one row, and each element gets a copy of its group (`repeat_tile`). The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
+| `MapResultToConst` | `DataFunction(extent → *)` | `DataFunction(extent → C)`, `C` the constant's tiling | Replaces each value of a function input at the level op-conversion states with the same constant (or zips it in, per its mode), preserving the levels above it. A value at that level may itself be a collection, which the constant replaces or pairs with whole. A collection constant is one row, and each element gets a copy of its group (`repeat_tile`). The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `DataFunction(Unit → Scalar)` | `Scalar` | Unwraps a `DataFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
 | `SelectField` | `Record{name: T, …}` | `T` | Hands back one field's tile, the eliminator for `MakeRecord`. Pulls the product whole, and releases what its consumer released of the field it selects and every other field whole (`guard_at_field`). |
 | `Converse` | `DataFunction(domain → Scalar(codomain))` | `DataFunction(codomain → domain)` | Inverts a function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `A ⤇ B ⤇ C` | `{_0: A, _1: B} ⤇ C` | Flattens a collection of collections into one keyed by pairs: the two key extents pack into a record key and the values stand as they were. |
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
-| `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the input's level at the predicate's innermost depth, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` and `map_filter` both compile to it. <br>TODO the function form can probably be replaced by Restrict |
+| `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the keys at the level op-conversion states ([The level a node is converted at](#the-level-a-node-is-converted-at)), which is the predicate's innermost level, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` compiles to it, and under `map` it filters each element collection. <br>TODO the function form can probably be replaced by Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `DataFunction(A → *)` | Same as input | Filters a function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
 | `Aggregate` | `DataFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `DataFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile. Constructed with an `only_terminal` flag: when `true` it emits only once the aggregation is marked terminal (the `only_terminal: false` path is currently `todo!()`). |
@@ -506,7 +562,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Only release builds then skip the upstream pull — a `Memo` sits above most scalar producers, so short-circuiting in debug would shield every one of them from the release-contract check. A `Memo` is also the one operator wired to `Notified`: while its input has not notified it and its cache is non-empty, the cache is the answer and no pull goes below, in every build. A drained input is exempt, which is what leaves the debug probe above intact. |
 | `ExtractFinal` | two inputs: `source` (`DataFunction(D → Scalar(T))`) and `default` (`Scalar(T')` for any `T'` that `T` includes) | `Scalar(T)` | Extracts the final codomain value of `source` once it signals terminal.  When `source` is terminal but emits zero values (e.g. a mutation loop whose body ran zero times because its iteration source was empty), emits the `default` scalar's value instead — keeping post-loop accumulators total.  Every emission is built at the **declared** extent `T`, not from the extracted value alone: a variant value carries only its own tag, so a column built from it would be width-narrower than `T` whenever the collapsed alternatives carry more tags between them — which is also why the `default` need only be *included in* `T` rather than equal to it (a conditional's trailing arm carries its tag and not its siblings').  Returns an empty scalar before `source` is terminal.  On the first terminal pull it releases both `source` and `default` universally — a final-consumer signal that propagates back through `FanOut`/`Memo`/mutation-loop bodies to the underlying data source. |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → Scalar(C))` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))` | Merges N function operators into one by forming the discriminated union of their domains, over a codomain the **caller declares**. The domain keeps every arm apart — which arm a row came from is what `final_or_default` dispatches on. The codomain does the opposite: the arms are alternative values at one row, so it is their **join** — and that join already exists. A union node is typed `D ⤇ V` with `V` the arms' join as inference computed it, in the full type lattice; op-conversion reads `V` off the node and passes its extent in. Re-deriving it from the operand tilings meant a second join in `Extent`'s lattice, which has variant and range rules but **no record rule**, so two arms at different record widths came out as an anonymous positional sum where the type layer said `{a: Int}` — a shape no row holds and nothing downstream can project. Arms that *do* agree on a tiling keep it verbatim, since a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express; that is the one thing still read off the operands. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
-| `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. |
+| `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
 | `VariantProject` | Scrutinee: `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | `DataFunction(UInt → Scalar(Pᵢ))` for a bare scrutinee (implicit `0..N` keys), or `DataFunction(D → Scalar(Pᵢ))` for a stream scrutinee (the real `D` keys preserved) | **Sum elimination — the read-dual of `VariantWrap`.** Projects the arm named `tag` out of a tagged-union stream, *restricting to the sub-domain of rows carrying that tag* and yielding that arm's payload column, keyed by the original `UInt` position. A tag the scrutinee does not carry yields an **empty** projection rather than an error — that is what makes a width-subtype scrutinee, and so a `match` arm the scrutinee can never reach, inert instead of ill-formed. **Restrict and project are one op**: a [`UnionArm`] stores its rows alongside its payloads, so reading the arm *is* the tag restriction — there is no separate boolean `Restrict` step and no tag-discriminating `Predicate` (a domain-`Restrict` could not express it: the tag lives in the scrutinee's codomain, not its domain). Emitted by `lambda_elim` for a scrutinee-`Case`; consumed as a bare `Builtin::VariantProject(tag)` composed onto the fed scrutinee. |
 
 **Pointwise `FunctionDef`s** (applied element-wise via `MapResult(input, Constant(FunctionDef))`, not standalone operators): `BinOp(op)` over a `{_0, _1}` record column, `UnaryOp(op)` over one column, and `RecordField(f)` projecting a field.
@@ -643,6 +699,37 @@ than by a second list agreeing.  The pass walks the AST inserting
 layer) — `iterate ▷ (p ▷ restrict) ▷ …`, application rather than composition.
 Op-conversion never has to invent an iteration source on its own.
 
+### The level a node is converted at
+
+Every node is converted at a `CurryLevel`: how many levels of its input are the iteration it is
+lifted over, rather than part of the element it takes. The AST around the node sets it
+(`OpConversionContext::level`). A tiling cannot tell a level the node iterates from a level inside
+the element it takes, so the operators listed below this table take their level from here. Over
+grouped rows, `(sum(g), max(g))` and `(g, [s.qty for s in g])` both pair at the groups' keys,
+while their arms carry one level and two.
+
+| Node | Converts its children at |
+|---|---|
+| a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
+| `map(𝑓)` | 𝑓 one level in |
+| an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
+| `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
+| a top-level `Transact` | its body at level 1, over the store's own domain |
+| every other node, composition included | the level it is converted at |
+
+The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
+pairs at it, and so does a product morphism with no input, at the domains its type is curried
+over. `MapResult` and `MapResultToConst` apply at it. `Filter` masks the keys one level above
+it, the keys a `filter_values`' elements stand at; under `map`, one level in, those are the keys
+of each element collection. A composed `VariantWrap` wraps at it, and an applied one at the
+outermost level, its whole payload being one variant value. A fed copairing merges one level
+above it.
+
+Two operators read their level off their input's tiling. `VariantProject` projects at the level
+holding its scrutinee's union column, which is always the deepest: an arm holds its payload as one
+materialized cell, so no level sits beneath a union. `MapAggregate` folds the innermost
+collection its input holds.
+
 ### Iteration sources
 
 After planning, the only ways op-conversion learns about an iteration are via
@@ -761,8 +848,11 @@ Compiling it is the pairing. [`Product`] gives each outer row a group holding th
 domain, one level deeper than the outer collection — a collection per row — and `𝑔` then compiles over
 that like any other morphism over a stream, its result inheriting the grouping.
 The inner source does not mention the outer binder, so every row iterates the same domain and
-the pairing is a cartesian product. A source that differs per row is the same output shape
-from a different builder
+the pairing is a cartesian product (`Product::shared_at`). While the inner side is still
+arriving, each row is paired with the elements it holds so far and left open: no row is complete
+until the inner side is, since every row can gain its next element. Every row reads the whole
+inner side, so it is released only when everything is. A source that differs per row is the same
+output shape from a different builder
 ([Where a collection is materialized](#where-a-collection-is-materialized)), where the per-row
 collection arrives as a value rather than being selected by the binder.
 

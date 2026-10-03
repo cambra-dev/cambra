@@ -210,8 +210,8 @@ rewrites, in the order `run` performs them:
 5. **Refinement-predicate compilation** (`compile_refinement_predicates`) — every remaining bare
    predicate is normalized tree-wide to point-free form, reaching the consumer contracts that sit
    outside any iteration site.
-6. **Per-group filter insertion** (`insert_map_filters`) — a refinement riding an inner collection's
-   domain becomes a `map_filter`. A narrowing it cannot materialize is rejected
+6. **Per-group filter insertion** (`insert_per_group_filters`) — a refinement riding an inner
+   collection's domain becomes `map(filter_values(𝑞))`. A narrowing it cannot materialize is rejected
    (`reject_unmaterialized_narrowings`), since op-conversion would compile the site without its
    filter.
 
@@ -226,7 +226,7 @@ let mut expr = simplify(expr);
 fold_constants(&mut expr);
 insert_iterate_markers(&mut expr, &discharged);
 compile_refinement_predicates(&mut expr, &PredMemo::new());
-insert_map_filters(&mut expr);
+insert_per_group_filters(&mut expr);
 reject_unmaterialized_narrowings(&expr)?;
 simplify(expr)
 ```

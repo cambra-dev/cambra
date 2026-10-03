@@ -1746,3 +1746,84 @@ fn test_a_match_in_a_loop_partitions_a_tagged_stream(#[case] tail: &str, #[case]
 fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
+
+/// A variant whose payload is a **collection** is one variant value, the collection held
+/// whole in its arm, which the variant's type says: `` `some(xs) `` is a
+/// `` {`some{[0, 1] ⤇ Int}} ``, not a collection of `` `some `` values. The `match` reopens
+/// the payload as the collection it was.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_list(indoc! {"
+    xs = [1, 2]
+    x = `some(xs)
+    match x:
+        case `some(v):
+            sum(v)
+        case `none:
+            0"})]
+#[case::a_map(indoc! {r#"
+    m = map([("a", 1), ("b", 2)])
+    x = `some(m)
+    match x:
+        case `some(v):
+            sum(v)
+        case `none:
+            0"#})]
+fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
+    check_scalar(code, Value::Int(3));
+}
+
+/// One variant per row when each row's payload is a collection: the groups `[1]`, `[2, 3]`
+/// and `[4]` wrap into three `` `some `` values, each holding its group whole, rather than
+/// one per element.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_collection_payload_per_row_is_one_variant_per_row() {
+    let tile = run_pipeline(indoc! {r"
+        g = groupby([1, 2, 3, 4], \v -> v // 2)
+        [`some(xs) for xs in g]
+    "});
+    let cambra::interpreter::Tile::DataFunction {
+        domain, codomain, ..
+    } = tile
+    else {
+        panic!("a collection of variants, got {tile:?}")
+    };
+    assert_eq!(domain.len(), 3, "one variant per group");
+    let cambra::interpreter::Tile::Scalar(cambra::interpreter::ColumnValue::Union(arms)) =
+        *codomain
+    else {
+        panic!("a union column, got {codomain:?}")
+    };
+    let some = arms
+        .get(&FieldKey::Name("some".into()))
+        .expect("the `some` arm");
+    let lens: Vec<usize> = some
+        .values()
+        .clone()
+        .drain_to_value_iter()
+        .map(|v| match v {
+            Value::Function(bindings) => bindings.len(),
+            other => panic!("a group held whole, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(lens, vec![1, 2, 1]);
+}
+
+/// A collection **literal** as the payload, written in place, does not compile: planning
+/// gives the literal no iteration to stand over, so op-conversion meets it without an
+/// input. Bound to a name first, as above, it compiles. Pinned as it fails.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_collection_literal_payload_in_place_does_not_compile() {
+    check_compile_error(
+        indoc! {"
+            x = `some([1, 2])
+            match x:
+                case `some(v):
+                    sum(v)
+                case `none:
+                    0"},
+        "list literal reached op-conversion without an input",
+    );
+}

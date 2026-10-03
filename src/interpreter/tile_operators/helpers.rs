@@ -232,22 +232,6 @@ pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
     }
 }
 
-/// Replace the tile sitting under every level of `input_tile` with what `transformation`
-/// makes of it — the tile-level [`process_tile_result`].
-///
-/// Used where the result carries levels, which a column has nowhere to put, and where the
-/// values are read as a tile rather than as a column of elements. It needs no tiling: what
-/// it replaces is chosen by the tile's own shape, and the transformation states the rest.
-pub(crate) fn map_tile_result(
-    mut input_tile: Tile,
-    transformation: impl FnOnce(Tile) -> Tile,
-) -> Tile {
-    let values = input_tile.deepest_values_mut();
-    let taken = std::mem::replace(values, Tile::Scalar(ColumnValue::Units(0)));
-    *values = transformation(taken);
-    input_tile
-}
-
 /// Inverse of [`scalar_tile_to_column_value`]: reconstructs a [`Tile`] from a
 /// [`ColumnValue`] using the given [`Tiling`] to determine the output shape.
 ///

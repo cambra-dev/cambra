@@ -1080,7 +1080,7 @@ fn elim_lambda_impl(
             // function, and hand the result to the nested-lambda rule, which carries
             // the binder's type into the curried morphism. The refinement ends up on
             // the inner collection's domain, under the Pi that binds `param`, and
-            // planning materializes it there as a `map_filter`.
+            // planning materializes it there as a per-group filter.
             //
             // Re-targeting the cast onto the eliminated morphism instead does not
             // typecheck: it narrows a data function's domain inside a codomain, and

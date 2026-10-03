@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::{
-    interpreter::{Consumer, Scheduler, forwarding_consumer, shared_consumer, tuple_field},
+    interpreter::{Consumer, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field},
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
 };
@@ -152,7 +152,7 @@ impl TileOperator for Zip {
                 .map(|i| {
                     i.subscribe(
                         i.tiling().universal_guard(),
-                        forwarding_consumer(&shared),
+                        forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                         scheduler,
                     )
                 })
@@ -193,11 +193,46 @@ impl TileProducer for ZipProducer {
         // intersection on a `cyclic: bool` constructor flag (mirroring
         // `FanOut::new` vs `FanOut::new_cyclic`) and keeping the simpler
         // "all inputs agree" path for zips that can't lag.
-        let tiles: Vec<Tile> = self
+        let mut tiles: Vec<Tile> = self
             .inputs
             .iter_mut()
             .map(|i| i.get(i.tiling().universal_guard()))
             .collect();
+
+        // Every level above the pair has to agree before anything pairs beneath it. The
+        // arms are pulled from their own branches, so one may already hold a row under a
+        // key the other has not reached, and beneath a standing level a key alone does not
+        // name that row — it repeats across its siblings' groups. So the arms are aligned
+        // over whole paths, level by level: each keeps the paths every arm holds.
+        //
+        // Level by level rather than by extension, because a group may legitimately be
+        // empty. A key holding nothing extends to no path of the level below, and reading
+        // the levels above off the deepest one's paths would take that key away — where
+        // what every arm agrees on is that the key is there and holds nothing.
+        // Only where something stands above the pair's own enclosing level. One level up is
+        // the flat case, which the presence intersection below already aligns over the
+        // outermost keys, and a path set per arm per pull is not worth building for it.
+        if let Some(above) = self.level.enclosing()
+            && above.index() >= 1
+            && tiles[0].is_data_function()
+        {
+            let present: Vec<HashSet<Vec<Value>>> = (0..=above.index())
+                .map(|depth| {
+                    let level = CurryLevel::new(depth);
+                    tiles
+                        .iter()
+                        .map(|tile| tile.paths_at(level).into_iter().collect())
+                        .reduce(|acc: HashSet<Vec<Value>>, held| {
+                            acc.intersection(&held).cloned().collect()
+                        })
+                        .expect("Zip has at least one input")
+                })
+                .collect();
+            let keep = |path: &[Value]| present[path.len() - 1].contains(path);
+            for tile in tiles.iter_mut() {
+                tile.retain_paths(above, &keep);
+            }
+        }
 
         match &tiles[0] {
             Tile::DataFunction { .. } => {
@@ -427,7 +462,7 @@ impl TileOperator for MakeRecord {
                 .map(|i| {
                     i.subscribe(
                         i.tiling().universal_guard(),
-                        forwarding_consumer(&shared),
+                        forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                         scheduler,
                     )
                 })
@@ -1095,5 +1130,90 @@ mod tests {
             ColumnValue::UInts(vec![20, 21]),
             "branch b's values should remain [0, 1] (already its full presence)",
         );
+    }
+
+    /// A release naming part of the pair record reaches each arm as that arm's field, spelled
+    /// against the arm's own tiling. The guard is the one a consumer builds with `to_guard`
+    /// while row 0 of the collection-valued arm is still open.
+    #[test]
+    fn a_zip_release_reaches_each_arm_as_its_own_field() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm0_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let arm1_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let arm0 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let arm1 = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                ColumnValue::from_uints(vec![0]),
+                ColumnValue::from_uints(vec![3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(int())),
+                (
+                    tuple_field(1),
+                    Tiling::data_function(uint(), Tiling::Scalar(int())),
+                ),
+            ])),
+        );
+        let (spy0, released0) = ReleaseSpy::new(arm0, arm0_tiling.clone());
+        let (spy1, released1) = ReleaseSpy::new(arm1, arm1_tiling.clone());
+        let mut zip = ZipProducer {
+            base: ProducerBase::new(ZipProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0), tuple_field(1)],
+            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            level: CurryLevel::new(1),
+        };
+        let out = zip.get(out_tiling.universal_guard());
+        let guard = out.to_guard();
+        zip.release(guard.clone());
+        // Key 0 is open, since the collection arm can still grow under it. The release
+        // contract releases a field with no keys of its own along with its key, so the
+        // scalar arm is released nothing yet, and the collection arm is released the inner
+        // key it delivered beneath key 0.
+        let covers = |log: &Rc<std::cell::RefCell<Vec<TileGuard>>>, path: &[Value]| {
+            log.borrow().iter().any(|g| g.covers_path(path))
+        };
+        assert!(
+            !covers(&released0, &[Value::UInt(0)]),
+            "the scalar arm was released an open key: {:?}, from {guard:?}",
+            released0.borrow()
+        );
+        assert!(
+            covers(&released1, &[Value::UInt(0), Value::UInt(3)]),
+            "the collection arm was not released its inner key: {:?}, from {guard:?}",
+            released1.borrow()
+        );
+        // Releasing key 0 whole reaches both arms as key 0.
+        zip.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::UInt(0)),
+        )));
+        for (log, tiling) in [(&released0, &arm0_tiling), (&released1, &arm1_tiling)] {
+            for g in log.borrow().iter() {
+                assert!(
+                    g.check_from(tiling),
+                    "{g:?} is not a guard over the arm's tiling {tiling}"
+                );
+            }
+            assert!(
+                covers(log, &[Value::UInt(0)]),
+                "an arm was not released key 0: {:?}",
+                log.borrow()
+            );
+        }
     }
 }

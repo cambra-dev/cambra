@@ -216,15 +216,19 @@ mod tests {
         );
     }
 
+    /// A column that has not arrived is incomplete, at the top level and beneath keys that
+    /// may still gain values. Beneath settled keys an empty column is no tile at all
+    /// (`valid_over_settled`).
     #[test]
     fn values_that_have_not_arrived_are_incomplete() {
         let tile = Tile::data_function(
             ColumnValue::from_uints(vec![0, 1]),
             ints(vec![]),
-            Predicate::True,
+            Predicate::False,
             BitSet::new(),
         );
         assert_eq!(read(tile), Err(SinkReadError::Incomplete));
+        assert_eq!(read(*ints(vec![])), Err(SinkReadError::Incomplete));
     }
 
     /// An aggregation or a store reaching a sink is refused as one, at the top level and as

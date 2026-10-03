@@ -1,10 +1,10 @@
 //! Per-group filter planning: materialize a refinement that rides an inner
-//! collection's domain as a [`Builtin::MapFilter`].
+//! collection's domain as `map(filter_values(𝑞))`.
 
 use super::{join::combine_predicates, *};
 use crate::ccl::{Refinement, application_order, subst::open_codomain};
 
-/// Insert a `map_filter` wherever a morphism's codomain refines the collection its
+/// Insert a per-group filter wherever a morphism's codomain refines the collection its
 /// domain carries.
 ///
 /// The site is `𝑚 : (𝑔: {𝐷 | 𝑟} ⤇ 𝑊) ⇒ ({𝐷 | 𝑟, 𝑝(𝑔)} ⤇ 𝑉)` — a morphism taking a
@@ -25,11 +25,11 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// predicate, and the rewrite is
 ///
 /// ```text
-/// 𝑢 ≫ 𝑚   ⟹   𝑢 ≫ map_filter(𝑞₁ and … and 𝑞ₙ) ≫ 𝑚'
+/// 𝑢 ≫ 𝑚   ⟹   𝑢 ≫ map(filter_values(𝑞₁ and … and 𝑞ₙ)) ≫ 𝑚'
 /// ```
 ///
 /// with `𝑚'` re-typed to take the narrowed collection. A refinement set narrows by the
-/// conjunction of its members, so a whole difference materializes as one `map_filter`
+/// conjunction of its members, so a whole difference materializes as one filter
 /// over the conjoined value predicate rather than a chain of them, and every 𝑞ₖ stays
 /// stated against the collection the site is handed. The conjunction is built in
 /// [`application_order`], so the emitted term is a function of which refinements the
@@ -45,27 +45,27 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// would leave the site claiming a narrowing it no longer performs. Such a site is rejected
 /// by name afterwards ([`reject_unmaterialized_narrowings`]) rather than compiled without its
 /// filter.
-pub(super) fn insert_map_filters(expr: &mut Expr) {
-    expr.walk_children_mut(insert_map_filters);
+pub(super) fn insert_per_group_filters(expr: &mut Expr) {
+    expr.walk_children_mut(insert_per_group_filters);
     let TypedExprNode::Compose(elts) = &expr.node else {
         return;
     };
-    // The compose is what the recording names: the `map_filter` is spliced into it,
+    // The compose is what the recording names: the filter is spliced into it,
     // and the site it narrows keeps its own id, re-typed in place. `Machinery`, for
-    // the reason `planning.iterate` is — a `map_filter` is how a refinement the site's
+    // the reason `planning.iterate` is — a per-group filter is how a refinement the site's
     // type already carries gets materialised, and the user wrote an inner
     // comprehension with an `if`.
     //
-    // The recording spans the *match*: `map_filter_site` clones a candidate's value
+    // The recording spans the *match*: `per_group_filter_site` clones a candidate's value
     // predicate out of its refinements while probing, so a scan that rewrites nothing
     // still copies. Those copies reach no output tree and compose away as transients
     // of this node, as `planning.hash_join`'s rejected attempts do.
     let _g = provenance::enter(
         expr.node_id(),
-        "planning.map_filter",
+        "planning.per_group_filter",
         provenance::Nature::Machinery,
     );
-    let Some(site) = elts.iter().position(|e| map_filter_site(e).is_some()) else {
+    let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) else {
         return;
     };
     // `site` is never 0: the morphism consumes a collection, so something upstream
@@ -76,24 +76,32 @@ pub(super) fn insert_map_filters(expr: &mut Expr) {
     let TypedExprNode::Compose(elts) = &mut expr.node else {
         unreachable!("matched a Compose above")
     };
-    let Some((site_codomain, value_predicate)) = map_filter_site(&elts[site]) else {
+    let Some((site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
         unreachable!("position found it")
     };
     let narrowed = site_codomain
         .domain()
-        .expect("a map_filter site returns a collection");
-    // `map_filter(𝑞) : (𝐷 ⤇ 𝑊) ⇒ ({𝐷 | 𝑝} ⤇ 𝑊)` — same values, fewer of them.
+        .expect("a per-group filter site returns a collection");
+    // `map(filter_values(𝑞)) : (𝐷 ⤇ 𝑊) ⇒ ({𝐷 | 𝑝} ⤇ 𝑊)` — same values, fewer of them.
+    // `filter_values(𝑞) : 𝑊 ⇒ 𝑊` keeps the values 𝑞 holds of, and `map` lifts it over the
+    // collection, so the keys it drops are the narrowing. `map` has no scheme of its own,
+    // so the narrowed type is stamped here, as the one-level filter's is.
     let upstream_codomain = elts[site]
         .ty
         .domain()
-        .expect("a map_filter site's own type is a function");
+        .expect("a per-group filter site's own type is a function");
     let carried = upstream_codomain
         .codomain()
-        .expect("a map_filter site takes a collection");
-    let filtered = Type::fun_like(&upstream_codomain, narrowed, carried);
-    let map_filter = apply_primitive(
+        .expect("a per-group filter site takes a collection");
+    let filtered = Type::fun_like(&upstream_codomain, narrowed, carried.clone());
+    let filter_values = apply_primitive(
         value_predicate,
-        Builtin::MapFilter,
+        Builtin::FilterValues,
+        Type::fun(carried.clone(), carried),
+    );
+    let filter = apply_primitive(
+        filter_values,
+        Builtin::Map,
         Type::fun(upstream_codomain, filtered.clone()),
     );
     // The site now takes the narrowed collection, and its Pi binder retires. An
@@ -104,12 +112,12 @@ pub(super) fn insert_map_filters(expr: &mut Expr) {
         function.ty = Type::fun(argument.ty.clone(), retyped.clone());
     }
     elts[site].ty = retyped;
-    elts.insert(site, map_filter);
+    elts.insert(site, filter);
 }
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
-/// filter site. See [`insert_map_filters`] for the shape.
-fn map_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
+/// filter site. See [`insert_per_group_filters`] for the shape.
+fn per_group_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
     let Narrowing {
         binder,
         opened,
@@ -117,7 +125,7 @@ fn map_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
         added,
     } = narrowing(expr)?;
     // `application_order` is the one place planning fixes an order on a refinement
-    // set. One `map_filter` materializes the whole conjunction, so the element types
+    // set. One filter materializes the whole conjunction, so the element types
     // it pairs with — the stages of a filter *pipeline* — have no counterpart here.
     let mut conjoined = None;
     for (r, _) in application_order(&added, &consumed) {
@@ -127,7 +135,7 @@ fn map_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
 }
 
 /// A morphism whose codomain refines the collection its domain carries, before asking
-/// whether a `map_filter` can materialize the refinements it adds.
+/// whether a per-group filter can materialize the refinements it adds.
 struct Narrowing {
     /// The Pi binder the added refinements read.
     binder: Name,
@@ -194,11 +202,11 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
     })
 }
 
-/// Reject a narrowing [`insert_map_filters`] left standing.
+/// Reject a narrowing [`insert_per_group_filters`] left standing.
 ///
 /// The site keeps claiming a narrowing no operator performs, and op-conversion reads a
 /// collection's extent with its refinements stripped, so compiling it would drop the filter
-/// and answer as though it were absent. Runs after [`insert_map_filters`] over the same
+/// and answer as though it were absent. Runs after [`insert_per_group_filters`] over the same
 /// positions it inspects: the elements of a composition after the first.
 pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
     if let TypedExprNode::Compose(elts) = &expr.node
@@ -301,7 +309,7 @@ mod tests {
         (chain, binder)
     }
 
-    /// The `map_filter` inserted at a site, and the type the site was left with.
+    /// The filter inserted at a site, and the type the site was left with.
     fn planned(expr: &Expr) -> (Option<&Expr>, Type) {
         let TypedExprNode::Compose(elts) = &expr.node else {
             panic!("planning kept the chain a Compose");
@@ -313,20 +321,23 @@ mod tests {
         }
     }
 
-    /// A whole refinement-set difference materializes as **one** `map_filter` over the
+    /// A whole refinement-set difference materializes as **one** filter over the
     /// conjoined value predicate: the set narrows by the conjunction of its members,
     /// and one filter keeps every conjunct stated against the collection the site is
     /// handed rather than against a chain of intermediate ones.
     #[test]
-    fn two_added_refinements_become_one_conjoined_map_filter() {
+    fn two_added_refinements_become_one_conjoined_filter() {
         let (mut expr, _) = site_adding(&["q1", "q2"]);
-        insert_map_filters(&mut expr);
+        insert_per_group_filters(&mut expr);
         let (filter, site_ty) = planned(&expr);
-        let filter = filter.expect("the site narrows, so a map_filter was inserted");
-        assert_eq!(symbolic(filter), "((q1, q2) ▷ zip ≫ and) ▷ map_filter");
+        let filter = filter.expect("the site narrows, so a filter was inserted");
+        assert_eq!(
+            symbolic(filter),
+            "((q1, q2) ▷ zip ≫ and) ▷ filter_values ▷ map"
+        );
         // The filter delivers exactly what the site now takes: one type, so the
         // post-planning `typecheck` chains them.
-        let filtered = filter.ty.codomain().expect("map_filter is a function");
+        let filtered = filter.ty.codomain().expect("the filter is a function");
         assert_eq!(site_ty.domain(), Some(filtered));
     }
 
@@ -360,8 +371,8 @@ mod tests {
         refinements.insert(closed);
 
         let before = expr.clone();
-        insert_map_filters(&mut expr);
-        assert_eq!(planned(&expr).0, None, "no map_filter was inserted");
+        insert_per_group_filters(&mut expr);
+        assert_eq!(planned(&expr).0, None, "no filter was inserted");
         assert_eq!(expr, before, "the site is untouched");
         let rejected = reject_unmaterialized_narrowings(&expr)
             .expect_err("the narrowing no operator performs is rejected");
@@ -372,7 +383,7 @@ mod tests {
     #[test]
     fn a_materialized_site_is_not_rejected() {
         let (mut expr, _) = site_adding(&["q1"]);
-        insert_map_filters(&mut expr);
+        insert_per_group_filters(&mut expr);
         assert_eq!(reject_unmaterialized_narrowings(&expr), Ok(()));
     }
 }

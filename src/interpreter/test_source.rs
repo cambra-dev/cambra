@@ -49,7 +49,15 @@ impl TestDataSource {
     }
 
     /// Set the yield predicate, describing the region of domain values currently available.
+    ///
+    /// A change is news to the source's readers as new data is: it moves what the source
+    /// calls complete, and closing the source is one. So it notifies them on the next
+    /// check, as a real source does at its end of input. Setting the predicate it already
+    /// has changes nothing and notifies no one.
     pub fn set_yield_predicate(&mut self, predicate: Predicate) {
+        if predicate != self.yield_predicate {
+            self.has_data = true;
+        }
         self.yield_predicate = predicate;
     }
 

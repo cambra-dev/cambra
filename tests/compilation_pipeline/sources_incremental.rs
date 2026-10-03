@@ -30,8 +30,7 @@ use smol_str::SmolStr;
 /// All six code variants project or transform the string elements of `testsource1`
 /// and should produce the same sorted key→value mapping: `{10 → "foo", 20 → "bar"}`.
 ///
-/// Also confirms that updating the yield guard without adding new data does not
-/// trigger a spurious notification.
+/// Also confirms that changing the yield guard notifies, and restating it does not.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("testsource1()")]
@@ -91,7 +90,15 @@ fn test_test_source(#[case] code: &str) {
     pairs.sort_by_key(|(k, _)| *k);
     assert_eq!(pairs, vec![(10, "foo".into()), (20, "bar".into())]);
 
-    // Changing the yield guard without adding new data must not notify.
+    // Changing the yield guard is news without new data: it closes the source here, which
+    // readers holding a cached tile would otherwise never learn.
+    data_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow());
+    // Restating the guard it already has changes nothing, and must not notify.
+    *notified.borrow_mut() = false;
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
@@ -1176,6 +1183,12 @@ fn test_a_dropped_filtered_row_is_released(#[case] code: &str) {
 /// through the given key) and pull to quiescence after each, then close the source and
 /// pull to a terminal tile.
 fn run_in_batches(code: &str, batches: &[(&[(usize, i64)], usize)]) -> Tile {
+    run_in_batches_seeing(code, batches).1
+}
+
+/// [`run_in_batches`], also answering the tile each batch's pull reached, so a test can
+/// say what arrived before the source closed.
+fn run_in_batches_seeing(code: &str, batches: &[(&[(usize, i64)], usize)]) -> (Vec<Tile>, Tile) {
     let mut ctx = GlobalContext::default();
     let source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1186,6 +1199,7 @@ fn run_in_batches(code: &str, batches: &[(&[(usize, i64)], usize)]) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let mut each = Vec::with_capacity(batches.len());
     for (rows, upto) in batches {
         let data: Vec<(Value, Value)> = rows
             .iter()
@@ -1195,7 +1209,9 @@ fn run_in_batches(code: &str, batches: &[(&[(usize, i64)], usize)]) -> Tile {
         source
             .borrow_mut()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(*upto)));
-        let _ = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+        let mut seen = pull_laps(ctx.scheduler(), &mut *producer, 64, |_| false);
+        seen.compact();
+        each.push(seen);
     }
     source.borrow_mut().set_yield_predicate(Predicate::True);
     let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, Tile::is_terminal);
@@ -1204,7 +1220,7 @@ fn run_in_batches(code: &str, batches: &[(&[(usize, i64)], usize)]) -> Tile {
         "{code}: stopped short of a terminal tile: {tile:?}"
     );
     tile.compact();
-    tile
+    (each, tile)
 }
 
 /// A record holding a collection, looked up under each row of a streamed join: the
@@ -1250,5 +1266,162 @@ fn a_constant_arm_waits_for_its_constant_after_a_filtered_batch(#[case] code: &s
             Predicate::True,
             BitSet::new(),
         )
+    );
+}
+
+/// A group arriving below one already held: a groupby over a stream opens groups in
+/// whatever order their keys first appear, so what it holds is not a prefix of its groups,
+/// and a release naming everything below the last one held would release a group before
+/// it arrives.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_group_arriving_below_one_held_is_not_released_early() {
+    let tile = run_in_batches(
+        "[sum(x) for x in groupby(source1(), \\x -> x // 10)]",
+        &[(&[(0, 20)], 0), (&[(1, 10)], 1)],
+    );
+    assert_eq!(
+        sort_function_by_domain(tile),
+        sort_function_by_domain(Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            Predicate::True,
+            BitSet::new(),
+        ))
+    );
+}
+
+/// The values beneath every level of `tile`, sorted: what a nest holds, whatever rows it
+/// holds them under.
+fn innermost_ints(tile: &Tile) -> Vec<i64> {
+    let Tile::Scalar(ColumnValue::Ints(mut values)) = tile.deepest_values().clone() else {
+        panic!("Ints beneath every level, got {tile:?}")
+    };
+    values.sort();
+    values
+}
+
+/// A comprehension over a source nested in one over a list, with the source read in the
+/// nest or bound before it: the inner side streams into every row's group as it arrives
+/// rather than waiting for the source to close, and a binding's cached tile learns of the
+/// close. The first batch's pull already holds that element under every row.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+#[case::comprehension("[[y * x for y in source1()] for x in [1, 2]]", &[1, 2], &[1, 2, 2, 4])]
+#[case::comprehension_bound_outside(
+    indoc! {"
+        ys = source1()
+        [[y * x for y in ys] for x in [1]]
+    "},
+    &[1],
+    &[1, 2]
+)]
+fn a_nest_over_a_streamed_source_runs_as_the_source_arrives(
+    #[case] code: &str,
+    #[case] first: &[i64],
+    #[case] last: &[i64],
+) {
+    let (each, tile) = run_in_batches_seeing(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    assert_eq!(innermost_ints(&each[0]), first, "after the first batch");
+    assert_eq!(innermost_ints(&tile), last, "once the source closes");
+}
+
+/// A nest summed at both levels answers once the source closes, the earliest a scalar sum
+/// can say it is whole.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+fn a_summed_nest_over_a_streamed_source_answers_at_the_close() {
+    let tile = run_in_batches(
+        "sum([sum([y * x for y in source1()]) for x in [1, 2]])",
+        &[(&[(0, 1)], 0), (&[(1, 2)], 1)],
+    );
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![9])));
+}
+
+/// A collection per row paired against a streamed source keeps each row's values as they
+/// arrive: the first batch's pull holds its element under both rows.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+fn a_collection_per_row_over_a_streamed_source() {
+    let (each, tile) = run_in_batches_seeing(
+        "[(x, [y * x for y in source1()]) for x in [1, 2]]",
+        &[(&[(0, 1)], 0), (&[(1, 2)], 1)],
+    );
+    let collections = |tile: Tile| {
+        let Tile::DataFunction { codomain, .. } = sort_function_by_domain(tile) else {
+            panic!("a collection of rows")
+        };
+        let Tile::Record(fields) = *codomain else {
+            panic!("each row is a pair")
+        };
+        innermost_ints(&fields[&tuple_field(1)])
+    };
+    assert_eq!(
+        collections(each[0].clone()),
+        vec![1, 2],
+        "after the first batch"
+    );
+    assert_eq!(
+        collections(tile),
+        vec![1, 2, 2, 4],
+        "once the source closes"
+    );
+}
+
+/// A collection per row over a streamed source, read as a sink reads it: each pull's tile
+/// is released whole once taken. Each later pull delivers only what arrived since — the
+/// pairs of the new element under every row — and closing it delivers nothing more.
+#[rstest]
+#[timeout(Duration::from_secs(20))]
+fn a_collection_per_row_released_as_it_is_read() {
+    let code = "[[y * x for y in source1()] for x in [1, 2]]";
+    let mut ctx = GlobalContext::default();
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    // The values the pull delivers, sorted, after which the whole tile is released.
+    let mut read = |rows: &[(usize, i64)], yielded: Predicate, until: fn(&Tile) -> bool| {
+        let data: Vec<(Value, Value)> = rows
+            .iter()
+            .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
+            .collect();
+        source.borrow_mut().add_data(&data);
+        source.borrow_mut().set_yield_predicate(yielded);
+        let mut tile = pull_laps(ctx.scheduler(), &mut *producer, 256, until);
+        tile.compact();
+        producer.release(tile.to_guard());
+        let Tile::DataFunction { codomain, .. } = &tile else {
+            panic!("a collection of rows, got {tile:?}")
+        };
+        let Tile::DataFunction { codomain, .. } = codomain.as_ref() else {
+            panic!("a collection per row, got {codomain:?}")
+        };
+        let Tile::Scalar(ColumnValue::Ints(mut values)) = (**codomain).clone() else {
+            panic!("of Ints, got {codomain:?}")
+        };
+        values.sort();
+        (values, tile.is_terminal())
+    };
+    let never: fn(&Tile) -> bool = |_| false;
+    assert_eq!(
+        read(&[(0, 1)], Predicate::at_or_below(Value::UInt(0)), never),
+        (vec![1, 2], false),
+        "the first element under both rows"
+    );
+    assert_eq!(
+        read(&[(1, 5)], Predicate::at_or_below(Value::UInt(1)), never),
+        (vec![5, 10], false),
+        "only the element added since — the released pairs are not re-delivered"
+    );
+    assert_eq!(
+        read(&[], Predicate::True, Tile::is_terminal),
+        (vec![], true),
+        "closing the source completes every row and delivers nothing new"
     );
 }
