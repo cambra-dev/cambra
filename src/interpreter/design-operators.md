@@ -257,9 +257,11 @@ the enclosing path and the key. One algebra serves both (`Componentwise` in `til
 
 A **prefix** of a lexicographic order is a staircase of componentwise predicates: `≤ (𝑎, 𝑏)` is
 `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. `domain_prefix` builds one across levels, one qualified arm per
-level, and `Predicate::at_or_below` builds one across a record key's fields. An interval is never built over
-record values, so a record key has only the componentwise algebra, and a prefix meets a per-field
-region under the same rules as any two componentwise predicates.
+level, and `Predicate::at_or_below` builds one across a record key's fields. An interval is
+never built over record values, so a record key has only the componentwise algebra. A level keyed
+by a nested loop's `(outer, inner)` pairs is released as a prefix, and a cartesian product's keys
+are stated per field, because its factors grow independently; the two meet under the same rules
+as any two componentwise predicates.
 
 A union key `𝑡(𝑣)` is ordered by its tag, then within the tag, so its prefix is every tag before
 `𝑡` whole, `𝑣`'s own prefix under `𝑡`, and no tag after. `Predicate::at_or_below_in` and
@@ -302,17 +304,19 @@ aggregate inside the nest would never settle.
 
 Operators split into two families by what they replace at their level:
 
-- **Replacing the values beneath it** — `Zip`, `VariantWrap`. Their tiling is
-  `with_values_at(input, level, new_values)` and the producer writes `*values_at_mut(level)`.
-  Nothing is grouped, so nothing is split per row.
-- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`. Each takes
-  the level apart one row of the level above at a time and puts it back with
-  `Tile::regroup_beneath`, handing it the empty level its own output tiling derives
-  (`Tile::per_group` derives it on the call), so a row that has been reached by nothing still
-  answers at the right shape. Operands pulled from their own branches need not hold the same rows,
-  nor hold them at the same positions, so an operator with several finds each row in the others by
-  its path (`Tile::rows_by_path`). A union's standing rows are its arms' together, each arm holding
-  its own share.
+- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`. Their
+  tiling is `with_values_at(input, level, new_values)` and the producer writes
+  `*values_at_mut(level)`. Nothing is grouped, so nothing is split per row. A member that
+  *reads* the rows above it takes them from the level they sit at rather than from the top,
+  because a standing level answers for every induction store beneath it and not for those rows.
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`,
+  `StoreDenseRead`. Each takes the level apart one row of the level above at a time and puts
+  it back with `Tile::regroup_beneath`, handing it the empty level its own output tiling
+  derives (`Tile::per_group` derives it on the call), so a row that has been reached by nothing
+  still answers at the right shape. Operands pulled from their own branches need not hold the
+  same rows, nor hold them at the same positions, so an operator with several finds each row in
+  the others by its path (`Tile::rows_by_path`). A union's standing rows are its arms' together,
+  each arm holding its own share.
 
 ### CCL types vs. tilings
 
@@ -379,7 +383,10 @@ are, because materializing a level-carrying value is what has no column to go in
 position, so `VariantWrap` materializes the collection into it (at the level the payload's own type
 names, not the input's innermost) and `VariantProject` opens it back into levels. An applied
 `` `𝑐(𝑥) `` is one variant value, so a collection-valued `𝑥` is one cell. The cell is emitted once
-the collection is complete, since a materialized value cannot grow.
+the collection is complete, since a materialized value cannot grow. The round trip is what carries
+a feed out of a nest: the enclosing decision's tap holds the inner loop's whole tap collection,
+materialized on the way in and opened on the way out, and the channel flattens the two levels to
+the positions the feed appended at.
 
 ---
 
@@ -434,6 +441,17 @@ report it where `Memo` takes it (`Tile::holds_a_plain_value`).
 scalar cell beside a collection goes with its key once that key is complete. A cell under a key
 that is still open cannot be named without its key (the keyless-field rule above), so a `Memo`
 over such a row is a gap the check reports.
+
+### What a producer holds
+
+A release is what lets a producer reclaim state, so what a producer still holds is how a
+program's retention is measured. `TileProducer::state_info` answers it for the producer alone,
+as a `ProducerStateInfo` counting values: a cached tile's cells (`Tile::cell_count`), an
+accumulator's, a store's seeds, changelog entries and decided positions, a driver window's rows.
+A producer that keeps nothing past a pull answers zero, and a producer's inputs report their own.
+`inspect` records the count on the producer's node, so a walk of the producer tree sums a
+program's state. A count that grows with how far a program has run, where its data does not, is
+state it never gives back (`a_long_nest_holds_the_same_store_state_at_any_length`).
 
 ## The completeness contract
 
@@ -729,20 +747,23 @@ while their arms carry one level and two.
 | an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
 | `curry(𝑔)` over a stream, `curry_over(𝑠, 𝑔)` | 𝑔 one level in, over the iteration `Product` appends; 𝑠 is a root |
 | a top-level `Transact` | its body at level 1, over the store's own domain |
+| a nested `Transact` | its source and its seed (over the flattened pairs) at the `Transact`'s level, its body one level in |
 | every other node, composition included | the level it is converted at |
 
 The operators that act at one level ([Curry levels](#curry-levels)) take it from here. `Zip`
 pairs at it, and so does a product morphism with no input, at the domains its type is curried
-over. `MapResult` and `MapResultToConst` apply at it. `Filter` masks the keys one level above
-it, the keys a `filter_values`' elements stand at; under `map`, one level in, those are the keys
-of each element collection. A composed `VariantWrap` wraps at it, and an applied one at the
-outermost level, its whole payload being one variant value. A fed copairing merges one level
-above it.
+over. `MapResult` and `MapResultToConst` apply at it, and a per-row `ExtractFinal` reduces the
+rows above it. `Filter` masks the keys one level above it, the keys a `filter_values`' elements
+stand at; under `map`, one level in, those are the keys of each element collection. A composed
+`VariantWrap` wraps at it, and an applied one at the outermost level, its whole payload being one
+variant value. A fed copairing merges one level above it, and a nested `Transact` leaves standing
+the levels above its own row, one fewer than it.
 
 Two operators read their level off their input's tiling. `VariantProject` projects at the level
 holding its scrutinee's union column, which is always the deepest: an arm holds its payload as one
-materialized cell, so no level sits beneath a union. `MapAggregate` folds the innermost
-collection its input holds.
+materialized cell, so no level sits beneath a union. That level can be deeper than the AST's,
+because a feed tap inside a nest reaches the projection as a collection per enclosing position.
+`MapAggregate` folds the innermost collection its input holds.
 
 ### Iteration sources
 
@@ -804,18 +825,20 @@ lookup.  It is recorded once at the let-bind site rather than re-derived at each
 use, because the tile-level information needed to disambiguate is already gone
 by Var-lookup time.
 
-(There is a known limitation with multi-depth iterations — see the
-TODO(nested-mutation) comment on `BindingKind` for the planned generalisation.)
+Which iteration a binding is aligned to is `LetBinding::depth`. A reference made in a deeper
+iteration reads a tile keyed by one it is not running over, so it is spread over the keys beneath
+each of the binding's rows first (`lift_into_iteration`).
 
 ### Fan-out and sharing
 
-Three arms share an input across multiple downstream consumers:
+Four arms share an input across multiple downstream consumers:
 
 - **`Apply(_, Zip)` with `Tuple` / `Record` arguments** fans the input out to
   each tuple / record element; the elements get `Some(fan_out_branch)` and
   combine via [`zip_arms_at`] (function-tiled arms) or [`MakeRecord`] (scalar arms).
   The 2-arm Zip-with-const fast path skips the fan-out and emits a single
-  `MapResultToConst` instead. A **store-read arm** (`__hist.k`) is a *leaf*
+  `MapResultToConst` instead. A **store-read arm** (`__hist.k`, or a nested store's
+  `__hist ≫ .k`, one history per enclosing position) is a *leaf*
   source over its own domain, so it is converted with **no** input (rather than
   the fanned branch, which it would reject); `zip_arms_at` co-aligns it with the
   input-driven arms by domain position. This is the cross-domain co-iteration a
@@ -826,10 +849,17 @@ Three arms share an input across multiple downstream consumers:
 - **`Let { bound_expr, body }`** fans the parent input into both the bound
   expression and the body (described above).
 
+- **A nested `Transact`** shares its enclosing drive, its per-row source, its pairs and
+  each seed between several readers, and each of those fans sits on a `Memo`: a
+  `FanOut` passes every branch's pull to its input, which without the cache is
+  recomputed once per reader per lap. None of these fans' releases is read as a
+  drive's progress, which is what keeps a `Memo` off an iteration source.
+
 - **Induction writer bodies** (the realization of a recognized `Transact` over a
   concrete iteration extent) fan-out the cyclic prev-accumulator stream and the
-  body output (via `FanOut::new_cyclic`); see *Induction stores as a changelog*
-  (`InductionStore` / `StoreDenseRead`) below for the full structure.
+  body output (via `FanOut::new_cyclic`); see
+  [*Induction stores as a changelog*](#induction-stores-as-a-changelog-inductionstore-and-storedenseread)
+  below for the full structure.
 
 ### Aggregates, sinks, and the program root
 
@@ -889,8 +919,10 @@ site it left alone keeps its `curry`, and op-conversion reads the domain off the
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
-its key sits. A tile that cannot answer every key answers none, since an undecided key would
-have to re-offset the groups it left.
+its key sits. A key the collection has not decided is left out of its group, and every level
+states the keys' completeness less the paths of the keys left out and of the rows above them.
+The rest of the group goes out as it is answered and is released by path, so the keys left out
+arrive beneath the same row once decided. A one-level stream is the same rule at depth zero.
 
 ### A correlated filter rides the pair
 
@@ -1054,10 +1086,28 @@ consumed prefix is released.
 The driver releases the source prefix it has consumed: every position it has emitted, and every
 filtered row it has read past. A filtered row stays in the source tile, marked deleted, and no
 decision or ack ever names it, so the driver releases it once the source calls it complete along
-with every position before it (`source_read_through`). Releasing a prefix the source has not
-called complete would name a position still to arrive, and a drive placed across a reload
-resumes past whatever its predecessor released. The transaction driver releases filtered rows by
-the same rule.
+with every path before it (`source_read_through` states the rule for a drive with no rows above
+it, and a nested drive reads it over paths). Releasing a prefix the source has not called
+complete would name a position still to arrive, and a drive placed across a reload resumes past
+whatever its predecessor released. The transaction driver releases filtered rows by the same rule.
+
+A **nested drive** is the same driver at a deeper path, carrying two additions in `NestedDrive`.
+It **reseeds** at each enclosing position: a boundary is a position whose enclosing components
+differ from the last one emitted, and there the previous accumulator comes from the accumulator's
+reseed stream rather than from the store. It **passes the enclosing parameter through**, because
+parameter elimination gave the body `((ᴘ, Pos), slots)`, and rewriting that would leave each
+inner level's own type stale. At depth zero both vanish: the only boundary is the first position,
+where the store already holds its seed.
+
+A nested drive states which rows at each level are complete, and a row is complete once the
+source will put no more positions under it and the store has folded every position it did. The
+first half is the source's statement, which the drive accumulates across pulls: the source may
+stop stating a row once the drive has released it, and the store can fold the row's last
+position after that release. The second half reads the frontier: under the enclosing path the
+frontier is inside, the rows before the frontier's are folded, and the frontier's own row once
+every position under it is at or below the frontier. That counts the positions the drive has
+emitted as well as those the source still holds, because an emitted position is released back to
+the source before the store decides it.
 
 ### One induction store at every depth
 
@@ -1079,10 +1129,10 @@ At depth zero each of these is its one-component case.
 The cyclic `FanOut` serves a snapshot taken before the traversal began, so a position decided
 during a pull is not visible until the next. The store's producer is on the stack for the whole
 traversal, so no arrangement of driver, body and store refreshes the memo mid-pull. The driver
-wakes its consumer when a pull emits a row or states its positions complete further, and the
-store wakes its readers whenever its output changes
+wakes its consumer when a pull emits a row or states a level complete further, and the store
+wakes its readers whenever its output changes
 ([The notification contract](#the-notification-contract)). Neither wakes itself while waiting,
-so a stuck cycle is quiescent rather than busy.
+so a stuck nest is quiescent rather than busy.
 
 Each pull renders the retained changelog, so the cost of a pull follows retention, which
 [reclamation](#reclaiming-the-changelog) bounds. Having the store publish its freshly rendered
@@ -1101,12 +1151,25 @@ seed. A **carry** read (`carry_forward: true`, an accumulator) resolves at every
 **tap** read (`carry_forward: false`) appears only at the positions whose own change wrote the
 key (`store_delta_at`).
 
+Under rows the read produces the same shape per enclosing position: one history per row, each folded
+against that row's own store, so a position that writes nothing resolves to the value its row
+began with rather than the previous row's last write. A row's positions at or below its frontier
+are decided, so the read states them complete beneath that row rather than waiting for the row
+to close.
+
 The trailing read of an accumulator, `final_read(history)`, is a `StoreFinalRead`: the key's
 value once the store has settled, sampled from the store rather than reduced from a stream, and
 the seed where the loop ran no position. `mut_elim` mints it as a sample, as `transact_phase`
 mints `await_final`'s, because a reduction is the wrong term for it: a store resuming mid-fold
 has not decided its predecessor's positions, so a reduction over its history would find nothing
 and answer with the declared init instead of the value carried in.
+
+An inner loop's trailing read is the same term over one store per enclosing position:
+`StoreFinalRead::per_row_at` answers each row its store's value once the induction store calls the
+row complete. Every enclosing position has a store, a row whose inner loop runs no position
+included, because a nested `Transact`'s seed is a morphism of the enclosing position and so arrives
+for every row: the store opens a row at its first decision, or once the drive calls it complete
+where it has none, and the row's value is then its seed.
 
 A co-iterated read (`for r in …: cnt += 1; with begin(): store := store + cnt`) consumes the
 dense read directly.
@@ -1151,12 +1214,17 @@ key for the length of the run. The flat trailing read therefore releases as it g
 releases below the highest position it has seen.
 
 Measured over a 90-position flat loop: 4 retained changelog entries with the reads releasing, and
-180 without. Retention is O(keys) plus the slowest reader's lag, independent of how many positions
-have run.
+180 without. Over `for y in [1, 2]: total += x * y` nested in 10, 30 or 90 enclosing positions,
+the stores never hold more than 10 values at once, counting seeds, changelog entries and decided
+positions as `TileProducer::state_info` does
+(`a_long_nest_holds_the_same_store_state_at_any_length`). Retention is O(keys) plus the slowest
+reader's lag, independent of how many positions have run and of how many rows.
 
 **A reader forwards the region it was released, unchanged.** It computes no bound of its own,
 because the rules below make which versions a later fold can reach the store's question, and the
-store is the side that holds the answer.
+store is the side that holds the answer. A release naming a row of a read names the same row of
+the induction store, since the two tilings agree on every level above the store, so one forward
+serves either depth.
 
 **A reclaim keeps the carry source a live position reads.** For each key the entry kept from the
 released prefix is its latest write at or below the boundary, and it is kept only where some
@@ -1178,9 +1246,30 @@ store's frontier. A frontier recovered from the domain instead — the highest d
 reads a finished row whose positions were all reclaimed as one that never started, and the drive
 above it never learns it can move on.
 
+**A row the meet names whole leaves the engine tree and the render together.** The drive's
+release names every row before the one it is running whole (`domain_prefix`), and a per-row
+`ExtractFinal` releases a row of its dense read once its own consumer has taken the row's final.
+Where every branch names a row, so does the meet, and `Engines::remove_covered` drops that row in
+the same release that reclaims the rest. The next render therefore cannot rebuild what was
+released, which `TileProducer::get` asserts against. The row's watermark goes with it, since
+nothing is left to ask where that store got to.
+
 The driver's own release runs outward, to the iteration source. It reclaims the consumed prefix as
 `emitted_through` advances and releases the source in full once the source is complete and every
 delivered position has been emitted, which ends the driver.
+
+**A nested induction store's pair-keyed inputs release as the drive passes them.** The enclosing
+parameter (`pairs`) and each accumulator's reseed are streams keyed by the body's
+`(enclosing, position)` pairs. The driver reads them only at positions past its cursor, so it
+releases each through `emitted_through`; the store reads a row's seed only to open that row, so it
+releases its seed streams through the path it has decided. Both name the region as a prefix of the
+pair-keyed domain, `domain_prefix` over the path with its last two components composed back into
+the pair, which `Predicate::at_or_below` spells as a staircase over the pair's fields. The seed and
+reseed streams are one stream behind a `FanOut`, so either consumer holding its branch would pin
+the pair stream, and the operators pairing it (`Uncurry`, `Product`) would re-deliver the
+whole run on every pull. `Uncurry` forwards a release of pairs as the inner keys they name under
+their outer keys, under whatever standing rows qualify it, so the row being run is reclaimed as it
+goes rather than when it finishes.
 
 ## Open Challenges
 

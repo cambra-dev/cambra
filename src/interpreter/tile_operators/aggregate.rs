@@ -110,6 +110,10 @@ impl AggregateProducer {
 }
 
 impl TileProducer for AggregateProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.accumulator.cell_count())
+    }
+
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -608,6 +612,15 @@ struct MapAggregateProducer {
 }
 
 impl TileProducer for MapAggregateProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        let accumulators: usize = self
+            .accumulators
+            .iter()
+            .map(|(path, acc)| path.len() + acc.cell_count())
+            .sum();
+        ProducerStateInfo::holding(accumulators + self.standing.len())
+    }
+
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {

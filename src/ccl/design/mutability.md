@@ -84,8 +84,6 @@ own recurrence, and a statement after that loop reads the final value. `body_int
 in `lower/loops.rs` names them and `transform_chain`'s `MutDecl` arm in `mut_elim.rs` seeds them.
 The variable restarts at its seed on the next iteration, the seed being re-evaluated there; the
 write set the enclosing loop carries never names it, so the enclosing store has no key for it.
-A nested `Transact` plans but does not run yet: operator conversion builds one engine per store and
-refuses a `Transact` whose `parameter` is `Some(_)` (`operator_conversion.rs`).
 
 The scope is the block that writes it, so an `if` branch introduces one of its own. The chain
 `splice_after_unit` carries onto each branch goes *inside* the introduction, as it does inside a
@@ -558,7 +556,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
 | `by_commit_time` | `(𝐼 ⤇ {time: Txn, …}) ⇒ (Txn ⤇ {time: Txn, …})` | one site's commit records keyed by the commit time each carries. A denied iteration's record carries a time too in the model, where `begin_<site>` is injective over iterations; the engine allocates no tick for it. The tap's ``variant_project(`commit)`` drops it. Heads each in-block reply tap, so a reply's keys have type `Txn` |
 | `final_or_default` | `(𝐷 ⤇ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed stream; the default if the domain is empty. Compiles to `ExtractFinal`. A mutable variable's final value is `final_read`, a different term |
-| `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead` |
+| `final_read` | `(𝐷 ⤇ 𝑉) ⇒ 𝑉` | a mutable variable's value where its writers finish, sampled from the settled store, and its seed where they wrote nothing. `mut_elim` mints it for a loop's trailing read and `transact_phase` for `await_final`; it compiles to `StoreFinalRead`, one per enclosing position for an inner loop's |
 | `as_of_read` | `(Txn ⤇ 𝑉) ⇒ 𝑉` | a commit history read at an unspecified position — every fed-out mutable variable read. `rewrite_as_of_reads` pairs it with the reading loop that indexes it and builds the `AsOf` join; an unpaired one is a compile error, since nothing downstream supplies a position |
 | `await_final` | `Mut(𝑉, Txn) ⇒ 𝑉` | the terminal read of a transactional mutable variable — a surface marker `transact_phase` replaces with a `final_read` over the mutable variable's history binding, which compiles to `StoreFinalRead`. Its domain is the **handle**, not a value. See [`await_final`](#await_final) |
 
@@ -980,9 +978,10 @@ trailing slot the source. A constant decision, `⟨record⟩ ▷ const`, has nei
 source term, and `constant_decision_writer` recovers its writer from the site's domain alone: it
 reads no keys and iterates the extent, restricted when the extent is refined. The planned
 recurrence travels to op-conversion on the **`Transact` node**
-`Transact { keys, writers, domain }` — explicit key/writer header slots plus the opaque writer
-body — which `planning` iterate-wraps the writer sources of and op-conversion builds the engine
-from. One node serves both domains — there is no separate loop node. It is the loop analog of the
+`Transact { keys, writers, domain, parameter }` — explicit key/writer header slots plus the opaque
+writer body, and for an inner loop the enclosing parameter every component is a morphism of
+([`ir.md`, "`Transact` — the domain-parameterized recurrence carrier"](ir.md#transact--the-domain-parameterized-recurrence-carrier))
+— which `planning` iterate-wraps the writer sources of and op-conversion builds the engine from. One node serves both domains — there is no separate loop node. It is the loop analog of the
 other planning-phase iteration recognizers (`plan_loop_join` for joins, group-by for aggregates), so
 it sits beside them in `planning/`. Causality is re-checked at loop planning's wall by the point-free
 causal matcher (`letrec::check_letrec_causal`).
@@ -1003,8 +1002,8 @@ causal matcher (`letrec::check_letrec_causal`).
   `(prev…, item)` input, taking the next position from the decided frontier and the previous
   accumulator from the value at it. The accumulator crosses between them as a tile, one position
   per pull. `StoreDenseRead` folds the changelog at every decided position into the dense
-  `𝐷 ⇀ 𝑉` history a co-iterated read consumes; the trailing read is `StoreFinalRead`. One
-  writer, over a finite or async domain.
+  `𝐷 ⇀ 𝑉` history a co-iterated read consumes; the trailing read is `StoreFinalRead`, per row
+  under a nest. One writer, over a finite or async domain.
 - **The commit operator** — the concurrent generalization of the induction accumulator, for the `Txn` domain. The
   store is an MVCC commit log `Txn ⇀ {key: value}`, one changelog per key. A writer reads a snapshot of its footprint,
   runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
@@ -1059,8 +1058,6 @@ affordable by that complete compile-time knowledge.
 
 - **`while` loops** — a letrec binding over a condition-bounded prefix of `Nat`; the self-ceiling
   domain is a new *domain*, not a new construct.
-- **Nested `for` loops** — realizing the nested `Transact` they plan to: one store per
-  enclosing position, which operator conversion refuses today.
 - **Append-only mutable collections** — an `Appendable` collection as a letrec binding, its
   commit stream being the collection's history. A keyed write overwrites; an append needs the
   domain to grow with the history.

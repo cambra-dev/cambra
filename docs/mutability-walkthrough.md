@@ -718,7 +718,8 @@ Two wrappers sit on top of that, and neither is mutability-specific:
 
 - a **scalar** read of an accumulator — `x` after the loop — is `final_read(history)`, as
   `await_final(x)` is. It compiles to `StoreFinalRead`, which samples the key's carried value
-  once the store has settled rather than reducing a stream;
+  once the store has settled rather than reducing a stream. An inner loop's is the same term,
+  and compiles to `StoreFinalRead` per enclosing position;
 - a **co-iterated** read consumes the stream directly, since it is already a `𝐷 ⇀ 𝑉`.
 
 The exception is a `Txn` variable read *out of* a block: `rewrite_as_of_reads` turned that
@@ -805,7 +806,7 @@ against the direction of the `get` that causes it.
 |---|---|---|
 | store | `InductionStore` | `CommitOperator` + `TransactWriter` |
 | driver | `InductionDriver` | `TransactDriver` |
-| readers | `StoreDenseRead`, `StoreFinalRead` | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
+| readers | `StoreDenseRead`, `StoreFinalRead` (per row under a nest) | `AsOf`, `StoreValueStream`, `StoreFinalRead` |
 
 **Why the driver is a separate operator.** The accumulator has to reach the body, and the
 only sanctioned route is a tile pulled along an edge. Splitting the roles puts it on one:
