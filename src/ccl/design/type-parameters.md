@@ -2,9 +2,9 @@
 
 > **Status: [Sketched].** A proposed implementation of
 > [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
-> [Implementation stack](#implementation-stack), items 1 to 4 and 6 are implemented: the parser,
-> polymorphic aliases, type parameters with their bounds, requirements, and printing. Item 5 is
-> dropped. Item 7 describes work not yet done.
+> [Implementation stack](#implementation-stack), items 1 to 4, 6 and 7 are implemented: the
+> parser, polymorphic aliases, type parameters with their bounds, requirements, printing, and each
+> definition checked alone. Item 5 is dropped. Item 8 describes work not yet done.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -242,7 +242,7 @@ The `Var` arm instantiates every binding through `PolyScheme::instantiate_with_p
    substituted operands, freshened through the same cache, then records `𝑜 <: 𝛼ₒ` from the
    obligation's associated variable `𝑜` to the substituted associated type.
 
-A failure in 2 or 3 is blamed on the use. Item 7 adds a secondary label at the bound's or the
+A failure in 2 or 3 is blamed on the use. Item 8 adds a secondary label at the bound's or the
 requirement's span, the error shape
 [chl-spec.md, "A use that checks compiles [Decided]"](../../../docs/chl-spec.md#a-use-that-checks-compiles-decided)
 states.
@@ -268,18 +268,18 @@ miss the uses inside a clone.
 
 Each use substitutes its own types, so an error that only the opaque parameters expose, such as
 two unrelated parameters meeting at one position, never shows in a clone.
-`SpecializeFrame::generic` marks a binding annotated with a `Poly`, and `coalesce_generalized_let`
-checks such a definition alone with `typecheck_discarded_definition` once its last use is
-specialized, after which nothing clones from it, as it already checks a definition nothing calls. A
-diagnostic the clones already raised is not repeated.
+`coalesce_generalized_let` checks every definition alone once its last use is specialized, with
+its parameters opaque
+([type-inference.md, "Checking a definition alone"](type-inference.md#checking-a-definition-alone)),
+and that check is what reports such an error.
 
 An obligation copy holding an assumption about one of the specialized binding's own parameters
 is reset to its trait's instances and the assumptions that name no such parameter
 (`TraitObligation::reset_for_specialization`), and is redelivered its operands' lower bounds once
 the clone is pinned (`redeliver`). Freshening writes bounds directly and so does not deliver; the
 redelivery, which reads the bounds transitively, replaces it. That a reset obligation resolves
-follows from the use having satisfied every requirement at the same types, and item 7 of the
-[Implementation stack](#implementation-stack) asserts it.
+follows from the use having satisfied every requirement at the same types, and the check that a
+specialization raises nothing the definition alone does not asserts it.
 
 A use inside a generic definition checked alone carries that definition's still-opaque parameters
 into the specialization it reaches. The coalesce walk keeps the `requires` clauses of the
@@ -378,6 +378,10 @@ One change per item, each updating this doc and the spec status it implements:
 5. **`Poly` against `Poly`** (dropped). Module types need no subtyping rule between two `Poly`s
    ([Where a polymorphic type may appear](#where-a-polymorphic-type-may-appear)).
 6. **Printing inferred polymorphic types** (implemented).
-7. **A use that checks compiles.** Each generalized definition checked alone; the debug assertion
-   that a clone whose pin succeeded raises no error; an origin recorded on every bound, giving
-   every use error its secondary label.
+7. **A use that checks compiles** (implemented). Each generalized definition checked alone, and
+   the debug assertion that a specialization whose pin succeeded raises nothing the definition
+   alone does not. A collection annotation's kind demand is answered against a domain variable's
+   upper bounds as well as its lower ones, so a use supplying a domain of the wrong kind fails at
+   the use.
+8. **Secondary labels.** An origin recorded on every bound, giving every use error its secondary
+   label.
