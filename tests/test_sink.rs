@@ -179,21 +179,17 @@ fn a_record_holding_a_collection() {
     );
 }
 
-/// A comprehension whose elements are themselves collections does not convert. Pinned at
-/// the error it reaches; the reader's recursion into a nested `DataFunction` has no other way
-/// to be reached from source.
+/// A comprehension whose elements are themselves collections reaches the sink as a nested
+/// collection, which the reader recurses into.
 #[test]
-fn a_collection_of_collections_does_not_compile() {
-    let err = compile_error(
-        indoc! {r#"
+fn a_collection_of_collections() {
+    let v = observe_one(indoc! {r#"
         out = test_sink()
         out << [[y * x for y in [1, 2]] for x in [1, 2]]
-    "#},
-        &["out"],
-    );
-    assert!(
-        err.contains("non-combinator curry"),
-        "expected the curry conversion error, got: {err}"
+    "#});
+    assert_eq!(
+        format!("{}", v.expect("a value")),
+        "Function [ Function [ 1, 2 ], Function [ 2, 4 ] ]"
     );
 }
 

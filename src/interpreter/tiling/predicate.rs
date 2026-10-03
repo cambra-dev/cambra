@@ -670,11 +670,12 @@ where
     Predicate::Intervals(IntervalSet::new_unchecked(intervals))
 }
 
-/// Sort a `Tile::DataFunction` by its domain values for deterministic comparison.
+/// Sort a one-level `Tile::DataFunction` by its domain values for deterministic comparison.
 ///
-/// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all
-/// other tile forms are returned unchanged.  This is needed wherever key order
-/// depends on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
+/// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all other tile
+/// forms are returned unchanged, a deeper function among them — reordering its outermost
+/// level would have to carry every group with it. This is needed wherever key order depends
+/// on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
 pub fn sort_function_by_domain(tile: Tile) -> Tile {
     /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
     /// then rebuild the tile.
@@ -710,7 +711,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
             codomain,
             domain_predicate,
             deleted,
-        } if row_starts.len() == 1 => {
+        } if row_starts.len() == 1 && !codomain.is_data_function() => {
             match (*codomain, domain) {
                 (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
                     sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
