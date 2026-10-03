@@ -224,6 +224,110 @@ fn test_poly_calls_poly_at_two_types() {
     check_scalar(code, Value::Bool(true));
 }
 
+// An empty list's element is pinned to a type the operators reading it accept. Here
+// the read is inside a generalized definition, so the obligation watches the
+// comparison's operand variable there rather than the element variable, which sits in
+// the enclosing scope. Called and uncalled.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::called("sum(f(1))", Value::Int(0))]
+#[case::uncalled("1", Value::Int(1))]
+fn test_empty_list_read_inside_a_generalized_definition(
+    #[case] tail: &str,
+    #[case] expected: Value,
+) {
+    let code = indoc! {r"
+        xs = []
+        def f(a):
+            [x for x in xs if x == a]
+    "};
+    check_scalar(&format!("{code}{tail}"), expected);
+}
+
+// A definition sound alone whose body a use's types fail: `a if c else "s"` joins
+// `a` with `String`, which has a type until a use makes `a` an `Int`. The pin
+// succeeds, since `x` is not in the signature, so the error the specialization
+// raises is the use's, and is reported at the use.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_a_use_causes_in_the_body_is_reported_at_the_use() {
+    let code = indoc! {r#"
+        def f(c, a):
+            x = a if c else "s"
+            a
+        f(True, 2)
+    "#};
+    check_compile_error(code, "Conflicting Types: Int | String");
+    check_compile_error(code, "[<test>:4:1]");
+}
+
+// A call that fails against a definition the definition alone already rejects reports the
+// definition's error, at the definition: `a` is read both as a tuple and as a record.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_call_of_a_definition_wrong_alone_reports_the_definition() {
+    let code = indoc! {r#"
+        def f(c, a):
+            y = (a.0, a.foo)
+            a
+        f(True, 2)
+    "#};
+    check_compile_error(code, "Unresolved partial Record");
+    check_compile_error(code, "[<test>:1:1]");
+}
+
+/// The source text each inference error of `code` underlines, `None` for one with no
+/// location.
+fn inference_error_sites(code: &str) -> Vec<Option<String>> {
+    use cambra::ccl::context::CompileError;
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let Err(errs) = compile_program(&mut ctx, code, consumer) else {
+        panic!("expected a compile error, but the program compiled");
+    };
+    errs.iter()
+        .map(|e| match e {
+            CompileError::Infer { span, .. } => span.map(|s| code[s.start..s.end].to_string()),
+            other => panic!("expected an inference error, got {other:?}"),
+        })
+        .collect()
+}
+
+// An error a use causes through another definition is the outermost use's, reported at
+// the use `f` of `f(2)`: `f` is sound alone, and only `f(2)` makes `b`, and so `g`'s `a`,
+// an `Int`. The specialization of `g`
+// that fails is the one inside `f(2)`'s clone, whose call node is a copy with no source
+// position of its own.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_a_use_causes_through_another_definition_is_reported_at_the_outer_use() {
+    let code = indoc! {r#"
+        def g(c, a):
+            x = a if c else "s"
+            a
+        def f(b):
+            g(True, b)
+        f(2)
+    "#};
+    assert_eq!(inference_error_sites(code), [Some("f".to_string())]);
+}
+
+// When the enclosing definition alone already makes the call fail, the error is that
+// definition's, reported once at the call in its body rather than again at each use.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_the_enclosing_definition_causes_is_reported_in_its_body() {
+    let code = indoc! {r#"
+        def g(c, a):
+            x = a if c else "s"
+            a
+        def f(b):
+            g(True, 2)
+        f(1)
+    "#};
+    assert_eq!(inference_error_sites(code), [Some("g".to_string())]);
+}
+
 // List-producing body chained through a poly wrapper, single concrete use
 // type. The lone `f` use sits inside `g`'s (generalized) definition, so it is
 // only ever reached through `g`'s clone — one concrete use type suffices to

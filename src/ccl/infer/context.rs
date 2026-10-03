@@ -46,6 +46,9 @@ pub(super) struct Binding {
     /// `scheme`: a monomorphic `let`'s variables sit above the enclosing level as
     /// well, since its right-hand side is emitted one level up.
     pub(super) generalized: bool,
+    /// The node that binds it: the `let` for a let binding, whose rule raises an error
+    /// its definition causes ([`Typing::definition_alone_error`]).
+    pub(super) defined_at: NodeId,
 }
 
 /// Inference's lexical scope, read as the environment a solver query runs in.
@@ -538,6 +541,7 @@ impl Typing for InferCtx {
             Binding {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
                 generalized: false,
+                defined_at: self.current_node(),
             },
         );
         let r = self.under_binder(name, f);
@@ -553,6 +557,18 @@ impl Typing for InferCtx {
         let r = f(self);
         self.level -= 1;
         r
+    }
+
+    fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError> {
+        let binding = self.scopes.lookup(name)?;
+        if !binding.generalized {
+            return None;
+        }
+        let err = crate::ccl::infer::solve::resolve_var_type(&binding.scheme.body).err()?;
+        Some(LocatedInferError {
+            error: crate::ccl::infer::map_coalesce_err(err, name.base()),
+            node_id: binding.defined_at,
+        })
     }
 
     fn is_generalizable(&self, def: &Expr) -> bool {
@@ -604,6 +620,7 @@ impl Typing for InferCtx {
             Binding {
                 scheme,
                 generalized: generalize,
+                defined_at: self.current_node(),
             },
         );
         let r = self.under_binder(name, f);

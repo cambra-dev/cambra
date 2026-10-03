@@ -436,6 +436,10 @@ impl Typing for CheckCtx {
         false
     }
 
+    fn definition_alone_error(&self, _name: &Name) -> Option<LocatedInferError> {
+        None
+    }
+
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,

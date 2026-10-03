@@ -697,49 +697,72 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
     None
 }
 
-/// Answer each type kind recorded on `𝛼` against everything recorded below it.
+/// Answer each type kind recorded on `𝛼` against everything recorded below and above it.
 ///
-/// A kinding edge is answerable the moment its *type* side is known, and a variable's lower
-/// bounds are where a type arrives at it. So this runs where a lower is recorded and where a
-/// kind is, and asks the same question from both — whichever arrives second is the one that
-/// completes the pair.
+/// A kinding edge is answerable the moment its *type* side is known, and a variable's bounds
+/// are where a type arrives at it. So this runs where a bound is recorded and where a kind is,
+/// and asks the same question from both — whichever arrives second is the one that completes
+/// the pair.
 ///
-/// A lower that is itself a variable **inherits** the edge rather than answering it. The
-/// constraint is a conjunction with no polarity of its own (`src/ccl/design/type-inference.md`,
-/// "An unresolved candidate becomes a kinding edge"), so it travels down every path a type
-/// could arrive by, and is answered wherever one does.
+/// **Both directions.** A type kind is recorded only on a candidate of a sum's binder, which is
+/// a data domain, and a data domain is invariant (`src/ccl/design/type-inference.md`, "Data
+/// domains are invariant"): the variable resolves to what reaches it from either side. The
+/// direction a bound was recorded in is the edge's, not the domain's. The domain an argument
+/// supplies reaches a parameter's domain variable as an upper bound, so answering lower bounds
+/// alone would leave a use's mismatch to the definition's specialization.
+///
+/// A bound that is itself a variable **inherits** the edge, and is answered in turn against its
+/// own bounds. The constraint is a conjunction with no polarity of its own
+/// (`src/ccl/design/type-inference.md`, "An unresolved candidate becomes a kinding edge"), so it
+/// travels along every path a type could arrive by, and is answered wherever one does.
 ///
 /// **The peel finds the variable; the kind reads the type whole.** Refinements come off to see
-/// whether a lower is a variable, because a kind recorded on `{𝛼 | 𝑝}` is a demand on `𝛼`. The
+/// whether a bound is a variable, because a kind recorded on `{𝛼 | 𝑝}` is a demand on `𝛼`. The
 /// membership question is a different one and gets the unpeeled type, since a refined type is
 /// not the type it refines (`candidate_in_kind` says the same of a candidate) — one scrutinee
 /// answering both is how a refined range came to pass here and be refused at coalesce.
 pub(super) fn answer_type_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> {
-    let (lows, kinds) = {
-        let b = v.bounds.borrow();
-        (Rc::clone(b.lower()), b.type_kinds.clone())
-    };
-    if kinds.is_empty() || lows.is_empty() {
-        return Ok(());
-    }
-    for k in &kinds {
-        for low in lows.iter() {
-            match low.ty.peel_refinements() {
+    let mut pending = vec![Rc::clone(v)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = pending.pop() {
+        if !seen.insert(v.uid) {
+            continue;
+        }
+        let (bounds, kinds) = {
+            let b = v.bounds.borrow();
+            let bounds: Vec<Type> = b
+                .lower()
+                .iter()
+                .chain(b.upper().iter())
+                .map(|bound| bound.ty.clone())
+                .collect();
+            (bounds, b.type_kinds.clone())
+        };
+        if kinds.is_empty() {
+            continue;
+        }
+        for ty in &bounds {
+            match ty.peel_refinements() {
                 Type::Infer(w) => {
                     let mut b = w.bounds.borrow_mut();
-                    if !b.type_kinds.contains(k) {
-                        b.type_kinds.push(k.clone());
+                    for k in &kinds {
+                        if !b.type_kinds.contains(k) {
+                            b.type_kinds.push(k.clone());
+                        }
                     }
+                    drop(b);
+                    pending.push(Rc::clone(w));
                 }
                 // Only a *certain* non-member is an error: the kind abstains wherever the
                 // type is still open, and this runs while types are arriving.
-                _ if k.refuses(&low.ty) => {
-                    return Err(ConstrainError::NotOfKind {
-                        found: low.ty.clone(),
-                        type_kind: k.clone(),
-                    });
+                _ => {
+                    if let Some(k) = kinds.iter().find(|k| k.refuses(ty)) {
+                        return Err(ConstrainError::NotOfKind {
+                            found: ty.clone(),
+                            type_kind: k.clone(),
+                        });
+                    }
                 }
-                _ => {}
             }
         }
     }
@@ -1121,10 +1144,14 @@ fn constrain_go_impl(
                     // inequality and not the sub-comparison that exposed it — except for
                     // an `SmtError`, which established nothing: relabelling it would claim
                     // a conflict that no comparison decided. See [`super::smt`]. The
-                    // sub-comparison rides along as the inequality's `cause`.
+                    // sub-comparison rides along as the inequality's `cause`. A `NotOfKind`
+                    // is not an inequality either: it says a domain is not of the kind a
+                    // collection annotation demands, which holds whatever it is compared to.
                     if let Err(err) = decided {
                         return match err {
-                            ConstrainError::SmtError { .. } => Err(err),
+                            ConstrainError::SmtError { .. } | ConstrainError::NotOfKind { .. } => {
+                                Err(err)
+                            }
                             _ => Err(ConstrainError::DataDomainMismatch {
                                 lhs: Box::new((**d0).clone()),
                                 rhs: Box::new((**d1).clone()),
@@ -1384,6 +1411,8 @@ fn constrain_go_impl(
                 }
                 lows
             };
+            // The arriving type may be the answer to a kinding edge this variable holds.
+            answer_type_kinds(lv)?;
             // **No join here.** A variable's lower bounds are joined where every other
             // join is: at compaction, off these same bounds. Assembling one here as well
             // would compute it twice, by two rules, and — because this arm runs again on
