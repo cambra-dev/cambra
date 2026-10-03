@@ -526,7 +526,7 @@ variables that received no use-site bounds, is tolerated by inference (`Type::In
 invariant) and seen by no strict check, because the resolved definition is dropped.
 
 A use that checks does not make the definition fail
-([chl-spec.md, "A use that checks compiles [Decided]"](../../../docs/chl-spec.md#a-use-that-checks-compiles-decided)).
+([chl-spec.md, "A use that checks compiles"](../../../docs/chl-spec.md#a-use-that-checks-compiles)).
 So an error a specialization raises after its pin succeeded is held on the frame
 (`SpecializeFrame::held`) until the definition is checked alone. One the check also raises is
 reported there once, at the definition's own nodes. Any other breaks the guarantee: a debug build

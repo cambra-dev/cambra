@@ -389,11 +389,14 @@ pub enum InferError {
     ///
     /// Distinct from [`InferError::TypeMismatch`] so error messages can say
     /// "you annotated X as T but it has type U" vs. "expected T found U".
+    ///
+    /// Both types are boxed, as `TypeMismatch`'s are, to keep [`LocatedInferError`]
+    /// under `clippy::result_large_err`'s threshold.
     AnnotationMismatch {
         /// The type the user wrote in the annotation.
-        annotation: Type,
+        annotation: Box<Type>,
         /// The type that inference determined.
-        inferred: Type,
+        inferred: Box<Type>,
     },
     /// Collections over domains with no common answer met at one position.
     ///
@@ -587,8 +590,9 @@ pub enum InferError {
     ScopeViolation {
         /// Display label for the message (see the type docs — not the location).
         at: String,
-        /// The ill-scoped type.
-        ty: Type,
+        /// The ill-scoped type. Boxed, as `TypeMismatch`'s types are, to keep
+        /// [`LocatedInferError`] under `clippy::result_large_err`'s threshold.
+        ty: Box<Type>,
         /// The out-of-scope binder names free in the type's refinement
         /// predicates.
         unbound: Vec<String>,
@@ -713,8 +717,8 @@ impl InferError {
                 each(found);
             }
             InferError::MutableInRefinedType { ty, .. }
-            | InferError::ScopeViolation { ty, .. }
             | InferError::MutInCompositeType { ty, .. } => each(ty),
+            InferError::ScopeViolation { ty, .. } => each(ty),
             // No type to render: these carry a name, an id, or a rendered label.
             InferError::UnboundVariable(_)
             | InferError::Unsupported(_)
@@ -772,6 +776,85 @@ pub struct LocatedInferError {
     pub error: InferError,
     /// The node whose typing rule raised the error.
     pub node_id: crate::ccl::provenance::NodeId,
+    /// The other source positions the error involves, each a secondary label: where the
+    /// failing edge's value came from and what demanded it, when either is elsewhere
+    /// (`src/ccl/design/type-parameters.md`, "Secondary labels").
+    pub related: RelatedPositions,
+}
+
+/// The positions an error involves besides its own node: at most one per
+/// [`RelatedRole`], behind one thin pointer. Every inference rule returns a
+/// [`LocatedInferError`], so it stays under `clippy::result_large_err`'s threshold, and
+/// an error rarely has any.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RelatedPositions(Option<Box<[Option<Related>; 2]>>);
+
+impl RelatedPositions {
+    /// Each position: the value's, then the demand's.
+    pub fn iter(&self) -> impl Iterator<Item = &Related> {
+        self.0.iter().flat_map(|slots| slots.iter().flatten())
+    }
+
+    /// Record `related` in its role's slot.
+    fn set(&mut self, related: Related) {
+        let slot = match related.role {
+            RelatedRole::Value => 0,
+            RelatedRole::Demand => 1,
+        };
+        self.0.get_or_insert_with(Box::default)[slot] = Some(related);
+    }
+}
+
+/// A source position an error involves besides the node it was raised at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Related {
+    /// Where the position is.
+    pub origin: crate::ccl::infer_var::Origin,
+    /// What the position contributed to the failing edge.
+    pub role: RelatedRole,
+}
+
+/// What a [`Related`] position contributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelatedRole {
+    /// The value on the failing edge's left came from here.
+    Value,
+    /// The demand on the failing edge's right was stated here.
+    Demand,
+}
+
+impl RelatedRole {
+    /// The secondary label's text.
+    pub fn label(self) -> &'static str {
+        match self {
+            RelatedRole::Value => "the value comes from here",
+            RelatedRole::Demand => "required here",
+        }
+    }
+}
+
+impl LocatedInferError {
+    /// This error with the origins of the failing edge's two sides
+    /// ([`ConstrainCache::take_failure`](crate::ccl::infer::solver::ConstrainCache::take_failure))
+    /// as related positions, each one the error's own node is not.
+    pub fn with_failure(
+        mut self,
+        (value, demand): (
+            Option<crate::ccl::infer_var::Origin>,
+            Option<crate::ccl::infer_var::Origin>,
+        ),
+    ) -> Self {
+        let own = crate::ccl::infer_var::Origin::Node(self.node_id);
+        for (origin, role) in [(value, RelatedRole::Value), (demand, RelatedRole::Demand)] {
+            if let Some(origin) = origin
+                && origin != own
+                && !self.related.iter().any(|r| r.origin == origin)
+            {
+                self.related.set(Related { origin, role });
+            }
+        }
+        self
+    }
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -2600,10 +2683,8 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::AnnotationMismatch {
-                    annotation: Type::Base(BaseType::String),
-                    ..
-                }
+                InferError::AnnotationMismatch { annotation, .. }
+                    if **annotation == Type::Base(BaseType::String)
             )),
             "expected AnnotationMismatch against String, got {errs:?}"
         );
@@ -2903,8 +2984,8 @@ mod tests {
         assert_eq!(
             infer_bare(&mut expr, &mut ctx),
             Err(vec![InferError::AnnotationMismatch {
-                annotation: Type::Base(BaseType::String),
-                inferred: int_lit_ty(42),
+                annotation: Box::new(Type::Base(BaseType::String)),
+                inferred: Box::new(int_lit_ty(42)),
             }])
         );
     }

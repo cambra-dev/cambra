@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::ccl_utils::TermMemo;
+use crate::ccl::infer::api::RelatedPositions;
 use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::infer::solver::traits::{Assoc, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
@@ -59,6 +60,7 @@ pub(super) trait Typing {
         LocatedInferError {
             error,
             node_id: self.current_node(),
+            related: RelatedPositions::default(),
         }
     }
 
@@ -162,6 +164,17 @@ pub(super) trait Typing {
     /// in a diagnostic, so `T` reads as itself rather than as the hole lowering wrote
     /// for it. Check sees no type parameters and returns `ty`.
     fn resolve_type_params(&self, ty: &Type) -> Type;
+
+    /// Run `f` with the demand of every edge it draws stated at `origin` rather than
+    /// at the node under emission: a type parameter's bound or a requirement, written
+    /// in a `Poly` and checked at a use (`src/ccl/design/type-parameters.md`,
+    /// "Secondary labels"). Check draws no edge a label is read from, and runs `f`
+    /// unchanged.
+    fn with_demand_at<R>(
+        &mut self,
+        origin: crate::ccl::infer_var::Origin,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R;
 
     /// Require `sub <: sup`. `at` lazily produces an error-context label,
     /// invoked only on failure.

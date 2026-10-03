@@ -1315,6 +1315,8 @@ pub struct TypeParam {
     pub level: crate::ccl::Level,
     /// The upper bound, normalized at `level`, or `None`.
     pub bound: Option<Type>,
+    /// Where the bound was written, for the secondary label of a use that fails it.
+    pub bound_at: WrittenAt,
 }
 
 impl TypeParam {
@@ -1323,14 +1325,35 @@ impl TypeParam {
         spelling: impl Into<SmolStr>,
         level: crate::ccl::Level,
         bound: Option<Type>,
+        bound_at: WrittenAt,
     ) -> Rc<TypeParam> {
         Rc::new(TypeParam {
             id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
             spelling: spelling.into(),
             level,
             bound,
+            bound_at,
         })
     }
+}
+
+/// Where a part of a written type was written: the span a diagnostic's secondary label
+/// points at (`src/ccl/design/type-parameters.md`, "Secondary labels"), or `None` for
+/// a type nothing wrote.
+///
+/// Metadata, not identity: any two compare equal and hash alike, so where a type was
+/// written never makes two types differ.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WrittenAt(pub Option<chl_parser::ast::Span>);
+
+impl PartialEq for WrittenAt {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for WrittenAt {}
+impl std::hash::Hash for WrittenAt {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 impl PartialEq for TypeParam {
@@ -1382,6 +1405,8 @@ pub struct PolyRequirement {
     pub args: Vec<Type>,
     /// The associated types the clause names.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    /// Where the requirement was written.
+    pub at: WrittenAt,
 }
 
 impl PolyType {
@@ -1423,6 +1448,7 @@ impl PolyType {
                     hole: p.hole,
                     spelling: p.spelling.clone(),
                     bound: p.bound.as_ref().map(&mut f),
+                    bound_at: p.bound_at,
                 })
                 .collect(),
             requires: self
@@ -1432,6 +1458,7 @@ impl PolyType {
                     trait_: r.trait_,
                     args: r.args.iter().map(&mut f).collect(),
                     assoc: r.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
+                    at: r.at,
                 })
                 .collect(),
             body: f(&self.body),
@@ -1450,6 +1477,8 @@ pub struct PolyParam {
     /// The name the user wrote.
     pub spelling: SmolStr,
     pub bound: Option<Type>,
+    /// Where the bound was written.
+    pub bound_at: WrittenAt,
 }
 
 /// **Which binder a witness is** — its name, and the whole of its identity.

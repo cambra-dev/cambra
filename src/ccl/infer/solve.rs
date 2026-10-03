@@ -19,6 +19,7 @@
 // (`coalesce_node` ↔ `specialize_use`) over one shared [`CoalesceCtx`], so they
 // live in a single module.
 
+use crate::ccl::infer::api::RelatedPositions;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -113,12 +114,14 @@ fn push_coalesce_err(
             errors.push(LocatedInferError {
                 error: new_err,
                 node_id: blame,
+                related: RelatedPositions::default(),
             });
         }
     } else {
         errors.push(LocatedInferError {
             error: new_err,
             node_id: blame,
+            related: RelatedPositions::default(),
         });
     }
 }
@@ -577,7 +580,7 @@ struct SpecializeFrame {
     /// until the definition is checked alone.
     ///
     /// A use that checks does not make the definition fail (`docs/chl-spec.md`, "A use
-    /// that checks compiles [Decided]"), so each one is an error the definition raises
+    /// that checks compiles"), so each one is an error the definition raises
     /// alone, reported there once rather than once per specialization, at nodes the
     /// specialization re-minted. One the definition alone does not raise breaks that
     /// guarantee ([`coalesce_generalized_let`]).
@@ -1130,10 +1133,11 @@ fn check_scope_valid_go(
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
                 at: symbolic(expr),
-                ty: expr.ty.clone(),
+                ty: Box::new(expr.ty.clone()),
                 unbound: vec!["a witness reference free in its node's type".to_string()],
             },
             node_id: expr.node_id(),
+            related: RelatedPositions::default(),
         });
     }
     let mut witnesses = witnesses.to_vec();
@@ -1145,10 +1149,11 @@ fn check_scope_valid_go(
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
                 at: symbolic(expr),
-                ty: expr.ty.clone(),
+                ty: Box::new(expr.ty.clone()),
                 unbound: unbound.iter().map(|n| n.to_string()).collect(),
             },
             node_id: expr.node_id(),
+            related: RelatedPositions::default(),
         });
     }
     match &expr.node {
@@ -2231,6 +2236,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // cache is long gone, and sharing one cache across pins could only
     // conflate edges between independent specializations.
     let mut cache = ConstrainCache::new();
+    let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
+    cache.at(use_origin, use_origin);
     let pinned = constrain_subtype(&clone.ty, &use_expr.ty, &mut cache)
         .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
     // An obligation the copy reset, having assumed one of the binding's own type
@@ -2250,10 +2257,14 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         let e = e.clone();
         // Blamed on the use site, which is the node whose demanded type the pin
         // failed to satisfy, and the node this specialization's recording names.
-        ctx.errors.push(LocatedInferError {
-            error: map_constrain_err(e, "monomorphization specialization"),
-            node_id: use_expr.node_id(),
-        });
+        ctx.errors.push(
+            LocatedInferError {
+                error: map_constrain_err(e, "monomorphization specialization"),
+                node_id: use_expr.node_id(),
+                related: RelatedPositions::default(),
+            }
+            .with_failure(cache.take_failure()),
+        );
     }
 
     // Coalesce the clone re-entrantly, in the definition site's scope: every
@@ -2377,8 +2388,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             panic!(
                 "a specialization of `{}` raised `{:?}` after its pin succeeded, and the \
                  definition checked alone does not: a use that checks made the \
-                 definition fail (`docs/chl-spec.md`, \"A use that checks compiles \
-                 [Decided]\")",
+                 definition fail (`docs/chl-spec.md`, \"A use that checks compiles\")",
                 frame.name, held.error,
             );
         }

@@ -406,7 +406,7 @@ impl Diagnostic {
             CompileError::Parse(e) => ("parse", e.to_string(), Some(e.span())),
             CompileError::Lower(e) => ("lower", e.to_string(), Some(e.span())),
             CompileError::ChannelizeDefers(e) => ("channelizeDefers", e.to_string(), None),
-            CompileError::Infer { error, span } => ("infer", format!("{error:?}"), *span),
+            CompileError::Infer { error, span, .. } => ("infer", format!("{error:?}"), *span),
             CompileError::LambdaElim { error, span } => ("lambdaElim", error.to_string(), *span),
             CompileError::Conversion(e) => ("conversion", format!("{e:?}"), None),
             CompileError::Unsupported(msg) => ("unsupported", msg.clone(), None),

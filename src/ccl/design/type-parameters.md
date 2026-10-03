@@ -2,9 +2,9 @@
 
 > **Status: [Sketched].** A proposed implementation of
 > [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
-> [Implementation stack](#implementation-stack), items 1 to 4, 6 and 7 are implemented: the
-> parser, polymorphic aliases, type parameters with their bounds, requirements, printing, and each
-> definition checked alone. Item 5 is dropped. Item 8 describes work not yet done.
+> [Implementation stack](#implementation-stack), items 1 to 4 and 6 to 8 are implemented: the
+> parser, polymorphic aliases, type parameters with their bounds, requirements, printing, each
+> definition checked alone, and secondary labels. Item 5 is dropped.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -242,9 +242,9 @@ The `Var` arm instantiates every binding through `PolyScheme::instantiate_with_p
    substituted operands, freshened through the same cache, then records `𝑜 <: 𝛼ₒ` from the
    obligation's associated variable `𝑜` to the substituted associated type.
 
-A failure in 2 or 3 is blamed on the use. Item 8 adds a secondary label at the bound's or the
-requirement's span, the error shape
-[chl-spec.md, "A use that checks compiles [Decided]"](../../../docs/chl-spec.md#a-use-that-checks-compiles-decided)
+A failure in 2 or 3 is blamed on the use, with a secondary label at the bound or the
+requirement as written ([Secondary labels](#secondary-labels)), the error shape
+[chl-spec.md, "A use that checks compiles"](../../../docs/chl-spec.md#a-use-that-checks-compiles)
 states.
 
 ---
@@ -360,6 +360,46 @@ reads it, so a copy draws no edge to the definition's variables.
 
 ---
 
+## Secondary labels
+
+An error is reported at the node whose rule drew the failing edge, and each other position the
+edge involves is a secondary label (`LocatedInferError::related`): `x = id((sku=1))` then
+`x.at` is reported at `x.at`, with "the value comes from here" at `id((sku=1))`.
+
+- **Origins on bounds.** `Bound::origin` records where a bound's bounding side came from: for a
+  lower bound, the expression the value came from; for an upper bound, what demanded it. An
+  `Origin` is a node, or the span of a bound or requirement written in a `Poly`
+  (`ty::WrittenAt`), which has no node.
+- **The walk carries them.** `ConstrainCache` holds the origins of the edge being walked, set by
+  its caller (`ConstrainCache::at`): emission sets the node under emission, and a
+  specialization's pin sets the use. Recording a bound stores its bounding side's origin, and
+  closing an edge over a stored bound walks on with that bound's origin on its side. Freshening
+  and extrusion copy origins, so a definition's bounds point into its body at every use. The
+  first edge to fail records its two origins (`ConstrainCache::take_failure`).
+- **Trait obligations.** An obligation demands from where it was stated
+  (`TraitObligation::required_at`): its operator, or the requirement it was instantiated from. A
+  failed narrowing records the obligation as the demand and the contribution's origin as the
+  value.
+- **Written demands.** The `Var` arm checks a parameter's bound and instantiates a requirement
+  under `Typing::with_demand_at`, so a failure points at the bound or the requirement as written.
+- **Rendering.** `compile_program` resolves a node through the lowering projection and keeps a
+  label whose span lies outside the primary span, reading "required here" or "the value comes
+  from here".
+
+Not covered:
+
+- A concrete type carries no origin, so a value meeting a demand without passing through an
+  inference variable has no value label: `x = (sku=1)` then `x.at`
+  (`a_concrete_value_meeting_a_demand_directly_has_no_label`).
+- Narrowing an obligation records no origin, so a conflict between two operands of one operator
+  labels neither operand's source: `mk(True) + 1`, where `mk` returns a string.
+- An error raised at coalesce, such as an incompatible join or a use whose instantiation does not
+  resolve, has no edge and so no label.
+- The inspector's diagnostic carries one span (`inspector_model::wire::Diagnostic`), so it shows
+  no secondary label.
+
+---
+
 ## Implementation stack
 
 One change per item, each updating this doc and the spec status it implements:
@@ -383,5 +423,5 @@ One change per item, each updating this doc and the spec status it implements:
    alone does not. A collection annotation's kind demand is answered against a domain variable's
    upper bounds as well as its lower ones, so a use supplying a domain of the wrong kind fails at
    the use.
-8. **Secondary labels.** An origin recorded on every bound, giving every use error its secondary
-   label.
+8. **Secondary labels** (implemented). An origin recorded on every bound and obligation, giving
+   an error at a use its secondary label.

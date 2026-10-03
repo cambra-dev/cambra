@@ -1370,6 +1370,7 @@ pub(super) fn declare_type_params(
             hole: id,
             spelling: name.into(),
             bound,
+            bound_at: crate::ccl::ty::WrittenAt(tp.bound.as_ref().map(|b| b.span)),
         });
     }
     Ok(declared)
@@ -1467,7 +1468,12 @@ fn with_param_names(ty: &Type, ctx: &LoweringContext) -> Type {
             && let Some((name, _)) = ctx.type_params_in_scope.iter().find(|(_, h)| h == id)
         {
             // A display-only leaf: only its spelling is read.
-            *ty = Type::Param(crate::ccl::ty::TypeParam::fresh(name.as_str(), 0, None));
+            *ty = Type::Param(crate::ccl::ty::TypeParam::fresh(
+                name.as_str(),
+                0,
+                None,
+                crate::ccl::ty::WrittenAt::default(),
+            ));
             return;
         }
         ty.walk_children_mut(|child| go(child, ctx));
@@ -1567,6 +1573,7 @@ fn expand_requirement(
         trait_,
         args,
         assoc,
+        at: crate::ccl::ty::WrittenAt(Some(span)),
     });
     Ok(())
 }

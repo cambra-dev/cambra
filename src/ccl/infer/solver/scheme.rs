@@ -90,7 +90,11 @@ impl PolyScheme {
         current_level: Level,
         telescope: &Telescope,
         extra: &[&Type],
-    ) -> (Type, Vec<(Type, Type)>, Vec<Type>) {
+    ) -> (
+        Type,
+        Vec<(Type, Type, crate::ccl::ty::WrittenAt)>,
+        Vec<Type>,
+    ) {
         let mut cache = FreshenCache::new();
         cache.param_telescope = Some(telescope.clone());
         let ty = freshen_above(
@@ -113,7 +117,7 @@ impl PolyScheme {
                     FreshenLevel::At(current_level),
                     &mut cache,
                 );
-                bounded.push((instantiation, bound));
+                bounded.push((instantiation, bound, param.bound_at));
             }
         }
         let extra = extra
@@ -517,6 +521,7 @@ pub fn freshen_above(
                         param.spelling.clone(),
                         param.level,
                         bound,
+                        param.bound_at,
                     ))
                 }
             };
@@ -593,6 +598,7 @@ pub fn freshen_above(
             let new_lows: Vec<_> = lows
                 .iter()
                 .map(|b| Bound {
+                    origin: b.origin,
                     self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
@@ -601,6 +607,7 @@ pub fn freshen_above(
             let new_ups: Vec<_> = ups
                 .iter()
                 .map(|b| Bound {
+                    origin: b.origin,
                     self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),

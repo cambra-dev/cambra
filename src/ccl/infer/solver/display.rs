@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::ty::{PolyParam, PolyRequirement, PolyType, TypeParam, TypeParamId};
+use crate::ccl::ty::{PolyParam, PolyRequirement, PolyType, TypeParam, TypeParamId, WrittenAt};
 use crate::ccl::{InferVarId, Level, Type};
 
 use super::coalesce::{coalesce_compact, coalesce_position};
@@ -113,6 +113,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<Type> {
         .map(|(i, v)| PolyParam {
             hole: u32::try_from(i).expect("a rendered type has fewer than 2³² parameters"),
             spelling: names.spelling(*v),
+            bound_at: WrittenAt::default(),
             bound: match v {
                 Named::Var(v) => st.bounds.get(v).map(|b| names.rename(b)),
                 Named::Fresh(_) => None,
@@ -141,6 +142,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<Type> {
                 .map(|(name, _)| *name)
                 .zip(assoc_tys.iter().cloned())
                 .collect(),
+            at: WrittenAt::default(),
         };
         // A requirement about no parameter is one the definition already answered
         // at concrete types.
@@ -372,7 +374,7 @@ impl Parametrize<'_> {
     }
 
     fn mint(&mut self, placeholder: Placeholder) -> Rc<TypeParam> {
-        let p = TypeParam::fresh("_", self.cutoff + 1, None);
+        let p = TypeParam::fresh("_", self.cutoff + 1, None, WrittenAt::default());
         self.placeholders.insert(p.id, (Rc::clone(&p), placeholder));
         p
     }
@@ -481,7 +483,7 @@ impl<'a> Naming<'a> {
         if let Some(p) = self.params.borrow().get(&named) {
             return Rc::clone(p);
         }
-        let p = TypeParam::fresh(spelling(), self.st.cutoff + 1, None);
+        let p = TypeParam::fresh(spelling(), self.st.cutoff + 1, None, WrittenAt::default());
         self.params.borrow_mut().insert(named, Rc::clone(&p));
         p
     }

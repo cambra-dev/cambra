@@ -100,6 +100,9 @@ pub enum CompileError {
         error: InferError,
         /// The resolved source span, when known.
         span: Option<chl_parser::ast::Span>,
+        /// The other positions the error involves, resolved, each with its label's
+        /// text (`src/ccl/design/type-parameters.md`, "Secondary labels").
+        related: Vec<(chl_parser::ast::Span, &'static str)>,
     },
     /// Lambda elimination failed.
     ///
@@ -152,17 +155,21 @@ impl CompileError {
             CompileError::Infer {
                 error,
                 span: Some(span),
+                related,
             } => {
                 infer_report(
                     error,
                     *span,
+                    related,
                     src_name,
                     ariadne::Config::default().with_color(false),
                 )
                 .write((src_name, ariadne::Source::from(src)), &mut buf)
                 .expect("ariadne write should not fail on Vec<u8>");
             }
-            CompileError::Infer { error, span: None } => {
+            CompileError::Infer {
+                error, span: None, ..
+            } => {
                 buf.extend_from_slice(format!("error: type inference: {error:?}\n").as_bytes());
             }
             CompileError::LambdaElim {
@@ -217,8 +224,9 @@ impl CompileError {
             CompileError::Infer {
                 error,
                 span: Some(span),
+                related,
             } => {
-                infer_report(error, *span, src_name, ariadne::Config::default())
+                infer_report(error, *span, related, src_name, ariadne::Config::default())
                     .eprint((src_name, ariadne::Source::from(src)))
                     .expect("ariadne eprint should not fail on stderr");
             }
@@ -236,6 +244,7 @@ impl CompileError {
 fn infer_report<'a>(
     error: &InferError,
     span: chl_parser::ast::Span,
+    related: &[(chl_parser::ast::Span, &'static str)],
     src_name: &'a str,
     config: ariadne::Config,
 ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
@@ -249,6 +258,11 @@ fn infer_report<'a>(
                 .with_message(message)
                 .with_color(Color::Red),
         )
+        .with_labels(related.iter().map(|(at, text)| {
+            Label::new((src_name, (*at).into()))
+                .with_message(*text)
+                .with_color(Color::Blue)
+        }))
         .finish()
 }
 
@@ -314,7 +328,11 @@ impl IntoCompileErrors for Vec<InferError> {
         // `compile_program` path resolves spans explicitly and constructs the
         // `Infer` variant itself rather than going through `.errs()`.
         self.into_iter()
-            .map(|error| CompileError::Infer { error, span: None })
+            .map(|error| CompileError::Infer {
+                error,
+                span: None,
+                related: Vec::new(),
+            })
             .collect()
     }
 }
@@ -1917,12 +1935,34 @@ fn run_passes(
             .into_iter()
             .map(|mut located| {
                 located.error.map_types(&|ty| respelling.apply_type(ty));
-                let span = lowering_projection
-                    .get(&located.node_id)
-                    .and_then(|attr| attr.spans.first().copied());
+                let span_of = |id: &NodeId| {
+                    lowering_projection
+                        .get(id)
+                        .and_then(|attr| attr.spans.first().copied())
+                };
+                let span = span_of(&located.node_id);
+                // A related position is a secondary label only where it is not part of
+                // what the primary one underlines.
+                let within = |inner: chl_parser::ast::Span| {
+                    span.is_some_and(|outer| outer.start <= inner.start && inner.end <= outer.end)
+                };
+                let mut related: Vec<(chl_parser::ast::Span, &'static str)> = Vec::new();
+                for r in located.related.iter() {
+                    let at = match r.origin {
+                        crate::ccl::infer_var::Origin::Node(id) => span_of(&id),
+                        crate::ccl::infer_var::Origin::Written(at) => Some(at),
+                    };
+                    if let Some(at) = at
+                        && !within(at)
+                        && !related.iter().any(|(seen, _)| *seen == at)
+                    {
+                        related.push((at, r.role.label()));
+                    }
+                }
                 CompileError::Infer {
                     error: located.error,
                     span,
+                    related,
                 }
             })
             .collect());
@@ -2574,7 +2614,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2605,7 +2645,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2629,7 +2669,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2670,7 +2710,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));

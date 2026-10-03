@@ -176,6 +176,9 @@ pub struct Assumption {
     /// The associated types the clause names. One the clause leaves unnamed is
     /// absent, and leaves that position open.
     pub assoc: Vec<(Assoc, Type)>,
+    /// Where the requirement was written, for the secondary label of a use that
+    /// fails it.
+    pub at: crate::ccl::ty::WrittenAt,
 }
 
 impl Assumption {
@@ -515,6 +518,9 @@ pub struct TraitObligation {
     /// The ID of the operator node that spawned this obligation, to
     /// be used as provenance for any resulting refinement body.
     operator_node_id: provenance::NodeId,
+    /// Where the requirement was stated, when not at the operator: a requirement of a
+    /// `requires` clause, instantiated at a use. Read by [`required_at`](Self::required_at).
+    stated_at: Cell<Option<crate::ccl::infer_var::Origin>>,
 }
 
 /// What an obligation requires, as the types standing at its positions
@@ -568,6 +574,7 @@ impl TraitObligation {
                 .collect(),
             input_exprs: RefCell::new(input_exprs),
             operator_node_id,
+            stated_at: Cell::new(None),
         })
     }
 
@@ -608,6 +615,7 @@ impl TraitObligation {
                 .collect(),
             input_exprs: RefCell::new(original.input_exprs.borrow().clone()),
             operator_node_id: original.operator_node_id,
+            stated_at: Cell::new(original.stated_at.get()),
         })
     }
 
@@ -636,6 +644,20 @@ impl TraitObligation {
         }
         #[cfg(debug_assertions)]
         register_watch(self, pos, ty);
+    }
+
+    /// Where this requirement was stated: the operator that needs it, or the
+    /// `requires` clause it was instantiated from.
+    pub fn required_at(&self) -> crate::ccl::infer_var::Origin {
+        self.stated_at
+            .get()
+            .unwrap_or(crate::ccl::infer_var::Origin::Node(self.operator_node_id))
+    }
+
+    /// Record that this requirement was stated at `origin` rather than at its
+    /// operator.
+    pub fn set_required_at(&self, origin: crate::ccl::infer_var::Origin) {
+        self.stated_at.set(Some(origin));
     }
 
     /// The candidates still live, for diagnostics and tests.
@@ -725,12 +747,12 @@ impl TraitObligation {
                 for bound in v.bounds.borrow().lower().iter() {
                     match &bound.ty {
                         Type::Infer(below) => stack.push(Rc::clone(below)),
-                        other => contributions.push((other.clone(), Rc::clone(&v))),
+                        other => contributions.push((other.clone(), bound.origin, Rc::clone(&v))),
                     }
                 }
             }
-            for (contribution, at) in contributions {
-                deliver(self, pos as u8, &contribution, &at, cache)?;
+            for (contribution, origin, at) in contributions {
+                deliver(self, pos as u8, &contribution, origin, &at, cache)?;
             }
         }
         Ok(())
@@ -764,7 +786,7 @@ impl TraitObligation {
             return self.try_deposit(cache);
         }
         match &param.bound {
-            Some(bound) => deliver(self, pos, bound, var, cache),
+            Some(bound) => deliver(self, pos, bound, None, var, cache),
             None => Err(ConstrainError::MissingRequirement {
                 trait_: self.trait_,
                 position: pos,
@@ -1981,16 +2003,16 @@ pub(super) fn link_watches(
     // unchecked.
     let (known, params, below) = {
         let bounds = lower.bounds.borrow();
-        let known: Vec<BaseType> = bounds
+        let known: Vec<(BaseType, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
             .iter()
-            .filter_map(|b| offered_base(&b.ty).cloned())
+            .filter_map(|b| offered_base(&b.ty).map(|base| (base.clone(), b.origin)))
             .collect();
-        let params: Vec<Type> = bounds
+        let params: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
             .iter()
             .filter(|b| matches!(offered(&b.ty), Offered::Param(_)))
-            .map(|b| b.ty.clone())
+            .map(|b| (b.ty.clone(), b.origin))
             .collect();
         let below: Vec<Rc<InferVar>> = bounds
             .lower()
@@ -2003,11 +2025,14 @@ pub(super) fn link_watches(
         (known, params, below)
     };
     for (obligation, pos) in &added {
-        for base in &known {
-            obligation.narrow(*pos, base, cache)?;
+        for (base, origin) in &known {
+            if let Err(e) = obligation.narrow(*pos, base, cache) {
+                cache.note_failure_with(*origin, Some(obligation.required_at()));
+                return Err(e);
+            }
         }
-        for param in &params {
-            deliver(obligation, *pos, param, lower, cache)?;
+        for (param, origin) in &params {
+            deliver(obligation, *pos, param, *origin, lower, cache)?;
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
@@ -2039,7 +2064,7 @@ pub(super) fn notify_lower(
         watches.clone()
     };
     for (obligation, pos) in watches {
-        deliver(&obligation, pos, contribution, var, cache)?;
+        deliver(&obligation, pos, contribution, None, var, cache)?;
     }
     Ok(())
 }
@@ -2052,16 +2077,23 @@ fn deliver(
     obligation: &Rc<TraitObligation>,
     pos: u8,
     contribution: &Type,
+    value: Option<crate::ccl::infer_var::Origin>,
     var: &Rc<InferVar>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    match offered(contribution) {
+    let delivered = match offered(contribution) {
         Offered::Base(base) => obligation.narrow(pos, base, cache),
         Offered::Product(product) => obligation.narrow_product(pos, product, var, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
         Offered::Param(param) => obligation.narrow_param(pos, param, var, cache),
         Offered::Unknown => Ok(()),
+    };
+    // The obligation is the demand a contribution failed: an edge a deposit drew
+    // further in, failing first, has already recorded its own.
+    if delivered.is_err() {
+        cache.note_failure_with(value, Some(obligation.required_at()));
     }
+    delivered
 }
 
 #[cfg(test)]
