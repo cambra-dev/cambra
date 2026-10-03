@@ -23,6 +23,7 @@ use super::schemes::{OpSignature, OperatorResult};
 use super::typing::Typing;
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::Trait;
+use crate::ccl::infer_var::Origin;
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -111,10 +112,16 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     binding
                         .scheme
                         .instantiate_with_params(ctx.level, &ctx.telescope, &extra);
-                for (instantiation, bound) in bounded {
-                    ctx.require_sub(&instantiation, &bound, &|| {
-                        format!("the bound of a type parameter of `{name}`")
-                    })?;
+                for (instantiation, bound, bound_at) in bounded {
+                    let check = |ctx: &mut InferCtx| {
+                        ctx.require_sub(&instantiation, &bound, &|| {
+                            format!("the bound of a type parameter of `{name}`")
+                        })
+                    };
+                    match bound_at.0 {
+                        Some(span) => ctx.with_demand_at(Origin::Written(span), check)?,
+                        None => check(ctx)?,
+                    }
                 }
                 // Each requirement becomes an obligation at this use's types, minted
                 // as an operator's is; the associated type it names receives what the
@@ -129,14 +136,20 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                         .map(|(n, _)| (*n, extra.next().expect("one freshened type per name")))
                         .collect();
                     let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
-                    let settled = ctx.require_trait(
-                        r.trait_,
-                        node_id,
-                        &args.iter().collect::<Vec<_>>(),
-                        &[],
-                        assoc.first().map(|(n, _)| *n),
-                        &at,
-                    )?;
+                    let require = |ctx: &mut InferCtx| {
+                        ctx.require_trait(
+                            r.trait_,
+                            node_id,
+                            &args.iter().collect::<Vec<_>>(),
+                            &[],
+                            assoc.first().map(|(n, _)| *n),
+                            &at,
+                        )
+                    };
+                    let settled = match r.at.0 {
+                        Some(span) => ctx.with_demand_at(Origin::Written(span), require)?,
+                        None => require(ctx)?,
+                    };
                     if let (Some(settled), Some((_, named))) = (settled, assoc.first()) {
                         ctx.require_sub(&settled, named, &at)?;
                     }

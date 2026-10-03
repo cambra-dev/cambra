@@ -2762,7 +2762,7 @@ of a monomorphic binding is monomorphic. A tuple or record of polymorphic functi
 monomorphic, and making each field polymorphic on its own is **[Open]**.
 
 Type parameters, bounds, trait requirements and polymorphic type annotations are implemented,
-except where a marker says otherwise. The last subsection is **[Decided]** and not implemented.
+except where a marker says otherwise.
 
 #### Type parameters
 
@@ -2873,7 +2873,7 @@ is the type that satisfies it.
   covering the operator answers it before the bound does, so `a + b` under
   `T <: Int` and `requires Addable(T, T, Output=T)` is a `T`.
 - **Each call satisfies each requirement at its own instantiation.** A call that does not is
-  rejected at the call, with a secondary label at the requirement (**[Decided]**: the label).
+  rejected at the call, with a secondary label at the requirement.
 - `^+` has no nameable trait. Declaring a trait or an instance is **[Open]**.
 
 #### Polymorphic type annotations
@@ -2913,7 +2913,7 @@ pick: \T -> {T, T} => T = first
   write, such as a parameter joined with another type, is marked in the printed type (`A ∨ Int`),
   not dropped.
 
-#### A use that checks compiles [Decided]
+#### A use that checks compiles
 
 A polymorphic binding's type, inferred or written, states every requirement its body places on the
 types it quantifies. An instantiation that a checking use produces raises no error in the body.

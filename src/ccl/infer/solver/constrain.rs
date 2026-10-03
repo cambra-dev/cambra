@@ -20,6 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::ccl_utils::discharge_transparent_lets;
+use crate::ccl::infer_var::Origin;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
@@ -230,6 +231,15 @@ pub struct ConstrainCache {
     /// `d0`, so the contexts trade places with the substitutions.
     lctx: crate::ccl::ty::WitnessContext,
     rctx: crate::ccl::ty::WitnessContext,
+    /// **Where each side of the edge being walked came from**: the value on the left and
+    /// the demand on the right (`src/ccl/design/type-parameters.md`, "Secondary labels").
+    /// A recorded bound takes the origin of its bounding side, and closing an edge over
+    /// a stored bound walks on with that bound's origin on its side. Swapped wherever
+    /// the descent swaps the sides, as the contexts are.
+    origins: (Option<Origin>, Option<Origin>),
+    /// The origins of the innermost edge that failed, set by the first error to unwind
+    /// and read by the caller with [`take_failure`](Self::take_failure).
+    failure: Option<(Option<Origin>, Option<Origin>)>,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -270,6 +280,54 @@ impl ConstrainCache {
             derivation,
             lctx: crate::ccl::ty::WitnessContext::default(),
             rctx: crate::ccl::ty::WitnessContext::default(),
+            origins: (None, None),
+            failure: None,
+        }
+    }
+
+    /// Draw the next edge with its value from `value` and its demand from `demand`:
+    /// ordinarily both the expression whose typing rule draws it. Clears any failure an
+    /// earlier edge left unread.
+    pub fn at(&mut self, value: Option<Origin>, demand: Option<Origin>) -> &mut Self {
+        self.origins = (value, demand);
+        self.failure = None;
+        self
+    }
+
+    /// The origins of the innermost edge of the last failure: the value's and the
+    /// demand's.
+    pub fn take_failure(&mut self) -> (Option<Origin>, Option<Origin>) {
+        self.failure.take().unwrap_or_default()
+    }
+
+    /// Run `f` walking an edge whose sides came from `origins`, each falling back to the
+    /// current side's where it is unknown.
+    fn with_origins<R>(
+        &mut self,
+        origins: (Option<Origin>, Option<Origin>),
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.origins;
+        self.origins = (origins.0.or(saved.0), origins.1.or(saved.1));
+        let out = f(self);
+        self.origins = saved;
+        out
+    }
+
+    /// Record the current edge's origins as the failure's, unless an edge deeper in the
+    /// walk already did.
+    pub(super) fn note_failure(&mut self) {
+        if self.failure.is_none() {
+            self.failure = Some(self.origins);
+        }
+    }
+
+    /// [`note_failure`](Self::note_failure) with each side replaced where known: a trait
+    /// obligation demands from where it was stated, and a contribution it was offered
+    /// may come from a stored bound rather than the edge being drawn.
+    pub(super) fn note_failure_with(&mut self, value: Option<Origin>, demand: Option<Origin>) {
+        if self.failure.is_none() {
+            self.failure = Some((value.or(self.origins.0), demand.or(self.origins.1)));
         }
     }
 
@@ -309,8 +367,11 @@ impl ConstrainCache {
     /// round — the contravariant domain edge, which already swaps the substitutions.
     fn swapped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         std::mem::swap(&mut self.lctx, &mut self.rctx);
+        let (l, r) = self.origins;
+        self.origins = (r, l);
         let out = f(self);
         std::mem::swap(&mut self.lctx, &mut self.rctx);
+        self.origins = (l, r);
         out
     }
 }
@@ -914,9 +975,13 @@ fn constrain_go(
 
     // Structural descent over two types at once, one frame per constructor pair;
     // grow on demand as the other deep walks do.
-    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+    let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         constrain_go_impl(lhs, rhs, sl, sr, cache, scope)
-    })
+    });
+    if out.is_err() {
+        cache.note_failure();
+    }
+    out
 }
 
 fn constrain_go_impl(
@@ -1437,7 +1502,8 @@ fn constrain_go_impl(
         // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
-                let bound = Bound::edge(sl.clone(), rhs.clone(), sr.clone());
+                let bound =
+                    Bound::edge(sl.clone(), rhs.clone(), sr.clone()).with_origin(cache.origins.1);
                 crate::ccl::infer_var::enforce_bound_scope(lv, "upper", &bound);
                 let mut s = lv.bounds.borrow_mut();
                 s.upper_mut().push(bound);
@@ -1486,14 +1552,16 @@ fn constrain_go_impl(
             }
             for low in lows.iter() {
                 let (tau_l, tau_u) = bridge_holder_gap(&low.self_subst, sl);
-                constrain_go(
-                    &low.ty,
-                    rhs,
-                    &Subst::then(&low.ty_subst, &tau_l),
-                    &Subst::then(sr, &tau_u),
-                    cache,
-                    scope,
-                )?;
+                cache.with_origins((low.origin, None), |cache| {
+                    constrain_go(
+                        &low.ty,
+                        rhs,
+                        &Subst::then(&low.ty_subst, &tau_l),
+                        &Subst::then(sr, &tau_u),
+                        cache,
+                        scope,
+                    )
+                })?;
             }
             Ok(())
         }
@@ -1508,7 +1576,8 @@ fn constrain_go_impl(
         // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
-                let bound = Bound::edge(sr.clone(), lhs.clone(), sl.clone());
+                let bound =
+                    Bound::edge(sr.clone(), lhs.clone(), sl.clone()).with_origin(cache.origins.0);
                 crate::ccl::infer_var::enforce_bound_scope(rv, "lower", &bound);
                 let mut s = rv.bounds.borrow_mut();
                 s.lower_mut().push(bound);
@@ -1547,14 +1616,16 @@ fn constrain_go_impl(
             }
             for up in ups.iter() {
                 let (tau_l, tau_u) = bridge_holder_gap(sr, &up.self_subst);
-                constrain_go(
-                    lhs,
-                    &up.ty,
-                    &Subst::then(sl, &tau_l),
-                    &Subst::then(&up.ty_subst, &tau_u),
-                    cache,
-                    scope,
-                )?;
+                cache.with_origins((None, up.origin), |cache| {
+                    constrain_go(
+                        lhs,
+                        &up.ty,
+                        &Subst::then(sl, &tau_l),
+                        &Subst::then(&up.ty_subst, &tau_u),
+                        cache,
+                        scope,
+                    )
+                })?;
             }
             Ok(())
         }
@@ -2005,6 +2076,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 let new_lows: Vec<_> = lows
                     .iter()
                     .map(|b| Bound {
+                        origin: b.origin,
                         self_subst: b.self_subst.clone(),
                         ty: extrude(&b.ty, pol, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
@@ -2023,6 +2095,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 let new_ups: Vec<_> = ups
                     .iter()
                     .map(|b| Bound {
+                        origin: b.origin,
                         self_subst: b.self_subst.clone(),
                         ty: extrude(&b.ty, pol, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
@@ -2119,6 +2192,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                 let new_lows: Vec<_> = lows
                     .iter()
                     .map(|b| Bound {
+                        origin: b.origin,
                         self_subst: b.self_subst.clone(),
                         ty: extrude(&b.ty, true, target_level, cache),
                         ty_subst: b.ty_subst.clone(),
@@ -2135,6 +2209,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
                 let new_ups: Vec<_> = ups
                     .iter()
                     .map(|b| Bound {
+                        origin: b.origin,
                         self_subst: b.self_subst.clone(),
                         ty: extrude(&b.ty, false, target_level, cache),
                         ty_subst: b.ty_subst.clone(),

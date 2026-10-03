@@ -11,6 +11,7 @@ use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
 };
+use crate::ccl::infer_var::Origin;
 use crate::ccl::infer_var::{InferVarId, Telescope, TelescopeWalk};
 use std::rc::Rc;
 
@@ -197,6 +198,10 @@ pub(super) struct InferCtx {
     /// that would quietly become an ordinary variable, a flexible `T`, and this is
     /// what the normalization checks.
     pub(super) type_param_holes: HashSet<u32>,
+    /// Where the demand of the edges being drawn was stated, when it is not the node
+    /// under emission: a type parameter's bound or a requirement, written in a `Poly`
+    /// and checked at a use ([`Typing::with_demand_at`]).
+    demand_at: Option<Origin>,
     /// The assumptions in scope at the current emission position: the `requires`
     /// clauses of the polymorphic annotations whose right-hand sides enclose it.
     /// Every obligation `require_trait` mints takes those about its trait
@@ -261,6 +266,7 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             type_param_holes: HashSet::new(),
+            demand_at: None,
             assumptions: Vec::new(),
             requirements: HashMap::new(),
             telescope: Telescope::empty(),
@@ -454,6 +460,11 @@ impl InferCtx {
 }
 
 impl InferCtx {
+    /// The node under emission, as the origin of the edges its rule draws.
+    fn here(&self) -> Option<Origin> {
+        Some(Origin::Node(self.current_node_id))
+    }
+
     /// [`Typing::bind_annotation`], reporting a mismatch with the annotation shown as
     /// `ann_shown` and the inferred type as `inferred_ty`.
     ///
@@ -546,12 +557,16 @@ impl InferCtx {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
         };
-        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).map_err(|_| {
-            self.raise(InferError::AnnotationMismatch {
-                annotation: ann_shown.clone(),
-                inferred: inferred_ty.clone(),
-            })
-        })?;
+        self.cache.at(self.here(), self.here());
+        if constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).is_err() {
+            let failure = self.cache.take_failure();
+            return Err(self
+                .raise(InferError::AnnotationMismatch {
+                    annotation: Box::new(ann_shown.clone()),
+                    inferred: Box::new(inferred_ty),
+                })
+                .with_failure(failure));
+        }
         // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
         // above is contravariant in the domain, so it leaves the shared variable *below*
         // every domain annotated with it: a common lower bound, which orders each domain
@@ -584,12 +599,16 @@ impl InferCtx {
                 scopes: &self.scopes,
                 opaque_binders: &self.opaque_binders,
             };
-            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).map_err(|_| {
-                self.raise(InferError::AnnotationMismatch {
-                    annotation: ann_shown.clone(),
-                    inferred: inferred_ty,
-                })
-            })?;
+            self.cache.at(self.here(), self.here());
+            if constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).is_err() {
+                let failure = self.cache.take_failure();
+                return Err(self
+                    .raise(InferError::AnnotationMismatch {
+                        annotation: Box::new(ann_shown.clone()),
+                        inferred: Box::new(inferred_ty),
+                    })
+                    .with_failure(failure));
+            }
         }
         Ok(ann_simple)
     }
@@ -684,15 +703,22 @@ impl Typing for InferCtx {
             operand_exprs.iter().map(|e| (*e).clone()).collect(),
         );
         obligation.assume(&self.assumptions);
+        if let Some(origin) = self.demand_at {
+            obligation.set_required_at(origin);
+        }
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);
         }
         // A trait whose instances already agree settles here, before any
         // operand is known — the ordinary "all candidates agree" rule reaching its
         // condition immediately, not a special case.
-        obligation
-            .try_deposit(&mut self.cache)
-            .map_err(|e| self.raise(map_constrain_err(e, &at())))?;
+        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        if let Err(e) = obligation.try_deposit(&mut self.cache) {
+            let failure = self.cache.take_failure();
+            return Err(self
+                .raise(map_constrain_err(e, &at()))
+                .with_failure(failure));
+        }
         // Operands flow in as ordinary lower bounds, refinements and all. The
         // narrowing hook peels them where the base actually arrives.
         for (operand, position) in operand_types.iter().zip(&positions) {
@@ -743,7 +769,8 @@ impl Typing for InferCtx {
         // holes are seeded by the time it is normalized.
         for p in &poly.params {
             let bound = p.bound.as_ref().map(|b| self.normalize_annotation(b));
-            let param = crate::ccl::ty::TypeParam::fresh(p.spelling.clone(), self.level, bound);
+            let param =
+                crate::ccl::ty::TypeParam::fresh(p.spelling.clone(), self.level, bound, p.bound_at);
             let previous = self
                 .shared_holes
                 .borrow_mut()
@@ -770,6 +797,7 @@ impl Typing for InferCtx {
                         .iter()
                         .map(|(n, t)| (*n, self.normalize_annotation(t)))
                         .collect(),
+                    at: r.at,
                 })
             })
             .collect()
@@ -785,8 +813,23 @@ impl Typing for InferCtx {
             scopes: &self.scopes,
             opaque_binders: &self.opaque_binders,
         };
-        constrain_subtype_in(sub, sup, &mut self.cache, &scope)
-            .map_err(|e| self.raise(map_constrain_err(e, &at())))
+        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        match constrain_subtype_in(sub, sup, &mut self.cache, &scope) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let failure = self.cache.take_failure();
+                Err(self
+                    .raise(map_constrain_err(e, &at()))
+                    .with_failure(failure))
+            }
+        }
+    }
+
+    fn with_demand_at<R>(&mut self, origin: Origin, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.demand_at.replace(origin);
+        let out = f(self);
+        self.demand_at = saved;
+        out
     }
 
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {

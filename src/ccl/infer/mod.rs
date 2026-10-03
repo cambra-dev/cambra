@@ -632,7 +632,11 @@ pub(crate) fn run(
                 ),
             };
             let node_id = blame_node_for_place(expr, &blame_vars);
-            return Err(vec![LocatedInferError { error, node_id }]);
+            return Err(vec![LocatedInferError {
+                error,
+                node_id,
+                related: RelatedPositions::default(),
+            }]);
         }
     }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
