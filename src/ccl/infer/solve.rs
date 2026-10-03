@@ -573,31 +573,15 @@ struct SpecializeFrame {
     /// splices into is going away with the subtree, so liveness there is moot. It
     /// is the frames that **outlive** a discarded walk whose splices need filtering.
     inside_discarded: bool,
-    /// Whether the body demanded this binding at all — set by [`specialize_use`]
-    /// on entry, before anything can go wrong, and so **including uses that sit in
-    /// dead code**.
+    /// The errors raised while coalescing a specialization whose pin succeeded, held
+    /// until the definition is checked alone.
     ///
-    /// That is deliberate: such a binding is not discard-walked, and does not need
-    /// to be. It was already checked through the clone the dead use pinned, which
-    /// is a *stricter* reading than the generic one a discard walk would take — a
-    /// specialization only adds bounds. Walking it again would report whatever that
-    /// clone already reported (`through_a_call_in_dead_code` covers the case).
-    ///
-    /// This is *not* `!specs.is_empty()`, and the difference is exactly the case
-    /// where a use exists but produced no specialization: a use whose
-    /// instantiation fails to resolve reports and returns before minting one. Only
-    /// *this* flag answers "is the
-    /// definition dead code", which is what decides whether it is typechecked on
-    /// the way out ([`typecheck_discarded_definition`]) — asking `specs` instead
-    /// re-walks a definition whose uses merely failed, and reports its body's
-    /// conflicts a second time.
-    demanded: bool,
-    /// Whether the binding declares type parameters: it is annotated with a
-    /// polymorphic type. Such a definition is checked alone even when demanded,
-    /// after its last specialization, since a clone substitutes each use's types
-    /// for the parameters and so cannot see an error that only the parameters,
-    /// held opaque, expose (`src/ccl/design/type-parameters.md`, "Specialization").
-    generic: bool,
+    /// A use that checks does not make the definition fail (`docs/chl-spec.md`, "A use
+    /// that checks compiles [Decided]"), so each one is an error the definition raises
+    /// alone, reported there once rather than once per specialization, at nodes the
+    /// specialization re-minted. One the definition alone does not raise breaks that
+    /// guarantee ([`coalesce_generalized_let`]).
+    held: Vec<LocatedInferError>,
     /// Specializations minted so far, scanned linearly.
     /// A candidate use's [`SpecKey`] is compared against each entry's — both
     /// computed by the *same* procedure at the *same* point in the pin's lifecycle
@@ -800,9 +784,10 @@ fn with_shadows<R>(
 /// - **Inside the coalesce walk, before the branches.** A generalized definition's
 ///   unconstrained payload is a type *parameter* — its uses instantiate freshened
 ///   copies — so pinning it would make every instantiation `Unit` and reject a call
-///   that supplies that tag with a payload. Coalesce never walks such a definition
-///   in place, only its per-use clones, so pinning here reaches exactly the trees
-///   being resolved. And a `Lambda` resolves `param.ty` from its coalesced domain
+///   that supplies that tag with a payload. Coalesce walks such a definition in place
+///   only to check it alone, after its last clone, and that walk skips the pin where
+///   no value reaches the scrutinee (the `Case` arm of [`coalesce_node`]), so pinning
+///   here reaches the clones and the code nothing generalizes. And a `Lambda` resolves `param.ty` from its coalesced domain
 ///   *after* its body, so the pin still reaches the parameter type — but only if it
 ///   precedes the branch walk.
 ///
@@ -956,7 +941,37 @@ fn payload_flow_target(v: &crate::ccl::infer_var::InferVar) -> Option<Type> {
 fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::BaseType {
     use crate::ccl::BaseType;
 
-    let watches = v.watches.borrow();
+    // The obligations watching the payload, or any variable it flows into: an operand
+    // variable an operator minted sits above the payload, as does a variable of a
+    // generalized definition the payload reaches from an enclosing scope.
+    let mut watches = v.watches.borrow().clone();
+    let mut pending: Vec<Rc<crate::ccl::infer_var::InferVar>> = v
+        .bounds
+        .borrow()
+        .upper()
+        .iter()
+        .filter_map(|b| match &b.ty {
+            Type::Infer(w) => Some(Rc::clone(w)),
+            _ => None,
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::from([v.uid]);
+    while let Some(w) = pending.pop() {
+        if !seen.insert(w.uid) {
+            continue;
+        }
+        watches.extend(w.watches.borrow().iter().cloned());
+        pending.extend(
+            w.bounds
+                .borrow()
+                .upper()
+                .iter()
+                .filter_map(|b| match &b.ty {
+                    Type::Infer(u) => Some(Rc::clone(u)),
+                    _ => None,
+                }),
+        );
+    }
     let Some(((first, pos), rest)) = watches.split_first() else {
         return BaseType::Unit;
     };
@@ -1582,10 +1597,17 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // invariant `assert_reads_stable` enforces. The pin reads only the
             // constraint graph, which emission has already finished building, so
             // nothing here depends on the scrutinee having been coalesced.
+            //
+            // In a walk whose types are dropped — a definition checked alone, or dead
+            // code — a scrutinee no value reaches stands for what the uses supply, so
+            // an arm with no value at its payload is not unreachable: its payload is
+            // a parameter of the definition, and pinning it would decide a type no
+            // use chose.
+            let pin = !ctx.discarding || scrutinee.as_ref().is_some_and(|s| value_reaches(&s.ty));
             let pinned_tags: Vec<String> = branches
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
-                .filter(|p| pin_unobservable_arm_payload(p))
+                .filter(|p| pin && pin_unobservable_arm_payload(p))
                 .map(|p| p.tag.clone())
                 .collect();
             if let Some(s) = scrutinee {
@@ -2085,13 +2107,6 @@ fn coalesce_type_predicates_go(
 // (matching the solver's module-level allow).
 #[allow(clippy::mutable_key_type)]
 pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
-    // Record the demand before anything below can fail or decline to register: a
-    // definition is dead code only if no use ever reached this function.
-    let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
-        unreachable!("lookup_generalized returns indices of Generalized entries only");
-    };
-    frame.demanded = true;
-
     // The use's instantiation type, resolved off the live graph. The graph is
     // complete (emission saw the whole program), so everything this use
     // depends on has already been constrained — including, for a use inside
@@ -2231,7 +2246,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             obligation.redeliver(&mut cache)
         })
     });
-    if let Err(e) = pinned {
+    if let Err(e) = &pinned {
+        let e = e.clone();
         // Blamed on the use site, which is the node whose demanded type the pin
         // failed to satisfy, and the node this specialization's recording names.
         ctx.errors.push(LocatedInferError {
@@ -2247,9 +2263,18 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // introduced between the definition and this use and is suspended for the
     // duration. Nested generalized `let`s inside the clone push their own
     // frames on the truncated stack and specialize recursively.
+    let pin_succeeded = pinned.is_ok();
+    let before = ctx.errors.len();
     let suspended = ctx.scope.split_off(frame_idx);
     coalesce_node(&mut clone, cutoff + 1, ctx);
     ctx.scope.extend(suspended);
+    if pin_succeeded {
+        let raised = ctx.errors.split_off(before);
+        let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+            unreachable!("suspended entries were restored above the frame");
+        };
+        frame.held.extend(raised);
+    }
     // (The pin's effect on this use's own resolution — and on every other
     // read the walk made — is checked in bulk at end-of-pass by
     // `assert_reads_stable`, which is where the ordering invariant lives.)
@@ -2303,10 +2328,9 @@ fn surviving_use(ctx: &CoalesceCtx, frame_idx: usize) -> bool {
 /// definition, concrete binder slot. Each layer closes the lifted body type
 /// over its binding (`[name_i ↦ def_i]`, the §6.2 move site), exactly as
 /// `coalesce_node`'s tail does for a monomorphic `let` — the specializations
-/// are concrete here, so the discharge splices resolved types. A binding the
-/// body never demanded (no uses at any type) is resolved for its diagnostics
-/// ([`typecheck_discarded_definition`]) and then dropped entirely — its
-/// definition is dead code.
+/// are concrete here, so the discharge splices resolved types. The definition
+/// itself is resolved for its diagnostics ([`typecheck_discarded_definition`])
+/// and dropped, so a binding the body never demanded leaves nothing behind.
 pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     let saved_annotation = expr.user_annotation.take();
     let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
@@ -2322,15 +2346,13 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // Every specialization is the one binding, split by use type, so each
     // carries its transparency.
     let transparency = binding.transparency;
-    let generic = matches!(binding.user_annotation, Some(Type::Poly(_)));
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
             def: *bound_expr,
             cutoff: level,
             inside_discarded: ctx.discarding,
-            demanded: false,
-            generic,
+            held: Vec::new(),
             specs: Vec::new(),
         })));
     coalesce_node(&mut body, level, ctx);
@@ -2338,23 +2360,29 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         unreachable!("the binding's frame still tops the scope after a balanced body walk");
     };
 
-    // A definition no use demanded is dead code — but it is still the user's
-    // code, so it is typechecked before it is dropped.
+    // Every definition is checked alone, with its quantified variables flexible and its
+    // type parameters opaque (`src/ccl/design/type-inference.md`, "Checking a definition
+    // alone"). Every use has been specialized by now, so nothing clones from it any more
+    // and it can be resolved in place.
     let requirements = ctx.requirements.get(&frame.name).cloned();
     let assumptions: &[Rc<Assumption>] = requirements.as_deref().map_or(&[], |r| r.as_slice());
-    if !frame.demanded {
-        debug_assert!(
-            frame.specs.is_empty(),
-            "specialization without a demand: `{}` registered {} specialization(s) \
-             though no use reached `specialize_use`",
-            frame.name,
-            frame.specs.len(),
-        );
-        typecheck_discarded_definition(&mut frame.def, level, assumptions, ctx);
-    } else if frame.generic {
-        // Every use has been specialized, so nothing clones from the definition any
-        // more and it can be resolved in place, with its type parameters opaque.
-        typecheck_discarded_definition(&mut frame.def, level, assumptions, ctx);
+    let raised = typecheck_discarded_definition(&mut frame.def, level, assumptions, ctx);
+    for held in std::mem::take(&mut frame.held) {
+        if raised.contains(&held.error) {
+            continue;
+        }
+        // Reported in a release build rather than dropped: the program is wrong either
+        // way, and the specialization's report is the one there is.
+        if cfg!(debug_assertions) {
+            panic!(
+                "a specialization of `{}` raised `{:?}` after its pin succeeded, and the \
+                 definition checked alone does not: a use that checks made the \
+                 definition fail (`docs/chl-spec.md`, \"A use that checks compiles \
+                 [Decided]\")",
+                frame.name, held.error,
+            );
+        }
+        ctx.errors.push(held);
     }
 
     // Wrap the body in one specialized `let` per distinct type. Built in
@@ -2364,7 +2392,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // Dropping the binding rests on every use having been *renamed* to a
     // specialization. A use that failed to resolve was not, so it is left naming a
     // binding this rebuild deletes — see `src/ccl/design/type-inference.md`,
-    // "Typechecking a never-called definition", for why that dangling reference is
+    // "Checking a definition alone", for why that dangling reference is
     // unobservable today and what fixes it.
     //
     // The recording names the generalized `let`: the chain of K specialized layers
@@ -2403,19 +2431,17 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     expr.user_annotation = saved_annotation;
 }
 
-/// Resolve a generalized definition that no use demanded, for its diagnostics
-/// alone: the definition is dead code and is dropped as soon as this returns.
+/// Resolve a generalized definition for its diagnostics alone, returning every error
+/// the walk raised, repeats included: the definition is dropped as soon as this
+/// returns, and only its specializations are spliced.
 ///
-/// A used definition comes here only once every use has been specialized, and
-/// only if it declares type parameters ([`SpecializeFrame::generic`]): coalescing
-/// a definition in place overwrites the bound-bearing variables its per-use clones
+/// A used definition comes here once every use has been specialized: coalescing a
+/// definition in place overwrites the bound-bearing variables its per-use clones
 /// freshen from (see [`coalesce_node`]), which is harmless only after the last
-/// clone. An unused definition comes here unconditionally, since nothing was
-/// cloned from it, and the binding goes out of scope here, so nothing can clone it
-/// later. What is left is the
-/// under-determination, which inference tolerates (`Type::Infer`'s invariant)
-/// and which no strict check ever sees, because the resolved types are dropped
-/// with the definition.
+/// clone. An unused definition has no clone, and the binding goes out of scope here,
+/// so nothing can clone it later. What is left is the under-determination, which
+/// inference tolerates (`Type::Infer`'s invariant) and which no strict check ever
+/// sees, because the resolved types are dropped with the definition.
 ///
 /// What the walk is *for* is the class of error only resolution sees. Emission
 /// visits a definition body whether or not it is used, so a demand that conflicts
@@ -2426,7 +2452,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
 /// resolution does. Before this walk existed, such a definition was accepted
 /// precisely as long as nobody called it.
 ///
-/// See `src/ccl/design/type-inference.md`, "Typechecking a never-called definition".
+/// See `src/ccl/design/type-inference.md`, "Checking a definition alone".
 ///
 /// Runs in the definition site's scope: the binding's frame is popped before the
 /// call, so `ctx.scope` is already what was in scope where the definition was
@@ -2441,7 +2467,7 @@ fn typecheck_discarded_definition(
     level: Level,
     assumptions: &[Rc<Assumption>],
     ctx: &mut CoalesceCtx,
-) {
+) -> Vec<InferError> {
     let before = ctx.errors.len();
     let was_discarding = std::mem::replace(&mut ctx.discarding, true);
     let depth = ctx.assumptions.len();
@@ -2449,6 +2475,10 @@ fn typecheck_discarded_definition(
     coalesce_node(def, level + 1, ctx);
     ctx.assumptions.truncate(depth);
     ctx.discarding = was_discarding;
+    let raised = ctx.errors[before..]
+        .iter()
+        .map(|e| e.error.clone())
+        .collect();
 
     // A dead definition nested inside a *live* generalized one sits inside each of
     // its clones, so it is walked once per specialization of the enclosing binding
@@ -2472,6 +2502,7 @@ fn typecheck_discarded_definition(
             i += 1;
         }
     }
+    raised
 }
 
 /// The type [`specialize_projection_domain`] writes, given the value `input`

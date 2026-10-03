@@ -224,6 +224,26 @@ fn test_poly_calls_poly_at_two_types() {
     check_scalar(code, Value::Bool(true));
 }
 
+// An empty list's element is pinned to a type the operators reading it accept. Here
+// the read is inside a generalized definition, so the obligation watches the
+// comparison's operand variable there rather than the element variable, which sits in
+// the enclosing scope. Called and uncalled.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::called("sum(f(1))", Value::Int(0))]
+#[case::uncalled("1", Value::Int(1))]
+fn test_empty_list_read_inside_a_generalized_definition(
+    #[case] tail: &str,
+    #[case] expected: Value,
+) {
+    let code = indoc! {r"
+        xs = []
+        def f(a):
+            [x for x in xs if x == a]
+    "};
+    check_scalar(&format!("{code}{tail}"), expected);
+}
+
 // List-producing body chained through a poly wrapper, single concrete use
 // type. The lone `f` use sits inside `g`'s (generalized) definition, so it is
 // only ever reached through `g`'s clone — one concrete use type suffices to
