@@ -736,10 +736,13 @@ pub(super) fn lower_middle_stmt(
         // Function definition → Let binding with curried lambda body.
         ChlStmt::FunctionDef {
             name,
+            type_params,
             params,
             output,
+            requires,
             body: fn_body,
         } => {
+            refuse_polymorphic_signature(type_params, requires)?;
             let func_expr = lower_function_body(stmt.span, params, output.as_ref(), fn_body, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind(name.as_str().to_string(), func_expr, body),
@@ -1396,6 +1399,12 @@ pub(super) fn lower_type_expr(
             "a comparison is a refinement's predicate, and a refinement is written in \
              braces with `where`: `{Int where _ >= 0}`",
         )),
+        ChlExpr::Lambda { type_params, .. } if !type_params.is_empty() => {
+            Err(LoweringError::unsupported(
+                annotation.span,
+                "polymorphic types `\\T -> …` are not supported yet",
+            ))
+        }
         other => Err(LoweringError::unsupported(
             annotation.span,
             format!("{} is not a type", describe_type_form(other)),
