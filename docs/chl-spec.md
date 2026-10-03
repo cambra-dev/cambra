@@ -2746,22 +2746,25 @@ requires `Addable` of its operand types ([Trait requirements](#trait-requirement
 `add(1, "s")` is rejected at the call. `def f(a): (a + 1, a + "s")` is rejected at the definition,
 because no type satisfies both of its requirements.
 
+A binding whose right-hand side names a polymorphic binding is polymorphic too. `g = f` binds `g`
+at `f`'s type, and each use of `g` instantiates that type as a use of `f` would:
+
+```python
+def add(a, b):
+    a + b
+
+plus = add
+(plus(1, 2), plus("a", "b"))   # (3, "ab")
+```
+
 Every other binding is **monomorphic**: it has one type, shared by every use and settled by all of
 them together. A binding whose right-hand side is a call, a collection, a tuple or record, or a name
-is monomorphic.
+of a monomorphic binding is monomorphic. A tuple or record of polymorphic functions is therefore
+monomorphic, and making each field polymorphic on its own is **[Open]**.
 
 The subsections below are **[Decided]** and not implemented. The parser recognises their syntax:
 type parameters, bounds, `requires` clauses, and `\T -> V` in a type position. Lowering refuses
 each as unsupported.
-
-#### A name of a polymorphic binding is polymorphic [Decided]
-
-`g = f`, where `f` is polymorphic, binds `g` at `f`'s type. Each use of `g` instantiates that type
-as a use of `f` would. Today `g` is monomorphic: `(g(1, 2), g("a", "b"))` is rejected, and a `g`
-that nothing uses is reported as an unresolved type.
-
-A tuple or record of polymorphic functions stays monomorphic. Making each field polymorphic on its
-own is **[Open]**.
 
 #### Type parameters [Decided]
 

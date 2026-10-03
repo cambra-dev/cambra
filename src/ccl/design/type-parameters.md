@@ -2,8 +2,8 @@
 
 > **Status: [Sketched].** A proposed implementation of
 > [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
-> [Implementation stack](#implementation-stack), item 1, the parser, is implemented; nothing past
-> it is.
+> [Implementation stack](#implementation-stack), items 1 and 2, the parser and polymorphic aliases,
+> are implemented; nothing past them is.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -268,13 +268,8 @@ parameter by `id`, and a `Poly` by its parameters' positions, so α-equivalent `
 
 ## Polymorphic aliases
 
-An alias `g = f` of a generalized `f` needs no annotation. The `Var` arm instantiates `f`'s scheme
-inside `g`'s right-hand side, one level up, so `g`'s type holds quantifiable variables and `f`'s
-obligations ride them. `should_generalize` admits a right-hand side that is a `Var` bound to a
-generalized binding. A use of `g` specializes a clone of `Var f`, which specializes `f` inside the
-clone's walk, the path [3.1 Let-Polymorphism is Freshening
-(Instantiation)](type-inference.md#31-let-polymorphism-is-freshening-instantiation) describes for a
-generalized function used inside another.
+An alias `g = f` of a generalized `f` needs no annotation. Implemented as
+[A name of a generalized binding](type-inference.md#a-name-of-a-generalized-binding) describes.
 
 ---
 
@@ -299,7 +294,7 @@ One change per item, each updating this doc and the spec status it implements:
    `FunctionDef` and `Lambda`; a requirement's associated types by name; `<:` on a lambda's type
    parameters. Lowering refuses each new form as unsupported. A capitalized `def` parameter stops
    being a value parameter.
-2. **Polymorphic aliases.**
+2. **Polymorphic aliases** (implemented).
 3. **`Type::Poly`, `Type::Param`, bounds.** Lowering of `def` type parameters and of
    `\T -> V`, levels and escape, subtyping, checking a binding against a `Poly`, instantiation of
    bounds, specialization, the post-inference check, display.

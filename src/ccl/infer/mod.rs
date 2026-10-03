@@ -52,7 +52,7 @@
 //! generalized definition) by plain recursion.
 //!
 //! Generalization itself is narrow ([`should_generalize`](context::should_generalize)): only *function*
-//! definitions with a quantifiable variable. Value bindings stay monomorphic
+//! definitions with a quantifiable variable, and names of generalized bindings. Value bindings stay monomorphic
 //! and shared (the pre-let-poly behavior), since specializing a value would
 //! duplicate it, which the feed/define and join-planning machinery is sensitive
 //! to.
