@@ -69,6 +69,7 @@
 //! does not yet have. Which operators state which requirement, and which take a fixed
 //! result rather than an associated one, is `schemes.rs`'s business, not this module's.
 
+use crate::ccl::ty::TraitRequirement;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::rc::Rc;
@@ -119,14 +120,13 @@ pub enum Trait {
     /// operator's, identical for every pair the trait accepts.
     Equatable,
     /// `<`, `<=`, `>`, `>=` over `(𝐴, 𝐵)`, associating **nothing**, as [`Equatable`].
+    /// `max` places it on its codomain twice, `(γ, γ)`: a pure requirement, since the
+    /// aggregate's scheme already returns an element of what it consumes.
     ///
     /// [`Equatable`]: Trait::Equatable
     Orderable,
     /// Unary `-` over `(𝐴)`, associating `Output`.
     Negatable,
-    /// `max`'s codomain, over `(𝐴)`, associating **nothing** — a pure requirement,
-    /// since the aggregate's scheme already returns an element of what it consumes.
-    Comparable,
 }
 
 /// A type a trait associates with the types satisfying it — Rust's *associated
@@ -134,13 +134,31 @@ pub enum Trait {
 ///
 /// A trait is a requirement, not a function, so an associated type is something it
 /// happens to name rather than something it must produce. A trait may associate any
-/// number, **including none**: a bare requirement (`Orderable(γ)` on an aggregate's
+/// number, **including none**: a bare requirement (`Orderable(γ, γ)` on an aggregate's
 /// codomain) associates nothing, and saying so is better than manufacturing an
 /// output no one reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Assoc {
     /// The type an operator's result takes.
     Output,
+}
+
+impl Assoc {
+    /// The associated type a `requires` clause names by `name`, as in `Output=O`.
+    pub fn from_surface_name(name: &str) -> Option<Assoc> {
+        match name {
+            "Output" => Some(Assoc::Output),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Assoc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Assoc::Output => f.write_str("Output"),
+        }
+    }
 }
 
 /// One instance: the types it accepts, and what it associates with them.
@@ -234,14 +252,15 @@ const NUMERIC_OR_STRING: &[TraitInstance] = &[
     },
 ];
 
-/// Homogeneous comparison over every base the interpreter can compare.
+/// Homogeneous comparison over every base the interpreter can compare, which is also
+/// every base `max` folds (`ccl/aggregate.rs`).
 ///
 /// **Associates nothing.** A comparison's `Bool` is fixed by the *operator's*
 /// signature, not computed by the trait: it is the same `Bool` for every pair of
 /// types the trait accepts, so it carries no information about them. Recording it as
 /// an associated type would state that the trait determines something it does not —
 /// the same mistake as an operator inheriting an operand's refinement, one level up.
-const COMPARABLE: &[TraitInstance] = &[
+const COMPARISON: &[TraitInstance] = &[
     TraitInstance {
         args: &[BaseType::Int, BaseType::Int],
         assoc: &[],
@@ -267,23 +286,6 @@ const NEGATABLE: &[TraitInstance] = &[TraitInstance {
     assoc: &[(Assoc::Output, BaseType::Int, None)],
 }];
 
-/// The bases an aggregate can order, matching `max`'s merge in `ccl/mod.rs`. Unary
-/// and associating nothing — the fourth shape, and a pure requirement.
-const ORDERED: &[TraitInstance] = &[
-    TraitInstance {
-        args: &[BaseType::Int],
-        assoc: &[],
-    },
-    TraitInstance {
-        args: &[BaseType::UInt],
-        assoc: &[],
-    },
-    TraitInstance {
-        args: &[BaseType::String],
-        assoc: &[],
-    },
-];
-
 impl Trait {
     /// This trait's instances.
     ///
@@ -302,9 +304,8 @@ impl Trait {
             Trait::Subtractable | Trait::Multipliable | Trait::Divisible | Trait::Exponentiable => {
                 NUMERIC
             }
-            Trait::Equatable | Trait::Orderable => COMPARABLE,
+            Trait::Equatable | Trait::Orderable => COMPARISON,
             Trait::Negatable => NEGATABLE,
-            Trait::Comparable => ORDERED,
         }
     }
 
@@ -339,10 +340,27 @@ impl Trait {
     /// Equality only. It is defined componentwise on any product, which is what makes the
     /// decomposition a reading of the trait rather than a new relation. Ordering is not:
     /// comparing two products needs an order on their components, and a record's fields
-    /// carry none, so `Orderable` and `Comparable` stay what their rows say they are.
+    /// carry none, so `Orderable` stays what its rows say it is.
     /// Arithmetic has no product reading at all.
     pub fn is_structural(self) -> bool {
         matches!(self, Trait::Equatable)
+    }
+
+    /// The trait a `requires` clause names by `name`, or `None` for a name that is no
+    /// trait. `AddableRefined` has no surface name (`docs/chl-spec.md`, "Trait
+    /// requirements").
+    pub fn from_surface_name(name: &str) -> Option<Trait> {
+        Some(match name {
+            "Addable" => Trait::Addable,
+            "Subtractable" => Trait::Subtractable,
+            "Multipliable" => Trait::Multipliable,
+            "Divisible" => Trait::Divisible,
+            "Exponentiable" => Trait::Exponentiable,
+            "Equatable" => Trait::Equatable,
+            "Orderable" => Trait::Orderable,
+            "Negatable" => Trait::Negatable,
+            _ => return None,
+        })
     }
 
     /// The trait's name, for diagnostics.
@@ -357,7 +375,6 @@ impl Trait {
             Trait::Equatable => "Equatable",
             Trait::Orderable => "Orderable",
             Trait::Negatable => "Negatable",
-            Trait::Comparable => "Comparable",
         }
     }
 }
@@ -399,6 +416,16 @@ pub struct TraitObligation {
     /// The instances still consistent with everything seen so far.
     /// Monotonically shrinking; empty is unrepresentable (it is the error).
     candidates: RefCell<Vec<TraitInstance>>,
+    /// The **assumptions** still consistent with everything seen so far: the
+    /// requirements of the `requires` clauses in scope where the obligation was
+    /// minted, read as further rows beside [`candidates`](Self::candidates)
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    /// Shrinks as `candidates` does; the obligation fails only when both are empty.
+    assumptions: RefCell<Vec<Rc<TraitRequirement>>>,
+    /// Every assumption in scope at minting, before any narrowing: what an
+    /// obligation this one mints for a product's component starts from
+    /// ([`narrow_product`](Self::narrow_product)).
+    in_scope: RefCell<Rc<Vec<Rc<TraitRequirement>>>>,
     /// The type standing at each operand position, indexed by position.
     ///
     /// Recorded by [`watch`](Self::watch), which is the one place a position is bound to a
@@ -446,6 +473,12 @@ enum ProductRule {
     Open,
     /// A base arrived, so only the rows can answer.
     RuledOut,
+    /// A product arrived, recorded here with its components' refinements peeled, while an
+    /// assumption stating that product still answers the obligation. The rule waits: its
+    /// conditions would demand that every operand be a product, which an assumption
+    /// relating the product to a type parameter does not state
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    Pending(Type),
     /// A product arrived, recorded here with its components' refinements peeled, and the
     /// rule's conditions are minted ([`TraitObligation::apply_product_rule`]).
     Applied(Type),
@@ -477,6 +510,8 @@ impl TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_,
             candidates: RefCell::new(trait_.instances().to_vec()),
+            assumptions: RefCell::new(Vec::new()),
+            in_scope: RefCell::new(Rc::new(Vec::new())),
             operands: RefCell::new(Vec::new()),
             product_rule: RefCell::new(if trait_.is_structural() {
                 ProductRule::Open
@@ -517,6 +552,8 @@ impl TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
             trait_: original.trait_,
             candidates: RefCell::new(original.candidates()),
+            assumptions: RefCell::new(original.assumptions.borrow().clone()),
+            in_scope: RefCell::new(Rc::clone(&original.in_scope.borrow())),
             operands: RefCell::new(Vec::new()),
             product_rule: RefCell::new(original.product_rule.borrow().clone()),
             assoc: original
@@ -563,6 +600,217 @@ impl TraitObligation {
     /// The candidates still live, for diagnostics and tests.
     pub fn candidates(&self) -> Vec<TraitInstance> {
         self.candidates.borrow().clone()
+    }
+
+    /// Add the assumptions in scope where this obligation was minted, as rows beside
+    /// its trait's instances. Only those about this obligation's trait are kept.
+    pub fn assume(&self, in_scope: &[Rc<TraitRequirement>]) {
+        let rows: Vec<Rc<TraitRequirement>> = in_scope
+            .iter()
+            .filter(|a| a.trait_ == self.trait_)
+            .cloned()
+            .collect();
+        *self.assumptions.borrow_mut() = rows.clone();
+        *self.in_scope.borrow_mut() = Rc::new(rows);
+    }
+
+    /// Rewrite every type its assumptions state through `f`: a specialization clone
+    /// re-mints the type parameters of the definitions nested in it, and its copy of
+    /// an obligation must name the clone's parameters, not the original's.
+    pub(crate) fn map_assumptions(&self, mut f: impl FnMut(&Type) -> Type) {
+        let mut map = |rows: &[Rc<TraitRequirement>]| -> Vec<Rc<TraitRequirement>> {
+            rows.iter().map(|r| Rc::new(r.map_types(&mut f))).collect()
+        };
+        let assumptions = map(&self.assumptions.borrow());
+        let in_scope = map(&self.in_scope.borrow());
+        *self.assumptions.borrow_mut() = assumptions;
+        *self.in_scope.borrow_mut() = Rc::new(in_scope);
+    }
+
+    /// Replace each variable an assumption of a reset copy states with what `resolve`
+    /// settles it to, once the pin has tied it to the use's types.
+    ///
+    /// The variables are a specialized binding's own parameters, which a kept row
+    /// ([`reset_for_specialization`](Self::reset_for_specialization)) names beside a
+    /// nested definition's. An assumption is matched by equality, so it states a base
+    /// rather than a variable standing for one.
+    pub(crate) fn settle_assumptions(&self, mut resolve: impl FnMut(&Type) -> Option<Type>) {
+        self.map_assumptions(|t| match t {
+            Type::Infer(_) => resolve(t).unwrap_or_else(|| t.clone()),
+            _ => t.clone(),
+        });
+    }
+
+    /// Add `more` to the assumptions this obligation is answered by, keeping those
+    /// about its trait that it does not hold yet.
+    pub(crate) fn assume_more(&self, more: &[Rc<TraitRequirement>]) {
+        let mut assumptions = self.assumptions.borrow_mut();
+        let mut in_scope = (**self.in_scope.borrow()).clone();
+        for a in more.iter().filter(|a| a.trait_ == self.trait_) {
+            if !in_scope.contains(a) {
+                in_scope.push(Rc::clone(a));
+                assumptions.push(Rc::clone(a));
+            }
+        }
+        *self.in_scope.borrow_mut() = Rc::new(in_scope);
+    }
+
+    /// Reset a specialization's copy whose rows assume one of the specialized
+    /// binding's own type parameters, `own`.
+    ///
+    /// The copy stands where the parameter is a concrete type, so an assumption
+    /// about the parameter alone no longer describes it: the copy goes back to its
+    /// trait's instances and the assumptions it still needs, and nothing it had
+    /// deposited stands. An assumption that also names another parameter, one of a
+    /// definition nested in the clone, is the only row answering that parameter, so it
+    /// is kept, its own parameters becoming the clone's variables and then the use's
+    /// types ([`settle_assumptions`](Self::settle_assumptions)). Returns whether it was
+    /// reset; a reset copy is [redelivered](Self::redeliver) once the clone is pinned
+    /// (`src/ccl/design/type-parameters.md`, "Specialization").
+    pub(super) fn reset_for_specialization(&self, own: &[crate::ccl::ty::TypeParamId]) -> bool {
+        let names_own = |a: &Rc<TraitRequirement>| a.mentions_any(own);
+        if !self.assumptions.borrow().iter().any(names_own) {
+            return false;
+        }
+        let only_own = |a: &&Rc<TraitRequirement>| names_own(a) && !a.mentions_other_than(own);
+        *self.candidates.borrow_mut() = self.trait_.instances().to_vec();
+        *self.product_rule.borrow_mut() = if self.trait_.is_structural() {
+            ProductRule::Open
+        } else {
+            ProductRule::Absent
+        };
+        let kept: Vec<Rc<TraitRequirement>> = self
+            .in_scope
+            .borrow()
+            .iter()
+            .filter(|a| !only_own(a))
+            .cloned()
+            .collect();
+        *self.assumptions.borrow_mut() = kept.clone();
+        *self.in_scope.borrow_mut() = Rc::new(kept);
+        for position in &self.assoc {
+            position.deposited.set(false);
+        }
+        true
+    }
+
+    /// Offer this obligation everything its operand variables already carry, read
+    /// transitively through variable bounds.
+    ///
+    /// For a specialization's [reset](Self::reset_for_specialization) copy: the
+    /// copy's bounds were written directly, so they were never delivered, and the
+    /// pin that ties the copy to its use's types reaches the operands only through
+    /// those bounds.
+    pub(crate) fn redeliver(
+        self: &Rc<Self>,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let operands = self.operands.borrow().clone();
+        for (pos, operand) in operands.iter().enumerate() {
+            let Some(Type::Infer(var)) = operand else {
+                continue;
+            };
+            let mut stack = vec![Rc::clone(var)];
+            let mut seen = std::collections::HashSet::new();
+            let mut contributions = Vec::new();
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v.uid) {
+                    continue;
+                }
+                for bound in v.bounds.borrow().lower().iter() {
+                    match &bound.ty {
+                        Type::Infer(below) => stack.push(Rc::clone(below)),
+                        other => contributions.push(other.clone()),
+                    }
+                }
+            }
+            for contribution in contributions {
+                deliver(self, pos as u8, &contribution, cache)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Narrow by a type parameter arriving at `pos`, inside the definition that
+    /// declares it.
+    ///
+    /// An assumption naming the parameter there is what answers it. The instances accept
+    /// bases only and the product rule products only, so both drop out. With no such
+    /// assumption, the parameter offers its bound in its place, and an unbounded
+    /// parameter supports nothing (`src/ccl/design/type-parameters.md`, "Obligations
+    /// under assumptions").
+    fn narrow_param(
+        self: &Rc<Self>,
+        pos: u8,
+        param: &Rc<crate::ccl::ty::TypeParam>,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let stated = Type::Param(Rc::clone(param));
+        let assumed = self
+            .assumptions
+            .borrow()
+            .iter()
+            .any(|a| a.args.get(pos as usize) == Some(&stated));
+        if assumed {
+            self.candidates.borrow_mut().clear();
+            self.rule_out_product_rule();
+            self.assumptions
+                .borrow_mut()
+                .retain(|a| a.args.get(pos as usize) == Some(&stated));
+            return self.try_deposit(cache);
+        }
+        match &param.bound {
+            // The operand is this parameter, so a requirement missing further up its bound
+            // chain is missing of it.
+            Some(bound) => deliver(self, pos, bound, cache).map_err(|e| match e {
+                ConstrainError::MissingRequirement {
+                    trait_, position, ..
+                } => ConstrainError::MissingRequirement {
+                    trait_,
+                    position,
+                    param: Rc::clone(param),
+                },
+                other => other,
+            }),
+            None => Err(ConstrainError::MissingRequirement {
+                trait_: self.trait_,
+                position: pos,
+                param: Rc::clone(param),
+            }),
+        }
+    }
+
+    /// Rule the product rule out, unless it is absent or already applied.
+    fn rule_out_product_rule(&self) {
+        let mut rule = self.product_rule.borrow_mut();
+        if matches!(*rule, ProductRule::Open | ProductRule::Pending(_)) {
+            *rule = ProductRule::RuledOut;
+        }
+    }
+
+    /// Whether every candidate is gone: no row, no assumption, and no product rule
+    /// that could still answer.
+    fn exhausted(&self) -> bool {
+        self.candidates.borrow().is_empty()
+            && self.assumptions.borrow().is_empty()
+            && !matches!(
+                *self.product_rule.borrow(),
+                ProductRule::Open | ProductRule::Pending(_) | ProductRule::Applied(_)
+            )
+    }
+
+    /// What position `pos` still accepts, from the instances and the assumptions
+    /// alike, for a diagnostic.
+    fn accepted_types_at(&self, pos: u8) -> Vec<Type> {
+        let mut out: Vec<Type> = self.accepted_at(pos).into_iter().map(Type::Base).collect();
+        for a in self.assumptions.borrow().iter() {
+            if let Some(arg) = a.args.get(pos as usize)
+                && !out.contains(arg)
+            {
+                out.push(arg.clone());
+            }
+        }
+        out
     }
 
     /// The type standing at each associated position, in declaration order.
@@ -623,7 +871,7 @@ impl TraitObligation {
     /// a type at every position that trait declares, which is the same invariant
     /// [`accepted_at`](Self::accepted_at) rests on.
     fn siblings_of(&self, pos: u8) -> Vec<(u8, Vec<BaseType>)> {
-        let arity = self.candidates.borrow().first().map_or(0, |i| i.args.len());
+        let arity = self.trait_.arity();
         (0..arity as u8)
             .filter(|i| *i != pos)
             .map(|i| (i, self.accepted_at(i)))
@@ -652,13 +900,19 @@ impl TraitObligation {
                     drop(rule);
                     return self.reject(pos, &Type::Base(base.clone()));
                 }
-                ProductRule::Open => *rule = ProductRule::RuledOut,
+                ProductRule::Open | ProductRule::Pending(_) => *rule = ProductRule::RuledOut,
                 ProductRule::Absent | ProductRule::RuledOut => {}
             }
         }
         // Read before the mutable borrow: "what this position could have accepted" is
         // only meaningful before the contribution rules rows out.
+        #[cfg(debug_assertions)]
         let accepted = self.accepted_at(pos);
+        let accepted_types = self.accepted_types_at(pos);
+        // An assumption accepts a base where it states that base.
+        self.assumptions
+            .borrow_mut()
+            .retain(|a| matches!(a.args.get(pos as usize), Some(Type::Base(b)) if b == base));
         {
             let mut candidates = self.candidates.borrow_mut();
             #[cfg(debug_assertions)]
@@ -673,26 +927,30 @@ impl TraitObligation {
             if candidates.len() < before {
                 assert_post_emission_narrowing_selects(self, pos, base, &accepted);
             }
-            if candidates.is_empty() {
+            drop(candidates);
+            if self.exhausted() {
                 return Err(ConstrainError::NoTraitInstance {
                     trait_: self.trait_,
                     position: pos,
                     found: Type::Base(base.clone()),
-                    accepted: accepted.into_iter().map(Type::Base).collect(),
+                    accepted: accepted_types,
                 });
             }
         }
         self.try_deposit(cache)
     }
 
-    /// Answer a **product** contribution at `pos` by the trait's product rule.
+    /// Answer a **product** contribution at `pos`: by an assumption stating that product
+    /// there, or by the trait's product rule.
     ///
     /// The rule relates two products of the same shape when each field's components are
-    /// related in turn: for `Equatable`, `{𝑎₁ … 𝑎ₙ}` and `{𝑏₁ … 𝑏ₙ}` when every `𝑎ᵢ` and
-    /// `𝑏ᵢ` are `Equatable`. A product is no row's operand, so the first one to arrive
-    /// leaves the rule the one candidate and applies it ([`apply_product_rule`]); one
-    /// arriving after it has to have the same shape. A base already delivered has ruled the
-    /// rule out, and a trait with no product reading has none.
+    /// related in turn: for `Equatable`, `{𝑎₁ … 𝑎ₙ}` and `{𝑏₁ … 𝑏ₙ}` when each pair `𝑎ᵢ`,
+    /// `𝑏ᵢ` is `Equatable`. A product is no row's operand, so the rows drop out. The first
+    /// product to arrive applies the rule ([`apply_product_rule`]), unless an assumption
+    /// stating that product still answers the obligation; the rule then waits, and applies
+    /// once none does. A product arriving after it has to have the same shape. A base
+    /// already delivered has ruled the rule out, and a trait with no product reading has
+    /// none.
     ///
     /// [`apply_product_rule`]: Self::apply_product_rule
     fn narrow_product(
@@ -701,22 +959,98 @@ impl TraitObligation {
         product: &Type,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
-        let state = self.product_rule.borrow().clone();
-        match state {
-            ProductRule::Absent | ProductRule::RuledOut => self.reject(pos, product),
+        let peeled = peel_components(product);
+        let mut stated = canonical_type(&peeled);
+        let mut assumed = self
+            .assumptions
+            .borrow()
+            .iter()
+            .any(|a| a.args.get(pos as usize) == Some(&stated));
+        if !assumed && let Some(arg) = self.sole_assumption_it_can_become(pos, &stated) {
+            // A product of a generic use's variables arrives before its components do, so
+            // it states no assumption by equality yet. Where one assumption alone states a
+            // product it can become, the variables are that product's components.
+            for (component, stated_component) in product_components(&stated)
+                .iter()
+                .zip(product_components(&arg))
+            {
+                if matches!(component, Type::Infer(_)) {
+                    constrain_subtype(component, &stated_component, cache)?;
+                    constrain_subtype(&stated_component, component, cache)?;
+                }
+            }
+            stated = arg;
+            assumed = true;
+        }
+        // Nothing that could answer a product: reported against what the rows accept.
+        if !assumed
+            && matches!(
+                *self.product_rule.borrow(),
+                ProductRule::Absent | ProductRule::RuledOut
+            )
+        {
+            return self.reject(pos, product);
+        }
+        self.assumptions
+            .borrow_mut()
+            .retain(|a| a.args.get(pos as usize) == Some(&stated));
+        self.candidates.borrow_mut().clear();
+        let any_assumed = !self.assumptions.borrow().is_empty();
+        let current = self.product_rule.borrow().clone();
+        let (next, apply) = match current {
+            ProductRule::Absent | ProductRule::RuledOut => (current, None),
             ProductRule::Applied(settled) => {
-                if product_shape(&settled) == product_shape(product) {
-                    Ok(())
+                if product_shape(&settled) != product_shape(&peeled) {
+                    return self.reject(pos, product);
+                }
+                (ProductRule::Applied(settled), None)
+            }
+            ProductRule::Pending(settled) => {
+                if product_shape(&settled) != product_shape(&peeled) {
+                    (ProductRule::RuledOut, None)
+                } else if any_assumed {
+                    (ProductRule::Pending(settled), None)
                 } else {
-                    self.reject(pos, product)
+                    (ProductRule::Applied(settled.clone()), Some(settled))
                 }
             }
             ProductRule::Open => {
-                let product = peel_components(product);
-                *self.product_rule.borrow_mut() = ProductRule::Applied(product.clone());
-                self.apply_product_rule(&product, cache)
+                if any_assumed {
+                    (ProductRule::Pending(peeled), None)
+                } else {
+                    (ProductRule::Applied(peeled.clone()), Some(peeled))
+                }
             }
+        };
+        *self.product_rule.borrow_mut() = next;
+        if self.exhausted() {
+            return self.reject(pos, product);
         }
+        if let Some(at) = apply {
+            self.apply_product_rule(&at, cache)?;
+        }
+        self.try_deposit(cache)
+    }
+
+    /// The one assumption stating, at `pos`, a product of `stated`'s shape whose every
+    /// component is `stated`'s, or one a variable component of `stated` can become.
+    /// `None` when no assumption or more than one does.
+    fn sole_assumption_it_can_become(&self, pos: u8, stated: &Type) -> Option<Type> {
+        let fields = product_shape(stated);
+        let components = product_components(stated);
+        let assumptions = self.assumptions.borrow();
+        let mut fitting = assumptions.iter().filter_map(|a| {
+            let arg = canonical_type(a.args.get(pos as usize)?);
+            let fits = matches!(arg, Type::Tuple(_) | Type::Record(_))
+                && product_shape(&arg) == fields
+                && components
+                    .iter()
+                    .zip(product_components(&arg))
+                    .all(|(c, a)| matches!(c, Type::Infer(_)) || *c == a);
+            fits.then_some(arg)
+        });
+        let first = fitting.next()?;
+        fitting.next().is_none().then_some(first)
     }
 
     /// Mint the product rule's conditions for `product`'s shape: one obligation of this
@@ -770,6 +1104,9 @@ impl TraitObligation {
                 self.operator_node_id,
                 self.input_exprs(),
             );
+            // A condition is answered by the same `requires` clauses as the product:
+            // `Equatable({T, U}, {V, W})` is stated through its components too.
+            condition.assume(&self.in_scope.borrow());
             for (pos, slot) in at_field.iter().enumerate() {
                 condition.watch(slot, pos as u8);
             }
@@ -787,7 +1124,7 @@ impl TraitObligation {
     /// The product the product rule was applied at, if a product has arrived.
     pub(super) fn answered_by_product(&self) -> Option<Type> {
         match &*self.product_rule.borrow() {
-            ProductRule::Applied(product) => Some(product.clone()),
+            ProductRule::Applied(product) | ProductRule::Pending(product) => Some(product.clone()),
             _ => None,
         }
     }
@@ -814,7 +1151,7 @@ impl TraitObligation {
                 provenance::Nature::Machinery,
             );
             let target = position.ty.borrow().clone();
-            let ty_base = Type::Base(settled);
+            let ty_base = settled;
             let ty = match maybe_refinement {
                 Some(template) => Type::Refinement(
                     Box::new(ty_base),
@@ -855,15 +1192,32 @@ impl TraitObligation {
 
     /// The type every surviving instance associates with `name`, or `None` if
     /// they disagree — the condition a deposit waits on.
-    fn agreed_assoc(&self, name: Assoc) -> Option<(BaseType, Option<RefinementTemplate>)> {
-        let candidates = self.candidates.borrow();
-        let (first, rest) = candidates
-            .split_first()
-            .expect("a candidate set is never empty: emptying it is the error");
-        let (settled_ty, settled_rf) = first.assoc_ty(name)?;
-        rest.iter()
-            .all(|i| i.assoc_ty(name).map(|(t, _)| t) == Some(settled_ty))
-            .then(|| (settled_ty.clone(), settled_rf))
+    ///
+    /// Instances and assumptions are read alike: an assumption associates the type
+    /// its `requires` clause names, and one that names none leaves the position
+    /// open. A refinement template is an instance's alone.
+    fn agreed_assoc(&self, name: Assoc) -> Option<(Type, Option<RefinementTemplate>)> {
+        let mut settled: Option<(Type, Option<RefinementTemplate>)> = None;
+        let mut agree = |ty: Type, template: Option<RefinementTemplate>| match &settled {
+            None => {
+                settled = Some((ty, template));
+                true
+            }
+            Some((s, _)) => *s == ty,
+        };
+        for instance in self.candidates.borrow().iter() {
+            let (ty, template) = instance.assoc_ty(name)?;
+            if !agree(Type::Base(ty.clone()), template) {
+                return None;
+            }
+        }
+        for assumption in self.assumptions.borrow().iter() {
+            let ty = assumption.assoc_ty(name)?;
+            if !agree(ty.clone(), None) {
+                return None;
+            }
+        }
+        settled
     }
 }
 
@@ -1227,7 +1581,12 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             // An obligation answered by a product is answered off the table, so its
             // `accepted_at` is the untouched row set and intersecting it would deposit a
             // base at a place holding a product ([`TraitObligation::narrow_product`]).
-            if obligation.answered_by_product().is_some() {
+            //
+            // An obligation that still holds assumptions is about a type parameter its
+            // `requires` clause states, which the sweep's base intersection cannot read.
+            if obligation.answered_by_product().is_some()
+                || !obligation.assumptions.borrow().is_empty()
+            {
                 continue;
             }
             if !entry
@@ -1603,6 +1962,21 @@ pub(crate) fn product_fields(product: &Type) -> Vec<FieldKey> {
     }
 }
 
+/// `ty` with every record's fields in a canonical order, recursively: the form two
+/// spellings of one type share, which an assumption is matched in
+/// ([`TraitObligation::narrow_product`]).
+pub(crate) fn canonical_type(ty: &Type) -> Type {
+    let mut out = ty.clone();
+    fn go(ty: &mut Type) {
+        if let Type::Record(fields) = ty {
+            fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+        }
+        ty.walk_children_mut(go);
+    }
+    go(&mut out);
+    out
+}
+
 /// A product's fields in a canonical order, for deciding whether two products are the same
 /// shape.
 ///
@@ -1813,25 +2187,7 @@ fn deliver(
         Offered::Base(base) => obligation.narrow(pos, base, cache),
         Offered::Product(product) => obligation.narrow_product(pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
-        Offered::Param(param) => match &param.bound {
-            // The operand is this parameter, so a requirement missing further up its bound
-            // chain is missing of it.
-            Some(bound) => deliver(obligation, pos, bound, cache).map_err(|e| match e {
-                ConstrainError::MissingRequirement {
-                    trait_, position, ..
-                } => ConstrainError::MissingRequirement {
-                    trait_,
-                    position,
-                    param: Rc::clone(param),
-                },
-                other => other,
-            }),
-            None => Err(ConstrainError::MissingRequirement {
-                trait_: obligation.trait_,
-                position: pos,
-                param: Rc::clone(param),
-            }),
-        },
+        Offered::Param(param) => obligation.narrow_param(pos, param, cache),
         Offered::Unknown => Ok(()),
     }
 }
@@ -1902,7 +2258,10 @@ mod tests {
             .expect("Int is addable");
 
         assert!(
-            matches!(ob.agreed_assoc(Assoc::Output), Some((BaseType::Int, None))),
+            matches!(
+                ob.agreed_assoc(Assoc::Output),
+                Some((Type::Base(BaseType::Int), None))
+            ),
             "(Int, Int) ⇝ Int is the only row left, so its Output is settled, and \
              `+` leaves that output unrefined",
         );
@@ -2127,7 +2486,6 @@ mod tests {
             Trait::Equatable,
             Trait::Orderable,
             Trait::Negatable,
-            Trait::Comparable,
         ] {
             let (arity, assocs) = (trait_.arity(), trait_.assocs());
             for row in trait_.instances() {

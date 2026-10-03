@@ -121,6 +121,9 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
 #[case("sum([1,2,3])", Value::Int(6))]
 #[case("max([x + 1 for x in [1,2,3]])", Value::Int(4))]
 #[case("max([x + sum([1,2,3]) for x in [1,2,3]])", Value::Int(9))]
+// `Bool` is `Orderable`, with `False < True` (`docs/chl-spec.md`, "Trait requirements").
+#[case("max([False, True, False])", Value::Bool(true))]
+#[case("max([False, False])", Value::Bool(false))]
 fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

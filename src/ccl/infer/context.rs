@@ -27,6 +27,7 @@ use super::solve::value_type;
 use super::typing::Typing;
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
+use crate::ccl::ty::TraitRequirement;
 
 /// A lexical-scope entry: the binder's polymorphic scheme.
 ///
@@ -184,6 +185,11 @@ pub(super) struct InferCtx {
     /// [`Typing::close_poly`], so a `Poly` an alias names, opened by each binding it
     /// annotates, maps to that binding's parameters alone.
     opened_params: Vec<(crate::ccl::ty::TypeParamId, Type)>,
+    /// The assumptions in scope at the current emission position: the `requires`
+    /// clauses of the polymorphic annotations whose right-hand sides enclose it.
+    /// Every obligation `require_trait` mints takes those about its trait
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    assumptions: Vec<Rc<TraitRequirement>>,
     /// The binders in lexical scope at the current emission position — what
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
@@ -240,6 +246,7 @@ impl InferCtx {
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
             opened_params: Vec::new(),
+            assumptions: Vec::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
         }
@@ -525,6 +532,7 @@ impl Typing for InferCtx {
             operator_node_id,
             operand_exprs.iter().map(|e| (*e).clone()).collect(),
         );
+        obligation.assume(&self.assumptions);
         for (i, position) in positions.iter().enumerate() {
             obligation.watch(position, i as u8);
         }
@@ -568,10 +576,26 @@ impl Typing for InferCtx {
         base
     }
 
-    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) -> Result<(), LocatedInferError> {
+    fn with_assumptions<R>(
+        &mut self,
+        assumptions: &[Rc<TraitRequirement>],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let depth = self.assumptions.len();
+        self.assumptions.extend(assumptions.iter().cloned());
+        let r = f(self);
+        self.assumptions.truncate(depth);
+        r
+    }
+
+    fn open_poly(
+        &mut self,
+        poly: &crate::ccl::ty::PolyType,
+    ) -> Result<crate::ccl::ty::PolyType, LocatedInferError> {
         // In declaration order: a bound names only the parameters before it, which are
         // open by the time it is typed and normalized.
         let mut failed = None;
+        let mut params = Vec::with_capacity(poly.params.len());
         for p in &poly.params {
             let bound = p.bound().map(|b| {
                 let mut b = b.clone();
@@ -580,11 +604,28 @@ impl Typing for InferCtx {
                 }
                 self.normalize_annotation(&b)
             });
-            let opened =
-                crate::ccl::ty::TypeParam::opened(p.param.spelling.clone(), self.level, bound);
-            self.opened_params.push((p.param.id, Type::Param(opened)));
+            let opened = crate::ccl::ty::TypeParam::opened(
+                p.param.spelling.clone(),
+                self.level,
+                bound.clone(),
+            );
+            self.opened_params
+                .push((p.param.id, Type::Param(Rc::clone(&opened))));
+            params.push(crate::ccl::ty::PolyParam::with_bound(opened, bound));
         }
-        failed.map_or(Ok(()), Err)
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        let requires = poly
+            .requires
+            .iter()
+            .map(|r| Rc::new(r.map_types(|t| self.normalize_annotation(t))))
+            .collect();
+        Ok(crate::ccl::ty::PolyType {
+            params,
+            requires,
+            body: poly.body.clone(),
+        })
     }
 
     fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType) {
@@ -691,8 +732,14 @@ impl Typing for InferCtx {
             // Polymorphic: generalize at the outer level. Each `Var` use
             // instantiates a fresh copy; the coalesce walk then specializes
             // the definition per distinct use instantiation
-            // (`specialize_use`).
-            PolyScheme::poly(self.level, bound_ty.clone())
+            // (`specialize_use`). A binding annotated with a polymorphic type, which
+            // `emit_let` has opened in place, also states its `requires` clause, which
+            // each use instantiates.
+            let requires = match &binding.user_annotation {
+                Some(Type::Poly(poly)) => poly.requires.clone(),
+                _ => Vec::new(),
+            };
+            PolyScheme::poly(self.level, bound_ty.clone()).with_requires(requires)
         } else {
             // Monomorphic: one type, shared by every use, so `instantiate` freshens
             // nothing — uses stay as `Var` references and share the binding's

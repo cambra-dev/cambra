@@ -418,9 +418,9 @@ generalized definition while retaining a captured outer channel. See
 `max(xs)` lower to this node. `OperatorSchemes::aggregate` supplies the whole input-to-output
 type; `emit_aggregate` applies that scheme to the inferred input. A collection input has data
 function type `𝐷 ⤇ 𝑉`. `Sum` requires `Int` elements and yields `Int`. `Max` yields the element
-type and also requires `Comparable`. `Drain` consumes any element type and yields `Unit`; `Sole`
-yields the element type and requires at most one input element at runtime. Operator conversion
-dispatches by `AggregateKind`, without inspecting a call-site variable name.
+type and also requires `Orderable` of two elements. `Drain` consumes any element type and yields
+`Unit`; `Sole` yields the element type and requires at most one input element at runtime.
+Operator conversion dispatches by `AggregateKind`, without inspecting a call-site variable name.
 
 `AggregateKind` also defines the output extent, seed, fold, and partiality. `Sum`, `Max`, and
 `Drain` use total folds with an in-band identity. `Sole` has an `Option(𝐴)`-like accumulator:

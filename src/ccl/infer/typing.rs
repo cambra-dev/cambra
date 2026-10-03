@@ -136,7 +136,9 @@ pub(super) trait Typing {
     /// declares, at the current level and over its normalized bound, which
     /// normalization then puts in place of the declared one until
     /// [`close_poly`](Self::close_poly) (`src/ccl/design/type-parameters.md`,
-    /// "Checking a binding against a polymorphic type"). Called inside
+    /// "Checking a binding against a polymorphic type"). Returns the `Poly` opened:
+    /// its parameters the opened ones, and its `requires` clause normalized, the
+    /// assumptions the right-hand side is emitted under. Called inside
     /// [`in_let_rhs`](Self::in_let_rhs), so a parameter sits at the level of the
     /// right-hand side's own variables. Check never meets a `Poly`: none survives
     /// inference.
@@ -147,7 +149,20 @@ pub(super) trait Typing {
     /// would reach the post-inference wall with its variables unresolved. Every
     /// parameter is opened even when a predicate fails, so
     /// [`close_poly`](Self::close_poly) closes what this opened.
-    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) -> Result<(), LocatedInferError>;
+    fn open_poly(
+        &mut self,
+        poly: &crate::ccl::ty::PolyType,
+    ) -> Result<crate::ccl::ty::PolyType, LocatedInferError>;
+
+    /// Run `f` with `assumptions` in scope: every trait obligation minted meanwhile
+    /// takes those about its trait as rows beside its instances. Check mints none.
+    fn with_assumptions<R>(
+        &mut self,
+        assumptions: &[std::rc::Rc<crate::ccl::ty::TraitRequirement>],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
+    where
+        Self: Sized;
 
     /// Close the innermost `Poly` [`open_poly`](Self::open_poly) opened, once its
     /// binding's right-hand side and annotation are checked.

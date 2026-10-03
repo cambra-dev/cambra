@@ -495,12 +495,11 @@ mod tests {
         );
     }
 
-    /// `max` is defined at eval only for orderable bases (`Int`/`UInt`/`String` —
-    /// see merge/identity in `ccl/mod.rs`), and its scheme `∀α γ. (α ⤇ γ) ⇒ γ`
-    /// cannot say so: `γ` is the codomain it *returns*, so nothing about it is
-    /// constrained.
+    /// `max` is defined at eval only for orderable bases (see identity and merge in
+    /// `ccl/aggregate.rs`), and its scheme `∀α γ. (α ⤇ γ) ⇒ γ` cannot say so: `γ` is
+    /// the codomain it *returns*, so nothing about it is constrained.
     ///
-    /// `Comparable(γ)` says it — a **pure requirement**, associating nothing, since
+    /// `Orderable(γ, γ)` says it — a **pure requirement**, associating nothing, since
     /// the scheme already supplies the result type. A codomain the program never
     /// determines is still accepted here, as an unresolved variable rather than a
     /// missing instance; that is the ordinary limit of narrowing, not a gap
@@ -533,9 +532,9 @@ mod tests {
             errs.iter().any(|e| matches!(
                 e,
                 crate::ccl::infer::InferError::NoTraitInstance { trait_, .. }
-                    if trait_ == "Comparable"
+                    if trait_ == "Orderable"
             )),
-            "expected NoTraitInstance for Comparable, got {errs:?}"
+            "expected NoTraitInstance for Orderable, got {errs:?}"
         );
     }
 }

@@ -1399,16 +1399,75 @@ static TYPE_PARAM_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub struct PolyType {
     /// The type parameters, in declaration order, each with its kind.
     pub params: Vec<PolyParam>,
+    /// The `requires` clause.
+    pub requires: Vec<Rc<TraitRequirement>>,
     /// The type the parameters are quantified over.
     pub body: Type,
 }
 
+/// A trait requirement: `Addable(A, B, Output=O)` in a `requires` clause
+/// (`docs/chl-spec.md`, "Trait requirements").
+///
+/// One type serves every reading of a requirement. In a lowered [`PolyType`] its
+/// operands are base types, declared type parameters, and products against a type
+/// parameter, a requirement between products of one shape already read componentwise
+/// (`src/ccl/design/type-parameters.md`, "Lowering requirements"). Opened and normalized,
+/// it is an **assumption**: a row of
+/// the candidate set of each obligation minted while the definition it annotates is
+/// emitted (`src/ccl/design/type-parameters.md`, "Obligations under assumptions"), and
+/// freshened at a use, an obligation that use must satisfy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TraitRequirement {
+    pub trait_: crate::ccl::infer::solver::traits::Trait,
+    /// One per operand position.
+    pub args: Vec<Type>,
+    /// The associated types the clause names. One it leaves unnamed is absent, and
+    /// leaves that position open.
+    pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+}
+
+impl TraitRequirement {
+    /// This requirement with `f` applied to each operand and associated type.
+    pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> TraitRequirement {
+        TraitRequirement {
+            trait_: self.trait_,
+            args: self.args.iter().map(&mut f).collect(),
+            assoc: self.assoc.iter().map(|(n, t)| (*n, f(t))).collect(),
+        }
+    }
+
+    /// The type this requirement associates with `name`, if it names one.
+    pub fn assoc_ty(&self, name: crate::ccl::infer::solver::traits::Assoc) -> Option<&Type> {
+        self.assoc.iter().find(|(n, _)| *n == name).map(|(_, t)| t)
+    }
+
+    /// Whether an operand is one of the type parameters `params`.
+    pub fn mentions_any(&self, params: &[TypeParamId]) -> bool {
+        self.args
+            .iter()
+            .any(|t| matches!(t, Type::Param(p) if params.contains(&p.id)))
+    }
+
+    /// Whether an operand is a type parameter other than `params`.
+    pub fn mentions_other_than(&self, params: &[TypeParamId]) -> bool {
+        self.args
+            .iter()
+            .any(|t| matches!(t, Type::Param(p) if !params.contains(&p.id)))
+    }
+}
+
 impl PolyType {
-    /// Every type this `Poly` holds: each kind's in declaration order, then the body.
+    /// Every type this `Poly` holds: each kind's in declaration order, each
+    /// requirement's operands and associated types, then the body.
     pub fn types(&self) -> impl Iterator<Item = &Type> {
         self.params
             .iter()
             .flat_map(|p| p.kind.children())
+            .chain(
+                self.requires
+                    .iter()
+                    .flat_map(|r| r.args.iter().chain(r.assoc.iter().map(|(_, t)| t))),
+            )
             .chain(std::iter::once(&self.body))
     }
 
@@ -1417,11 +1476,15 @@ impl PolyType {
         self.params
             .iter_mut()
             .flat_map(|p| p.kind.children_mut())
+            .chain(self.requires.iter_mut().flat_map(|r| {
+                let r = Rc::make_mut(r);
+                r.args.iter_mut().chain(r.assoc.iter_mut().map(|(_, t)| t))
+            }))
             .chain(std::iter::once(&mut self.body))
     }
 
-    /// This `Poly` with `f` applied to each kind's types and to the body; the
-    /// parameters keep their identities.
+    /// This `Poly` with `f` applied to each kind's types, each requirement's types and
+    /// the body; the parameters keep their identities.
     pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> PolyType {
         PolyType {
             params: self
@@ -1431,6 +1494,11 @@ impl PolyType {
                     param: Rc::clone(&p.param),
                     kind: p.kind.map_children(&mut f),
                 })
+                .collect(),
+            requires: self
+                .requires
+                .iter()
+                .map(|r| Rc::new(r.map_types(&mut f)))
                 .collect(),
             body: f(&self.body),
         }
@@ -1450,6 +1518,14 @@ pub struct PolyParam {
 }
 
 impl PolyParam {
+    /// `param` with kind `SubtypesOf(bound)`, or `Type` with no bound.
+    pub fn with_bound(param: Rc<TypeParam>, bound: Option<Type>) -> PolyParam {
+        PolyParam {
+            param,
+            kind: bound.map_or(TypeKind::Type, |b| TypeKind::SubtypesOf(Box::new(b))),
+        }
+    }
+
     /// The upper bound the parameter's kind gives it: `𝐵` for `SubtypesOf(𝐵)`, and
     /// none for `Type`.
     ///
@@ -2242,7 +2318,26 @@ fn fmt_type(
                 "forall ({}) {}",
                 params.join(", "),
                 at(&poly.body, binders)
-            )
+            )?;
+            let requires: Vec<String> = poly
+                .requires
+                .iter()
+                .map(|r| {
+                    let mut args: Vec<String> =
+                        r.args.iter().map(|t| at(t, binders).to_string()).collect();
+                    args.extend(
+                        r.assoc
+                            .iter()
+                            .map(|(n, t)| format!("{n}={}", at(t, binders))),
+                    );
+                    format!("{}({})", r.trait_, args.join(", "))
+                })
+                .collect();
+            if requires.is_empty() {
+                Ok(())
+            } else {
+                write!(f, " requires {}", requires.join(", "))
+            }
         }
         Type::Txn => write!(f, "Txn"),
         Type::History {

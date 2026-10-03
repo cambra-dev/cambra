@@ -11,7 +11,7 @@ use crate::{
     },
     chl_parser::ast::{
         AnnotationMode, AssignTarget, BinOp as ChlBinOp, IfBranch, KindAnnotation, MatchArm,
-        PayloadPattern, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
+        PayloadPattern, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
     },
 };
 
@@ -742,12 +742,12 @@ pub(super) fn lower_middle_stmt(
             requires,
             body: fn_body,
         } => {
-            refuse_requires_clause(requires)?;
             let (func_expr, annotation) = lower_def(
                 stmt.span,
                 type_params,
                 params,
                 output.as_ref(),
+                requires,
                 fn_body,
                 ctx,
             )?;
@@ -1299,8 +1299,8 @@ pub(super) fn lower_let_annotation(
 /// Declare `type_params` in the current alias scope, in order, each as an alias of
 /// a declared [`Type::Param`], which inference replaces with the parameter it mints
 /// when it opens the `Poly`, and each kind lowered with the parameters before it in
-/// scope.
-/// Return them as a `Poly`'s parameter list. The caller owns the scope.
+/// scope. Each is also pushed onto [`LoweringContext::type_params_in_scope`]. Return
+/// them as a `Poly`'s parameter list. The caller owns both scopes and restores them.
 pub(super) fn declare_type_params(
     type_params: &[TypeParam],
     ctx: &mut LoweringContext,
@@ -1323,6 +1323,7 @@ pub(super) fn declare_type_params(
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
         ctx.declare_type_alias(name, Type::Param(Rc::clone(&param)));
+        ctx.type_params_in_scope.push(name.to_string());
         declared.push(crate::ccl::ty::PolyParam { param, kind });
     }
     Ok(declared)
@@ -1424,6 +1425,231 @@ fn lower_bound(
             ),
         )),
     }
+}
+
+/// Lower a `requires` clause over the type parameters in scope
+/// (`docs/chl-spec.md`, "Trait requirements").
+///
+/// Each requirement names a trait the table has, with that trait's operand count and
+/// associated types. An `Equatable` over products is read componentwise, as `==` reads
+/// two products, so it lowers to one requirement per component. After that every
+/// operand is a type parameter or a base type, and one that no instance could accept,
+/// alone or with the other operands' bases, is refused here, since no use could
+/// satisfy it. A requirement on bases only states nothing about a parameter: it is
+/// checked against the table and dropped.
+pub(super) fn lower_requirements(
+    requires: &[Spanned<Requirement>],
+    ctx: &mut LoweringContext,
+) -> Result<Vec<Rc<crate::ccl::ty::TraitRequirement>>, LoweringError> {
+    use crate::ccl::infer::solver::traits::{Assoc, Trait};
+    let mut out = Vec::new();
+    for req in requires {
+        let name = req.node.name.as_str();
+        if name == "Transaction" {
+            return Err(LoweringError::unsupported(
+                req.node.name_span,
+                "`requires Transaction` is not supported yet: transactions as contextual \
+                 parameters are not implemented",
+            ));
+        }
+        let Some(trait_) = Trait::from_surface_name(name) else {
+            return Err(LoweringError::unsupported(
+                req.node.name_span,
+                format!(
+                    "`{name}` is not a trait; a requirement names one of Addable, Subtractable, \
+                     Multipliable, Divisible, Exponentiable, Negatable, Equatable, Orderable"
+                ),
+            ));
+        };
+        if req.node.args.len() != trait_.arity() {
+            return Err(LoweringError::unsupported(
+                req.span,
+                format!(
+                    "`{trait_}` is over {} type(s), and this requirement names {}",
+                    trait_.arity(),
+                    req.node.args.len()
+                ),
+            ));
+        }
+        // An instance row matches a base whatever its refinements, so a requirement
+        // states none (`docs/chl-spec.md`, "Trait requirements").
+        let args = req
+            .node
+            .args
+            .iter()
+            .map(|a| lower_type_expr(a, ctx).map(|t| crate::ccl::ccl_utils::strip_refinements(&t)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut assoc: Vec<(Assoc, Type)> = Vec::new();
+        for a in &req.node.assoc {
+            let Some(n) =
+                Assoc::from_surface_name(a.name.as_str()).filter(|n| trait_.assocs().contains(n))
+            else {
+                return Err(LoweringError::unsupported(
+                    a.name_span,
+                    format!("`{trait_}` associates no type named `{}`", a.name),
+                ));
+            };
+            if assoc.iter().any(|(m, _)| *m == n) {
+                return Err(LoweringError::unsupported(
+                    a.name_span,
+                    format!("`{n}` is named twice in this requirement"),
+                ));
+            }
+            let ty = crate::ccl::ccl_utils::strip_refinements(&lower_type_expr(&a.value, ctx)?);
+            if !is_requirement_operand(&ty) {
+                return Err(LoweringError::unsupported(
+                    a.value.span,
+                    format!(
+                        "`{n}=…` names a type parameter or a base type; no instance of \
+                         `{trait_}` associates `{ty}`"
+                    ),
+                ));
+            }
+            assoc.push((n, ty));
+        }
+        expand_requirement(trait_, args, assoc, req.span, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Whether `ty` may stand at a requirement's position: a type parameter in scope or a
+/// base type.
+fn is_requirement_operand(ty: &Type) -> bool {
+    matches!(ty, Type::Param(_) | Type::Base(_))
+}
+
+fn is_product(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(_) | Type::Record(_))
+}
+
+/// Whether one of the type parameters `params` occurs in `ty`.
+fn mentions_param(ty: &Type, params: &[crate::ccl::ty::TypeParamId]) -> bool {
+    if let Type::Param(p) = ty
+        && params.contains(&p.id)
+    {
+        return true;
+    }
+    let mut found = false;
+    ty.walk_children(|c| found |= mentions_param(c, params));
+    found
+}
+
+/// Push the requirement `trait_(args, assoc)` onto `out`, reading one over products of
+/// one shape componentwise. See [`lower_requirements`].
+fn expand_requirement(
+    trait_: crate::ccl::infer::solver::traits::Trait,
+    args: Vec<Type>,
+    assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
+    span: Span,
+    out: &mut Vec<Rc<crate::ccl::ty::TraitRequirement>>,
+) -> Result<(), LoweringError> {
+    let unsatisfiable = |args: &[Type]| {
+        let mut shown: Vec<String> = args.iter().map(|t| t.to_string()).collect();
+        shown.extend(assoc.iter().map(|(name, t)| format!("{name}={t}")));
+        LoweringError::unsupported(
+            span,
+            format!(
+                "no instance of `{trait_}` accepts ({}), so no use could satisfy this \
+                 requirement",
+                shown.join(", ")
+            ),
+        )
+    };
+    if trait_.is_structural() && args.iter().any(is_product) {
+        use crate::ccl::infer::solver::traits::{product_fields, product_shape};
+        // The trait's product rule is the one instance a product satisfies it by, so a
+        // requirement between products of one shape states it of each field's components,
+        // paired by field.
+        if args.iter().all(is_product) {
+            let shape = product_shape(&args[0]);
+            if args.iter().any(|a| product_shape(a) != shape) {
+                return Err(unsatisfiable(&args));
+            }
+            for field in &shape {
+                let at_field: Vec<Type> = args
+                    .iter()
+                    .map(|a| {
+                        let i = product_fields(a)
+                            .iter()
+                            .position(|f| f == field)
+                            .expect("every operand has the shape's fields");
+                        crate::ccl::infer::solver::traits::product_components(a)[i].clone()
+                    })
+                    .collect();
+                expand_requirement(trait_, at_field, Vec::new(), span, out)?;
+            }
+            return Ok(());
+        }
+        // A product against a type parameter: satisfiable by any use instantiating the
+        // parameter at a product of that shape, unless the parameter occurs inside the
+        // product, which no finite type satisfies. It is kept as written, an assumption
+        // the product rule defers to (`src/ccl/design/type-parameters.md`, "Obligations
+        // under assumptions").
+        let whole: Vec<_> = args
+            .iter()
+            .filter_map(|a| match a {
+                Type::Param(p) => Some(p.id),
+                _ => None,
+            })
+            .collect();
+        let occurs = args
+            .iter()
+            .filter(|a| is_product(a))
+            .any(|a| mentions_param(a, &whole));
+        if args
+            .iter()
+            .all(|a| is_product(a) || matches!(a, Type::Param(_)))
+            && !occurs
+        {
+            out.push(Rc::new(crate::ccl::ty::TraitRequirement {
+                trait_,
+                args: args
+                    .iter()
+                    .map(crate::ccl::infer::solver::traits::canonical_type)
+                    .collect(),
+                assoc,
+            }));
+            return Ok(());
+        }
+        return Err(unsatisfiable(&args));
+    }
+    if !args.iter().all(is_requirement_operand) {
+        return Err(unsatisfiable(&args));
+    }
+    // A row fits when each base stands where the row has it, associated types
+    // included, and each type parameter stands for one base throughout.
+    let fits = |row: &crate::ccl::infer::solver::traits::TraitInstance| {
+        let mut bound: HashMap<crate::ccl::ty::TypeParamId, BaseType> = HashMap::new();
+        let mut agrees = |stated: &Type, accepted: &BaseType| match stated {
+            Type::Base(base) => base == accepted,
+            Type::Param(p) => bound.entry(p.id).or_insert_with(|| accepted.clone()) == accepted,
+            _ => false,
+        };
+        args.iter().zip(row.args.iter()).all(|(a, b)| agrees(a, b))
+            && assoc.iter().all(|(name, t)| {
+                row.assoc_ty(*name)
+                    .is_some_and(|(accepted, _)| agrees(t, accepted))
+            })
+    };
+    if !trait_.instances().iter().any(fits) {
+        return Err(unsatisfiable(&args));
+    }
+    if args.iter().all(|a| matches!(a, Type::Base(_))) {
+        if assoc.iter().any(|(_, t)| !matches!(t, Type::Base(_))) {
+            return Err(LoweringError::unsupported(
+                span,
+                "a requirement on base types only fixes its associated type to a base type; \
+                 write that type instead of a type parameter",
+            ));
+        }
+        return Ok(());
+    }
+    out.push(Rc::new(crate::ccl::ty::TraitRequirement {
+        trait_,
+        args,
+        assoc,
+    }));
+    Ok(())
 }
 
 /// Lower a CHL type *expression* to a CCL [`Type`].
@@ -1601,15 +1827,18 @@ pub(super) fn lower_type_expr_or_poly(
             body,
             requires,
         } => {
-            refuse_requires_clause(requires)?;
             let snapshot = ctx.snapshot_type_aliases();
+            let scoped = ctx.type_params_in_scope.len();
             let poly = declare_type_params(type_params, ctx).and_then(|params| {
+                let requires = lower_requirements(requires, ctx)?;
                 let body = lower_type_expr(body, ctx)?;
                 Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
                     params,
+                    requires,
                     body,
                 })))
             });
+            ctx.type_params_in_scope.truncate(scoped);
             ctx.restore_type_aliases(snapshot);
             poly
         }
