@@ -271,6 +271,19 @@ pub(super) trait Typing {
     /// use one normalization for both or it relates two unrelated variables.
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError>;
 
+    /// [`bind_annotation`](Self::bind_annotation) for a polymorphic annotation, called
+    /// at the right-hand side's level once the `Poly` is opened: `declared` is its body
+    /// with the parameters resolved. A mismatch shows the annotation as `annotation`,
+    /// and the inferred type as a polymorphic type over the variables the right-hand
+    /// side minted (`src/ccl/design/type-parameters.md`, "Printing an inferred
+    /// polymorphic type").
+    fn bind_poly_annotation(
+        &mut self,
+        inferred: &Type,
+        declared: &Type,
+        annotation: &Type,
+    ) -> Result<Type, LocatedInferError>;
+
     /// Obtain the type for a binder slot that lives on a
     /// [`TypedBinding`](crate::ccl::TypedBinding) rather than an [`Expr`] (a
     /// `Case` pattern payload, a `Loop` accumulator) — a place the tree walk

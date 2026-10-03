@@ -485,6 +485,15 @@ pub struct TraitObligation {
     /// because answering one means saying what the positions beside it hold
     /// ([`narrow_product`](Self::narrow_product)).
     operands: RefCell<Vec<Option<Type>>>,
+    /// The operands of the obligation this one is a freshened copy of, for the
+    /// positions the copy never watched: an operand variable that freshening did
+    /// not reach is not copied, so the original's stands at that position in the
+    /// copy too.
+    ///
+    /// Read only to state the requirement ([`stated_requirement`](Self::stated_requirement)).
+    /// Narrowing reads [`operands`](Self::operands) alone, so a copy never draws an edge
+    /// to a variable of the definition it was copied from.
+    inherited_operands: Vec<Option<Type>>,
     /// The product shape this obligation settled at, once one has arrived.
     ///
     /// Set by [`narrow_product`](Self::narrow_product) and never unset, as a candidate set
@@ -506,6 +515,16 @@ pub struct TraitObligation {
     /// The ID of the operator node that spawned this obligation, to
     /// be used as provenance for any resulting refinement body.
     operator_node_id: provenance::NodeId,
+}
+
+/// What an obligation requires, as the types standing at its positions
+/// ([`TraitObligation::stated_requirement`]).
+pub(super) struct StatedRequirement {
+    pub trait_: Trait,
+    /// One per operand position.
+    pub operands: Vec<Type>,
+    /// One per associated name the trait declares.
+    pub assoc: Vec<(Assoc, Type)>,
 }
 
 /// One associated position of an obligation: the name, the type standing in for it,
@@ -537,6 +556,7 @@ impl TraitObligation {
             assumptions: RefCell::new(Vec::new()),
             in_scope: RefCell::new(Rc::new(Vec::new())),
             operands: RefCell::new(Vec::new()),
+            inherited_operands: Vec::new(),
             structural: RefCell::new(None),
             assoc: assoc
                 .into_iter()
@@ -575,6 +595,7 @@ impl TraitObligation {
             assumptions: RefCell::new(original.assumptions.borrow().clone()),
             in_scope: RefCell::new(Rc::clone(&original.in_scope.borrow())),
             operands: RefCell::new(Vec::new()),
+            inherited_operands: original.stated_operands(),
             structural: RefCell::new(original.structural.borrow().clone()),
             assoc: original
                 .assoc
@@ -771,6 +792,52 @@ impl TraitObligation {
     /// [`set_assoc_types`](Self::set_assoc_types).
     pub(super) fn assoc_types(&self) -> Vec<Type> {
         self.assoc.iter().map(|p| p.ty.borrow().clone()).collect()
+    }
+
+    /// The requirement this obligation states, as its operand and associated
+    /// positions: `None` before every operand is watched, and for an obligation a
+    /// product answered, whose components state it instead
+    /// ([`narrow_product`](Self::narrow_product)).
+    pub(super) fn stated_requirement(&self) -> Option<StatedRequirement> {
+        if self.structural.borrow().is_some() {
+            return None;
+        }
+        let operands = self.stated_operands();
+        if operands.len() != self.trait_.arity() {
+            return None;
+        }
+        let operands = operands.into_iter().collect::<Option<Vec<Type>>>()?;
+        let assoc = self
+            .assoc
+            .iter()
+            .map(|p| (p.name, p.ty.borrow().clone()))
+            .collect();
+        Some(StatedRequirement {
+            trait_: self.trait_,
+            operands,
+            assoc,
+        })
+    }
+
+    /// The variables watched at the operand positions, which belong to this
+    /// obligation's own instantiation.
+    pub(super) fn watched_operands(&self) -> Vec<Type> {
+        self.operands.borrow().iter().flatten().cloned().collect()
+    }
+
+    /// The type at each operand position: the one watched there, else the one the
+    /// obligation this was copied from had ([`inherited_operands`](Self::inherited_operands)).
+    fn stated_operands(&self) -> Vec<Option<Type>> {
+        let watched = self.operands.borrow();
+        (0..self.trait_.arity())
+            .map(|i| {
+                watched
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| self.inherited_operands.get(i).cloned().flatten())
+            })
+            .collect()
     }
 
     /// Rewrite the associated positions. Freshening's second phase; see

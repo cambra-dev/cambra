@@ -534,6 +534,15 @@ impl Typing for CheckCtx {
         Ok(ann.clone())
     }
 
+    fn bind_poly_annotation(
+        &mut self,
+        inferred: &Type,
+        declared: &Type,
+        _annotation: &Type,
+    ) -> Result<Type, LocatedInferError> {
+        self.bind_annotation(inferred, declared)
+    }
+
     fn binding_slot(&mut self, slot: &mut Type) -> Type {
         // Read the already-resolved binder type back, untouched.
         slot.clone()

@@ -1893,7 +1893,10 @@ pub(super) fn emit_let<C: Typing>(
         // for it.
         Some(Type::Poly(poly)) => {
             let declared = ctx.resolve_type_params(&complete_annotation(&poly.body, &bound_ty));
-            ctx.in_let_rhs(|ctx| ctx.bind_annotation(&bound_ty, &declared))?
+            let mut shown = poly.map_types(|t| ctx.resolve_type_params(t));
+            shown.body = declared.clone();
+            let shown = Type::Poly(std::rc::Rc::new(shown));
+            ctx.in_let_rhs(|ctx| ctx.bind_poly_annotation(&bound_ty, &declared, &shown))?
         }
         Some(ann) => {
             let declared = match ann {

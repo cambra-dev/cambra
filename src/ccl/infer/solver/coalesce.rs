@@ -194,6 +194,14 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
     coalesce_compact_go(&graph.term, true, &[])
 }
 
+/// [`coalesce_compact`] of one position at `polarity`, outside any binder.
+///
+/// For a caller that rewrites a [`CompactGraph`] position by position and needs to
+/// know what one materializes to (`super::display`).
+pub(super) fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
+    coalesce_compact_go(ct, polarity, &[])
+}
+
 /// A binder as the output spells it: the name its position answers to, over what the
 /// position turned out to range over.
 ///

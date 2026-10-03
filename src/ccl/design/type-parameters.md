@@ -2,9 +2,9 @@
 
 > **Status: [Sketched].** A proposed implementation of
 > [chl-spec.md, "6.8 Polymorphic types"](../../../docs/chl-spec.md#68-polymorphic-types). Of the
-> [Implementation stack](#implementation-stack), items 1 to 4 are implemented: the parser,
-> polymorphic aliases, type parameters with their bounds, and requirements. The sections on
-> `Poly` against `Poly`, printing, and item 7 describe work not yet done.
+> [Implementation stack](#implementation-stack), items 1 to 4 and 6 are implemented: the parser,
+> polymorphic aliases, type parameters with their bounds, requirements, and printing. Item 5 is
+> dropped. Item 7 describes work not yet done.
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their bounds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -292,20 +292,17 @@ given those as well (`assume_more`).
 
 ## Where a polymorphic type may appear
 
-A `Poly` reaches the solver in two ways. As a binding's annotation, emission opens it and the `Var`
-arm instantiates it, so `constrain_go` never sees it. Anywhere else, `constrain_go` meets it inside
-another type, and the rules are:
+A `Poly` reaches the solver only as a binding's annotation: emission opens it and the `Var` arm
+instantiates it. Lowering refuses one inside another type, which the spec leaves **[Open]**, so
+`constrain_go` never meets a `Poly`, and `compact`, `extrude` and `spec_key` treat one as
+unreachable.
 
-| Constraint | Rule |
-| --- | --- |
-| `Poly(𝜋₁) <: Poly(𝜋₂)` | open `𝜋₂` with its parameters opaque and its requirements assumed, instantiate `𝜋₁`, and constrain the bodies. This is the Module-type member check |
-| `Poly(𝜋) <: 𝑈`, `𝑈` not a `Poly` | instantiate `𝜋` and constrain its body |
-| `𝑋 <: Poly(𝜋)`, `𝑋` not a `Poly` | refused: `𝑋` would have to be generalized where it stands |
-
-The spec leaves a polymorphic type nested inside another type **[Open]**. Until it decides, lowering
-refuses one, and the first two rows serve Module-type member checks once modules land. Until item
-5, `compact`, `extrude` and `spec_key` treat a `Poly` reaching them as unreachable. A refused case is
-an error, never an approximation.
+A Module-type member check, once modules land, is the same check as a binding's annotation: the
+argument member's contract, written or inferred, is checked against the parameter's member type
+as a right-hand side is checked against its `Poly`
+([Checking a binding against a polymorphic type](#checking-a-binding-against-a-polymorphic-type)).
+Members resolve statically to their binders, so no Module type flows through inference variables,
+and no subtyping rule between two `Poly`s is needed.
 
 ---
 
@@ -329,14 +326,37 @@ An alias `g = f` of a generalized `f` needs no annotation. Implemented as
 
 ## Printing an inferred polymorphic type
 
-A diagnostic renders a generalized binding's scheme as a `Poly`:
+`poly_for_display` (`src/ccl/infer/solver/display.rs`) renders a type as a `Poly` over its
+variables above a cutoff. An annotation mismatch against a `Poly` uses it for the right-hand side's
+type, with the cutoff at the binding's level, so `pick: \T -> T => T = inc` reports `inc` as
+`\A -> (A ⇒ Int) requires Addable(A, Int, Output=Int)`.
 
-- each quantified variable becomes a parameter, named `A`, `B`, … in order of first appearance,
-  with its upper bound as `<:` when it has a single concrete one;
-- each obligation watching a quantified variable becomes a requirement, with an associated variable
-  named by the same rule;
-- a part the notation cannot write, such as the kind of a function type or a refinement over a name
-  not in scope at the diagnostic, is rendered with a marker rather than dropped.
+- **One term.** The type is compacted together with the operands and associated types of every
+  obligation watching a variable it reaches, so a variable is one identity across the body and
+  the requirements. An operand stands at a positive position: values flow into it, and the
+  operator's own operand variable is reached only through what flows in. Each associated type's
+  variable is pinned against simplification's polar-only elimination, since it can occur at one
+  polarity of the term and still tie the requirement's `Output` to the body.
+- **Polarity-correct.** Compaction does not fall back to a variable's upper bound at a positive
+  position, so a demand is never shown as a value.
+- **Parameters.** Each variable above the cutoff that survives simplification becomes a parameter,
+  named `A`, `B`, … in order of first appearance, skipping a spelling a type parameter in the type
+  already has. A position no variable and no type reached is a parameter of its own.
+- **Bounds.** The type beside a parameter at a negative position is its bound. A parameter that
+  occurs once was eliminated by simplification, so its bound is written inline:
+  `def at(a): a.at` prints as `\A -> ({at: A} ⇒ A)`, and `def both(a): (a.at, a)` as
+  `\A <: {at: B}, B -> (A ⇒ (B, A))`.
+- **Requirements.** Each obligation becomes a requirement unless every operand is concrete, which
+  the definition already answered. Refinements are dropped, since an instance row matches a base
+  whatever its refinements. An obligation a product answered is stated by its components.
+- **Markers.** A join or meet the notation cannot write is a parameter spelled as what it stands
+  for: `A ∨ Int` where a parameter and a concrete type meet at a positive position
+  (`def f(c, a): a if c else 1`), `A ∨ B` where two parameters do, and `A ∧ B` at a negative one.
+
+A freshened obligation copy watches only the operand variables freshening reached. An operand it
+did not reach, such as the variable a literal flows into, is still the original's, and the copy
+records it for the requirement it states (`TraitObligation::inherited_operands`). Narrowing never
+reads it, so a copy draws no edge to the definition's variables.
 
 ---
 
@@ -355,8 +375,9 @@ One change per item, each updating this doc and the spec status it implements:
 4. **Requirements** (implemented). Assumption rows, the componentwise `Equatable` reading,
    unsatisfiable requirements, instantiation of requirements, clone reset and redelivery, the
    sweep.
-5. **`Poly` against `Poly`.** The subsumption rule, with Module types as its consumer.
-6. **Printing inferred polymorphic types.**
+5. **`Poly` against `Poly`** (dropped). Module types need no subtyping rule between two `Poly`s
+   ([Where a polymorphic type may appear](#where-a-polymorphic-type-may-appear)).
+6. **Printing inferred polymorphic types** (implemented).
 7. **A use that checks compiles.** Each generalized definition checked alone; the debug assertion
    that a clone whose pin succeeded raises no error; an origin recorded on every bound, giving
    every use error its secondary label.
