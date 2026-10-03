@@ -155,8 +155,10 @@ reserved for future use.
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
 > `summon` (the transactions-as-contextual-parameters layer — §8.7,
-> **[Decided]**), `import` (built-in modules — the `http` module surface,
-> **[Decided]**; general modules remain future work, §9), and `assert` and its
+> **[Decided]**; `requires` also states trait requirements —
+> [Trait requirements](#trait-requirements-decided)), `import` (built-in
+> modules — the `http` module surface, **[Decided]**; general modules remain
+> future work, §9), and `assert` and its
 > `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names
 > for other purposes. (`with`, `:=`, `match`, `case` and `where` are
@@ -1413,7 +1415,9 @@ Annotation types are arbitrary expressions evaluated in the
 surrounding scope. `p: T` fixes the parameter's type at `T`; `p <: T`
 leaves it inferred and bounded above by `T` (see [Two annotation
 forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
-The two forms may be mixed across a parameter list. A return-type
+The two forms may be mixed across a parameter list. A capitalized
+parameter is a type parameter, not a value (**[Decided]**,
+[Type parameters](#type-parameters-decided)). A return-type
 annotation, introduced by `=>`, specifies a fixed output type for the
 function. The inferred type of the function body must be a subtype of
 the annotated output type.
@@ -2135,6 +2139,8 @@ marked one carries its status per "How to read this document".)
   is a record type — `{x: T, y: U} ⇒ V`. Surface syntax uses the `=>`
   function. Whether the function is a collection or a callable capability
   is inferred, never written (§6.3).
+- `\T -> U` — polymorphic type: for every type `T`, a `U` (**[Decided]**,
+  [6.8 Polymorphic types](#68-polymorphic-types)).
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
@@ -2678,9 +2684,10 @@ The rules, and what each one is doing:
   what the statement sees, and nothing more.
 - **A capitalized name is bound only by an alias.** Every other binding form —
   `:=`, `op=`, `<<=`, a `for` target, a comprehension generator — rejects a
-  capitalized binder and names this one. A `def` name and a parameter name are
-  not yet checked; a capitalized one there binds a value the type language
-  cannot see.
+  capitalized binder and names this one. A `def` name is not yet checked; a
+  capitalized one binds a value the type language cannot see. A capitalized
+  parameter binds a value today and is a type parameter under
+  [Type parameters](#type-parameters-decided) (**[Decided]**).
 - **The type language's own names are reserved.** `Int`, `UInt`, `String`,
   `Bool`, `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
   `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
@@ -2705,9 +2712,193 @@ alias expanded lower to the same CCL, so no later phase knows the name.
 **[Open]** — whether an alias may be **parameterised** (`Pair(T) = {T, T}`),
 which is the difference between naming a type and naming a type constructor. A
 parameterised left-hand side is currently an "invalid assignment target" parse
-error.
+error. If added, a parameterised alias takes this head form: `\T -> V` in a type
+position is a polymorphic type, not a type constructor
+([Polymorphic type annotations](#polymorphic-type-annotations-decided)).
 
 The north-star `storefront` exercises four aliases, two of them refined.
+
+### 6.8 Polymorphic types
+
+A **polymorphic** binding has one definition and a type that each use instantiates at its own
+types. A `def`, and a binding whose right-hand side is a lambda, is polymorphic over every type its
+body leaves open. Each call is checked against its own instantiation, and the compiler builds one
+version of the function per distinct instantiation.
+
+```python
+def swap(a, b):
+    (b, a)
+
+(swap(1, "x"), swap(True, 2))   # (("x", 1), (2, True))
+```
+
+The inferred type carries what the body requires of each open type. `def add(a, b): a + b`
+requires `Addable` of its operand types ([Trait requirements](#trait-requirements-decided)), so
+`add(1, "s")` is rejected at the call. `def f(a): (a + 1, a + "s")` is rejected at the definition,
+because no type satisfies both of its requirements.
+
+Every other binding is **monomorphic**: it has one type, shared by every use and settled by all of
+them together. A binding whose right-hand side is a call, a collection, a tuple or record, or a name
+is monomorphic.
+
+The subsections below are **[Decided]** and not implemented.
+
+#### A name of a polymorphic binding is polymorphic [Decided]
+
+`g = f`, where `f` is polymorphic, binds `g` at `f`'s type. Each use of `g` instantiates that type
+as a use of `f` would. Today `g` is monomorphic: `(g(1, 2), g("a", "b"))` is rejected, and a `g`
+that nothing uses is reported as an unresolved type.
+
+A tuple or record of polymorphic functions stays monomorphic. Making each field polymorphic on its
+own is **[Open]**.
+
+#### Type parameters [Decided]
+
+```ebnf
+def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
+params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
+type_param      ::= Ident [ "<:" expression ]        (* Ident: a capitalized identifier *)
+value_param     ::= ident [ ( ":" | "<:" ) expression ]
+```
+
+A capitalized parameter is a **type parameter**. It names a type in the parameter annotations, the
+result annotation, the `requires` clause, and the body. Type parameters precede the value
+parameters.
+
+```python
+def larger(T, a: T, b: T) => T requires Orderable(T, T):
+    b if a < b else a
+
+larger(3, 7)       # T = Int
+larger("a", "b")   # T = String
+```
+
+- **A type parameter is not an argument.** `larger` takes two arguments. Each call infers the
+  type parameters from its arguments. Supplying one explicitly is **[Open]**: it would be a named
+  component in an otherwise positional call, which
+  [3.8 Function calls](#38-function-calls) leaves open.
+- **Every type parameter is determined by the arguments.** It appears in a value parameter's
+  annotation, or it is the associated type of a requirement whose other positions are determined
+  ([Trait requirements](#trait-requirements-decided)). Any other type parameter is an error at the
+  definition.
+- **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
+  `requires` clause state, and nothing else. `def inc(T, x: T) => T: x + 1` is an error at `+`,
+  because no requirement states that `T` and `Int` are `Addable`.
+- **Two type parameters have no common type.** With `a: T` and `b: U`, `b if a < b else a` is an
+  error: no type the program can write covers both, unless one parameter's bound names the other.
+- **A type parameter does not leave its definition.** A value of type `T` flowing into something
+  declared outside the `def`, as in `outer << x` with `x: T`, is an error naming `T`. Outside the
+  definition no use has substituted a type for it.
+- **A type parameter is scoped like an alias declared in the function's block**
+  ([6.7 Type-alias statements](#67-type-alias-statements)). It shadows an outer alias of the same
+  name. An alias of the same name declared in the body is an error naming both.
+
+#### Bounds [Decided]
+
+`T <: U` restricts `T` to subtypes of `U`. The body uses a value of type `T` as a `U`. The caller
+receives its own type for `T`.
+
+```python
+def newest(T <: {at: Int}, a: T, b: T) => T:
+    b if a.at < b.at else a
+
+latest = newest((at=1, sku="tee"), (at=2, sku="mug"))
+latest.sku   # String: T is the arguments' record type, sku included
+```
+
+With `a: {at: Int}` and a `{at: Int}` result instead, `latest` is `{at: Int}` and `latest.sku` is an
+error.
+
+- A bound names only the type parameters before it. A bound naming its own parameter is a recursive
+  type, which [6.7 Type-alias statements](#67-type-alias-statements) leaves unwritable.
+- A type parameter has an upper bound or none. Lower bounds are not provided.
+
+#### Trait requirements [Decided]
+
+```ebnf
+requires_clause ::= "requires" requirement ( "," requirement )*
+requirement     ::= Ident [ "(" req_arg ( "," req_arg )* ")" ]
+req_arg         ::= expression | Ident "=" expression
+```
+
+A **trait** is a named requirement on a list of types. Each operator places one on its operand
+types. The traits are built in:
+
+| Trait | Required by | Operands | Associated type | Satisfied by |
+| --- | --- | --- | --- | --- |
+| `Addable` | `+` | 2 | `Output` | `Int`, `UInt`, `String` |
+| `Subtractable` | `-` | 2 | `Output` | `Int`, `UInt` |
+| `Multipliable` | `*` | 2 | `Output` | `Int`, `UInt` |
+| `Divisible` | `//` | 2 | `Output` | `Int`, `UInt` |
+| `Exponentiable` | `**` | 2 | `Output` | `Int`, `UInt` |
+| `Negatable` | unary `-` | 1 | `Output` | `Int` |
+| `Equatable` | `==`, `!=` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
+| `Orderable` | `<`, `<=`, `>`, `>=` | 2 | none | `Int`, `UInt`, `String`, `Bool` |
+| `Comparable` | `max` | 1 | none | `Int`, `UInt`, `String` |
+
+A binary trait is satisfied by two operands of one listed type, and a tuple or record satisfies
+`Equatable` only against the same product ([3.4 Comparisons](#34-comparisons)). A trait's `Output`
+is the type that satisfies it.
+
+- **An associated type is written by name after the operands.** `requires Addable(A, B, Output=O)`
+  states that `A` and `B` are `Addable` and that `O` is their `Output`. Omitting `Output=…` leaves
+  it unnamed.
+- **A requirement's arguments are any types.** `Equatable` reads a product componentwise, as `==`
+  does ([3.4 Comparisons](#34-comparisons)), so `requires Equatable({T, U}, {T, U})` also states
+  `Equatable(T, T)` and `Equatable(U, U)`.
+- **A requirement no instance can satisfy is an error at the requirement.**
+  `requires Orderable(List(T), List(T))` is rejected where it is written: no `List` is `Orderable`,
+  so no call could satisfy it.
+- **One clause holds every requirement.** `Transaction`
+  ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters))
+  is written in the same clause: `requires Transaction, Orderable(T, T)`.
+- **The body uses only what the clause states.** An operator whose operand type involves a type
+  parameter is an error unless a requirement covers it.
+- **Each call satisfies each requirement at its own instantiation.** A call that does not is
+  rejected at the call, with a secondary label at the requirement.
+- `^+` has no nameable trait. Declaring a trait or an instance is **[Open]**.
+
+#### Polymorphic type annotations [Decided]
+
+```ebnf
+poly_type       ::= "\" type_param ( "," type_param )* "->" expression [ requires_clause ]
+```
+
+In a type position, `\T, U <: B -> V requires …` is the type of a polymorphic value: for every
+`T` and `U` that meet the bounds and requirements, a value of type `V`. A polymorphic `def` has this
+type, with its type parameters moved into the lambda. `larger` above has type
+`\T -> {T, T} => T requires Orderable(T, T)`.
+
+```python
+bigger: \T -> {T, T} => T requires Orderable(T, T) = larger
+```
+
+- **It annotates a polymorphic binding.** A monomorphic binding with a polymorphic annotation is an
+  error.
+- **The annotation is exact.** The right-hand side is checked once, with each type parameter
+  opaque, and every use instantiates the annotation rather than the right-hand side's inferred
+  type. `<:` with a polymorphic type is an error.
+- **It is written only as a whole annotation.** Inside another type, as in
+  `{\T -> T => T} => Int`, it would type a function that takes a polymorphic argument. That is
+  **[Open]** and an error.
+- **An alias may name it.** `Larger = \T -> {T, T} => T requires Orderable(T, T)` declares an alias
+  of a polymorphic type, and `bigger: Larger = larger` uses it as a whole annotation
+  ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
+  the nested case above.
+- **It is never a type constructor.** `\T -> V` does not denote a function from types to types. A
+  parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
+  ([6.7 Type-alias statements](#67-type-alias-statements)).
+- **A diagnostic prints an inferred polymorphic type in this notation.** A part of the type the
+  notation cannot write, such as whether a function is a collection
+  ([6.3 Direction: collection types](#63-direction-collection-types-decided)), is marked in the
+  printed type, not dropped.
+
+#### A use that checks compiles [Decided]
+
+A polymorphic binding's type, inferred or written, states every requirement its body places on the
+types it quantifies. An instantiation that a checking use produces raises no error in the body.
+Every error a use causes is reported at the use, with a secondary label at the requirement it
+fails: the line of the body that imposes it, or the annotation that states it.
 
 ---
 
@@ -3273,6 +3464,9 @@ Supporting decisions (same source):
   `tx`, which collides with "transmit"); operations `begin()` / `abort()`.
 - **Implicit *parameters* only — never implicit conversions**; given
   visibility stays explicit and resolution inspectable (hence `summon`).
+- **One `requires` clause.** `Transaction` and trait requirements share it:
+  `requires Transaction, Orderable(T, T)`
+  ([Trait requirements](#trait-requirements-decided)).
 
 ### 8.8 `@LoadFrom`
 

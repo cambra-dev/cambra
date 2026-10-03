@@ -182,7 +182,7 @@ def identity(x):
 
 **Not yet implemented:**
 
-* **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. Does not block today's coverage; a natural next step.
+* **Explicit quantification (`∀`/Π types).** Explicit `∀`/Π types as a first-class `Type` for the cases implicit level-based polymorphism cannot express. [type-parameters.md](type-parameters.md) sketches `Type::Poly`, the written form.
 * **SMT-backed refinements outside linear integer arithmetic, and after `lambda_elim`.**
   [Semantic entailment as a fallback](#semantic-entailment-as-a-fallback) discharges an
   `Int`/`Bool` predicate in linear integer arithmetic to Z3 when structural matching leaves a
