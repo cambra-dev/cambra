@@ -125,6 +125,21 @@ pub(super) trait Typing {
     /// node-annotation predicate handling in [`emit_node`](super::emit::emit_node).
     fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError>;
 
+    /// Open a `let`'s polymorphic annotation before its right-hand side is
+    /// emitted: mint an opened [`Type::Param`] for each parameter the `Poly`
+    /// declares, at the current level and over its normalized bound, which
+    /// normalization then puts in place of the declared one until
+    /// [`close_poly`](Self::close_poly) (`src/ccl/design/type-parameters.md`,
+    /// "Checking a binding against a polymorphic type"). Called inside
+    /// [`in_let_rhs`](Self::in_let_rhs), so a parameter sits at the level of the
+    /// right-hand side's own variables. Check never meets a `Poly`: none survives
+    /// inference.
+    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType);
+
+    /// Close the innermost `Poly` [`open_poly`](Self::open_poly) opened, once its
+    /// binding's right-hand side and annotation are checked.
+    fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType);
+
     /// Require `sub <: sup`. `at` lazily produces an error-context label,
     /// invoked only on failure.
     fn require_sub(

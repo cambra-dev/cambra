@@ -72,6 +72,48 @@ impl PolyScheme {
         )
     }
 
+    /// [`instantiate`](Self::instantiate) for a scheme that may quantify **type
+    /// parameters**, returning beside the type each parameter's instantiation and
+    /// its bound, freshened through the same copy.
+    ///
+    /// The caller records `instantiation <: bound` for each pair: a bound is checked
+    /// at every use, at the use's types (`src/ccl/design/type-parameters.md`,
+    /// "Instantiation"). A variable minted for a parameter stands in `telescope`,
+    /// the use site's, since a parameter has no variable a copy could inherit a
+    /// scope from.
+    pub fn instantiate_with_params(
+        &self,
+        current_level: Level,
+        telescope: &Telescope,
+    ) -> (Type, Vec<(Type, Type)>) {
+        let mut cache = FreshenCache::new();
+        cache.param_telescope = Some(telescope.clone());
+        let ty = freshen_above(
+            self.level,
+            &self.body,
+            FreshenLevel::At(current_level),
+            &mut cache,
+        );
+        // Bounds are freshened after the body, so every parameter a bound names
+        // already maps to its instantiation; a parameter is mapped by the arm, not
+        // here, so a bound that names a parameter the body does not is still copied.
+        let mut params: Vec<_> = cache.params.values().cloned().collect();
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut bounded = Vec::new();
+        for (param, instantiation) in params {
+            if let Some(bound) = &param.bound {
+                let bound = freshen_above(
+                    self.level,
+                    bound,
+                    FreshenLevel::At(current_level),
+                    &mut cache,
+                );
+                bounded.push((instantiation, bound));
+            }
+        }
+        (ty, bounded)
+    }
+
     /// [`instantiate`](Self::instantiate), stamping the *use site's* telescope
     /// on every variable the instantiation mints. For an operator scheme the
     /// template's variables stand nowhere — they were built outside any
@@ -135,6 +177,20 @@ pub struct FreshenCache {
     /// `∀A O. A ⇒ O requires Addable(A, Int ⇝ O)`; sharing one obligation across uses
     /// would let a `String` use narrow the `Int` use's candidate set to nothing.
     pub obligations: HashMap<TraitObligationId, Rc<TraitObligation>>,
+    /// Original type parameter → what this copy stands it at
+    /// (`src/ccl/design/type-parameters.md`, "Instantiation" and "Specialization").
+    ///
+    /// Instantiation maps each parameter above the cutoff to a fresh variable at the
+    /// use's level, which the use then bounds. A specialization clone maps the
+    /// specialized binding's own parameters, the ones at the cutoff's next level, to
+    /// fresh variables its pin ties to the use's types; a parameter deeper than that
+    /// belongs to a definition nested in the clone, which stays generic, so it is
+    /// re-minted as a new parameter.
+    pub params: HashMap<crate::ccl::ty::TypeParamId, (Rc<crate::ccl::ty::TypeParam>, Type)>,
+    /// The scope a variable minted for a type parameter stands in: the use site's,
+    /// at instantiation. A parameter has no variable of its own whose telescope a
+    /// copy could inherit.
+    pub param_telescope: Option<Telescope>,
 }
 
 impl FreshenCache {
@@ -269,6 +325,10 @@ fn freshen_level(ty: &Type) -> Level {
     // answer `type_level` gives it and for the same reason.
     let mut lvl = match ty {
         Type::Infer(v) => v.level,
+        // A declared parameter, in an annotation slot a clone copies, is a name the
+        // solver never reads; normalization replaced it where the right-hand side was
+        // emitted.
+        Type::Param(param) => param.opened_at.unwrap_or(0),
         _ => 0,
     };
     for r in ty.refinements() {
@@ -424,6 +484,45 @@ pub fn freshen_above(
                 .map(|r| freshen_refinement_predicate(lim, r, target, cache))
                 .collect(),
         ),
+        // A declared parameter, in an annotation slot a clone copies, names no solver
+        // content and is copied as it is.
+        Type::Param(param) if param.opened_at.is_none() => ty.clone(),
+        Type::Param(param) => {
+            if let Some((_, existing)) = cache.params.get(&param.id) {
+                return existing.clone();
+            }
+            let telescope = cache
+                .param_telescope
+                .clone()
+                .unwrap_or_else(Telescope::empty);
+            let out = match target {
+                FreshenLevel::At(at) => Type::Infer(InferVar::fresh_in(at, &telescope)),
+                FreshenLevel::Preserve if param.level() == lim + 1 => {
+                    Type::Infer(InferVar::fresh_in(param.level(), &telescope))
+                }
+                FreshenLevel::Preserve => {
+                    let bound = param
+                        .bound
+                        .as_ref()
+                        .map(|b| freshen_above(lim, b, target, cache));
+                    Type::Param(crate::ccl::ty::TypeParam::opened(
+                        param.spelling.clone(),
+                        param.level(),
+                        bound,
+                    ))
+                }
+            };
+            cache
+                .params
+                .insert(param.id, (Rc::clone(param), out.clone()));
+            out
+        }
+        // A `Poly` in a type slot is a nested definition's annotation, reached by a
+        // specialization clone. Its parameters are declared ones, which the clone never
+        // re-opens, so only its types are copied.
+        Type::Poly(poly) => Type::Poly(Rc::new(
+            poly.map_types(|t| freshen_above(lim, t, target, cache)),
+        )),
         Type::Infer(tv) => {
             if let Some(existing) = cache.vars.get(&tv.uid) {
                 return Type::Infer(Rc::clone(existing));

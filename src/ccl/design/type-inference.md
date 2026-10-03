@@ -210,8 +210,9 @@ shares one when the specialization key matches (`infer/context.rs`, `infer/solve
 generalized definition, used or not, is also checked alone before its binding is removed (see
 [Checking a definition alone](#checking-a-definition-alone)). A use whose type
 remains unresolved can survive inference as `Type::Infer` and fail the strict post-inference check.
-`ccl::Type` has no `Type::ForAll`; implicit generalization is represented by `PolyScheme`, not by a
-first-class quantified type (`infer/solver/scheme.rs`).
+Implicit generalization is represented by `PolyScheme`, not by a quantified type
+(`infer/solver/scheme.rs`); the one quantified `Type` is a written annotation, `Type::Poly`
+([type-parameters.md](type-parameters.md)).
 
 ### Roadmap and Current Prototype Status
 
@@ -247,8 +248,9 @@ materialization; `Equatable` additionally handles tuple and record equality comp
 [A product is answered off the table](#a-product-is-answered-off-the-table)). This is separate from
 a general nominal-type system (`infer/schemes.rs`, `infer/solver/traits.rs`).
 
-`ccl::Type` has no first-class explicit `∀` type; [type-parameters.md](type-parameters.md) sketches
-`Type::Poly`, the written form. The SMT fallback handles linear integer
+`ccl::Type` quantifies only a whole `let` annotation, `Type::Poly`
+([type-parameters.md](type-parameters.md)); a polymorphic type inside another type is not
+implemented, and the spec leaves it **[Open]**. The SMT fallback handles linear integer
 arithmetic over supported `Int`/`Bool` predicate forms. Both inference and `inline` use `smt_sub`;
 inlining uses it to check a refined parameter's precondition before beta-reduction. A predicate
 it cannot encode falls back to the structural mismatch, and point-free predicates after
@@ -2986,6 +2988,7 @@ A contribution arriving at a position is one of four things, and each has its ow
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
 | **determined, and neither** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
+| a **type parameter** | `T` in `def f(T, x: T)` | its bound is offered in its place; with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
 The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
 
@@ -3064,6 +3067,10 @@ A variable's lower bounds are written in exactly four places, and delivery is wi
 * `constrain_go`'s concrete arm — delivers the contribution directly.
 * `constrain_go`'s var-var arm — propagates the watch *downward*, toward the variables feeding the watched one, and delivers what they already know.
 * `extrude`'s proxy seeding, and `freshen_above`'s clone — both seed bounds by direct writes rather than through `constrain_go`.
+
+`link_watches` replays what the lower variable already carries when it links an obligation to it: its
+bases, and its type parameters, so an operator on an unbounded parameter is refused whichever edge
+arrives first.
 
 That the list is closed is an argument about today's code, not something the compiler enforces, and a missed delivery is quiet: the obligation never narrows, so a type is left undetermined and surfaces phases later on an interior node. `verify_narrowing_is_complete` checks the argument instead of trusting it — after emission, every watched operand is resolved against the completed graph, and a resolved base must already have narrowed its obligation. `a_concrete_operand_reaches_its_obligation` covers the four writers, a case per mechanism.
 

@@ -133,6 +133,118 @@ pub enum PartialKind {
 // Coalesce: CompactGraph → ccl::Type
 // ---------------------------------------------------------------------------
 
+/// Relate the type parameters contributing at one position, to each other and to the
+/// concrete contributions beside them, through their bounds
+/// (`src/ccl/design/type-parameters.md`, "Subtyping with a type parameter"). `None`
+/// when no parameter meets another contribution there.
+///
+/// Atoms are otherwise incomparable, so a parameter beside another contribution would
+/// collide. A bound orders them:
+///
+/// - **Two parameters a bound chain relates.** Under `𝑈 <: 𝑇` the join of `𝑇` and `𝑈`
+///   is `𝑇` and the meet `𝑈`, so the other one is dropped.
+/// - **A meet keeps a parameter below the rest.** The meet of `𝑃` and a concrete type
+///   `𝑋` is `𝑃` when a bound on `𝑃`'s chain is below `𝑋` ([`CompactType::is_below`]).
+/// - **Otherwise a parameter is widened to its bound**, and the position merges as
+///   one without it would: a value of a bounded parameter's type is a value of its
+///   bound's type. `𝑇 ∨ {at: Int}` under `𝑇 <: {at: Int, sku: String}` is
+///   `{at: Int}`. An unbounded parameter has nothing to widen to and still collides,
+///   as two parameters with no common bound do.
+///
+/// Widening at a meet is what reading the values at a negative position needs (the
+/// opposite-polarity fallback, as a projection's domain reads the record flowing in),
+/// and it never hides an error the program has: a position holding a parameter lies
+/// in a definition checked alone, whose types are dropped
+/// ([`typecheck_discarded_definition`](crate::ccl::infer::solve)), and every value
+/// that reaches a parameter's position was related to it through its bound when the
+/// edge was drawn.
+fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactType> {
+    use super::compact::AtomKey;
+    use crate::ccl::ty::TypeParam;
+    use std::rc::Rc;
+
+    fn params(ct: &CompactType) -> Vec<Rc<TypeParam>> {
+        ct.atoms
+            .iter()
+            .filter_map(|a| match a {
+                AtomKey::Param(p) => Some(Rc::clone(p)),
+                _ => None,
+            })
+            .collect()
+    }
+    /// The bounds up `p`'s chain, nearest first.
+    fn chain(p: &TypeParam) -> Vec<&Type> {
+        let mut out = Vec::new();
+        let mut next = p.bound.as_ref();
+        while let Some(b) = next {
+            out.push(b);
+            next = match b {
+                Type::Param(q) => q.bound.as_ref(),
+                _ => None,
+            };
+        }
+        out
+    }
+    /// Whether `low`'s bound chain reaches `high`.
+    fn below(low: &TypeParam, high: &Rc<TypeParam>) -> bool {
+        chain(low)
+            .iter()
+            .any(|b| matches!(b, Type::Param(q) if q == high))
+    }
+
+    if params(ct).is_empty() || ct.shapes() < 2 {
+        return None;
+    }
+    let mut ct = ct.clone();
+    while ct.shapes() >= 2 {
+        let ps = params(&ct);
+        // A parameter a bound chain puts below another here: the join keeps the
+        // higher one, the meet the lower.
+        let dominated = ps.iter().find(|q| {
+            ps.iter()
+                .any(|p| p != *q && if polarity { below(q, p) } else { below(p, q) })
+        });
+        if let Some(q) = dominated {
+            ct.atoms.remove(&AtomKey::Param(Rc::clone(q)));
+            continue;
+        }
+        if !polarity && let [p] = ps.as_slice() {
+            let mut rest = ct.clone();
+            rest.atoms.remove(&AtomKey::Param(Rc::clone(p)));
+            let meets_as_p = rest.denotes_a_type()
+                && chain(p).into_iter().any(|b| {
+                    let bound = super::compact::compact_type(b);
+                    bound.rec_vars.is_empty()
+                        && bound.term.denotes_a_type()
+                        && bound.term.is_below(&rest)
+                });
+            if meets_as_p {
+                ct = CompactType {
+                    vars: ct.vars.clone(),
+                    kinds: ct.kinds.clone(),
+                    refinements: ct.refinements.clone(),
+                    atoms: std::iter::once(AtomKey::Param(Rc::clone(p))).collect(),
+                    ..CompactType::default()
+                };
+                break;
+            }
+        }
+        let Some((p, bound)) = ps.iter().find_map(|p| {
+            p.bound
+                .as_ref()
+                .map(|b| (p, super::compact::compact_type(b)))
+        }) else {
+            break;
+        };
+        if !bound.rec_vars.is_empty() {
+            break;
+        }
+        ct.atoms.remove(&AtomKey::Param(Rc::clone(p)));
+        ct = CompactType::merge(polarity, ct, bound.term);
+    }
+    Some(ct)
+}
+
 /// Materialize a CompactType into `ccl::Type`.
 ///
 /// Multiple atom contributions at the same position is an error
@@ -231,6 +343,8 @@ fn coalesce_compact_go(
     // join-variable counterpart of `constrain_go`'s direct feed read-through
     // rule (a feed history `<: T` reads through to its read view `domain ⤇ value`).
     let ct = &dissolve_read_feeds(ct.clone(), polarity);
+    let related = relate_params_by_bounds(ct, polarity);
+    let ct = related.as_ref().unwrap_or(ct);
     // Count concrete (non-variable) contributions to pick the output
     // type. With multiple distinct contributions, we would need
     // a Union/Intersection — we error instead.
@@ -712,6 +826,7 @@ mod tests {
     #![allow(clippy::mutable_key_type)]
 
     use std::collections::BTreeMap;
+    use std::rc::Rc;
 
     use super::*;
     use crate::ccl::infer::solver::compact::{AtomKey, CompactGraph, CompactType};
@@ -1127,5 +1242,82 @@ mod tests {
             }
             other => panic!("expected Variant, got {other}"),
         }
+    }
+
+    // ---- Type parameters at one position (`relate_params_by_bounds`) ----
+
+    fn field(name: &str, ty: Type) -> (FieldKey, Type) {
+        (FieldKey::Name(name.into()), ty)
+    }
+
+    /// The position where `parts` all contribute, at `polarity`.
+    fn position(polarity: bool, parts: &[Type]) -> CompactType {
+        parts
+            .iter()
+            .map(|t| compact_type(t).term)
+            .reduce(|a, b| CompactType::merge(polarity, a, b))
+            .expect("at least one contribution")
+    }
+
+    /// A bounded parameter joined with a wider record widens to its bound.
+    #[test]
+    fn a_join_widens_a_bounded_parameter_to_its_bound() {
+        let t = crate::ccl::ty::TypeParam::opened(
+            "T",
+            1,
+            Some(record(&[
+                field("at", prim(BaseType::Int)),
+                field("sku", prim(BaseType::Int)),
+            ])),
+        );
+        let at = record(&[field("at", prim(BaseType::Int))]);
+        let ct = position(true, &[Type::Param(t), at.clone()]);
+        assert_eq!(coalesce_compact_go(&ct, true, &[]).unwrap(), at);
+    }
+
+    /// Under `U <: T`, the join of the two is `T` and the meet `U`.
+    #[test]
+    fn a_bound_chain_orders_two_parameters() {
+        let t = crate::ccl::ty::TypeParam::opened("T", 1, None);
+        let u = crate::ccl::ty::TypeParam::opened("U", 1, Some(Type::Param(Rc::clone(&t))));
+        let parts = [Type::Param(Rc::clone(&t)), Type::Param(Rc::clone(&u))];
+        assert_eq!(
+            coalesce_compact_go(&position(true, &parts), true, &[]).unwrap(),
+            Type::Param(t)
+        );
+        assert_eq!(
+            coalesce_compact_go(&position(false, &parts), false, &[]).unwrap(),
+            Type::Param(u)
+        );
+    }
+
+    /// The meet of a parameter and a type its bound is below is the parameter.
+    #[test]
+    fn a_meet_keeps_a_parameter_whose_bound_is_below() {
+        let t = crate::ccl::ty::TypeParam::opened(
+            "T",
+            1,
+            Some(record(&[
+                field("at", prim(BaseType::Int)),
+                field("sku", prim(BaseType::Int)),
+            ])),
+        );
+        let at = record(&[field("at", prim(BaseType::Int))]);
+        let ct = position(false, &[Type::Param(Rc::clone(&t)), at]);
+        assert_eq!(
+            coalesce_compact_go(&ct, false, &[]).unwrap(),
+            Type::Param(t)
+        );
+    }
+
+    /// An unbounded parameter has no common type with anything else.
+    #[test]
+    fn an_unbounded_parameter_beside_a_type_collides() {
+        let t = crate::ccl::ty::TypeParam::opened("T", 1, None);
+        let ct = position(true, &[Type::Param(t), prim(BaseType::Int)]);
+        assert!(matches!(
+            coalesce_compact_go(&ct, true, &[]),
+            Err(CoalesceError::IncompatibleBounds { .. })
+        ));
     }
 }

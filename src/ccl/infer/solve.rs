@@ -348,6 +348,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         // Nominal channel domains agree by name (the level is freshening
         // bookkeeping, not identity - see `ChanLevel`).
         (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
+        (Type::Param(a), Type::Param(b)) => a == b,
         (
             Type::Fun {
                 name: n1,
@@ -1883,7 +1884,11 @@ fn coalesce_type_predicates_go(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        | Type::Param(_)
         | Type::Infer(_) => {}
+        Type::Poly(poly) => Rc::make_mut(poly)
+            .types_mut()
+            .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
     }
 }
 

@@ -175,11 +175,18 @@ pub(super) struct InferCtx {
     /// that shared an id across a `let` RHS boundary would silently take the first
     /// level it saw.
     shared_holes: RefCell<HashMap<u32, Type>>,
+    /// The type parameters the `Poly`s open at the current emission position have
+    /// minted, innermost last: each declared parameter's id with the opened
+    /// [`Type::Param`] that [`normalize_annotation`](Self::normalize_annotation)
+    /// replaces it with. Pushed by [`Typing::open_poly`] and popped by
+    /// [`Typing::close_poly`], so a `Poly` an alias names, opened by each binding it
+    /// annotates, maps to that binding's parameters alone.
+    opened_params: Vec<(crate::ccl::ty::TypeParamId, Type)>,
     /// The binders in lexical scope at the current emission position — what
     /// [`Typing::fresh`] stamps on each minted variable as its telescope.
     /// Extended and restored by `scoped` / `scoped_let` in lockstep with
     /// [`scopes`](Self::scopes).
-    telescope: Telescope,
+    pub(super) telescope: Telescope,
     /// What each [opaque](crate::ccl::BindingTransparency::Opaque) binder was
     /// bound at, kept past the binder's scope.
     ///
@@ -230,6 +237,7 @@ impl InferCtx {
             lit_singletons: HashMap::new(),
             current_node_id: root,
             shared_holes: RefCell::new(HashMap::new()),
+            opened_params: Vec::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
         }
@@ -280,6 +288,23 @@ impl InferCtx {
                 .entry(*id)
                 .or_insert_with(|| Type::Infer(InferVar::fresh_in(self.level, telescope)))
                 .clone(),
+            // A declared type parameter is the one the innermost open `Poly` declaring it
+            // minted. Lowering scopes a parameter to the definition its `Poly`
+            // annotates, and that definition is emitted with the `Poly` open, so every
+            // declared occurrence normalized has one.
+            Type::Param(param) if param.opened_at.is_none() => self
+                .opened_params
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == param.id)
+                .map(|(_, opened)| opened.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "type parameter `{}` was normalized outside the right-hand side whose \
+                         `Poly` declares it",
+                        param.spelling
+                    )
+                }),
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
             // the *only* place `BoundedHole` is consumed; every other pass either
@@ -395,7 +420,15 @@ impl InferCtx {
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
             | Type::Txn
+            // An opened type parameter stands for itself in its definition's body.
+            | Type::Param(_)
             | Type::Infer(_) => ty.clone(),
+            // `emit_let` opens a `Poly` annotation itself, normalizing its bounds
+            // and body, and lowering admits a `Poly` only as a `let` annotation.
+            Type::Poly(_) => unreachable!(
+                "a polymorphic type reached `normalize_annotation`; lowering admits one only \
+                 as a `let` annotation, which `emit_let` opens"
+            ),
         }
     }
 }
@@ -509,6 +542,29 @@ impl Typing for InferCtx {
 
     fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {
         crate::ccl::infer::emit::emit_annotation_predicates(ty, self)
+    }
+
+    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) {
+        // In declaration order: a bound names only the parameters before it, which are
+        // open by the time it is normalized.
+        for p in &poly.params {
+            let bound = p.bound.as_ref().map(|b| self.normalize_annotation(b));
+            let opened =
+                crate::ccl::ty::TypeParam::opened(p.param.spelling.clone(), self.level, bound);
+            self.opened_params.push((p.param.id, Type::Param(opened)));
+        }
+    }
+
+    fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType) {
+        let depth = self.opened_params.len() - poly.params.len();
+        debug_assert!(
+            self.opened_params[depth..]
+                .iter()
+                .zip(&poly.params)
+                .all(|((id, _), p)| *id == p.param.id),
+            "`close_poly` closes the innermost open `Poly`"
+        );
+        self.opened_params.truncate(depth);
     }
 
     fn require_sub(

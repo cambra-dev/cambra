@@ -344,13 +344,18 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
             )
         }
+        // A type parameter keys by identity. A live use's instantiation holds none,
+        // since instantiation replaces each with a fresh variable; a use inside a
+        // generic definition checked alone, coalesced in place, does.
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::Param(_)
         | Type::Txn => KeyView::from_atom(
             AtomKey::from_type(ty).expect("every atomic type classifies as an AtomKey"),
         ),
+        Type::Poly(_) => unreachable!("a polymorphic type reached `spec_key`"),
         // A `Hole` contributes nothing — the same "no information here" the
         // default key denotes, so a `Hole` keys identically to an
         // under-determined `Infer`. That collision cannot merge two uses that

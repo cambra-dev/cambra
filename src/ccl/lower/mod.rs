@@ -413,6 +413,12 @@ pub struct LoweringContext {
     /// spelling because lowering precedes uniquify.
     pub(super) type_aliases: HashMap<String, Type>,
 
+    /// The type parameters of the definitions being lowered, by spelling. A type
+    /// parameter is scoped like an alias declared in its definition's block, and a
+    /// same-named alias in the body is an error rather than a shadow
+    /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
+    pub(super) type_params_in_scope: Vec<String>,
+
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
     /// currently bind each name. The `transactional_vars` set is keyed by base
@@ -803,6 +809,11 @@ impl LoweringContext {
     /// The type `name` aliases, if any.
     pub(super) fn type_alias(&self, name: &str) -> Option<&Type> {
         self.type_aliases.get(name)
+    }
+
+    /// Whether `name` is a type parameter of a definition being lowered.
+    pub(super) fn is_type_param(&self, name: &str) -> bool {
+        self.type_params_in_scope.iter().any(|n| n == name)
     }
 
     /// Record that `def name` carries a pass-by-reference `Mut` parameter, so it

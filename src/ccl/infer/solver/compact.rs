@@ -69,6 +69,11 @@ pub enum AtomKey {
     /// a nominal feed-channel domain (rigid until
     /// channelize substitutes it).
     ChanDom(Name, crate::ccl::ChanLevel),
+    /// A type parameter, opaque in the definition that declares it, so it matches
+    /// only itself: two distinct parameters at one position collide as `Int` and
+    /// `String` do (`src/ccl/design/type-parameters.md`, "Subtyping with a type
+    /// parameter").
+    Param(Rc<crate::ccl::ty::TypeParam>),
 }
 
 impl AtomKey {
@@ -83,6 +88,7 @@ impl AtomKey {
             Type::Txn => Some(AtomKey::Txn),
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
+            Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
             _ => None,
         }
     }
@@ -95,6 +101,7 @@ impl AtomKey {
             AtomKey::Txn => Type::Txn,
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
+            AtomKey::Param(p) => Type::Param(Rc::clone(p)),
         }
     }
 }
@@ -902,7 +909,7 @@ impl CompactType {
     /// Two more things that look like a second shape are not. Refinements ride the one shape
     /// there is, so `{Int | p}` names one; and a disagreeing pair of data domains sits inside
     /// the function, which materializes as a Σ over the operands rather than as an error.
-    fn shapes(&self) -> usize {
+    pub(super) fn shapes(&self) -> usize {
         let CompactType {
             vars: _,
             kinds: _,
@@ -1831,7 +1838,10 @@ fn compact_go(
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::Param(_)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
+        // `emit_let` opens a `Poly` and binds at its body; none reaches the solver.
+        Type::Poly(_) => unreachable!("a polymorphic type reached `compact`"),
         // A witness reference is an ordinary atom: nullary, standing for one candidate
         // without saying which, matching only itself (see [`AtomKey::Witness`]). The
         // range comes from the variable the occurrence carries, so nothing is looked
