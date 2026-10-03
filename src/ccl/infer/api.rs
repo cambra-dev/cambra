@@ -570,6 +570,22 @@ pub enum InferError {
 }
 
 impl InferError {
+    /// Whether `self` and `other` report one defect: equal but for the inference
+    /// variables they name, which differ between a definition and a specialization's
+    /// copy of it.
+    pub fn same_defect(&self, other: &InferError) -> bool {
+        fn anonymous(e: &InferError) -> InferError {
+            let mut e = e.clone();
+            match &mut e {
+                InferError::IncompatibleBounds { vars, .. } => vars.clear(),
+                InferError::UnresolvedInfer { id, .. } => *id = InferVarId(0),
+                _ => {}
+            }
+            e
+        }
+        anonymous(self) == anonymous(other)
+    }
+
     /// Rewrite every type this error renders through `f`.
     ///
     /// The one caller is the diagnostic boundary in

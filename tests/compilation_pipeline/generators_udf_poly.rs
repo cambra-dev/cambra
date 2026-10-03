@@ -224,6 +224,43 @@ fn test_poly_calls_poly_at_two_types() {
     check_scalar(code, Value::Bool(true));
 }
 
+// An empty list's element is pinned to a type the operators reading it accept. Here
+// the read is inside a generalized definition, so the obligation watches the
+// comparison's operand variable there rather than the element variable, which sits in
+// the enclosing scope. Called and uncalled.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::called("sum(f(1))", Value::Int(0))]
+#[case::uncalled("1", Value::Int(1))]
+fn test_empty_list_read_inside_a_generalized_definition(
+    #[case] tail: &str,
+    #[case] expected: Value,
+) {
+    let code = indoc! {r"
+        xs = []
+        def f(a):
+            [x for x in xs if x == a]
+    "};
+    check_scalar(&format!("{code}{tail}"), expected);
+}
+
+// A definition sound alone whose body a use's types fail: `a if c else "s"` joins
+// `a` with `String`, which has a type until a use makes `a` an `Int`. The pin
+// succeeds, since `x` is not in the signature, so the error the specialization
+// raises is the use's, and is reported at the use.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_error_a_use_causes_in_the_body_is_reported_at_the_use() {
+    let code = indoc! {r#"
+        def f(c, a):
+            x = a if c else "s"
+            a
+        f(True, 2)
+    "#};
+    check_compile_error(code, "Conflicting Types: Int | String");
+    check_compile_error(code, "[<test>:4:1]");
+}
+
 // List-producing body chained through a poly wrapper, single concrete use
 // type. The lone `f` use sits inside `g`'s (generalized) definition, so it is
 // only ever reached through `g`'s clone — one concrete use type suffices to

@@ -263,7 +263,9 @@ miss the uses inside a clone.
 Each use substitutes its own types, so an error that only the opaque parameters expose, such as
 two unrelated parameters meeting at one position, never shows in a clone.
 `coalesce_generalized_let` checks every definition alone once its last use is specialized, with
-its parameters opaque, and that check is what reports such an error.
+its parameters opaque
+([type-inference.md, "Checking a definition alone"](type-inference.md#checking-a-definition-alone)),
+and that check is what reports such an error.
 
 An obligation copy holding an assumption about one of the specialized binding's own parameters
 is reset to its trait's instances and the assumptions that name no such parameter

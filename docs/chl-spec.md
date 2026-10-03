@@ -2968,12 +2968,10 @@ pick: \T -> {T, T} => T = first
 
 #### A use that checks compiles
 
-**[Decided]**
-
 A polymorphic binding's type, inferred or written, states every requirement its body places on the
 types it quantifies. An instantiation that a checking use produces raises no error in the body.
-Every error a use causes is reported at the use, with a secondary label at the requirement it
-fails: the line of the body that imposes it, or the annotation that states it.
+Every error a use causes is reported at the use. A secondary label at the requirement it fails,
+the line of the body that imposes it or the annotation that states it, is **[Decided]**.
 
 ---
 

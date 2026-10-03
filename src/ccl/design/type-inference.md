@@ -206,9 +206,9 @@ def identity(x):
 The body gives `x` and the result the same variable `α`, yielding `α ⇒ α` before a call
 constrains it. If bound as a qualifying `let`, this type becomes a `PolyScheme`. Each use receives
 a fresh instance. Coalescing creates a specialization for each distinct use-site instantiation and
-shares one when the specialization key matches (`infer/context.rs`, `infer/solve.rs`). An unused
-definition is still checked for errors before its specialization-free binding is removed (see
-[Typechecking a never-called definition](#typechecking-a-never-called-definition)). A use whose type
+shares one when the specialization key matches (`infer/context.rs`, `infer/solve.rs`). Every
+generalized definition, used or not, is also checked alone before its binding is removed (see
+[Checking a definition alone](#checking-a-definition-alone)). A use whose type
 remains unresolved can survive inference as `Type::Infer` and fail the strict post-inference check.
 `ccl::Type` has no `Type::ForAll`; implicit generalization is represented by `PolyScheme`, not by a
 first-class quantified type (`infer/solver/scheme.rs`).
@@ -363,7 +363,7 @@ and negative-position merging. A negative position can merge lower bounds even w
 bounds already provide a shape. See [The collapse happens at the position](#the-collapse-happens-at-the-position).
 
 Generalized definitions follow the [specialization lifecycle](#specialization-scope-and-lifecycle),
-including the separate [diagnostic walk for unused definitions](#typechecking-a-never-called-definition).
+including the separate [diagnostic walk of each definition alone](#checking-a-definition-alone).
 
 #### Simplification
 
@@ -644,18 +644,19 @@ of the same name. A frame retains the original definition until its body's walk 
 
 `specialize_use` performs these operations:
 
-1. Mark the frame `demanded` before any operation that can fail.
-2. Resolve the use's instantiation for structural checks and channel-domain pairing.
-3. Compute its `SpecKey` from the still-live type before this use's pin.
-4. On a memo hit, rename the use to the existing specialization and copy its resolved type.
+1. Resolve the use's instantiation for structural checks and channel-domain pairing.
+2. Compute its `SpecKey` from the still-live type before this use's pin.
+3. On a memo hit, rename the use to the existing specialization and copy its resolved type.
    A surviving use also marks a previously unreferenced specialization as referenced.
-5. On a miss, clone the definition and freshen its type slots with levels preserved.
+4. On a miss, clone the definition and freshen its type slots with levels preserved.
    `seed_chan_dom_pairings` aligns rigid channel-domain names with the use before freshening;
    a two-way subtype pin cannot equate two different rigid names.
-6. Pin the clone and live use type in both directions, using a fresh `ConstrainCache`.
+5. Pin the clone and live use type in both directions, using a fresh `ConstrainCache`.
    Pin errors are reported at the use site.
-7. Coalesce the clone in the definition site's scope, then restore the use site's scope.
-8. Rename the use to `Name::mono`, stamp the clone's resolved type, and register the clone under
+6. Coalesce the clone in the definition site's scope, then restore the use site's scope. If the
+   pin succeeded, the errors the clone's walk raises are held on the frame
+   ([Checking a definition alone](#checking-a-definition-alone)).
+7. Rename the use to `Name::mono`, stamp the clone's resolved type, and register the clone under
    the pre-pin key.
 
 Freshening reaches node types, binder slots, refinement-predicate slots, and substitution payloads
@@ -674,8 +675,8 @@ refinements. See [`let` binders and scope exit](#let-binders-and-scope-exit).
 
 The original definition is not coalesced in place while its uses need clones. Its quantified
 variables carry the bounds copied into each specialization; overwriting them would remove that
-input. A never-demanded definition takes the
-[diagnostic-only path](#typechecking-a-never-called-definition).
+input. Once its last use is specialized, the definition is
+[checked alone](#checking-a-definition-alone).
 
 A memo hit is not pinned again. A miss pins a variable-bearing clone, whereas a hit contains
 already materialized types. Constraining that concrete result against another live use is a
@@ -730,46 +731,59 @@ emitted one level up, so a level test would generalize `g = m` over `m`'s own sh
 Emission reads `Binding::generalized`; the coalesce walk asks whether the name resolves to a
 specialization frame (`lookup_generalized`).
 
-#### Typechecking a never-called definition
+#### Checking a definition alone
 
-A generalized definition with no demand is checked before being dropped.
-`typecheck_discarded_definition` coalesces it in its definition-site scope and retains diagnostics,
-not its resolved expression.
+Every generalized definition is checked alone before its binding is dropped.
+`typecheck_discarded_definition` coalesces it in its definition-site scope, with its quantified
+variables flexible, and retains diagnostics, not its resolved expression. A used definition is checked after its last use is specialized, since coalescing it in
+place overwrites the bound-bearing variables its clones freshen from; an unused one has no clones.
 
 Emission already visits the body. It can reject a conflict with a concrete type immediately.
 Other errors require reading several bounds together: `λ a → (a.0, a.foo)` demands both a tuple
-and a named record from one parameter. Resolving the unused definition detects that conflict even
-without a call site.
+and a named record from one parameter. Resolving the definition detects that conflict even without
+a call site.
 
-An unused definition can retain unresolved positions because no use supplies their types.
-That residue is tolerated during inference and disappears with the discarded subtree; it is not
-evidence that a surviving unresolved function can pass strict compilation checks.
+The definition can retain unresolved positions because no use supplies their types. That residue
+is tolerated during inference and disappears with the dropped subtree; it is not evidence that a
+surviving unresolved function can pass strict compilation checks.
+
+An error is the definition's or a use's
+([chl-spec.md, "A use that checks compiles"](../../../docs/chl-spec.md#a-use-that-checks-compiles)),
+and a specialization's errors can be either. An error a specialization raises after its pin
+succeeds is held on the frame (`SpecializeFrame::held`) until the definition is checked alone. If
+the check raises it too, at the node the specialization's node copies or as the same defect, it is
+the definition's and is reported once, there. Otherwise it is the use's and is reported once, at
+the use: `def f(c, a): x = a if c else "s"` is sound alone, and a use at `Int` fails at the join,
+which the signature does not show, so the pin succeeds.
+
+In a walk whose types are dropped, a `match` on a scrutinee no value reaches does not pin its arm
+payloads
+([An unobservable arm payload is pinned to what its uses require](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)):
+the scrutinee stands for what the uses supply, so its payloads are parameters of the definition.
 
 Calls from discarded code are checked too. They can specialize an outer generalized binding to
 test the callee's demands against the arguments. Those specializations remain registered for memo
 reuse, but they are not spliced into a surviving outer let unless a surviving use references them.
 
-Three frame fields distinguish these decisions:
+Three frame fields carry these decisions:
 
 | Field | Meaning |
 | --- | --- |
-| `demanded` | A use reached `specialize_use`, even if resolving it later failed |
+| `held` | Errors a specialization raised after its pin succeeded, with the use and the copied node |
 | `Specialization::referenced` | The specialization must be retained when its let is rebuilt |
 | `inside_discarded` | The frame was created inside a subtree that will itself be discarded |
 
-An empty specialization list does not establish deadness: a failed use can mark a demand without
-creating a clone. Rechecking its definition as dead code would duplicate diagnostics.
 Discarded uses do register clones; registration and splice liveness are separate.
 
 `inside_discarded` is a property recorded when the frame is created, not a saved scope depth.
 The re-entrant specialization walk truncates the scope stack, so a depth comparison would
 misclassify frames pushed inside a discarded clone.
 
-The dead-definition walk runs in release builds too. Nested dead definitions are checked once per
-specialization of their enclosing live definition because their types can depend on that
-specialization. Repeated diagnostics are deduplicated. Memo registration avoids cloning an outer
-callee independently for every dead use, but it does not remove the general specialization-growth
-problem.
+The walk runs in release builds on every generalized definition: one coalesce of the definition
+beyond its specializations. Nested definitions are checked once per specialization of their
+enclosing live definition because their types can depend on that specialization. Repeated
+diagnostics are deduplicated. Memo registration avoids cloning an outer callee independently for
+every dead use, but it does not remove the general specialization-growth problem.
 
 A failed use that returns before renaming can still refer to a binding dropped during the let
 rebuild. No pass reads that tree: `run_frontend` in `ccl/context.rs` resolves each inference
@@ -793,7 +807,7 @@ not wait for a call. See [The domain join needs `box`](#the-domain-join-needs-bo
 
 Regression coverage is in `tests/type_check.rs` and `infer/solve.rs`, including
 `a_dead_definitions_calls_splice_no_specialization`,
-`a_suppressed_specialization_does_not_get_its_definition_re_walked`, and
+`a_definition_whose_use_failed_is_checked_alone_once`, and
 `one_defect_does_not_multiply_by_the_enclosing_specialization_count`.
 
 #### Keying a specialization
@@ -2101,8 +2115,15 @@ types.
 A membership test needs a shape, and a computed collection's domain is still a variable when the
 entry term is emitted. So `𝛼 :: 𝐾` is drawn as an **edge** on that variable — `InferBounds::kinds` —
 and answered wherever a type reaches it (`solver::constrain::answer_type_kinds`), which is the
-first moment it has an answer. A lower bound that is itself a variable inherits the edge instead of
+first moment it has an answer. A bound that is itself a variable inherits the edge instead of
 answering it, so the question travels every path a type could arrive by.
+
+Upper bounds answer it as lower bounds do. The variable is a candidate of a sum's binder, a data
+domain, and a data domain is invariant ([Data domains are invariant](#data-domains-are-invariant)),
+so it resolves to a domain reaching it from either side; which side a bound was recorded on is the
+edge's direction, not the domain's. The domain an argument supplies reaches a parameter's domain
+variable as an upper bound, so a use of `def make(s): r: List(Int) = box([y + 1 for y in s])`
+with a data source fails at the use rather than in the specialization.
 
 The dual case is a shape meeting a witness whose candidate has not resolved. The candidate
 is an ordinary variable among the candidates, so the demand lands on it as a bound like any other
@@ -3003,7 +3024,7 @@ Placement is forced at both ends. **After emission**, because that is when a def
 
 A delivery also tightens what the obligation's other positions accept: `Addable` narrowed to `Int` at position 0 accepts only `Int` at position 1. Nothing re-reads a variable standing at such a position against the requirements this pass already intersected for it. What the pin can deliver bounds the exposure. A base the sweep deposited was narrowed into the obligations by the sweep itself, at fixpoint, so the tightening is not new. `payload_trait_default` delivers `Int`, which every trait table contains, so every sibling intersection still accepts it. A base read off a consumer's bound is neither of those, and an obligation that cannot accept it empties and fails the pin's own assertion rather than narrowing quietly. Whether a stale sibling verdict is reachable at all is unresolved — no program in the corpus reaches one, and the bound is a property of the trait tables rather than of this code.
 
-This is the gap [Typechecking a never-called definition](#typechecking-a-never-called-definition) names. The two are complementary. That walk resolves a dead definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
+This is the gap [Checking a definition alone](#checking-a-definition-alone) names. The two are complementary. That walk resolves a definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
 
 #### The unit is a place, not a variable
 

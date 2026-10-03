@@ -1199,30 +1199,24 @@ fn a_never_called_function_over_a_source_is_typechecked(
     }
 }
 
-/// Deadness is the absence of a *demand*, not of a specialization: a use can be
-/// reached and still register nothing. Registering nothing is what the memo records,
-/// so reading deadness off the memo walks the definition of a binding that is very
-/// much used — reporting its body's defect a second time, from its own nodes.
+/// Every generalized definition is checked alone exactly once, whether or not a use
+/// registered a specialization of it. Here `g` is dead code, and its walk reaches the use
+/// `f(q)`, whose instantiation fails to resolve, so it registers nothing. `f`'s record/tuple
+/// key conflict is then reported once at `f`'s own sites (`a`, `a`, and the lambda), and the
+/// sites of `g` whose types carry the failed instantiation report it as well (`f`, `q`, and
+/// the lambda).
 ///
-/// Here the demand comes from **dead code**: `g` is dropped, so the walk over it
-/// specializes `f` — which is what checks the call, and reports `f`'s defect once,
-/// through the clone — but that specialization is marked unreferenced rather than
-/// spliced, so nothing about it reaches the program. The defect is a record/tuple key
-/// conflict, which neither the Σ work nor the trait rework changes, so this stays a
-/// rejection.
-///
-/// The exact count is the assertion: three diagnostics for one defect, not six.
+/// The exact count is the assertion: a second walk of `f` would add three more.
 #[test]
-fn a_suppressed_specialization_does_not_get_its_definition_re_walked() {
+fn a_definition_whose_use_failed_is_checked_alone_once() {
     let errs = infer_program_err(&dead_code(indoc! {r#"
         f = \a -> (a.0, a.foo)
         g = \q -> f(q)
     "#}));
     assert_eq!(
         errs.len(),
-        3,
-        "one defect, reported once per site that met it — a definition demanded \
-         without registering must not also be walked as dead code: {errs:?}"
+        6,
+        "one defect, reported once per site that met it: {errs:?}"
     );
 }
 
