@@ -16,13 +16,29 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::ccl::ty::{FunKind, PolyType, TypeKind};
+use crate::ccl::infer::solver::display::InferredPoly;
+use crate::ccl::ty::{FunKind, PolyType, TypeKind, TypeParamId};
 use crate::ccl::{BaseType, BinOpKind, Builtin, Expr, HistoryKind, Lit, Name, Type, TypedExprNode};
 use crate::ccl::{FieldKey, UnaryOpKind};
 
 /// `ty` written in CHL.
 pub fn chl_type(ty: &Type) -> String {
     Printer::for_type(ty).ty(ty)
+}
+
+/// An inferred polymorphic type written in CHL: its `Poly`, or its body alone when it
+/// has no parameters, with each join or meet the notation cannot write written as its
+/// operands, `A ∨ Int`.
+pub fn chl_inferred_poly(inferred: &InferredPoly) -> String {
+    let mut p = Printer {
+        joins: inferred.join_texts(chl_type),
+        ..Printer::for_type(&Type::Poly(std::rc::Rc::new(inferred.poly.clone())))
+    };
+    if inferred.poly.params.is_empty() {
+        p.ty(&inferred.poly.body)
+    } else {
+        p.poly(&inferred.poly)
+    }
 }
 
 #[derive(Default)]
@@ -38,6 +54,9 @@ struct Printer {
     /// Every spelling a name in the printed type has, so a binder the compiler minted is
     /// given one that no other name in the text reads as.
     taken: HashSet<String>,
+    /// The text of each parameter that stands for a join or meet
+    /// ([`chl_inferred_poly`]).
+    joins: Vec<(TypeParamId, String)>,
 }
 
 /// Binding tightness of a CHL expression, loosest first.
@@ -133,7 +152,10 @@ impl Printer {
             Type::Hole => "_".to_string(),
             // A variable has an identity `_` would drop: two occurrences are one type.
             Type::SharedHole(_) | Type::Infer(_) => self.fallback(ty),
-            Type::Param(p) => p.spelling.to_string(),
+            Type::Param(p) => match self.joins.iter().find(|(id, _)| *id == p.id) {
+                Some((_, text)) => text.clone(),
+                None => p.spelling.to_string(),
+            },
             Type::Tuple(ts) => match ts.as_slice() {
                 [] => "{}".to_string(),
                 [only] => format!("{{{},}}", self.ty(only)),

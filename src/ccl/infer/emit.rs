@@ -1982,14 +1982,22 @@ fn emit_let_bound<C: Typing>(
         // type, which is the poison.
         //
         // A polymorphic annotation is exact, and binds at its body: the
-        // right-hand side is checked once against it with the parameters opaque. A
-        // `def`'s body is a `Hole`, completed from the lambda, whose annotations
-        // already name the parameters. The reconcile runs at the right-hand side's
-        // level, so a hole in the body is quantified with the definition.
+        // right-hand side is checked once against it with the parameters opaque. The
+        // reconcile runs at the right-hand side's level, so a hole in the body is
+        // quantified with the definition.
+        // A `def`'s `Poly` is over a `Hole`: the lambda's own annotations state the
+        // signature, so the binding is bound at the right-hand side's type, and there
+        // is nothing to reconcile or to show in a mismatch.
+        Some(Type::Poly(poly)) if matches!(poly.body, Type::Hole) => bound_ty,
         Some(Type::Poly(poly)) => {
             poisoned = false;
             let declared = complete_annotation(&poly.body, &bound_ty);
-            match ctx.in_let_rhs(|ctx| ctx.bind_annotation(&bound_ty, &declared)) {
+            // The annotation as written, over the completed body, for a mismatch.
+            let shown = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+                body: declared.clone(),
+                ..(**poly).clone()
+            }));
+            match ctx.in_let_rhs(|ctx| ctx.bind_poly_annotation(&bound_ty, &declared, &shown)) {
                 Ok(ty) => ty,
                 Err(error) => {
                     ctx.recover(error, reads_before)?;

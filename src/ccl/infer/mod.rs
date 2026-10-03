@@ -204,8 +204,9 @@ pub(super) fn coalesce_for_error(ty: &Type) -> Type {
 }
 
 /// Resolve every node type inside `ty`'s refinement predicates, on a copy of each
-/// predicate: the copy is for a message, so nothing shares it.
-fn resolve_predicate_types(ty: &mut Type) {
+/// predicate: the copy is for a message, so nothing shares it. See
+/// [`coalesce_for_error`] for why a message's types are resolved when it is raised.
+pub(super) fn resolve_predicate_types(ty: &mut Type) {
     fn resolve_expr(e: &mut TypedExpr) {
         if let Ok(resolved) = resolve_var_type(&e.ty) {
             e.ty = resolved;

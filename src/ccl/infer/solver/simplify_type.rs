@@ -38,6 +38,20 @@ enum CoOccItem {
 /// Recursive variables must not merge with non-recursive ones, though the current
 /// solver does not supply recursive types for that path.
 pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
+    simplify_type_pinning(cty, &BTreeSet::new())
+}
+
+/// [`simplify_type`], keeping every variable in `pinned`: neither polar-only
+/// elimination nor atomic absorption drops one, though another variable may still
+/// merge into it.
+///
+/// For a reading in which a variable carries information the term does not show.
+/// A trait requirement on a variable is such information, and a variable that
+/// occurs at one polarity of the term may be what links it to the requirement
+/// (`super::display`).
+pub fn simplify_type_pinning(cty: CompactGraph, pinned: &BTreeSet<InferVarId>) -> CompactGraph {
+    // A variable a pinned one merges into stands for it, so it is pinned too.
+    let mut pinned = pinned.clone();
     // All variable UIDs encountered during the walk.
     let mut all_vars: BTreeSet<InferVarId> = cty.rec_vars.keys().cloned().collect();
     // Guards against re-entering a rec-var bound during analysis.
@@ -60,7 +74,7 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
 
     // Eliminate polar-only non-recursive variables.
     for &v in &all_vars {
-        if !cty.rec_vars.contains_key(&v) {
+        if !cty.rec_vars.contains_key(&v) && !pinned.contains(&v) {
             let has_pos = co_occurrences.contains_key(&(true, v));
             let has_neg = co_occurrences.contains_key(&(false, v));
             if has_pos != has_neg {
@@ -99,6 +113,9 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
                             .unwrap_or(false);
                         if v_in_w {
                             var_subst.insert(w, Some(v));
+                            if pinned.contains(&w) {
+                                pinned.insert(v);
+                            }
                             if cty.rec_vars.contains_key(&w) {
                                 // Both recursive: rec-bound merging deferred until recursive types land.
                                 // (Never reached today — rec_vars is always empty.)
@@ -120,7 +137,7 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
                             .get(&(!pol, v))
                             .map(|s| s.contains(&CoOccItem::Atom(atom.clone())))
                             .unwrap_or(false);
-                        if neg_has_atom {
+                        if neg_has_atom && !pinned.contains(&v) {
                             var_subst.insert(v, None);
                         }
                     }

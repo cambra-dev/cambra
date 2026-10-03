@@ -820,6 +820,42 @@ impl TraitObligation {
         self.assoc.iter().map(|p| p.ty.borrow().clone()).collect()
     }
 
+    /// The requirement this obligation states, as its operand and associated
+    /// positions: `None` before every operand is watched, and for an obligation a
+    /// product answered, whose conditions state it instead
+    /// ([`narrow_product`](Self::narrow_product)).
+    pub(super) fn stated_requirement(&self) -> Option<TraitRequirement> {
+        if self.answered_by_product().is_some() {
+            return None;
+        }
+        let operands = self.operands();
+        if operands.len() != self.trait_.arity() {
+            return None;
+        }
+        let args = operands.into_iter().collect::<Option<Vec<Type>>>()?;
+        let assoc = self
+            .assoc
+            .iter()
+            .map(|p| (p.name, p.ty.borrow().clone()))
+            .collect();
+        Some(TraitRequirement {
+            trait_: self.trait_,
+            args,
+            assoc,
+        })
+    }
+
+    /// The type standing at each operand position, `None` where none is yet.
+    pub(super) fn operands(&self) -> Vec<Option<Type>> {
+        self.operands.borrow().clone()
+    }
+
+    /// The variables watched at the operand positions, which belong to this
+    /// obligation's own instantiation.
+    pub(super) fn watched_operands(&self) -> Vec<Type> {
+        self.operands.borrow().iter().flatten().cloned().collect()
+    }
+
     /// Rewrite the associated positions. Freshening's second phase; see
     /// [`AssocPosition::ty`].
     pub(super) fn set_assoc_types(&self, tys: Vec<Type>) {

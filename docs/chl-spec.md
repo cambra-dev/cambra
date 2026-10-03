@@ -3003,10 +3003,10 @@ pick: forall (T) {T, T} => T = first
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
   ([6.7 Type-alias statements](#67-type-alias-statements)).
-- **A diagnostic prints an inferred polymorphic type in this notation** (**[Decided]**). A
-  mismatch against a polymorphic annotation prints the right-hand side's type with each variable
-  it quantifies as a parameter, `A`, `B`, … in order of first appearance, and each trait it
-  requires of them as a requirement. `def inc(a): a + 1` prints as
+- **A diagnostic prints an inferred polymorphic type in this notation.** A mismatch against a
+  polymorphic annotation prints the right-hand side's type with each variable it quantifies as a
+  parameter, `A`, `B`, … in order of first appearance, and each trait it requires of them as a
+  requirement. `def inc(a): a + 1` prints as
   `forall (A) A => Int requires Addable(A, Int, Output=Int)`. A part of the type the notation cannot
   write, such as a parameter joined with another type, is marked in the printed type (`A ∨ Int`),
   not dropped.

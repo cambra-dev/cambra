@@ -130,9 +130,10 @@ mentions a parameter.
    step 2, on every path out. It returns `𝜋` opened, its requirements normalized over the opened
    parameters, which are in scope as **assumptions** while the right-hand side is emitted
    ([Obligations under assumptions](#obligations-under-assumptions)).
-2. Emits the right-hand side and records `inferred <: 𝜋.body` through `bind_annotation`, at the
-   right-hand side's level, with the parameters opaque. A `def`'s body is a `Hole`, completed from
-   the lambda's type.
+2. Emits the right-hand side and records `inferred <: 𝜋.body` through `bind_poly_annotation`, at
+   the right-hand side's level, with the parameters opaque. A `def`'s body is a `Hole`: the lambda's
+   own annotations state the signature, so the binding is bound at the lambda's type and nothing is
+   reconciled.
 3. Binds the name at the completed body and generalizes. The body mentions the parameters above the
    binding's level, so `should_generalize` admits the `let` through its level test, and the
    coalesce walk asks the same predicate.
@@ -396,6 +397,13 @@ cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` 
 - **Parameters.** Each variable above the cutoff that survives simplification becomes a parameter,
   named `A`, `B`, … in order of first appearance, skipping a spelling a type parameter in the type
   already has. A position no variable and no type reached is a parameter of its own.
+- **The enclosing scope's variables.** A variable at or below the cutoff is one type of the
+  enclosing scope, so it is pinned against polar-only elimination and stays a variable, which
+  `chl_print` writes as `‹?𝑛›`. Under `def outer(y)`, `pick: forall (T) T => T = \x -> y` reports
+  `\x -> y` as `forall (A) A => ‹?𝑛›`.
+- **Predicates.** The types inside the result's refinement predicates are resolved when the error
+  is raised, as `coalesce_for_error` resolves them, so `chl_print` can tell a read of a collection
+  (`ys[_]`) from a call.
 - **Bounds.** The type beside a parameter at a negative position is its bound. A parameter that
   occurs once was eliminated by simplification, so its bound is written inline:
   `def at(a): a.at` prints as `forall (A) {at: A} => A`, and `def both(a): (a.at, a)` as

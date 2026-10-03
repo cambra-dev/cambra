@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
+use crate::ccl::infer::solver::display::poly_for_display;
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
@@ -472,6 +473,136 @@ impl InferCtx {
 }
 
 impl InferCtx {
+    /// [`Typing::bind_annotation`], raising `mismatch` on a conflict.
+    ///
+    /// `mismatch` renders the inferred type as read before the reconcile adds any
+    /// bound, so a report shows what was inferred rather than the partially modified
+    /// state a failed `constrain_subtype` leaves behind.
+    fn reconcile_annotation(
+        &mut self,
+        inferred: &Type,
+        ann: &Type,
+        mismatch: InferError,
+    ) -> Result<Type, LocatedInferError> {
+        // Shared by *binder* annotations (trait call sites in the emit rules)
+        // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
+        // reconciliation is identical: annotation wins on success, conflict
+        // surfaces as AnnotationMismatch.
+        //
+        // **One-way**: `inferred <: ann`. An ascription `x: T = e` needs exactly
+        // that — the value must be usable where `T` is expected — and nothing more.
+        //
+        // The reverse edge (`ann <: inferred`) additionally rejects a value whose
+        // inferred type is a *strict subtype* of its annotation, which is a sound
+        // widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`, a
+        // variant inferred as `{A}` annotated at the wider `{A | B}`, or `[0,3)⤇V`
+        // ascribed at `List(V)`. It was harmless only while every source annotation
+        // was a `Type::Base` leaf, where the two directions coincide; singleton
+        // literals and source-reachable collection/`UIntRange` annotations both make
+        // the over-restriction live. Worse for collections: a two-way `List`
+        // annotation would demand `Σ <: [0,3)⤇V` (consuming the sum *against the value*),
+        // a coercion with no sound denotation. One-way leaves a collection annotation
+        // to be met by the Σ rule, which is the only edge into a sum — a bare `[0,3)⤇V`
+        // does not reach `List(V)` at all without a `box`
+        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
+        //
+        // Information still flows *from* the annotation, so "annotation wins" is
+        // preserved: against a `Hole`-based annotation (`channelize`'s filter-feed
+        // `Fun(Refinement(Hole, r), Hole)`) the forward edge demands the
+        // annotation's refinement of an inferred variable, and the refinement rule
+        // flows that deficit onto it rather than rejecting. What changes is *when* a
+        // genuine conflict surfaces: at coalesce rather than immediately.
+        //
+        // This is for *ascriptions* only. A lambda **parameter** annotation is
+        // not reconciled here at all: `emit_lambda` binds the param directly at
+        // its annotation (bidirectional checking mode), so a conflicting body use
+        // fails at the use site rather than through any annotation edge.
+        // An unnamed annotation function over a *named* inferred one adopts the
+        // inferred Pi binder before normalizing — the same preservation
+        // `emit_cast` performs on a cast value's binder, for the same reason: a
+        // dependent codomain flowing into the annotation's codomain slot
+        // references the binder, and the adopted name is what gives that edge
+        // its correspondence and puts the binder in the telescope of the
+        // variables normalization mints inside the codomain (the group-by
+        // lowering's `data_fun(key_ty, Hole)` annotation over `λ __gb_k → …`
+        // is the exercising case). The adopted name is a spelling and an
+        // opening address; the annotation states no claim of its own about the
+        // binder.
+        //
+        // One layer: the outermost function only, so an annotation nested two
+        // dependent functions deep adopts the outer binder and not the inner. No
+        // shape reaching here carries two — a nested group-by resolves to
+        // `(Int ⤇ (Int ⤇ Int))`, with the key binders discharged — and the
+        // recursion would need the annotation and the inferred type to agree on
+        // depth, which nothing establishes at this edge.
+        let adopted;
+        let ann_to_normalize = match (inferred.peel_refinements(), ann.peel_refinements()) {
+            (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
+                let mut named = ann.clone();
+                // Name the unrefined function layer `peel_refinements` matched;
+                // refinement wrappers stay outside it. The walk peels exactly what
+                // that match peeled, so it lands on that same function.
+                let mut cur: &mut Type = &mut named;
+                while let Type::Refinement(inner, _) = cur {
+                    cur = inner;
+                }
+                let Type::Fun { name, .. } = cur else {
+                    unreachable!(
+                        "`peel_refinements` matched a `Fun` on this annotation, and \
+                         this walk peels the same `Refinement` layers, so it lands on it"
+                    )
+                };
+                *name = Some(b.clone());
+                adopted = named;
+                &adopted
+            }
+            _ => ann,
+        };
+        let ann_simple = self.normalize_annotation(ann_to_normalize);
+        let scope = SolverScope {
+            scopes: &self.scopes,
+            opaque_binders: &self.opaque_binders,
+        };
+        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope)
+            .map_err(|_| self.raise(mismatch.clone()))?;
+        // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
+        // above is contravariant in the domain, so it leaves the shared variable *below*
+        // every domain annotated with it: a common lower bound, which orders each domain
+        // under it and says nothing between them. Lowering writes the id to claim that two
+        // positions are one domain, and a data domain is invariant, so the claim is an
+        // equation and this draws its other half.
+        //
+        // Only where the id names the domain. A domain variable reached any other way may
+        // receive several domains deliberately — a conditional collection's arms, a
+        // domain-generic consumer's parameter — and equating those is what `constrain_go`'s
+        // invariant-domain arm declines to do for a variable-sided edge.
+        //
+        // Never against a **bound witness**. A sum's domain is its binder's reference, and
+        // entering a sum is a term (`src/ccl/design/type-inference.md`, "Only a term builds
+        // a sum"), so an equation between that reference and a free variable is not a claim
+        // about two positions but an escape of the binder — the coercion the one-way rule
+        // above exists to leave to the Σ rule.
+        if let Type::Fun {
+            domain: claimed, ..
+        } = ann_to_normalize.peel_refinements()
+            && matches!(**claimed, Type::SharedHole(_))
+            && let Type::Fun { domain: shared, .. } = ann_simple.peel_refinements()
+            && let Type::Fun {
+                domain: inferred_dom,
+                ..
+            } = inferred.peel_refinements()
+            && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
+        {
+            let scope = SolverScope {
+                scopes: &self.scopes,
+                opaque_binders: &self.opaque_binders,
+            };
+            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope)
+                .map_err(|_| self.raise(mismatch))?;
+        }
+        Ok(ann_simple)
+    }
+
     /// `lit`'s singleton type, with its predicate shared across every occurrence
     /// of the same literal value in this pass (see [`Self::lit_singletons`]).
     pub(super) fn lit_singleton(&mut self, lit: &Lit) -> Type {
@@ -904,135 +1035,35 @@ impl Typing for InferCtx {
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<Type, LocatedInferError> {
-        // Shared by *binder* annotations (trait call sites in the emit rules)
-        // and *node* annotations (`emit_node`'s `user_annotation` tail) — the
-        // reconciliation is identical: annotation wins on success, conflict
-        // surfaces as AnnotationMismatch.
-        //
-        // **One-way**: `inferred <: ann`. An ascription `x: T = e` needs exactly
-        // that — the value must be usable where `T` is expected — and nothing more.
-        //
-        // The reverse edge (`ann <: inferred`) additionally rejects a value whose
-        // inferred type is a *strict subtype* of its annotation, which is a sound
-        // widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`, a
-        // variant inferred as `{A}` annotated at the wider `{A | B}`, or `[0,3)⤇V`
-        // ascribed at `List(V)`. It was harmless only while every source annotation
-        // was a `Type::Base` leaf, where the two directions coincide; singleton
-        // literals and source-reachable collection/`UIntRange` annotations both make
-        // the over-restriction live. Worse for collections: a two-way `List`
-        // annotation would demand `Σ <: [0,3)⤇V` (consuming the sum *against the value*),
-        // a coercion with no sound denotation. One-way leaves a collection annotation
-        // to be met by the Σ rule, which is the only edge into a sum — a bare `[0,3)⤇V`
-        // does not reach `List(V)` at all without a `box`
-        // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
-        //
-        // Information still flows *from* the annotation, so "annotation wins" is
-        // preserved: against a `Hole`-based annotation (`channelize`'s filter-feed
-        // `Fun(Refinement(Hole, r), Hole)`) the forward edge demands the
-        // annotation's refinement of an inferred variable, and the refinement rule
-        // flows that deficit onto it rather than rejecting. What changes is *when* a
-        // genuine conflict surfaces: at coalesce rather than immediately.
-        //
-        // This is for *ascriptions* only. A lambda **parameter** annotation is
-        // not reconciled here at all: `emit_lambda` binds the param directly at
-        // its annotation (bidirectional checking mode), so a conflicting body use
-        // fails at the use site rather than through any annotation edge.
-        // An unnamed annotation function over a *named* inferred one adopts the
-        // inferred Pi binder before normalizing — the same preservation
-        // `emit_cast` performs on a cast value's binder, for the same reason: a
-        // dependent codomain flowing into the annotation's codomain slot
-        // references the binder, and the adopted name is what gives that edge
-        // its correspondence and puts the binder in the telescope of the
-        // variables normalization mints inside the codomain (the group-by
-        // lowering's `data_fun(key_ty, Hole)` annotation over `λ __gb_k → …`
-        // is the exercising case). The adopted name is a spelling and an
-        // opening address; the annotation states no claim of its own about the
-        // binder.
-        //
-        // One layer: the outermost function only, so an annotation nested two
-        // dependent functions deep adopts the outer binder and not the inner. No
-        // shape reaching here carries two — a nested group-by resolves to
-        // `(Int ⤇ (Int ⤇ Int))`, with the key binders discharged — and the
-        // recursion would need the annotation and the inferred type to agree on
-        // depth, which nothing establishes at this edge.
-        let adopted;
-        let ann_to_normalize = match (inferred.peel_refinements(), ann.peel_refinements()) {
-            (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
-                let mut named = ann.clone();
-                // Name the unrefined function layer `peel_refinements` matched;
-                // refinement wrappers stay outside it. The walk peels exactly what
-                // that match peeled, so it lands on that same function.
-                let mut cur: &mut Type = &mut named;
-                while let Type::Refinement(inner, _) = cur {
-                    cur = inner;
-                }
-                let Type::Fun { name, .. } = cur else {
-                    unreachable!(
-                        "`peel_refinements` matched a `Fun` on this annotation, and \
-                         this walk peels the same `Refinement` layers, so it lands on it"
-                    )
-                };
-                *name = Some(b.clone());
-                adopted = named;
-                &adopted
-            }
-            _ => ann,
+        let mismatch = InferError::AnnotationMismatch {
+            annotation: ann.clone(),
+            inferred: coalesce_for_error(inferred),
         };
-        let ann_simple = self.normalize_annotation(ann_to_normalize);
-        // Snapshot the inferred type before any annotation bound is added. Both reports
-        // below read this one snapshot, so each shows what was inferred rather than the
-        // partially modified state a failed `constrain_subtype` leaves behind.
-        let inferred_ty = coalesce_for_error(inferred);
-        let scope = SolverScope {
-            scopes: &self.scopes,
-            opaque_binders: &self.opaque_binders,
+        self.reconcile_annotation(inferred, ann, mismatch)
+    }
+
+    fn bind_poly_annotation(
+        &mut self,
+        inferred: &Type,
+        declared: &Type,
+        annotation: &Type,
+    ) -> Result<Type, LocatedInferError> {
+        // Called at the right-hand side's level, one above the binding's, which is
+        // where every variable the right-hand side minted sits.
+        let mismatch = match poly_for_display(inferred, self.level - 1) {
+            Some(mut shown) => InferError::PolyAnnotationMismatch {
+                inferred: Box::new({
+                    shown.map_types(&mut super::resolve_predicate_types);
+                    shown
+                }),
+                annotation: Box::new(annotation.clone()),
+            },
+            None => InferError::AnnotationMismatch {
+                annotation: annotation.clone(),
+                inferred: coalesce_for_error(inferred),
+            },
         };
-        constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope).map_err(|_| {
-            self.raise(InferError::AnnotationMismatch {
-                annotation: ann.clone(),
-                inferred: inferred_ty.clone(),
-            })
-        })?;
-        // **A `SharedHole` naming a domain is an equation, not an ordering.** The edge
-        // above is contravariant in the domain, so it leaves the shared variable *below*
-        // every domain annotated with it: a common lower bound, which orders each domain
-        // under it and says nothing between them. Lowering writes the id to claim that two
-        // positions are one domain, and a data domain is invariant, so the claim is an
-        // equation and this draws its other half.
-        //
-        // Only where the id names the domain. A domain variable reached any other way may
-        // receive several domains deliberately — a conditional collection's arms, a
-        // domain-generic consumer's parameter — and equating those is what `constrain_go`'s
-        // invariant-domain arm declines to do for a variable-sided edge.
-        //
-        // Never against a **bound witness**. A sum's domain is its binder's reference, and
-        // entering a sum is a term (`src/ccl/design/type-inference.md`, "Only a term builds
-        // a sum"), so an equation between that reference and a free variable is not a claim
-        // about two positions but an escape of the binder — the coercion the one-way rule
-        // above exists to leave to the Σ rule.
-        if let Type::Fun {
-            domain: claimed, ..
-        } = ann_to_normalize.peel_refinements()
-            && matches!(**claimed, Type::SharedHole(_))
-            && let Type::Fun { domain: shared, .. } = ann_simple.peel_refinements()
-            && let Type::Fun {
-                domain: inferred_dom,
-                ..
-            } = inferred.peel_refinements()
-            && !matches!(inferred_dom.peel_refinements(), Type::WitnessRef(_))
-        {
-            let scope = SolverScope {
-                scopes: &self.scopes,
-                opaque_binders: &self.opaque_binders,
-            };
-            constrain_subtype_in(inferred_dom, shared, &mut self.cache, &scope).map_err(|_| {
-                self.raise(InferError::AnnotationMismatch {
-                    annotation: ann.clone(),
-                    inferred: inferred_ty,
-                })
-            })?;
-        }
-        Ok(ann_simple)
+        self.reconcile_annotation(inferred, declared, mismatch)
     }
 
     fn binding_slot(&mut self, slot: &mut Type) -> Type {
