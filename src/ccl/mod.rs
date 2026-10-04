@@ -9,6 +9,7 @@
 pub mod anf;
 pub mod ccl_utils;
 pub mod channelize;
+pub mod chl_print;
 pub mod content_hash;
 pub mod context;
 pub mod diff;

@@ -1027,10 +1027,14 @@ impl std::fmt::Debug for InferError {
                 annotation,
                 inferred,
             } => {
+                // In CHL: the annotation is what the user wrote, and the inferred type is
+                // what they would write in its place (`src/ccl/design/diagnostics.md`,
+                // "How a diagnostic writes a type").
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    annotation, inferred
+                    crate::ccl::chl_print::chl_type(annotation),
+                    crate::ccl::chl_print::chl_type(inferred)
                 )
             }
             InferError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),

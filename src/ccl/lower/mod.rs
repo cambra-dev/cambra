@@ -1250,6 +1250,12 @@ pub(crate) mod test_helpers {
         )))
     }
 
+    /// Lower the CHL type expression `code`, a polymorphic type included.
+    pub(crate) fn lower_type(code: &str) -> Type {
+        super::stmts::lower_type_expr_or_poly(&parse_expr(code), &mut LoweringContext::default())
+            .unwrap_or_else(|e| panic!("`{code}` lowers as a type: {e:?}"))
+    }
+
     /// Parse a CHL module and return the statement list.
     pub(crate) fn parse_module(code: &str) -> Vec<Spanned<ChlStmt>> {
         chl_parser::parse_module(code)

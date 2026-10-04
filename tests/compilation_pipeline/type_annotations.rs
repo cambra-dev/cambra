@@ -48,7 +48,7 @@ def itsa_five(a) => String:
 
 itsa_five(\"dummy_arg\")
 ",
-        "Annotation mismatch: annotated as String, but inferred as Int@5",
+        "Annotation mismatch: annotated as String, but inferred as {Int where _ == 5}",
     )
 }
 
@@ -74,7 +74,7 @@ def itsa_nine(a) => {Int where _ == 9}:
 
 itsa_nine(\"dummy_arg\")
 ",
-        "Annotation mismatch: annotated as Int@9, but inferred as Int@8",
+        "Annotation mismatch: annotated as {Int where _ == 9}, but inferred as {Int where _ == 8}",
     )
 }
 
@@ -178,7 +178,7 @@ x = (3,-1)
 
 sum_up(x)
 ",
-        "Annotation mismatch: annotated as {Int | __elem >= __arg_tuple_0.0}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ >= ‹__arg_tuple_0›.0}, but inferred as Int",
     )
 }
 
@@ -196,7 +196,7 @@ def test(x: Int) => {Int where _ > x}:
 
 ()
 ",
-        "Annotation mismatch: annotated as {Int | __elem > x}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ > x}, but inferred as Int",
     )
 }
 
@@ -233,7 +233,7 @@ def test(x: {{Int where _ != y + y} where _ != y}) => {Int where _ > y + x}:
 
 ()
 ",
-        "Annotation mismatch: annotated as {Int | __elem > y + x}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ > y + x}, but inferred as Int",
     )
 }
 
@@ -295,7 +295,7 @@ def f(x: {Int where _ == _}) => {Int where _ == x}:
     x
 ()
 ",
-        "Annotation mismatch: annotated as {Int | __elem == x}, but inferred as {Int | __elem == __elem}",
+        "Annotation mismatch: annotated as {Int where _ == x}, but inferred as {Int where _ == _}",
     )
 }
 
@@ -309,7 +309,7 @@ def f(x: Int) => {Int where _ == x}:
     x
 ()
 ",
-        "Annotation mismatch: annotated as {Int | __elem == x}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ == x}, but inferred as Int",
     )
 }
 
@@ -589,7 +589,7 @@ fn a_call_in_the_body_leaves_the_result_unrefined() {
 
             foo(2)
         "#},
-        "inferred as {Int | __elem == t ^+ y ^+ t ▷ bar}",
+        "inferred as {Int where _ == t ^+ y ^+ bar(t)}",
     )
 }
 
@@ -632,7 +632,7 @@ fn an_aggregate_bound_following_from_the_filter_alone() {
 
             f(0)
         "#},
-        "Annotation mismatch: annotated as {Int | __elem <= 15}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ <= 15}, but inferred as Int",
     )
 }
 
@@ -650,7 +650,7 @@ fn an_aggregate_bound_needing_the_elements() {
 
             f(0)
         "#},
-        "Annotation mismatch: annotated as {Int | __elem <= 10}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ <= 10}, but inferred as Int",
     )
 }
 
@@ -667,7 +667,7 @@ fn an_aggregate_bound_the_elements_refute() {
 
             f(0)
         "#},
-        "Annotation mismatch: annotated as {Int | __elem <= 5}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ <= 5}, but inferred as Int",
     )
 }
 
@@ -727,7 +727,7 @@ fn a_record_equality_leaves_a_singleton_annotation_undischarged() {
 
             foo((a=2, b=3))
         "#},
-        "Annotation mismatch: annotated as Bool@true, but inferred as Bool",
+        "Annotation mismatch: annotated as {Bool where _ == True}, but inferred as Bool",
     )
 }
 
@@ -744,7 +744,7 @@ fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
 
             foo((a=1, b=2)).a
         "#},
-        "Annotation mismatch: annotated as {{a: Int, b: Int} | __elem == t}, but inferred as {a: Int, b: Int}",
+        "Annotation mismatch: annotated as {{a: Int, b: Int} where _ == t}, but inferred as {a: Int, b: Int}",
     )
 }
 
@@ -766,7 +766,7 @@ fn a_refined_map_key_no_key_satisfies() {
 m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
 m
 "#,
-        r#"Annotation mismatch: annotated as Σ (σ : SubtypesOf({String | __elem != ""}))"#,
+        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as FullMap({String where _ in ["a", "z"]}, Int)"#,
     )
 }
 
@@ -885,7 +885,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Annotation mismatch: annotated as {Int | __elem == a}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ == a}, but inferred as Int",
     )
 }
 

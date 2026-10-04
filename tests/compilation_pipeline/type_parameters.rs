@@ -316,7 +316,7 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
         g: \\T -> T = m
         1
     "},
-    "annotated as T, but inferred as Int@5",
+    "annotated as T, but inferred as {Int where _ == 5}",
 )]
 // The annotation fits the value, so what refuses it is that the name it binds is
 // monomorphic.

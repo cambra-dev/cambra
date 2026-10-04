@@ -24,6 +24,8 @@
 #[path = "compilation_pipeline/helpers.rs"]
 mod helpers;
 
+#[path = "compilation_pipeline/chl_types.rs"]
+mod chl_types;
 #[path = "compilation_pipeline/comprehensions.rs"]
 mod comprehensions;
 #[path = "compilation_pipeline/conditionals.rs"]

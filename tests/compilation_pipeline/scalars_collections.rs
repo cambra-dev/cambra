@@ -477,7 +477,7 @@ fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
 // `chl-parser/src/parser.rs`'s `power_precedence_and_associativity`.
 #[case::chain("2 ** 3 ** 2")]
 fn an_exponent_not_shown_non_negative_is_rejected(#[case] code: &str) {
-    check_compile_error(code, "__elem >= 0");
+    check_compile_error(code, "annotated as {Int where _ >= 0}");
 }
 
 /// What a program *can* show, which is what the refinement admits.
