@@ -1306,7 +1306,8 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 /// before the zip disqualifies the rule. Both morphisms are optional — a bare
 /// `.0` arm is `𝑓 = id`, an empty suffix is `𝑔 = id` — so the rule also covers
 /// the degenerate forms `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply) ⟹ 𝑓` and
-/// `curry(⟨.1, .0⟩ ≫ apply) ⟹ id`.
+/// `curry(⟨.1, .0⟩ ≫ apply) ⟹ id`. Where the curried collection is narrower than the
+/// argument, the last form is `map(id)` instead.
 ///
 /// 𝑔 leaves the curry as `map(𝑔)`, the internal hom's action on 𝑔
 /// (`map(𝑔)(k) = k ≫ 𝑔`), post-composed onto the curried function's result. The
@@ -1350,7 +1351,7 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
             unreachable!()
         };
         // `𝑔`: everything the curried function's result flows through.
-        let suffix = inner_elts.split_off(2);
+        let mut suffix = inner_elts.split_off(2);
         let _apply = inner_elts.pop().unwrap();
         let zip_node = inner_elts.pop().unwrap();
         let TypedExpr {
@@ -1372,6 +1373,27 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
             TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
             _ => None,
         };
+        // **A curry whose collection is narrower than its argument keeps a node to say so.**
+        // A filtered inner comprehension over the outer binder moves the filter onto the
+        // pair's `.1` binder (`lambda_elim`, the cast-wrapped lambda), so the curried
+        // collection is the argument restricted to `{𝐷 | 𝑝}` and only `curry_ty` records it.
+        // With 𝑓 and the suffix both absent the rewrite would leave `id`, which
+        // `try_compose_identity` removes, and the filter would be gone. `map(id)` carries the
+        // narrowing, and planning materializes it as a `map_filter`
+        // (`planning/map_filter.rs`).
+        //
+        // With 𝑓 present the narrowing reads the argument while `map` receives 𝑓's result,
+        // so no type spells it; that shape fails the post-elimination type check as it does
+        // without this rule.
+        //
+        // The test is the one `id` itself would fail: with 𝑓 and the suffix absent the curry
+        // is `𝐴 ⇒ 𝐵`, and `id` types only where `𝐴` is `𝐵`.
+        if f.is_none() && suffix.is_empty() && curry_ty.domain() != curry_ty.codomain() {
+            let Some(elem) = curry_ty.codomain().and_then(|c| c.codomain()) else {
+                unreachable!("a curry's result is a collection, got {curry_ty}")
+            };
+            suffix.push(id().with_ty(Type::fun(elem.clone(), elem)));
+        }
         // With 𝑓 absent the `.0` arm hands `apply` the curry's argument unchanged,
         // so `map(𝑔)` is the whole replacement and carries the curry's type as it
         // stands — rebuilding it would drop the Pi binder a dependent refinement

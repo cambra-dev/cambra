@@ -1175,6 +1175,38 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
+/// Reject a `for` loop over a collection whose type is a sum.
+///
+/// A loop's history is a function over its source's domain ([`fun_parts`]), and a sum's
+/// domain is a reference to the witness the sum binds. The history stands outside the sum, so
+/// the reference in its domain has no binder, and nothing drives a loop over a domain only
+/// the value holds (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+/// This holds for a determined sum as well: planning erases one only after this phase has
+/// typed the history. Runs on the inlined tree ahead of the transactional slice and
+/// [`run`], which both build a history over a loop's source.
+pub(crate) fn check_no_loop_over_a_sum(expr: &Expr) -> Result<(), String> {
+    if let TypedExprNode::For { iter, .. } = &expr.node
+        && matches!(
+            fun_parts(&iter.ty).0.peel_refinements(),
+            Type::WitnessRef(_)
+        )
+    {
+        return Err(format!(
+            "a `for` loop over a collection whose type is a sum is not supported yet: `{}` has \
+             type {}. A comprehension over it compiles",
+            symbolic(iter),
+            iter.ty
+        ));
+    }
+    let mut result = Ok(());
+    expr.walk_children(|child| {
+        if result.is_ok() {
+            result = check_no_loop_over_a_sum(child);
+        }
+    });
+    result
+}
+
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in

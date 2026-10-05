@@ -229,13 +229,15 @@ calls `planning::plan_loops` to recognize causal `LetRec` groups as `Transact` n
 induction loops and transaction groups use this carrier; its domain selects the runtime
 engine during operator conversion. `planning::run` then performs these rewrites in order:
 
-1. Realize collection-valued conditionals and erase determined sum witnesses.
+1. Realize collection-valued conditionals and erase determined sum witnesses. A row of a jagged
+   collection read from a mutable variable is refused.
 2. Recognize pointful keyed-aggregate sources and rewrite them using `converse`.
 3. Simplify point-free expressions before inserting iteration sources.
 4. Fold closed scalar computations with `const_fold::fold_constants`.
 5. Mark iteration sites, choosing a hash join where its predicate matches.
 6. Compile remaining refinement predicates throughout the tree.
-7. Insert `map_filter` for supported refinements on inner, per-group collections.
+7. Insert `map_filter` for supported refinements on inner, per-group collections, and refuse a
+   narrowing none materializes (`reject_unmaterialized_narrowings`).
 8. Simplify the planned expression again.
 
 Constant folding evaluates supported operations through the runtime's `src/scalar_ops.rs` kernel
@@ -255,9 +257,10 @@ finitely many named candidates, conditional planning restricts each arm by its f
 condition and unions the arms. Exactly one arm contributes data. The resulting tagged union
 is an executable representation of the selected collection; it is introduced after type
 inference because its type differs from the source sum. A determined witness with one
-candidate is erased from the term and its types. A sum whose domain cannot be determined
-from named candidates remains unresolved and may be rejected by operator conversion if it
-needs a concrete iteration extent. See
+candidate is erased from the term and its types. Every other witness is materialized: its `box`
+stays standing, the value carries its own keys, and operator conversion bounds the domain from
+the witness's kind. A `for` loop over a sum is refused by name, since its history would name the
+witness outside its binder. See
 [collections.md](collections.md#compiling-a-conditional-collection).
 
 ### Loop recognition
@@ -360,8 +363,9 @@ function, where that refinement depends on the function's input collection. The 
 iteration walk sees the function's own domain and cannot materialize this inner one.
 When each added predicate reads that input collection, planning converts the added
 conditions into a value predicate and inserts one `map_filter` before the function.
-The operator filters each group's elements independently. A shape that does not meet
-this condition remains for the post-planning type check to reject.
+The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
+refuses a narrowing no `map_filter` materializes, since operator conversion would compile the
+site without its filter.
 
 ---
 

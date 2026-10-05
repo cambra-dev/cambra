@@ -512,15 +512,18 @@ impl CompactType {
 /// `UIntRanges` states of its members ([`crate::ccl::ty::TypeKind::refuses`]).
 ///
 /// A refinement disqualifies it, as it does at the type level: a filtered range has holes,
-/// and admitting it would hand a length witness to a domain that lacks one. So does an
-/// unresolved variable, which has not said what it is; a join asking "is every candidate a
-/// range" must not read silence as yes.
+/// and admitting it would hand a length witness to a domain that lacks one.
+///
+/// **A variable beside the atom does not.** Naming a position is not filling it, and the atom
+/// count is what tells the two apart: a position holding no atom is the one that has said
+/// nothing, and compaction has already folded a variable's bounds into the atoms beside it.
+/// [`denoted_domains`] reads the same position and takes that reading, so both agree on which
+/// positions denote a domain at all.
 fn denotes_a_uint_range(ct: &CompactType) -> bool {
     let o = ct.occupied();
     o.atoms == 1
         && o.fun.is_none()
         && !o.others
-        && ct.vars.is_empty()
         && ct.atoms.iter().all(|a| matches!(a, AtomKey::UIntRange(_)))
 }
 
@@ -2537,6 +2540,28 @@ mod tests {
         };
         let merged = CompactType::merge(true, data_fun(refined()), data_fun(refined()));
         assert_eq!(merged.fun.expect("fun slot present").kind, KindPin::Data);
+    }
+
+    /// A variable beside a single range atom still denotes that range, and a variable alone
+    /// denotes nothing. The join over `UIntRanges` is where the difference shows: the
+    /// candidate is admitted, so the kind stays `UIntRanges` rather than rising to the
+    /// universe.
+    #[test]
+    fn a_variable_beside_a_range_atom_denotes_the_range() {
+        let range_and_var = CompactType {
+            vars: BTreeSet::from([InferVarId(0)]),
+            ..CompactType::from_atom(AtomKey::UIntRange(2))
+        };
+        assert!(denotes_a_uint_range(&range_and_var));
+        assert!(!denotes_a_uint_range(&CompactType::from_var(InferVarId(0))));
+        assert!(matches!(
+            CompactTypeKind::merge(
+                true,
+                CompactTypeKind::Enumerated(vec![range_and_var]),
+                CompactTypeKind::UIntRanges,
+            ),
+            CompactTypeKind::UIntRanges
+        ));
     }
 
     /// Compact merge at positive polarity unions tags.

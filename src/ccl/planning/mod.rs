@@ -90,7 +90,11 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// Also: the pointful group-by rewrite for keyed aggregates
 /// ([`groupby::recognize_groupby_sites`], via `groupby::convert_groupby_pointful`)
 /// runs before the materialisation walk.
-pub fn run(mut expr: Expr) -> Expr {
+///
+/// The error is an unsupported program: a jagged row realization cannot keep
+/// ([`conditionals::realize_conditional_collections`]), or a per-group filter no
+/// `map_filter` materializes ([`map_filter::reject_unmaterialized_narrowings`]).
+pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // Refinement predicates travel through inference and lambda-elim as bare
     // expressions over the implicit `REFINEMENT_BINDER` (design §6.3) and are
     // compiled to point-free form only when a refined type is iterated (§6.5).
@@ -100,7 +104,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // Realize conditional collections first: the gated union it produces is an ordinary
     // collection, so every later phase — recognizers, iteration-site materialisation,
     // predicate compilation — sees one shape rather than needing a `Case` case.
-    let discharged = conditionals::realize_conditional_collections(&mut expr);
+    let realized = conditionals::realize_conditional_collections(&mut expr)?;
     groupby::recognize_groupby_sites(&mut expr);
     let mut expr = simplify(expr);
     // Constant-fold before the iteration walk so a collection literal's elements are
@@ -108,7 +112,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the
     // fold dispatches on the operator it is handed.
     const_fold::fold_constants(&mut expr);
-    insert_iterate_markers(&mut expr, &discharged);
+    insert_iterate_markers(&mut expr, &realized);
     // Normalize every remaining bare predicate tree-wide to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
     // refinement also rides **consumer contracts** that sit outside any site —
@@ -127,6 +131,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // matches the point-free predicate, and after the group-by rewrite because the
     // site's upstream is the `converse` chain it splices into.
     map_filter::insert_map_filters(&mut expr);
+    map_filter::reject_unmaterialized_narrowings(&expr)?;
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its
@@ -138,7 +143,7 @@ pub fn run(mut expr: Expr) -> Expr {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
     // such read is already an `as_of` join — nothing to do at planning time.
-    expr
+    Ok(expr)
 }
 
 /// Is `e` a bare `Var` other than the element binder (the free key binder)?

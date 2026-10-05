@@ -42,9 +42,9 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 ///
 /// A site whose added refinements do not all dereference 𝑔 is left alone: nothing here
 /// knows what stream to evaluate such a predicate against, and materializing the rest
-/// would leave the site claiming a narrowing it no longer performs. An unmaterialized
-/// refinement is caught by the check at the end of planning rather than silently
-/// dropped.
+/// would leave the site claiming a narrowing it no longer performs. Such a site is rejected
+/// by name afterwards ([`reject_unmaterialized_narrowings`]) rather than compiled without its
+/// filter.
 pub(super) fn insert_map_filters(expr: &mut Expr) {
     expr.walk_children_mut(insert_map_filters);
     let TypedExprNode::Compose(elts) = &expr.node else {
@@ -109,11 +109,39 @@ pub(super) fn insert_map_filters(expr: &mut Expr) {
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
 /// filter site. See [`insert_map_filters`] for the shape.
-///
-/// The codomain comes back **opened**: a reference to the site's Pi binder is stored as
-/// an index, and every use here needs the name — matching a predicate against the
-/// binder, and emitting types in which that binder no longer exists.
 fn map_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
+    let Narrowing {
+        binder,
+        opened,
+        consumed,
+        added,
+    } = narrowing(expr)?;
+    // `application_order` is the one place planning fixes an order on a refinement
+    // set. One `map_filter` materializes the whole conjunction, so the element types
+    // it pairs with — the stages of a filter *pipeline* — have no counterpart here.
+    let mut conjoined = None;
+    for (r, _) in application_order(&added, &consumed) {
+        conjoined = combine_predicates(conjoined, Some(value_predicate(&r.predicate, &binder)?));
+    }
+    Some((opened, conjoined?))
+}
+
+/// A morphism whose codomain refines the collection its domain carries, before asking
+/// whether a `map_filter` can materialize the refinements it adds.
+struct Narrowing {
+    /// The Pi binder the added refinements read.
+    binder: Name,
+    /// The codomain, **opened**: a reference to the Pi binder is stored as an index, and
+    /// every use needs the name — matching a predicate against the binder, and emitting
+    /// types in which that binder no longer exists.
+    opened: Type,
+    /// The domain of the collection the morphism consumes.
+    consumed: Type,
+    /// The refinements the codomain's domain carries beyond `consumed`'s, never empty.
+    added: Vec<Refinement>,
+}
+
+fn narrowing(expr: &Expr) -> Option<Narrowing> {
     let Type::Fun {
         name: Some(binder),
         domain,
@@ -125,6 +153,19 @@ fn map_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
     };
     let consumed = domain.domain()?;
     let opened = open_codomain(&expr.ty, codomain);
+    // **A row whose collection is a sum** — a jagged row, its domain a witness — narrows
+    // under a sum of its own: the codomain binds a second witness over the same kind, and
+    // the two domains name different binders for the one row's domain. Reading the codomain
+    // at the domain's binder is what lets them compare, and what the emitted filter's type
+    // then says.
+    let opened = match (domain.sum(), opened.sum()) {
+        // A substitution rather than `Type::rename_witnesses`, because the refinement's
+        // predicate types its `__elem` at the witness and only a substitution reaches it.
+        (Some([row, ..]), Some([narrowed, ..])) if row.type_kind() == narrowed.type_kind() => {
+            crate::ccl::subst::Subst::rename_witness(narrowed.id(), row.id()).apply_type(&opened)
+        }
+        _ => opened,
+    };
     let narrowed = opened.domain()?;
     // The narrowing must be of the collection the site consumes; a refinement over
     // some unrelated domain is not this shape, and neither is a codomain that *drops*
@@ -142,14 +183,41 @@ fn map_filter_site(expr: &Expr) -> Option<(Type, Expr)> {
         .filter(|r| !already.contains(r))
         .cloned()
         .collect();
-    // `application_order` is the one place planning fixes an order on a refinement
-    // set. One `map_filter` materializes the whole conjunction, so the element types
-    // it pairs with — the stages of a filter *pipeline* — have no counterpart here.
-    let mut conjoined = None;
-    for (r, _) in application_order(&added, &consumed) {
-        conjoined = combine_predicates(conjoined, Some(value_predicate(&r.predicate, binder)?));
+    if added.is_empty() {
+        return None;
     }
-    Some((opened, conjoined?))
+    Some(Narrowing {
+        binder: binder.clone(),
+        opened,
+        consumed,
+        added,
+    })
+}
+
+/// Reject a narrowing [`insert_map_filters`] left standing.
+///
+/// The site keeps claiming a narrowing no operator performs, and op-conversion reads a
+/// collection's extent with its refinements stripped, so compiling it would drop the filter
+/// and answer as though it were absent. Runs after [`insert_map_filters`] over the same
+/// positions it inspects: the elements of a composition after the first.
+pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
+    if let TypedExprNode::Compose(elts) = &expr.node
+        && let Some(site) = elts.iter().skip(1).find(|e| narrowing(e).is_some())
+    {
+        return Err(format!(
+            "a filter on an inner collection that planning cannot materialize is not \
+             supported yet: `{}` narrows the collection it is handed to {}",
+            symbolic(site),
+            narrowing(site).map_or_else(String::new, |n| n.opened.to_string())
+        ));
+    }
+    let mut result = Ok(());
+    expr.walk_children(|child| {
+        if result.is_ok() {
+            result = reject_unmaterialized_narrowings(child);
+        }
+    });
+    result
 }
 
 /// Strip `__elem ▷ (𝑔 ≫ 𝑞)` down to `𝑞`, the predicate on the collection's values.
@@ -264,8 +332,8 @@ mod tests {
 
     /// All-or-nothing: an added refinement that never dereferences the binder leaves
     /// the whole site alone. Materializing only its siblings would leave the site
-    /// claiming a narrowing it no longer performs, and the unmaterialized refinement
-    /// is reported at the end of planning instead.
+    /// claiming a narrowing it no longer performs, and
+    /// [`reject_unmaterialized_narrowings`] reports it instead.
     #[test]
     fn a_refinement_that_does_not_dereference_the_binder_blocks_the_site() {
         let (mut expr, _) = site_adding(&["q1"]);
@@ -295,5 +363,16 @@ mod tests {
         insert_map_filters(&mut expr);
         assert_eq!(planned(&expr).0, None, "no map_filter was inserted");
         assert_eq!(expr, before, "the site is untouched");
+        let rejected = reject_unmaterialized_narrowings(&expr)
+            .expect_err("the narrowing no operator performs is rejected");
+        assert!(rejected.contains("cannot materialize"), "{rejected}");
+    }
+
+    /// A site the insertion materialized narrows nothing any more, so the check passes it.
+    #[test]
+    fn a_materialized_site_is_not_rejected() {
+        let (mut expr, _) = site_adding(&["q1"]);
+        insert_map_filters(&mut expr);
+        assert_eq!(reject_unmaterialized_narrowings(&expr), Ok(()));
     }
 }

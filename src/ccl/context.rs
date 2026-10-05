@@ -2031,6 +2031,8 @@ fn run_passes(
     // silently absorbed into the outer block's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
     check_transact_rejections(&expr, &txn_mut_vars)?;
+    mut_elim::check_no_loop_over_a_sum(&expr)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
 
     // The two rewrites the transactional slice runs before its own: both mint expression
     // nodes, so both sit inside the phase's recording — outside it their nodes reach the
@@ -2150,7 +2152,8 @@ fn run_passes(
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
         typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
         planning::run(recognized)
-    });
+    })
+    .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
     audit.finish(&join_planned);
     // Planning is the one phase that introduces `iterate` / `restrict` /
