@@ -1116,7 +1116,10 @@ fn constrain_go_impl(
             // materialization, where every contribution to the variable meets in
             // the compact domain lattice (`src/ccl/design/type-inference.md`,
             // "Materialization"). Whether a side is a variable is a property of the
-            // edge, not of when it fires, so both spellings stay order-independent.
+            // edge, not of when it fires, so the path an edge takes does not depend on
+            // constraint order. That does not establish that the outcome is
+            // order-independent: a conflict can be reported at a concrete edge or at
+            // materialization, depending on which constraints force the comparison.
             //
             // The kind edge above reports which rule its two sides call for, so
             // this asks one question rather than inspecting both spellings — a var
