@@ -62,9 +62,12 @@ use crate::interpreter::{
     tile_operators::{FanOut, TileProducer},
 };
 
-/// The root branch: the one the process starts with, and the one a control-port
-/// verb without a branch segment addresses.
-pub const ROOT: &str = "main";
+/// The branch a request that names none addresses: a control-port verb without
+/// a branch segment, the single-branch accessors, and the unlabelled output of
+/// the binary's driver. The process starts with a branch of this name, and the
+/// name means whichever branch holds it, so once that branch is deleted a
+/// branch created under the name takes its place.
+pub const DEFAULT_BRANCH: &str = "main";
 
 /// Builds the consumer that wakes the driver for a program's `main` output.
 ///
@@ -473,7 +476,7 @@ impl LiveProgram {
         )?;
         let (program, main_producer) = driving(program);
         let root = Branch {
-            name: ROOT.to_string(),
+            name: DEFAULT_BRANCH.to_string(),
             provenance: None,
             version: 1,
             // A first compilation keeps nothing, so its tally is `0` kept of
@@ -500,17 +503,18 @@ impl LiveProgram {
             .ok_or_else(|| BranchError::Unknown(name.to_string()))
     }
 
-    /// The branch the single-branch accessors answer for: the one named `main`.
-    /// Once `main` is deleted they answer `None` rather than pick another
-    /// branch, the way a control verb without a branch segment answers 404
-    /// (`src/ccl/design/program-evolution.md`, "The control port").
-    fn primary(&self) -> Option<&Branch> {
-        self.branches.iter().find(|b| b.name == ROOT)
+    /// The branch the single-branch accessors answer for: the one named
+    /// [`DEFAULT_BRANCH`]. While no branch holds that name they answer `None`
+    /// rather than pick another branch, the way a control verb without a branch
+    /// segment answers 404 (`src/ccl/design/program-evolution.md`, "The control
+    /// port").
+    fn default_branch(&self) -> Option<&Branch> {
+        self.branches.iter().find(|b| b.name == DEFAULT_BRANCH)
     }
 
     /// The compiled program `main` runs, while the table holds `main`.
     pub fn program(&self) -> Option<&CompiledProgram> {
-        self.primary().map(|b| &b.program)
+        self.default_branch().map(|b| &b.program)
     }
 
     /// The compiled program branch `name` runs.
@@ -521,12 +525,12 @@ impl LiveProgram {
 
     /// `main`'s `main` output's producer, for inspection.
     pub fn main_producer(&self) -> Option<&dyn TileProducer> {
-        self.primary()?.main_producer.as_deref()
+        self.default_branch()?.main_producer.as_deref()
     }
 
     /// `main`'s `main` output's producer, for a driver to pull.
     pub fn main_producer_mut(&mut self) -> Option<&mut Box<dyn TileProducer>> {
-        self.branch_main_producer_mut(ROOT)
+        self.branch_main_producer_mut(DEFAULT_BRANCH)
     }
 
     /// Branch `name`'s `main` output's producer, for a driver to pull.
@@ -538,19 +542,18 @@ impl LiveProgram {
     /// The source `main`'s current version was compiled from, while the table
     /// holds `main`.
     pub fn source(&self) -> Option<&str> {
-        self.primary().map(|b| b.program.source.as_str())
+        self.default_branch().map(|b| b.program.source.as_str())
     }
 
     /// Pull every branch's `main` output that has something new, in creation
     /// order.
     ///
-    /// `pull` is handed the branch's name, whether it is the root, and the
-    /// producer, and answers whether that output has now finished. A finished
+    /// `pull` is handed the branch's name and the producer, and answers whether that output has now finished. A finished
     /// output is not pulled again (`src/ccl/design/program-evolution.md`, "A
     /// reload changes no other branch"). Returns whether anything was pulled.
     pub fn pull_mains(
         &mut self,
-        mut pull: impl FnMut(&str, bool, &mut dyn TileProducer) -> bool,
+        mut pull: impl FnMut(&str, &mut dyn TileProducer) -> bool,
     ) -> bool {
         let mut pulled = false;
         for branch in &mut self.branches {
@@ -562,7 +565,7 @@ impl LiveProgram {
             };
             branch.main_notified.set(false);
             pulled = true;
-            if pull(&branch.name, branch.provenance.is_none(), producer.as_mut()) {
+            if pull(&branch.name, producer.as_mut()) {
                 branch.main_finished = true;
             }
         }
@@ -671,7 +674,7 @@ impl LiveProgram {
         code: &str,
         phase: Phase,
     ) -> Result<DiffReport, Vec<CompileError>> {
-        self.diff_branch(ctx, ROOT, code, phase)
+        self.diff_branch(ctx, DEFAULT_BRANCH, code, phase)
             .map_err(|e| match e {
                 BranchError::Compile(errs) => errs,
                 other => vec![CompileError::Unsupported(other.to_string())],
@@ -734,7 +737,7 @@ impl LiveProgram {
         code: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<ReloadReport, Vec<CompileError>> {
-        self.reload_branch(ctx, ROOT, code, main_consumer)
+        self.reload_branch(ctx, DEFAULT_BRANCH, code, main_consumer)
             .map_err(|e| match e {
                 BranchError::Compile(errs) => errs,
                 other => vec![CompileError::Unsupported(other.to_string())],

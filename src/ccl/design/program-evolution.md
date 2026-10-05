@@ -35,8 +35,13 @@ Three questions decide a reload:
 - **Version**: one revision of a program's source, and the operator graph built from it. A branch's
   versions are numbered, rising by one at each reload, and `<branch>@<n>` names version `n` of
   `<branch>`.
-- **Branch**: a named version, running from the moment it is created. The **root** branch, `main`,
-  is the one the process starts with, as `main@1`.
+- **Branch**: a named version, running from the moment it is created. The **root** is the branch
+  the process starts with, as `main@1`. Root is informational: it is the branch with no branch
+  provenance, `/branches/list` reports it as `from=-`, and nothing else reads it.
+- **Default branch**: the branch named `main` (`DEFAULT_BRANCH`), whichever branch holds that name.
+  A request that names no branch addresses it, and the binary's driver prints its value unlabelled.
+  It is the root until the root is deleted, and a branch created under `main` afterwards is the
+  default branch without being the root.
 - **Branch provenance**: the `<parent>@<n>` a branch was created from. It is recorded at creation
   and reported, and no reload reads it. The root has none. It is unrelated to node provenance,
   [provenance.md](provenance.md).
@@ -72,9 +77,9 @@ body when the body is non-blank, and otherwise from the query string, percent-de
 is `text/plain; charset=utf-8`.
 
 A `<name>` is a non-empty path segment of ASCII letters, digits, `-` and `_`. A `<branch>` segment
-that is omitted means `main`, and so does an omitted `/from/<parent>`. No verb falls back to another
-branch, so once `main` is deleted every verb must name its branch, and one that does not answers
-404.
+that is omitted means the default branch, `main`, and so does an omitted `/from/<parent>`. No verb
+falls back to another branch, so while no branch is named `main` every verb must name its branch,
+and one that does not answers 404.
 
 | Verb | Takes | Does |
 | --- | --- | --- |
@@ -313,9 +318,9 @@ fan-out](#guards-intersect-at-a-fan-out). The next reload of any branch that kee
 would then resume those iterations below where that branch had reached, and decide positions a
 second time (`a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice`). A branch's outputs
 stay subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
-`main` output (`LiveProgram::pull_mains`), and prints a value from a branch other than the root as
-`Got value from <branch>: …`. The root is the branch with no branch provenance, so a branch created
-under the name `main` after the root's deletion prints labelled. A version whose `main` output has
+`main` output (`LiveProgram::pull_mains`). It prints the default branch's value as `Got value: …`
+and every other branch's as `Got value from <branch>: …`, so a branch created under the name `main`
+after the root's deletion prints unlabelled. A version whose `main` output has
 finished is no longer pulled. The process exits when every branch's `main` output has finished and
 every branch's sink outputs have signalled completion, which a sink program serving a route never
 does.

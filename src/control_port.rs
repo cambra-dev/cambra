@@ -39,7 +39,7 @@ use log::info;
 
 use crate::ccl::context::{GlobalContext, Phase, ReuseTally, render_errors};
 use crate::live_program::{
-    BranchError, LiveProgram, MainConsumerFactory, ROOT, ReloadReport, is_branch_name,
+    BranchError, DEFAULT_BRANCH, LiveProgram, MainConsumerFactory, ReloadReport, is_branch_name,
     render_unreadable,
 };
 
@@ -419,7 +419,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
             let phase = phase()?;
             require_code(&code)?;
             Ok(ControlRequest::Diff {
-                branch: rest.first().copied().unwrap_or(ROOT).to_string(),
+                branch: rest.first().copied().unwrap_or(DEFAULT_BRANCH).to_string(),
                 code,
                 phase,
             })
@@ -444,7 +444,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
         ("reload", [] | [_]) => {
             require_code(&code)?;
             Ok(ControlRequest::Reload {
-                branch: rest.first().copied().unwrap_or(ROOT).to_string(),
+                branch: rest.first().copied().unwrap_or(DEFAULT_BRANCH).to_string(),
                 code,
             })
         }
@@ -452,7 +452,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
             require_code(&code)?;
             Ok(ControlRequest::Branch {
                 name: name.to_string(),
-                parent: ROOT.to_string(),
+                parent: DEFAULT_BRANCH.to_string(),
                 code,
             })
         }
@@ -646,7 +646,7 @@ mod tests {
         let waiter = thread::spawn(move || rx.recv().expect("a reply").status);
         drop(ControlMessage {
             request: ControlRequest::Reload {
-                branch: ROOT.to_string(),
+                branch: DEFAULT_BRANCH.to_string(),
                 code: "x".to_string(),
             },
             reply: Some(tx),
