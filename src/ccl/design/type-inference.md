@@ -2726,189 +2726,315 @@ Obligations ride variables through `freshen_above`, so a generalized function ca
 
 ## 5. CCL-specific inference rules
 
-§1–§4 describe the engine generically; the general two-pass structure (emit → coalesce) is §2. This section covers the per-node wiring specific to CCL's AST — the structural rule each `TypedExprNode` variant emits. `ccl::infer` runs on a `TypedExpr` whose nodes all carry `Type::Hole`, calls the emit rules below per node, and coalesces the resulting constraint graph back onto each `expr.ty` (§2). A residual `Type::Infer(id)` after inference means the coalesce pass left a variable genuinely unconstrained (e.g. the parameter of an unapplied identity lambda).
+The rules in `infer/emit.rs` describe each CCL node's structural typing. They run in both
+inference and checking contexts; see
+[The post-inference check](#the-post-inference-check-shared-rules).
+Lowered nodes can already carry annotations or function-kind information. Inference does not
+require every input type slot to be `Type::Hole`.
 
 ### `groupby`
 
-`groupby` is not a dedicated node. It lowers to a cast-wrapped key lambda — `λ k → cast({I | i ▷ c ▷ key == k} ⇒ A, λ i → c(i))` — so its typing falls out of the ordinary `Lambda`/`Cast` rules plus the dependent-refinement machinery of [§4.5](#45-dependent-refinements-via-pi-types); planning's `convert_groupby_pointful` then recognizes the resulting Pi-const source.
+`groupby` lowers to a key lambda whose result is a collection restricted to that key.
+Its type follows from the ordinary Lambda, Cast and dependent-refinement rules, rather
+than a dedicated inference node. Planning recognizes it through `convert_groupby_pointful`.
+[The exact groupby type](collections.md#groupbys-exact-type) owns the key-image and
+per-group domain contracts.
 
 ### BinOp type rules
 
-| Op kind | Operand constraint | Result type |
-|---|---|---|
-| `Arithmetic` | a trait obligation over two *unrelated* variables — `Addable`, `Subtractable`, `Multipliable`, `Divisible`, `Exponentiable` | the trait's `Output` |
-| `Compare` | a trait obligation — `Equatable` (`==`, `!=`) or `Orderable` (`<`, `<=`, `>`, `>=`), which associate nothing | `Bool`, fixed by the operator |
-| `Concat` | both operands constrained to `String` | `String` |
-| `BoolLogic` | both operands constrained to `Bool` | `Bool` |
+`emit_binop` reads both operands as values, then applies the signature selected by
+`OperatorSchemes::binop`. A signature is either a fixed scheme or a trait obligation.
 
-The bottom two rows are ordinary schemes, because their operand types are fixed. The top two are not, and could not be: see [Traits](#traits).
+| Op kind | Operand requirement | Result |
+| --- | --- | --- |
+| Arithmetic | Separate operand positions in `Addable`, `Subtractable`, `Multipliable`, `Divisible` or `Exponentiable` | Associated `Output` |
+| Internal `AddRefined` | `AddableRefined` | Associated `Output` |
+| Equality comparison | `Equatable` | `Bool` |
+| Ordering comparison | `Orderable` | `Bool` |
+| `Concat` | Both operands flow into `String` | `String` |
+| `BoolLogic` | Both operands flow into `Bool` | `Bool` |
 
-**Note**: String + String → `Concat` rewriting is performed at **compile time** (in `simplify.rs`), not at inference time. Inference accepts `(String, String) ⇝ String` as an `Addable` instance and returns `String`.
+The operand variables of an arithmetic obligation are not equated. The trait relation
+determines which combinations are accepted; [Traits](#traits) owns resolution and
+generalization. Comparison traits have no associated result: the operator fixes `Bool`.
+
+String addition is an `Addable` instance during inference. The later simplification pass
+rewrites the typed addition to `Concat`; inference does not perform that rewrite.
 
 ### UnaryOp type rules
 
-| Op kind | Operand constraint | Result type |
-|---|---|---|
-| `Neg` | a **unary** trait obligation — `Negatable` | the trait's `Output` |
-| `Not` | operand constrained to `Bool` | `Bool` |
+`emit_unary` uses the same scheme/obligation distinction.
+
+| Op kind | Operand requirement | Result |
+| --- | --- | --- |
+| `Neg` | Unary `Negatable` obligation | Associated `Output` |
+| `Not` | Operand flows into `Bool` | `Bool` |
 
 ### `Case` inference
 
-For each `Branch { guard, body }`: the guard flows one-way into `Type::Base(BaseType::Bool)` (a refined boolean is still a boolean); every body flows one-way into one shared variable. The overall `Case` type is that variable — the arms' **join**. Two arms of incompatible base types therefore collide as `IncompatibleBounds` at coalesce, where a heterogeneous list literal or `Copair` reports it, rather than as an eager mismatch here. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+A `Case` has at least one branch. `emit_case` reports `InferError::EmptyCase` for an
+empty branch list; normal lowering does not produce one.
+
+For every branch, the guard must be a subtype of `Bool`, and the body type flows into
+one shared result variable. The result is the arms' join, not a requirement that all
+arm types be equal. Common refinements survive the join; incompatible primitive types
+produce `IncompatibleBounds` at coalesce. Collection arms must also satisfy the domain
+rules in [The domain join needs `box`](#the-domain-join-needs-box).
+
+A structural match additionally carries a scrutinee and patterns:
+
+1. Allocate a payload variable for each named tag and place it in the pattern binding.
+2. Constrain the scrutinee as a subtype of the expected variant. Shared tags thereby
+   constrain their payload variables.
+3. With no default arm, use a closed expected variant: missing coverage is an error.
+   With a default arm, use an open expected variant: unnamed tags are permitted, but
+   named payload constraints still apply.
+4. For a pattern that claims to have no payload, constrain its payload to `Unit`.
+   Do this after the scrutinee constraint so a failure is attributed to that arm.
+5. Infer each guard and body with its pattern binding in scope.
+
+[The unified tagged sum](#the-unified-tagged-sum) defines the coverage
+relation. Placing the scrutinee and expected variant below a common fresh variable would
+not propagate payload types from one into the other.
+
+Branch bodies are value reads. Selecting between mutable variables selects their values,
+not a write-through handle; this does not relax the restriction on writable argument nodes.
 
 #### An unobservable arm payload is pinned to what its uses require
 
-An arm naming a tag the scrutinee cannot carry receives no lower bound: no value reaches that payload, and nothing else determines it unless a use of it says something. Such an arm is ordinary code rather than an error (a `match` written for the whole `Option` over a scrutinee inference has pinned to one tag), so inference chooses a type for it rather than reaching the post-inference wall with an unresolved variable. Unobservability is read off the **lower** side alone — a bound *above* the position is a use's requirement, which is what the choice below reads, not evidence that a value arrived.
+A pattern payload with no transitive value contribution on its lower side needs a concrete
+type when that use of the match is materialized. Upper bounds and trait requirements do
+not establish that a value reaches it. `value_reaches` therefore examines lower-bound
+reachability separately from ordinary type resolution.
 
-The rule is **pin to a type the payload's requirements accept**, and a requirement reaches the payload in one of two recorded forms:
+`pin_unobservable_arm_payload` chooses a type using `payload_pin`:
 
-- A **subtyping upper bound**, `payload <: 𝑈`, from the binder occurring in a position. When `𝑈` resolves concretely it is the strongest requirement available, and pinning past it contradicts the flow. The commonest shape is the body that *is* the binder (`` `b(w) → w ``), where `𝑈` is the arms' result join: choosing `Unit` there does not merely lose information, it enters that join and collides with the reachable arm's type.
-- A **trait obligation**, from an operator read (`w + 1` records `Addable`). The obligations choose from the types their surviving instances still accept.
+1. Resolve each upper bound independently, with its recorded substitution. Use the first
+   concrete result returned by `payload_flow_target`; unresolved results are skipped.
+2. Otherwise intersect the types accepted at that payload position by its trait
+   obligations. Choose the first surviving type in instance-table order.
+3. With no obligations, choose `Unit`. An empty intersection also falls back to `Unit`,
+   leaving contradictory requirements to fail the pin's assertion rather than silently
+   treating the intersection as unconstrained.
 
-With neither, nothing observes the payload at all and `Unit` — the type that carries no information — is the choice. The two forms do not compete for one payload: an operand's upper bound is the operator's own requirement variable rather than a concrete type.
+A body consisting of its payload binder can constrain that payload through the arms'
+result type. Defaulting such a payload to `Unit` before reading the upper bound would
+add `Unit` to the result join and conflict with reachable arms.
 
-Each upper bound is resolved **as its own position**, by a walk entered at that variable rather than as a hop along the payload's bound chain — the distinction [the collapse happens at the position](#the-collapse-happens-at-the-position) draws. Reading it through the payload would collapse its quantifier as a side effect and hand the result to every other variable on the chain; deciding it in the pin is one deliberate choice, at the one variable whose quantifier is being eliminated.
+Each upper bound is resolved as its own position. Resolving it through the payload's
+bound chain could collapse another variable's quantifier as a side effect; see
+[The collapse happens at the position](#the-collapse-happens-at-the-position).
 
-The choice is recorded on the *variable*, not in the binder slot, so every occurrence of it agrees — the slot, the scrutinee's expected variant, and hence an enclosing lambda's parameter type. That is also why the pin precedes the scrutinee's own walk and not merely the branches': the scrutinee's type is the variant these payload variables sit inside, so a pin placed after it leaves that reading stale. Unreachable arms are **kept**, not pruned: an arm for a tag the scrutinee cannot carry projects an empty restriction and contributes nothing, while pruning would narrow the arm set relative to the enclosing lambda's declared domain. `pin_unobservable_arm_payload` in `src/ccl/infer/solve.rs` holds the mechanism, including the ordering constraints that place it inside the coalesce walk.
+The chosen type is constrained in both directions against the payload variable. Updating
+only the binding slot would leave other occurrences, including the scrutinee's expected
+variant, unresolved. The pin occurs during coalescing of a use, before walking the
+scrutinee and branches. Generalized definitions are not pinned in place. A debug-only
+`assert_pinned_tags_are_unreachable` checks the premise after the scrutinee resolves.
 
-A refined pin is what makes the compaction identity below load-bearing: an empty
-refinement set is absorbing under the positive intersection, so `Int@1` arriving
-from the pin would be erased by the scrutinee's own per-tag variable if that
-variable's contribution read as an empty set. It does not.
-`CompactType::refinements` is an `Option`, the same sentinel every *shape*
-component carries: `None` is "no refinement contribution here" and merges as the
-identity, and only a *value* carries a set — an empty one included, because a
-value that guarantees nothing is a fact about it. A bare variable and a hole are
-not values.
+Unreachable arms remain in the tree. Their tag projections select no rows at that use;
+pruning the arms would also change the declared input type of an enclosing function.
+Selecting a representative satisfying their requirements is an implementation choice,
+not bounded universal quantification.
+
+A refined pin must survive merging with bare variables. `CompactType::refinements`
+therefore distinguishes no contribution from a value contributing no predicates.
+[Refinements on the lattice](#refinements-on-the-lattice) owns that merge rule.
 
 ### Record literals and field access
 
-A CHL record value is a parenthesised list of `name=value` fields:
+CHL distinguishes record fields, tuple positions and collection keys syntactically:
 
 ```python
-r = (x=1, y="hello")   # Record([("x", 1), ("y", "hello")])
-r.x                        # Apply(r, Proj(ProjKey::Field("x"))) → 1
-t = (1, "hello")       # Tuple([1, "hello"])
-t.0                        # Apply(t, Proj(ProjKey::Index(0))) → 1
+r = (x=1, y="hello")
+r.x
+t = (1, "hello")
+t.0
 ```
 
-**Lowering:** the surface has one postfix form for both keyings — the parser holds the key
-verbatim in `Attribute { attr }`, and lowering resolves which `ProjKey` it is. The two are
-disjoint because an identifier cannot begin with a digit, so *leading digit* is the whole
-discriminator; nothing is inferred from context. `[…]` is collection lookup only, and
-lowers to the application it *is* (`c[k]` → `Apply(lower(k), lower(c))`), so a product —
-having no domain — is never reachable through it.
+The parser retains the attribute spelling. Lowering maps an attribute beginning with
+a digit to a positional `ProjKey::Index`; an identifier becomes `ProjKey::Field`.
+Square brackets denote collection application, not product projection. Symbolically,
+`𝑟.x` is `𝑟 ▷ .x`, whereas `𝑐[𝑘]` is `𝑘 ▷ 𝑐`.
 
-- `(name=v, ...)` → `TypedExprNode::Record([(name, v), ...])`.
-- `expr.field` → `Apply(lower(expr), Proj(ProjKey::Field("field")))`.
-- `expr.n` → `Apply(lower(expr), Proj(ProjKey::Index(n)))`.
+Record inference assigns each field its value-read type, as tuple inference does for
+positions. A record node retains a record type. Inside lambda elimination, its fields
+become morphisms with a common input; applying `Zip` to that record of morphisms produces
+a morphism returning a record.
 
-**Type inference:** `Record([(k, e), ...])` infers to `Type::Record([(k, T), ...])` where each `T` is the inferred type of the corresponding value expression — identical in structure to `Tuple` inference.
-
-**Lambda elimination:** `Record(fields)` inside a lambda body is treated identically to `Tuple`: each field expression is recursively eliminated, producing `Apply(Record([…elim fields…]), Zip)`. The inner `Record` node carries type `Record([(k, Fun(D,T)), …])` — a record of morphisms — and the outer `Zip` application fuses them via a shared `FanOut`, producing a morphism to a record. This ensures `typecheck` invariants hold: a `Record` node always has a `Record` type.
-
-**Operator conversion:** At the `Apply(Record([…]), Zip)` node, the `Zip` handler dispatches on the argument shape. For a `Record` argument it uses `zip_arms_named_at`, which selects `Zip::new_at` (function-tiling inputs) or `MakeRecord::new_named` (scalar inputs) and preserves the declared field names in the output `Tile::Record`. `Proj(ProjKey::Field(name))` compiles to a `MapResult` using `FunctionDef::RecordField(name)`, extracting the named field from the upstream record tile — identical in mechanism to `Proj(ProjKey::Index(n))` for tuples.
+Operator conversion preserves field names. The record `Zip` path uses
+`zip_arms_named_at`, selecting `Zip::new_at` for function tilings or
+`MakeRecord::new_named` for scalar inputs. Named projection uses
+`FunctionDef::RecordField`; positional projection uses the corresponding tuple operation.
+[Compilation](optimization.md#compilation) owns the product compilation cases.
 
 ### `Proj` inference — open product domains
 
-A bare `Proj(key)` node — i.e. the projection morphism, not an application of it — is inferred as a function type whose domain is an ordinary structural product constraining only the projected field. There is no dedicated "partial" `Type` variant; width-subtyping does the work:
+A projection demands only enough product structure to reach its field. `proj_requirement`
+builds that requirement; `emit_proj` constrains the projection's domain against it and
+uses the projected field type as its codomain.
 
-| Key | Inferred domain requirement |
-|---|---|
-| `Proj(Index(n))` | `Tuple([?_0, …, ?_{n-1}, ?a]) ⇒ ?a` — an `n+1`-tuple padded with fresh vars |
-| `Proj(Field("x"))` | `Record([("x", ?a)]) ⇒ ?a` — a single-field record |
+| Key | Requirement |
+| --- | --- |
+| Position `𝑛` | A tuple of width `𝑛+1`, with fresh variables before the projected position |
+| Field `x` | A single-field record `{x: ?a}`, with result `?a` |
 
-The index domain is a `Type::Tuple` padded with fresh variables up to index `n`; the field domain is a single-field `Type::Record` (see `emit_proj`). Width-subtyping lets either unify with any concrete product carrying at least that field, constraining `?a` to the element type there.
+There is no partial-product type constructor. Width subtyping accepts a larger tuple or
+record with the required field. A dependent projection opens its recorded codomain before
+using that type in the domain requirement.
 
-**What the padding costs the diagnostics.** `Type::Tuple` is dense, so "has position `𝑛`" is only expressible as "is `𝑛+1` wide" — a positional projection cannot state a *sparse* requirement the way the named one does. Two consequences the error path has to absorb, since both would otherwise report a shape the program never had:
+Tuple requirements are dense, so demanding position `𝑛` also allocates preceding slots.
+Diagnostics account for this representation:
 
-- A projection past the end fails as a **width** violation, and the first absent position is the value's own width rather than the one the user asked for. So the subtyping edge reports the *widest* position the requirement demands (`constrain_go`'s tuple arm), which for a projection is the only position genuinely demanded — `t.99` on a 3-tuple is missing `.99`, not `.3`. `InferError::MissingField` then states the requested position against the found width, rather than the padded 100-tuple.
-- Projecting with the *wrong keying* (`r.0`, `t.name`) is a `Record`-vs-`Tuple` constructor mismatch whose "required" side is the partial requirement (`(?31)`, `{name: ?31}`). A record/tuple mismatch is always a keying confusion, so the message carries that as a hint instead of leaving the partial shape to be read as a type.
+- An out-of-range projection reports the widest demanded position, not the first absent
+  padding position. Thus `t.99` on a three-element tuple reports position 99, not 3.
+  `InferError::MissingField` reports that demand against the found width.
+- A record/tuple mismatch reports incompatible keying. The padded or single-field
+  requirement is not presented as though it were the complete product the user supplied.
 
-A projection's domain appears only at a negative position, so the one-way constraints leave it under-determined; its full structure (the value actually flowing in) is recovered structurally during the coalesce walk by monomorphizing the morphism to its input — see [Apply is one-way](#apply-is-one-way) and [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass).
+A projection's full input type is recovered during coalescing, not by adding a reverse
+application edge. See [Apply is one-way](#apply-is-one-way) and
+[Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass).
 
 ### `Compose` inference
 
-N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each morphism's codomain is constrained as a **subtype** of the next morphism's domain (`constrain_subtype(prev_codomain, d_i)`). This allows a refined codomain (e.g. `Refinement(T, pred)`) to feed into a base-typed domain (`T`) without a type error. The overall type is `Fun(domain(f₀), codomain(fₙ₋₁))`. This case arises when `infer` is run over output from `simplify`, which can produce `Compose` nodes.
+A composition `𝑓₀ ≫ … ≫ 𝑓ₙ₋₁` requires at least two elements. `compose_chain`
+constrains each codomain as a subtype of the next domain. A refined codomain can therefore
+feed an unrefined domain without an equality constraint.
 
-### Variant (sum) semantic equality
+Each adjacency carries the witness context from both component functions through
+`Typing::require_sub_under`. A named function's codomain is opened before continuing
+the chain, and its term binder scopes the recursive comparison. The resulting function
+has the first domain and final codomain.
 
-The post-inference structural checks decide type equality via the solver's `constrain_subtype` (bidirectionally, in `typecheck_compatible`), which compares `Type::Variant` tag sets structurally. Nested sums never reach this comparison: `TypedExpr::copair` flattens at construction (next section), so a `Var(y)` referencing a let-bound sum still contributes a single flat variant.
+`emit_compose` preserves the final morphism's Pi binder when present and closes its
+codomain during construction. It takes the function kind from the composition's recorded
+type, not from the first morphism: a projection followed by a collection can still denote
+data. A freshly lowered chain receives its kind annotation through `emit_node`.
+
+The coalesce walk recovers underdetermined projection domains from preceding codomains.
+No reverse adjacency edge is added during emission. The shared checking rule also applies
+to compositions introduced by later transformations.
+
+### Variant type comparison
+
+`CheckCtx` requires the reconstructed node type to subtype its recorded type. It does not
+require equality: an annotation can record a wider type. For `Type::Variant`, the relation
+compares tags and payloads structurally, including the open/closed demand rules. Syntactic
+flattening of a producing expression is not the type-comparison algorithm.
+
+Tagged variants and positional union domains share `Type::Variant`. Dependent sums use
+function witness binders instead; see [Dependent sums](#47-dependent-sums).
 
 ### Union flattening (construction-time)
 
-`a ++ b ++ c` in CHL parses to right- or left-associated binary AST nodes. **`TypedExpr::copair` flattens at construction time**: any operand that is itself a `TypedExprNode::Copair` is spliced into the outer operand list, so the constructor always returns a flat N-ary node. This makes the invariant **"no operand of a `Copair` is itself a `Copair`"** hold from lowering onward — inference, lambda elimination, and operator conversion never need to look through nested AST. The flat AST flows naturally into a flat `Type::Variant` domain (each operand contributes one tag). `operator_conversion` compiles the N-ary node directly to a single `UnionOperator` with N inputs.
+`TypedExpr::copair` splices any direct `Copair` operand's list into the new operand list,
+preserving order. Repeated use of this constructor therefore flattens syntactically nested
+`++` expressions. It does not inline a variable to discover a let-bound `Copair`, nor
+recursively repair an arbitrarily malformed nested operand.
+
+Inference builds a positional variant domain from the resulting operand types.
+Operator conversion can compile the N-ary node as one `UnionOperator` with N inputs.
+[Collection union](ir.md#copair-and-disjointjoin--two-collection-combining-operations-not-one)
+owns their distinct collection-combining semantics.
 
 ### `check_fully_typed` validation
 
-After coalesce, `infer` calls `check_fully_typed(expr)` to assert that every `ty` and every `TypedBinding::ty` in the tree is a concrete type — no `Type::Hole` or `Type::Infer(_)` anywhere, including inside compound types like `Fun` or `Tuple`. Returns `InferError::UnresolvedHole` or `InferError::UnresolvedInfer(id)` on failure, with the symbolic representation of the offending expression for debugging.
+`check_fully_typed` runs `check_annotated` at `Strictness::Strict`. It returns all collected
+errors, not just the first. It checks expression and binding types, compound type children,
+witness-kind children and refinement predicates. Shared predicates are visited once by
+`PredicateId`.
 
-### TODOs
+The strict check rejects holes, shared holes, unresolved bounded annotations and inference
+variables, including those nested in other types. It also rejects surviving history handles
+and nominal channel domains. Failures carry the relevant expression or binding context;
+holes and variables use `UnresolvedHole` and `UnresolvedInfer`, while a bounded marker
+uses `UnresolvedBoundedHole`.
 
-- Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see [optimization.md](optimization.md#compilation)).
-- CHL `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
+This is the annotation-completeness phase of `typecheck`, not the structural compatibility
+check itself. Before channelization and mutability elimination, `typecheck` can instead use
+`Strictness::PreChannelize`, which permits transient inference variables and handles.
+Holes and bounded markers remain errors in that mode.
+[The post-inference check](#the-post-inference-check-shared-rules) owns the shared structural
+rules and their use at compiler boundaries.
 
 ---
 
 ## 6. Future work
 
-Directions the current design points toward but does not yet implement.
+These proposals are not implemented general typing rules.
 
 ### General `𝑈 ⇒ 𝑇` cast
 
-The [`Cast`](ir.md#cast--explicit-refinement-acquisition) node is named more generally than the current implementation, which only honours `Fun(Refinement(_, _), _)` targets — i.e. it can only attach a refinement to a collection function's *domain*. The name suggests the full upcast semantics `𝑈 ⇒ 𝑇` (re-view a value of any type `𝑈` at any supertype `𝑇`). Two directions are open: **generalize** `Cast` to the full `𝑈 ⇒ 𝑇` upcast (subject to `𝑈 <: 𝑇`), or **rename** it narrower (`Refine` / `AssertDomain`) to match what it does. Acquiring a *value-level* refinement (a covariant narrowing like `Int → {Int | 𝑝}`) is not an upcast — it is a runtime/SMT-checked narrowing — so the general form must keep that boundary. (An in-code `TODO` on the `Cast` node in `ccl/expr.rs` points here.)
+The current [Cast contract](ir.md#cast--explicit-refinement-acquisition) acquires
+function-domain refinements. A possible extension would provide a general upcast from
+`𝑈` to `𝑇` when `𝑈 <: 𝑇`. Alternatively, a narrower node name could make the current
+restriction explicit.
+
+Neither choice would justify acquiring an arbitrary scalar refinement. Converting
+`Int` to `{𝑥: Int | 𝑝(𝑥)}` is a narrowing requiring proof or a runtime check, not an upcast.
 
 ### Pattern-match arm binder referenced by the result type
 
-A `match` arm whose result type carries a refinement closing over an arm-local binder:
+An arm-dependent result type cannot retain an arm-local binder after leaving that scope.
+For example, a collection result filtered by a field of an arm's payload needs that
+dependency expressed in terms of values still available at the result position.
 
-```python
-def filter_against(tagged):
-    match tagged:
-        case Pair(a, b): return [x for x in xs if x > b]
-        case Single(s):  return [x for x in xs if x > s]
+One proposed construction is a result predicate that performs the same match. In
+pseudocode, a predicate local to each arm,
+
+```text
+pair(a, b) -> x > b
+single(s) -> x > s
 ```
 
-The right answer is to *inline the case match into the refinement* — produce a refined type whose predicate is itself a `match` on `tagged`:
+would become a predicate on the scrutinee:
 
-```
-{𝑥 | match tagged:
-       case Pair(a, b): 𝑥 > b
-       case Single(s):  𝑥 > s }
+```text
+x -> match tagged:
+    pair(a, b) -> x > b
+    single(s) -> x > s
 ```
 
-so the refinement's only free variables are `𝑥` (its own binder) and `tagged` (in scope). This needs the type system to express match expressions in predicate position, the inliner to construct them, and the refinement equality/SMT machinery to handle them. Until then inference rejects this shape with a typing error ("result type references arm-local binder `b`").
+The payload names are then bound inside the predicate, whose external dependency is
+`tagged`. This needs a transformation that constructs the predicate and validates its
+typing, scope and refinement comparisons. The proposal is not a claim that every
+arm-dependent program currently has one dedicated diagnostic. The general post-inference
+scope validation is debug-only; it checks for free names left in recorded types.
 
 ---
 
 ## 7. Glossary
 
-Consult these definitions as needed; each term is introduced in context in §1–§4 above.
+These definitions summarize the linked contracts rather than restating their algorithms.
 
-| Term | Origin | Definition |
-| :--- | :--- | :--- |
-| **`Type::Infer` / `InferVar`** | Algebraic subtyping | An inference unknown. `Type::Infer(Rc<InferVar>)`; the shared `InferVar` carries a stable `uid`, a `level`, and a `RefCell` of lower/upper bounds. The solver works directly on `ccl::Type`, so this *is* the constraint-graph node — there is no separate "SimpleType". |
-| **Position** | Algebraic subtyping | A location within a type expression where another type sits (a function domain/codomain, a record field value). Each position has a polarity determined by its path from the outermost type. |
-| **Polarity** | Algebraic subtyping | Positive or negative. The outermost type is positive; codomains and field values preserve polarity, domains flip it. Polarity selects the primary bounds for compaction; [Coalescing](#coalescing-from-bounds-to-types) describes the additional opposite-side reads. |
-| **Lower Bound** | Algebraic subtyping | A type `L` recorded on variable `α` such that `L <: α` must hold (a type that "flows into" `α`). Lower bounds supply the primary contributions at positive occurrences. |
-| **Upper Bound** | Algebraic subtyping | A type `U` recorded on variable `α` such that `α <: U` must hold (a type `α` "must flow into"). Upper bounds supply the primary contributions at negative occurrences. |
-| **Level** | Algebraic subtyping | Inference scope depth, starting at 0. Every `let` RHS and `MutDecl` initializer is emitted one level deeper; the surrounding level is restored for the body. Generalization is decided after RHS emission. |
-| **Level mismatch** | Algebraic subtyping | During `constrain` involving a variable `v`, the condition that the other side contains a variable whose level is numerically higher than `v`'s. Triggers extrude. |
-| **Extrude** | Algebraic subtyping | On a level mismatch, the process of copying a type down to a target level by replacing each too-high variable with a fresh proxy at that level (linked back via the polarity-appropriate bound), so the constraint can be recorded without leaking inner-scope variables. |
-| **Scheme (PolyScheme)** | Algebraic subtyping | A generalized type with a cutoff level. Variables whose level is numerically greater than the cutoff are quantified; using the scheme *instantiates* (freshens) them at the current level. |
-| **CompactType** | Algebraic subtyping | A flat, per-position bag of contributions (variables, atoms, an optional record shape, an optional variant shape, an optional function shape, and a refinement set) produced for simplification and co-occurrence analysis. |
-| **`CompactGraph`** | Algebraic subtyping | A top-level `CompactType` plus a side-table of recursive-variable definitions; the intermediate produced by `compact_type` and consumed by `simplify_type` / `coalesce_compact`. |
-| **Coalesce** | Algebraic subtyping | Materializing a `CompactGraph` back into a `ccl::Type`. Compaction selects bounds by polarity, with opposite-side shape recovery and negative-position merging as described in [Coalescing](#coalescing-from-bounds-to-types). |
-| **`FieldKey`** | Algebraic subtyping | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
-| **`Variant` (tagged sum)** | Both | The single sum representation: `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `` `tag(…) ``; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). |
-| **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Hole` is normalized to a fresh var, while `Refinement` is kept and rides the lattice as a refinement. |
-| **Refinement** | Both | A `Type::Refinement(T, r)` carries a refinement `r` (an immutable predicate `Rc<TypedExpr>`) — a refinement in its role as a black box to the subtyping lattice. A type holds a *set* of refinements, width-subtyped like records (more refinements ⇒ subtype; `{T\|p,q} <: {T\|p}`). Refinements compare by type-blind structural predicate equality (`Refinement`'s `PartialEq`; pointer-equal predicates short-circuit), with implication reached for only as a fallback (`smt_sub`). A refinement is *required* — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
-| **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |
-| **`InferArena`** | Cambra-Specific | The single owner of every inference variable minted during one `infer()` run. Captures each mint through a thread-local sink and, on `Drop`, clears all variables' bounds to break the `Rc` cycles that mutual subtyping constraints form — the end-of-inference cleanup that reference counting alone cannot do. See §3.2. |
-| **Pi type** | Both | A `Type::Fun` with `name: Some(𝑥)` — the dependent function type `(𝑥: domain) ⇒ codomain`, with `𝑥` bound in `codomain` and referenceable by nested refinement predicates. `name: None` is the ordinary function type. See §4.5. |
-| **`Subst` / discharge / rename** | Cambra-Specific | A context morphism over *term* binders (`ccl::subst`), riding a constraint edge in a two-sided `Bound { self_subst, ty, ty_subst }` (native direction, never inverted at record time). A **rename** `[𝑘 ↦ 𝑥]` is invertible; a **discharge** `[𝑥 ↦ arg]` (dependent application) is one-way. Composed forward along the closure and the coalesce walk, forced at refinement predicates. See §4.5. |
-| **Correspondence** | Both | The binder alignment `[𝑘 ↦ 𝑥]` *derived* by `constrain_go`'s Fun/Fun arm when relating two Pi codomains, carried on the codomain edge so a dependent refinement renames consistently. See §4.5. |
+| Term | Definition |
+| --- | --- |
+| `Type::Infer` / `InferVar` | A type unknown with an ID, level and mutable bounds; the solver's graph node. See [Bounds](#bounds-and-constraint-propagation). |
+| Position | A location inside a type, such as a function domain or record field. |
+| Polarity | The direction used when reading bounds: domains flip it; codomains and fields preserve it. See [Coalescing](#coalescing-from-bounds-to-types). |
+| Lower / upper bound | `𝐿 <: 𝛼` / `𝛼 <: 𝑈`, stored with substitutions. See [Native bound edges](#native-bound-edges-and-closure). |
+| Level | Inference-scope depth, used for generalization and escape prevention. See [Levels and schemes](#levels-schemes-and-let-polymorphism). |
+| Level mismatch / extrusion | A bound contains variables above the receiving level; extrusion represents them through lower-level proxies. Invariant positions preserve both directions. See [Bounds](#bounds-and-constraint-propagation). |
+| `PolyScheme` | A type with a generalization cutoff; use-site instantiation freshens quantified variables. See [Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation). |
+| `CompactType` | Per-position contributions used by compaction, simplification and materialization. See [Coalescing](#coalescing-from-bounds-to-types). |
+| `CompactGraph` | A compact root with recursive-variable definitions. |
+| Coalesce | Materialize compact contributions as a `Type`, reporting unrepresentable conflicts. See [Coalescing](#coalescing-from-bounds-to-types). |
+| `FieldKey` | A named or positional product-field/variant-tag key. |
+| `Variant` | A tagged or positional sum, with width subtyping dual to records. Not the dependent-sum representation. See [The unified tagged sum](#the-unified-tagged-sum). |
+| `ccl::Type` | The AST's type representation, also used by the solver; it can contain inference unknowns during solving. |
+| Refinement | A base type restricted by predicate terms. See [Refinements on the lattice](#refinements-on-the-lattice). |
+| Let binding resolution | Resolve a binding and its uses, specializing generalized uses independently. See [Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation). |
+| `InferArena` | Owns inference variables for one run and clears bounds on drop to break reference cycles. See [Variable lifetime](#32-the-inferarena-who-owns-inference-variables). |
+| Pi type | A function type binding a term name in its codomain. See [Dependent refinements](#45-dependent-refinements-via-pi-types). |
+| Dependent sum | A data function binding type witnesses for its domain. See [Dependent sums](#47-dependent-sums). |
+| `Subst` / discharge / rename | Substitution over term and witness references; discharge supplies a value/type, while rename aligns binders. See [Substitution](#substitution-and-bound-transport). |
+| Correspondence | Binder alignment supplied by the relation's caller or derived at a function edge. See [Substitution](#substitution-and-bound-transport) and [The Σ rule](#the-σ-rule). |
 
 ---
-[^1]: For example, `def f(x): x` has the Principal Type `a -> a`, and `def map(f, collection): ...` might have the Principal Type `(a -> b) -> [a] -> [b]`, where `[a]` denotes a collection for all `a`.
-[^2]: When a function like `def id(x): return x` is generalized into a PolyScheme, type variables minted inside the body are assigned a level numerically higher than the surrounding outer scope's depth — the "cutoff." Variables above the cutoff are strictly local to the function (like `x`'s type, `α`); because they are self-contained they are universally quantified and work for all types. Each call instantiates the scheme by minting a fresh variable for `α`, preventing `id(5)` from colliding with `id("hello")`. Variables at or below the cutoff are free variables captured from the enclosing environment; instantiation passes them by reference so all call sites share the same outer-scope constraints.
+
+[^1]: For example, the identity function has principal type `𝛼 ⇒ 𝛼`. A generic map has
+    the schematic type `(𝛼 ⇒ 𝛽) ⇒ Collection(𝛼) ⇒ Collection(𝛽)`; this illustrates
+    quantification, not the exact collection-domain contract of a particular builtin.
+[^2]: Generalization quantifies variables above the scheme's cutoff. Each use freshens those
+    variables, while variables at or below the cutoff remain shared. See
+    [Let-polymorphism](#31-let-polymorphism-is-freshening-instantiation).
