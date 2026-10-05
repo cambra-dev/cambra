@@ -369,7 +369,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 
 The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key mutable variable, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
 
-- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history.
+- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ {key: value}`, held as per-tick write sets with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the key's changelog.
 - **`CommitOperator` / `CommitProducer`** — the store's tile adapter. It owns the engine, publishes its history as one [`Tile::Store`] output, drains each writer's new proposals in writer-index order (the serialization order, rotated per pull so no writer is starved), and acknowledges a commit by `release`ing that step back to its writer. Writer inputs are wired *after* construction, so the operator sits inside a cyclic `FanOut` and every writer reads the store back before proposing — the cyclic-`FanOut` feedback idiom, one writer per key.
 - **`TransactDriver` / `TransactDriverProducer`** — one per `with begin():` site: it owns the transaction source, folds `(frontier, snapshot)` for the site's read keys out of the cyclic store, and **produces** the decision body's `(snap…, item)` input. A row is emitted once per `(item, frontier)`, so a retry at a moved frontier is a fresh position and a re-pull at an unchanged one emits nothing. It closes (terminal) once every transaction has been attempted and acked over a source that can deliver no more — the writer's completeness signal, since the writer owns no source of its own. It releases the source through each finished item on its ack, and through each filtered row once it reads past it, since no ack comes for a row nothing attempts.
 - **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull it decides the driver's newest live position and appends a `{snap, reads, writes}` proposal when the body's decision is `` `commit ``, or advances locally when it is `` `abort ``. When the decision also reads an induction accumulator, that value arrives co-iterated in the writer *source* or broadcast as a constant — see [mutability.md](../ccl/design/mutability.md#reading-an-induction-accumulator-in-a-commit-decision), "Reading an induction accumulator in a commit decision".
@@ -393,11 +393,37 @@ A single-writer induction store is the degenerate no-conflict case of this same 
 
 ### The store is a changelog, not a function
 
-`CommitOperator`'s output is a [`Tile::Store`], not a `DataFunction`: each tick carries only *that tick's* write-set delta, and a tick absent from the changelog is **decided-absent** — its value holds from the latest earlier change. Consumers must therefore **fold** the store (`store_current` / `store_value_at`), never index it. That is what makes a mutable variable readable while its store is still live: the current value is defined at the decided frontier, with no need for the history to end. Terminality is a flag separate from the frontier watermark, so a terminal store with trailing carries is not undercounted.
+`CommitOperator`'s output is a [`Tile::Store`], not a `DataFunction`: each key carries only the ticks
+that wrote it, and a tick absent from a key's changelog is **decided-absent** — its value holds from
+the latest earlier change. Consumers must therefore **fold** the store (`store_current` /
+`store_value_at`), never index it. That is what makes a mutable variable readable while its store is
+still live: the current value is defined at the decided frontier, with no need for the history to
+end. Terminality is a flag separate from the frontier watermark, so a terminal store with trailing
+carries is not undercounted.
+
+### One changelog per key
+
+A `Tile::Store` holds a record with one field per store key — a mutable variable or a reply tap —
+and each field is that key's changelog, `Txn ⇀ V`. A tick whose write set names several keys is one
+tick in each of their changelogs, so a write set spanning different keys at different ticks is which
+changelogs hold a tick rather than an encoding of its own.
+
+The key space comes from the tiling, which names every key statically, so a key nothing has written
+is present with an empty changelog. Two consequences follow. A key carries its own value extent,
+where one shared codomain could only name the union of what the keys hold. And two renders of one
+store carry the same fields, which is what lets `merge` append them field by field.
+
+A key's tiling is `Tiling::Scalar` of its value extent, so each change holds the key's whole value
+as one cell, a collection included. A collection's entries do not yet stand as a level beneath the
+change (`TODO(store-key-levels)`).
+
+A proposal's `reads` and `writes` ride one `map_to_value` cell each, and their key sets vary
+from one decision to the next. A write set holds every carry key of the store consuming it and
+only the taps that fired. A read set omits a key the store holds no value for yet.
 
 ### The decision record
 
-A writer body returns one **decision variant** per transaction, `` {`commit{𝑃} | `abort} `` (`ccl_utils::wrap_decision_variant`). `` `commit `` carries the payload record 𝑃 = `{writes, __to_<defer>*}` — the proposed new values keyed by the variable each is for, plus one field per reply tap — and `` `abort `` is the nullary whole-transaction deny: carry, no proposal. Making the grant/deny the *tag* rather than a `commit` field leaves "denied yet real writes" unrepresentable. `body_decision_at` decodes the tag by name, so the two ends agree without a canonical arm position. A tap's value is `` {`fired{𝑉} | `idle} `` — the fed value on the positions its own control-flow path admits, `` `idle `` on the rest (see [mutability.md](../ccl/design/mutability.md#general-in-transaction-conditionals-and-conditional-writes), "General in-transaction conditionals (and conditional writes)"). The grant path omits an `` `idle `` tap from the commit delta, so a routed reply fires only on its own route. A tap whose path *is* the commit — a single-guard or spine feed — wraps unconditionally. Carrying the gate as the value's tag is what lets a fed value be domain-restricted: a value beside a separate `Bool` gate would have to answer wherever the record commits.
+A writer body returns one **decision variant** per transaction, `` {`commit{𝑃} | `abort} `` (`ccl_utils::wrap_decision_variant`). `` `commit `` carries the payload record 𝑃 = `{writes, __to_<defer>*}` — the proposed new values keyed by the variable each is for, plus one field per reply tap — and `` `abort `` is the nullary whole-transaction deny: carry, no proposal. Making the grant/deny the *tag* rather than a `commit` field leaves "denied yet real writes" unrepresentable. `body_decision_at` decodes the tag by name, so the two ends agree without a canonical arm position. A tap's value is `` {`fired{𝑉} | `idle} `` — the fed value on the positions its own control-flow path admits, `` `idle `` on the rest (see [mutability.md](../ccl/design/mutability.md#general-in-transaction-conditionals-and-conditional-writes), "General in-transaction conditionals (and conditional writes)"). The grant path omits an `` `idle `` tap from the commit's write set, so a routed reply fires only on its own route. A tap whose path *is* the commit — a single-guard or spine feed — wraps unconditionally. Carrying the gate as the value's tag is what lets a fed value be domain-restricted: a value beside a separate `Bool` gate would have to answer wherever the record commits.
 
 ### Convergence: the writer re-arms, one step per pull
 
@@ -829,10 +855,10 @@ the latest *change* tick.
 **Reply feeds ride the changelog as taps.** A feed inside the loop (`out << e`) rides the
 writer decision as a `__to_<defer>` field, exactly as a commit writer's reply tap does. Op-
 conversion appends each tap as a write-only changelog key (after the accumulator keys), the
-producer applies the decision's `tap_fired` gate (a `` `fired `` tap joins the position's delta, an
+producer applies the decision's `tap_fired` gate (a `` `fired `` tap joins the position's write set, an
 `` `idle `` one is omitted — the tag mechanism shared with the commit store), and a
 `__to_<defer>` read is a **non-carry** `StoreDenseRead` (`carry_forward: false`): for each loop
-position it reads the tap **only if that position's delta actually wrote it**
+position it reads the tap **only if that position's write set wrote it**
 (`store_delta_at`), so the feed's per-position stream spans exactly the fired positions. A
 **conditional feed** (`if p: out << e`) is the same shape — the letrec phase makes its guard path the
 tap's `` `fired `` condition and folds that path into the `commit` gate so a feed-only position still
@@ -847,7 +873,7 @@ the same way the commit store's is: a reader's release drives GC, and `StoreDens
 forwards a store release derived **purely from the consumer's release** — never from who the
 consumer is. A release of loop positions `≤ P` is a promise never to request them again, so
 `StoreDenseRead::release_impl` computes what the store no longer needs:
-- A **tap** read (`carry_forward: false`) reads only tick `p + 1`'s delta at position `p` (no
+- A **tap** read (`carry_forward: false`) reads only tick `p + 1`'s write at position `p` (no
   back-reference), so positions `≤ P` make ticks `≤ P + 1` dead.
 - A **carry** read (`carry_forward: true`) reads the latest write `≤` each position's tick. The
   earliest still-needed position is `P + 1` (reading tick `P + 2`); its **carry source** is the
