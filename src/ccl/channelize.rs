@@ -121,6 +121,7 @@ use crate::ccl::{
     ccl_utils::{apply_primitive, count_free, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance::{self, Located, NodeId},
+    scope::{ScopedItem, for_each_scoped_item},
 };
 
 /// A **channel type**, which this pass is the one that erases: a nominal channel
@@ -1125,11 +1126,17 @@ fn erase_chan_domains(
         erase_chan_domains(body, map, kinds, predicates);
         // §6.2 Let-closing on the substitution content (see fn docs).
         // A discharge template is not a tree node: it is cloned again at every
-        // read, and that read is where the sibling is minted.
-        let discharge =
-            crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
-        for dom in map.values_mut() {
-            *dom = discharge.apply_type(dom);
+        // read, and that read is where the sibling is minted. An opaque binder, a
+        // mutable variable's read, is not discharged: a type lifted past it keeps the
+        // binder (`crate::ccl::BindingTransparency`).
+        if binding.transparency == BindingTransparency::Transparent {
+            let discharge = crate::ccl::subst::Subst::discharge(
+                &binding.name,
+                bound_expr.clone_preserving_ids(),
+            );
+            for dom in map.values_mut() {
+                *dom = discharge.apply_type(dom);
+            }
         }
     } else {
         expr.walk_children_mut(|c| erase_chan_domains(c, map, kinds, predicates));
@@ -1929,18 +1936,30 @@ fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
     let mut body_fvs: HashSet<Name> = HashSet::new();
     collect_free_vars(body, &mut body_fvs);
     let protected: HashSet<Name> = channel_fvs.intersection(&body_fvs).cloned().collect();
-    fn walk(e: &Expr, protected: &HashSet<Name>) {
+    // An opaque binder, a mutable variable's read, is named by the types lifted past it
+    // rather than discharged (`crate::ccl::BindingTransparency`), so a channel's type naming
+    // one is the reference the design admits outside its scope, not a capture. Only a read
+    // of it in a channel's term is.
+    let read: HashSet<Name> = channels
+        .values()
+        .flat_map(crate::ccl::ccl_utils::free_names_in_value)
+        .collect();
+    fn walk(e: &Expr, protected: &HashSet<Name>, read: &HashSet<Name>) {
         if let TypedExprNode::Let { binding, .. } = &e.node {
+            let captured = match binding.transparency {
+                BindingTransparency::Opaque => read.contains(&binding.name),
+                BindingTransparency::Transparent => protected.contains(&binding.name),
+            };
             debug_assert!(
-                !protected.contains(&binding.name),
+                !captured,
                 "channelize: body binding `{}` shadows a channel-captured free \
                  variable — uniquification invariant violated (see module docs)",
                 binding.name
             );
         }
-        e.walk_children(|c| walk(c, protected));
+        e.walk_children(|c| walk(c, protected, read));
     }
-    walk(body, &protected);
+    walk(body, &protected, &read);
 }
 
 /// Walk `expr` through `Let` / `ExprStmt` bodies to the scope where the
@@ -2077,65 +2096,48 @@ fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
     cluster
 }
 
-/// Collect every free `Var` name in `expr` into `out`, respecting
-/// shadowing by enclosing `Let`/`Lambda` bindings on the term spine.
+/// Collect every free `Var` name in `expr` into `out`, under the binders
+/// [`for_each_scoped_item`] states for every node.
 ///
-/// Also walks references hidden in **type positions**:
-/// - `expr.ty` refinement predicates (including a lambda's refined domain)
-/// - `expr.user_annotation` refinement predicates (set by
-///   [`extract_for_defer`]'s filter-feed rewrite)
+/// Also walks references hidden in **type positions** — every slot
+/// [`Expr::walk_type_slots`] reaches, `expr.ty`'s refinement predicates (a
+/// lambda's refined domain included) and the `user_annotation` predicates
+/// [`extract_for_defer`]'s filter-feed rewrite sets. A slot sits in its node's
+/// scope, so a name a type mentions is free only when no binder enclosing that
+/// node within `expr` binds it: `let k = 1 in let ys : {… | z > k} = … in …`
+/// has no free `k`.
 ///
-/// Without these, a channel that references an outer let-binding only
-/// through a refinement predicate would be missed by
+/// Without the type positions, a channel that references an outer let-binding
+/// only through a refinement predicate would be missed by
 /// [`assert_no_shadowed_captures`], leaving a downstream `Let` shadow
 /// undetected and the channel silently reading the wrong value at the
 /// cluster bind site.
 ///
-/// Shadowing inside type-position predicates is intentionally not
-/// tracked — the goal here is "does the channel reference this name
-/// anywhere," not "does the name occur free per lexical-scope
-/// rules."  This matches [`crate::ccl::ccl_utils::count_free`]'s
-/// behaviour on type refinements.
+/// A `Feed`/`Define`/`MutWrite` target is not collected: [`extract_for_defer`]
+/// re-binds a `let` around an extracted feed that reads it, and a defer handle
+/// is not a binding to copy.
 fn collect_free_vars(expr: &Expr, out: &mut HashSet<Name>) {
     fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
-        // Type-position predicates on this node (`expr.ty` and any
-        // user-supplied annotation) are visited unconditionally — they
-        // belong to the *outer* scope, and shadowing inside them isn't
-        // tracked here.
-        collect_free_vars_in_type(&expr.ty, out);
-        if let Some(ann) = &expr.user_annotation {
-            collect_free_vars_in_type(ann, out);
+        let mut in_types = HashSet::new();
+        expr.walk_type_slots(|ty| collect_free_vars_in_type(ty, &mut in_types));
+        out.extend(in_types.into_iter().filter(|n| !bound.contains(n)));
+        if let TypedExprNode::Var(name) = &expr.node
+            && !bound.contains(name)
+        {
+            out.insert(name.clone());
         }
-        match &expr.node {
-            TypedExprNode::Var(name) => {
-                if !bound.iter().any(|b| b == name) {
-                    out.insert(name.clone());
-                }
+        for_each_scoped_item(expr, &mut |item| {
+            if let ScopedItem::Child {
+                expr: child,
+                binders,
+            } = item
+            {
+                let depth = bound.len();
+                bound.extend(binders.iter().map(|b| b.name.clone()));
+                rec(child, bound, out);
+                bound.truncate(depth);
             }
-            // Binder variants need scope-aware recursion: positions
-            // outside the binder (bound_expr, init_args, source, Lambda
-            // refinement) see the outer scope; positions inside see the
-            // binder's name added to `bound`.
-            TypedExprNode::Let {
-                binding,
-                bound_expr,
-                body,
-            } => {
-                rec(bound_expr, bound, out);
-                bound.push(binding.name.clone());
-                rec(body, bound, out);
-                bound.pop();
-            }
-            TypedExprNode::Lambda { param, body } => {
-                // Domain refinements ride the param's *type*, visited
-                // unconditionally by the `collect_free_vars_in_type(&expr.ty)`
-                // call at the top of `rec` (they belong to the outer scope).
-                bound.push(param.name.clone());
-                rec(body, bound, out);
-                bound.pop();
-            }
-            _ => expr.walk_children(|c| rec(c, bound, out)),
-        }
+        });
     }
     let mut bound = Vec::new();
     rec(expr, &mut bound, out);
@@ -2633,16 +2635,25 @@ fn extract_for_defer_impl(
                         // payload only feeds `apply_type`, so it is a *template*
                         // rather than a tree node — it keeps its ids, and the
                         // sibling is minted at the read inside `apply_type`.
-                        let let_ty = crate::ccl::subst::Subst::discharge(
-                            &binding.name,
-                            bound_expr.clone_preserving_ids(),
-                        )
-                        .apply_type(&original.ty);
+                        //
+                        // An opaque binder, a mutable variable's read, is not
+                        // discharged: a type lifted past it keeps the binder
+                        // (`crate::ccl::BindingTransparency`), and its definition
+                        // is a read no type may hold.
+                        let let_ty = if binding.transparency == BindingTransparency::Opaque {
+                            original.ty.clone()
+                        } else {
+                            crate::ccl::subst::Subst::discharge(
+                                &binding.name,
+                                bound_expr.clone_preserving_ids(),
+                            )
+                            .apply_type(&original.ty)
+                        };
                         // The `Let` this walk is rebuilding keeps the original
                         // `bound_expr` in the body, and each extracted feed that
                         // captures the binder gets its own re-binding of the same
-                        // definition, so every wrap is a copy.
-                        *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
+                        // definition, opacity included, so every wrap is a copy.
+                        *feed = Expr::let_in(binding.clone(), bound_expr.clone(), original)
                             .with_ty(let_ty);
                     }
                 }

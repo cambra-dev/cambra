@@ -64,6 +64,14 @@
 //! mention there is not a read and stays where it stands
 //! ([`atomize_handle`]).
 //!
+//! **A read that reaches a predicate is renamed, not hoisted** ([`name_reads`]).
+//! A comprehension's guards and sources become its cast's refinement predicate,
+//! and a refined cast's target holds a copy of its value; this pass never
+//! descends into a type, so a read there would put the variable in one. Each
+//! such read is renamed to one binding per variable, placed ahead of the term,
+//! in every copy at once. Neither term performs a write, so every read in it
+//! denotes the value the variable holds where the term stands.
+//!
 //! # Five recognition contracts: positions a `Let` must never sit between
 //!
 //! Five shapes carry an external recognition contract: a later pass
@@ -128,8 +136,9 @@
 //! rewrites the body copy alone — and the fresh uid each hoist mints means
 //! normalizing the predicate copy too would still produce a second, unequal
 //! name. The two copies then type at unrelated witnesses. So a refined cast's
-//! value is left exactly as lowering built it; an unrefined one, carrying no
-//! predicate to hold a copy, normalizes like any other operand.
+//! value is left as lowering built it, but for its mutable-variable reads,
+//! which are renamed in both copies at once (below); an unrefined one, carrying
+//! no predicate to hold a copy, normalizes like any other operand.
 //!
 //! **A value-position `Case`'s scrutinee.** `match c[k]?:` dispatches on a
 //! *dependent* result — the checked lookup's codomain discharges its key
@@ -159,8 +168,10 @@
 
 use crate::ccl::{
     Branch, Expr, Name, TypedBinding, TypedExprNode,
+    ccl_utils::is_free,
     mut_scope::{Muts, is_mut_var, under_param, with},
     provenance::{self, Nature},
+    subst::Subst,
 };
 
 /// A-normalize `expr`. See the module docs for what "atomic" means here and
@@ -265,9 +276,22 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         // every later generator, and the element, and the element's own
         // bindings seal around it.
         TypedExprNode::Comprehension {
-            generators,
+            mut generators,
             element,
         } => {
+            // A guard or source that reads an enclosing mutable variable reads it
+            // through a binding ahead of the comprehension, so the predicate both
+            // reach names a binder instead of the variable. One binding per
+            // variable suffices: the comprehension performs no write, so every read
+            // in it denotes the value the variable holds where the comprehension
+            // stands.
+            let mut reads = Vec::new();
+            for generator in &mut generators {
+                name_reads(&mut generator.iter, muts, &mut reads);
+                for guard in &mut generator.guards {
+                    name_reads(guard, muts, &mut reads);
+                }
+            }
             // Under **no** mutable variables: a comprehension is a map, so its
             // element is evaluated once per source position with no write in
             // between, and a read of an enclosing mutable variable denotes one
@@ -279,10 +303,13 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             } else {
                 normalize(*element, &Muts::new())
             };
-            rebuild(TypedExprNode::Comprehension {
-                generators,
-                element: Box::new(element),
-            })
+            let_chain(
+                read_bindings(reads),
+                rebuild(TypedExprNode::Comprehension {
+                    generators,
+                    element: Box::new(element),
+                }),
+            )
         }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
@@ -321,11 +348,17 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             // second, unequal name. The two copies then type at unrelated
             // witnesses.
             //
-            // So a refined cast's value is left as it stands. Only an
-            // unrefined one — a `cast` re-viewing a value at a kind, carrying
-            // no predicate to hold a copy — normalizes like any other operand.
+            // So a refined cast's value is left as it stands, but for its reads
+            // of mutable variables: those are renamed in both copies at once
+            // ([`name_reads`]), so the predicate names a binder instead of the
+            // variable. Only an unrefined cast — re-viewing a value at a kind,
+            // carrying no predicate to hold a copy — normalizes like any other
+            // operand.
             if target.carries_refinement() {
-                return rebuild(TypedExprNode::Cast { value, target });
+                let mut cast = rebuild(TypedExprNode::Cast { value, target });
+                let mut reads = Vec::new();
+                name_reads(&mut cast, muts, &mut reads);
+                return let_chain(read_bindings(reads), cast);
             }
             let (binds, value) = atomize(*value, muts);
             let_chain(
@@ -461,15 +494,25 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
+        // A read sealed in the definiens moves ahead of the `let` ([`peel`]): the
+        // binding's type is refined by its definiens, and a read binder sealed
+        // inside it is opaque, so the type would name a binder out of scope at
+        // every use.
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
-        } => rebuild(TypedExprNode::Let {
-            binding,
-            bound_expr: Box::new(normalize(*bound_expr, muts)),
-            body: Box::new(normalize(*body, muts)),
-        }),
+        } => {
+            let (binds, bound_expr) = peel(normalize(*bound_expr, muts), muts);
+            let_chain(
+                binds,
+                rebuild(TypedExprNode::Let {
+                    binding,
+                    bound_expr: Box::new(bound_expr),
+                    body: Box::new(normalize(*body, muts)),
+                }),
+            )
+        }
 
         TypedExprNode::MutDecl {
             binding,
@@ -557,6 +600,45 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             e.node.kind_name()
         ),
     }
+}
+
+/// Replace every read of a mutable variable in `muts` within `e` by a reference to
+/// that variable's binder in `reads`, adding one for a variable `reads` lacks.
+///
+/// For a term whose reads reach a refinement predicate before inference: a
+/// comprehension's guard or source, which `crate::ccl::comprehension` places in
+/// one, and a refined cast, whose target holds a copy of its value. The rename
+/// reaches the predicates `e`'s types carry, so a cast's two copies stay equal.
+/// Every mention is a read, the [`atomize_handle`] positions included: a
+/// pass-by-reference callee writes, and neither term performs a write.
+fn name_reads(e: &mut Expr, muts: &Muts, reads: &mut Vec<(Name, Name)>) {
+    let mut read: Vec<&Name> = muts.iter().filter(|m| is_free(m, e)).collect();
+    if read.is_empty() {
+        return;
+    }
+    // Sorted, so the bindings land in an order the program decides.
+    read.sort();
+    let mut rename = Subst::id();
+    for variable in read {
+        let temp = match reads.iter().find(|(r, _)| r == variable) {
+            Some((_, temp)) => temp.clone(),
+            None => {
+                let temp = Name::anf_temp();
+                reads.push((variable.clone(), temp.clone()));
+                temp
+            }
+        };
+        rename = rename.extended_rename(variable.clone(), temp);
+    }
+    rename.rewrite_expr(e);
+}
+
+/// The bindings [`name_reads`] collected, one read per variable, ahead of the term.
+fn read_bindings(reads: Vec<(Name, Name)>) -> Vec<(TypedBinding, Expr)> {
+    reads
+        .into_iter()
+        .map(|(variable, temp)| (TypedBinding::new_unannotated(temp), Expr::var(variable)))
+        .collect()
 }
 
 /// Normalize the arm bodies of a comprehension element that

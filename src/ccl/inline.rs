@@ -590,12 +590,18 @@ fn inline_impl(expr: Expr) -> Expr {
             // misses it (writes stopped being `let` shadows in mutability v2).
             //
             // A binder some type spells is never dropped, by either rewrite
-            // below: a type lifted past an opaque binder keeps the binder rather
-            // than its definiens (`crate::ccl::BindingTransparency`), so
-            // collapsing the binding would leave those types naming a binder the
-            // tree no longer holds. Only an opaque binder can be in that
-            // position — a transparent one was discharged at inference.
-            let binder_spelled_in_a_type = binding.transparency == BindingTransparency::Opaque
+            // below, in two cases. A type lifted past an opaque binder keeps the
+            // binder rather than its definiens (`crate::ccl::BindingTransparency`),
+            // so collapsing the binding would leave those types naming a binder
+            // the tree no longer holds. And a binder bound to a mutable variable's
+            // read — `k = acc`, whose definiens carries the `Mut` handle — would put
+            // the variable into the types inside its scope, which no type may name
+            // (`src/ccl/design/mutability.md`, "A read is named while inference
+            // runs"). Any other transparent binder's definiens is what inference
+            // discharged into every type lifted out of its scope, so substituting
+            // it into the types inside is the same discharge.
+            let binder_spelled_in_a_type = (binding.transparency == BindingTransparency::Opaque
+                || bound_expr.ty.mut_value_type().is_some())
                 && (crate::ccl::subst::type_free_vars(&ty).contains(&binding.name)
                     || spelled_in_a_type(&body, &binding.name));
 

@@ -61,8 +61,8 @@
 //! # Why a read gets a name
 //!
 //! No type may depend on a mutable variable, which has no single value for one
-//! to refer to (`crate::ccl::infer::InferError::MutableInRefinedType`).
-//! Inference refines a computed value by the term that computed it, so a read
+//! to refer to (`src/ccl/design/mutability.md`, "A read is named while inference
+//! runs"). Inference refines a computed value by the term that computed it, so a read
 //! reaching an operand puts the mutable variable in that operand's refinement:
 //! `x ^+ 1` types as `{Int | __elem == x ^+ 1}`, which names `x` where nothing
 //! binds it. Read through a binder, the same operand types as `{Int | __elem ==
@@ -337,22 +337,11 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
         // body, and a read there names a binding of its own, per position,
         // exactly as a lambda body's does.
         //
-        // **A generator source is an ordinary operand** of the statement
-        // carrying the comprehension. The copy the loop-join predicate takes of
-        // it is taken after this pass, so both copies carry the rewrite and stay
-        // equal.
-        //
-        // **A guard is not rewritten.** It becomes the refinement predicate on
-        // the cast's domain, which is a type, and nothing inside a type is
-        // rewritten here (module docs, "Anything inside a type"). A read left
-        // standing there is what `InferError::MutableInRefinedType` reports.
-        TypedExprNode::Comprehension {
-            generators,
-            element,
-        } => {
-            for g in generators.iter_mut() {
-                g.iter = operand(std::mem::take(&mut g.iter), muts, open, minted);
-            }
+        // **A generator source and a guard arrive named.** Both reach the cast's
+        // refinement predicate, and A-normalization renames their reads to a
+        // binding ahead of the comprehension (`crate::ccl::anf`, `name_reads`),
+        // which this pass seals like any other.
+        TypedExprNode::Comprehension { element, .. } => {
             **element = block(std::mem::take(element), muts);
             expr
         }
@@ -480,9 +469,9 @@ fn rebuilder(e: &Expr) -> impl Fn(TypedExprNode) -> Expr + use<> {
 ///
 /// For a message and nothing else. `compile_program` applies it to an inference
 /// error's types on the way out, past the point anything types them again.
-/// Substituting the variable into a type inference still holds is the rewrite
-/// [`MutableInRefinedType`](crate::ccl::infer::InferError::MutableInRefinedType)
-/// refuses: a mutable variable has no single value for a type to refer to.
+/// Substituting the variable into a type inference still holds would put the
+/// variable in that type, and a mutable variable has no single value for a type to
+/// refer to.
 ///
 /// A binder the user wrote keeps its spelling. `x0 ^= x` names the read `x0`,
 /// and respelling it `x` reports a name the program does not use at that point,

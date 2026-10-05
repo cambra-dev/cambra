@@ -2245,6 +2245,10 @@ fn transform_chain(
             bound_expr,
             body,
         } if b.transparency == BindingTransparency::Transparent => {
+            // The binder's type too: a filter reading a snapshot puts the snapshot's
+            // binder in the type of the collection it filters.
+            let mut b = b;
+            Subst::discharge_env_in_binder(&mut b, env);
             let bound = Subst::discharge_env_in_place(*bound_expr, env);
             let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
             Expr::let_in_preserving(stmt_id, b, bound, rest)

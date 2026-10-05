@@ -966,7 +966,7 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "post-letrec produced an invalid tree",
+        "Barendregt violation: substitution range mentions binder",
     )
 }
 

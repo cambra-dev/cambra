@@ -71,7 +71,8 @@ does not require globally distinct uids, since copied binding sites retain their
 
 `ccl/scope.rs` defines term binding with `for_each_scoped_item`. It yields direct children with
 their enclosing binders and yields the name occurrences made by the node itself. Free-variable
-analysis and `Subst::rewrite_expr` use that walk. The scope rules are:
+analysis, `Subst::rewrite_expr` and inference's `check_scope_valid` use that walk. The scope rules
+are:
 
 | Node | Binder scope |
 |---|---|
