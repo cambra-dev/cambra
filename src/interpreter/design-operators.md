@@ -990,14 +990,15 @@ it, since this site is a morphism under `curry` rather than one the iterate-then
 chain reaches. A keyed collection's membership refinement is a different kind of refinement
 and stays on the binder whose lookup reads it.
 
-[`Filter`] reads the resulting mask **positionally**: the predicate compiled over the same
-pairs, so its flat codomain is one boolean per entry in entry order, which is the mask
-`Tile::retain_keys` takes and re-offsets the shortened groups from. Each side is pulled from its
-own branch of the pairs and they need not have reached the same rows. An input with nothing in it
-is already filtered, which is the ordinary end of a pull; anything else out of step is refused
-with a message that says so, rather than reading the mask across the misalignment, which drops
-the wrong entries silently, or answering empty, which waits for an alignment that is not
-coming.
+[`Filter`] reads the resulting mask by path. The predicate is compiled over the same pairs, so
+its flat codomain is one boolean per entry, which is the mask `Tile::retain_keys` takes and
+re-offsets the shortened groups from. Each side is pulled from its own branch of the pairs, and
+the two need not have reached the same entries. Where they hold the same paths, the mask is
+positional. Otherwise each input entry takes the answer at its own path. An entry the predicate
+has not answered yet is undecided: it is left out of the pull, and its path and the rows above
+it are left out of every level's completeness, so it arrives beneath the same row once
+answered. An answer for an entry the input has not reached stays in the predicate until the
+filter's output releases that entry. An input with nothing in it is already filtered.
 
 A filter that reads the outer binder forms the pair even when the body reads nothing outer.
 The binder is then free only in the filter's cast, and `lambda_elim` rewrites that cast to the
