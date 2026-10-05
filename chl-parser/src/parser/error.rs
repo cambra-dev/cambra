@@ -282,6 +282,12 @@ impl ParseError {
             ParseError::Lex(e) => {
                 let (span, msg): (Span, &'static str) = match e {
                     LexError::InvalidToken { span } => (*span, "invalid token"),
+                    LexError::UnterminatedString { span } => {
+                        (*span, "string literal has no closing quote on its line")
+                    }
+                    LexError::DetachedBacktick { span } => {
+                        (*span, "backtick is not immediately followed by a tag name")
+                    }
                     LexError::UnmatchedClose { span } => (*span, "unmatched close-bracket"),
                     LexError::UnclosedBracket { span } => {
                         (*span, "unclosed bracket at end of input")
