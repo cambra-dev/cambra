@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 
 use bit_set::BitSet;
 use bit_vec::BitVec;
+use std::borrow::Cow;
 
+use super::curry_level::CurryLevel;
 use crate::{
     ccl::AggregateKind,
     interpreter::{
@@ -105,13 +107,13 @@ pub enum Tile {
         /// as a level beneath the tick is `TODO(store-key-levels)`. A write set spanning
         /// several keys lands as one tick in each of their changelogs.
         state: Box<Tile>,
-        /// The decided frontier: `LessThanEq(w)` means every tick `≤ w` is decided
+        /// The decided frontier: `at_or_below(w)` means every tick `≤ w` is decided
         /// — the watermark `w` counts trailing carries (positions past the latest
         /// *change*), because a store is a right-continuous step function over its
         /// whole decided prefix, not a list of change events. `False` while
         /// undecided (never stepped). **Not** `True`: terminality is the separate
         /// `terminal` axis so the numeric watermark is never discarded (a terminal
-        /// store with trailing carries keeps `LessThanEq(w)`, so `len` and
+        /// store with trailing carries keeps `at_or_below(w)`, so `len` and
         /// `store_frontier` read `w` directly instead of undercounting to the latest
         /// change tick).
         frontier: Predicate,
@@ -119,7 +121,7 @@ pub enum Tile {
         /// a *terminal* read (`ExtractFinal` / `final_or_default`) resolves. Distinct
         /// from the decided *extent* (`frontier`): a live store decided up to `w`
         /// has `terminal == false`; the same store, once its writers finish, flips
-        /// `terminal` to `true` while keeping `frontier = LessThanEq(w)`.
+        /// `terminal` to `true` while keeping `frontier = at_or_below(w)`.
         terminal: bool,
         /// Keys that will receive no further write, deduplicated and in no
         /// meaningful order — it is read as a set (`Value` is not `Ord`, and
@@ -179,9 +181,9 @@ impl Tile {
             // list of change events: a tick absent from a key's changelog but at or below
             // the frontier is *decided*, its value holding from the latest earlier change.
             // So it is empty when nothing is decided, which an undecided (`False`) frontier
-            // says and a `LessThanEq` watermark never does.
+            // says and an `at_or_below` watermark never does.
             Tile::Store { frontier, .. } => {
-                !matches!(frontier, Predicate::LessThanEq(Value::UInt(_)))
+                !matches!(frontier.as_at_or_below(), Some(Value::UInt(_)))
             }
         }
     }
@@ -379,8 +381,8 @@ impl Tile {
             // already present (a changelog only grows forward in commit time), so
             // appending preserves the ascending order the fold relies on. Each key's
             // changelog is one row's collection, so the state merges as the whole value it
-            // is. The frontier advances to the union — for the watermark `LessThanEq(w)`
-            // this is `LessThanEq(max(w_self, w_other))`; the `terminal` flag ORs (either
+            // is. The frontier advances to the union — for the watermark `at_or_below(w)`
+            // this is `at_or_below(max(w_self, w_other))`; the `terminal` flag ORs (either
             // side declaring the frontier closed closes it), and `closed_keys` unions for
             // the same reason — closure is monotone, so a key either side reports closed
             // stays closed. A store releases by physically dropping a decided prefix (see
@@ -621,32 +623,61 @@ impl Tile {
     /// TODO: the index_at calls here aren't very efficient; we should optmize this by applying the
     /// predicates in a more columnar way.
     pub fn remove_guarded(&mut self, guard: TileGuard) {
+        // In canonical form, so a region naming everything beneath some keys names them
+        // ([`TileGuard::flatten_or`]) and the keys go with what they map to.
+        self.remove_guarded_under(TileGuard::flatten_or(vec![guard]), &[Vec::new()], false);
+    }
+
+    /// [`remove_guarded`](Self::remove_guarded) with the path reaching each of this tile's
+    /// rows, outermost key first.
+    ///
+    /// A guard that names an enclosing path is read against the whole path, so the walk
+    /// carries it down: a key value alone repeats once per row of the level above, and
+    /// under a standing level that is several nodes rather than one. The paths are built
+    /// only where the guard names one, so an ordinary release walks the keys as before.
+    ///
+    /// `under_a_level` says whether a collection level stands above this tile. A keyless
+    /// value under one shares its rows with its record's other fields, so it goes with its
+    /// key rather than on its own.
+    fn remove_guarded_under(
+        &mut self,
+        guard: TileGuard,
+        row_paths: &[Vec<Value>],
+        under_a_level: bool,
+    ) {
+        let key_paths =
+            (self.is_data_function() && guard.names_a_path()).then(|| self.key_paths(row_paths));
         match (&mut *self, guard) {
             // If the guard is empty, do nothing.
             (_, g) if g.is_empty() => {}
-            // Scalar: universal guard clears the scalar; empty guard is a no-op.
-            (Tile::Scalar(cv), TileGuard::Scalar(true)) => {
+            // A keyless value under a level is dropped with its key. Its cells stand over the
+            // rows its record's other fields do, and a tile cannot hold a row without them,
+            // so a release naming them before the key is recorded and they are returned
+            // until the key goes (`src/interpreter/design-operators.md`, "The release
+            // contract"). In canonical form a guard naming the whole row names the key.
+            (Tile::Scalar(_), TileGuard::Scalar(_))
+            | (Tile::Aggregation { .. }, TileGuard::Aggregation(_))
+                if under_a_level => {}
+            // With no level above, a universal guard clears the value.
+            (Tile::Scalar(cv), TileGuard::Scalar(pred)) if pred.is_true() => {
                 *cv = cv.select_indices(std::iter::empty(), 0);
             }
-            (Tile::Scalar(_), TileGuard::Scalar(false)) => {}
-            // Aggregation: universal guard clears all state; empty guard is a no-op.
             (
                 Tile::Aggregation {
                     accumulator,
                     terminal,
                     ..
                 },
-                TileGuard::Aggregation(true),
-            ) => {
+                TileGuard::Aggregation(pred),
+            ) if pred.is_true() => {
                 **accumulator = accumulator.select_rows(&[]);
                 *terminal = terminal.select_indices(std::iter::empty(), 0);
             }
-            (Tile::Aggregation { .. }, TileGuard::Aggregation(false)) => {}
             // Record: recurse per field.
             (Tile::Record(fields), TileGuard::Record(mut guards)) => {
                 for (k, t) in fields.iter_mut() {
                     if let Some(g) = guards.remove(k) {
-                        t.remove_guarded(g);
+                        t.remove_guarded_under(g, row_paths, under_a_level);
                     }
                 }
             }
@@ -654,7 +685,7 @@ impl Tile {
             // it describes; together they remove the union of all arms.
             (tile, TileGuard::Or(arms)) => {
                 for arm in arms {
-                    tile.remove_guarded(arm);
+                    tile.remove_guarded_under(arm, row_paths, under_a_level);
                 }
             }
             // **A guard nests as deeply as the value does.** `Domain(p)` names this
@@ -667,28 +698,35 @@ impl Tile {
                     domain, deleted, ..
                 },
                 TileGuard::Function(FunctionGuard::Domain(pred)),
-            ) => {
-                for key in 0..domain.len() {
-                    if pred.contains(&domain.index_at(key)) {
-                        deleted.insert(key);
+            ) => match &key_paths {
+                Some(paths) => {
+                    for (key, path) in paths.iter().enumerate() {
+                        if pred.contains_path(path) {
+                            deleted.insert(key);
+                        }
                     }
                 }
-            }
+                None => {
+                    for key in 0..domain.len() {
+                        if pred.contains(&domain.index_at(key)) {
+                            deleted.insert(key);
+                        }
+                    }
+                }
+            },
             (
                 Tile::DataFunction { codomain, .. },
                 TileGuard::Function(FunctionGuard::Codomain(inner)),
-            ) => codomain.remove_guarded(*inner),
-            // A store release names a prefix of decided commit ticks the consumer
-            // no longer needs to *read at*. Dropping those change cells here would
-            // be unsound: under step interpolation a released tick's value may
-            // still hold forward past the release watermark, so a fold
-            // (`store_current` at the frontier) needs each key's latest write even
-            // when it lies in the released prefix. The load-bearing GC is therefore
-            // the engine's `gc_released_prefix` (keep-latest), which bounds the
-            // *source*; the per-consumer `FanOut` view reaching here is a throwaway
-            // per-pull clone the consumer folds whole, so removal is a no-op. This
-            // is the release-path face of the function overload the `Store` variant
-            // exists to avoid — "release tick t" is not "delete position t".
+            ) => codomain.remove_guarded_under(*inner, key_paths.as_deref().unwrap_or(&[]), true),
+            // A store release names positions the consumer no longer reads at, which is not
+            // the same as deleting them: under step interpolation a released position's
+            // value may hold forward past the release, so a fold at a later position can
+            // still need a change inside the released region. Which changes those are is the
+            // engine's question — `gc_released_prefix` reclaims the source and keeps them —
+            // and the per-consumer `FanOut` view reaching here is a per-pull clone the
+            // consumer folds whole, so removal is a no-op. This is the release-path face of
+            // the function overload the `Store` variant exists to avoid: "release position
+            // t" is not "delete position t".
             (Tile::Store { .. }, TileGuard::Function(FunctionGuard::Domain(_))) => {}
             (s, g) => panic!("Incompatible tile and guard in remove_guarded: {s:?} and {g:?}"),
         }
@@ -714,10 +752,10 @@ impl Tile {
     /// the obsolete guards, which lets them use smaller representations.
     pub fn to_guard(&self) -> TileGuard {
         match self {
-            Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
-            Tile::Aggregation { terminal, .. } => {
-                TileGuard::Aggregation(terminal.as_single().map(|t| t.as_bool()).unwrap_or(false))
-            }
+            Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
+            Tile::Aggregation { terminal, .. } => TileGuard::Aggregation(TileGuard::leaf(
+                terminal.as_single().map(|t| t.as_bool()).unwrap_or(false),
+            )),
             Tile::Record(m) => {
                 TileGuard::Record(m.iter().map(|(k, t)| (k.clone(), t.to_guard())).collect())
             }
@@ -753,10 +791,16 @@ impl Tile {
                 }
                 let mut open_values = (**codomain).clone();
                 open_values.retain_rows(&open);
+                // The whole value is one row at the empty path, so an open key's path is
+                // the key itself.
+                let open_paths: Vec<Vec<Value>> = (0..domain.len())
+                    .filter(|key| open[*key])
+                    .map(|key| vec![domain.index_at(key)])
+                    .collect();
                 TileGuard::flatten_or(vec![
                     TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
                     TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                        open_values.held_guard(),
+                        open_values.held_guard(&open_paths),
                     ))),
                 ])
             }
@@ -856,27 +900,247 @@ impl Tile {
         }
     }
 
-    /// The tile `depth` levels in, which is `self` at depth 0.
+    /// The tile at `level`, which is `self` at [`CurryLevel::OUTERMOST`].
     ///
     /// Where [`Self::deepest_values`] goes all the way down, this stops where an operator
     /// says to — at the levels its inputs share, below which each of them keeps its own.
-    pub fn values_at(&self, depth: usize) -> &Tile {
-        match (depth, self) {
+    pub fn values_at(&self, level: CurryLevel) -> &Tile {
+        match (level.index(), self) {
             (0, _) => self,
-            (_, Tile::DataFunction { codomain, .. }) => codomain.values_at(depth - 1),
-            (_, other) => panic!("no level {depth} in {other:?}"),
+            (_, Tile::DataFunction { codomain, .. }) => codomain.values_at(level.in_codomain()),
+            (_, other) => panic!("no {level} in {other:?}"),
         }
     }
 
     /// [`Self::values_at`], to write through.
-    pub fn values_at_mut(&mut self, depth: usize) -> &mut Tile {
-        if depth == 0 {
+    pub fn values_at_mut(&mut self, level: CurryLevel) -> &mut Tile {
+        if level == CurryLevel::OUTERMOST {
             return self;
         }
         let Tile::DataFunction { codomain, .. } = self else {
-            panic!("no level {depth} in {self:?}")
+            panic!("no {level} in {self:?}")
         };
-        codomain.values_at_mut(depth - 1)
+        codomain.values_at_mut(level.in_codomain())
+    }
+
+    /// Rebuild the level at `level`, one row of the level above it at a time — the deepest
+    /// standing level at a time.
+    ///
+    /// `group` answers the collection replacing the group at each row, indexed by that
+    /// row's flat key position; `empty_level` is what replaces it where there are no rows
+    /// yet, since the rebuilt level's shape is the caller's to say and not derivable from
+    /// the input's. Only the rebuilt level's `row_starts` are recomputed — the levels
+    /// above keep their own, their key counts being untouched.
+    ///
+    /// This is for an operation that changes the **keys** beneath the standing levels:
+    /// pairing two of them into one, merging a partition's arms. An operation that leaves
+    /// the keys alone and only replaces the values wants
+    /// [`values_at_mut`](Self::values_at_mut) instead, which needs no regrouping — a zip
+    /// beneath standing levels is that one.
+    ///
+    /// At the outermost level the whole tile is one group, so an operator written against
+    /// this needs no separate arm for the un-nested case.
+    pub fn regroup_beneath(
+        &self,
+        level: CurryLevel,
+        empty_level: Tile,
+        group: &mut dyn FnMut(usize) -> Tile,
+    ) -> Tile {
+        let Some(enclosing) = level.enclosing() else {
+            return group(0);
+        };
+        let Tile::DataFunction { domain, .. } = self.values_at(enclosing) else {
+            panic!("{level} of {self:?} has no level above it to take rows from")
+        };
+        // Each group states its completeness over its own paths, and the rebuilt level is the
+        // whole tile's, so each is qualified by its row's path ([`Predicate::beneath`])
+        // before they are run together.
+        let paths = self.paths_at(enclosing);
+        let mut group = |row: usize| {
+            let mut built = group(row);
+            built.map_level_predicates(&mut |depth, pred| pred.beneath(&paths[row], depth));
+            built
+        };
+        let mut starts: Vec<usize> = Vec::with_capacity(domain.len());
+        let mut merged: Option<Tile> = None;
+        for row in 0..domain.len() {
+            starts.push(merged.as_ref().map_or(0, Tile::level_width));
+            match &mut merged {
+                None => merged = Some(group(row)),
+                // Each group is one row of the rebuilt level, so they follow one another
+                // rather than describing one row between them: two enclosing rows key
+                // their groups independently, and running them together makes one row
+                // whose keys descend where the second row restarts.
+                Some(acc) => acc.merge_rows(group(row)),
+            }
+        }
+        let Tile::DataFunction {
+            domain: rebuilt_keys,
+            codomain,
+            domain_predicate,
+            deleted,
+            ..
+        } = merged.unwrap_or(empty_level)
+        else {
+            panic!("a regrouped level is a collection")
+        };
+        let mut out = self.clone();
+        *out.values_at_mut(level) = Tile::grouped(
+            ColumnValue::UInts(starts),
+            rebuilt_keys,
+            codomain,
+            domain_predicate,
+            deleted,
+        );
+        out
+    }
+
+    /// [`Self::regroup_beneath`] with the empty level read off `out`, the tiling of the
+    /// result.
+    ///
+    /// The empty level is always `out.values_at(level).empty_at_no_rows()` — the level
+    /// being rebuilt, emptied, not the codomain beneath it and not a level assembled from
+    /// parts. Deriving it here rather than taking it is what keeps a caller from passing
+    /// the wrong one, which answers a row that has reached nothing with a tile of the
+    /// wrong shape.
+    pub fn per_group(
+        &self,
+        out: &Tiling,
+        level: CurryLevel,
+        group: &mut dyn FnMut(usize) -> Tile,
+    ) -> Tile {
+        self.regroup_beneath(level, out.values_at(level).empty_at_no_rows(), group)
+    }
+
+    /// Row `row`'s group at `level`, beneath the standing levels above it, as a collection
+    /// in its own right — that level with every other row emptied. `None` where this tile
+    /// has not reached that row.
+    ///
+    /// The companion to [`regroup_beneath`](Self::regroup_beneath): one takes a row's group
+    /// apart, the other puts the results back. At the outermost level the whole tile is the
+    /// one group, so an operator written against the pair needs no arm for the un-nested
+    /// case.
+    pub fn group_at(&self, level: CurryLevel, row: usize) -> Option<Cow<'_, Tile>> {
+        // Borrowed at the outermost level: the whole tile *is* the one group, and this sits
+        // on the nested read's per-pull path, where cloning it would copy the store every
+        // lap.
+        let Some(enclosing) = level.enclosing() else {
+            return Some(Cow::Borrowed(self));
+        };
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = self.values_at(enclosing)
+        else {
+            return None;
+        };
+        if domain.len() <= row {
+            return None;
+        }
+        let mut group = (**codomain).clone();
+        group.retain_rows(&BitVec::from_fn(domain.len(), |i| i == row));
+        // The group is a collection in its own right, so its completeness is stated over its
+        // own paths ([`Predicate::within`]). A key some level above calls complete is
+        // complete at every depth beneath it, and the group taken out on its own has no
+        // level above to read that from, so it says so itself.
+        let path = &self.paths_at(enclosing)[row];
+        let row_complete = self.completion_at(enclosing).contains_path(path);
+        group.map_level_predicates(&mut |depth, pred| match row_complete {
+            true => Predicate::True,
+            false => pred.within(path, depth),
+        });
+        Some(Cow::Owned(group))
+    }
+
+    /// Which paths through `level` are complete, over whole paths: those `level` calls
+    /// complete, and every path beneath a key some level above it calls complete.
+    ///
+    /// Completeness is downward-closed (`src/interpreter/design-operators.md`, "Curry
+    /// levels"), so what `level` states on its own is not all that is complete there: a
+    /// producer may say it once, at the outermost level that settles.
+    pub(crate) fn completion_at(&self, level: CurryLevel) -> Predicate {
+        let mut node = self;
+        let mut complete = Predicate::False;
+        for depth in 0..=level.index() {
+            let Tile::DataFunction {
+                codomain,
+                domain_predicate,
+                ..
+            } = node
+            else {
+                panic!("{level} of {self:?} has no level there")
+            };
+            complete = match depth {
+                0 => domain_predicate.clone(),
+                _ => complete.descend(1).union(domain_predicate),
+            };
+            node = codomain;
+        }
+        complete
+    }
+
+    /// Qualify what this one-row collection's codomain states by the keys it holds.
+    ///
+    /// A codomain built as a column over this tile's keys ([`crate::interpreter::tile_operators`]'s
+    /// `stored_value_tile`, say) states its groups' completeness without knowing the
+    /// keys its rows stand under, so an unqualified statement there reads as one about
+    /// every key. Qualifying it by the keys held ([`Predicate::qualified_by`]) says what the
+    /// column meant.
+    pub(crate) fn qualify_codomain_by_keys(&mut self) {
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            ..
+        } = self
+        else {
+            return;
+        };
+        debug_assert_eq!(
+            row_starts.len(),
+            1,
+            "qualifying by keys reads them as whole paths, so the collection is one row with no \
+             level above: {self:?}"
+        );
+        let rows = Predicate::from_column_value(domain);
+        codomain.map_level_predicates(&mut |depth, pred| pred.qualified_by(&rows, depth));
+    }
+
+    /// Replace every collection level's `domain_predicate` along this chain, outermost
+    /// first, with `f(depth, predicate)`: what an operator does when it restates a collection
+    /// over different paths ([`Predicate::within`], [`Predicate::beneath`]).
+    pub(crate) fn map_level_predicates(
+        &mut self,
+        f: &mut dyn FnMut(usize, &Predicate) -> Predicate,
+    ) {
+        fn walk(tile: &mut Tile, depth: usize, f: &mut dyn FnMut(usize, &Predicate) -> Predicate) {
+            match tile {
+                Tile::DataFunction {
+                    codomain,
+                    domain_predicate,
+                    ..
+                } => {
+                    *domain_predicate = f(depth, domain_predicate);
+                    walk(codomain, depth + 1, f);
+                }
+                // A record of tiles stands over the same rows, so a collection in one of its
+                // fields is a level at the same depth as the record.
+                Tile::Record(fields) => {
+                    for field in fields.values_mut() {
+                        walk(field, depth, f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(self, 0, f);
+    }
+
+    /// How many keys this level holds in total, across every row of it.
+    fn level_width(&self) -> usize {
+        match self {
+            Tile::DataFunction { domain, .. } => domain.len(),
+            _ => 0,
+        }
     }
 
     /// [`Self::deepest_values`], to write through.
@@ -904,13 +1168,13 @@ impl Tile {
     /// The innermost collection of this chain ([`Self::innermost_depth`]).
     pub fn innermost_level(&self) -> Option<&Tile> {
         let depth = self.innermost_depth()?;
-        Some(self.values_at(depth))
+        Some(self.values_at(CurryLevel::new(depth)))
     }
 
     /// [`Self::innermost_level`], to write through.
     pub fn innermost_level_mut(&mut self) -> Option<&mut Tile> {
         let depth = self.innermost_depth()?;
-        Some(self.values_at_mut(depth))
+        Some(self.values_at_mut(CurryLevel::new(depth)))
     }
 
     /// The key path of every row at `depth`, outermost key first.
@@ -1049,6 +1313,62 @@ impl Tile {
         paths
     }
 
+    /// The key path of every key of `level`, each extending its row's path.
+    ///
+    /// [`key_paths`](Self::key_paths) applied down the chain from the outermost level. A
+    /// key repeats across its siblings' groups, so beneath a standing level only the whole
+    /// path names an element — which is what two collections have to agree on before
+    /// anything pairs them row for row.
+    pub fn paths_at(&self, level: CurryLevel) -> Vec<Vec<Value>> {
+        let mut node = self;
+        let mut paths = vec![Vec::new()];
+        for depth in 0..=level.index() {
+            paths = node.key_paths(&paths);
+            if depth == level.index() {
+                break;
+            }
+            let Tile::DataFunction { codomain, .. } = node else {
+                panic!("{level} of {self:?} has no level there")
+            };
+            node = codomain;
+        }
+        paths
+    }
+
+    /// Keep only the keys whose path `keep` admits, at every level down to and including
+    /// `level`.
+    ///
+    /// Top-down, because a key the level above dropped takes its whole group with it: each
+    /// level's mask is read against the survivors of the one above, and a prefix of a kept
+    /// path is itself kept.
+    pub fn retain_paths(&mut self, level: CurryLevel, keep: &dyn Fn(&[Value]) -> bool) {
+        self.retain_paths_under(level.index(), vec![Vec::new()], keep);
+    }
+
+    fn retain_paths_under(
+        &mut self,
+        depth: usize,
+        row_paths: Vec<Vec<Value>>,
+        keep: &dyn Fn(&[Value]) -> bool,
+    ) {
+        let paths = self.key_paths(&row_paths);
+        let mask: BitVec = paths.iter().map(|p| keep(p)).collect();
+        self.retain_keys(&mask);
+        if depth == 0 {
+            return;
+        }
+        let survivors: Vec<Vec<Value>> = paths
+            .into_iter()
+            .zip(mask.iter())
+            .filter(|(_, kept)| *kept)
+            .map(|(path, _)| path)
+            .collect();
+        let Tile::DataFunction { codomain, .. } = self else {
+            unreachable!("retain_keys leaves the collection it filtered")
+        };
+        codomain.retain_paths_under(depth - 1, survivors, keep);
+    }
+
     /// This collection with `level` appended below its innermost one.
     ///
     /// `level` builds that level out of the values the tile arrives with, which is the data
@@ -1099,40 +1419,94 @@ impl Tile {
     }
 
     /// The guard naming what this tile **holds**, with no allowance for what it has been
-    /// promised.
+    /// promised, standing over rows at `row_paths`.
     ///
     /// What [`Self::to_guard`] answers for a whole tile includes its `domain_predicate`:
     /// a key the producer promises is releasable even before it arrives. A
     /// [`FunctionGuard::Codomain`] arm cannot carry that, because it is read against every
     /// row of the values it wraps — a promised key would be released under a row that
-    /// already holds it, and that row's value would go with it.
-    fn held_guard(&self) -> TileGuard {
+    /// already holds it, and that row's value would go with it. A held key is named by its
+    /// whole path for the same reason: named bare, it would be released under every row,
+    /// including a row that has not received it yet.
+    fn held_guard(&self, row_paths: &[Vec<Value>]) -> TileGuard {
         match self {
-            // A record's fields stand over the rows the record does, so what it holds is
-            // what its fields hold — each read the same way, because a `Codomain` arm is
-            // read against every row whatever sits at it.
+            // A record's fields stand over the rows the record does, and a `Codomain` arm
+            // is read against every row whatever sits at it — so a field is named here
+            // only where what it names limits itself to the rows in hand. A field holding
+            // a level does: it names its own keys. One holding none has no keys to name
+            // itself by, so naming it would claim it at every row of the tiling, including
+            // rows this tile does not hold. Its value is released with its key, at the
+            // level above, once every field under that key is complete.
             Tile::Record(fields) => TileGuard::Record(
                 fields
                     .iter()
-                    .map(|(name, field)| (name.clone(), field.held_guard()))
+                    .map(|(name, field)| {
+                        let held = match field.holds_a_level() {
+                            true => field.held_guard(row_paths),
+                            false => empty_guard_of(field),
+                        };
+                        (name.clone(), held)
+                    })
                     .collect(),
             ),
-            Tile::DataFunction {
-                domain, codomain, ..
-            } => {
-                let keys_guard = TileGuard::Function(FunctionGuard::Domain(
-                    Predicate::from_column_value(domain),
-                ));
-                if !codomain.holds_a_level() {
-                    return keys_guard;
+            // A key whose value is a **scalar** is held whole as soon as it is there, so
+            // every key present is named. A key whose value still holds a level may be
+            // growing, and only a `domain_predicate` says which will not — which a
+            // `Codomain` arm cannot carry, being read against every row. So a level-holding
+            // level names no keys of its own and answers with what lies beneath: claiming
+            // them whole releases a key holding nothing, and the row that later fills it
+            // never gets to deliver.
+            Tile::DataFunction { codomain, .. } => {
+                if codomain.holds_a_level() {
+                    return TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                        codomain.held_guard(&self.key_paths(row_paths)),
+                    )));
                 }
-                TileGuard::flatten_or(vec![
-                    keys_guard,
-                    TileGuard::Function(FunctionGuard::Codomain(Box::new(codomain.held_guard()))),
-                ])
+                TileGuard::Function(FunctionGuard::Domain(self.held_keys(row_paths)))
             }
             other => other.to_guard(),
         }
+    }
+
+    /// The keys this collection holds, each beneath the path of the row holding it.
+    ///
+    /// Rows holding the same keys are named together, in the order the first of them
+    /// appears, so a column whose rows hold alike costs one arm however many rows it has
+    /// and the region is spelled the same way each time.
+    fn held_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
+        let Tile::DataFunction { domain, .. } = self else {
+            panic!("held_keys is a collection's: {self:?}")
+        };
+        let mut group_of: HashMap<Vec<Value>, usize> = HashMap::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for row in 0..row_paths.len() {
+            let (start, end) = self.row_run(row);
+            if start < end {
+                let keys = (start..end).map(|k| domain.index_at(k)).collect();
+                let group = *group_of.entry(keys).or_insert_with(|| {
+                    groups.push(Vec::new());
+                    groups.len() - 1
+                });
+                groups[group].push(row);
+            }
+        }
+        Predicate::union_all(
+            groups
+                .into_iter()
+                .map(|rows| {
+                    let (start, end) = self.row_run(rows[0]);
+                    let keys = Predicate::from_column_value(
+                        &domain.select_indices(start..end, end - start),
+                    );
+                    let rows = Predicate::union_all(
+                        rows.iter()
+                            .map(|&row| Predicate::exactly(&row_paths[row]))
+                            .collect(),
+                    );
+                    Predicate::qualified(rows, keys)
+                })
+                .collect(),
+        )
     }
 
     /// The half-open run of `domain` belonging to row `row`.
@@ -1158,50 +1532,98 @@ impl Tile {
         (0..offsets.len()).map(move |row| level_run(offsets, row, domain.len()))
     }
 
-    /// A guard naming exactly the rows [`compact`](Self::compact) removes from this collection,
-    /// or `None` when it removes none or the tile is no collection.
+    /// A guard naming exactly the rows [`compact`](Self::compact) removes from this tile, at
+    /// every level, or `None` when it removes none.
     ///
     /// An operator that compacts its input and emits what is left releases this to the input,
     /// since no consumer of its output sees those rows, so no consumer's guard can name them.
+    /// A row deleted beneath the top level is named by its key path, so the guard leaves the
+    /// same key under its siblings alone.
     ///
     /// # Panics
     ///
-    /// When a removed row has no exact spelling as a guard: a deleted key of a collection under
-    /// an enclosing row, or a deleted row inside a nested group. A `Domain` guard names a key
-    /// under every enclosing row, those still to arrive included, and a `Codomain` guard is read
-    /// against every group, so either would release the key where it may still be live. Naming
-    /// a key beneath the path that reaches it needs a predicate qualified by that path, which
-    /// these guards do not have.
+    /// When the tile stands over several rows and removes one: its rows' paths lie above it,
+    /// so no guard it can build names a key under one row and not the others. Also when an
+    /// aggregate's accumulator holds a deleted row, which its own guard has no spelling for.
     pub fn deleted_keys_guard(&self) -> Option<TileGuard> {
-        let Tile::DataFunction {
-            domain,
-            codomain,
-            deleted,
-            ..
-        } = self
-        else {
-            return None;
-        };
-        assert!(
-            !codomain.holds_deleted_rows(),
-            "compacting drops a row deleted inside a nested group, and no guard names a key \
-             beneath the path that reaches it, so the row cannot be released: {self:?}"
-        );
-        if deleted.is_empty() {
+        if !self.holds_deleted_rows() {
             return None;
         }
         assert_eq!(
             self.rows(),
             1,
-            "compacting drops a deleted key of a collection under an enclosing row, and a \
+            "compacting drops a deleted row of a tile under several enclosing rows, and a \
              `Domain` guard would release that key under every row, so it cannot be released: \
              {self:?}"
         );
-        let dropped: Vec<usize> = deleted.iter().collect();
-        let keys = domain.select_indices(dropped.iter().copied(), dropped.len());
-        Some(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::from_column_value(&keys),
-        )))
+        self.deleted_guard_under(&[Vec::new()])
+    }
+
+    /// [`Self::deleted_keys_guard`] for a tile whose rows are reached by `row_paths`.
+    fn deleted_guard_under(&self, row_paths: &[Vec<Value>]) -> Option<TileGuard> {
+        match self {
+            Tile::DataFunction {
+                domain,
+                codomain,
+                deleted,
+                ..
+            } => {
+                let paths = self.key_paths(row_paths);
+                let mut arms = Vec::new();
+                if !deleted.is_empty() {
+                    // At the top level a key is its own path, so the keys spell the region.
+                    let here = if row_paths.iter().all(Vec::is_empty) {
+                        let dropped: Vec<usize> = deleted.iter().collect();
+                        Predicate::from_column_value(
+                            &domain.select_indices(dropped.iter().copied(), dropped.len()),
+                        )
+                    } else {
+                        Predicate::union_all(
+                            deleted
+                                .iter()
+                                .map(|k| Predicate::exactly(&paths[k]))
+                                .collect(),
+                        )
+                    };
+                    arms.push(TileGuard::Function(FunctionGuard::Domain(here)));
+                }
+                if let Some(inner) = codomain.deleted_guard_under(&paths) {
+                    arms.push(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                        inner,
+                    ))));
+                }
+                (!arms.is_empty()).then(|| TileGuard::flatten_or(arms))
+            }
+            Tile::Record(fields) => {
+                let named: HashMap<&String, TileGuard> = fields
+                    .iter()
+                    .filter_map(|(name, field)| Some((name, field.deleted_guard_under(row_paths)?)))
+                    .collect();
+                (!named.is_empty()).then(|| {
+                    TileGuard::Record(
+                        fields
+                            .iter()
+                            .map(|(name, field)| {
+                                let guard = named
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_else(|| empty_guard_of(field));
+                                (name.clone(), guard)
+                            })
+                            .collect(),
+                    )
+                })
+            }
+            Tile::Aggregation { accumulator, .. } => {
+                assert!(
+                    !accumulator.holds_deleted_rows(),
+                    "compacting drops a row deleted inside an aggregate's accumulator, which \
+                     the aggregate's guard has no spelling for: {self:?}"
+                );
+                None
+            }
+            Tile::Scalar(_) | Tile::Store { .. } => None,
+        }
     }
 
     /// Whether any collection in this tile, at any level, marks a row deleted.
@@ -1241,6 +1663,25 @@ pub fn live_keys<'a>(
     (0..domain.len())
         .filter(|i| !deleted.contains(*i))
         .map(|i| (i, domain.index_at(i)))
+}
+
+/// The guard naming nothing, shaped to `tile`.
+///
+/// What a field contributes where its release belongs to its key rather than to itself.
+fn empty_guard_of(tile: &Tile) -> TileGuard {
+    match tile {
+        Tile::Scalar(_) => TileGuard::Scalar(Predicate::False),
+        Tile::Aggregation { .. } => TileGuard::Aggregation(Predicate::False),
+        Tile::Record(fields) => TileGuard::Record(
+            fields
+                .iter()
+                .map(|(name, field)| (name.clone(), empty_guard_of(field)))
+                .collect(),
+        ),
+        Tile::DataFunction { .. } | Tile::Store { .. } => {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::False))
+        }
+    }
 }
 
 /// A collection's own `row_starts`, for the validation a constructor does.
@@ -1707,6 +2148,23 @@ mod tests {
         two_rows_of_two_keys(&[1]).deleted_keys_guard();
     }
 
+    /// A key deleted inside one group is named by its path, so the same key under the
+    /// group's sibling is left alone.
+    #[test]
+    fn deleted_keys_guard_names_a_nested_deleted_key_by_its_path() {
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(two_rows_of_two_keys(&[1])),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let guard = tile.deleted_keys_guard().expect("the deleted key is named");
+        let path = |outer: usize, inner: usize| [Value::UInt(outer), Value::UInt(inner)];
+        assert!(guard.covers_path(&path(0, 1)), "{guard:?}");
+        assert!(!guard.covers_path(&path(1, 1)), "{guard:?}");
+        assert!(!guard.covers_path(&path(0, 0)), "{guard:?}");
+    }
+
     // ── Merging a collection delivered row by row ─────────────────────────────
 
     /// One enclosing row's group, for a collection of collections.
@@ -1781,6 +2239,337 @@ mod tests {
         )
     }
 
+    /// A key is there only through what it maps to, so a release naming everything beneath
+    /// a key drops the key, and one naming part of it keeps the key, however little that
+    /// leaves beneath: the tile then says nothing unreleased lies there, which is true.
+    #[test]
+    fn a_codomain_release_drops_only_the_keys_it_names_whole() {
+        // 0 ↦ {1, 2}, 1 ↦ {3}, 2 ↦ {3, 9}; key 0 and key 2 complete.
+        let tile = || {
+            two_level_uint_int(
+                vec![0, 1, 2],
+                vec![0, 2, 3],
+                vec![1, 2, 3, 3, 9],
+                vec![10, 20, 30, 31, 90],
+                Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2])),
+            )
+        };
+        let keys_left = |guard: TileGuard| {
+            let mut t = tile();
+            t.remove_guarded(guard);
+            t.compact();
+            match t {
+                Tile::DataFunction { domain, .. } => domain,
+                other => panic!("a collection stays a collection: {other:?}"),
+            }
+        };
+        let codomain = |pred: Predicate| {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(pred),
+            ))))
+        };
+        // Part of what lies beneath every key, though it empties key 0.
+        assert_eq!(
+            keys_left(codomain(Predicate::at_or_below(Value::UInt(5)))),
+            ColumnValue::UInts(vec![0, 1, 2])
+        );
+        // Everything beneath key 0.
+        assert_eq!(
+            keys_left(codomain(Predicate::qualified(
+                Predicate::point(Value::UInt(0)),
+                Predicate::True
+            ))),
+            ColumnValue::UInts(vec![1, 2])
+        );
+        // Everything beneath every key.
+        assert_eq!(
+            keys_left(codomain(Predicate::True)),
+            ColumnValue::UInts(vec![])
+        );
+    }
+
+    /// Two rows, `0 ↦ {10, 11}` and `1 ↦ {10}`, nothing stated complete.
+    fn two_rows() -> Tile {
+        two_level_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 10],
+            vec![1, 2, 3],
+            Predicate::False,
+        )
+    }
+
+    /// One row's group taken out as a collection of its own.
+    fn group(keys: Vec<usize>, values: Vec<i64>, stated: Predicate) -> Tile {
+        Tile::data_function(
+            ColumnValue::UInts(keys),
+            Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+            stated,
+            BitSet::new(),
+        )
+    }
+
+    /// At the outermost level the whole tile is the one group, so the rebuild is the group.
+    #[test]
+    fn regroup_beneath_at_the_outermost_level_is_the_one_group() {
+        let replacement = group(vec![7], vec![70], Predicate::True);
+        let rebuilt = two_rows().regroup_beneath(
+            CurryLevel::OUTERMOST,
+            Tile::Scalar(ColumnValue::Ints(Vec::new())),
+            &mut |_| replacement.clone(),
+        );
+        assert_eq!(rebuilt, replacement);
+    }
+
+    /// The rebuild may change each row's keys: the groups' runs are re-cut around what each
+    /// row now holds, the rows above stand, and each group's statement is read beneath its
+    /// own row.
+    #[test]
+    fn regroup_beneath_recuts_the_runs_around_new_keys() {
+        let rebuilt = two_rows().regroup_beneath(
+            CurryLevel::new(1),
+            group(Vec::new(), Vec::new(), Predicate::False),
+            &mut |row| match row {
+                0 => group(vec![5], vec![50], Predicate::False),
+                _ => group(vec![6, 7], vec![60, 70], Predicate::True),
+            },
+        );
+        let levels = rebuilt.key_levels();
+        assert_eq!(
+            *levels[0].1,
+            ColumnValue::UInts(vec![0, 1]),
+            "the rows stand"
+        );
+        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 1]));
+        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![5, 6, 7]));
+        let Tile::DataFunction {
+            domain_predicate: stated,
+            ..
+        } = rebuilt.values_at(CurryLevel::new(1))
+        else {
+            panic!("the rebuilt level is a collection: {rebuilt:?}")
+        };
+        let at = |r: usize, k: usize| stated.contains_path(&[Value::UInt(r), Value::UInt(k)]);
+        assert!(
+            at(1, 6) && at(1, 7),
+            "row 1's group said it is complete: {stated:?}"
+        );
+        assert!(!at(0, 5), "row 0's said nothing: {stated:?}");
+        assert!(
+            !at(0, 6),
+            "row 1's statement stays beneath row 1: {stated:?}"
+        );
+    }
+
+    /// With no rows there are no groups to run together, so the rebuilt level is the
+    /// caller's empty level.
+    #[test]
+    fn regroup_beneath_with_no_rows_answers_the_empty_level() {
+        let empty = two_level_uint_int(vec![], vec![], vec![], vec![], Predicate::False);
+        let level = Tile::grouped(
+            ColumnValue::UInts(Vec::new()),
+            ColumnValue::UInts(Vec::new()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(Vec::new()))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let rebuilt = empty.regroup_beneath(CurryLevel::new(1), level.clone(), &mut |row| {
+            unreachable!("no row {row} to rebuild")
+        });
+        assert_eq!(*rebuilt.values_at(CurryLevel::new(1)), level);
+    }
+
+    /// `per_group` derives that empty level from the result's tiling.
+    #[test]
+    fn per_group_reads_the_empty_level_off_the_tiling() {
+        let empty = two_level_uint_int(vec![], vec![], vec![], vec![], Predicate::False);
+        use crate::ccl::BaseType;
+        use crate::interpreter::Extent;
+        let uint = Extent::Base(BaseType::UInt);
+        let out = Tiling::data_function(
+            uint.clone(),
+            Tiling::data_function(uint, Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        let rebuilt = empty.per_group(&out, CurryLevel::new(1), &mut |row| {
+            unreachable!("no row {row} to rebuild")
+        });
+        assert_eq!(
+            *rebuilt.values_at(CurryLevel::new(1)),
+            out.values_at(CurryLevel::new(1)).empty_at_no_rows()
+        );
+    }
+
+    /// At the outermost level the group is the tile itself, borrowed; past the rows a tile
+    /// holds there is no group.
+    #[test]
+    fn group_at_borrows_the_outermost_group_and_has_none_past_the_rows() {
+        let tile = two_rows();
+        let whole = tile
+            .group_at(CurryLevel::OUTERMOST, 0)
+            .expect("the one group");
+        assert!(matches!(whole, Cow::Borrowed(_)));
+        assert_eq!(*whole, tile);
+        assert!(tile.group_at(CurryLevel::new(1), 2).is_none());
+    }
+
+    /// At the outermost level a dropped key takes its whole group with it.
+    #[test]
+    fn retain_paths_at_the_outermost_level_drops_a_key_with_its_group() {
+        let mut tile = two_rows();
+        tile.retain_paths(CurryLevel::OUTERMOST, &|p: &[Value]| p != [Value::UInt(0)]);
+        assert_eq!(
+            tile.paths_at(CurryLevel::new(1)),
+            vec![vec![Value::UInt(1), Value::UInt(10)]]
+        );
+    }
+
+    /// Three levels down, each level's mask is read against the survivors of the one above,
+    /// so one entry goes and its siblings and cousins stay.
+    #[test]
+    fn retain_paths_reads_whole_paths_three_levels_down() {
+        let mut tile = abc();
+        let gone = [Value::UInt(10), Value::UInt(2), Value::UInt(200)];
+        tile.retain_paths(CurryLevel::new(2), &|p: &[Value]| p != gone);
+        let u = |v: [usize; 3]| v.iter().map(|k| Value::UInt(*k)).collect::<Vec<_>>();
+        assert_eq!(
+            tile.paths_at(CurryLevel::new(2)),
+            vec![u([10, 1, 100]), u([10, 2, 201]), u([20, 3, 300])]
+        );
+        assert!(validate_tile(&tile));
+    }
+
+    /// `group_at` restates a group over its own paths, and `regroup_beneath` puts it back
+    /// beneath its row.
+    #[test]
+    fn group_at_and_regroup_beneath_round_trip() {
+        let mut tile = two_level_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 10],
+            vec![1, 2, 3],
+            Predicate::False,
+        );
+        // Level 1 states row 0's key 10 complete, and nothing under row 1.
+        let Tile::DataFunction { codomain, .. } = &mut tile else {
+            unreachable!()
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = codomain.as_mut()
+        else {
+            unreachable!()
+        };
+        *domain_predicate = Predicate::exactly(&[Value::UInt(0), Value::UInt(10)]);
+
+        let level = CurryLevel::new(1);
+        let group = |row: usize| tile.group_at(level, row).unwrap().into_owned();
+        let pred_of = |t: &Tile| match t {
+            Tile::DataFunction {
+                domain_predicate, ..
+            } => domain_predicate.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(pred_of(&group(0)), Predicate::point(Value::UInt(10)));
+        assert_eq!(pred_of(&group(1)), Predicate::False);
+
+        let rebuilt = tile.regroup_beneath(level, group(0), &mut |row| group(row));
+        let stated = pred_of(rebuilt.values_at(level));
+        assert!(
+            stated.contains_path(&[Value::UInt(0), Value::UInt(10)]),
+            "{stated:?}"
+        );
+        assert!(
+            !stated.contains_path(&[Value::UInt(1), Value::UInt(10)]),
+            "{stated:?}"
+        );
+        assert_eq!(rebuilt.key_levels(), tile.key_levels());
+    }
+
+    /// `retain_paths` filters by whole path, so a key dropped beneath one row stays beneath
+    /// another.
+    #[test]
+    fn retain_paths_reads_whole_paths() {
+        let mut tile = two_level_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 10],
+            vec![1, 2, 3],
+            Predicate::False,
+        );
+        tile.retain_paths(CurryLevel::new(1), &|p: &[Value]| {
+            p.len() == 1 || p != [Value::UInt(1), Value::UInt(10)]
+        });
+        assert_eq!(
+            tile.paths_at(CurryLevel::new(1)),
+            vec![
+                vec![Value::UInt(0), Value::UInt(10)],
+                vec![Value::UInt(0), Value::UInt(11)],
+            ]
+        );
+    }
+
+    /// A two-level tile keyed by a union: tag 0 holds outer keys 0 and 1, each with one
+    /// inner row.
+    fn union_keyed(outer_pred: Predicate) -> (Tile, Tiling) {
+        use crate::ccl::{BaseType, TagMap};
+        use crate::interpreter::Extent;
+        let domain = ColumnValue::positional_union(
+            &[0, 0],
+            vec![ColumnValue::UInts(vec![0, 1]), ColumnValue::UInts(vec![])],
+        );
+        let tile = Tile::data_function(
+            domain,
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::from_uints(vec![10, 20]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            outer_pred,
+            BitSet::new(),
+        );
+        let uint = Extent::Base(BaseType::UInt);
+        let tiling = Tiling::data_function(
+            Extent::Union(TagMap::from_positional(vec![uint.clone(), uint.clone()])),
+            Tiling::data_function(uint, Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        (tile, tiling)
+    }
+
+    /// The guard a union-keyed nested tile releases is well formed against its tiling, which
+    /// `TileProducer::release` asserts, whether its outer level states nothing or part.
+    #[test]
+    fn a_union_keyed_tiles_guard_tiles_as_it_does() {
+        use crate::ccl::TagMap;
+        let partial = Predicate::over_every_tag(TagMap::from_positional(vec![
+            Predicate::at_or_below(Value::UInt(0)),
+            Predicate::False,
+        ]));
+        for stated in [Predicate::False, partial] {
+            let (tile, tiling) = union_keyed(stated);
+            let guard = tile.to_guard();
+            assert!(guard.check_from(&tiling), "{guard:?} against {tiling}");
+        }
+    }
+
+    /// Completeness is downward-closed, so a group taken out beneath a key the outermost
+    /// level calls complete is complete, though the levels between state nothing.
+    #[test]
+    fn a_group_beneath_a_complete_grandparent_is_complete() {
+        let tile = three_levels(&[(10, &[(1, &[(100, 1)])])], Predicate::True);
+        let group = tile
+            .group_at(CurryLevel::new(2), 0)
+            .expect("row 0 of level 1 is there");
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = group.as_ref()
+        else {
+            panic!("a group is a collection: {group:?}")
+        };
+        assert_eq!(domain_predicate, &Predicate::True);
+    }
+
     /// The pairing rule holds at every level, not just the outermost: each level is one run
     /// of keys per row of the level above, and the values are one entry per innermost key.
     #[test]
@@ -1850,7 +2639,7 @@ mod tests {
             "each `C` key extends its `B` key's path, which extends its `A` key's"
         );
         assert_eq!(
-            tile.values_at(2).rows(),
+            tile.values_at(CurryLevel::new(2)).rows(),
             3,
             "`C` stands over `B`'s three keys"
         );
@@ -1923,7 +2712,7 @@ mod tests {
         let mut tile = abc();
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
-                FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(200))),
+                FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(200))),
             )))),
         ))));
         tile.compact();
@@ -1951,7 +2740,7 @@ mod tests {
             .innermost_depth()
             .unwrap_or_else(|| unreachable!("three levels"));
         // Keep only `C` keys 201 and 300 — `B=1`'s only entry goes.
-        tile.values_at_mut(innermost)
+        tile.values_at_mut(CurryLevel::new(innermost))
             .retain_keys(&BitVec::from_fn(4, |k| k >= 2));
 
         assert_eq!(
@@ -1963,7 +2752,11 @@ mod tests {
             ],
             "every `B` key survives the filter that emptied one of them"
         );
-        assert_eq!(tile.values_at(2).row_run(0), (0, 0), "`B=1` holds nothing");
+        assert_eq!(
+            tile.values_at(CurryLevel::new(2)).row_run(0),
+            (0, 0),
+            "`B=1` holds nothing"
+        );
         assert!(validate_tile(&tile));
     }
 
@@ -1993,7 +2786,7 @@ mod tests {
     /// A record component may hold **a collection per row** rather than a value per row:
     /// `xs` restates the rows it sits under as its own outermost level, so each row keys a
     /// group of its own. That is the shape a product value takes inside a codomain, and the
-    /// alternative — one boxed map per cell — is what it exists to avoid.
+    /// alternative — one materialized map per cell — is what it exists to avoid.
     ///
     /// `n` is the record's scalar field, one value per `K` key. `None` is a delivery that
     /// does not carry it, which is what a repeat of a key it already stated must do.
@@ -2057,6 +2850,50 @@ mod tests {
         (column(n), column(domain), column(values))
     }
 
+    /// A keyless field's cell beneath a level goes with its key. A release naming `n` under
+    /// row 0 alone changes nothing, since the row still holds `xs`; once `xs` is released
+    /// under row 0 too, the row is whole and goes, both fields with it.
+    #[test]
+    fn a_keyless_field_goes_with_its_key() {
+        let row0 = Predicate::at_or_below(Value::UInt(0));
+        let under_row0 = Predicate::qualified(row0, Predicate::True);
+        let tile = record_between_levels(
+            &[(0, Some(1), &[(100, 10)]), (1, Some(2), &[(200, 20)])],
+            Predicate::False,
+            Predicate::False,
+        );
+        let n_alone = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+            HashMap::from([
+                ("n".to_string(), TileGuard::Scalar(under_row0.clone())),
+                (
+                    "xs".to_string(),
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+                ),
+            ]),
+        ))));
+        let mut released = tile.clone();
+        released.remove_guarded(n_alone.clone());
+        assert_eq!(released, tile, "the cell stays while its row does");
+
+        let xs_too = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+            HashMap::from([
+                ("n".to_string(), TileGuard::Scalar(Predicate::False)),
+                (
+                    "xs".to_string(),
+                    TileGuard::Function(FunctionGuard::Domain(under_row0)),
+                ),
+            ]),
+        ))));
+        released.remove_guarded(n_alone.union(&xs_too));
+        released.compact();
+        let expected = record_between_levels(
+            &[(1, Some(2), &[(200, 20)])],
+            Predicate::False,
+            Predicate::False,
+        );
+        assert_eq!(record_fields(&released), record_fields(&expected));
+    }
+
     /// A collection under a record's field is a level under the key the record stands on,
     /// so the key is complete only when every field is. Reading the codomain's node type
     /// alone calls the record a leaf and releases every `K` key, taking the still-growing
@@ -2083,20 +2920,29 @@ mod tests {
         };
         assert_eq!(
             fields.get("n"),
-            Some(&TileGuard::Scalar(true)),
-            "a scalar field is complete as soon as it is there: {fields:?}"
+            Some(&TileGuard::Scalar(Predicate::False)),
+            "a scalar field has no keys to name itself by, so naming it under a codomain \
+             arm — which is read against every row — would claim it at rows this tile does \
+             not hold. It is released with its key: {fields:?}"
         );
-        assert_eq!(
-            fields.get("xs"),
-            Some(&TileGuard::Function(FunctionGuard::Domain(
-                Predicate::from_column_value(&ColumnValue::from_uints(vec![100, 200]))
-            ))),
-            "the collection field names the inner keys it holds: {fields:?}"
+        let Some(TileGuard::Function(FunctionGuard::Domain(held))) = fields.get("xs") else {
+            panic!("the collection field names the inner keys it holds: {fields:?}");
+        };
+        let at = |k: usize, j: usize| held.contains_path(&[Value::UInt(k), Value::UInt(j)]);
+        assert!(
+            at(0, 100) && at(1, 200),
+            "each inner key is named under the row holding it: {held:?}"
+        );
+        assert!(
+            !at(0, 200) && !at(1, 100),
+            "a codomain arm is read against every row, so an inner key named bare would be \
+             released under a row that has not received it: {held:?}"
         );
     }
 
     /// Releasing exactly what the guard named empties what sat under the keys and leaves
-    /// the keys themselves, which are not complete and were never named.
+    /// the keys themselves, which are not complete and were never named — and with them
+    /// the scalar field, which a key carries rather than releasing on its own.
     #[test]
     fn releasing_a_record_codomain_keeps_the_keys_above_it() {
         let mut tile = record_between_levels(
@@ -2114,8 +2960,9 @@ mod tests {
         assert_eq!(domain.len(), 2, "the unsettled keys stay: {domain:?}");
         assert_eq!(
             record_fields(&tile),
-            (vec![], vec![], vec![]),
-            "everything the guard named is gone"
+            (vec![Value::Int(1), Value::Int(2)], vec![], vec![]),
+            "the collection field's keys were named and are gone; `n` was not, and stays \
+             with the keys it stands over"
         );
     }
 
@@ -2184,12 +3031,12 @@ mod tests {
         );
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
-                ("n".to_string(), TileGuard::Scalar(false)),
+                ("n".to_string(), TileGuard::Scalar(Predicate::False)),
                 (
                     "xs".to_string(),
-                    TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(
-                        100,
-                    )))),
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+                        Value::UInt(100),
+                    ))),
                 ),
             ])),
         ))));
@@ -2281,7 +3128,9 @@ mod tests {
     fn compacting_reaches_an_inner_level() {
         let mut tile = one_group(0, vec![0, 1], vec![10, 20]);
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Codomain(Box::new(
-            TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(0)))),
+            TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+                0,
+            )))),
         ))));
         tile.compact();
 
@@ -2310,7 +3159,7 @@ mod tests {
             BitSet::new(),
         );
         field.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(0)),
+            Predicate::at_or_below(Value::UInt(0)),
         )));
         let mut tile = Tile::Record(HashMap::from([("a".to_string(), field)]));
         tile.compact();
@@ -2345,7 +3194,7 @@ mod tests {
             BitSet::new(),
         );
         accumulator.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
-            Predicate::LessThanEq(Value::UInt(100)),
+            Predicate::at_or_below(Value::UInt(100)),
         )));
         let mut tile = Tile::Aggregation {
             kind: AggregateKind::Sole,
@@ -2678,9 +3527,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("level {level} carries a codomain arm, got {at:?}"));
         }
         let pred = domain_arm(at).expect("the innermost level names its keys");
+        let path = |keys: [usize; 3]| keys.map(Value::UInt);
         assert!(
-            pred.contains(&Value::UInt(100)) && pred.contains(&Value::UInt(103)),
-            "the arm carries the innermost keys, got {pred:?}"
+            pred.contains_path(&path([0, 10, 100])) && pred.contains_path(&path([0, 11, 103])),
+            "the arm carries the innermost keys, each under its own path, got {pred:?}"
+        );
+        assert!(
+            !pred.contains_path(&path([0, 10, 103])),
+            "a key is named under the group holding it and no other, got {pred:?}"
         );
     }
 
@@ -3026,7 +3880,7 @@ mod tests {
     fn to_guard_scalar_empty_is_empty() {
         assert_eq!(
             Tile::Scalar(ColumnValue::Ints(vec![])).to_guard(),
-            TileGuard::Scalar(false)
+            TileGuard::Scalar(Predicate::False)
         );
     }
 
@@ -3034,7 +3888,7 @@ mod tests {
     fn to_guard_scalar_nonempty_is_universal() {
         assert_eq!(
             Tile::Scalar(ColumnValue::Ints(vec![1])).to_guard(),
-            TileGuard::Scalar(true)
+            TileGuard::Scalar(Predicate::True)
         );
     }
 
@@ -3065,9 +3919,10 @@ mod tests {
         let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
             panic!("expected Domain pred");
         };
-        assert!(pred.contains(&Value::UInt(10)));
-        assert!(pred.contains(&Value::UInt(11)));
-        assert!(!pred.contains(&Value::UInt(99)));
+        // Each named beneath the row holding it.
+        let at = |key: usize| pred.contains_path(&[Value::UInt(0), Value::UInt(key)]);
+        assert!(at(10) && at(11));
+        assert!(!at(99));
     }
 
     /// A group the predicate calls whole is released by its own key; only the groups it
@@ -3082,7 +3937,7 @@ mod tests {
             vec![0, 2],
             vec![10, 11, 10, 11],
             vec![100, 110, 200, 210],
-            Predicate::LessThanEq(Value::UInt(0)),
+            Predicate::at_or_below(Value::UInt(0)),
         );
         let TileGuard::Or(arms) = tile.to_guard() else {
             panic!("expected an Or over the two halves")
@@ -3097,9 +3952,13 @@ mod tests {
         let TileGuard::Function(FunctionGuard::Domain(keys)) = codomain else {
             panic!("a codomain arm guards the inner domain, got {codomain:?}")
         };
-        // Group 1's keys, named once each rather than twice.
-        assert!(keys.contains(&Value::UInt(10)));
-        assert!(keys.contains(&Value::UInt(11)));
+        // Group 1's keys, named under group 1: groups 0 and 2 are released by their own keys.
+        let at = |row: usize, key: usize| keys.contains_path(&[Value::UInt(row), Value::UInt(key)]);
+        assert!(at(1, 10) && at(1, 11), "the open group's keys: {keys:?}");
+        assert!(
+            !at(0, 10) && !at(2, 11),
+            "only the open group's keys: {keys:?}"
+        );
         assert!(
             arms.iter()
                 .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_)))),
@@ -3134,7 +3993,7 @@ mod tests {
         // When the inner level is empty its guard is Predicate::False (empty).  flatten_or
         // must filter it out, leaving only the outer predicate as a plain Domain guard — not
         // wrapped in an Or.
-        let pred = Predicate::LessThanEq(Value::UInt(5));
+        let pred = Predicate::at_or_below(Value::UInt(5));
         let tile = two_level_uint_int(vec![], vec![], vec![], vec![], pred.clone());
         let guard = tile.to_guard();
         // The codomain arm is empty → filtered; only the domain arm remains.
@@ -3153,8 +4012,8 @@ mod tests {
         let TileGuard::Record(guards) = tile.to_guard() else {
             panic!("expected Record guard");
         };
-        assert_eq!(guards["a"], TileGuard::Scalar(true));
-        assert_eq!(guards["b"], TileGuard::Scalar(false));
+        assert_eq!(guards["a"], TileGuard::Scalar(Predicate::True));
+        assert_eq!(guards["b"], TileGuard::Scalar(Predicate::False));
     }
 
     // ── Tile::remove_guarded ──────────────────────────────────────────────────
@@ -3162,14 +4021,14 @@ mod tests {
     #[test]
     fn remove_guarded_scalar_universal_clears() {
         let mut tile = Tile::Scalar(ColumnValue::Ints(vec![42]));
-        tile.remove_guarded(TileGuard::Scalar(true));
+        tile.remove_guarded(TileGuard::Scalar(Predicate::True));
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![])));
     }
 
     #[test]
     fn remove_guarded_scalar_empty_is_noop() {
         let mut tile = Tile::Scalar(ColumnValue::Ints(vec![42]));
-        tile.remove_guarded(TileGuard::Scalar(false));
+        tile.remove_guarded(TileGuard::Scalar(Predicate::False));
         assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![42])));
     }
 
@@ -3341,8 +4200,8 @@ mod tests {
             ("b".to_string(), Tile::Scalar(ColumnValue::Ints(vec![2]))),
         ]));
         tile.remove_guarded(TileGuard::Record(HashMap::from([
-            ("a".to_string(), TileGuard::Scalar(true)),
-            ("b".to_string(), TileGuard::Scalar(false)),
+            ("a".to_string(), TileGuard::Scalar(Predicate::True)),
+            ("b".to_string(), TileGuard::Scalar(Predicate::False)),
         ])));
         let Tile::Record(fields) = &tile else {
             panic!()
@@ -3562,7 +4421,7 @@ mod tests {
 
     /// The accumulator column of the aggregation at `level`.
     fn accumulated(tile: &Tile, level: usize) -> ColumnValue {
-        let Tile::Aggregation { accumulator, .. } = tile.values_at(level) else {
+        let Tile::Aggregation { accumulator, .. } = tile.values_at(CurryLevel::new(level)) else {
             panic!("expected an aggregation at level {level}: {tile:?}");
         };
         let Tile::Scalar(column) = accumulator.as_ref() else {
@@ -3613,7 +4472,7 @@ mod tests {
         tile.merge(two_groups(200, vec![2, 4]));
         assert!(validate_tile(&tile), "{tile:?}");
         assert_eq!(
-            tile.values_at(1)
+            tile.values_at(CurryLevel::new(1))
                 .key_paths(&[vec![Value::UInt(0)], vec![Value::UInt(1)]]),
             vec![
                 vec![Value::UInt(0), Value::UInt(100)],

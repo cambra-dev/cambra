@@ -203,7 +203,7 @@ fn run_program(
 /// rather than from the record as a whole.
 fn release_guard_for(tile: &Tile) -> TileGuard {
     match tile {
-        Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
+        Tile::Scalar(cv) => TileGuard::Scalar(TileGuard::leaf(!cv.is_empty())),
         Tile::DataFunction {
             domain_predicate, ..
         } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
