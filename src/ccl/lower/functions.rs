@@ -272,8 +272,8 @@ pub(super) fn uncurry_params(
         // freshened interior while keeping its own span on the root, which is the
         // pair a consumer needs: the root says which occurrence, the interior says
         // which declaration. A substituted parameter binds nothing, so this is the
-        // only channel that can name its site — see `src/ccl/design/ir.md`, "A
-        // substituted parameter's site rides its projection".
+        // only channel that can name its site — see `src/ccl/design/ir.md`,
+        // "Source locations on substituted parameter projections".
         let site = arg.name_span;
         let var = ctx.tag_machinery(Expr::var(&tuple_name), site, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), site, up);
@@ -303,10 +303,9 @@ pub(super) fn uncurry_params(
 /// Lower a CHL lambda expression to an [`Expr::Lambda`] via
 /// [`uncurry_params`].
 ///
-/// Users who want genuine currying still write it explicitly
-/// (`\x -> \y -> ...` or an explicit `curry(f)` call); those nest
-/// through the general Lambda rule and remain unsupported past operator
-/// conversion — tracked as follow-up work.
+/// Explicitly nested lambdas can produce the internal `curry` combinator when
+/// they survive inlining. Operator conversion does not compile arbitrary
+/// curried lambda bodies. CHL has no built-in surface `curry` function.
 ///
 /// `validate_function_params` only checks for at least one parameter; the
 /// CHL parser already rejects `*args`, `**kwargs`, defaults, and keyword-only

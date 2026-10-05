@@ -122,8 +122,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
-        // Cast: an upcast re-viewing `value` at the supertype `target`. See
-        // [`emit_cast`] (shared with `check_node`).
+        // Cast: rebuild `value`'s function type with `target`'s domain refinements.
+        // See [`emit_cast`] (shared with `check_node`).
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
         // Realization is a planning rewrite, so it is born after inference has finished:
         // Emit only ever runs on a tree that has none. The post-inference check *does*

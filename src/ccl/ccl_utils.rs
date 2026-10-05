@@ -1059,16 +1059,18 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// Construct a [`TypedExprNode::Cast`], a pure type-level assertion that
 /// re-views `value` under `target_ty`.
 ///
-/// `cast` is an upcast: [`crate::ccl::infer`]'s `Cast` arm types it
-/// by the single obligation `value_ty <: target_ty`.
+/// [`crate::ccl::infer`]'s `emit_cast` types a cast constructively: it rebuilds
+/// `value_ty` as a function with `target_ty`'s domain refinements and function
+/// kind, and emits no `value_ty <: target_ty` edge. See `src/ccl/design/ir.md`,
+/// "`Cast` — explicit refinement acquisition".
 ///
 /// Op-conversion treats `cast` as a no-op — see [`TypedExprNode::Cast`] — so
 /// this is purely a type-level coercion with no runtime cost.
 ///
 /// **Temporary shape contract:** `target_ty` must be
-/// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  Inference
-/// no longer *requires* this (any `target` with `value_ty <: target` is a
-/// well-typed upcast), but it is the only shape lowering produces today and
+/// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  `emit_cast`
+/// reads only the domain refinements and the function kind off a target, and
+/// this is the only shape lowering produces today and
 /// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a refinement
 /// off of, so this asserts the lowering contract: a non-conforming target is
 /// a construction-time bug, not a user error, so it panics rather than
@@ -1093,10 +1095,10 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 ///
 /// [`crate::ccl::lambda_elim`]'s cast-wrapped-lambda arm calls this on a
 /// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
-/// reconstructed `groupby` lambda.  (Inference does not need it: it types the
-/// cast as the upcast `value_ty <: target` and lets the solver carry the
-/// refinement.) The returned refinements share their predicates' `Rc<Expr>`s with
-/// `target`.
+/// reconstructed `groupby` lambda. Inference's `emit_cast` instead decomposes the
+/// value's function type and rebuilds it with the target's domain refinements;
+/// it does not emit a `value_ty <: target` edge. The returned refinements share
+/// their predicates' `Rc<Expr>`s with `target`.
 ///
 /// The whole [`RefinementSet`] is returned rather than a single refinement: a target
 /// is *built* carrying one predicate ([`refined_data_fun`]), but the domain it
@@ -1308,7 +1310,8 @@ pub fn canonicalize_cast_types(expr: &mut Expr) {
 /// group-by's key equation), the value's refinements by the value's own type, which
 /// is already canonical by induction (both callers walk bottom-up). The graph
 /// view of the same position accumulates the same union on the ordinary route
-/// — the upcast `value <: target` is how the value's refinements flow in — but
+/// — `emit_cast` rebuilds the value's own domain, which is how the value's
+/// refinements flow in — but
 /// *which* refinements an occurrence's variable accumulates depends on the route
 /// bounds took through the graph: an embedded copy of a cast (a comprehension
 /// source cloned into a filter predicate) has its own variable, and under an
