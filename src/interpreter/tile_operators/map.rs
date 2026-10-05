@@ -12,10 +12,11 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-/// Applies a function operator to the values of a collection, at whatever depth they sit.
+/// Applies a function operator to the values of a collection at the level the program applies
+/// it ([`MapResult::new_at`]).
 ///
 /// The result takes the place of the value the function was applied to, so the function's
-/// own levels come to sit under the input's ([`apply_at`]).
+/// own levels come to sit under the input's.
 pub struct MapResult {
     /// Output tiling matches `input` tiling, transforming the codomain according to `function`.
     base: OperatorBase,
@@ -23,20 +24,27 @@ pub struct MapResult {
     input: Box<dyn TileOperator>,
     /// The function to apply to each element.
     function: Box<dyn TileOperator>,
+    /// The level the arguments stand at ([`MapResult::new_at`]).
+    level: CurryLevel,
 }
 
 impl MapResult {
-    /// Create a new `Map` operator applying `function` to each element of `input`.
+    /// Apply `function` to each of `input`'s values at `level`: the iteration the
+    /// application sits in, which the caller states from where it is in the program.
     ///
-    /// The output `tiling` and `extent` are derived from the inputs: the codomain
-    /// of `function` becomes the output value extent, threaded through the domain
-    /// (if any) of `input`.
-    pub fn new(input: Box<dyn TileOperator>, function: Box<dyn TileOperator>) -> Self {
+    /// Not read off `input`'s tiling: an argument may be a collection of its own, whose
+    /// levels a descent to the input's values would take for more of the iteration. The
+    /// codomain of `function` takes the argument's place, beneath the levels above it.
+    pub fn new_at(
+        input: Box<dyn TileOperator>,
+        function: Box<dyn TileOperator>,
+        level: CurryLevel,
+    ) -> Self {
         let function_tiling = function.tiling();
         // Application consumes the function's outermost level and leaves whatever sits
         // under it, so a keyed collection `B ⤇ C ⤇ D` applied at a `B` yields the `C ⤇ D`
-        // beneath. [`apply_at`] puts that where the argument was, which is how the
-        // function's levels come to sit under the input's.
+        // beneath, which goes where the argument was: that is how the function's levels come
+        // to sit under the input's.
         let (fn_domain_extent, fn_result) = match function_tiling {
             Tiling::DataFunction { domain, codomain } => (domain.clone(), (**codomain).clone()),
             other => (
@@ -50,21 +58,34 @@ impl MapResult {
         };
 
         let input_tiling = input.tiling();
+        let arguments = input_tiling.values_at(level);
         // A function applied to an argument holding a collection as a tile yields its
         // codomain's collections as tiles too ([`Tiling::from_extent`]): the argument could
         // not have been boxed into a column, and neither can the result. A function's type
         // says only its codomain extent, which cannot draw that distinction on its own.
-        let fn_result = if input_tiling.deepest_values().holds_a_level() {
+        let fn_result = if arguments.holds_a_level() {
             Tiling::from_extent(&fn_result.extent())
         } else {
             fn_result
         };
-        let tiling = apply_at(input_tiling, &fn_domain_extent, fn_result)
-            .unwrap_or_else(|| panic!("Cannot apply {function_tiling} to {input_tiling}"));
+        // Subtyping, not equality: an argument whose extent is a *width subtype* of the
+        // function's domain applies soundly. A variant with fewer tags is the case that makes
+        // this observable — the function handles tags this argument never carries, and
+        // projecting one of those simply yields nothing — but the same holds for a record
+        // with extra fields. [`Extent::includes`] is the runtime statement of that rule.
+        assert!(
+            fn_domain_extent.includes(&arguments.extent()),
+            "Cannot apply {function_tiling} to the values of {input_tiling} at {level}"
+        );
+        // The result takes the place of the argument it was applied to, which is where the
+        // program applies it: a collection-valued argument is itself one, so its own levels
+        // are not the iteration.
+        let tiling = with_values_at(input_tiling, level, fn_result);
         Self {
             base: OperatorBase::new(tiling),
             input,
             function,
+            level,
         }
     }
 }
@@ -152,31 +173,6 @@ fn restate_gathered(
     )
 }
 
-/// Substitute `result` for the outermost value `fn_domain` accepts.
-///
-/// The applied value takes the place of the input value it was applied to, which is the
-/// outermost one the function's domain includes rather than the deepest: a collection-valued
-/// cell is itself an argument, so descending past one would map the function over its
-/// elements instead.
-///
-/// Subtyping, not equality: an argument whose extent is a *width subtype* of the function's
-/// domain applies soundly. A variant with fewer tags is the case that makes this observable
-/// — the function handles tags this argument never carries, and projecting one of those
-/// simply yields nothing — but the same holds for a record with extra fields.
-/// [`Extent::includes`] is the runtime statement of that rule.
-fn apply_at(tiling: &Tiling, fn_domain: &Extent, result: Tiling) -> Option<Tiling> {
-    if fn_domain.includes(&tiling.extent()) {
-        return Some(result);
-    }
-    match tiling {
-        Tiling::DataFunction { domain, codomain } => Some(Tiling::DataFunction {
-            domain: domain.clone(),
-            codomain: Box::new(apply_at(codomain, fn_domain, result)?),
-        }),
-        _ => None,
-    }
-}
-
 impl TileOperator for MapResult {
     impl_operator_base!();
 
@@ -194,18 +190,19 @@ impl TileOperator for MapResult {
         let shared = shared_consumer(consumer);
         let function_producer = self.function.subscribe(
             self.function.tiling().universal_guard(),
-            forwarding_consumer(&shared),
+            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
             scheduler,
         );
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            forwarding_consumer(&shared),
+            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
             scheduler,
         );
         Box::new(MapResultProducer {
             base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling()),
             input: input_producer,
             function: function_producer,
+            level: self.level,
         })
     }
 
@@ -224,17 +221,13 @@ struct MapResultProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
+    /// The level the arguments stand at.
+    level: CurryLevel,
 }
 
-impl TileProducer for MapResultProducer {
-    impl_producer_base!();
-
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("fn", self.function.inspect(opts))
-            .child("input", self.input.inspect(opts))
-    }
-
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+impl MapResultProducer {
+    /// The function applied at every argument the input holds.
+    fn apply(&mut self, projection_guard: TileGuard) -> Tile {
         let f_tiling = self.function.tiling().clone();
         assert!(
             f_tiling.has_domain(),
@@ -434,18 +427,20 @@ impl TileProducer for MapResultProducer {
         } = &function_tile
             && input_tile.is_data_function()
         {
-            let Tile::Scalar(arguments) = input_tile.deepest_values() else {
+            let Tile::Scalar(arguments) = input_tile.values_at(self.level) else {
                 panic!(
                     "MapResult over a function expects a scalar argument column, got {:?}",
-                    input_tile.deepest_values()
+                    input_tile.values_at(self.level)
                 );
             };
             // The key path of every argument, so a withheld one can be taken out of every
             // level's statement: its row arrives later beneath each prefix of its path, so no
-            // level may call that prefix complete. The arguments are the innermost level's
-            // keys, so their paths are the rows one level further in.
-            let innermost = input_tile
-                .innermost_depth()
+            // level may call that prefix complete. The arguments stand beneath the keys of
+            // the level above them, so their paths are the rows one level further in.
+            let innermost = self
+                .level
+                .index()
+                .checked_sub(1)
                 .unwrap_or_else(|| unreachable!("the input was matched as a collection"));
             let paths = input_tile.row_paths_at(innermost + 1);
             let mut keep = bit_vec::BitVec::from_elem(arguments.len(), true);
@@ -458,8 +453,7 @@ impl TileProducer for MapResultProducer {
             }
             if !withheld.is_empty() {
                 input_tile
-                    .innermost_level_mut()
-                    .unwrap_or_else(|| unreachable!("the chain was walked above"))
+                    .values_at_mut(CurryLevel::new(innermost))
                     .retain_keys(&keep);
                 for depth in 0..=innermost {
                     let prefixes = Predicate::flatten_or(
@@ -492,10 +486,10 @@ impl TileProducer for MapResultProducer {
         } = &function_tile
             && f_values.holds_a_level()
         {
-            let Tile::Scalar(arguments) = input_tile.deepest_values() else {
+            let Tile::Scalar(arguments) = input_tile.values_at(self.level) else {
                 panic!(
                     "MapResult over a function expects a scalar argument column, got {:?}",
-                    input_tile.deepest_values()
+                    input_tile.values_at(self.level)
                 )
             };
             let rows: HashMap<Value, usize> =
@@ -512,7 +506,7 @@ impl TileProducer for MapResultProducer {
             // Each gathered row states its levels' completeness over the function's paths,
             // beneath the function's key. Placed where its argument was, it is restated over
             // the argument's path ([`restate_gathered`]), as the level-valued case above does.
-            match input_tile.innermost_depth() {
+            match self.level.index().checked_sub(1) {
                 Some(innermost) => {
                     let paths = input_tile.row_paths_at(innermost + 1);
                     let complete = input_tile.completion_at(CurryLevel::new(innermost));
@@ -546,38 +540,63 @@ impl TileProducer for MapResultProducer {
                     });
                 }
             }
-            *input_tile.deepest_values_mut() = gathered;
+            *input_tile.values_at_mut(self.level) = gathered;
             return input_tile;
         }
 
-        // An argument carrying a level cannot be boxed into a column, so a computable
+        // An argument carrying a level cannot be materialized into a column, so a computable
         // function that takes one is applied to the tile instead ([`FunctionDef::apply_tile`]
         // — `insert`, whose collection operand reaches it opened).
-        if input_tile.deepest_values().holds_a_level()
+        let level = self.level;
+        let arguments = std::mem::replace(
+            input_tile.values_at_mut(level),
+            Tile::Scalar(ColumnValue::Units(0)),
+        );
+        *input_tile.values_at_mut(level) = if arguments.holds_a_level()
             && let Tile::Scalar(f) = &function_tile
             && let Some(Value::ComputableFunction(f)) = f.as_single()
         {
-            return map_tile_result(input_tile, move |values| {
-                f.apply_tile(values, f_domain_extent)
-            });
-        }
+            f.apply_tile(arguments, f_domain_extent)
+        } else {
+            // Standard logic for non-Function outputs
+            process_tile_result(self.tiling().values_at(level), arguments, move |values| {
+                apply_function_tile(function_tile, values, f_domain_extent, f_codomain_extent)
+            })
+        };
+        input_tile
+    }
+}
 
-        // Standard logic for non-Function outputs
-        process_tile_result(self.tiling(), input_tile, move |values| {
-            apply_function_tile(function_tile, values, f_domain_extent, f_codomain_extent)
-        })
+impl TileProducer for MapResultProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("fn", self.function.inspect(opts))
+            .child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let mut out = self.apply(projection_guard);
+        // Part of an output value released names no part of the input, so the input keeps
+        // the row and the value is recomputed on the next pull (`release_impl`); what the
+        // consumer let go is taken back out here.
+        if !self.base.obsolete_guard.is_empty() {
+            out.remove_guarded(self.base.obsolete_guard.clone());
+        }
+        out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // A guard is shaped by the tiling it is handed to, so the input's is built
         // from the input's tiling — never from the function's, whose tiling is
         // unrelated (a function tiling, against the input's stream).
-        // The input's levels are the output's, and beneath them the function's values stand
-        // where the input's did, so only a guard naming them whole translates.
+        // Mapping is position-preserving, so a region of the output's keys names that same
+        // region of the input's; beneath them the output holds the function's values, not the
+        // input's arguments. The levels above the arguments are the ones the two sides share.
         let input = self.input.tiling();
         let upstream_guard = crate::interpreter::tiling::through_shared_levels(
             obsolete_guard,
-            input.levels(),
+            self.level.index(),
             input,
         );
         let done = upstream_guard.is_universal();
@@ -596,12 +615,14 @@ impl TileProducer for MapResultProducer {
 }
 
 /// Takes a function input and returns a function with the same structure
-/// but with a constant codomain swapped or zipped in, as determined by the [`MapResultToConstMode`]
-/// param.
+/// but with a constant swapped or zipped in for its values at one level, as determined by
+/// the [`MapResultToConstMode`] param.
 ///
-/// `input` must be a `DataFunction` tile; `constant` must be a Scalar.
+/// The level is the caller's to state ([`MapResultToConst::new_at`]), as
+/// [`MapResult`]'s is: a value at it may be a collection of its own, whose levels are part
+/// of the value rather than of the iteration.
 pub struct MapResultToConst {
-    /// Output tiling matches `input` tiling, transforming the codomain to `constant`.
+    /// Output tiling matches `input` tiling, with the values at `level` transformed.
     base: OperatorBase,
     /// The function input to iterate over.
     input: Box<dyn TileOperator>,
@@ -609,6 +630,8 @@ pub struct MapResultToConst {
     constant: Box<dyn TileOperator>,
     /// Whether to zip with the constant instead of replacing with the constant.
     mode: MapResultToConstMode,
+    /// The level whose values the constant replaces or pairs with.
+    level: CurryLevel,
 }
 
 /// The type fof MapResultToConst operation to perform
@@ -623,28 +646,28 @@ pub enum MapResultToConstMode {
 }
 
 impl MapResultToConst {
-    /// Create a new `MapResultToConst` operator that maps any codomain to the given constant.
-    pub fn new(
+    /// Replace, or pair with the constant, each of `input`'s values at `level`: the
+    /// iteration the node sits in, which the caller states from where it is in the program.
+    pub fn new_at(
         input: Box<dyn TileOperator>,
         constant: Box<dyn TileOperator>,
         mode: MapResultToConstMode,
+        level: CurryLevel,
     ) -> Self {
-        let tiling = match mode {
-            MapResultToConstMode::Replace => {
-                change_tiling_result(input.tiling(), |_| constant.tiling().clone())
-            }
-            MapResultToConstMode::ZipLeft => change_tiling_result(input.tiling(), |e| {
-                Tiling::tuple(&[constant.tiling().clone(), Tiling::Scalar(e.clone())])
-            }),
-            MapResultToConstMode::ZipRight => change_tiling_result(input.tiling(), |e| {
-                Tiling::tuple(&[Tiling::Scalar(e.clone()), constant.tiling().clone()])
-            }),
+        let values = input.tiling().values_at(level).clone();
+        let constant_tiling = constant.tiling().clone();
+        let result = match mode {
+            MapResultToConstMode::Replace => constant_tiling,
+            MapResultToConstMode::ZipLeft => Tiling::tuple(&[constant_tiling, values]),
+            MapResultToConstMode::ZipRight => Tiling::tuple(&[values, constant_tiling]),
         };
+        let tiling = with_values_at(input.tiling(), level, result);
         Self {
             base: OperatorBase::new(tiling),
             input,
             constant,
             mode,
+            level,
         }
     }
 }
@@ -666,12 +689,12 @@ impl TileOperator for MapResultToConst {
         let shared = shared_consumer(consumer);
         let constant_producer = self.constant.subscribe(
             self.constant.tiling().universal_guard(),
-            forwarding_consumer(&shared),
+            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
             scheduler,
         );
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            forwarding_consumer(&shared),
+            forwarding_consumer(&shared, &scheduler.wakeup_queue()),
             scheduler,
         );
         Box::new(MapResultToConstProducer {
@@ -679,6 +702,7 @@ impl TileOperator for MapResultToConst {
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
+            level: self.level,
         })
     }
 }
@@ -688,6 +712,7 @@ struct MapResultToConstProducer {
     input: Box<dyn TileProducer>,
     constant: Box<dyn TileProducer>,
     mode: MapResultToConstMode,
+    level: CurryLevel,
 }
 
 impl MapResultToConstProducer {
@@ -703,10 +728,10 @@ impl MapResultToConstProducer {
         let mut live = input.clone();
         live.compact();
         let mut out = self.tiling().empty_tile();
-        // The levels the output shares with the input are the input's whole chain, since the
-        // constant replaces what sits below it. A collection constant adds levels of its own
-        // beneath those, and nothing in the input names them.
-        for level in (0..self.input.tiling().levels()).map(CurryLevel::new) {
+        // The levels the output shares with the input are the ones above `self.level`, since
+        // the constant replaces or pairs with what sits there. A collection constant adds
+        // levels of its own beneath those, and nothing in the input names them.
+        for level in (0..self.level.index()).map(CurryLevel::new) {
             let held: Vec<Predicate> = live
                 .paths_at(level)
                 .iter()
@@ -800,11 +825,10 @@ impl TileProducer for MapResultToConstProducer {
         // A collection constant repeated down a column states each copy's completeness without
         // knowing which row holds it, so it is qualified by the rows that do
         // (`src/interpreter/design-operators.md`, "The completeness contract").
-        let input_levels = self.input.tiling().levels();
-        let held = (input_levels > 0).then(|| {
+        let held = self.level.enclosing().map(|rows| {
             Predicate::union_all(
                 input_tile
-                    .paths_at(CurryLevel::new(input_levels - 1))
+                    .paths_at(rows)
                     .iter()
                     .map(|path| Predicate::exactly(path))
                     .collect(),
@@ -813,17 +837,19 @@ impl TileProducer for MapResultToConstProducer {
         // Stated over tiles rather than columns: `Replace` never reads the values, and the
         // two `Zip` modes pair with them whatever they carry — a level included, which a
         // column has nowhere to put.
-        map_tile_result(input_tile, move |values| {
-            let mut const_tile = repeat_tile(constant_tile, values.rows());
-            if let Some(held) = &held {
-                const_tile.map_level_predicates(&mut |depth, pred| pred.qualified_by(held, depth));
-            }
-            match mode {
-                MapResultToConstMode::Replace => const_tile,
-                MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
-                MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
-            }
-        })
+        let mut output = input_tile;
+        let slot = output.values_at_mut(self.level);
+        let values = std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0)));
+        let mut const_tile = repeat_tile(constant_tile, values.rows());
+        if let Some(held) = &held {
+            const_tile.map_level_predicates(&mut |depth, pred| pred.qualified_by(held, depth));
+        }
+        *slot = match mode {
+            MapResultToConstMode::Replace => const_tile,
+            MapResultToConstMode::ZipLeft => Tile::tuple(vec![const_tile, values]),
+            MapResultToConstMode::ZipRight => Tile::tuple(vec![values, const_tile]),
+        };
+        output
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -892,9 +918,7 @@ impl TileOperator for MapResultWithSource {
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
             self.source.clone(),
             self.tiling().clone(),
-            self.input
-                .result_correlation()
-                .expect("MapResultWithSource requires input result_correlation"),
+            self.input.result_correlation(),
         ))
     }
 }
@@ -908,7 +932,11 @@ struct MapResultWithSourceProducer {
     /// A correlation between the result values and some piece of the domain of the input tile.
     /// We need this in order to translate domain obsolete guards into releases of the underlying
     /// source.
-    result_correlation: Vec<TilePathStep>,
+    ///
+    /// `None` where the input states none, as a pairing does: each of its rows reads every
+    /// key the inner side holds, so no release short of the whole one frees a source row,
+    /// and the source is held until then.
+    result_correlation: Option<Vec<TilePathStep>>,
     /// What the input last read holds, where it holds a level beneath its keys: a release
     /// naming paths beneath particular keys is read against it
     /// ([`Self::released_beneath_every_key`]).
@@ -963,7 +991,7 @@ impl MapResultWithSourceProducer {
         input: Box<dyn TileProducer>,
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
         tiling: Tiling,
-        result_correlation: Vec<TilePathStep>,
+        result_correlation: Option<Vec<TilePathStep>>,
     ) -> Self {
         let result = Self {
             base: ProducerBase::new(MapResultWithSourceProducer::alloc_id(), &tiling),
@@ -1057,9 +1085,18 @@ impl TileProducer for MapResultWithSourceProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let Some(correlation) = self.result_correlation.clone() else {
+            if obsolete_guard.is_universal() {
+                self.source
+                    .borrow_mut()
+                    .release(&self.name(), Predicate::True);
+            }
+            self.input.release(obsolete_guard);
+            return;
+        };
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                let extracted_pred = extract_predicate(pred, &self.result_correlation).clone();
+                let extracted_pred = extract_predicate(pred, &correlation).clone();
                 self.source
                     .borrow_mut()
                     .release(&self.name(), extracted_pred);
@@ -1068,13 +1105,9 @@ impl TileProducer for MapResultWithSourceProducer {
                 if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) =>
             {
                 if let TileGuard::Function(FunctionGuard::Domain(pred)) = &**g {
-                    assert_eq!(
-                        self.result_correlation.first(),
-                        Some(&TilePathStep::Codomain)
-                    );
+                    assert_eq!(correlation.first(), Some(&TilePathStep::Codomain));
                     let keys = self.released_beneath_every_key(pred);
-                    let extracted_pred =
-                        extract_predicate(&keys, &self.result_correlation[1..]).clone();
+                    let extracted_pred = extract_predicate(&keys, &correlation[1..]).clone();
                     self.source
                         .borrow_mut()
                         .release(&self.name(), extracted_pred);
@@ -1143,6 +1176,7 @@ mod tests {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &in_tiling),
             input: Box::new(input),
             function: Box::new(fn_spy),
+            level: CurryLevel::new(1),
         };
         (producer, released, in_tiling)
     }
@@ -1234,6 +1268,7 @@ mod tests {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             function: Box::new(function_producer),
+            level: CurryLevel::new(1),
         };
 
         // Get the result from MapResultProducer
@@ -1360,6 +1395,7 @@ mod tests {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
+            level: CurryLevel::new(1),
         };
 
         let result = map_result.get(map_result.tiling().universal_guard());
@@ -1431,6 +1467,7 @@ mod tests {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
+            level: CurryLevel::new(1),
         };
         let result = map_result.get(map_result.tiling().universal_guard());
         let Tile::DataFunction {
@@ -1499,6 +1536,7 @@ mod tests {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             function: Box::new(TestTileProducer::new(f, fn_tiling)),
+            level: CurryLevel::new(1),
         };
         let out = producer.get(producer.tiling().universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
@@ -1581,6 +1619,7 @@ mod tests {
             base: ProducerBase::new(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input, in_tiling)),
             function: Box::new(function),
+            level: CurryLevel::new(2),
         };
         let out = producer.get(producer.tiling().universal_guard());
         let Tile::DataFunction { codomain, .. } = &out else {
@@ -1599,6 +1638,59 @@ mod tests {
         );
         *next.borrow_mut() = f_at(vec![5, 6]);
         let _ = producer.get(producer.tiling().universal_guard());
+    }
+
+    /// At a level above the innermost, `MapResultToConst` replaces each value there whole:
+    /// over groups `0 ↦ [1]` and `1 ↦ [2, 3]` at level 1, each group becomes one constant,
+    /// rather than each element.
+    #[test]
+    fn map_result_to_const_replaces_each_value_at_its_level() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let groups = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 1]),
+                ColumnValue::UInts(vec![0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let operator = MapResultToConst::new_at(
+            Box::new(Constant::collection(groups.clone(), in_tiling.clone())),
+            Box::new(Constant::new(Value::Int(7), int())),
+            MapResultToConstMode::Replace,
+            CurryLevel::new(1),
+        );
+        assert_eq!(
+            operator.tiling(),
+            &Tiling::data_function(uint(), Tiling::Scalar(int()))
+        );
+        let mut producer = MapResultToConstProducer {
+            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), operator.tiling()),
+            input: Box::new(TestTileProducer::new(groups, in_tiling)),
+            constant: Box::new(TestTileProducer::new(
+                Tile::Scalar(ColumnValue::Ints(vec![7])),
+                Tiling::Scalar(int()),
+            )),
+            mode: MapResultToConstMode::Replace,
+            level: CurryLevel::new(1),
+        };
+        let out = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            out,
+            Tile::data_function(
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 7]))),
+                Predicate::True,
+                BitSet::new(),
+            )
+        );
     }
 
     /// While its constant is not terminal, `MapResultToConst` emits no rows and states what
@@ -1638,6 +1730,7 @@ mod tests {
                 c_tiling,
             )),
             mode: MapResultToConstMode::Replace,
+            level: CurryLevel::new(1),
         };
         let first = producer.get(producer.tiling().universal_guard());
         assert_eq!(stated(&first), Predicate::at_or_below(Value::UInt(0)));
@@ -1694,7 +1787,7 @@ mod tests {
             Box::new(TestTileProducer::new(input, in_tiling)),
             as_domain,
             out_tiling,
-            vec![TilePathStep::Codomain],
+            Some(vec![TilePathStep::Codomain]),
         );
         let _ = producer.get(producer.tiling().universal_guard());
         let beneath = |outer: usize| {

@@ -97,8 +97,10 @@ impl Tiling {
 
     /// This tiling's empty tile at **no rows**, which is what a partial fold seeds with:
     /// its accumulator carries presence in its row count, so an empty one must have none.
+    ///
+    /// [`empty_tile`](Self::empty_tile) is the same tile at one row.
     pub fn empty_at_no_rows(&self) -> Tile {
-        self.empty_over(0)
+        self.empty_at_rows(0)
     }
 
     pub fn universal_guard(&self) -> TileGuard {
@@ -183,23 +185,38 @@ impl Tiling {
         }
     }
 
+    /// This tiling's empty tile, standing at one row and **calling nothing complete**.
+    ///
+    /// The predicate is the load-bearing half. Every collection level is built at
+    /// `Predicate::False`, which says no key of its domain has been delivered — right for a
+    /// producer that has not run yet, and wrong for a level that delivered its keys and had
+    /// them released. Those two tiles are both empty and differ only here, so a consumer
+    /// that reads a row as a whole is told "still filling" by both.
+    ///
+    /// Returning this from a shape mismatch buries that claim: a tile that fails to
+    /// destructure is a broken contract, and answering "nothing is complete" turns it into
+    /// a wrong answer somewhere downstream. Assert the shape instead.
     pub fn empty_tile(&self) -> Tile {
-        self.empty_over(1)
+        self.empty_at_rows(1)
     }
 
-    /// The empty tile of this tiling, vectorized over `rows` rows.
+    /// The empty tile of this tiling, vectorized over `rows` rows of the level above.
     ///
     /// A collection's run is empty at every row, so whatever sits under it stands at no rows
     /// at all — which is what makes the chain well formed rather than each level restating
     /// one row it does not have.
-    fn empty_over(&self, rows: usize) -> Tile {
+    ///
+    /// Every collection level is `Predicate::False`: nothing here has been delivered.
+    fn empty_at_rows(&self, rows: usize) -> Tile {
         match self {
             Tiling::Scalar(e) => Tile::Scalar(ColumnValue::from_values(Vec::new(), e)),
-            Tiling::Record(m) => Tile::Record(transform_hashmap_values(m, |t| t.empty_over(rows))),
+            Tiling::Record(m) => {
+                Tile::Record(transform_hashmap_values(m, |t| t.empty_at_rows(rows)))
+            }
             Tiling::DataFunction { domain, codomain } => Tile::grouped(
                 ColumnValue::UInts(vec![0; rows]),
                 ColumnValue::from_values(Vec::new(), domain),
-                Box::new(codomain.empty_over(0)),
+                Box::new(codomain.empty_at_rows(0)),
                 Predicate::False,
                 BitSet::new(),
             ),
@@ -213,7 +230,7 @@ impl Tiling {
             // write any of them. The key space is the record's, so it is present from
             // the start even though nothing has been written.
             Tiling::Store { .. } => Tile::Store {
-                state: Box::new(self.store_state().empty_over(1)),
+                state: Box::new(self.store_state().empty_at_rows(1)),
                 frontier: Predicate::False,
                 terminal: false,
                 closed_keys: Vec::new(),
@@ -244,9 +261,11 @@ impl Tiling {
 
     /// Whether a level sits here, or inside a record here — the static counterpart of
     /// [`Tile::holds_a_level`](crate::interpreter::Tile::holds_a_level), which carries the rule.
+    /// It is also the test an operator makes before materializing a value into a column,
+    /// which has nowhere to put a level.
     ///
-    /// [`Extent::holds_a_collection`] asks whether the value type contains a collection at
-    /// all, which a column of maps answers yes and this no.
+    /// [`Extent::holds_a_collection`] asks the other question, whether the value type contains
+    /// a collection at all, which a column of maps answers yes and this one no.
     pub fn holds_a_level(&self) -> bool {
         match self {
             Tiling::DataFunction { .. } => true,

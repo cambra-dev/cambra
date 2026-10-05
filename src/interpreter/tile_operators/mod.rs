@@ -410,7 +410,12 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                         (label.to_vec(), path.clone()),
                         Entry {
                             value: EntryValue::Value(Some(column.index_at(row))),
-                            complete: level > 0 && above.contains_path(path),
+                            // A value at the root is the whole answer once it has arrived:
+                            // a scalar holds no more than one.
+                            complete: match level {
+                                0 => true,
+                                _ => above.contains_path(path),
+                            },
                         },
                     );
                 }
@@ -443,6 +448,19 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
         &mut entries,
     );
     (nodes, entries)
+}
+
+/// Whether `guard` releases the root value under record fields `label` whole.
+fn released_whole(guard: &TileGuard, label: &[String]) -> bool {
+    match guard {
+        g if g.is_universal() => true,
+        TileGuard::Or(arms) => arms.iter().any(|arm| released_whole(arm, label)),
+        TileGuard::Record(fields) => label
+            .split_first()
+            .and_then(|(field, rest)| fields.get(field).map(|g| released_whole(g, rest)))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// The paths reaching collection level `level` under record fields `label` that `guard`
@@ -500,8 +518,11 @@ pub(crate) fn assert_complete_region_unchanged(
              complete, and now calls only {kept:?} complete"
         );
     }
-    let is_released = |label: &Vec<String>, path: &Vec<Value>| {
-        !path.is_empty() && released_at(released, label, path.len() - 1).contains_path(path)
+    // A root value is released by a release naming it whole, through the record fields that
+    // reach it; a path beneath the root by one naming it.
+    let is_released = |label: &Vec<String>, path: &Vec<Value>| match path.len() {
+        0 => released_whole(released, label),
+        n => released_at(released, label, n - 1).contains_path(path),
     };
     // A release lets a region leave the output, and nothing more: what a producer still
     // holds beneath a complete path, or adds beneath one, is checked whether or not a

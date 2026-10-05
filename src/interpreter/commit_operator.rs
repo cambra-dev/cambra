@@ -1034,7 +1034,11 @@ impl TileOperator for CommitOperator {
                     )
                 });
                 let guard = input.tiling().universal_guard();
-                input.subscribe(guard, forwarding_consumer(&consumer), scheduler)
+                input.subscribe(
+                    guard,
+                    forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                    scheduler,
+                )
             })
             .collect::<Vec<_>>();
         let n = writer_producers.len();
@@ -1514,7 +1518,11 @@ impl TileOperator for InductionStore {
         );
         let body_producer = {
             let g = body_op.tiling().universal_guard();
-            body_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
+            body_op.subscribe(
+                g,
+                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                scheduler,
+            )
         };
         Box::new(InductionStoreProducer {
             base: ProducerBase::new(InductionStoreProducer::alloc_id(), self.tiling()),
@@ -1840,9 +1848,11 @@ impl TileOperator for StoreValueStream {
         let consumer = shared_consumer(consumer);
         consumer.borrow_mut().notify();
         let g = self.store_op.tiling().universal_guard();
-        let store_producer = self
-            .store_op
-            .subscribe(g, forwarding_consumer(&consumer), scheduler);
+        let store_producer = self.store_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(StoreValueStreamProducer::alloc_id(), self.tiling()),
             store_producer,
@@ -2030,9 +2040,11 @@ impl TileOperator for StoreFinalRead {
         let consumer = shared_consumer(consumer);
         consumer.borrow_mut().notify();
         let g = self.store_op.tiling().universal_guard();
-        let store_producer = self
-            .store_op
-            .subscribe(g, forwarding_consumer(&consumer), scheduler);
+        let store_producer = self.store_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         Box::new(StoreFinalReadProducer {
             base: ProducerBase::new(StoreFinalReadProducer::alloc_id(), self.tiling()),
             store_producer,
@@ -2196,13 +2208,19 @@ impl TileOperator for StoreDenseRead {
         consumer.borrow_mut().notify();
         let trigger_producer = {
             let g = self.trigger.tiling().universal_guard();
-            self.trigger
-                .subscribe(g, forwarding_consumer(&consumer), scheduler)
+            self.trigger.subscribe(
+                g,
+                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                scheduler,
+            )
         };
         let store_producer = {
             let g = self.store_op.tiling().universal_guard();
-            self.store_op
-                .subscribe(g, forwarding_consumer(&consumer), scheduler)
+            self.store_op.subscribe(
+                g,
+                forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+                scheduler,
+            )
         };
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), self.tiling()),
@@ -2589,13 +2607,17 @@ impl TileOperator for AsOf {
         // only propose; later pulls commit and render).
         let consumer = shared_consumer(consumer);
         let tg = self.trigger.tiling().universal_guard();
-        let trigger = self
-            .trigger
-            .subscribe(tg, forwarding_consumer(&consumer), scheduler);
+        let trigger = self.trigger.subscribe(
+            tg,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         let sg = self.source.tiling().universal_guard();
-        let source = self
-            .source
-            .subscribe(sg, forwarding_consumer(&consumer), scheduler);
+        let source = self.source.subscribe(
+            sg,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         let b_extent = match self.tiling() {
             Tiling::DataFunction { domain, .. } => domain.clone(),
             _ => unreachable!("AsOf tiles as a function"),
@@ -3024,7 +3046,11 @@ fn subscribe_driver_inputs(
     let consumer = shared_consumer(consumer);
     let source_producer = {
         let g = source_op.tiling().universal_guard();
-        source_op.subscribe(g, forwarding_consumer(&consumer), scheduler)
+        source_op.subscribe(
+            g,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        )
     };
     let store_producer = {
         let g = store_op.tiling().universal_guard();
@@ -3964,9 +3990,11 @@ impl TileOperator for TransactWriter {
         // owns the transaction source, so a request arriving on a live source
         // reaches this writer, and through it the commit cycle, along this edge.
         let dg = self.driver_op.tiling().universal_guard();
-        let driver_producer =
-            self.driver_op
-                .subscribe(dg, forwarding_consumer(&consumer), scheduler);
+        let driver_producer = self.driver_op.subscribe(
+            dg,
+            forwarding_consumer(&consumer, &scheduler.wakeup_queue()),
+            scheduler,
+        );
         Box::new(TransactWriterProducer {
             base: ProducerBase::new(TransactWriterProducer::alloc_id(), self.tiling()),
             store_producer,

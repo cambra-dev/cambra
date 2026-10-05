@@ -740,6 +740,11 @@ impl TileProducer for FanOutProducer {
         // re-deliver data that a consumer has already released.
         let index = self.index();
         let accumulated = shared.release_guards[index].union(&obsolete_guard);
+        trace!(
+            "{} branch {index} accumulate {:?} + {obsolete_guard:?} = {accumulated:?}",
+            self.name(),
+            shared.release_guards[index]
+        );
         shared.release_guards[index] = accumulated;
         // Only live subscribers constrain the release. A subscriber whose
         // producer has been dropped never releases again, so counting its guard
@@ -750,7 +755,12 @@ impl TileProducer for FanOutProducer {
             .fold(self.tiling().universal_guard(), |acc, i| {
                 acc.intersect(&shared.release_guards[i])
             });
-        trace!("{} releasing: {intersection:?}", self.name());
+        trace!(
+            "{} releasing: {intersection:?} from branches {:?} live {:?}",
+            self.name(),
+            shared.release_guards,
+            shared.live_indices().collect::<Vec<_>>()
+        );
         // The match is total for a fan-out a recurrence reads, rather than a
         // shape test with a fallthrough. Every function tiling's empty and
         // universal guards are `Function(Domain(_))` (`Tiling::empty_guard`,
@@ -827,7 +837,7 @@ impl TileOperator for Memo {
             ),
             input: self.input.subscribe(
                 intent_guard,
-                notified.consumer(forwarding_consumer(&consumer)),
+                notified.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
                 scheduler,
             ),
             cached_tile: self.tiling().empty_tile(),
@@ -910,6 +920,23 @@ impl TileProducer for MemoProducer {
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
         input.compact();
+        // Everything merged into the cache is released, because the cache cannot take a
+        // value twice: a second delivery of one is a position delivered twice, which
+        // `Tile::merge` rejects. What the release leaves behind may still be the keys of open
+        // groups, which grow by key, and join-shaped values, which combine; a plain value
+        // left there is one the input will deliver again.
+        #[cfg(debug_assertions)]
+        {
+            let mut unreleased = input.clone();
+            unreleased.remove_guarded(upstream_obsolete.clone());
+            unreleased.compact();
+            debug_assert!(
+                !unreleased.holds_a_plain_value(),
+                "{} merged values it cannot release: {unreleased:?} is left after releasing \
+                 {upstream_obsolete:?} from {input:?}",
+                self.name(),
+            );
+        }
         trace!("{} releasing {upstream_obsolete:?}", self.name());
         // Latch: once the input has handed over everything, a later pull answering
         // empty (as a conforming input does for a region it released) must not

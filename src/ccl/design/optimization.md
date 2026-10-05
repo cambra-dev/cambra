@@ -165,8 +165,7 @@ The other combinators introduced here include `Curry`, `Const`, `Apply`, `Map`, 
 builtins, and the point-free `Copair` form. `Builtin::Copair` appears as
 `Apply(Tuple(arms), Builtin(Copair))` when a copair is lifted out of a lambda. A value-position
 `TypedExprNode::Copair` remains a value-form node. Planning later introduces `Iterate`,
-`Restrict`, `MapFilter`, `CurryOver`, `Converse`, `Uncurry`, and the domain transformations used by
-join plans.
+`Restrict`, `CurryOver`, `Converse`, `Uncurry`, and the domain transformations used by join plans.
 Lambda elimination does not introduce iteration sources.
 
 ### Conditional expressions and filters
@@ -237,8 +236,8 @@ engine during operator conversion. `planning::run` then performs these rewrites 
 4. Fold closed scalar computations with `const_fold::fold_constants`.
 5. Mark iteration sites, choosing a hash join where its predicate matches.
 6. Compile remaining refinement predicates throughout the tree.
-7. Insert `map_filter` for supported refinements on inner, per-group collections, and refuse a
-   narrowing none materializes (`reject_unmaterialized_narrowings`).
+7. Insert `map(filter_values(𝑞))` for supported refinements on inner, per-group collections, and
+   refuse a narrowing none materializes (`reject_unmaterialized_narrowings`).
 8. Simplify the planned expression again.
 
 Constant folding evaluates supported operations through the runtime's `src/scalar_ops.rs` kernel
@@ -359,13 +358,13 @@ has an iteration source, and another wrapper would stack a second one.
 
 ### Per-group value filters
 
-`insert_map_filters` handles a refinement on the domain of a collection returned by a
+`insert_per_group_filters` handles a refinement on the domain of a collection returned by a
 function, where that refinement depends on the function's input collection. The ordinary
 iteration walk sees the function's own domain and cannot materialize this inner one.
 When each added predicate reads that input collection, planning converts the added
-conditions into a value predicate and inserts one `map_filter` before the function.
+conditions into a value predicate 𝑞 and inserts one `map(filter_values(𝑞))` before the function.
 The operator filters each group's elements independently. `reject_unmaterialized_narrowings`
-refuses a narrowing no `map_filter` materializes, since operator conversion would compile the
+refuses a narrowing no per-group filter materializes, since operator conversion would compile the
 site without its filter.
 
 ---
@@ -391,7 +390,7 @@ boundary and is rejected.
 | `(true ▷ const) ▷ iterate` | `IterateExtent` over the declared domain |
 | `p ▷ iterate`, nontrivial `p` | `IterateExtent` followed by `Restrict` |
 | `upstream ▷ (p ▷ restrict)` | Filter the upstream with `Restrict` |
-| `filter_values(p)`, `map_filter(p)` | Filter fed values or inner collections |
+| `filter_values(p)`, `map(filter_values(p))` | Filter fed values or each inner collection |
 | `copair`, `disjoint_join` | Combine collection arms through union operators |
 | `List` | `MapResult` over an index stream |
 | `Lit`, value-position `Tuple` or `Record` | `Constant` or `MakeRecord` |
