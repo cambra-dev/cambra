@@ -1889,6 +1889,26 @@ fn floor_div(a: i64, b: i64) -> Option<i64> {
     Some(if rounds_down { q - 1 } else { q })
 }
 
+/// `base ** exponent`, or `None` where it has no value: a negative exponent, or a result
+/// outside `i64`. The exponent is taken whole, so `1 ** 5000000000` is `1`.
+///
+/// Computes by squaring and checks each square for overflow. A square that overflows is a power
+/// of `base` no larger than the result's, so the result overflows too.
+fn int_pow(mut base: i64, exponent: i64) -> Option<i64> {
+    let mut exponent = u64::try_from(exponent).ok()?;
+    let mut acc: i64 = 1;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            acc = acc.checked_mul(base)?;
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            base = base.checked_mul(base)?;
+        }
+    }
+    Some(acc)
+}
+
 /// Apply a binary operator. An overflow or a division by zero is an [`Error`]: the spec leaves
 /// it undefined (`docs/chl-spec.md`, "Partiality is not yet defined [Open]").
 fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
@@ -1905,6 +1925,10 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
         (BinOp::Sub, Value::Int(a), Value::Int(b)) => int(a.checked_sub(*b)),
         (BinOp::Mul, Value::Int(a), Value::Int(b)) => int(a.checked_mul(*b)),
         (BinOp::FloorDiv, Value::Int(a), Value::Int(b)) => int(floor_div(*a, *b)),
+        // The interpreter discharges no refinement, so a negative exponent the compiler rejects
+        // where it is written (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators")
+        // arrives here and is refused.
+        (BinOp::Pow, Value::Int(a), Value::Int(b)) => int(int_pow(*a, *b)),
         (BinOp::LogicalAnd, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
         (BinOp::LogicalOr, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
         (BinOp::LogicalXor, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
@@ -2026,6 +2050,35 @@ mod tests {
         for (source, message) in cases {
             assert_eq!(refused(source), message, "{source}");
         }
+    }
+
+    #[test]
+    fn exponentiation_takes_a_non_negative_exponent() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            out << 2 ** 10 + 0 ** 0 + (-3) ** 3
+        "#});
+        assert_eq!(v.to_string(), "[() -> 998]");
+        let e = refused(indoc! {r#"
+            out = test_sink()
+            out << 2 ** 64
+        "#});
+        assert!(e.contains("is not defined"), "{e}");
+        let e = refused(indoc! {r#"
+            out = test_sink()
+            out << 2 ** (0 - 3)
+        "#});
+        assert!(e.contains("is not defined"), "{e}");
+    }
+
+    /// An exponent past `u32` still has a value where the power does not overflow.
+    #[test]
+    fn a_large_exponent_of_a_unit_base_is_defined() {
+        let v = out(indoc! {r#"
+            out = test_sink()
+            out << 1 ** 5000000000 + (-1) ** 5000000001 + 0 ** 5000000000
+        "#});
+        assert_eq!(v.to_string(), "[() -> 0]");
     }
 
     #[test]

@@ -49,19 +49,26 @@ use panic_message::panic_message;
 
 /// The skeletons whose every cell agrees, so a change that breaks one of them fails
 /// `live_rows_agree`.
+///
+/// `function_body` is not here: its `rows_sum` cell does not compile
+/// (`a_def_body_summing_jagged_rows_does_not_compile`, in `tests/compilation_pipeline/sums.rs`).
 const LIVE: &[&str] = &[
     "aggregate_arg",
     "binop_operand",
     "bool_feed",
     "comp_source",
+    "comp_source_in_loop",
     "feed",
     "function_arg",
-    "function_body",
     "groupby_source",
+    "keyed_write_value",
     "match_scrutinee",
     "max_arg",
     "mut_init",
+    "rec_comp_element",
+    "rec_loop_feed",
     "rec_with_coll_feed",
+    "rec_with_coll_in_loop",
     "rec_with_coll_projected",
     "rec_with_coll_scalar_field",
     "record_coll_source",
@@ -73,6 +80,8 @@ const LIVE: &[&str] = &[
     "str_coll_source",
     "str_loop_feed",
     "string_feed",
+    "terminal_read",
+    "terminal_read_after_guard",
     "ternary_branch",
     "tuple_component",
     "txn_guard",
@@ -111,6 +120,8 @@ enum Ty {
     Variant,
     /// A record with a collection field `xs` and an integer field `n`.
     RecWithColl,
+    /// A collection of integer collections, whose rows may differ in domain.
+    Rows,
     /// A transactional mutable variable. Nothing evaluates to one, so it names what a binder
     /// denotes and never what a hole wants or a filler produces; `no_hole_wants_a_store`
     /// holds that.
@@ -254,10 +265,6 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             r = (xs={}, n=1)
             out << sum(r.xs) + r.n
-        "#}},
-        Skeleton { name: "record_in_list", hole: Ty::Int, scope: &[], body: indoc! {r#"
-            out = test_sink()
-            out << sum([r.a for r in [(a={}, b=1)]])
         "#}},
         Skeleton { name: "tuple_component", hole: Ty::Int, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -559,6 +566,97 @@ fn skeletons() -> Vec<Skeleton> {
                 r = {}
                 out << sum(r.xs)
         "#}},
+
+        // Nested `for` loops writing a mutable variable declared outside both: one recurrence
+        // per enclosing position (`docs/chl-spec.md`, "4.6 `for` — iteration").
+        Skeleton { name: "nested_mut_write_rhs", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for q in [1, 2, 3]:
+                    acc := acc + {}
+            out = test_sink()
+            out << acc
+        "#}},
+        Skeleton { name: "nested_mut_source", hole: Ty::IntColl, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for q in {}:
+                    acc := acc + q
+            out = test_sink()
+            out << acc
+        "#}},
+        // The inner source is the outer element, so each enclosing position has its own domain.
+        Skeleton { name: "nested_mut_over_row", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            acc := 0
+            for xs in [[1, 2], [3, 4]]:
+                for x in xs:
+                    acc := acc + {}
+            out = test_sink()
+            out << acc
+        "#}},
+        // A mutable variable a loop body introduces, restarting at its seed each iteration.
+        Skeleton { name: "body_mut_intro", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            total := 0
+            for x in [1, 2]:
+                y := {}
+                total += y
+            out = test_sink()
+            out << total
+        "#}},
+        Skeleton { name: "body_mut_intro_nested", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for q in [1, 2, 3]:
+                    y := {}
+                    acc += y
+            out = test_sink()
+            out << acc
+        "#}},
+        // Nested loops that write no mutable variable and feed instead. The feed's element
+        // is the fed value, so the deferred collection folds to a scalar. The inner source is
+        // named: a literal one is refused before the feed is compiled.
+        Skeleton { name: "nested_loop_feed", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            ch = defer()
+            ys = [10, 20]
+            for i in [1, 2]:
+                for q in ys:
+                    ch << {}
+            out = test_sink()
+            out << sum(ch)
+        "#}},
+
+        // Rows of a collection of collections, jagged or not.
+        Skeleton { name: "rows_comp_element", hole: Ty::Int, scope: &[("v", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << sum([sum([{} for v in r]) for r in [box([1, 2]), box([3, 4, 5])]])
+        "#}},
+        Skeleton { name: "rows_comp_source", hole: Ty::Rows, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            out << sum([sum(r) for r in {}])
+        "#}},
+        Skeleton { name: "rows_inner_filter", hole: Ty::Rows, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            out << sum([sum([v for v in r if v > 1]) for r in {}])
+        "#}},
+        Skeleton { name: "rows_loop_feed", hole: Ty::Rows, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            for r in {}:
+                out << sum(r)
+        "#}},
+        Skeleton { name: "rows_nested_mut", hole: Ty::Rows, scope: &[], body: indoc! {r#"
+            acc := 0
+            for xs in {}:
+                for x in xs:
+                    acc := acc + x
+            out = test_sink()
+            out << acc
+        "#}},
+
+        // A product key: a tuple names each group (`Equatable` on a product).
+        Skeleton { name: "groupby_tuple_key", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            out << sum([sum([r.a for r in g]) for g in groupby({}, \e -> (e.a, e.b))])
+        "#}},
     ]
 }
 
@@ -580,6 +678,8 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "tuple_proj", ty: Ty::Int, needs: &[], decls: "", expr: "(3, 4).0" },
         Filler { name: "record_proj", ty: Ty::Int, needs: &[], decls: "", expr: "(p=3, q=4).p" },
         Filler { name: "ternary", ty: Ty::Int, needs: &[], decls: "", expr: "(1 if 2 > 1 else 0)" },
+        Filler { name: "pow", ty: Ty::Int, needs: &[], decls: "", expr: "2 ** 3" },
+        Filler { name: "rows_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum(r2) for r2 in [box([1, 2]), box([3])]])" },
         // A sum of nothing, which is its identity, 0.
         Filler { name: "sum_of_empty", ty: Ty::Int, needs: &[], decls: "", expr: "sum([z for z in [1, 2] if z > 99])" },
         Filler { name: "call", ty: Ty::Int, needs: &[], decls: indoc! {r#"
@@ -602,6 +702,11 @@ fn fillers() -> Vec<Filler> {
                 hn * 2
         "#}, expr: "helper_fn2({b})" },
         Filler { name: "binder_ternary", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "({b} if {b} > 1 else 0)" },
+        Filler { name: "binder_pow", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} ** 2" },
+        // A correlated filter whose body reads the binder too, beside `binder_in_comp_filter`,
+        // whose body reads nothing outer.
+        Filler { name: "binder_in_corr_filter", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum([z2 * {b} for z2 in [1, 2, 3] if z2 > {b}])" },
+        Filler { name: "binder_in_nested_comp", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum([sum([z2 * z3 * {b} for z3 in [1, 2]]) for z2 in [1, 2]])" },
 
         // --- booleans
         Filler { name: "bool_lit", ty: Ty::Bool, needs: &[], decls: "", expr: "True" },
@@ -628,8 +733,9 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "union", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2] ++ [3, 4]" },
         Filler { name: "dup_union", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2] ++ [1, 2]" },
         Filler { name: "map_lit", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([(\"a\", 1), (\"b\", 2)])" },
-        Filler { name: "binder_list", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[{b}, {b} * 2]" },
         Filler { name: "binder_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2]]" },
+        Filler { name: "binder_filtered_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2, 3] if z2 > {b}]" },
+        Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([\"a\" -> 1, \"b\" -> 2])" },
         Filler { name: "generator_coll", ty: Ty::IntColl, needs: &[], decls: indoc! {r#"
             def helper_gen2(hxs):
                 for hx in hxs:
@@ -641,6 +747,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rec_binder_sum", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "{b}.a + {b}.b" },
         Filler { name: "rec_binder_in_comp", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "sum([z2 * {b}.a for z2 in [1, 2]])" },
         Filler { name: "rec_binder_cmp", ty: Ty::Bool, needs: &[Ty::Rec], decls: "", expr: "{b}.a > 1" },
+        Filler { name: "rec_binder_corr_filter", ty: Ty::Int, needs: &[Ty::Rec], decls: "", expr: "sum([z2 * {b}.a for z2 in [1, 2, 3] if z2 > {b}.b])" },
 
         // --- strings and collections of them
         Filler { name: "str_list", ty: Ty::StrColl, needs: &[], decls: "", expr: "[\"a\", \"b\"]" },
@@ -669,6 +776,8 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "two_binders_in_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 for z2 in [1, 2, 3] if z2 > {b} - {c}])" },
         Filler { name: "two_binders_ternary", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "({b} if {c} > 1 else {c})" },
         Filler { name: "two_binders_cmp", ty: Ty::Bool, needs: &[Ty::Int, Ty::Int], decls: "", expr: "{b} > {c}" },
+        Filler { name: "two_binders_corr_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 * {b} for z2 in [1, 2, 3] if z2 > {c}])" },
+        Filler { name: "two_binders_both_filter", ty: Ty::Int, needs: &[Ty::Int, Ty::Int], decls: "", expr: "sum([z2 * {b} * {c} for z2 in [1, 2, 3] if z2 > {b} - {c}])" },
         Filler { name: "rec_and_int", ty: Ty::Int, needs: &[Ty::Rec, Ty::Int], decls: "", expr: "{b}.a * {c}" },
         Filler { name: "rec_and_int_cmp", ty: Ty::Bool, needs: &[Ty::Rec, Ty::Int], decls: "", expr: "{b}.a > {c}" },
 
@@ -678,18 +787,26 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "terminal", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b})" },
         Filler { name: "terminal_arith", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b}) * 2 + 1" },
         Filler { name: "terminal_in_comp", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "sum([z2 + await_final({b}) for z2 in [1, 2]])" },
-        Filler { name: "terminal_in_agg", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "max([await_final({b}), 0])" },
         Filler { name: "terminal_ternary", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "(await_final({b}) if 2 > 1 else 0)" },
         Filler { name: "terminal_cmp", ty: Ty::Bool, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b}) > 90" },
 
         // --- records holding a collection
         Filler { name: "rec_with_list", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[1, 2, 3], n=4)" },
         Filler { name: "rec_with_singleton", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[7], n=1)" },
+        // The collection varies with the binder, so it is a comprehension: a list literal's
+        // elements are constants (`docs/chl-spec.md`, "3.11 List, tuple, record literals").
+        Filler { name: "rec_with_binder_comp", ty: Ty::RecWithColl, needs: &[Ty::Int], decls: "", expr: "(xs=[z2 * {b} for z2 in [1, 2]], n={b})" },
         Filler { name: "rec_with_comp", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[z2 * 2 for z2 in [1, 2]], n=1)" },
         Filler { name: "rec_with_empty", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[z2 for z2 in [1, 2] if z2 > 99], n=0)" },
         Filler { name: "rec_with_union", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=[1, 2] ++ [3], n=2)" },
         Filler { name: "rec_with_map", ty: Ty::RecWithColl, needs: &[], decls: "", expr: "(xs=map([(\"a\", 1), (\"b\", 2)]), n=3)" },
-        Filler { name: "rec_with_binder_coll", ty: Ty::RecWithColl, needs: &[Ty::Int], decls: "", expr: "(xs=[{b}, {b} * 2], n={b})" },
+
+        // --- collections of integer collections: rows of one domain, jagged rows (`box`
+        // binds each row's domain as a witness), and rows a comprehension builds
+        Filler { name: "rows_lit", ty: Ty::Rows, needs: &[], decls: "", expr: "[[1, 2], [3, 4]]" },
+        Filler { name: "rows_jagged", ty: Ty::Rows, needs: &[], decls: "", expr: "[box([1, 2]), box([3, 4, 5])]" },
+        Filler { name: "rows_comp", ty: Ty::Rows, needs: &[], decls: "", expr: "[[z3 * z2 for z3 in [1, 2]] for z2 in [1, 2]]" },
+        Filler { name: "rows_filtered", ty: Ty::Rows, needs: &[], decls: "", expr: "[[z3 for z3 in [1, 2, 3] if z3 > z2] for z2 in [1, 2]]" },
     ]
 }
 
