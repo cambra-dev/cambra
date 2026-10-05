@@ -7,10 +7,13 @@
 //! tree once, mints a fresh [`Name`] uid at every binding site, and rewrites
 //! each bound variable reference to the name of the binder that lexically
 //! binds it. After it runs, two binders are equal iff they are the *same*
-//! binder — plain structural equality on terms coincides with α-equivalence,
-//! which is what lets every downstream equality-mediated decision (refinement
-//! dedup, demand satisfaction, structural reconciles) compare names without a
-//! scope analysis.
+//! binder. Structural equality coincides with α-equivalence only for terms
+//! copied from one minted term: copies keep their uids, so downstream
+//! equality-mediated decisions (refinement dedup, demand satisfaction,
+//! structural reconciles) compare names without a scope analysis. Two
+//! independently minted α-equivalent terms carry different uids and compare
+//! unequal. See `src/ccl/design/ir.md`,
+//! "Structured names and α-uniquification (Barendregt convention)".
 //!
 //! The convention this establishes (see `src/ccl/names.rs`): **unique binding
 //! sites at lowering; copying preserves uids; no pass mints fresh uids on an

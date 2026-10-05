@@ -87,6 +87,11 @@ pub(super) fn for_body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
 /// a bare effect and stays rejected by the generator path. Gates the
 /// final-statement hidden-writer fallback in [`super::stmts::lower_final_stmt`];
 /// mirrors the non-yield/non-feed `ChlStmt::Expr` arm of [`lower_for_body_stmt`].
+///
+/// TODO: this reads `stmts.last()` before `pass` removal, so a body ending in
+/// `bump(c)` followed by `pass` misses the effect-call path and lowering rejects
+/// the loop. Select the terminal through [`super::stmts::contributing_stmts`]
+/// instead. See `src/ccl/design/lowering.md`, "`pass` statements".
 pub(super) fn for_body_terminal_is_bare_effect(stmts: &[Spanned<ChlStmt>]) -> bool {
     matches!(
         stmts.last().map(|s| &s.node),

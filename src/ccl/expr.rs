@@ -234,13 +234,12 @@ pub enum TypedExprNode {
     /// lowerings, not a contract: the one arm that *requires* the shape asserts
     /// it where it needs it ([`crate::ccl::lambda_elim`]'s cast-wrapped lambda).
     ///
-    /// `Cast` is an **upcast**: the refined-domain function it produces is a
-    /// supertype of `value`.  The refinement is attached *constructively* —
-    /// inference's `emit_cast` decomposes `value`'s type and re-wraps its
-    /// domain — rather than discharged as a `value_ty <: target`
-    /// edge, because no such edge exists: the refinement lattice is strict
-    /// (`unrefined ⊀ refined`), and the target lowering emits for a
-    /// comprehension is a **data** function, whose domain is invariant rather
+    /// The refinement is attached constructively: inference's `emit_cast`
+    /// decomposes `value`'s type and re-wraps its domain, rather than
+    /// discharging a `value_ty <: target` edge. No such edge exists: the
+    /// refinement lattice is strict (`unrefined ⊀ refined`), and the target
+    /// lowering emits for a comprehension is a **data** function, whose domain is
+    /// invariant rather
     /// than contravariant.  Re-wrapping stacks the refinement onto any the
     /// value already carries, so nested casts compose (nested list
     /// comprehensions).  `target`'s predicate is inferred by the
@@ -248,7 +247,7 @@ pub enum TypedExprNode {
     /// any refinement-bearing type.  A *covariant* refinement (e.g. casting
     /// `Int` to `{Int | p}`) has no such construction and is rejected —
     /// acquiring a value-level refinement is a runtime/SMT-checked narrowing,
-    /// not an upcast.
+    /// which `Cast` does not perform.
     ///
     /// `target` is the lowering-time *specification* (its domain/codomain
     /// are typically `Type::Hole`, carrying only the refinement); the
@@ -268,15 +267,16 @@ pub enum TypedExprNode {
     /// Pure type-level assertion that `value` is the **executable realization** of a term
     /// typed `target` — a re-view the type system cannot prove, and is not asked to.
     ///
-    /// Distinct from [`Cast`](Self::Cast), and the distinction is the whole point. A cast
-    /// is an **upcast**: its typing rule is the subtype obligation `value_ty <: target`,
-    /// discharged by the ordinary rules. This asserts an **isomorphism the rules cannot
-    /// see**. Planning's realization of a conditional collection is the case: a `Case`
+    /// Distinct from [`Cast`](Self::Cast). A cast's type is derived from `value`'s: `emit_cast`
+    /// rebuilds `value`'s own function type with the target's domain refinements, so the
+    /// result keeps `value`'s domain shape. This asserts a type with a different domain shape,
+    /// an **isomorphism the rules cannot see**. Planning's realization of a conditional
+    /// collection is the case: a `Case`
     /// typed `Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉` becomes a gated union typed
     /// `Variant({𝑖: {𝐷ᵢ | π̂ᵢ}}) ⤇ 𝑉`, and those are genuinely different types — the sum
     /// picks one branch, the tagged union has rows from every leg. Only the gates make them
-    /// agree, and no typing rule can check a gate. Routing that through `Cast` would mean
-    /// claiming a subtype relation that does not hold.
+    /// agree, and no typing rule can check a gate. `Cast`'s rebuild would type the gated
+    /// union at its own `Variant` domain, not at the sum.
     ///
     /// **Why it exists rather than rewriting the types above it.** Realization changes a
     /// subterm's type, and every enclosing mention of that type would otherwise have to
