@@ -285,22 +285,35 @@ its trailing expression is that output.
 
 ### `Transact` — the domain-parameterized recurrence carrier
 
-`Transact { keys, writers, domain }` is the recurrence carrier for mutable accumulation loops and
-transactions. It denotes a record whose fields are key histories, each of type `𝐷 ⤇ 𝑉` over the
-shared sequencing domain 𝐷. A read of key `k` projects `__hist.k`. Each `TransactKey` carries its
-initial value, evaluated once outside the writer bodies. Each `WriterSite` carries an iteration
-source, a point-free decision body, and read and write key lists. Its decision is either
-`` `commit(writes) `` or `` `abort(unit) ``. The store's feedback and scheduling belong to
-the compiled operator, while the node denotes the resulting history record.
+`Transact { keys, writers, domain, parameter }` is the recurrence carrier for mutable accumulation
+loops and transactions. It denotes a record whose fields are key histories, each of type `𝐷 ⤇ 𝑉`
+over the shared sequencing domain 𝐷. A read of key `k` projects `__hist.k`. Each `TransactKey`
+carries its initial value, the seed: what the key holds before the domain's first position. Each
+`WriterSite` carries an iteration source, a point-free decision body, and read and write key lists.
+Its decision is either `` `commit(writes) `` or `` `abort(unit) ``. The store's feedback and
+scheduling belong to the compiled operator, while the node denotes the resulting history record.
 
 `planning::plan_loops` constructs `Transact` from a recognized causal `LetRec` after lambda
 elimination. An induction group has one writer with the accumulator footprint; a transaction
 group can have multiple writers with separate read and write sets. Operator conversion selects
 the position-driven induction store for a concrete iteration domain and the concurrent commit
 store for `Type::Txn`. The node carries the domain so conversion can choose the engine without
-reconstructing it from the writer expressions. See
-[mutation loops](lowering.md#mutation-accumulation-loops)
-and [loop planning](mutability.md#loop-planning-plan_loops-letrec-patterns--the-transact-carrier).
+reconstructing it from the writer expressions.
+
+`parameter` is `None` for a top-level `Transact`, whose writers take the snapshot tuple alone. A
+**nested** `Transact`, an inner loop's, sets it to the `(enclosing, position)` pair `lambda_elim`
+merged the two loops' binders into, and is the top-level `Transact` lifted pointwise over that
+parameter 𝑃: each `init` is `𝑃 ⇒ 𝑉`, so the inner loop seeds from wherever the enclosing one had got
+to, and each writer's body takes `(𝑃, (snap…, item))`. The source is curried instead,
+`enclosing ⤇ (domain ⤇ item)`, one collection per enclosing position. The `Transact` then denotes
+one history record per enclosing position, `enclosing ⇒ {key: 𝐷 ⤇ 𝑉}`, and a variable read is the
+morphism `__hist ≫ .key` of the enclosing parameter. The parameter is stated rather than rebuilt
+from `enclosing` and `domain` because the pair carries refinements neither component does.
+Symbolic rendering: `transact under 𝑃 (k = init, …) { … }`. A nested `Transact` plans but does not
+run yet: operator conversion refuses a `Transact` whose `parameter` is `Some(_)`.
+
+See [mutation loops](lowering.md#mutation-accumulation-loops)
+and [loop planning](mutability.md#loop-planning-plan_loops-letrec-patterns--transact).
 
 ### `LetRec` — causal mutually recursive definition groups
 

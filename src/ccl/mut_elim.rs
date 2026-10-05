@@ -25,7 +25,7 @@
 //!
 //! [`crate::ccl::planning::plan_loops`] runs **after `lambda_elim`**, on the group's point-free
 //! normal form, and lowers each group onto the domain-parameterized
-//! [`TypedExprNode::Transact`] carrier (`let __hist = Transact{…} in …`),
+//! [`TypedExprNode::Transact`] node (`let __hist = Transact{…} in …`),
 //! whose induction domain op-conversion compiles to the changelog induction
 //! store (the `Txn` domain, to the commit operator).
 //!
@@ -41,7 +41,7 @@
 //! re-checked at recognition's wall by the point-free matcher
 //! ([`crate::ccl::letrec::check_letrec_causal`]).
 //!
-//! `Transact` is recognition's **output** carrier, born post-elim and spanning
+//! `Transact` is recognition's **output** node, born post-elim and spanning
 //! recognition → planning → op-conversion: it separates the mutable variable's *keys*
 //! (each with its `init`) from the *writer body*, which is what lets `planning`
 //! iterate-wrap the writer source and op-conversion build the engine. (Retiring
@@ -560,7 +560,7 @@ fn push_continuation_into_case(e: &mut Expr) -> Option<Expr> {
 /// A-normalization makes that body start with a binding whenever any operand
 /// is compound (`let __anf = [unit] in for … do …`). The binding's scope then
 /// ends at the statement, so anything later in the spine that reads it — a
-/// store carrier `transact_phase` places at the tail, a write the letrec phase
+/// store's `Transact`, which `transact_phase` places at the tail, a write the letrec phase
 /// moves — names a binder it sits outside of.
 ///
 /// [`flatten_spine`] performs the same reassociation gated on the statement
@@ -1997,20 +1997,40 @@ fn collect_writes(
     value_tys: &HashMap<Name, Type>,
     out: &mut Vec<AccumulatorVariable>,
 ) {
-    collect_writes_in(expr, None, value_tys, out);
+    collect_writes_in(expr, None, value_tys, &mut Vec::new(), out);
 }
 
 /// `stmt` is the `ExprStmt` whose effect `expr` is, when the walk arrived through
 /// one. Post-[`flatten_spine`] every write on a statement chain is a direct
 /// `ExprStmt` effect, so a write reached with `stmt` unset is one in a
 /// hand-built tree; its own node then stands as the whole site.
+///
+/// `introduced` names the mutable variables a [`TypedExprNode::MutDecl`] on the way down
+/// declared. A write to one of those accumulates over the introduction's own scope, so it
+/// is not this loop's — the inner loop that sequences it carries it, and claiming it here
+/// would give this loop a key whose seed names something bound inside its own body.
 fn collect_writes_in(
     expr: &Expr,
     stmt: Option<NodeId>,
     value_tys: &HashMap<Name, Type>,
+    introduced: &mut Vec<Name>,
     out: &mut Vec<AccumulatorVariable>,
 ) {
-    if let TypedExprNode::MutWrite { name, value, .. } = &expr.node {
+    if let TypedExprNode::MutDecl {
+        binding,
+        init,
+        body,
+    } = &expr.node
+    {
+        collect_writes_in(init, None, value_tys, introduced, out);
+        introduced.push(binding.name.clone());
+        collect_writes_in(body, None, value_tys, introduced, out);
+        introduced.pop();
+        return;
+    }
+    if let TypedExprNode::MutWrite { name, value, .. } = &expr.node
+        && !introduced.contains(name)
+    {
         let write = expr.node_id();
         let site = StmtSite::new(stmt.unwrap_or(write), write);
         match out.iter_mut().find(|a| a.name == *name) {
@@ -2029,11 +2049,11 @@ fn collect_writes_in(
         }
     }
     if let TypedExprNode::ExprStmt { expr: effect, body } = &expr.node {
-        collect_writes_in(effect, Some(expr.node_id()), value_tys, out);
-        collect_writes_in(body, None, value_tys, out);
+        collect_writes_in(effect, Some(expr.node_id()), value_tys, introduced, out);
+        collect_writes_in(body, None, value_tys, introduced, out);
         return;
     }
-    expr.walk_children(|c| collect_writes_in(c, None, value_tys, out));
+    expr.walk_children(|c| collect_writes_in(c, None, value_tys, introduced, out));
 }
 
 /// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
@@ -2118,6 +2138,28 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
         } => Expr::let_in(binding, *bound_expr, splice_after_unit(*body, tail)),
         TypedExprNode::ExprStmt { expr, body } => {
             Expr::expr_stmt(*expr, splice_after_unit(*body, tail))
+        }
+        // A mutable variable the branch introduces scopes over the rest of that branch,
+        // so the splice goes inside it as it does inside a `Let`. Splicing after it
+        // instead leaves the whole introduction in *effect* position, where
+        // [`transform_chain`] meets a `MutDecl` as an `ExprStmt`'s effect and has no arm
+        // for it.
+        TypedExprNode::MutDecl {
+            binding,
+            init,
+            body,
+        } => {
+            let spliced = splice_after_unit(*body, tail);
+            let ty = spliced.ty.clone();
+            Expr::preserve(
+                chain.node_id,
+                TypedExprNode::MutDecl {
+                    binding,
+                    init,
+                    body: Box::new(spliced),
+                },
+            )
+            .with_ty(ty)
         }
         // A `Unit`-valued terminal that is not the sentinel — a branch whose last
         // statement is a bare write or feed, which lowering leaves unwrapped
@@ -2213,6 +2255,21 @@ fn transform_chain(
             env.insert(b.name, bound);
             transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
         }
+        // A mutable variable the loop body **introduces**, scoped to one iteration. Its
+        // writes belong to whatever sequences them — an inner loop, which the `For` arm
+        // folds into its own recurrence — so it never joins `accs` and never reaches this
+        // loop's write set. Seeding the read-your-writes environment with its initial
+        // value is the whole of the introduction: the inner fold replaces that entry with
+        // its final read, which is what a statement after the inner loop reads.
+        TypedExprNode::MutDecl {
+            binding: b,
+            init,
+            body,
+        } => {
+            let seed = Subst::discharge_env_in_place(*init, env);
+            env.insert(b.name.clone(), seed);
+            transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
+        }
         // A statement-position tag-`Case` (``match m: case `t(w): acc += e``,
         // lowered by `lower_loop_body_chain`). Rewrite it into the guard-`Case`
         // the arm below already merges into a writer decision, and re-enter. The
@@ -2299,9 +2356,12 @@ fn transform_chain(
                 // Both of the branch's escapes leave the scope of the bindings its
                 // own chain introduced: the feeds it just appended, which land on
                 // the top decision record, and its write set, which the merge
-                // below lifts into value-`Case` arms. Each is re-bound over what
-                // it reads.
-                let dec = decision_writes(dec);
+                // below lifts into value-`Case` arms. Each is closed over what it
+                // reads: the branch's scope beneath its prefix, then the prefix.
+                let (dec, scope) = decision_writes(dec);
+                for feed in &mut feeds[collected..] {
+                    feed.value = scope.close(feed.value.clone());
+                }
                 close_feeds_over_prefix(&dec.prefix, &mut feeds[collected..]);
                 all.push((pi, dec));
             }
@@ -2402,6 +2462,80 @@ fn transform_chain(
                 } => {
                     let spliced = Expr::let_in(binding, *bound_expr, Expr::expr_stmt(*rest, *body));
                     transform_chain(spliced, env, accs, writes_ty, entering, path, feeds)
+                }
+                // An inner loop — a recurrence nested in the enclosing one. Folding it
+                // here is what makes nesting work at any depth: the fold walks the
+                // inner body with this same function, so a third loop meets this arm
+                // again. The inner history binds inside the enclosing writer's
+                // decision body, closing over the enclosing binder, which is what
+                // lets the inner source depend on the outer element.
+                //
+                // The accumulator's value after the inner loop is that loop's final,
+                // so the fold's seeds — plain references to the accumulator names —
+                // discharge against the read-your-writes environment in hand here,
+                // and each accumulator's new environment value is its final read.
+                TypedExprNode::For {
+                    target,
+                    iter,
+                    body: inner_body,
+                } => {
+                    let mut value_tys = mut_var_value_tys([&*inner_body]);
+                    for acc in accs {
+                        value_tys.insert(acc.name.clone(), acc.ty.clone());
+                    }
+                    // An inner loop whose calls inlined to no write, and which feeds
+                    // nothing, is a no-op, as a flat one is: lowering let it through only
+                    // because a call might have hidden a pass-by-reference write.
+                    let mut inner_accs = Vec::new();
+                    collect_writes(&inner_body, &value_tys, &mut inner_accs);
+                    if inner_accs.is_empty() && !body_has_feed(&inner_body) {
+                        return transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
+                    }
+                    let fold = fold_induction_loop(&target, &iter, *inner_body, &value_tys);
+                    // Both halves of a binding: a binder's declared type is written in
+                    // the enclosing scope, so an inner loop correlated with this one's
+                    // binder carries it there too — in the refinement on its own iteration
+                    // domain, say. Rewriting only the definition leaves the binding
+                    // disagreeing with its body about the same type.
+                    let (mut hist_binding, hist_def) = fold.binding;
+                    Subst::discharge_env_in_binder(&mut hist_binding, env);
+                    let hist_def = Subst::discharge_env_in_place(hist_def, env);
+                    let reads: Vec<(TypedBinding, Expr)> = fold
+                        .reads
+                        .into_iter()
+                        .map(|(b, def)| (b, Subst::discharge_env_in_place(def, env)))
+                        .collect();
+                    // Typed from the fold's own accumulators: an inner loop may write a
+                    // variable it never reads, which the reads it was folded against omit.
+                    for (acc, x_final) in &fold.renames {
+                        let ty = fold
+                            .accs
+                            .iter()
+                            .find(|a| a.name == *acc)
+                            .map(|a| a.ty.clone())
+                            .unwrap_or_else(|| unreachable!("a rename names a folded accumulator"));
+                        env.insert(acc.clone(), tvar(x_final, ty));
+                    }
+                    // A feed from inside the inner loop is a feed of **this** body: there
+                    // is no scope here to hoist it to, the decision being a writer's
+                    // value. It rides this decision as a tap the way a feed written
+                    // directly here does, holding the inner history's own tap — one
+                    // collection per position of this level. `attach_feed_fields`
+                    // descends through the `letrec` this group builds, so the view's
+                    // reference to the inner history is in scope where the field lands.
+                    let site = StmtSite::new(stmt_id, effect_id);
+                    for (defer, view) in fold.feed_views {
+                        let field = defer.defer_tap_field(feeds.len());
+                        feeds.push(FeedSite {
+                            defer,
+                            field,
+                            value: view,
+                            fire: path.clone(),
+                            site,
+                        });
+                    }
+                    let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
+                    close_recurrence_group(vec![(hist_binding, hist_def)], reads, Vec::new(), rest)
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in loop body: {}",
@@ -2638,23 +2772,78 @@ impl PartialEq for BranchWrites {
     }
 }
 
+/// A branch decision's scope beneath its `let*` prefix: the `letrec` groups it passes under,
+/// outermost first, and the `let`s beneath them, inlined into one environment.
+///
+/// A `letrec` is **kept** rather than inlined: its bindings are mutually recursive, so there
+/// is no value to substitute in. An inner loop inside a branch is exactly this — the inner
+/// recurrence sits between the prefix and the record. A `let` beneath a group reads the group
+/// (an inner loop's final), so it is inlined rather than joining the prefix, which stands
+/// outside the groups ([`close_feeds_over_prefix`], [`wrap_reads`]).
+#[derive(Default)]
+struct BranchScope {
+    groups: Vec<Vec<(TypedBinding, Expr)>>,
+    beneath: HashMap<Name, Expr>,
+}
+
+impl BranchScope {
+    /// `e`, read inside the branch beneath its prefix, made self-contained there: the `let`s
+    /// beneath the groups inlined and the groups wrapped around it.
+    fn close(&self, e: Expr) -> Expr {
+        let inlined = Subst::discharge_env_in_place(e, &self.beneath);
+        self.groups.iter().rev().fold(inlined, |inner, bindings| {
+            let ty = inner.ty.clone();
+            let mut wrapped = Expr::new(TypedExprNode::LetRec {
+                bindings: bindings.clone(),
+                body: Box::new(inner),
+            });
+            wrapped.ty = ty;
+            wrapped
+        })
+    }
+}
+
 /// The `writes` elements of a `{commit, writes(, __to_*)}` decision record
-/// (as [`transform_chain`] builds it), with the `let*` prefix they read.
-fn decision_writes(dec: Expr) -> BranchWrites {
+/// (as [`transform_chain`] builds it), with the `let*` prefix they read, each closed over the
+/// branch's scope beneath that prefix ([`BranchScope`]), which is returned for the branch's
+/// feeds to be closed over too.
+fn decision_writes(dec: Expr) -> (BranchWrites, BranchScope) {
     let mut prefix: Vec<PrefixBinding> = Vec::new();
+    let mut scope = BranchScope::default();
     let mut record = dec;
-    while let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = record.node
-    {
-        prefix.push((record.node_id, binding, *bound_expr));
-        record = *body;
+    loop {
+        match record.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } if scope.groups.is_empty() => {
+                prefix.push((record.node_id, binding, *bound_expr));
+                record = *body;
+            }
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                let bound = Subst::discharge_env_in_place(*bound_expr, &scope.beneath);
+                scope.beneath.insert(binding.name.clone(), bound);
+                record = *body;
+            }
+            TypedExprNode::LetRec { bindings, body } => {
+                scope.groups.push(bindings);
+                record = *body;
+            }
+            node => {
+                record.node = node;
+                break;
+            }
+        }
     }
     let TypedExprNode::Record(fields) = record.node else {
         panic!(
-            "letrec phase: a branch decision is `let* in {{commit, writes}}`, got {}",
+            "letrec phase: a branch decision is `(let | letrec)* in {{commit, writes}}`, \
+             got {}",
             symbolic(&record)
         );
     };
@@ -2666,10 +2855,8 @@ fn decision_writes(dec: Expr) -> BranchWrites {
     let TypedExprNode::Record(elts) = writes.node else {
         panic!("letrec phase: a decision `writes` is keyed by accumulator");
     };
-    BranchWrites {
-        prefix,
-        writes: elts.into_iter().map(|(_, e)| e).collect(),
-    }
+    let writes = elts.into_iter().map(|(_, e)| scope.close(e)).collect();
+    (BranchWrites { prefix, writes }, scope)
 }
 
 /// Build the writer decision `{commit, writes}` for a statement-`Case`, from its
@@ -2833,6 +3020,21 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
             // The same logical `Let` with its feed fields attached, so it keeps its
             // own id rather than minting a replacement.
             Expr::let_in_preserving(node_id, binding, *bound_expr, new_body)
+        }
+        // An inner loop's history binds inside the decision, so the record sits under
+        // a `letrec` as readily as under a `let`. Attaching the fields under it keeps
+        // the group where it was rather than lifting the record out of its scope.
+        TypedExprNode::LetRec { bindings, body } => {
+            let new_body = attach_feed_fields(*body, feeds);
+            let ty = new_body.ty.clone();
+            Expr::preserve(
+                node_id,
+                TypedExprNode::LetRec {
+                    bindings,
+                    body: Box::new(new_body),
+                },
+            )
+            .with_ty(ty)
         }
         TypedExprNode::Record(fields) => {
             let bool_ty = Type::Base(BaseType::Bool);
@@ -3031,12 +3233,12 @@ mod tests {
     }
 
     /// Recognition lowers the group onto the domain-parameterized `Transact`
-    /// carrier: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
+    /// node: `let __hist = transact (x = x) { [x]⇒[x] over … do λ __p → …
     /// `commit(⟨writes: (x)⟩) | `abort } in (__hist.x, x) ▷ final_or_default``, with
     /// the key `init` read from the pre-loop binding and each accumulator read
     /// rewritten to a history-record projection.
     #[test]
-    fn recognition_builds_the_transact_carrier() {
+    fn recognition_builds_the_transact() {
         let (tree, _, _) = direct_mirror_sum();
         // Recognition consumes the point-free normal form, so run the elim
         // (+simplify) pass between the phase and the recognizer, as the
@@ -3046,11 +3248,8 @@ mod tests {
         let s = symbolic(&out);
         assert!(!s.contains("letrec"), "letrec must be consumed: {s}");
         assert!(!s.contains("get_prev_seq"), "guard must be consumed: {s}");
-        assert!(!s.contains("loop"), "the Loop carrier is retired: {s}");
-        assert!(
-            s.contains("transact"),
-            "should build a Transact carrier: {s}"
-        );
+        assert!(!s.contains("loop"), "the Loop node is retired: {s}");
+        assert!(s.contains("transact"), "should build a Transact: {s}");
         assert!(
             s.contains("variant_wrap(`commit)") && s.contains("writes:") && s.contains("`abort"),
             "writer body must terminate in a `` `commit(⟨writes⟩) | `abort `` decision: {s}"

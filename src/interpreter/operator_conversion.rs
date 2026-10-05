@@ -27,7 +27,7 @@ use crate::{
         Value,
         // The runtime commit engine. Its `TransactWriter` is the *operator*
         // (aliased `CommitWriter` to avoid clashing with the CCL `TransactWriter`
-        // node-field carrier imported from `ccl` above).
+        // node field imported from `ccl` above).
         commit_operator::{
             AsOf, AsOfField, CommitOperator, InductionDriver, InductionStore, StoreDenseRead,
             StoreFinalRead, StoreValueStream, TransactDriver, TransactWriter as CommitWriter,
@@ -148,8 +148,19 @@ fn compile_let_binding(
         keys,
         writers,
         domain,
+        parameter,
     } = &bound_expr.node
     {
+        // A **nested** `Transact` — an inner loop's, whose components all take the enclosing
+        // body's parameter — has no realization here: the store builds one engine, and a
+        // nested `Transact` is one per enclosing position.
+        if parameter.is_some() {
+            return Err(ConversionError::Unsupported(
+                "a nested `for` loop that writes a mutable variable compiles to a `Transact` per \
+                 enclosing position, and only a top-level `Transact` is realized"
+                    .to_string(),
+            ));
+        }
         ctx.bind_store(&binding.name, bound_expr, keys, writers, domain)?;
         return Ok(input);
     }

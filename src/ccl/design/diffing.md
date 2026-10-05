@@ -638,7 +638,7 @@ question, not which ones are well-formed.
 | `Channelize` | mutability eliminated, feeds routed | The compiler's shape rather than the user's — `For`/`MutWrite`/`Begin`/`Defer` are gone. Taken *before* the as-of-read rewrite. |
 | `AsOfRead` | fed-out mutable reads rewritten to as-of joins | **The last tree that still has binders**, and the one `lambda_elim` consumes. Fully typed and fully mutability-eliminated, while an edit still localizes the way it does at the phases above — see below. |
 | `LambdaElim` | point-free combinators | No binders in the term at all. |
-| `Planning` | recurrences on the `Transact` carrier, joins planned | The shape operator conversion consumes, and where compute sharing is decided. |
+| `Planning` | recurrences as `Transact` nodes, joins planned | The shape operator conversion consumes, and where compute sharing is decided. |
 
 A later phase carries signal the term structure alone does not: in `x = 1` /
 `(x, x)` versus `x = "a"` / `(x, x)` the bodies are structurally identical and

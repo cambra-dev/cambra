@@ -975,7 +975,7 @@ pub struct CompiledProgram {
     ///
     /// Walked from the compiled outputs before they are subscribed, which is the
     /// last point at which every operator still holds its inputs: `subscribe`
-    /// takes each `CycleSlot` and each store's `init_ops`. See
+    /// takes each `CycleSlot` and each store's keyed inputs. See
     /// [`operator_graph`](crate::interpreter::operator_graph).
     ///
     /// Retained unconditionally, unlike
@@ -1584,8 +1584,23 @@ fn settle(ir: &Expr, boundary: &str, check: Check) -> Result<(), Vec<CompileErro
         Check::PreChannelize => check_pre_channelize(ir),
         Check::Typed => typecheck(ir),
     };
-    outcome.unwrap_or_else(|errs| panic!("{boundary} produced an invalid tree: {errs:?}"));
+    outcome.unwrap_or_else(|errs| invalid_tree(ir, boundary, &errs));
     Ok(())
+}
+
+/// Report a wall failure, naming the boundary and dumping the tree behind
+/// `CAMBRA_DUMP_WALL`.
+///
+/// The errors name the two types that disagree but not where in the tree they sit, and a
+/// wall failure is a pass bug rather than a user one — so the tree is what localizes it.
+/// Behind an env var because it is one enormous line, and `settle`'s `debug!` of the same
+/// tree only reaches a caller that has a subscriber installed, which the test binaries do
+/// not.
+fn invalid_tree(ir: &Expr, boundary: &str, errs: &impl std::fmt::Debug) -> ! {
+    if std::env::var_os("CAMBRA_DUMP_WALL").is_some() {
+        eprintln!("{boundary} tree:\n{}", symbolic_typed(ir));
+    }
+    panic!("{boundary} produced an invalid tree: {errs:?}")
 }
 
 /// The two user-facing mutability rules, checked on the fully-typed,
@@ -2137,7 +2152,7 @@ fn run_passes(
     }
 
     // Recognition: lower each causal group — now in its point-free normal
-    // form — onto the domain-parameterized `Transact` carrier (a
+    // form — onto the domain-parameterized `Transact` (a
     // `get_prev_txn` transaction group → `Transact{Txn}`; a `get_prev_seq`
     // induction group → `Transact{iteration extent}`) so planning stages the
     // writer sources and operator conversion picks the engine on the domain.
@@ -2150,7 +2165,9 @@ fn run_passes(
     let join_planned = recorded(capture_provenance, Phase::Planning, || {
         let recognized = planning::plan_loops(lambda_elim);
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
-        typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
+        if let Err(errs) = typecheck(&recognized) {
+            invalid_tree(&recognized, "letrec recognition", &errs);
+        }
         planning::run(recognized)
     })
     .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
@@ -2358,7 +2375,7 @@ fn compile_version(
     // producer nobody reads.
     ctx.conversion_ctx().release_inheritance();
     // Before the subscribe loop below: `subscribe` takes every `CycleSlot` and
-    // every store's `init_ops`, so an operator asked for its inputs afterwards
+    // every store's keyed inputs, so an operator asked for its inputs afterwards
     // would answer without them.
     let operator_graph = boundary_session.into_graph(&per_field_ops);
     assert_graph_invariants(&operator_graph);

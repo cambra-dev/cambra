@@ -329,29 +329,11 @@ pub(super) fn lower_final_stmt(
                     };
                     return lower_generator_or_mutation_loop(&site, unit, ctx);
                 }
-                // Mirror `lower_middle_stmt`'s remaining mutation guards before
-                // the hidden-writer fallback below — the final-position path must
-                // reject the same mistaken shapes, not silently swallow them as
-                // no-op `For`s. A *nested* mutation of an outer name (under an
-                // `if`/inner `for`) is unsupported; a *plain* `=` to an outer name
-                // is a mistaken accumulator (`=` binds immutably, so it would be a
-                // per-iteration shadow silently discarding each update). Both
-                // otherwise reach the bare-effect hidden-writer path and compile
-                // to a silent no-op — the exact gap the generator path catches
-                // when a trailing read makes the loop non-final.
-                if let Some(nested) = find_nested_mutation_var(for_body, &scope) {
-                    return Err(LoweringError::unsupported(
-                        last.span,
-                        format!(
-                            "mutation of `{nested}` is nested inside an inner \
-                             `for` in this for-loop body; nested-loop mutation \
-                             is not yet supported (a conditional `if p: \
-                             {nested} += …` write is supported — only an inner \
-                             `for` is not).  Move the mutation to the outer loop \
-                             body, or rewrite using a generator expression."
-                        ),
-                    ));
-                }
+                // A *plain* `=` to an outer name is a mistaken accumulator (`=` binds
+                // immutably, so it would be a per-iteration shadow silently discarding each
+                // update). It would otherwise reach the bare-effect hidden-writer path below
+                // and compile to a silent no-op — the gap the generator path catches when a
+                // trailing read makes the loop non-final.
                 if let Some(name) = first_outer_plain_assign(for_body, &scope) {
                     return Err(outer_binding_write_error(last.span, name));
                 }
@@ -568,22 +550,7 @@ pub(super) fn lower_middle_stmt(
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
             if mut_annotation_parts(&annotation.ty, ctx).is_some() {
-                // `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut`
-                // annotation with the *immutable* `=` operator. This is
-                // contradictory under the cutover: `=` is a plain immutable
-                // binding, and every mutable (induction or transactional) is
-                // introduced solely with `:=`. Reject and point at `:=` (the
-                // value type — and `Txn` — still ride the annotation:
-                // `x: Mut(V) := init`, `x: Mut(V, Txn) := init`).
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    format!(
-                        "`{name}: Mut(…) = …` introduces a mutable with the immutable \
-                         `=` operator; use `:=` instead (e.g. `{name}: Mut(V) := init`, \
-                         `{name}: Mut(V, Txn) := init`, or a bare `{name} := init` to \
-                         infer the value type)"
-                    ),
-                ));
+                return Err(mut_decl_with_assign_error(stmt.span, &name));
             }
             let annotation_ty = lower_type_annotation(annotation, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
@@ -816,27 +783,6 @@ pub(super) fn lower_middle_stmt(
                 };
                 return lower_generator_or_mutation_loop(&site, body, ctx);
             }
-            // Top-level scan found nothing, but a *nested* `if` or
-            // `for` may still mutate an outer-scope variable — we
-            // don't yet support either of those (nested-for is
-            // future work; mutations under `if` need refinement
-            // propagation).  Reject early with a specific message
-            // so users don't see the generic "must end in yield"
-            // error from the generator-for fallback below.
-            if let Some(nested) = find_nested_mutation_var(for_body, &scope) {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    format!(
-                        "mutation of `{nested}` is nested inside an inner `for` \
-                     in this for-loop body; nested-loop mutation is not yet \
-                     supported (a conditional `if p: {nested} += …` write is \
-                     supported — only an inner `for` is not).  Move the mutation \
-                     to the outer loop body, or rewrite using a generator \
-                     expression."
-                    ),
-                ));
-            }
-
             // A plain `=` to a name bound *outside* the loop is not a mutable variable
             // write — `=` binds immutably, so it would be a per-iteration
             // shadow that silently discards each update (a mistaken
@@ -1062,6 +1008,24 @@ pub(super) fn check_mut_write_context(
         ));
     }
     Ok(())
+}
+
+/// Rejection for `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut` annotation with
+/// the *immutable* `=` operator.
+///
+/// Contradictory wherever it is written: `=` is a plain immutable binding, and every
+/// mutable variable is introduced solely with `:=`. The message points at `:=` rather than
+/// at the context, because the context does not change the answer — a loop body may
+/// introduce a mutable variable, and this spelling is wrong there too.
+pub(super) fn mut_decl_with_assign_error(span: Span, name: &str) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        format!(
+            "`{name}: Mut(…) = …` introduces a mutable with the immutable `=` operator; \
+             use `:=` instead (e.g. `{name}: Mut(V) := init`, `{name}: Mut(V, Txn) := \
+             init`, or a bare `{name} := init` to infer the value type)"
+        ),
+    )
 }
 
 /// Resolve the annotation on a `:=` **introduction** to `(value type, transactional?)`,

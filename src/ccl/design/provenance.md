@@ -485,7 +485,7 @@ snapshots: `infer/solve` (`mono.specialize`,
 `letrec.accumulator`, `letrec.feed`, `letrec.bare_write`,
 `letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
-key rebind, key-init stash, carrier, the cross-domain and await-final rules), and
+key rebind, key-init stash, store, the cross-domain and await-final rules), and
 `channelize` (`channelize.cluster`, `channelize.defer_lift`,
 `channelize.defer_collapse`), `transact_phase`'s as-of-read rewrite
 (`transact.as_of_read`), and `lambda_elim` (`lambda_elim.abstract`,
@@ -540,7 +540,7 @@ read `expr.node_id()` before the destructure.
 
 Four refinements the shapes above do not cover:
 
-- **A product spanning several nodes** — the transaction carrier is what a set of
+- **A product spanning several nodes** — the transaction's `Transact` is what a set of
   scattered `with begin():` blocks and register declarations collectively became.
   Parent it on the **outermost** node it replaces, never on a synthetic stand-in.
 - **The named node may be one the phase itself just minted**, provided it was

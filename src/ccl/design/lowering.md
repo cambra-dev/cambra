@@ -96,8 +96,10 @@ and [mut_elim: eliminating overwrite mutability](mutability.md#mut_elim-eliminat
 A generator with loop-carried mutation uses this `For` path and a synthesized result defer. Each
 `yield` feeds that defer. A conditional in a mutation loop becomes a statement-position `Case`
 whose branches contain statement chains. The merge of a write branch and its carry is constructed
-by `mut_elim`. A nested `for` is rejected anywhere in a mutation-loop body. A `with begin():`
-block nested inside such a conditional is also unsupported.
+by `mut_elim`. A nested `for`, at the body's top level or inside such a conditional, lowers as a
+loop of its own whose recurrence is nested in the enclosing one
+([ir.md](ir.md#transact--the-domain-parameterized-recurrence-carrier)). A `with begin():` block
+nested inside such a conditional is unsupported.
 
 ## Deferred collection operators — `defer` / `<<` / `<<=`
 

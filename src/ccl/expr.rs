@@ -435,24 +435,43 @@ pub enum TypedExprNode {
     /// no-conflict dual of the commit store); [`Type::Txn`] → the concurrent
     /// commit operator (multiple writers, serialize + retry).
     Transact {
-        /// The mutable variable keys — one per scalar mutable variable sharing this carrier's
-        /// sequencing domain. Each carries its position-0 `init` (the seed,
-        /// evaluated once outside every writer's parameter scope). The node
+        /// The mutable variable keys — one per scalar mutable variable sharing this node's
+        /// sequencing domain. Each carries its `init`, the seed: the value it holds before
+        /// the domain's first position. The node
         /// denotes the mutable variable **record** `{key.field_key(): Fun(domain, V)}`; a
-        /// variable read is a projection `__hist.key`. A single-key carrier is
+        /// variable read is a projection `__hist.key`. A single-key `Transact` is
         /// the one-accumulator case.
         keys: Vec<TransactKey>,
         /// The writers, in declaration order. Each reads/writes a footprint of
         /// keys (its read-set / write-set) and proposes a per-position decision
-        /// record. An induction-domain carrier has exactly one writer (a `mut`
+        /// record. An induction-domain `Transact` has exactly one writer (a `mut`
         /// loop, whose footprint is all its accumulators).
         writers: Vec<WriterSite>,
-        /// The carrier's **sequencing domain** — the index of every key's history
+        /// The node's **sequencing domain** — the index of every key's history
         /// `Fun(domain, V)`. A concrete iteration domain for a `mut`
         /// accumulator (the loop's induction domain); [`Type::Txn`] for a
         /// transactional commit clock (later increment). Op-conversion
         /// dispatches the engine on it.
         domain: Type,
+        /// A nested `Transact`'s **writer parameter** — the `(enclosing, position)` pair
+        /// `lambda_elim` merged the two loops' binders into — or `None` for a
+        /// top-level `Transact`, whose writers take the snapshot tuple alone.
+        ///
+        /// An inner loop is one recurrence per position of the loop around it, so a
+        /// nested `Transact` is the top-level `Transact` lifted **pointwise** over that
+        /// context: every component denotes under the enclosing argument what it
+        /// denotes on its own. Each key's `init` is `Fun(parameter, V)` — the inner
+        /// loop seeds from wherever the enclosing one had got to — and each writer's
+        /// `body` is `Fun((parameter, (snap…, item)), decision)`. The `source` is the
+        /// one component curried instead, `Fun(enclosing, Fun(domain, item))`, because
+        /// a collection is what it has to be for the planner to stage it.
+        ///
+        /// Stated rather than rebuilt from `enclosing` and `domain`, because the pair
+        /// carries refinements neither component does: `lambda_elim` lifts a filter on
+        /// the inner binder onto the pair, where it reads `__elem.1`, and a rebuilt
+        /// `(enclosing, domain)` drops it. The rebuilt type is the weaker one, so the
+        /// difference surfaces as the seed failing a check the body passes.
+        parameter: Option<Type>,
     },
 
     /// A mutually recursive definition group:
@@ -479,7 +498,7 @@ pub enum TypedExprNode {
     /// as causal groups. The group then travels — bodies point-freed — through
     /// `channelize` and `lambda_elim`; `planning::plan_loops` runs *after*
     /// `lambda_elim` on the point-free normal form and lowers every recognized
-    /// group onto the domain-parameterized [`Transact`](Self::Transact) carrier.
+    /// group onto the domain-parameterized [`Transact`](Self::Transact) node.
     /// A `LetRec` therefore does not survive to planning — a group reaching
     /// op-conversion unrecognized is treated as unreachable rather than guessed.
     ///
@@ -1064,7 +1083,7 @@ impl TypedExpr {
     /// Where Rust forces a copy to get a value out of a map or a slice and the
     /// source is then dropped, the copy is the node it came from:
     /// `transact_phase`'s key-init stash, whose rewritten seed replaces the entry
-    /// it was copied from, and its carrier binding list, borrowed from a plan
+    /// it was copied from, and its `Transact`'s binding list, borrowed from a plan
     /// that is placed exactly once. The discriminator is whether the source stays
     /// reachable, not whether the copy reaches the output — a copy that reaches
     /// the output beside a surviving source is a sibling and freshens.
@@ -1986,15 +2005,16 @@ impl TypedExpr {
     /// predicate riding one.
     ///
     /// **Coverage is exact — every variant, no exceptions**, including a
-    /// [`TypedExprNode::Transact`]'s `domain`. A `Transact` is born by
+    /// [`TypedExprNode::Transact`]'s `domain` and `parameter`. A `Transact` is born by
     /// `planning::plan_loops` and its sequencing domain is the extent of the source
     /// it iterates, refinements and all, so a `mut` accumulator over a filtered
     /// collection carries that filter's predicate there as well as on every other
-    /// slot the same extent reaches. `planning::compile_refinement_predicates`
+    /// slot the same extent reaches; a nested `Transact`'s `parameter` carries the same
+    /// filter again, lifted onto the pair. `planning::compile_refinement_predicates`
     /// rewrites predicates through this walk, and the post-planning `typecheck`
-    /// compares refinements by structural equality, so a domain this walk skipped
+    /// compares refinements by structural equality, so a slot this walk skipped
     /// would hold the bare predicate while its siblings hold the compiled one and
-    /// the carrier's own type would contradict its `domain`. The exhaustiveness
+    /// the node's own type would contradict it. The exhaustiveness
     /// this claims is checked, not asserted:
     /// `walk_type_slots_covers_every_carried_type_slot`.
     ///
@@ -2010,8 +2030,14 @@ impl TypedExpr {
         if let TypedExprNode::Cast { target, .. } = &self.node {
             f(target);
         }
-        if let TypedExprNode::Transact { domain, .. } = &self.node {
+        if let TypedExprNode::Transact {
+            domain, parameter, ..
+        } = &self.node
+        {
             f(domain);
+            if let Some(parameter) = parameter {
+                f(parameter);
+            }
         }
         self.walk_binders(|b| {
             f(&b.ty);
@@ -2032,8 +2058,14 @@ impl TypedExpr {
         if let TypedExprNode::Cast { target, .. } = &mut self.node {
             f(target);
         }
-        if let TypedExprNode::Transact { domain, .. } = &mut self.node {
+        if let TypedExprNode::Transact {
+            domain, parameter, ..
+        } = &mut self.node
+        {
             f(domain);
+            if let Some(parameter) = parameter {
+                f(parameter);
+            }
         }
         self.walk_binders_mut(|b| {
             f(&mut b.ty);
@@ -2143,8 +2175,8 @@ pub struct TransactKey {
     /// The key — the (α-uniquified) `Name` of the mutable variable. A read of the
     /// variable projects [`Name::field_key`] of the history record (`__hist.k`).
     pub name: Name,
-    /// The position-0 initial value (the scalar seed), evaluated once outside
-    /// every writer's scope. The key's history is `Fun(domain, V)`; a read is
+    /// The initial value (the scalar seed), evaluated once outside every writer's
+    /// scope: the value the key holds before its domain's first position. The key's history is `Fun(domain, V)`; a read is
     /// its latest value `V` (`final_or_default(history, init)`, defaulting to
     /// `init` when the mutable variable ran zero positions).
     pub init: TypedExpr,
@@ -2372,8 +2404,23 @@ mod tests {
             keys: Vec::new(),
             writers: Vec::new(),
             domain: marker("transact_domain"),
+            parameter: None,
         });
         txn.ty = marker("node_ty");
         assert_eq!(reached(&txn), vec!["node_ty", "transact_domain"]);
+
+        // A nested `Transact` carries its writers' parameter too, which holds the same
+        // filter lifted onto the pair.
+        let mut nested = TypedExpr::new(TypedExprNode::Transact {
+            keys: Vec::new(),
+            writers: Vec::new(),
+            domain: marker("transact_domain"),
+            parameter: Some(marker("writer_parameter")),
+        });
+        nested.ty = marker("node_ty");
+        assert_eq!(
+            reached(&nested),
+            vec!["node_ty", "transact_domain", "writer_parameter"]
+        );
     }
 }
