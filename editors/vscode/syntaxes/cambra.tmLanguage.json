@@ -1,0 +1,285 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Cambra",
+  "scopeName": "source.cambra",
+  "fileTypes": [
+    "cambra"
+  ],
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#string-double"
+    },
+    {
+      "include": "#string-single"
+    },
+    {
+      "include": "#decorator"
+    },
+    {
+      "include": "#function-definition"
+    },
+    {
+      "include": "#constant-boolean"
+    },
+    {
+      "include": "#keyword-control"
+    },
+    {
+      "include": "#keyword-other"
+    },
+    {
+      "include": "#builtin"
+    },
+    {
+      "include": "#variant-tag"
+    },
+    {
+      "include": "#type-hole"
+    },
+    {
+      "include": "#type-name"
+    },
+    {
+      "include": "#number"
+    },
+    {
+      "include": "#lambda"
+    },
+    {
+      "include": "#mutation"
+    },
+    {
+      "include": "#define"
+    },
+    {
+      "include": "#feed"
+    },
+    {
+      "include": "#operator-subtype"
+    },
+    {
+      "include": "#operator-arrow"
+    },
+    {
+      "include": "#operator-assignment-augmented"
+    },
+    {
+      "include": "#operator-comparison"
+    },
+    {
+      "include": "#operator-arithmetic"
+    },
+    {
+      "include": "#operator-logical"
+    },
+    {
+      "include": "#operator-assignment"
+    },
+    {
+      "include": "#operator-question"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.cambra",
+      "begin": "#",
+      "end": "$",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.comment.cambra"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#todo"
+        }
+      ]
+    },
+    "todo": {
+      "name": "keyword.other.todo.cambra",
+      "match": "\\b(?:TODO|FIXME|XXX)\\b"
+    },
+    "string-double": {
+      "name": "string.quoted.double.cambra",
+      "begin": "\"",
+      "end": "\"|$",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.cambra"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.cambra"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#escape"
+        }
+      ]
+    },
+    "string-single": {
+      "name": "string.quoted.single.cambra",
+      "begin": "'",
+      "end": "'|$",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.cambra"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.cambra"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#escape"
+        }
+      ]
+    },
+    "escape": {
+      "name": "constant.character.escape.cambra",
+      "match": "\\\\[ntr0\\\\\\\"']"
+    },
+    "decorator": {
+      "name": "meta.function.decorator.cambra",
+      "match": "(@)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "punctuation.definition.decorator.cambra"
+        },
+        "2": {
+          "name": "entity.name.function.decorator.cambra"
+        }
+      }
+    },
+    "function-definition": {
+      "match": "\\b(def)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.other.cambra"
+        },
+        "2": {
+          "name": "entity.name.function.cambra"
+        }
+      }
+    },
+    "constant-boolean": {
+      "name": "constant.language.boolean.cambra",
+      "match": "\\b(?:True|False)\\b"
+    },
+    "keyword-control": {
+      "name": "keyword.control.cambra",
+      "match": "\\b(?:if|elif|else|for|in|return|yield|match|case|pass|with)\\b"
+    },
+    "keyword-other": {
+      "name": "keyword.other.cambra",
+      "match": "\\b(?:def|where|and|or|not)\\b"
+    },
+    "builtin": {
+      "name": "support.function.builtin.cambra",
+      "match": "\\b(?:sum|max|groupby|set|map|box|empty_map|await_final|defer|begin|http_serve|test_sink|stdin)\\b"
+    },
+    "variant-tag": {
+      "name": "variable.other.enummember.cambra",
+      "match": "(`)[A-Za-z_][A-Za-z0-9_]*",
+      "captures": {
+        "1": {
+          "name": "punctuation.definition.variant.cambra"
+        }
+      }
+    },
+    "type-hole": {
+      "match": "(?:(?<=[:{])|(?<=^=>)|(?<=[^=<>!:+\\-*/^]=>))\\s*(_)(?![A-Za-z0-9_])",
+      "captures": {
+        "1": {
+          "name": "entity.name.type.cambra"
+        }
+      }
+    },
+    "type-name": {
+      "name": "entity.name.type.cambra",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+    "number": {
+      "name": "constant.numeric.integer.decimal.cambra",
+      "match": "\\b[0-9]+\\b"
+    },
+    "lambda": {
+      "name": "storage.type.function.lambda.cambra",
+      "match": "\\\\"
+    },
+    "mutation": {
+      "name": "keyword.other.mutation.cambra",
+      "match": ":="
+    },
+    "define": {
+      "name": "keyword.other.define.cambra",
+      "match": "<<="
+    },
+    "feed": {
+      "name": "keyword.other.feed.cambra",
+      "match": "<<"
+    },
+    "operator-subtype": {
+      "name": "keyword.operator.subtype.cambra",
+      "match": "<:"
+    },
+    "operator-arrow": {
+      "name": "keyword.operator.arrow.cambra",
+      "match": "->|=>"
+    },
+    "operator-assignment-augmented": {
+      "name": "keyword.operator.assignment.augmented.cambra",
+      "match": "//=|\\+=|-=|\\*=|\\^="
+    },
+    "operator-comparison": {
+      "name": "keyword.operator.comparison.cambra",
+      "match": "==|!=|<=|>=|<|>"
+    },
+    "operator-arithmetic": {
+      "name": "keyword.operator.arithmetic.cambra",
+      "match": "\\*\\*|//|\\+\\+|\\^\\+|\\+|-|\\*"
+    },
+    "operator-logical": {
+      "name": "keyword.operator.logical.cambra",
+      "match": "&|\\||\\^"
+    },
+    "operator-assignment": {
+      "name": "keyword.operator.assignment.cambra",
+      "match": "="
+    },
+    "operator-question": {
+      "name": "keyword.operator.question.cambra",
+      "match": "\\?"
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.element.cambra",
+          "match": ","
+        },
+        {
+          "name": "punctuation.terminator.statement.cambra",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.colon.cambra",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.accessor.cambra",
+          "match": "\\."
+        }
+      ]
+    }
+  }
+}

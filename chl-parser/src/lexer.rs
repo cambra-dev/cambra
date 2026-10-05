@@ -33,6 +33,8 @@ use std::fmt;
 /// directly by logos. `Indent`/`Dedent` are synthesised by the layout pass in
 /// [`tokenize`].
 #[derive(Logos, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// The tests enumerate every variant. A data field holds its `Default` value.
+#[cfg_attr(test, derive(strum::EnumIter))]
 #[logos(skip r"[ \t]+")] // horizontal whitespace inside a line
 #[logos(skip r"#[^\n]*")] // comments (excluding the terminating newline)
 pub enum Token {
@@ -240,6 +242,35 @@ pub enum Token {
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*", |lex| SmolStr::from(lex.slice()), priority = 2)]
     Ident(SmolStr),
 }
+
+/// Every keyword spelling and the token it lexes to: the identifier-shaped
+/// spellings that lex as something other than [`Token::Ident`].
+///
+/// The editor grammars under `editors/` list the same spellings, and
+/// `tests/editor_grammars.rs` fails when either grammar differs from this
+/// table. `True` and `False` are listed here although the grammars highlight
+/// them as constants rather than as keywords. It is public for the planned
+/// language server (`editors/README.md`).
+pub const KEYWORDS: &[(&str, Token)] = &[
+    ("True", Token::True),
+    ("False", Token::False),
+    ("where", Token::Where),
+    ("and", Token::And),
+    ("or", Token::Or),
+    ("not", Token::Not),
+    ("if", Token::If),
+    ("elif", Token::Elif),
+    ("else", Token::Else),
+    ("for", Token::For),
+    ("in", Token::In),
+    ("def", Token::Def),
+    ("return", Token::Return),
+    ("yield", Token::Yield),
+    ("pass", Token::Pass),
+    ("with", Token::With),
+    ("match", Token::Match),
+    ("case", Token::Case),
+];
 
 /// User-facing rendering of a token, used by the parser's `Rich` error
 /// formatter. Returns the bare symbol or literal text — chumsky's error
@@ -783,6 +814,108 @@ mod tests {
                 Token::Newline,
             ]
         );
+    }
+
+    #[test]
+    fn every_keyword_spelling_lexes_to_its_token() {
+        for (spelling, token) in KEYWORDS {
+            assert_eq!(
+                tokens(spelling),
+                vec![token.clone(), Token::Newline],
+                "`{spelling}` does not lex to its KEYWORDS token"
+            );
+            assert_eq!(token.to_string(), *spelling);
+        }
+    }
+
+    /// Whether `token` is a keyword: an identifier-shaped spelling that lexes
+    /// as something other than [`Token::Ident`]. The match has no wildcard arm,
+    /// so a new variant does not compile until it is classified here.
+    fn is_keyword(token: &Token) -> bool {
+        match token {
+            Token::True
+            | Token::False
+            | Token::Where
+            | Token::And
+            | Token::Or
+            | Token::Not
+            | Token::If
+            | Token::Elif
+            | Token::Else
+            | Token::For
+            | Token::In
+            | Token::Def
+            | Token::Return
+            | Token::Yield
+            | Token::Pass
+            | Token::With
+            | Token::Match
+            | Token::Case => true,
+            Token::Newline
+            | Token::Indent
+            | Token::Dedent
+            | Token::LShiftEq
+            | Token::LShift
+            | Token::EqEq
+            | Token::NotEq
+            | Token::LtE
+            | Token::LtColon
+            | Token::GtE
+            | Token::PlusPlus
+            | Token::PlusEq
+            | Token::CaretPlus
+            | Token::CaretEq
+            | Token::MinusEq
+            | Token::Arrow
+            | Token::DoubleArrow
+            | Token::StarStar
+            | Token::StarEq
+            | Token::DoubleSlashEq
+            | Token::DoubleSlash
+            | Token::Plus
+            | Token::Minus
+            | Token::Star
+            | Token::Amp
+            | Token::Pipe
+            | Token::Caret
+            | Token::Eq
+            | Token::Lt
+            | Token::Gt
+            | Token::LParen
+            | Token::RParen
+            | Token::LBracket
+            | Token::RBracket
+            | Token::Question
+            | Token::LBrace
+            | Token::RBrace
+            | Token::Comma
+            | Token::Colon
+            | Token::ColonEq
+            | Token::Dot
+            | Token::Backtick
+            | Token::Semi
+            | Token::Backslash
+            | Token::At
+            | Token::Int(_)
+            | Token::String(_)
+            | Token::Ident(_) => false,
+        }
+    }
+
+    /// `KEYWORDS` lists a variant exactly when [`is_keyword`] classifies it as
+    /// one, each variant once.
+    #[test]
+    fn keywords_lists_exactly_the_keyword_variants() {
+        use strum::IntoEnumIterator;
+        for token in Token::iter() {
+            let rows = KEYWORDS.iter().filter(|(_, t)| *t == token).count();
+            assert_eq!(
+                rows,
+                usize::from(is_keyword(&token)),
+                "{token:?}: {rows} KEYWORDS rows, is_keyword = {}",
+                is_keyword(&token)
+            );
+        }
     }
 
     /// `where` separates a refinement's base type from its predicate

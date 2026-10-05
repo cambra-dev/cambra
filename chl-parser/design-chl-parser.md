@@ -48,6 +48,10 @@ keywords, identifiers, integer and string literals (both `"…"` and `'…'`),
 all CHL operators and punctuation, plus a physical `Newline` token.
 Comments (`# …`) and inline whitespace (`' '`, `'\t'`) are skipped.
 
+`KEYWORDS` lists every keyword spelling with its token. The editor grammars
+under `editors/` list the same spellings, and `tests/editor_grammars.rs` fails
+when they differ ([editors/README.md](../editors/README.md#highlight-classes)).
+
 A layout post-pass then walks that stream and:
 
 - tracks bracket depth (`(`, `[`, `{`) and **suppresses newlines inside
