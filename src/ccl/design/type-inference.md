@@ -1690,9 +1690,9 @@ situation can arise after pairing and currying introduce a parameter for a point
 ### Scoped inference variables: a stored bound closes against a telescope
 
 An inference variable carries the term-binder telescope at its creation. A bound can refer to
-those names or to binders discharged by its edge substitutions. Separately, references bound by
-functions inside a stored type use Pi indices. These mechanisms let the solver check scope at
-record time and compare closed types without depending on their binder spellings.
+those names or to any binder of its edge substitutions, renames included. Separately, references
+bound by functions inside a stored type use Pi indices. These mechanisms let the solver check
+scope at record time and compare closed types without depending on their binder spellings.
 
 A group-by annotation can place its refinement on a variable outside the function node that
 visually contains the key binder. The variable's telescope, not that node's shape, determines
@@ -1739,7 +1739,8 @@ not prove every later rewrite preserves lexical scope, so neither check is redun
 The representation is locally nameless:
 
 - A reference to a surrounding telescope entry is a free, uniquified `Name`. Each variable
-  receiving a bound checks that name against its own telescope or the edge's discharge domains.
+  receiving a bound checks that name against its own telescope or against any binder of either
+  edge substitution, renames included.
 - A reference bound by a function inside the type is `Name::PiBound(PiRef)`. Its index counts
   enclosing function-codomain crossings to that function. Function domains do not enter their
   own term binder's scope.
@@ -1998,11 +1999,21 @@ collection. Record width subtyping does not have this effect: a record consumer 
 fields named by its contract. Collection transformations also reproduce their input domain in
 their output, so the domain cannot be treated solely as a contravariant input parameter.
 
-The same requirement applies at joins. Collections with unequal domains are not silently narrowed
-to a common prefix or given an implicit sum. Programs that combine them need the explicit boxing
-described under [The domain join needs `box`](#the-domain-join-needs-box).
-Accepting arbitrary extents is a polymorphism problem; taking a prefix requires an explicit
-operation. Neither requires a subtype coercion that silently drops rows.
+The same requirement applies at joins. Subtyping and joining are one order, so a contravariant
+data domain would also change what a join computes. Under contravariance the join of the arms of
+`[1,2] if c else [1,2,3]` is `[0,1] ⤇ Int`, and `sum` of it returns `3` even when the else-arm
+ran, with nothing in the type recording the dropped row. Under invariance the two collections are
+incomparable, so they have no join and the conditional is rejected. Programs that combine them
+need the explicit boxing described under [The domain join needs `box`](#the-domain-join-needs-box),
+whose Σ over both domains loses no row.
+
+The rule holds when a data domain becomes writable in the surface language, as
+[`Array(𝑛, 𝑇)`](../../../docs/chl-spec.md#63-direction-collection-types-decided), a collection of
+`𝑛` values with `𝑛` known at compile time, would make it. The two things a contravariant domain
+would provide have explicit forms. A function accepting every length is the scheme
+`∀𝑛. Array(𝑛, 𝑇) ⇒ …`, which the solver freshens per use; a subsumption edge relates one pair of
+extents at one site. A prefix is a term that takes the rows it wants, so the truncation is visible
+at the use site rather than hidden in a declaration.
 
 The function constraint arm first relates kinds. If either resolved kind is data, it uses the
 invariant-domain path:
