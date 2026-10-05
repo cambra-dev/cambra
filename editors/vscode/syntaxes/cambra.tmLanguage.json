@@ -103,7 +103,7 @@
     },
     "todo": {
       "name": "keyword.other.todo.cambra",
-      "match": "\\b(?:TODO|FIXME|XXX)\\b"
+      "match": "(?<![A-Za-z0-9_])(?:TODO|FIXME|XXX)(?![A-Za-z0-9_])"
     },
     "string-double": {
       "name": "string.quoted.double.cambra",
@@ -151,12 +151,15 @@
     },
     "decorator": {
       "name": "meta.function.decorator.cambra",
-      "match": "(@)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "match": "((@))\\s*([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": {
-          "name": "punctuation.definition.decorator.cambra"
+          "name": "entity.name.function.decorator.cambra"
         },
         "2": {
+          "name": "punctuation.definition.decorator.cambra"
+        },
+        "3": {
           "name": "entity.name.function.decorator.cambra"
         }
       }

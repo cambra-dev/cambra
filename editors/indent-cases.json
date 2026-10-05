@@ -1,0 +1,183 @@
+{
+  "cases": [
+    {
+      "name": "a def header opens a block",
+      "lines": ["def f(x):"],
+      "indent": 4,
+      "next": "return x"
+    },
+    {
+      "name": "a header's trailing comment is ignored",
+      "lines": ["def f(x):  # entry"],
+      "indent": 4,
+      "next": "return x"
+    },
+    {
+      "name": "a nested for header opens a block",
+      "lines": ["def f(xs):", "    for x in xs:"],
+      "indent": 8,
+      "next": "yield x"
+    },
+    {
+      "name": "an if header opens a block",
+      "lines": ["def f(c):", "    if c:"],
+      "indent": 8,
+      "next": "return 1",
+      "rest": ["    return 0"]
+    },
+    {
+      "name": "return dedents",
+      "lines": ["def f(c):", "    if c:", "        return 1"],
+      "indent": 4,
+      "next": "return 0"
+    },
+    {
+      "name": "pass dedents",
+      "lines": ["def f():", "    pass"],
+      "indent": 0,
+      "next": "x = 1"
+    },
+    {
+      "name": "an elif header opens a block",
+      "lines": ["def f(c, d):", "    if c:", "        return 1", "    elif d:"],
+      "indent": 8,
+      "next": "return 2",
+      "rest": ["    return 0"]
+    },
+    {
+      "name": "an else header opens a block",
+      "lines": ["def f(c):", "    if c:", "        return 1", "    else:"],
+      "indent": 8,
+      "next": "return 0"
+    },
+    {
+      "name": "a match statement's arms sit one level in",
+      "lines": ["def f(o):", "    match o:"],
+      "indent": 8,
+      "next": "case `some(v):",
+      "rest": ["            return v", "        case `none:", "            return 0"]
+    },
+    {
+      "name": "a case arm opens a block",
+      "lines": ["def f(o):", "    match o:", "        case `some(v):"],
+      "indent": 12,
+      "next": "return v",
+      "rest": ["        case `none:", "            return 0"]
+    },
+    {
+      "name": "an if on the right of an assignment indents its body two levels",
+      "lines": ["def f(c):", "    label = if c:"],
+      "indent": 12,
+      "next": "1",
+      "rest": ["        else:", "            2", "    return label"]
+    },
+    {
+      "name": "the else of an if on the right of an assignment opens a block",
+      "lines": ["def f(c):", "    label = if c:", "            1", "        else:"],
+      "indent": 12,
+      "next": "2",
+      "rest": ["    return label"]
+    },
+    {
+      "name": "an if on the right of an augmented assignment indents its body two levels",
+      "lines": ["def f(c):", "    total = 0", "    total += if c:"],
+      "indent": 12,
+      "next": "1",
+      "rest": ["        else:", "            2", "    return total"]
+    },
+    {
+      "name": "a match on the right of an assignment indents its arms one level",
+      "lines": ["def f(x):", "    y = match x:"],
+      "indent": 8,
+      "next": "case `some(v):",
+      "rest": ["            v + 1", "        case `none:", "            0", "    return y"]
+    },
+    {
+      "name": "a def header spanning lines inside brackets indents from its first line",
+      "lines": ["def f(a,", "      b):"],
+      "indent": 4,
+      "next": "return a",
+      "expected_failures": {
+        "vscode": "indents one level past the header's last line, to the tab stop at column 8"
+      }
+    },
+    {
+      "name": "inside an unclosed bracket, the previous line's indent",
+      "lines": ["def f(a):", "    x = g(a,"],
+      "indent": 4,
+      "next": "a)",
+      "rest": ["    return x"]
+    },
+    {
+      "name": "after a line ending in an open bracket, the previous line's indent",
+      "lines": ["def f(a):", "    x = g("],
+      "indent": 4,
+      "next": "a)",
+      "rest": ["    return x"],
+      "expected_failures": {
+        "vscode": "its bracket rule indents one level after a line ending in an open bracket, to column 8"
+      }
+    },
+    {
+      "name": "after a bracket closes, the indent of the line that opened it",
+      "lines": ["def f(a):", "    x = g(a,", "          a)"],
+      "indent": 4,
+      "next": "return x",
+      "expected_failures": {
+        "vscode": "indents from the expression's last line, to column 10"
+      }
+    },
+    {
+      "name": "a return that leaves a bracket open does not dedent",
+      "lines": ["def f(a):", "    return g(a,"],
+      "indent": 4,
+      "next": "a)",
+      "expected_failures": {
+        "vscode": "its outdent rule exempts only a line ending in an open bracket, so it outdents to column 0"
+      }
+    },
+    {
+      "name": "a colon inside a comment opens no block",
+      "lines": ["def f(x):", "    y = x  # note:"],
+      "indent": 4,
+      "next": "return y"
+    },
+    {
+      "name": "a bracket inside a comment is not open",
+      "lines": ["def f(x):", "    y = x  # see g("],
+      "indent": 4,
+      "next": "return y"
+    },
+    {
+      "name": "a colon inside a string opens no block",
+      "lines": ["def f(x):", "    y = \"a:\""],
+      "indent": 4,
+      "next": "return y"
+    },
+    {
+      "name": "a bracket inside a string is not open",
+      "lines": ["def f(x):", "    y = \"(\" + '['"],
+      "indent": 4,
+      "next": "return y"
+    },
+    {
+      "name": "a # inside a string starts no comment",
+      "lines": ["def f(s):", "    if s == \"#\":"],
+      "indent": 8,
+      "next": "return 1",
+      "rest": ["    return 0"],
+      "expected_failures": {
+        "vscode": "its rules read a # anywhere as a comment, so the header's : does not count"
+      }
+    },
+    {
+      "name": "mixed quotes pair left to right",
+      "lines": ["def f(g):", "    x = '\"' + g('\"') + g(", "        1)"],
+      "indent": 4,
+      "next": "return x",
+      "expected_failures": {
+        "vscode": "indents from the expression's last line, to column 8"
+      }
+    }
+  ]
+}

@@ -44,7 +44,10 @@ syn match cambraEscape +\\[ntr0\\"']+ contained
 " A string literal ends on its line, so an unterminated one stops at the line end.
 syn region cambraString start=+"+ skip=+\\.+ end=+"+ end=+$+ contains=cambraEscape
 syn region cambraString start=+'+ skip=+\\.+ end=+'+ end=+$+ contains=cambraEscape
-syn keyword cambraTodo TODO FIXME XXX contained
+" A word is bounded by characters other than ASCII letters, digits and `_`, as
+" in the lexer's `todo_words`; `syn keyword` would use 'iskeyword' instead. `\Z`
+" lets the word end on a letter that carries a combining mark.
+syn match cambraTodo "\Z[A-Za-z0-9_]\@1<!\%(TODO\|FIXME\|XXX\)[A-Za-z0-9_]\@!" contained
 syn match cambraComment "#.*$" contains=cambraTodo
 
 hi def link cambraBoolean Boolean

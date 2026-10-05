@@ -52,6 +52,13 @@ Comments (`# …`) and inline whitespace (`' '`, `'\t'`) are skipped.
 under `editors/` list the same spellings, and `tests/editor_grammars.rs` fails
 when they differ ([editors/README.md](../editors/README.md#highlight-classes)).
 
+`highlight` maps source to highlight spans: each logos token's
+`HighlightClass` from `highlight_class`, with string escapes, comments and the
+`TODO_WORDS` inside comments as spans of their own. An identifier that
+`SurfaceBuiltin::from_name` resolves is a `Builtin`. `./ci.sh editors` checks
+both editor grammars against it
+([editors/README.md](../editors/README.md#editor-highlight-check)).
+
 A layout post-pass then walks that stream and:
 
 - tracks bracket depth (`(`, `[`, `{`) and **suppresses newlines inside
