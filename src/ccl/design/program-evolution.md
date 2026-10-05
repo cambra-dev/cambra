@@ -91,8 +91,7 @@ branch name the table does not hold, and 503 or 500 for a request the program dr
 answered. A tombstoned name is one the table does not hold. A path segment in a `<name>` position
 that is not a valid `<name>` is an unknown path, so it answers 404. Segments are read by position,
 so a branch may be named `delete`, `info` or `from`. A refusal's body names what was refused and
-why.
-`/branch/<name>/delete`, `/branch/<name>/info`, `/branches/list` and `/diff/<branch>/<branch>`
+why. `/branch/<name>/delete`, `/branch/<name>/info`, `/branches/list` and `/diff/<branch>/<branch>`
 ignore the request body.
 
 ### `/diff`
@@ -135,8 +134,8 @@ table, so creating it succeeds and continues the tombstone's numbering. A 200 re
 created `<name>@<n>` from `<parent>@<m>` ``, a newline, and the reply `/reload` gives.
 
 **Delete** removes `<name>`'s entry and leaves its tombstone, per [Deleting a
-branch](#deleting-a-branch). It is refused for a name the table does not hold and for the last
-branch in the table. Every other deletion is allowed, pending [Branch
+branch](#deleting-a-branch). It answers 404 for a name the table does not hold, and is refused with
+400 for the last branch in the table. Every other deletion is allowed, pending [Branch
 protection](#branch-protection). A 200 reply reads `` deleted branch `<name>` ``.
 
 **Info** replies with the branch's `/branches/list` line, a blank line, one line per version of the
@@ -208,16 +207,21 @@ decided, the one built-in rule is that the last branch in the table cannot be de
 > `a_recreated_name_continues_its_tombstones_numbering`,
 > `deleting_a_branch_frees_only_what_no_other_entry_holds`, `the_last_branch_cannot_be_deleted`,
 > `a_lagging_branch_does_not_make_a_reload_fold_twice`,
-> `a_lagging_branch_does_not_make_a_new_branch_fold_twice` and
-> `the_driver_pulls_every_branch_and_exits_when_all_have_finished`.
+> `a_lagging_branch_does_not_make_a_new_branch_fold_twice`,
+> `a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it` and
+> `the_driver_pulls_every_branch_and_exits_when_all_have_finished`. A reload that keeps an iteration
+> another branch also reads folds elements twice, the pinned failure
+> `a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice`, per [Routes across
+> branches](#routes-across-branches).
 
 **A branch's entry is its branch provenance, its version number, its version, and the operators it
-holds.** The version is what a `LiveProgram` holds today: the `CompiledProgram` (source, tree,
-outputs) and the main producer. The entry therefore keeps its current version's source, and a
-version's source is dropped when a reload replaces it. The operators are what `Inheritance::entries`
-holds today, a map from a node of the entry's tree to the `Recorded` operator or store built from
-it, together with the sink consumers of the entry's outputs. The recorded `NodeId`s are addresses
-into the entry's tree, so the entry holds that tree by reference and a copied entry shares it.
+holds.** The entry is a `Branch` in `LiveProgram`. Its version is the `CompiledProgram` (source,
+tree, outputs) and the `main` output's producer. The entry therefore keeps its current version's
+source, and a version's source is dropped when a reload replaces it. Its operators are its record,
+an `Inheritance`: a map from a node of the entry's tree to the `Recorded` operator or store built
+from it. Its sink consumers are those of its version's outputs. The recorded `NodeId`s are addresses
+into the tree of the compile that recorded them, which is the entry's own, so each entry keeps its
+own tree.
 
 **A branch's version number rises by one at each reload, and a name's numbering survives the
 branch's deletion.** Deleting a branch leaves a tombstone holding its last version number, and a
@@ -228,10 +232,12 @@ version its parent has since replaced, or a branch since deleted.
 **An operator lives as long as some branch holds it.** An entry holds each `Recorded::Operator` by
 its `Rc<FanOut>`, and each fan-out owns the chain under it, per [Nothing inside a fan-out owns
 it](#nothing-inside-a-fan-out-owns-it). Dropping an operator from one entry therefore frees it only
-when no other entry holds it. A sink consumer needs an explicit `SinkConsumer::detach` to stop
-dispatch, and a branch detaches only the sink consumers no other entry holds. Every sink consumer is
-built by the compile that installs one entry's version, branch-and-reload's included, so no two
-entries hold one and a teardown detaches all of its own (`Branch::tear_down`).
+when no other entry holds it.
+
+**A sink consumer belongs to exactly one entry.** It is built by the compile that installs one
+entry's version, branch-and-reload's included, and only that entry holds it. A sink consumer needs
+an explicit `SinkConsumer::detach` to stop dispatch, and a teardown detaches every sink consumer of
+its branch (`Branch::tear_down`).
 
 ![An operator graph beside its branch table: main holds r1, r2 and r3; v1, v2 and v3 each hold the part of that chain they share with it and their own ember nodes g1, b1 to b2, and o1](img/branch-table.svg)
 
@@ -292,7 +298,8 @@ the original. No reload makes two branches share a store again.
 Every other entry holding the spent operator keeps it. The rebuilt term reads no source, so both
 compute one value, per [A binding whose operator is spent is rebuilt, not
 changed](#a-binding-whose-operator-is-spent-is-rebuilt-not-changed). A reload never changes another
-branch's entry.
+branch's entry. This follows from the reload reading only its own entry, and no test holds a spent
+operator in two entries.
 
 ### A reload changes no other branch
 
@@ -304,13 +311,14 @@ reload diffs against its own version, so a parent's reload never has to be follo
 the `released_position` of every fan-out it reads stops rising, per [Guards intersect at a
 fan-out](#guards-intersect-at-a-fan-out). The next reload of any branch that keeps such a fan-out
 would then resume those iterations below where that branch had reached, and decide positions a
-second time. A branch's outputs stay subscribed and pulled for as long as its entry exists. The
-binary's driver pulls every branch's `main` output (`LiveProgram::pull_mains`), and prints a value
-from a branch other than the root as `Got value from <branch>: …`. The root is the branch with no
-branch provenance, so a branch created under the name `main` after the root's deletion prints
-labelled. A version whose `main` output has finished is no longer pulled. The process exits when
-every branch's `main` output has finished and every branch's sink outputs have signalled
-completion, which a sink program serving a route never does.
+second time (`a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice`). A branch's outputs
+stay subscribed and pulled for as long as its entry exists. The binary's driver pulls every branch's
+`main` output (`LiveProgram::pull_mains`), and prints a value from a branch other than the root as
+`Got value from <branch>: …`. The root is the branch with no branch provenance, so a branch created
+under the name `main` after the root's deletion prints labelled. A version whose `main` output has
+finished is no longer pulled. The process exits when every branch's `main` output has finished and
+every branch's sink outputs have signalled completion, which a sink program serving a route never
+does.
 
 ![main's operator graph with branch_1 hanging off n1, then the same graph after main's reload: n4 to n6 built, n1 kept, n2 and n3 freed](img/branching-flow.svg)
 
@@ -326,10 +334,10 @@ The root's entries, before and after its reload from `main@1` to `main@2`:
 
 ### Deleting a branch
 
-**Deleting a branch removes its entry and leaves its tombstone.** Its outputs are dropped and its
-sink consumers detached where no other entry holds them. Its operators are freed where no other
-entry holds them, and a freed producer's `Drop` returns its release record to the source it read,
-per [Retention is the agreement, and a record dies with its
+**Deleting a branch removes its entry and leaves its tombstone.** Its outputs are dropped and every
+sink consumer it holds is detached. Its operators are freed where no other entry holds them, and a
+freed producer's `Drop` returns its release record to the source it read, per [Retention is the
+agreement, and a record dies with its
 producer](#retention-is-the-agreement-and-a-record-dies-with-its-producer). Each route no remaining
 branch binds is retired, per [Routes across branches](#routes-across-branches).
 
@@ -358,9 +366,10 @@ it carries already summarizes, and a store rebuilt from that state would fold th
 `carry_release_to_new_producers` therefore records, per source, the intersection of the
 predecessor's producers' releases, and the source's own agreement goes on governing retention only.
 A predecessor with no producer on a source records the agreement there. Every branch reading a
-source reads it through its own producer, and no producer's progress advances another's view
-(`a_lagging_branch_does_not_make_a_reload_fold_twice`,
-`a_lagging_branch_does_not_make_a_new_branch_fold_twice`).
+source reads it through its own producer, and at the source no producer's progress moves where
+another branch's new producers start (`a_lagging_branch_does_not_make_a_reload_fold_twice`,
+`a_lagging_branch_does_not_make_a_new_branch_fold_twice`). A fan-out two branches share does not
+keep that separation, per the note below.
 
 **A branch's producers are the ones its version's compile registered and the ones under the
 operators it holds.** A producer registers with a source from `IterateExtent::subscribe`, which
@@ -372,10 +381,15 @@ outputs' producers. The carry runs before the reloaded branch's teardown, becaus
 its outputs' producers and a record dies with its producer. A producer that registers outside every
 frame, which only a subscription made outside a compile does, is attributed to no branch.
 
-> **Open: a fan-out seeds a new subscriber from every branch's slots.** A rebuilt reader
-> subscribing to a kept fan-out starts at `FanOutShared::released`, the intersection over every
-> slot, so another branch's lagging slot holds it down the way a lagging producer would hold down a
-> source. The one-branch form of this is the pinned failure in `tests/hot_reload/fanout_lag.rs`.
+> **Open: a fan-out reads its release off every branch's slots.** A rebuilt reader subscribing to a
+> kept fan-out starts at `FanOutShared::released`, the intersection over every slot, so another
+> branch's lagging slot holds it down the way a lagging producer would hold down a source. The
+> one-branch form of this is the pinned failure in `tests/hot_reload/fanout_lag.rs`. A rebuilt store
+> over a kept iteration resumes one past `FanOut::released_position`, which is the highest position
+> that same intersection has named, so a lagging slot holds the resume position down too and the
+> store folds the positions between a second time
+> (`a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice`). The fix is a per-reader
+> release view at the fan-out, as `carry_release_to_new_producers` is at the source.
 
 **Every branch pins retention for every other.** A source keeps an element until every branch's
 producer releases it, so a slow branch holds memory for all of them, until it is reloaded or
@@ -386,7 +400,11 @@ costs its compute and retention until every entry holding it has dropped it.
 
 > **Status: [Decided]** for every branch, and for branch-and-reload against its parent's tree and
 > entry (`a_childs_reload_keeps_its_own_accumulated_value`,
-> `branch_and_reload_creates_a_branch_forked_from_its_parent`).
+> `branch_and_reload_creates_a_branch_forked_from_its_parent`), except a reload that keeps an
+> iteration another branch also reads. That reload resumes the iteration below where the reloaded
+> branch had reached and folds elements twice, the pinned failure
+> `a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice`, per [Routes across
+> branches](#routes-across-branches).
 
 A reload drops the running version's subscriptions and then builds the replacement's, so one
 version's graph is subscribed at a time and nothing observes a half-swapped one. What crosses the
@@ -432,11 +450,12 @@ A loop driver has finished a row its source's filter removed once it reads past 
 that row too (`test_filtered_rows_of_a_live_transaction_source_are_released`). Under an induction
 loop the store decides such a row as well, so the reads of the store emit or release it like any
 other position (`test_filtered_rows_of_a_live_induction_source_are_released`). A source seeds a
-newly registered producer from the release every reader agrees on (`ProducerReleases`), so once
-every other reader of the source has released such a row as well, a replacement version is not
-offered it, even where the replacement's filter would keep it. A read of a loop's final value
-keeps the newest position it has seen, since the final value may be there, so a replacement is
-offered that row (`a_filter_edit_offers_only_the_rows_a_reader_holds`).
+newly registered producer from the intersection of the releases of the predecessor's producers
+(`ProducerReleases::carry_to_new_producers`), so once every one of those producers has released such
+a row as well, a replacement version is not offered it, even where the replacement's filter would
+keep it. A read of a loop's final value keeps the newest position it has seen, since the final value
+may be there, so a replacement is offered that row
+(`a_filter_edit_offers_only_the_rows_a_reader_holds`).
 
 Nothing establishes a frontier across the graph. Each rebuilt operator resumes wherever its own
 input still has work, and two of them can resume at unrelated positions in unrelated inputs.
@@ -693,9 +712,9 @@ in its neighbour's variable is receivable, so takeover does not catch it. It is 
 refusals of [Five refusals](#five-refusals).
 
 `LiveProgram::check` runs both checks before anything is torn down, for `reload_branch` and
-`create_branch` alike. It compares the variables the
-predecessor holds against those the new version declares, read off its planned tree
-(`OpConversionContext::state_conflicts`). A refused reload leaves every branch whole and serving.
+`create_branch` alike. It compares the variables the predecessor holds against those the new version
+declares, read off its planned tree (`OpConversionContext::state_conflicts`). A refused reload
+leaves every branch whole and serving.
 
 ### Inherit and load
 
@@ -912,6 +931,14 @@ a newly registered producer runs below the store's resume position rather than d
 a drive holds the input it reads one position back through, so the drive holds those elements
 without re-deciding them.
 
+A store over a rebuilt iteration over a source resumes one past the last position its predecessor
+decided. Its resume position is `first_position_for_a_new_producer`, one past what the predecessor's
+producers released, and an induction drive releases its source through the position it has emitted
+(`InductionDriverProducer::reclaim_consumed`). The store seeded with the carried value therefore
+decides each later position once. A fold of `1, 2, 4, 8` whose iteration a reload or branch-and-reload rebuilds
+before `16` arrives folds only `16` on top of the carried `15`
+(`a_rebuilt_iteration_resumes_one_past_its_predecessors_last_position`).
+
 ### A variable that begins above its loop's input
 
 A recurrence starts at a position and folds upward from it, so which position it starts at and what
@@ -921,7 +948,10 @@ sequence, and a store's variables share it.
 A variable **carrying a value**, inherited or loaded, has had every position that value summarizes
 folded into it. Its loop takes the retired iteration and starts one above what that iteration
 released, so no element is folded twice. That is property 1 of
-[Reload](/docs/operational-semantics/semantics.md#4-reload).
+[Reload](/docs/operational-semantics/semantics.md#4-reload). A loop whose iteration the reload
+rebuilds does not take the retired iteration. Over a source it starts one past the last position the
+retired iteration decided, per [Where a rebuilt store picks up](#where-a-rebuilt-store-picks-up), so
+no element is folded twice there either.
 
 A variable **carrying nothing** starts at its declared value, which summarizes no position, so it
 wants its loop's input from the beginning. It gets that only where the loop's input is rebuilt,
@@ -952,7 +982,13 @@ and the input reads a source), and `a_loop_added_over_a_buildable_collection_rep
 
 ## The reload lifecycle
 
-> **Status: [Decided]** for every branch's reload and for branch-and-reload.
+> **Status: [Decided]** for every branch's reload and for branch-and-reload, pinned by the cases
+> each step cites and by `a_childs_reload_keeps_its_own_accumulated_value`,
+> `branch_and_reload_creates_a_branch_forked_from_its_parent`,
+> `a_refused_branch_and_reload_leaves_no_entry` and
+> `a_lagging_branch_does_not_make_a_reload_fold_twice`. A reload that keeps an iteration another
+> branch also reads is excluded: it folds elements twice
+> (`a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice`, a pinned failure).
 
 A reload is a **swap**: the reloaded branch's subscriptions are dropped and the replacement's are
 built, so one version of that branch is subscribed at a time and nothing observes a half-swapped
@@ -970,10 +1006,11 @@ one.
 3. Record, for each source, where producers registering from then on start
    (`GlobalContext::carry_release_from`, `carry_release_to_new_producers`): where the predecessor's
    producers stopped, per [Routes across branches](#routes-across-branches). This runs while the
-   predecessor's producers all exist. Then tear down the branch's graph: detach its sink consumers
-   and drop its outputs. Only the sink consumers no other entry holds are detached, per [The branch
-   table](#the-branch-table). For branch-and-reload the teardown does nothing, because every sink
-   consumer the copy holds is its parent's.
+   predecessor's producers all exist. Then tear down the branch's graph: detach every sink consumer
+   it holds and drop its outputs. A sink consumer belongs to the compile that built it, so to
+   exactly one entry, per [The branch table](#the-branch-table). Branch-and-reload tears nothing
+   down: it builds no copy of the parent's entry, and the parent's sink consumers stay the
+   parent's.
 4. Offer the predecessor's operators and stores as the next compilation's inheritance
    (`GlobalContext::offer_predecessor`, `Inheritance::handover`). The record is offered by
    reference: for a reload the branch's own entry, which the branch replaces at step 5, and for
@@ -1067,8 +1104,9 @@ What it costs:
 
 ## Sources and sinks outlive a version
 
-> **Status: [Decided]** for `main`. [Routes across branches](#routes-across-branches) says
-> what changes with more.
+> **Status: [Decided]** for every branch. The registry is the process's, and [Routes across
+> branches](#routes-across-branches) says what retires a route once several branches bind it
+> (`the_last_branch_cannot_be_deleted`).
 
 A `SourceSinkRegistry` (`ccl/context.rs`) holds a program's open data sources, the reply sink of
 each open `http_serve` route, and the listener behind each bound port. A listener's socket, its
@@ -1089,8 +1127,8 @@ holds and fail.
 Removing an `http_serve` is accepted, and the route goes with it. Left registered, the address would
 keep matching requests and buffering them for a reader that no longer exists, and the client would
 wait on a reply nobody computes. `SourceSinkRegistry::retire_routes_absent_from` compares the routes
-the pass bound against those the registry holds and unregisters the difference, so the address
-answers 404.
+the registry holds against the union of the routes the pass bound and the routes every other
+branch's version binds, and unregisters the difference, so the address answers 404.
 
 A request that arrived before the unregister has no version left to answer it, and retirement
 answers it with the same 404. The source holding such a request outlives the route, because a
@@ -1100,9 +1138,11 @@ both stages a request waits at: the dispatcher's channel, before the source has 
 shared pending map, after. The stage a request reached therefore does not decide what its client
 sees (`a_request_that_arrived_before_its_route_was_retired_is_answered`).
 
-Retiring belongs to installing a version, not to compiling one, so it runs in `compile_program`
-rather than in `run_frontend`. A diff compiles the new version against the running registry, so a
-compile that unregistered a route would make `/diff` change what the program serves
+Retiring belongs to installing a version or deleting a branch, not to compiling one. It runs in
+`compile_version`, which installs both a first version and a replacement, and in
+`LiveProgram::delete_branch` (`GlobalContext::retire_routes_absent_from`), not in `run_frontend`. A
+diff compiles the new version against the running registry, so a compile that unregistered a route
+would make `/diff` change what the program serves
 (`diffing_against_a_version_that_drops_a_route_does_not_retire_it`).
 
 The port goes when its last route does. While a sibling route survives there the listener stays, so
