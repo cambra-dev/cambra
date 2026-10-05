@@ -15,6 +15,7 @@ use crate::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BindingTransparency as ChlTransparency, BoolOp,
         CmpOp, Expr as ChlExpr, Lit as ChlLit, Span, Spanned, UnaryOp,
     },
+    chl_parser::{self, SurfaceBuiltin},
 };
 
 pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
@@ -26,19 +27,17 @@ pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
     Ok(Expr::lit(lit))
 }
 
-/// Lower a CHL function call to a CCL built-in expression.
+/// Lower a CHL function call.
 ///
-/// Supported built-ins:
-///
-/// | CHL call | CCL node | Arity |
-/// |---|---|---|
-/// | `sum(expr)` | [`TypedExprNode::Aggregate`] (`Sum`) | 1 |
-/// | `max(expr)` | [`TypedExprNode::Aggregate`] (`Max`) | 1 |
-/// | `groupby(collection, key)` | `Lambda`/`Apply` encoding with refinement | 2 |
-/// | `await_final(x)` | [`TypedExprNode::Apply`] of [`Builtin::AwaitFinal`] to a `Var` | 1 |
-///
-/// Unknown function names return [`LoweringError::Unsupported`]. (CHL has no
-/// keyword-argument syntax, so the parser already rejects those.)
+/// The callee's name resolves through [`SurfaceBuiltin::from_name`], before scope is
+/// consulted, so a user binding does not shadow a builtin here. Each
+/// [`SurfaceBuiltinKind::Function`](chl_parser::SurfaceBuiltinKind::Function) builtin lowers in
+/// its own arm; a call of the wrong arity is refused rather than lowered as an ordinary call. A
+/// call to a registered source lowers to [`TypedExprNode::Source`], and any other name lowers
+/// as an application of the variable it names. A zero-argument call to a name that is neither a
+/// `Function`-kind builtin nor a registered source returns [`LoweringError::Unsupported`]; this
+/// includes `begin()`, `test_sink()`, and `http_serve()` outside the statement that recognizes
+/// them.
 pub(super) fn lower_call(
     func: &Spanned<ChlExpr>,
     args: &[Spanned<ChlExpr>],
@@ -54,16 +53,17 @@ pub(super) fn lower_call(
         }
     };
 
-    match name {
+    let builtin = SurfaceBuiltin::from_name(name);
+    match builtin {
         // groupby(c: I ⤇ A, key: A → K) lowers to a data function over this site's key
         // domain — [`lower_groupby`] builds the shape and says why it has two layers. The
         // key domain it returns is unused here, the surface call having no second position
         // over the same keys.
-        "groupby" => {
-            if args.len() != 2 {
+        Some(b @ SurfaceBuiltin::Groupby) => {
+            if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "groupby requires exactly two arguments",
+                    format!("groupby requires {}", b.arity()),
                 ));
             }
             let collection = lower_expr(&args[0], ctx)?;
@@ -81,11 +81,11 @@ pub(super) fn lower_call(
         // `Drain` absorbs a key's duplicates into the one `unit` a `Set(K) = Map(K,
         // unit)` holds, so a repeated element is set semantics rather than the fault
         // `map`'s `Sole` raises.
-        "set" => {
-            if args.len() != 1 {
+        Some(b @ SurfaceBuiltin::Set) => {
+            if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "set requires exactly one argument",
+                    format!("set requires {}", b.arity()),
                 ));
             }
             let elements = lower_expr(&args[0], ctx)?;
@@ -122,11 +122,11 @@ pub(super) fn lower_call(
         // of silently picking a winner: a map literal's keys are distinct
         // (`docs/chl-spec.md`, "3.11 List, tuple, record literals"), and a mutable map
         // resolves repeats by its own merge law instead.
-        "map" => {
-            if args.len() != 1 {
+        Some(b @ SurfaceBuiltin::Map) => {
+            if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "map requires exactly one argument",
+                    format!("map requires {}", b.arity()),
                 ));
             }
             let entries = lower_expr(&args[0], ctx)?;
@@ -157,17 +157,17 @@ pub(super) fn lower_call(
                 ctx,
             ))
         }
-        "sum" | "max" => {
-            if args.len() != 1 {
+        Some(b @ (SurfaceBuiltin::Sum | SurfaceBuiltin::Max)) => {
+            if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "aggregate functions require exactly one argument",
+                    format!("aggregate functions require {}", b.arity()),
                 ));
             }
-            let kind = match name {
-                "sum" => AggregateKind::Sum,
-                "max" => AggregateKind::Max,
-                _ => unreachable!(),
+            let kind = match b {
+                SurfaceBuiltin::Sum => AggregateKind::Sum,
+                SurfaceBuiltin::Max => AggregateKind::Max,
+                _ => unreachable!("the arm matched sum or max"),
             };
             let input = lower_expr(&args[0], ctx)?;
             Ok(Expr::aggregate(input, kind))
@@ -183,11 +183,19 @@ pub(super) fn lower_call(
         // than consuming a value, so the operand is a handle position and never goes
         // through the value-reading `lower_expr` (whose out-of-block read gate would
         // reject the very read this is).
-        "await_final" => {
+        Some(SurfaceBuiltin::AwaitFinal) => {
+            debug_assert_eq!(
+                SurfaceBuiltin::AwaitFinal.arity(),
+                chl_parser::builtins::Arity::Exact(1),
+                "the slice pattern below states await_final's arity"
+            );
             let [arg] = args else {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "await_final requires exactly one argument",
+                    format!(
+                        "await_final requires {}",
+                        SurfaceBuiltin::AwaitFinal.arity()
+                    ),
                 ));
             };
             let ChlExpr::Name(id) = &arg.node else {
@@ -237,11 +245,11 @@ pub(super) fn lower_call(
         // (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). Subtyping has
         // no `𝑇 <: Σ` rule, so this is what a program writes when two collections meet
         // at a join and it wants both alternatives kept rather than one of them lost.
-        "box" => {
-            if args.len() != 1 {
+        Some(b @ SurfaceBuiltin::Box) => {
+            if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "`box` takes exactly one argument",
+                    format!("`box` takes {}", b.arity()),
                 ));
             }
             let inner = lower_expr(&args[0], ctx)?;
@@ -258,21 +266,33 @@ pub(super) fn lower_call(
         //
         // Both holes are the use site's to fill: `Map(𝐾, 𝑉)` and `Set(𝐾)` are this one
         // type, the latter at a `unit` codomain, so one term serves both annotations.
-        "empty_map" => {
-            if !args.is_empty() {
+        Some(b @ SurfaceBuiltin::EmptyMap) => {
+            if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
                     func.span,
-                    "`empty_map` takes no arguments; its key and value types come from \
-                     the annotation on what it seeds",
+                    format!(
+                        "`empty_map` takes {}; its key and value types come from the annotation \
+                         on what it seeds",
+                        b.arity()
+                    ),
                 ));
             }
             Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
         }
-        "defer" => Ok(Expr::new(TypedExprNode::Defer)),
-        name if ctx.sources.contains_key(name) => {
-            Ok(Expr::new(TypedExprNode::Source(name.to_string())))
-        }
-        _ => {
+        Some(SurfaceBuiltin::Defer) => Ok(Expr::new(TypedExprNode::Defer)),
+        // A transaction marker or a sink declaration is recognized by the statement that
+        // holds it, and a source by its registration rather than by this table. Called
+        // anywhere else, each of these lowers as an ordinary call.
+        Some(
+            SurfaceBuiltin::Begin
+            | SurfaceBuiltin::HttpServe
+            | SurfaceBuiltin::TestSink
+            | SurfaceBuiltin::Stdin,
+        )
+        | None => {
+            if ctx.sources.contains_key(name) {
+                return Ok(Expr::new(TypedExprNode::Source(name.to_string())));
+            }
             // For zero-argument calls, only registered sources are allowed.
             if args.is_empty() {
                 return Err(LoweringError::unsupported(

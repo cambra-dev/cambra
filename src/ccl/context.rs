@@ -2485,6 +2485,26 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// The sources a default context registers are the sources `SURFACE_BUILTINS` lists.
+    #[test]
+    fn default_sources_are_the_listed_sources() {
+        use crate::chl_parser::builtins::{SURFACE_BUILTINS, SurfaceBuiltinKind};
+        use std::collections::BTreeSet;
+        let ctx = GlobalContext::new();
+        let registered: BTreeSet<&str> = ctx
+            .sources_and_sinks
+            .sources
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let listed: BTreeSet<&str> = SURFACE_BUILTINS
+            .iter()
+            .filter(|e| e.kind == SurfaceBuiltinKind::Source)
+            .map(|e| e.spelling)
+            .collect();
+        assert_eq!(registered, listed);
+    }
+
     /// Driver that runs `compile_program` for an error-only test, returning
     /// the collected error list. Discards the program — these tests only
     /// care about which errors surface.

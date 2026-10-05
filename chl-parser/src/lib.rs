@@ -15,14 +15,16 @@
 //! tracks indentation depth and bracket depth, emitting `NEWLINE`, `INDENT`,
 //! and `DEDENT` tokens where Python would. The parser ([`parser`]) consumes
 //! those tokens with chumsky combinators and produces the AST defined in
-//! [`ast`].
+//! [`ast`]. [`builtins`] lists the names a call recognizes as builtins.
 //!
 //! See `chl-parser/design-chl-parser.md` for the design rationale and for picking
 //! chumsky 1.0-alpha + logos over alternatives.
 
 pub mod ast;
+pub mod builtins;
 pub mod lexer;
 pub mod parser;
 
 pub use ast::{Expr, Module, Stmt};
+pub use builtins::{SurfaceBuiltin, SurfaceBuiltinKind};
 pub use parser::{ParseError, parse_expression, parse_module};

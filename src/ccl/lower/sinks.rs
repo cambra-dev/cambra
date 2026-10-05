@@ -6,6 +6,7 @@
 //! `with` block refuse through [`refuse_nested_sink`], and
 //! [`sink_rebindings`](super::sink_rebindings) exempts the declaration from the rebinding check.
 
+use crate::chl_parser::SurfaceBuiltin;
 use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned};
 
 use super::*;
@@ -20,12 +21,12 @@ pub(super) enum SinkDecl {
 }
 
 impl SinkDecl {
-    /// The builtin the declaration calls, as the source spells it.
-    fn builtin(&self) -> &'static str {
+    /// The builtin the declaration calls.
+    fn builtin(&self) -> SurfaceBuiltin {
         match self {
-            Self::Http(_) => "http_serve",
+            Self::Http(_) => SurfaceBuiltin::HttpServe,
             #[cfg(any(test, feature = "test-helpers"))]
-            Self::Test { .. } => "test_sink",
+            Self::Test { .. } => SurfaceBuiltin::TestSink,
         }
     }
 }
@@ -49,7 +50,7 @@ pub(super) fn sink_not_top_level(decl: &SinkDecl, span: Span) -> LoweringError {
         format!(
             "{} is only supported at the top level of a program, not inside an if/else branch, \
              match arm, loop body, `with` block or function body",
-            decl.builtin()
+            decl.builtin().spelling()
         ),
     )
 }

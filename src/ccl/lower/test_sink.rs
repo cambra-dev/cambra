@@ -12,6 +12,7 @@
 //! top level only.
 
 use crate::ccl::{Expr, TypedExprNode};
+use crate::chl_parser::SurfaceBuiltin;
 use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Span, Spanned};
 
 use super::{LoweringContext, LoweringError};
@@ -28,8 +29,9 @@ pub(super) fn test_sink_name(
     let ChlExpr::Call { func, args } = &value.node else {
         return None;
     };
-    (args.is_empty() && matches!(&func.node, ChlExpr::Name(id) if id == "test_sink"))
-        .then(|| name.to_string())
+    let is_test_sink = matches!(&func.node, ChlExpr::Name(id)
+        if SurfaceBuiltin::from_name(id) == Some(SurfaceBuiltin::TestSink));
+    (is_test_sink && SurfaceBuiltin::TestSink.arity().accepts(args.len())).then(|| name.to_string())
 }
 
 /// Lower `name = test_sink()` at `span` in front of `body`: `let name = Defer in body`, with

@@ -20,7 +20,10 @@ use smol_str::SmolStr;
 use super::*;
 use crate::{
     ccl::{BindingTransparency, Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
-    chl_parser::ast::{AssignTarget, Expr as ChlExpr, IfBranch, Span, Spanned, Stmt as ChlStmt},
+    chl_parser::{
+        SurfaceBuiltin,
+        ast::{AssignTarget, Expr as ChlExpr, IfBranch, Span, Spanned, Stmt as ChlStmt},
+    },
 };
 
 /// Validate that a `with` block's context is the `begin()` transaction marker.
@@ -44,8 +47,8 @@ fn reject_txn_handle(binding: &Option<SmolStr>, span: Span) -> Result<(), Loweri
 fn validate_begin_context(context: &Spanned<ChlExpr>) -> Result<(), LoweringError> {
     if let ChlExpr::Call { func, args } = &context.node
         && let ChlExpr::Name(id) = &func.node
-        && id.as_str() == "begin"
-        && args.is_empty()
+        && SurfaceBuiltin::from_name(id) == Some(SurfaceBuiltin::Begin)
+        && SurfaceBuiltin::Begin.arity().accepts(args.len())
     {
         return Ok(());
     }
