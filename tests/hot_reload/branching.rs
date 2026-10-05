@@ -768,10 +768,12 @@ const FOLD_VIA_VIEW: &str = indoc! {r#"
 "#};
 
 /// The same, through another comprehension, so a reload from [`FOLD_VIA_VIEW`]
-/// rebuilds the iteration again.
+/// rebuilds the iteration again. The comprehension scales each element by `10`,
+/// so the folded value says which positions the installed version decided:
+/// a carried `x` plus `10` times each element it folded.
 const FOLD_VIA_OTHER_VIEW: &str = indoc! {r#"
     x := 0
-    for i in [j * 1 for j in src()]:
+    for i in [j * 10 for j in src()]:
         x := x + i
     x
 "#};
@@ -866,14 +868,17 @@ fn fold_after(with_lagging_branch: bool, install: Install) -> (i64, Predicate) {
     (x_of(&live, installed), agreed)
 }
 
+/// What [`fold_after`] folds: the carried `15` (`1 + 2 + 4 + 8`) plus `16`
+/// through [`FOLD_VIA_OTHER_VIEW`], per
+/// [`a_rebuilt_iteration_resumes_one_past_its_predecessors_last_position`].
+/// Re-deciding `8` gives `255`, and dropping `15` and re-folding the source
+/// from position 0 gives `310`.
+const RESUMED_AT_16: i64 = 15 + 10 * 16;
+
 /// Assert that a lagging second branch changes nothing the install folds.
 ///
-/// The comparison is against the same run without the second branch rather
-/// than against `1 + 2 + 4 + 8 + 16`. Without branches the installed version
-/// already folds the last element its predecessor decided a second time: the
-/// drive releases one position behind its decision, and a rebuilt iteration over
-/// this source starts at the source's release. That is the one-branch reload's
-/// behaviour, which branching leaves as it was.
+/// Both runs are asserted against [`RESUMED_AT_16`]: the run without the second
+/// branch as the baseline, and the run beside it as equal to that baseline.
 fn assert_lag_changes_nothing(install: Install) {
     let (alone, agreed_alone) = fold_after(false, install);
     let (beside, agreed_beside) = fold_after(true, install);
@@ -881,14 +886,149 @@ fn assert_lag_changes_nothing(install: Install) {
         agreed_beside, agreed_alone,
         "the second branch holds the agreement below where main's producers stopped"
     );
+    assert_eq!(alone, RESUMED_AT_16, "the one-branch baseline");
     assert_eq!(
         beside, alone,
         "a second, lagging branch changes what the installed version folds"
     );
-    assert!(
-        alone < 1 + 2 + 4 + 8 + 16 + 4 + 8,
-        "the baseline folds neither `4` nor `8` twice: {alone}"
+}
+
+/// A version that rebuilds a loop's iteration over a source resumes one past the
+/// last position its predecessor decided, whether a reload or branch-and-reload
+/// installs it.
+///
+/// The predecessor's drive released `src()` through position 3, the last it
+/// emitted, so the rebuilt iteration's new producer starts at position 4. The
+/// store seeded with the carried `15` decides only `16`, and `x` is
+/// [`RESUMED_AT_16`].
+#[test]
+fn a_rebuilt_iteration_resumes_one_past_its_predecessors_last_position() {
+    assert_eq!(fold_after(false, Install::Reload).0, RESUMED_AT_16);
+    assert_eq!(fold_after(false, Install::Branch).0, RESUMED_AT_16);
+}
+
+/// [`FOLD`] with an edited loop body, so a version built from it keeps `FOLD`'s
+/// iteration and rebuilds its store.
+const FOLD_TIMES_ONE: &str = indoc! {r#"
+    x := 0
+    for i in src():
+        x := x + i * 1
+    x
+"#};
+
+/// A second edit of [`FOLD`]'s loop body, so a reload from [`FOLD`] keeps the
+/// iteration and rebuilds the store again.
+const FOLD_PLUS_ZERO: &str = indoc! {r#"
+    x := 0
+    for i in src():
+        x := x + i + 0
+    x
+"#};
+
+/// `main` folds `1, 2`. With `with_lagging_branch`, a branch created from `main`
+/// with [`FOLD_TIMES_ONE`] subscribes to `main`'s kept iteration and is never
+/// pulled. `main` folds `4, 8`, reloads to [`FOLD_PLUS_ZERO`], which keeps the
+/// iteration and rebuilds the store, and folds `16`. Returns `main`'s `x`.
+fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> i64 {
+    let (mut ctx, src) = with_src();
+    let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    add(&src, 0, &[1, 2]);
+    pull(&mut ctx, &mut live, ROOT);
+    if with_lagging_branch {
+        live.create_branch(&mut ctx, "lagging", ROOT, FOLD_TIMES_ONE, &no_main)
+            .expect("a body edit is accepted");
+    }
+    add(&src, 2, &[4, 8]);
+    pull(&mut ctx, &mut live, ROOT);
+    assert_eq!(x_of(&live, ROOT), 15);
+    live.reload(&mut ctx, FOLD_PLUS_ZERO, &no_main)
+        .expect("a body edit is accepted");
+    add(&src, 4, &[16]);
+    pull(&mut ctx, &mut live, ROOT);
+    x_of(&live, ROOT)
+}
+
+/// A lagging branch subscribed to a kept iteration makes a reload of another
+/// branch that rebuilds its store fold elements twice.
+///
+/// Pinned failure: the correct `x` is `31` (`1 + 2 + 4 + 8 + 16`), which the
+/// same run without the lagging branch folds, and today it is `43`, with `4`
+/// and `8` folded twice. The rebuilt store resumes one past the kept
+/// iteration's `FanOut::released_position`, which is read off the intersection
+/// of every live slot's release, so the lagging branch's slot holds it at the
+/// position the branch was created at. A fix replaces `43` with `31` and renames
+/// this test after the behaviour it then pins.
+///
+/// TODO: the fix is a per-reader release view applied at both layers. The
+/// source layer has it: `ProducerReleases::carry_to_new_producers` starts a new
+/// producer from its predecessor's own producers' release. A fan-out does not:
+/// the guard a new subscriber starts with and `released_position` are both the
+/// intersection over every slot, whichever branch holds it.
+#[test]
+fn a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice() {
+    assert_eq!(reload_over_a_kept_iteration(false), 31);
+    assert_eq!(reload_over_a_kept_iteration(true), 43);
+}
+
+/// [`FOLD`] with an edited program value and the same loop, so a branch built
+/// from it keeps `FOLD`'s store.
+const FOLD_VALUE_EDITED: &str = indoc! {r#"
+    x := 0
+    for i in src():
+        x := x + i
+    x + 0
+"#};
+
+/// [`FOLD_VALUE_EDITED`] folding ten times each element, so a reload from it
+/// rebuilds the store and the store's value says which rule folded what.
+const FOLD_VALUE_AND_BODY_EDITED: &str = indoc! {r#"
+    x := 0
+    for i in src():
+        x := x + i * 10
+    x + 0
+"#};
+
+/// A store kept at creation is shared: pulling one branch advances the value
+/// both read. The first reload that rebuilds it gives the reloaded branch its
+/// own store, seeded from the shared value, and the other branch keeps the
+/// original.
+#[test]
+fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
+    let (mut ctx, src) = with_src();
+    let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    add(&src, 0, &[1, 2]);
+    pull(&mut ctx, &mut live, ROOT);
+    live.create_branch(&mut ctx, "child", ROOT, FOLD_VALUE_EDITED, &no_main)
+        .expect("an edit outside the loop is accepted");
+
+    add(&src, 2, &[4]);
+    pull(&mut ctx, &mut live, ROOT);
+    assert_eq!(x_of(&live, ROOT), 7);
+    assert_eq!(x_of(&live, "child"), 7, "one store, run once for both");
+
+    live.reload_branch(&mut ctx, "child", FOLD_VALUE_AND_BODY_EDITED, &no_main)
+        .expect("a body edit is accepted");
+    add(&src, 3, &[8]);
+    pull(&mut ctx, &mut live, ROOT);
+    pull(&mut ctx, &mut live, "child");
+    assert_eq!(x_of(&live, ROOT), 7 + 8, "main keeps the original store");
+    assert_eq!(
+        x_of(&live, "child"),
+        7 + 80,
+        "the child's store is its own, seeded from the shared `7`"
     );
+}
+
+/// The root's first version was installed by the process's first compile,
+/// which keeps nothing, so `/branch/main/info` lists it as `kept=0/<bound>`.
+#[test]
+fn the_roots_first_version_keeps_nothing() {
+    let (mut ctx, _src) = with_src();
+    let live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    let info = live.render_info(ROOT).expect("main exists");
+    let versions = info.split("\n\n").nth(1).expect("a versions block");
+    assert!(versions.starts_with("1\tkept=0/"), "{versions}");
+    assert_eq!(versions.lines().count(), 1, "{versions}");
 }
 
 /// A reload's new producer starts where the reloaded branch's own producers
