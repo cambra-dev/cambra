@@ -886,19 +886,51 @@ pub trait TileProducer {
     /// Contains producer-specific release logic.
     fn release_impl(&mut self, obsolete_guard: TileGuard);
 
+    /// What this producer keeps of its own between pulls ([`ProducerStateInfo`]).
+    ///
+    /// A producer that keeps nothing past a pull answers the default, which holds nothing.
+    /// What its inputs keep is theirs to report.
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::default()
+    }
+
     /// Inspect this producer as an [`InspectNode`] for visualization.
     ///
-    /// Always includes name and tiling, and impls can add children with `add_inspect_children`
+    /// Always includes name and tiling, and impls can add children with `add_inspect_children`.
+    /// A producer holding state records its [`state_info`](Self::state_info) on the node.
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        self.add_inspect_children(
-            InspectNode::new(self.name()).with_tiling(self.tiling().to_string()),
-            opts,
-        )
+        let node = InspectNode::new(self.name()).with_tiling(self.tiling().to_string());
+        let node = match self.state_info().values {
+            0 => node,
+            held => node.with_held_values(held),
+        };
+        self.add_inspect_children(node, opts)
     }
 
     /// Hook for adding any children to the InspectNode.
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
         node
+    }
+}
+
+/// How much state a producer holds of its own: what it keeps from one pull to the next, as
+/// opposed to what it computes in a pull and hands on.
+///
+/// Counted in values — a cell of a column, a key of a collection, an entry of a changelog —
+/// rather than bytes, so the count is a property of the program's data and not of how a
+/// value is laid out. A count that grows with how long a program has run where its data does
+/// not is state the program never gives back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProducerStateInfo {
+    /// The values held: a cached tile's cells ([`Tile::cell_count`]), an accumulator's, or a
+    /// store's changelog entries, decided positions and seeds.
+    pub values: usize,
+}
+
+impl ProducerStateInfo {
+    /// `values` held.
+    pub fn holding(values: usize) -> Self {
+        ProducerStateInfo { values }
     }
 }
 

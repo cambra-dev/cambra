@@ -145,6 +145,10 @@ struct ConstantProducer {
 }
 
 impl TileProducer for ConstantProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.tile.cell_count())
+    }
+
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {

@@ -43,6 +43,9 @@ pub struct InspectNode {
     /// Children with edge labels, e.g. `("left", child_desc)`. An empty label
     /// renders the child with no `edge: ` prefix.
     pub children: Vec<(String, InspectNode)>,
+    /// How many values the node keeps of its own, for a node that holds state. Not
+    /// rendered.
+    pub held_values: Option<usize>,
 }
 
 impl InspectNode {
@@ -56,6 +59,7 @@ impl InspectNode {
             obsolete_guard: None,
             intent_guard: None,
             children: Vec::new(),
+            held_values: None,
         }
     }
 
@@ -67,6 +71,12 @@ impl InspectNode {
     /// Add an annotation (shown after label on same line).
     pub fn annotate(mut self, annotation: impl Into<String>) -> Self {
         self.annotations.push(annotation.into());
+        self
+    }
+
+    /// Record how many values the node keeps of its own.
+    pub fn with_held_values(mut self, held: usize) -> Self {
+        self.held_values = Some(held);
         self
     }
 

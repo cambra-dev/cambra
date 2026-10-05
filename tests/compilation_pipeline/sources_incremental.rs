@@ -1332,16 +1332,33 @@ fn a_nest_over_a_streamed_source_runs_as_the_source_arrives(
     assert_eq!(innermost_ints(&tile), last, "once the source closes");
 }
 
-/// A nest summed at both levels answers once the source closes, the earliest a scalar sum
-/// can say it is whole.
+/// A nest totalled at both levels, by a loop over a source nested in a loop over a list or by
+/// the comprehension form of the same pairing, answers once the source closes: the earliest a
+/// scalar total can say it is whole.
 #[rstest]
 #[timeout(Duration::from_secs(20))]
-fn a_summed_nest_over_a_streamed_source_answers_at_the_close() {
-    let tile = run_in_batches(
-        "sum([sum([y * x for y in source1()]) for x in [1, 2]])",
-        &[(&[(0, 1)], 0), (&[(1, 2)], 1)],
-    );
-    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![9])));
+#[case::inner_source(indoc! {r"
+    total := 0
+    for x in [1, 2]:
+        for y in source1():
+            total += x * y
+    total
+"}, 9)]
+#[case::bound_outside(indoc! {r"
+    ys = source1()
+    total := 0
+    for x in [1]:
+        for y in ys:
+            total += x * y
+    total
+"}, 3)]
+#[case::comprehension("sum([sum([y * x for y in source1()]) for x in [1, 2]])", 9)]
+fn a_totalled_nest_over_a_streamed_source_answers_at_the_close(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
 /// A collection per row paired against a streamed source keeps each row's values as they
@@ -1471,5 +1488,39 @@ fn a_mut_loop_runs_in_order_over_positions_that_arrive_out_of_order(
     #[case] expected: i64,
 ) {
     let tile = run_in_batches(code, &[(&[(0, 1)], 0), (&[(1, 2)], 1)]);
+    assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// A **correlated lookup into a streamed collection**: each row's group of keys waits on a
+/// collection that decides none of them until its source closes, across pulls that deliver
+/// batches in between. The map is built whole at the close, so every key is undecided until
+/// then, and `3` is decided present or absent by what the batches delivered. A group answered
+/// in part is `CheckedLookup`'s unit tests' (`tile_operators/lookup.rs`).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::decided_at_close(false, 30)]
+#[case::delivered_later(true, 39)]
+fn a_correlated_lookup_answers_the_keys_its_collection_has_decided(
+    #[case] deliver_five: bool,
+    #[case] expected: i64,
+) {
+    let code = indoc::indoc! {r"
+        def or_zero(o: Option(Int)) => Int:
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        m = map([(x, x) for x in source1()])
+        sum([sum([or_zero(m[k]?) * r for k in [10, 3]]) for r in [1, 2]])
+    "};
+    let first: (&[(usize, i64)], usize) = (&[(0, 10)], 0);
+    let second: (&[(usize, i64)], usize) = (&[(5, 3)], 5);
+    let batches = if deliver_five {
+        vec![first, second]
+    } else {
+        vec![first]
+    };
+    let tile = run_in_batches(code, &batches);
     assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }

@@ -221,7 +221,20 @@ fn unwrap_seed_record(e: Expr) -> (Expr, bool) {
 /// ([`unwrap_seed_record`]), and which guard. The view slot (the causal history
 /// read) is validated by `check_letrec_causal` and discarded here — the
 /// engine reconstructs every read from the history record itself.
-fn split_causal_compose(guard: Expr) -> (Expr, bool, Builtin) {
+fn split_causal_compose(mut guard: Expr) -> (Expr, bool, Builtin) {
+    // A seed reading a binding of the enclosing body arrives under that binding:
+    // `mut_elim::sink_prefix` re-binds, around each restriction-free part of a decision,
+    // the prefix bindings it reads, and the guard is one such part. Each binding is a
+    // morphism of the writer's argument, as the guard is, so inlining it states the same
+    // guard.
+    while let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = guard.node
+    {
+        guard = crate::ccl::lambda_elim::substitute(*body, &binding.name, &bound_expr);
+    }
     let TypedExprNode::Compose(mut elts) = guard.node else {
         panic!("letrec recognition: guard is not a compose");
     };
@@ -812,26 +825,60 @@ fn collapse_snapshot_sources(
     changed
 }
 
-/// Whether a morphism of `(enclosing, position)` reads the position.
+/// A morphism of `(enclosing, position)` that does not read the position, restated as a
+/// morphism of `enclosing` alone; `None` where it reads the position.
 ///
-/// The parameter is read at the head of a compose, so a read of the position is a
-/// `.1` in that position. Used on a nested `Transact`'s seed, which is the value entering
-/// the inner loop at an enclosing position and so cannot vary with the position the
-/// loop is about to run over.
-fn reads_own_position(e: &Expr) -> bool {
-    match &e.node {
-        TypedExprNode::Proj(ProjKey::Index(1)) => true,
-        TypedExprNode::Compose(elts) => elts.first().is_some_and(reads_own_position),
-        // A zip's legs each read the parameter; a `const`'s argument reads nothing.
-        TypedExprNode::Apply { function, .. }
-            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Const)) =>
-        {
-            false
+/// A nested `Transact`'s seed is the value entering the inner loop at an enclosing position,
+/// so it cannot vary with the position the loop is about to run over, though elimination
+/// leaves it a morphism of the pair. Restated over the enclosing position, it is defined
+/// there whether or not the inner loop runs any position, which is what lets the store open
+/// every enclosing position. The pair is read at the head of a morphism: `.0` reads the
+/// enclosing component and `.1` the position, a `const` reads neither, and a `zip` reads it
+/// in each leg.
+fn onto_enclosing(e: Expr, enclosing: &Type) -> Option<Expr> {
+    let codomain = e.ty.codomain()?;
+    let ty = Type::fun_like(&e.ty, enclosing.clone(), codomain);
+    match e.node {
+        TypedExprNode::Proj(ProjKey::Index(0)) => Some(Expr::builtin(Builtin::Id).with_ty(ty)),
+        TypedExprNode::Compose(elts) => {
+            let mut elts = elts.into_iter();
+            let head = onto_enclosing(elts.next()?, enclosing)?;
+            let rest: Vec<Expr> = elts.collect();
+            match (head.node, rest.is_empty()) {
+                // Reading the enclosing component and then the rest is the rest, over it.
+                (TypedExprNode::Builtin(Builtin::Id), false) if rest.len() == 1 => {
+                    rest.into_iter().next()
+                }
+                (TypedExprNode::Builtin(Builtin::Id), false) => {
+                    Some(Expr::compose(rest).with_ty(ty))
+                }
+                (node, _) => {
+                    let head = Expr::new(node).with_ty(head.ty);
+                    Some(Expr::compose(std::iter::once(head).chain(rest).collect()).with_ty(ty))
+                }
+            }
         }
-        TypedExprNode::Apply { argument, .. } => reads_own_position(argument),
-        TypedExprNode::Tuple(elts) => elts.iter().any(reads_own_position),
-        TypedExprNode::Record(fields) => fields.iter().any(|(_, v)| reads_own_position(v)),
-        _ => false,
+        TypedExprNode::Apply { argument, function } => match &function.node {
+            TypedExprNode::Builtin(Builtin::Const) => {
+                let function = (*function).with_ty(Type::fun(argument.ty.clone(), ty.clone()));
+                Some(Expr::apply(*argument, function).with_ty(ty))
+            }
+            TypedExprNode::Builtin(Builtin::Zip) => {
+                let TypedExprNode::Tuple(legs) = argument.node else {
+                    return None;
+                };
+                let legs = legs
+                    .into_iter()
+                    .map(|leg| onto_enclosing(leg, enclosing))
+                    .collect::<Option<Vec<Expr>>>()?;
+                let tuple_ty = Type::Tuple(legs.iter().map(|leg| leg.ty.clone()).collect());
+                let tuple = Expr::tuple(legs).with_ty(tuple_ty.clone());
+                let function = (*function).with_ty(Type::fun(tuple_ty, ty.clone()));
+                Some(Expr::apply(tuple, function).with_ty(ty))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -1004,22 +1051,19 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
             // A record of seeds closed in it rides under one `const`, which distributes
             // over the fields — the shape a mutable variable the enclosing body
             // introduces leaves, its seed being the same at every enclosing position.
-            let init = match (&parameter, seeds_closed) {
-                (Some(p), true) => {
+            let init = match (&enclosing, seeds_closed) {
+                (Some(ctx_ty), true) => {
                     let init_ty = init.ty.clone();
-                    apply_primitive(init, Builtin::Const, Type::fun(p.clone(), init_ty))
+                    apply_primitive(init, Builtin::Const, Type::fun(ctx_ty.clone(), init_ty))
                 }
-                _ => init,
+                (Some(ctx_ty), false) => onto_enclosing(init, ctx_ty).unwrap_or_else(|| {
+                    panic!(
+                        "letrec recognition: a nested `Transact`'s seed `{label}` reads its own \
+                         position, which the value entering the loop cannot depend on"
+                    )
+                }),
+                (None, _) => init,
             };
-            // A nested `Transact`'s seed is the value entering the inner loop at an
-            // enclosing position, so it is constant in this `Transact`'s own position
-            // even though it is a morphism of the pair. The engine reads it anywhere
-            // in the row; the assertion is what makes that reading safe.
-            debug_assert!(
-                enclosing.is_none() || !reads_own_position(&init),
-                "letrec recognition: a nested `Transact`'s seed `{label}` reads its own \
-                 position, which the value entering the loop cannot depend on"
-            );
             TransactKey {
                 name: Name::fresh(label),
                 init,

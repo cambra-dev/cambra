@@ -303,14 +303,16 @@ reconstructing it from the writer expressions.
 `parameter` is `None` for a top-level `Transact`, whose writers take the snapshot tuple alone. A
 **nested** `Transact`, an inner loop's, sets it to the `(enclosing, position)` pair `lambda_elim`
 merged the two loops' binders into, and is the top-level `Transact` lifted pointwise over that
-parameter 𝑃: each `init` is `𝑃 ⇒ 𝑉`, so the inner loop seeds from wherever the enclosing one had got
-to, and each writer's body takes `(𝑃, (snap…, item))`. The source is curried instead,
-`enclosing ⤇ (domain ⤇ item)`, one collection per enclosing position. The `Transact` then denotes
-one history record per enclosing position, `enclosing ⇒ {key: 𝐷 ⤇ 𝑉}`, and a variable read is the
-morphism `__hist ≫ .key` of the enclosing parameter. The parameter is stated rather than rebuilt
-from `enclosing` and `domain` because the pair carries refinements neither component does.
-Symbolic rendering: `transact under 𝑃 (k = init, …) { … }`. A nested `Transact` plans but does not
-run yet: operator conversion refuses a `Transact` whose `parameter` is `Some(_)`.
+parameter 𝑃: each writer's body takes `(𝑃, (snap…, item))`. Each `init` is `enclosing ⇒ 𝑉`, a
+morphism of the enclosing position alone, so the inner loop seeds from wherever the enclosing one
+had got to, and an enclosing position whose inner loop runs no position has a seed all the same. The
+source is curried instead, `enclosing ⤇ (domain ⤇ item)`, one collection per enclosing position. The
+`Transact` then denotes one history record per enclosing position, `enclosing ⇒ {key: 𝐷 ⤇ 𝑉}`, and a
+variable read is the morphism `__hist ≫ .key` of the enclosing parameter. The parameter is stated
+rather than rebuilt from `enclosing` and `domain` because the pair carries refinements neither
+component does. Operator conversion realizes it as one store per enclosing position (see
+[*Induction stores as a changelog*](../../interpreter/design-operators.md#induction-stores-as-a-changelog-inductionstore-and-storedenseread)).
+Symbolic rendering: `transact under 𝑃 (k = init, …) { … }`.
 
 See [mutation loops](lowering.md#mutation-accumulation-loops)
 and [loop planning](mutability.md#loop-planning-plan_loops-letrec-patterns--transact).
