@@ -29,7 +29,7 @@ use cambra::{
     },
     control_port::{ControlReply, ControlRequest, service},
     interpreter::{BaseType, Extent, Predicate, TestDataSource, Value, pull_laps},
-    live_program::{BranchError, LiveProgram, ROOT},
+    live_program::{BranchError, DEFAULT_BRANCH, LiveProgram},
 };
 
 use crate::harness::{launch_under_control, source};
@@ -150,7 +150,7 @@ fn branch_and_reload_creates_a_branch_forked_from_its_parent() {
     let reply = ask(
         &mut ctx,
         &mut live,
-        create("staging", ROOT, with_port(DASHED_LOG, port)),
+        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
@@ -181,7 +181,11 @@ fn a_refused_branch_and_reload_leaves_no_entry() {
     let (port, mut ctx, mut live) = running_log_with_ab();
     let before = list(&mut ctx, &mut live);
 
-    let broken = ask(&mut ctx, &mut live, create("staging", ROOT, "x = ".into()));
+    let broken = ask(
+        &mut ctx,
+        &mut live,
+        create("staging", DEFAULT_BRANCH, "x = ".into()),
+    );
     assert_eq!(
         broken.status, 400,
         "a compile error is a 400: {}",
@@ -192,7 +196,7 @@ fn a_refused_branch_and_reload_leaves_no_entry() {
     let dropping = ask(
         &mut ctx,
         &mut live,
-        create("staging", ROOT, with_port(LOG_DROPPED, port)),
+        create("staging", DEFAULT_BRANCH, with_port(LOG_DROPPED, port)),
     );
     assert_eq!(dropping.status, 400, "{}", dropping.body);
     assert!(
@@ -206,7 +210,7 @@ fn a_refused_branch_and_reload_leaves_no_entry() {
     let retried = ask(
         &mut ctx,
         &mut live,
-        create("staging", ROOT, with_port(DASHED_LOG, port)),
+        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(retried.status, 200, "{}", retried.body);
     assert!(
@@ -225,7 +229,7 @@ fn a_duplicate_name_is_refused_and_an_unknown_parent_is_not_found() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -235,7 +239,7 @@ fn a_duplicate_name_is_refused_and_an_unknown_parent_is_not_found() {
     let duplicate = ask(
         &mut ctx,
         &mut live,
-        create("staging", ROOT, with_port(PLUSSED_LOG, port)),
+        create("staging", DEFAULT_BRANCH, with_port(PLUSSED_LOG, port)),
     );
     assert_eq!(duplicate.status, 400, "{}", duplicate.body);
     assert!(
@@ -268,7 +272,7 @@ fn a_parents_reload_leaves_its_child_untouched() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -279,7 +283,7 @@ fn a_parents_reload_leaves_its_child_untouched() {
     let reply = ask(
         &mut ctx,
         &mut live,
-        reload(ROOT, source("running-log-writer-edit", port)),
+        reload(DEFAULT_BRANCH, source("running-log-writer-edit", port)),
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
 
@@ -315,13 +319,13 @@ fn a_childs_reload_keeps_its_own_accumulated_value() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
     );
     let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "c")]);
-    assert_eq!(log_of(&live, ROOT), "abc");
+    assert_eq!(log_of(&live, DEFAULT_BRANCH), "abc");
     assert_eq!(log_of(&live, "staging"), "ab-c");
 
     let reply = ask(
@@ -357,7 +361,7 @@ fn a_one_branch_diff_compares_against_that_branchs_version() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -395,7 +399,7 @@ fn a_two_branch_diff_compares_current_versions() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -407,11 +411,16 @@ fn a_two_branch_diff_compares_current_versions() {
         phase: Phase::AsOfRead,
     };
 
-    let across = ask(&mut ctx, &mut live, diff(ROOT, "staging"));
+    let across = ask(&mut ctx, &mut live, diff(DEFAULT_BRANCH, "staging"));
     assert_eq!(across.status, 200, "{}", across.body);
     assert!(across.body.contains("divergence"), "{}", across.body);
     let expected = live
-        .diff_branch(&ctx, ROOT, &with_port(DASHED_LOG, port), Phase::AsOfRead)
+        .diff_branch(
+            &ctx,
+            DEFAULT_BRANCH,
+            &with_port(DASHED_LOG, port),
+            Phase::AsOfRead,
+        )
         .expect("compiles")
         .diff;
     assert_eq!(
@@ -422,7 +431,10 @@ fn a_two_branch_diff_compares_current_versions() {
     let itself = ask(&mut ctx, &mut live, diff("staging", "staging"));
     assert_eq!(itself.body, "no difference at phase AsOfRead\n");
 
-    assert_eq!(ask(&mut ctx, &mut live, diff(ROOT, "nowhere")).status, 404);
+    assert_eq!(
+        ask(&mut ctx, &mut live, diff(DEFAULT_BRANCH, "nowhere")).status,
+        404
+    );
     assert_eq!(list(&mut ctx, &mut live), before, "asking changes nothing");
 }
 
@@ -437,7 +449,7 @@ fn list_and_info_report_versions_and_provenance() {
         ask(
             &mut ctx,
             &mut live,
-            reload(ROOT, source("running-log-writer-edit", port))
+            reload(DEFAULT_BRANCH, source("running-log-writer-edit", port))
         )
         .status,
         200
@@ -446,7 +458,7 @@ fn list_and_info_report_versions_and_provenance() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -455,7 +467,7 @@ fn list_and_info_report_versions_and_provenance() {
         ask(
             &mut ctx,
             &mut live,
-            reload(ROOT, source("running-log", port))
+            reload(DEFAULT_BRANCH, source("running-log", port))
         )
         .status,
         200
@@ -514,7 +526,9 @@ fn list_and_info_report_versions_and_provenance() {
     let root = ask(
         &mut ctx,
         &mut live,
-        ControlRequest::Info { name: ROOT.into() },
+        ControlRequest::Info {
+            name: DEFAULT_BRANCH.into(),
+        },
     );
     assert!(
         root.body.starts_with("main\tversion=3\tfrom=-\t"),
@@ -541,7 +555,7 @@ fn a_recreated_name_continues_its_tombstones_numbering() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -591,7 +605,7 @@ fn a_recreated_name_continues_its_tombstones_numbering() {
     let recreated = ask(
         &mut ctx,
         &mut live,
-        create("staging", ROOT, with_port(DASHED_LOG, port)),
+        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(recreated.status, 200, "{}", recreated.body);
     assert!(
@@ -628,10 +642,10 @@ fn deleting_a_branch_frees_only_what_no_other_entry_holds() {
     let created = ask(
         &mut ctx,
         &mut live,
-        create("staging", ROOT, with_port(DASHED_LOG, port)),
+        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(created.status, 200, "{}", created.body);
-    let held_by_main: Vec<_> = live.held_operators(ROOT).expect("exists");
+    let held_by_main: Vec<_> = live.held_operators(DEFAULT_BRANCH).expect("exists");
     let held_by_staging: Vec<_> = live.held_operators("staging").expect("exists");
     let summary = &live.branches()[1];
     assert!(
@@ -672,7 +686,9 @@ fn the_last_branch_cannot_be_deleted() {
     let last = ask(
         &mut ctx,
         &mut live,
-        ControlRequest::Delete { name: ROOT.into() },
+        ControlRequest::Delete {
+            name: DEFAULT_BRANCH.into(),
+        },
     );
     assert_eq!(last.status, 400, "{}", last.body);
     assert!(last.body.contains("last branch"), "{}", last.body);
@@ -681,7 +697,7 @@ fn the_last_branch_cannot_be_deleted() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", ROOT, with_port(DASHED_LOG, port))
+            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -702,7 +718,9 @@ fn the_last_branch_cannot_be_deleted() {
         ask(
             &mut ctx,
             &mut live,
-            ControlRequest::Delete { name: ROOT.into() }
+            ControlRequest::Delete {
+                name: DEFAULT_BRANCH.into()
+            }
         )
         .status,
         200
@@ -721,15 +739,15 @@ fn the_last_branch_cannot_be_deleted() {
     // answers 404 rather than falling back to another branch.
     for request in [
         ControlRequest::Reload {
-            branch: ROOT.into(),
+            branch: DEFAULT_BRANCH.into(),
             code: with_port(DASHED_LOG, port),
         },
         ControlRequest::Diff {
-            branch: ROOT.into(),
+            branch: DEFAULT_BRANCH.into(),
             code: with_port(DASHED_LOG, port),
             phase: Phase::AsOfRead,
         },
-        create("scratch", ROOT, with_port(DASHED_LOG, port)),
+        create("scratch", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
     ] {
         let reply = ask(&mut ctx, &mut live, request);
         assert_eq!(reply.status, 404, "{}", reply.body);
@@ -839,27 +857,33 @@ fn fold_after(with_lagging_branch: bool, install: Install) -> (i64, Predicate) {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
-    pull(&mut ctx, &mut live, ROOT);
-    assert_eq!(x_of(&live, ROOT), 3);
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    assert_eq!(x_of(&live, DEFAULT_BRANCH), 3);
 
     if with_lagging_branch {
-        live.create_branch(&mut ctx, "lagging", ROOT, FOLD_VIA_VIEW, &no_main)
+        live.create_branch(&mut ctx, "lagging", DEFAULT_BRANCH, FOLD_VIA_VIEW, &no_main)
             .expect("rebuilding the iteration is accepted");
     }
     add(&src, 2, &[4, 8]);
-    pull(&mut ctx, &mut live, ROOT);
-    assert_eq!(x_of(&live, ROOT), 15);
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    assert_eq!(x_of(&live, DEFAULT_BRANCH), 15);
     let agreed = src.borrow().get_released_predicate();
 
     let installed = match install {
         Install::Reload => {
             live.reload(&mut ctx, FOLD_VIA_OTHER_VIEW, &no_main)
                 .expect("rebuilding the iteration is accepted");
-            ROOT
+            DEFAULT_BRANCH
         }
         Install::Branch => {
-            live.create_branch(&mut ctx, "child", ROOT, FOLD_VIA_OTHER_VIEW, &no_main)
-                .expect("rebuilding the iteration is accepted");
+            live.create_branch(
+                &mut ctx,
+                "child",
+                DEFAULT_BRANCH,
+                FOLD_VIA_OTHER_VIEW,
+                &no_main,
+            )
+            .expect("rebuilding the iteration is accepted");
             "child"
         }
     };
@@ -933,19 +957,25 @@ fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> i64 {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
-    pull(&mut ctx, &mut live, ROOT);
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
     if with_lagging_branch {
-        live.create_branch(&mut ctx, "lagging", ROOT, FOLD_TIMES_ONE, &no_main)
-            .expect("a body edit is accepted");
+        live.create_branch(
+            &mut ctx,
+            "lagging",
+            DEFAULT_BRANCH,
+            FOLD_TIMES_ONE,
+            &no_main,
+        )
+        .expect("a body edit is accepted");
     }
     add(&src, 2, &[4, 8]);
-    pull(&mut ctx, &mut live, ROOT);
-    assert_eq!(x_of(&live, ROOT), 15);
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    assert_eq!(x_of(&live, DEFAULT_BRANCH), 15);
     live.reload(&mut ctx, FOLD_PLUS_ZERO, &no_main)
         .expect("a body edit is accepted");
     add(&src, 4, &[16]);
-    pull(&mut ctx, &mut live, ROOT);
-    x_of(&live, ROOT)
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    x_of(&live, DEFAULT_BRANCH)
 }
 
 /// A lagging branch subscribed to a kept iteration makes a reload of another
@@ -997,21 +1027,31 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
-    pull(&mut ctx, &mut live, ROOT);
-    live.create_branch(&mut ctx, "child", ROOT, FOLD_VALUE_EDITED, &no_main)
-        .expect("an edit outside the loop is accepted");
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    live.create_branch(
+        &mut ctx,
+        "child",
+        DEFAULT_BRANCH,
+        FOLD_VALUE_EDITED,
+        &no_main,
+    )
+    .expect("an edit outside the loop is accepted");
 
     add(&src, 2, &[4]);
-    pull(&mut ctx, &mut live, ROOT);
-    assert_eq!(x_of(&live, ROOT), 7);
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    assert_eq!(x_of(&live, DEFAULT_BRANCH), 7);
     assert_eq!(x_of(&live, "child"), 7, "one store, run once for both");
 
     live.reload_branch(&mut ctx, "child", FOLD_VALUE_AND_BODY_EDITED, &no_main)
         .expect("a body edit is accepted");
     add(&src, 3, &[8]);
-    pull(&mut ctx, &mut live, ROOT);
+    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
     pull(&mut ctx, &mut live, "child");
-    assert_eq!(x_of(&live, ROOT), 7 + 8, "main keeps the original store");
+    assert_eq!(
+        x_of(&live, DEFAULT_BRANCH),
+        7 + 8,
+        "main keeps the original store"
+    );
     assert_eq!(
         x_of(&live, "child"),
         7 + 80,
@@ -1025,7 +1065,7 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
 fn the_roots_first_version_keeps_nothing() {
     let (mut ctx, _src) = with_src();
     let live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
-    let info = live.render_info(ROOT).expect("main exists");
+    let info = live.render_info(DEFAULT_BRANCH).expect("main exists");
     let versions = info.split("\n\n").nth(1).expect("a versions block");
     assert!(versions.starts_with("1\tkept=0/"), "{versions}");
     assert_eq!(versions.lines().count(), 1, "{versions}");
@@ -1050,8 +1090,8 @@ fn a_lagging_branch_does_not_make_a_new_branch_fold_twice() {
     assert_lag_changes_nothing(Install::Branch);
 }
 
-/// The binary's driver pulls every branch's `main` output, prints a branch
-/// other than the root's as `Got value from <branch>: …`, and exits once every
+/// The binary's driver pulls every branch's `main` output, prints every branch
+/// but the default one as `Got value from <branch>: …`, and exits once every
 /// branch's `main` output has finished.
 ///
 /// The branch is created after the first line has been answered, so its new

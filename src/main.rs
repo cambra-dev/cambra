@@ -16,7 +16,7 @@ use cambra::{
             window_tail,
         },
     },
-    live_program::LiveProgram,
+    live_program::{DEFAULT_BRANCH, LiveProgram},
 };
 use log::debug;
 
@@ -40,10 +40,10 @@ fn poll_control(
 /// Pull one branch's `main` output once, print what it delivered, and answer
 /// whether it has now finished.
 ///
-/// The root's value prints as `Got value: …` and every other branch's as
-/// `Got value from <branch>: …` (`src/ccl/design/program-evolution.md`, "A
-/// reload changes no other branch").
-fn pull_main(branch: &str, is_root: bool, producer: &mut dyn TileProducer) -> bool {
+/// The default branch's value prints as `Got value: …` and every other
+/// branch's as `Got value from <branch>: …`
+/// (`src/ccl/design/program-evolution.md`, "A reload changes no other branch").
+fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {
     debug!("Main calling get on {branch}");
     let tile = producer.get(producer.tiling().universal_guard());
 
@@ -53,7 +53,7 @@ fn pull_main(branch: &str, is_root: bool, producer: &mut dyn TileProducer) -> bo
     producer.release(release_guard);
     // Producers can return empty tiles, but still have more data.
     if !tile_is_empty(&tile) || done {
-        if is_root {
+        if branch == DEFAULT_BRANCH {
             println!("Got value: {tile:#?}");
         } else {
             println!("Got value from {branch}: {tile:#?}");
