@@ -822,8 +822,8 @@ pub(crate) fn source(name: &str, port: u16) -> String {
 /// deliver `after`, complete the source, and answer the program's integer value.
 ///
 /// `before` sits at positions `0..`, and `after` at the positions following it. The source
-/// stays live across the reload, so what the replacement is offered is what the retired
-/// version's readers left unreleased.
+/// calls `before` complete and stays live across the reload, so what the replacement is
+/// offered is what the retired version's readers left unreleased.
 pub(crate) fn int_value_across_a_reload_over_a_live_source(
     v1: &str,
     v2: &str,
@@ -864,6 +864,9 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
 
     let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
     source.borrow_mut().add_data(&rows(0, before));
+    source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(before.len() - 1)));
     for _ in 0..20 {
         pull(&mut ctx, &mut live);
     }

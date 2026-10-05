@@ -2541,8 +2541,8 @@ fn emit_transact_writer<C: Typing>(
 ///
 /// The node denotes the mutable variable **record** `{key: ⟦key⟧}` — each key's read type
 /// `Fun(domain, α)` (the value's history over the mutable variable's sequencing domain),
-/// what a variable projection `__hist.key` yields; a read reduces it to the
-/// latest `α` via `final_or_default(history, init)`. The init is the value before the
+/// what a variable projection `__hist.key` yields; a trailing read samples it at its
+/// final `α` via `final_read(history)`. The init is the value before the
 /// first position, so it bounds the codomain `α` (`init <: α`), not the whole collection.
 /// There is no recurrence *fixpoint* over a step type — the mutable variable↔writer cycle
 /// is realized operationally at op-conversion — so no `σ <: α` constraint, just
@@ -2565,8 +2565,8 @@ pub(super) fn emit_transact<C: Typing>(
     let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());
     for k in keys.iter_mut() {
         // The history-record field is the value's history `Fun(domain, α)` over
-        // the mutable variable's sequencing domain; `final_or_default` reads it back to the
-        // latest `α`.
+        // the mutable variable's sequencing domain; `final_read` reads it back at the
+        // final `α`.
         let value_ty = ctx.fresh();
         let read_ty = crate::ccl::ccl_utils::history_ty(domain, &value_ty);
         let init_ty = ctx.subexpr(&mut k.init)?;

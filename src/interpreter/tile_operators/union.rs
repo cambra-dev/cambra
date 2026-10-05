@@ -629,8 +629,12 @@ impl TileProducer for UnionProducer {
                 }
             }
             // Split the per-variant predicates and forward each to the input that
-            // produced that variant's data.
-            TileGuard::Function(FunctionGuard::Domain(pred @ Predicate::Union { .. })) => {
+            // produced that variant's data. Only a tagged union's domain is its arms' tags; a
+            // flat union's is the one domain its arms share, which may itself be keyed by a
+            // union (a loop over a concatenation), and forwards whole below.
+            TileGuard::Function(FunctionGuard::Domain(pred @ Predicate::Union { .. }))
+                if !self.flat =>
+            {
                 for (arm, input) in self.inputs.iter_mut().enumerate() {
                     let pred = pred
                         .under_tag(&crate::ccl::FieldKey::Index(arm))

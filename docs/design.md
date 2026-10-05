@@ -159,7 +159,7 @@ CHL source
                       See src/ccl/design/mutability.md)
   → mut_elim     (ccl/mut_elim.rs: the induction mutability phase — every non-transactional
                       mutation loop (For/MutWrite markers, feed-free or feeding) becomes a causal LetRec
-                      group over the induction domain (get_prev_seq recurrence, final_or_default trailing
+                      group over the induction domain (get_prev_seq recurrence, final_read trailing
                       read); see src/ccl/design/mutability.md. Runs before channelize so a
                       per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
   → channelize       (ccl/channelize.rs: Defer/Feed/Define → `++`-union channel bindings, each defer
