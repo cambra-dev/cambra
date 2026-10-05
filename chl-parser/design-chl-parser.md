@@ -62,6 +62,12 @@ at the opening quote. A backtick not immediately followed by an identifier gives
 the same spellings, and `tests/editor_grammars.rs` fails when they differ
 ([editors/README.md](../editors/README.md#highlight-classes)).
 
+`highlight` maps source to highlight spans: each logos token's `HighlightClass` from
+`highlight_class`, with string escapes, comments and the `TODO_WORDS` inside comments as spans of
+their own. An identifier that `SurfaceBuiltin::from_name` resolves is a `Builtin`. `./ci.sh editors`
+checks both editor grammars against it
+([editors/README.md](../editors/README.md#editor-highlight-check)).
+
 A statement opens a block either from its head keyword (`if`, `def`, …) or from
 an assignment's right-hand side, and the layout pass tells them apart by the
 line's first token. On a line that begins with `pub`, the second token is the

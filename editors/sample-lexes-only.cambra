@@ -1,0 +1,6 @@
+# Inputs on which the grammars and the lexer could disagree, for the editor
+# highlight check (editors/README.md). It lexes; it does not parse.
+
+# `==>` and `<=>` lex as `==` or `<=` and then `>`, so neither `_` is a type.
+a ==> _
+b <=> _
