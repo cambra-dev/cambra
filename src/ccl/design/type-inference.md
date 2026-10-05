@@ -1789,6 +1789,23 @@ Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty`. `lambda_elim` disting
 with `is_free_in_value`; a dependency in a refinement still requires the Pi binder. The same
 situation can arise after pairing and currying introduce a parameter for a point-free body.
 
+A lambda eliminates to the Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty` when its parameter
+occurs in `body.ty` and not in the body's value, and `body.ty` is not a data function whose domain
+reads the parameter. A refinement on a collection's domain is a filter, which determines which
+entries exist, so a parameter there varies the body as one free in the value does. Neither shape
+that carries such a filter takes the Pi-constant form:
+
+- The body is a lambda whose binder's type reads the parameter, as in
+  `λ r → λ i : {[0, 2] | 𝑝(r)} → 𝑒`. The nested-lambda rule lifts the refinement onto the pair it
+  forms.
+- A cast inside the body reads the parameter, under a node whose type does not, as in
+  `λ r → cast(λ i → 𝑒, {[0, 2] | 𝑝(r)} ⤇ Int) ▷ sum : Int`. `lambda_elim` rewrites the cast to
+  `λ i : {[0, 2] | 𝑝(r)} → 𝑒`, which reduces to the first shape.
+
+A cast that is a lambda's whole body is not rewritten. Its type is `body.ty`, so the cast arm binds
+the parameter there with a Pi, and `groupby`'s partition `λ k → cast(…)` keeps the shape planning's
+group-by recognizer reads.
+
 ### Scoped inference variables: a stored bound closes against a telescope
 
 An inference variable carries the term-binder telescope at its creation. A bound can refer to

@@ -885,17 +885,60 @@ fn a_correlated_filter_without_an_aggregate_does_not_compile() {
     );
 }
 
-/// A correlated filter whose **body** reads nothing outer. The outer binder appears in the
-/// filter alone, so it is free only in the type: lambda elimination takes the Pi-const arm
-/// and the site never becomes the pair the re-basing rewrite reads. The rewrite for this is
-/// a sibling of that one rather than an extension of it.
+/// A correlated filter whose **body** reads nothing outer. The outer binder is free only in
+/// the filter, which `lambda_elim` rewrites to the refined lambda it denotes, so the site is
+/// the same pair a correlated body makes and the filter rides it.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "unrecognised Var")]
-fn a_correlated_filter_over_an_uncorrelated_body_does_not_compile() {
+// `r = 1` keeps 2 + 3, `r = 2` keeps 3.
+#[case::list_source("sum([sum([v for v in [1, 2, 3] if v > r]) for r in [1, 2]])", 8)]
+// The filter reads the outer binder alone: `r = 2` keeps everything, `r = 1` nothing.
+#[case::filter_reads_only_the_outer(
+    "sum([sum([v for v in [1, 2, 3] if r > 1]) for r in [1, 2]])",
+    6
+)]
+// Over a collection: `r = 1` keeps 20, `r = 2` nothing.
+#[case::collection_source(
+    indoc! {r"
+        c = map([(1, 10), (2, 20)])
+        sum([sum([v for v in c if v > r * 10]) for r in [1, 2]])
+    "},
+    20
+)]
+// The filter reads the outermost binder from depth three: (2 + 3)·2 + 3·2.
+#[case::depth_3(
+    "sum([sum([sum([v for v in [1, 2, 3] if v > q]) for r in [1, 2]]) for q in [1, 2]])",
+    16
+)]
+// `max` rather than `sum`, under arithmetic: (3 + 1) + (3 + 1).
+#[case::max_under_arithmetic("sum([max([v for v in [1, 2, 3] if v > r]) + 1 for r in [1, 2]])", 8)]
+fn a_correlated_filter_over_an_uncorrelated_body(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// The uncorrelated-body filter empties a row, which keeps its place holding the identity.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_uncorrelated_body_keeps_an_emptied_row() {
+    check_tile(
+        "[sum([v for v in [1, 2] if v > r]) for r in [1, 2]]",
+        make_int_list(&[2, 0]),
+    );
+}
+
+/// The uncorrelated-body filter inside a transaction, where the outer binder is the
+/// transaction's own row: 5 + 3.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_uncorrelated_body_filter_runs_inside_a_transaction() {
     check_scalar(
-        "sum([sum([v for v in [1, 2, 3] if v > r]) for r in [1, 2]])",
-        // (2+3) + 3.
+        indoc! {r#"
+            n: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                with begin():
+                    n := n + sum([v for v in [1, 2, 3] if v > r])
+            await_final(n)
+        "#},
         Value::Int(8),
     );
 }

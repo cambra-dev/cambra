@@ -934,8 +934,8 @@ what to emit based only on its own AST shape and the input flowing in.
 An inner comprehension whose body reads the **outer** binder runs once per outer row, over its
 own copy of the inner domain. `lambda_elim` writes that as `curry(𝑔)` composed onto the outer
 stream, where `𝑔` takes the pair of the outer value and the inner element. The pair is what
-carries the correlation: an uncorrelated body never forms one, leaving a `const` that is
-computed once and broadcast.
+carries the correlation: an inner comprehension whose body and filter both read nothing outer
+never forms one, leaving a `const` that is computed once and broadcast.
 
 Compiling it is the pairing. The inner source does not mention the outer binder, so every row
 iterates the same collection 𝐾, and planning writes the site as
@@ -999,9 +999,12 @@ with a message that says so, rather than reading the mask across the misalignmen
 the wrong entries silently, or answering empty, which waits for an alignment that is not
 coming.
 
-Still not compiled: a correlated filter whose **body reads nothing outer**, whose binder is
-free only in the type, so lambda elimination takes the Pi-const arm and the site never becomes
-a pair at all.
+A filter that reads the outer binder forms the pair even when the body reads nothing outer.
+The binder is then free only in the filter's cast, and `lambda_elim` rewrites that cast to the
+lambda it denotes, whose binder carries the filter as a refinement. The nested-lambda rule
+lifts it onto the pair as it does any other filter
+([type-inference.md, "Dependent application and
+reconstruction"](../ccl/design/type-inference.md#dependent-application-and-reconstruction)).
 
 ### Where a collection is materialized
 

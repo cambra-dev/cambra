@@ -840,6 +840,111 @@ fn elim_lambda_kinded(
     })
 }
 
+/// Whether `ty` is a collection whose own domain reads `param`. A refinement there decides
+/// which entries the collection has, a comprehension's filter say, so a body of that type
+/// varies with `param` and is not constant in it. Only the body's own domain counts: a
+/// collection it holds is a value its type describes, and a function's domain is what it
+/// takes.
+fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
+    matches!(
+        ty.peel_refinements(),
+        Type::Fun {
+            fun_kind: FunKind::Data(..),
+            domain,
+            ..
+        } if crate::ccl::subst::type_free_vars(domain).contains(param)
+    )
+}
+
+/// Rewrite each cast-wrapped lambda under `expr` whose narrowing reads `param` to the
+/// refined lambda it denotes ([`refined_lambda`]). Answers whether any was rewritten.
+///
+/// A cast that is a lambda's whole body stays: it is that lambda's result, a dependent
+/// collection the cast arm eliminates when it reaches the lambda, and `groupby`'s partition
+/// `λ __gb_k → cast(…)` is that shape.
+fn refine_filtering_casts(param: &Name, expr: &mut Expr) -> bool {
+    let mut rewrote = false;
+    if let TypedExprNode::Cast { value, target } = &expr.node
+        && matches!(value.node, TypedExprNode::Lambda { .. })
+        && cast_target_refinement(target)
+            .is_some_and(|set| set.iter().any(|r| is_free(param, &r.predicate)))
+    {
+        // The cast arm records the same rewrite under the body it abstracts; this one names
+        // the cast it replaces.
+        let _g = provenance::enter(
+            expr.node_id(),
+            "lambda_elim.abstract",
+            provenance::Nature::Machinery,
+        );
+        let cast = std::mem::take(expr);
+        let TypedExprNode::Cast { value, target } = cast.node else {
+            unreachable!("matched a Cast above")
+        };
+        *expr = refined_lambda(*value, &target, cast.ty);
+        rewrote = true;
+    }
+    if let TypedExprNode::Lambda { body, .. } = &mut expr.node
+        && matches!(&body.node, TypedExprNode::Cast { value, .. }
+            if matches!(value.node, TypedExprNode::Lambda { .. }))
+    {
+        body.walk_children_mut(|child| rewrote |= refine_filtering_casts(param, child));
+        return rewrote;
+    }
+    expr.walk_children_mut(|child| rewrote |= refine_filtering_casts(param, child));
+    rewrote
+}
+
+/// The lambda a cast-wrapped lambda denotes: `cast(λ 𝑦 : {𝐷 | 𝑟} → body, {𝐷 | 𝑝} ⤇ 𝑉)` is
+/// `λ 𝑦 : {𝐷 | 𝑟, 𝑝} → body`, typed `ty`. A cast narrows the domain its lambda binds, so the
+/// narrowing is a filter on the elements the lambda takes.
+fn refined_lambda(value: Expr, target: &Type, ty: Type) -> Expr {
+    let id = value.node_id();
+    let TypedExpr {
+        node:
+            TypedExprNode::Lambda {
+                param: inner_binding,
+                body: inner_body,
+            },
+        ..
+    } = value
+    else {
+        unreachable!(
+            "a cast-wrapped lambda's value is a Lambda, got {}",
+            symbolic(&value)
+        )
+    };
+    // The cast **adds** its refinements to the ones the binder already carries rather than
+    // replacing them: a refinement set is a conjunction, and the partition's domain
+    // refinement and the filter's both hold of the elements that survive. The cast target
+    // names only the narrowing it imposes, so the binder is the union.
+    let binder_ty = match target.domain() {
+        Some(narrowing) => {
+            debug_assert_eq!(
+                narrowing.peel_refinements(),
+                inner_binding.ty.peel_refinements(),
+                "a cast narrows the domain the lambda already binds, so the two refine one base",
+            );
+            Type::refined(
+                inner_binding.ty.clone(),
+                narrowing.refinements().iter().cloned().collect(),
+            )
+        }
+        None => inner_binding.ty.clone(),
+    };
+    // The cast is gone and the lambda stays, under its own id.
+    Expr::preserve(
+        id,
+        TypedExprNode::Lambda {
+            param: crate::ccl::expr::TypedBinding {
+                ty: binder_ty,
+                ..inner_binding
+            },
+            body: inner_body,
+        },
+    )
+    .with_ty(ty)
+}
+
 fn elim_lambda_impl(
     ctx: &mut ElimContext,
     param: &Name,
@@ -866,9 +971,10 @@ fn elim_lambda_impl(
     // Pi the occurrences dangle and the checker's α-alignment has nothing to
     // bind them against.
     let body_ty = body.ty.clone();
+    let in_body_type = crate::ccl::subst::codomain_depends_on(param, &body_ty);
     let result_ty = if param_ty.is_unresolved() || body_ty.is_unresolved() {
         Type::Hole
-    } else if crate::ccl::subst::codomain_depends_on(param, &body_ty) {
+    } else if in_body_type {
         Type::pi_kinded(param, param_ty.clone(), body_ty.clone(), fun_kind.clone())
     } else {
         Type::Fun {
@@ -891,20 +997,40 @@ fn elim_lambda_impl(
         return Ok(result);
     }
 
-    // Pi-const: λ x → e  ⟹  const(e) : (x: param_ty) ⇒ e.ty  when `x` is free
-    // only in `e`'s **type** (a refinement closes over it) and not in its value.
-    // The value is a `const`; the binder rides the type as a Pi binder — a
-    // dependent refinement. This generalizes the cast-wrapped-lambda arm below
-    // (which the comment there flags as a special case to subsume): after the
-    // pairing rule rewrites a captured partition predicate onto a pair domain,
-    // the residual `λ __pair → <point-free value>` has its binder free only in
-    // that refinement. The cast-wrapped-lambda shape keeps its dedicated arm
-    // (it also point-frees the cast's inner lambda), so exclude it here.
     let body_is_cast_lambda = matches!(
         &body.node,
         TypedExprNode::Cast { value, .. } if matches!(value.node, TypedExprNode::Lambda { .. })
     );
-    if !body_is_cast_lambda && !is_free_in_value(param, &body) {
+    let in_value = is_free_in_value(param, &body);
+
+    // Filtering cast: λ x → e  where `x` is free in the narrowing of a cast-wrapped lambda
+    // inside `e` but not in `e`'s value. The narrowing is a filter on the elements that lambda
+    // takes, so `x` decides which elements `e` reads, and no Pi binder reaches it: a Pi binds
+    // only what `e.ty` names, and the cast sits under a node whose type does not. That holds
+    // whether or not `x` is also in `e.ty`. Each such cast becomes the refined lambda it
+    // denotes, and the nested-lambda rule lifts that binder's refinement onto the pair.
+    let mut body = body;
+    if !in_value && !body_is_cast_lambda && refine_filtering_casts(param, &mut body) {
+        return elim_lambda_kinded(ctx, param, param_ty, body, fun_kind);
+    }
+
+    // Pi-const: λ x → e  ⟹  const(e) : (x: param_ty) ⇒ e.ty  when `x` is free in `e`'s type
+    // (a refinement closes over it) and not in its value. The value is a `const`, and the
+    // binder rides the type as a Pi binder. After the pairing rule rewrites a captured
+    // partition predicate onto a pair domain, the residual `λ __pair → <point-free value>`
+    // has its binder free only in that refinement.
+    //
+    // A refinement in `e`'s type is a fact about a value, which a Pi binder can carry, except
+    // on a collection's own domain, where it decides which entries the collection has: there
+    // `x` is data, and `e` is not constant in it ([`reads_in_collection_domain`]). A filter
+    // on a comprehension's elements is such a refinement, which the nested-lambda rule lifts
+    // onto the pair. A cast-wrapped lambda has its own arm, which also point-frees the cast's
+    // inner lambda.
+    if !body_is_cast_lambda
+        && !in_value
+        && in_body_type
+        && !reads_in_collection_domain(param, &body.ty)
+    {
         let result_pi = Type::pi_kinded(param, param_ty.clone(), body.ty.clone(), fun_kind.clone());
         let const_fn =
             Expr::builtin(Builtin::Const).with_ty(Type::fun(body.ty.clone(), result_pi.clone()));
@@ -1082,45 +1208,7 @@ fn elim_lambda_impl(
             // typecheck: it narrows a data function's domain inside a codomain, and
             // a collection's domain is its data, so no subtyping edge admits that.
             if is_free(param, &value) {
-                let TypedExpr {
-                    node:
-                        TypedExprNode::Lambda {
-                            param: inner_binding,
-                            body: inner_body,
-                        },
-                    ..
-                } = *value
-                else {
-                    unreachable!("guarded on the value being a Lambda")
-                };
-                // The cast **adds** its refinements to the ones the binder already
-                // carries rather than replacing them: a refinement set is a
-                // conjunction, and the partition's domain refinement and the filter's
-                // both hold of the elements that survive. The cast target names only
-                // the narrowing it imposes, so the binder is the union.
-                let binder_ty = match target.domain() {
-                    Some(narrowing) => {
-                        debug_assert_eq!(
-                            narrowing.peel_refinements(),
-                            inner_binding.ty.peel_refinements(),
-                            "a cast narrows the domain the lambda already binds, so the \
-                             two refine one base",
-                        );
-                        Type::refined(
-                            inner_binding.ty.clone(),
-                            narrowing.refinements().iter().cloned().collect(),
-                        )
-                    }
-                    None => inner_binding.ty.clone(),
-                };
-                let refined = Expr::new(TypedExprNode::Lambda {
-                    param: crate::ccl::expr::TypedBinding {
-                        ty: binder_ty,
-                        ..inner_binding
-                    },
-                    body: inner_body,
-                })
-                .with_ty(body_ty.clone());
+                let refined = refined_lambda(*value, &target, body_ty.clone());
                 return elim_lambda_kinded(ctx, param, param_ty, refined, fun_kind);
             }
             // `param` occurs only in the refinement (the group-by shape): the value
@@ -1466,8 +1554,9 @@ fn elim_lambda_impl(
         // `param`. That is what varying means: a loop body, a comprehension, a `def` and a
         // `with` block are each a lambda here, and a mutable variable's read is a read of the
         // lambda's accumulator record, so this binder is the one lowering resolved the
-        // element's names to. A list none of whose elements reads `param` as a value never
-        // gets here: the Constant and Pi-const rules above return it whole.
+        // element's names to. An element also varies when a filter it applies reads `param`,
+        // which the Filtering cast rule above has made a refined binder. A list in which `param`
+        // is free nowhere never gets here, because the Constant rule returns it whole.
         //
         // The Tuple rule would be ill-typed here, not merely unsupported. A list's elements are
         // rows of a collection rather than slots of a row, and `Zip` is the product fanout,
@@ -1475,15 +1564,18 @@ fn elim_lambda_impl(
         // function, so the node would carry the lambda's type `𝑋 ⇒ ([0, 𝑛-1] ⤇ 𝑉)` where a
         // list node is typed `[0, 𝑛-1] ⤇ (𝑋 ⇒ 𝑉)`.
         TypedExprNode::List(elts) => {
-            assert!(
-                elts.iter().any(|e| is_free_in_value(param, e)),
-                "a list no element of which reads `{param}` as a value is a constant body, \
-                 which the Constant and Pi-const rules above have already returned"
-            );
+            // A filter's read sits in a binder's type, where `first_read_of` does not look,
+            // so the element that applies it stands for the read.
             let read = elts
                 .iter()
                 .find_map(|e| first_read_of(param, e))
-                .expect("an element reads `param`, asserted above");
+                .or_else(|| elts.iter().find(|e| is_free(param, e)).map(|e| e.node_id()))
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "a list in which `{param}` is free nowhere is a constant body, which \
+                         the Constant rule above has already returned"
+                    )
+                });
             Err(LambdaElimError::VaryingListElement {
                 binder: param.clone(),
                 read,
