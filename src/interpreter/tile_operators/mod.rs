@@ -394,7 +394,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 walk(codomain, label, level + 1, &keys, &complete, nodes, entries);
                 nodes.insert((label.to_vec(), level), CompletionNode { complete });
             }
-            Tile::Record(fields) => {
+            Tile::Record { fields, .. } => {
                 for (field, field_tile) in fields {
                     let mut label = label.to_vec();
                     label.push(field.clone());
@@ -435,7 +435,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     let one = tile.select_rows(&[row]);
                     // A store's seed is fixed for its whole life and a decided position's
                     // value never changes, so both are final wherever the store stands; its
-                    // frontier only moves forward, which `assert_complete_region_unchanged`
+                    // frontier only moves forward, which `completeness_violation`
                     // checks on its own.
                     let complete = true;
                     let entry = |value: EntryValue| Entry { value, complete };
@@ -457,7 +457,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     let positions = store_decided_positions(decided, 0);
                     let names: Vec<String> = one.store_keys().cloned().collect();
                     for name in names {
-                        let key = store_key(&name, Value::Unit);
+                        let key = store_key(&name);
                         // A store waiting for its seed has none yet; once it has one it
                         // keeps it.
                         let seed = store_seed_value(&one, &key);
@@ -491,7 +491,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 else {
                     unreachable!("matched as a store")
                 };
-                let Tile::Record(logs) = &**state else {
+                let Tile::Record { fields: logs, .. } = &**state else {
                     unreachable!("a store's state is a record of per-key changelogs")
                 };
                 let part = |name: &str| {
@@ -584,6 +584,11 @@ fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
             TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
                 walk(inner, label, depth + 1, level)
             }
+            // The values of the level itself: a record field's cell, named at the rows its
+            // leaf admits.
+            TileGuard::Function(FunctionGuard::Codomain(inner)) if depth == level => {
+                released_cells_at(inner, label)
+            }
             TileGuard::Function(FunctionGuard::Domain(pred)) if depth <= level => {
                 pred.descend(level - depth)
             }
@@ -593,19 +598,39 @@ fn released_at(guard: &TileGuard, label: &[String], level: usize) -> Predicate {
     walk(guard, label, 0, level)
 }
 
-/// Assert that `result` leaves unchanged everything `last` called complete, apart from
-/// removing what `released` has released since: the two rules of
-/// `src/interpreter/design-operators.md`, "The completeness contract".
+/// The paths whose value under record fields `label` `guard` names: a keyless leaf's rows.
+fn released_cells_at(guard: &TileGuard, label: &[String]) -> Predicate {
+    match guard {
+        TileGuard::Or(arms) => arms
+            .iter()
+            .map(|arm| released_cells_at(arm, label))
+            .fold(Predicate::False, |all, one| all.union(&one)),
+        TileGuard::Record(fields) => match label.split_first() {
+            Some((field, rest)) => fields
+                .get(field)
+                .map_or(Predicate::False, |g| released_cells_at(g, rest)),
+            None => Predicate::False,
+        },
+        TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) if label.is_empty() => {
+            TileGuard::leaf_rows(pred).clone()
+        }
+        _ => Predicate::False,
+    }
+}
+
+/// How `result` changes something `last` called complete, apart from removing what
+/// `released` has released since: the two rules of `src/interpreter/design-operators.md`,
+/// "The completeness contract". `None` where it changes nothing.
 ///
 /// A statement covers every path at its level, including paths under rows that have not
 /// arrived, so the second rule applies to them too: a key appearing under a row called
 /// complete before it arrived breaks it.
-pub(crate) fn assert_complete_region_unchanged(
+fn completeness_violation(
     name: &str,
     last: &Tile,
     result: &Tile,
     released: &TileGuard,
-) {
+) -> Option<String> {
     let (last_nodes, last_entries) = completion_view(last);
     let (result_nodes, result_entries) = completion_view(result);
     for ((label, level), node) in &last_nodes {
@@ -614,11 +639,12 @@ pub(crate) fn assert_complete_region_unchanged(
         let kept = result_nodes
             .get(&(label.clone(), *level))
             .map_or(Predicate::False, |n| n.complete.clone());
-        assert!(
-            kept.subsumes(&promised),
-            "{name} withdrew completion at level {level} of {label:?}: it called {promised:?} \
-             complete, and now calls only {kept:?} complete"
-        );
+        if !kept.subsumes(&promised) {
+            return Some(format!(
+                "{name} withdrew completion at level {level} of {label:?}: it called \
+                 {promised:?} complete, and now calls only {kept:?} complete"
+            ));
+        }
     }
     // A root value is released by a release naming it whole, through the record fields that
     // reach it; a path beneath the root by one naming it.
@@ -637,12 +663,14 @@ pub(crate) fn assert_complete_region_unchanged(
         match result_entries.get(&(label.clone(), path.clone())) {
             Some(now) if now.value == entry.value => {}
             None if is_released(label, path) => {}
-            now => panic!(
-                "{name} changed {label:?} at {path:?}, which it had called complete: {:?} \
-                 then {:?}, in {last:?} then {result:?}, having released {released:?}",
-                entry.value,
-                now.map(|n| &n.value)
-            ),
+            now => {
+                return Some(format!(
+                    "{name} changed {label:?} at {path:?}, which it had called complete: {:?} \
+                     then {:?}, in {last:?} then {result:?}, having released {released:?}",
+                    entry.value,
+                    now.map(|n| &n.value)
+                ));
+            }
         }
     }
     // A store's frontier only moves forward: a position it has decided stays decided.
@@ -657,12 +685,12 @@ pub(crate) fn assert_complete_region_unchanged(
         else {
             continue;
         };
-        assert!(
-            now.as_ref().is_some_and(|now| now >= then),
-            "{name} moved the frontier of {:?} at {:?} back: {then:?} then {now:?}",
-            key.0,
-            key.1
-        );
+        if !now.as_ref().is_some_and(|now| now >= then) {
+            return Some(format!(
+                "{name} moved the frontier of {:?} at {:?} back: {then:?} then {now:?}",
+                key.0, key.1
+            ));
+        }
     }
     for (label, path) in result_entries.keys() {
         if last_entries.contains_key(&(label.clone(), path.clone())) || path.is_empty() {
@@ -675,12 +703,14 @@ pub(crate) fn assert_complete_region_unchanged(
             .rev()
             .find_map(|n| last_nodes.get(&(label[..n].to_vec(), level)))
             .is_some_and(|n| n.complete.contains_path(path));
-        assert!(
-            !was_complete,
-            "{name} added {label:?} at {path:?}, beneath a path it had called complete: \
-             {last:?} then {result:?}"
-        );
+        if was_complete {
+            return Some(format!(
+                "{name} added {label:?} at {path:?}, beneath a path it had called complete: \
+                 {last:?} then {result:?}"
+            ));
+        }
     }
+    None
 }
 
 /// Common identity and tiling state shared by every [`TileProducer`].
@@ -696,7 +726,7 @@ pub struct ProducerBase {
     pub obsolete_guard: TileGuard,
     pub(crate) notified: Notified,
     /// The last tile `get` returned, for the debug check that the complete region never
-    /// changes ([`assert_complete_region_unchanged`]). Debug builds only; `None` in release.
+    /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
     pub(crate) last_output: Option<Tile>,
 }
 
@@ -798,7 +828,14 @@ pub trait TileProducer {
 
     /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
-        let result = self.get_impl(projection_guard);
+        let mut result = self.get_impl(projection_guard);
+        // A scalar field's cell released while its row stays open is left out here rather
+        // than by each producer: a producer rebuilds a row from inputs released by whole key,
+        // so it has the cell again, and its consumer has it already
+        // (`src/interpreter/design-operators.md`, "The release contract").
+        if let Some(cells) = self.obsolete_guard().released_cells() {
+            result.remove_guarded(cells);
+        }
         // A release says that data is never requested and never returned again.
         // Being pulled afterwards is fine — the answer is whatever lies outside
         // the released region, which after a universal release is nothing at all
@@ -827,19 +864,11 @@ pub trait TileProducer {
         debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
         if cfg!(debug_assertions) {
             if let Some(last) = &self.base().last_output
-                && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    assert_complete_region_unchanged(
-                        &self.name(),
-                        last,
-                        &result,
-                        self.obsolete_guard(),
-                    )
-                }))
-                .is_err()
+                && let Some(violation) =
+                    completeness_violation(&self.name(), last, &result, self.obsolete_guard())
             {
                 panic!(
-                    "the panic above, raised checking the completeness contract, in the \
-                     producer tree:\n{}",
+                    "{violation}\nin the producer tree:\n{}",
                     crate::pretty_tree::render_with_max_depth(
                         &self.inspect(&VizOptions::default()),
                         Some(6)
@@ -1051,14 +1080,17 @@ pub(crate) mod test_helpers {
         );
         let mut engine = CommitEngine::unopened();
         let step = |engine: &mut CommitEngine, p: usize| {
-            let writes = HashMap::from([(store_key("acc", Value::Unit), Value::Int(p as i64))]);
+            let writes = HashMap::from([(store_key("acc"), Value::Int(p as i64))]);
             engine.step(Position::new(Value::UInt(p)), Some(writes));
             engine.render_full_store_tile(&tiling)
         };
         let last = step(&mut engine, 0);
         let result = step(&mut engine, 1);
         let released = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
-        super::assert_complete_region_unchanged("honest", &last, &result, &released);
+        assert_eq!(
+            super::completeness_violation("honest", &last, &result, &released),
+            None
+        );
 
         let claim_all = |mut tile: Tile| {
             if let Tile::Store { decided, .. } = &mut tile
@@ -1070,19 +1102,13 @@ pub(crate) mod test_helpers {
             }
             tile
         };
-        let outcome = std::panic::catch_unwind(|| {
-            super::assert_complete_region_unchanged(
-                "claims_all",
-                &claim_all(last.clone()),
-                &claim_all(result.clone()),
-                &released,
-            )
-        });
-        let message = outcome
-            .expect_err("a decided set stated whole while it grows is reported")
-            .downcast::<String>()
-            .map(|m| *m)
-            .unwrap_or_default();
+        let message = super::completeness_violation(
+            "claims_all",
+            &claim_all(last.clone()),
+            &claim_all(result.clone()),
+            &released,
+        )
+        .expect("a decided set stated whole while it grows is reported");
         assert!(
             message.contains("#decided")
                 && message.contains("beneath a path it had called complete"),
@@ -1093,7 +1119,6 @@ pub(crate) mod test_helpers {
     /// A value in a record's field filled in beneath a key already called complete is an
     /// addition beneath a complete path, which the completeness contract forbids.
     #[test]
-    #[should_panic(expected = "beneath a path it had called complete")]
     fn a_record_field_filled_beneath_a_complete_key_is_reported() {
         use crate::interpreter::{ColumnValue, Predicate};
         use bit_set::BitSet;
@@ -1104,7 +1129,7 @@ pub(crate) mod test_helpers {
             Tile::DataFunction {
                 row_starts: ColumnValue::UInts(vec![0]),
                 domain: ColumnValue::UInts(vec![0]),
-                codomain: Box::new(Tile::Record(HashMap::from([
+                codomain: Box::new(Tile::record(HashMap::from([
                     ("n".to_string(), Tile::Scalar(n)),
                     (
                         "xs".to_string(),
@@ -1123,16 +1148,21 @@ pub(crate) mod test_helpers {
         };
         let last = with_n(ColumnValue::Ints(vec![]));
         let result = with_n(ColumnValue::Ints(vec![5]));
-        super::assert_complete_region_unchanged(
+        let violation = super::completeness_violation(
             "a_record_field",
             &last,
             &result,
             &TileGuard::Function(super::FunctionGuard::Domain(Predicate::False)),
+        )
+        .expect("an addition beneath a complete key is reported");
+        assert!(
+            violation.contains("beneath a path it had called complete"),
+            "{violation}"
         );
     }
 
-    /// A [`TileProducer`] that answers with a fixed tile and records every release
-    /// guard it is handed, for asserting that a release *propagates*.
+    /// A [`TileProducer`] that answers with a fixed tile, less what it has been released, and
+    /// records every release guard it is handed, for asserting that a release *propagates*.
     pub(crate) struct ReleaseSpy {
         pub(crate) base: ProducerBase,
         pub(crate) tile: Tile,

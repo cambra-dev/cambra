@@ -233,7 +233,7 @@ pub(crate) fn sort_tile_collections(tile: Tile) -> Tile {
         Tile::Scalar(ColumnValue::Variants(vs)) => Tile::Scalar(ColumnValue::Variants(
             vs.into_iter().map(sort_collection_bindings).collect(),
         )),
-        Tile::Record(fields) => Tile::Record(
+        Tile::Record { fields, .. } => Tile::record(
             fields
                 .into_iter()
                 .map(|(k, t)| (k, sort_tile_collections(t)))
@@ -278,7 +278,7 @@ pub(crate) fn extract_record_field(tile: Tile, field: &str) -> ColumnValue {
     let Tile::DataFunction { codomain, .. } = tile else {
         panic!("expected a collection, got {tile:?}");
     };
-    let Tile::Record(mut fields) = *codomain else {
+    let Tile::Record { mut fields, .. } = *codomain else {
         panic!("expected Record codomain");
     };
     scalar_tile_to_column_value(fields.remove(field).unwrap_or_else(|| {

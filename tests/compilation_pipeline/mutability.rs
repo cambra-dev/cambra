@@ -99,7 +99,7 @@ y := 0
 for i in [1, 2, 3]:
   fw(x, y)
 (x, y)"#,
-    Tile::Record(HashMap::from([
+    Tile::record(HashMap::from([
         ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
         ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
     ]))
@@ -225,7 +225,7 @@ for i in [1, 2, 3]:
     y := y + i
     x := x * i
 (x, y, x + y)"#,
-    Tile::Record(HashMap::from([
+    Tile::record(HashMap::from([
         ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
         ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
         ("_2".into(), Tile::Scalar(ColumnValue::Ints(vec![12]))),

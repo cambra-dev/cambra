@@ -101,8 +101,12 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
         }
 
         // One sub-tile per field at the same row count; the value of row `i` takes field
-        // `f` from sub-tile `f`'s row `i`.
-        Tile::Record(fields) => {
+        // `f` from sub-tile `f`'s row `i`. A field with no cell at some row has not arrived
+        // there, as an empty column has not.
+        Tile::Record { fields, absent } => {
+            if absent.values().any(|rows| !rows.is_empty()) {
+                return Err(SinkReadError::Incomplete);
+            }
             let mut columns: Vec<(&String, Vec<Value>)> = Vec::with_capacity(fields.len());
             for (name, sub) in fields {
                 columns.push((name, tile_rows(sub, rows)?));

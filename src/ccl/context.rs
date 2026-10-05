@@ -1579,9 +1579,6 @@ fn settle(ir: &Expr, boundary: &str, check: Check) -> Result<(), Vec<CompileErro
     crate::ccl::infer::debug_assert_no_free_witness(ir, boundary);
     debug!("{boundary} CCL:\n{}", symbolic(ir));
     debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
-    if std::env::var_os("TMPDUMP").is_some() {
-        eprintln!("TMPDUMP {boundary}:\n{}", symbolic(ir));
-    }
     let outcome = match check {
         Check::PreChannelizeReportingAmbiguity => return pre_channelize_wall(ir, boundary),
         Check::PreChannelize => check_pre_channelize(ir),

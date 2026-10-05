@@ -1170,7 +1170,7 @@ fn await_final_and_as_of_read_the_same_mut_var() {
             out << pool
         (sum(out), await_final(pool))
     "#};
-    let Tile::Record(fields) = run_pipeline(code) else {
+    let Tile::Record { fields, .. } = run_pipeline(code) else {
         panic!("expected a record of both reads")
     };
     // 100 − 10 − 20 = 70, and it is the *completed* value, not a sample of it.
@@ -1849,7 +1849,7 @@ fn unrelated_mut_vars_get_separate_stores() {
     assert_eq!(commit_stores(code), vec!["Txn[a]", "Txn[b]"]);
     check_tile(
         code,
-        Tile::Record(std::collections::HashMap::from([
+        Tile::record(std::collections::HashMap::from([
             ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
             ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
         ])),
@@ -2017,7 +2017,7 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
     assert_eq!(commit_stores(code), vec!["[0, 1][cnt]", "Txn[a]", "Txn[b]"]);
     check_tile(
         code,
-        Tile::Record(std::collections::HashMap::from([
+        Tile::record(std::collections::HashMap::from([
             ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![3]))),
             ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![30]))),
         ])),
@@ -2145,7 +2145,7 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     ctx.scheduler().check_for_notifications();
     let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
 
-    let Tile::Record(fields) = &result else {
+    let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
     };
     assert_eq!(
@@ -2205,7 +2205,7 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     ctx.scheduler().check_for_notifications();
     let result = pull_laps(ctx.scheduler(), &mut *producer, 65, |_| false);
 
-    let Tile::Record(fields) = &result else {
+    let Tile::Record { fields, .. } = &result else {
         panic!("expected a record of both replies, got {result:?}");
     };
     assert_eq!(

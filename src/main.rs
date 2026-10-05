@@ -207,7 +207,7 @@ fn release_guard_for(tile: &Tile) -> TileGuard {
         Tile::DataFunction {
             domain_predicate, ..
         } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-        Tile::Record(fields) => TileGuard::Record(
+        Tile::Record { fields, .. } => TileGuard::Record(
             fields
                 .iter()
                 .map(|(k, t)| (k.clone(), release_guard_for(t)))
@@ -223,7 +223,7 @@ fn tile_is_empty(tile: &Tile) -> bool {
     match tile {
         Tile::Scalar(cv) => cv.is_empty(),
         Tile::DataFunction { domain, .. } => domain.is_empty(),
-        Tile::Record(fields) => fields.values().all(tile_is_empty),
+        Tile::Record { fields, .. } => fields.values().all(tile_is_empty),
         _ => false,
     }
 }

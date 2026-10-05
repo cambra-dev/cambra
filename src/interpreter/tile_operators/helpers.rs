@@ -63,7 +63,7 @@ pub(crate) fn open_collections(cells: &ColumnValue, extent: &Extent) -> Tile {
             let ColumnValue::Records(columns) = cells else {
                 panic!("a record-valued column holds one column per field, got {cells:?}")
             };
-            Tile::Record(
+            Tile::record(
                 fields
                     .iter()
                     .map(|(name, field_extent)| {
@@ -114,16 +114,17 @@ pub(crate) fn column_of_rows(rows: impl Iterator<Item = Tile>, tiling: &Tiling) 
 ///
 /// Used by [`MapResultToConstProducer`] to broadcast a constant value across all
 /// domain elements: `Tile::Scalar(cv)` → `Tile::Scalar(cv.repeat(len))`;
-/// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`; a collection, one row
+/// a record → each field repeated; a collection, one row
 /// holding its keys, → one group per element, each a copy of that row's.
 pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
     match tile {
         Tile::Scalar(cv) => Tile::Scalar(cv.repeat(len)),
-        Tile::Record(m) => Tile::Record(
+        Tile::Record { fields: m, absent } => Tile::record({
+            assert_no_absent_cells(&absent);
             m.into_iter()
                 .map(|(k, t)| (k, repeat_tile(t, len)))
-                .collect(),
-        ),
+                .collect()
+        }),
         collection @ Tile::DataFunction { .. } => {
             assert_eq!(
                 collection.rows(),
@@ -134,6 +135,17 @@ pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
         }
         other => panic!("repeat_tile: unsupported tile shape {other:?}"),
     }
+}
+
+/// A column reader takes a record's fields one value per row, which a field holding no cell
+/// at some rows does not give; reaching one is a reader this representation has not been
+/// taught.
+pub(crate) fn assert_no_absent_cells(absent: &HashMap<String, bit_set::BitSet>) {
+    assert!(
+        absent.is_empty(),
+        "a record holding no cell of a field at some rows reached a reader taking one value \
+         per row: {absent:?}"
+    );
 }
 
 /// Converts a Scalar tile or Record of Scalars to its underlying [`ColumnValue`].
@@ -151,7 +163,8 @@ pub fn scalar_tile_to_column_value(tile: Tile) -> ColumnValue {
 pub fn try_scalar_tile_to_column_value(tile: Tile) -> Option<ColumnValue> {
     match tile {
         Tile::Scalar(cv) => Some(cv),
-        Tile::Record(m) => {
+        Tile::Record { fields: m, absent } => {
+            assert_no_absent_cells(&absent);
             let mut fields = HashMap::with_capacity(m.len());
             for (name, field) in m {
                 fields.insert(name, try_scalar_tile_to_column_value(field)?);
@@ -226,11 +239,12 @@ pub(crate) fn apply_function_tile(
 pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
     match tile {
         Tile::Scalar(cv) => cv,
-        Tile::Record(m) => ColumnValue::Records(
+        Tile::Record { fields: m, absent } => ColumnValue::Records({
+            assert_no_absent_cells(&absent);
             m.into_iter()
                 .map(|(name, field)| (name, materialize_collections(field)))
-                .collect(),
-        ),
+                .collect()
+        }),
         tile @ Tile::DataFunction { .. } => {
             let runs: Vec<(usize, usize)> = tile.row_runs().collect();
             let Tile::DataFunction {
@@ -276,7 +290,7 @@ pub(crate) fn materialized_row(tile: Tile) -> Value {
 /// [`ColumnValue`] using the given [`Tiling`] to determine the output shape.
 ///
 /// - `Tiling::Scalar` → `Tile::Scalar(cv)`
-/// - `Tiling::Record` → `Tile::Record(fields)` where each field is rebuilt recursively
+/// - `Tiling::Record` → a [`Tile::Record`] whose fields are each rebuilt recursively
 pub(crate) fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
     match tiling {
         Tiling::Scalar(_) => Tile::Scalar(cv),
@@ -286,7 +300,7 @@ pub(crate) fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
                     "column_value_to_tile: expected Records ColumnValue for Record tiling, got {cv:?}"
                 );
             };
-            Tile::Record(
+            Tile::record(
                 fields
                     .iter()
                     .map(|(k, t)| {
@@ -332,8 +346,8 @@ pub(crate) fn process_tile_result(
 ) -> Tile {
     match input_tile {
         Tile::Scalar(t) => column_value_to_tile(transformation(t), input_tiling),
-        Tile::Record(fields) => column_value_to_tile(
-            transformation(scalar_tile_to_column_value(Tile::Record(fields))),
+        record @ Tile::Record { .. } => column_value_to_tile(
+            transformation(scalar_tile_to_column_value(record)),
             input_tiling,
         ),
         Tile::DataFunction {
@@ -490,7 +504,7 @@ mod tests {
                 ]),
             ),
         ]));
-        let Tile::Record(fields) = open_checked(&cells, &extent) else {
+        let Tile::Record { fields, .. } = open_checked(&cells, &extent) else {
             panic!("a record holding a collection opens to a record of tiles")
         };
         assert_eq!(fields["a"], Tile::Scalar(ColumnValue::Ints(vec![5, 6])));

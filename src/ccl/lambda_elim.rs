@@ -944,11 +944,11 @@ fn elim_lambda_impl(
             // predicate is the closed value function a compiled refinement has to be.
             // It also puts the refinement where `planning::iterate` looks: on the
             // domain, which is the one place `Type::refinements` reads.
-            // **A carried proof stays; an owed restriction lifts.** A keyed collection's
-            // domain carries `collection_contains` to say the binder is a present key, and
-            // the lookup in the body reads it off the binder's own type — moving it would
-            // take the proof away from the site that needs it. A filter the program wrote
-            // is the other kind: nothing has applied it yet.
+            // **A membership refinement stays; a filter lifts.** A keyed collection's domain
+            // carries `collection_contains` to say the binder is a present key, and the lookup
+            // in the body reads it off the binder's own type, so it stays where that lookup
+            // reads it. A filter the program wrote is one nothing has applied yet, so it lifts
+            // onto the pair, where planning applies it.
             //
             // **A filter reading only the element stays on the component as well.**
             // Lifting is what makes a `param`-reading predicate closed; a predicate that
@@ -956,12 +956,10 @@ fn elim_lambda_impl(
             // of `y` need it there. The inner comprehension's source is the filtered
             // collection, typed `{𝐾 | 𝑝} ⤇ 𝑉`, and the body applies it to `y`: strip `𝑝`
             // from `y_ty` and that application has a bare `𝐾` where a `{𝐾 | 𝑝}` is
-            // required. The pair's copy is what planning reads, because neither
-            // inner-source builder applies a component refinement — the type-read route
-            // strips it in `extent_of` and drops the filter, and the named-source route
-            // hands the refined domain to `IterateExtent`, which rejects it. So the two
-            // copies serve different readers: the component states what `y` is, the pair
-            // states what to narrow.
+            // required. The pair's copy is what planning applies, as a `filter_values`
+            // (`emit_pair_filter` in `src/ccl/planning/correlated.rs`), and nothing applies a
+            // component refinement. So the two copies serve different readers: the
+            // component states what `y` is, the pair states what to narrow.
             let refinements = y_ty.refinements().to_vec();
             let lifting: Vec<Refinement> = refinements
                 .iter()
@@ -1407,7 +1405,7 @@ fn elim_lambda_impl(
             let calls: Vec<(Name, Expr)> = bindings
                 .iter()
                 .map(|(b, _)| {
-                    debug_assert!(
+                    assert!(
                         !crate::ccl::ccl_utils::is_free_in_type(param, &b.ty),
                         "a nested recurrence's history type does not depend on the enclosing \
                          parameter `{param}`, so each reference to it is typed `𝑃 ⇒ 𝑇`: `{}` \

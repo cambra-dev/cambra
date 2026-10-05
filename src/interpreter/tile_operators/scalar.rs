@@ -1263,7 +1263,7 @@ mod tests {
         // Only the commit keys survive the join, aligned by key: (time, payload)
         // = (1, 100) at key 10 and (3, 120) at key 12.
         assert_eq!(domain, ColumnValue::from_uints(vec![10, 12]));
-        let Tile::Record(fields) = *codomain else {
+        let Tile::Record { fields, .. } = *codomain else {
             panic!("expected Record values, got {codomain:?}");
         };
         assert_eq!(fields["_0"], Tile::Scalar(ColumnValue::Ints(vec![1, 3])));

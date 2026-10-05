@@ -311,9 +311,9 @@ struct KeyReadInfo {
     /// Whether the key's value **carries forward** across positions that do not write
     /// it — an accumulator, as against a reply tap, which is a per-position event.
     ///
-    /// Separate from `carried`: a **nested** accumulator carries forward like any other and is handed across versions by the enclosing
-    /// store rather than by its own, so the two answers part there: one is about the
-    /// fold within a run, the other about identity between runs.
+    /// Separate from `carried`, because a **nested** accumulator carries forward like any
+    /// other but is handed across versions by the enclosing store rather than by its own.
+    /// This is about the fold within a run, `carried` about identity between runs.
     carry_forward: bool,
     /// What identifies this variable across versions, or `None` for a key no version
     /// hands on: a reply tap, and a nested accumulator, whose value the enclosing store
@@ -457,8 +457,8 @@ pub struct OpConversionContext {
 ///
 /// A binding made outside it is keyed by the enclosing positions, and a reference made
 /// inside it runs over this `Transact`'s own. Lifting one to the other is pairing it with the
-/// keys beneath each enclosing position and flattening — the construction that built this
-/// `Transact`'s pairs, with the binding in the enclosing parameter's place.
+/// keys beneath each enclosing position, the construction that built this `Transact`'s pairs
+/// with the binding in the enclosing parameter's place ([`lift_into_iteration`]).
 #[derive(Clone)]
 pub(crate) struct OpenIteration {
     /// The curried source: one inner collection per enclosing position, which is the keys a
@@ -467,11 +467,6 @@ pub(crate) struct OpenIteration {
     /// The level the iteration adds beneath its enclosing positions, which a lifted binding is
     /// paired at ([`Product::per_row_at`]).
     paired: CurryLevel,
-    /// Where the reference reads the pairs **flattened**, the level they are flattened at:
-    /// a nested `Transact`'s seed runs over `(enclosing, position)` pair keys, as the pairs it
-    /// is converted against do, where its body reads the two levels as two. `None` for the
-    /// body.
-    flattened_at: Option<CurryLevel>,
 }
 
 /// What one compilation hands the version that replaces it: the operator behind
@@ -692,11 +687,9 @@ impl OpConversionContext {
     }
 
     /// The level the node being converted sits at ([`Self::level`](field@Self::level)).
-    ///
-    /// Level 1 where no root has set one: a conversion handed an input with nothing around
-    /// it is converted against that one stream.
     fn level(&self) -> CurryLevel {
-        self.level.unwrap_or(CurryLevel::new(1))
+        self.level
+            .expect("a root conversion sets the level before any node reads it")
     }
 
     /// Install what the tree about to be converted says about itself: the
@@ -817,7 +810,10 @@ impl OpConversionContext {
         // store is what hands its variables on ([`live_state`](Self::live_state) reads
         // that one). Registering it here is only so `__hist.k` inside the enclosing body
         // resolves to it.
-        let info = build_nested_induction_store(keys, w, bound_expr, enclosing_input, self)?;
+        let info = StoreReadInfo {
+            site: content_hash(bound_expr),
+            ..build_nested_induction_store(keys, w, bound_expr, enclosing_input, self)?
+        };
         self.transactional_stores.insert(name.clone(), info);
         Ok(())
     }
@@ -1351,11 +1347,15 @@ in it has a correspondent",
                     .previous(source.node_id())
                     .and_then(|prev| self.minted.entries.get(&prev))
                     .and_then(|entry| entry.fan().released_position());
-                let begins = match kept.as_ref().map(Position::value) {
-                    // A stream index is what an element count is reported in; a loop
-                    // over any other domain has no prefix of elements to be missing.
-                    Some(Value::UInt(released)) => released + 1,
-                    Some(_) => continue,
+                // Where the loop will begin past. A stream index is reported as an element
+                // count; any other domain's positions have no count, so the last one released
+                // is what is reported.
+                let missing = |p: Position| match p.into_value() {
+                    Value::UInt(n) => MissingPrefix::Elements(n + 1),
+                    through => MissingPrefix::Through(through),
+                };
+                let missing = match kept {
+                    Some(released) => Some(missing(released)),
                     // Read off the input's own domain rather than the store's,
                     // because the two store kinds are told this differently and
                     // both read the same elements. An induction drive is based at
@@ -1366,17 +1366,14 @@ in it has a correspondent",
                         .ty
                         .domain()
                         .and_then(|d| source_start(&strip_refinements(&d), self))
-                        .map_or(0, |p| match p.into_value() {
-                            Value::UInt(n) => n + 1,
-                            _ => 0,
-                        }),
+                        .map(missing),
                 };
-                if begins == 0 {
+                let Some(missing) = missing else {
                     continue;
-                }
+                };
                 out.extend(fresh.iter().map(|path| UnreadablePrefix {
                     path: (*path).clone(),
-                    positions: begins,
+                    missing: missing.clone(),
                 }));
             }
         }
@@ -2408,10 +2405,10 @@ fn convert_impl_inner(
             )))
         }
 
-        // A correlated inner comprehension whose inner source planning **named**
-        // (`src/ccl/planning/correlated.rs`). The source carries its domain in its
-        // codomain, so it compiles as its own iteration and [`Product`] pairs it with each
-        // outer row; everything after that is the arm below.
+        // A correlated inner comprehension whose type is dependent, which planning keeps as
+        // one node because the chain it rewrites other sites to has no spelling for a domain
+        // narrowed by its input (`src/ccl/planning/correlated.rs`). It converts to the
+        // operators that chain does.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::CurryOver) =>
         {
@@ -2428,77 +2425,32 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             };
-            let inner = convert_impl(source, None, ctx)?;
-            let pairs = Box::new(Product::shared_at(outer, inner, ctx.level()));
-            // The morphism runs once per pair, over the inner iteration `Product` appends.
+            // `⟨id, const(𝐾)⟩ ▷ zip ≫ strength`, the chain planning writes where the site's
+            // type is not dependent: each row beside the one collection every row reads.
+            let keys = convert_impl(source, None, ctx)?;
+            let with_keys = Box::new(MapResultToConst::new_at(
+                outer,
+                keys,
+                MapResultToConstMode::ZipRight,
+                ctx.level(),
+            ));
+            let pairs = strength_at(with_keys, ctx.level())?;
+            // The morphism runs once per pair, over the iteration `strength` appends.
             convert_lifted(morphism, Some(pairs), ctx)
         }
 
-        // **A correlated inner comprehension**: `curry(𝑔)` composed onto the outer collection,
-        // where `𝑔` takes the pair `(outer value, inner element)` because the inner body reads
-        // the outer binder. Running `𝑔` once per pair and grouping by the outer row is a
-        // collection per row, which is what [`Product`] emits and what `𝑔` then compiles over
-        // like any other morphism over a stream. An uncorrelated inner comprehension never
-        // reaches here: its body closes over nothing outer, so lambda elimination leaves a
-        // `const` and no pair.
-        //
-        // The inner side comes from the type, which is what makes it the same set for every
-        // row. A per-row inner collection is the same output shape from a different builder
-        // (`src/interpreter/design-operators.md`, "Where a collection is materialized").
+        // A curried morphism composed onto a collection is a correlated inner comprehension,
+        // which planning rewrites through `strength` (`src/ccl/planning/correlated.rs`). One
+        // reaching here is a site planning did not rewrite.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Curry)
                 && input.is_some()
                 && as_builtin(argument).is_none() =>
         {
-            let outer = expect_input(input, "curry")?;
-            // **The domain read off the type is the whole of what this site iterates**, so a
-            // refinement on it is one nothing here applies: `extent_of` strips it. A filter
-            // on the pair is planning's to emit as a term (`planning/correlated.rs`), and one
-            // left standing would drop silently. A present-key proof on the inner component
-            // says the domain is in the data, which the type cannot enumerate; planning names
-            // such a source, and one it did not name reaches here.
-            let domain = argument.ty.domain();
-            let unapplied = |what: &str| {
-                ConversionError::Unsupported(format!(
-                    "a correlated inner comprehension whose {what} is not supported yet: the \
-                     inner domain is read off the type {}, which cannot apply it",
-                    argument.ty
-                ))
-            };
-            if domain.as_ref().is_some_and(|d| !d.refinements().is_empty()) {
-                return Err(unapplied("pair carries a filter planning did not emit"));
-            }
-            let Some(Type::Tuple(pair)) = domain else {
-                return Err(ConversionError::TypeError(format!(
-                    "a curried morphism takes the pair of what it is curried over and what it \
-                     iterates, so its domain is a two-element tuple; got {}",
-                    argument.ty
-                )));
-            };
-            let [_, inner] = pair.as_slice() else {
-                return Err(ConversionError::TypeError(format!(
-                    "a curried morphism's domain pairs exactly two, got {}",
-                    argument.ty
-                )));
-            };
-            if inner
-                .refinements()
-                .iter()
-                .any(|r| r.is_collection_membership())
-            {
-                return Err(unapplied("source is a collection planning did not name"));
-            }
-            if !inner.refinements().is_empty() {
-                return Err(unapplied("inner domain carries a filter"));
-            }
-            let inner = ctx.extent_of(inner)?;
-            let pairs = Box::new(Product::shared_at(
-                outer,
-                Box::new(IterateExtent::new(inner)),
-                ctx.level(),
-            ));
-            // 𝑔 runs once per pair, over the inner iteration `Product` appends.
-            convert_lifted(argument, Some(pairs), ctx)
+            Err(ConversionError::Unsupported(format!(
+                "a curried morphism planning did not rewrite through `strength`: `{}`",
+                symbolic(expr)
+            )))
         }
 
         TypedExprNode::Apply { argument, function } => {
@@ -2556,9 +2508,8 @@ fn convert_impl_inner(
                     // so it is lifted once per iteration between the two. Read through,
                     // the two domains disagree at whatever pairs them.
                     (BindingKind::Aligned, _) => ctx.iterations[depth..]
-                        .to_vec()
                         .iter()
-                        .try_fold(op, |op, open| lift_into_iteration(op, open)),
+                        .try_fold(op, lift_into_iteration),
                     (BindingKind::Free, None) => Ok(op),
                     (BindingKind::Free, Some(input)) => {
                         Ok(Box::new(MapResult::new_at(input, op, ctx.level())))
@@ -2602,6 +2553,11 @@ fn convert_impl_inner(
             let input = expect_input(input, &format!("Builtin({})", b.name()))?;
             match b {
                 Builtin::Id => Ok(input),
+                // `strength`: each enclosing value paired with each value of its own
+                // collection, under that value's key. Its input is the pair `⟨id, 𝑆⟩ ▷ zip`
+                // made, one per row of the level it is converted at, so the two halves are
+                // that pair's fields.
+                Builtin::Strength => strength_at(input, ctx.level()),
                 // Entering a sum is the identity at runtime. A sum's value is a domain paired
                 // with a collection over it, and a collection carries its own domain, so the
                 // witness is recoverable from the value and nothing represents it separately
@@ -3092,7 +3048,7 @@ fn list_levels(elts: &[&Expr], elt_extent: &Extent) -> Result<(Tile, Tiling), Co
                 tiles.insert(name.clone(), tile);
                 tilings.insert(name.clone(), tiling);
             }
-            Ok((Tile::Record(tiles), Tiling::Record(tilings)))
+            Ok((Tile::record(tiles), Tiling::Record(tilings)))
         }
         _ => {
             let mut values = Vec::with_capacity(elts.len());
@@ -3363,21 +3319,19 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
         .collect()
 }
 
-/// The store key of mutable variable `reg` at data key `at`.
+/// The store key of mutable variable `reg`: `` `reg(unit) ``.
 ///
-/// A store's key space is a tagged sum over its mutable variables, each arm carrying that
-/// mutable variable's own key type: `Σ reg. K_reg`. A scalar mutable variable's key type is `Unit`,
-/// so it occupies the single key `` `reg(unit) ``. The tag is what keeps one
-/// mutable variable's keys disjoint from another's — without it a keyed mutable variable holding
-/// the string `"pool"` would alias the scalar mutable variable spelled `pool`.
+/// A store holds one changelog per mutable variable, a keyed one included, since a keyed
+/// write commits the whole collection (`mut_elim::desugar_keyed_writes`). The tag names the
+/// variable, and the `unit` payload is the one key a variable occupies.
 ///
 /// The tag is also the name a decision's write set is keyed by, which `body_decision_at`
 /// reads back — so the engine's own tests build their keys here rather than restating
 /// the shape.
-pub(crate) fn store_key(reg: &str, at: Value) -> Value {
+pub(crate) fn store_key(reg: &str) -> Value {
     Value::Union {
         tag: FieldKey::Name(reg.into()),
-        inner: Box::new(at),
+        inner: Box::new(Value::Unit),
     }
 }
 
@@ -3482,7 +3436,7 @@ fn build_commit_store(
     let mut value_extents: Vec<Extent> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
-        let runtime_key = store_key(&field, Value::Unit);
+        let runtime_key = store_key(&field);
         let key_value_extent = ctx.extent_of(&k.init.ty)?;
         if !value_extents.contains(&key_value_extent) {
             value_extents.push(key_value_extent.clone());
@@ -3523,7 +3477,7 @@ fn build_commit_store(
         _ => Extent::Union(TagMap::from_positional(value_extents)),
     };
     // Resolve a footprint key's runtime value from its `field_key`.
-    let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
+    let runtime_key = |n: &Name| store_key(&n.field_key());
 
     // Each writer's static write footprint, so the store can close a key once the
     // writers that may touch it have finished rather than only when every writer
@@ -3538,7 +3492,7 @@ fn build_commit_store(
                 .chain(
                     body_tap_fields(&w.body.ty)
                         .into_iter()
-                        .map(|(f, _)| store_key(&f, Value::Unit)),
+                        .map(|(f, _)| store_key(&f)),
                 )
                 .collect()
         })
@@ -3631,7 +3585,7 @@ fn build_commit_store(
         let mut tap_fields: Vec<String> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
             let tap_value_extent = ctx.extent_of(&tap_ty)?;
-            write_keys.push(store_key(&field, Value::Unit));
+            write_keys.push(store_key(&field));
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
@@ -3642,7 +3596,7 @@ fn build_commit_store(
                     // versions.
                     carry_forward: false,
                     carried: None,
-                    runtime_key: store_key(&field, Value::Unit),
+                    runtime_key: store_key(&field),
                     value_extent: tap_value_extent,
                 },
             );
@@ -4297,18 +4251,37 @@ pub enum StateConflict {
 pub struct UnreadablePrefix {
     /// The variable the loop accumulates into.
     pub path: VarPath,
-    /// How many positions of its input it will not see.
-    pub positions: usize,
+    /// The positions of its input it will not see.
+    pub missing: MissingPrefix,
+}
+
+/// The prefix of a loop's input a variable will not see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingPrefix {
+    /// The first `n` elements of a stream indexed from `0`.
+    Elements(usize),
+    /// Every position through this one, of a domain whose positions are not counted.
+    Through(Value),
 }
 
 impl std::fmt::Display for UnreadablePrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} starts at the value it declares and reads its input from element {}: the first {} \
-             were released before this version existed, so they are not in its value",
-            self.path, self.positions, self.positions,
-        )
+        match &self.missing {
+            MissingPrefix::Elements(n) => write!(
+                f,
+                "{} starts at the value it declares and reads its input from element {n}: the \
+                 first {n} were released before this version existed, so they are not in its \
+                 value",
+                self.path,
+            ),
+            MissingPrefix::Through(through) => write!(
+                f,
+                "{} starts at the value it declares and reads its input past position \
+                 {through}: the positions through it were released before this version \
+                 existed, so they are not in its value",
+                self.path,
+            ),
+        }
     }
 }
 
@@ -4398,8 +4371,10 @@ fn build_induction_store(
     build_induction_store_single(keys, w, domain, paths, ctx)
 }
 
-/// The parts of a `Transact`'s store that its depth does not change: the read keys' extents,
-/// the write keys, the reply-tap fields, and the per-key state tiling.
+/// The parts of an induction store that its depth does not change: the read keys' extents,
+/// the write keys, the reply-tap fields, and the per-key state tiling. A commit store keys
+/// its reads and writes by decision rather than by position, so [`build_commit_store`]
+/// assembles its own.
 ///
 /// A tap is a write-only changelog key appended after the accumulators — a per-position
 /// event rather than a carried mutable variable (`carried: None`), holding
@@ -4426,12 +4401,12 @@ fn store_parts(
     let mut write_keys: Vec<Value> = w
         .write_keys
         .iter()
-        .map(|n| store_key(&n.field_key(), Value::Unit))
+        .map(|n| store_key(&n.field_key()))
         .collect();
     let mut tap_fields: Vec<String> = Vec::new();
     for (field, tap_ty) in taps {
         let value_extent = ctx.extent_of(&tap_ty)?;
-        let runtime_key = store_key(&field, Value::Unit);
+        let runtime_key = store_key(&field);
         write_keys.push(runtime_key.clone());
         let prior = keys_map.insert(
             field.clone(),
@@ -4447,8 +4422,8 @@ fn store_parts(
         // this catches two taps landing on one field.
         debug_assert!(
             prior.is_none(),
-            "two of this store's keys are labeled `{field}`, so one read resolves \
-to the other's value",
+            "two of this store's keys are labeled `{field}`, so one read resolves to the \
+             other's value",
         );
         tap_fields.push(field);
     }
@@ -4536,7 +4511,7 @@ fn build_nested_induction_store(
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let _scope = crate::ccl::provenance::converting(bound_expr.node_id());
-    let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
+    let runtime_key = |n: &Name| store_key(&n.field_key());
     let taps = body_tap_fields(&w.body.ty);
     // Each fan below shares a computed input between several readers, so each sits on a
     // `Memo`: a `FanOut` passes every branch's pull to its input, and without the cache each
@@ -4564,9 +4539,8 @@ fn build_nested_induction_store(
         )));
     };
     let source_fan = Rc::new(FanOut::new(Box::new(Memo::new(source_nested))));
-    // The seed and the body take `(ᴘ, Pos)`, so each row's parameter is paired with the
-    // keys of **its own** collection. A shared inner side ([`Product::shared_at`]) would pair
-    // against one stream, which a nested loop does not have.
+    // The body takes `(ᴘ, Pos)`, so each row's parameter is paired with the keys of **its
+    // own** collection ([`Product::per_row_at`]).
     // The `Transact`'s rows stand beneath the levels left standing, and the pairing adds the
     // level beneath them: where the program puts this loop, not what the operands' tilings
     // happen to hold.
@@ -4597,12 +4571,12 @@ fn build_nested_induction_store(
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
     let mut seed_ops: Vec<Box<dyn TileOperator>> = Vec::new();
     let mut store_seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
-    // A seed runs over the pairs, one iteration deeper than the enclosing body, so a binding
-    // made there and read by a seed is lifted onto the pairs, flattened as they are.
+    // A seed is a morphism of the enclosing parameter, one per enclosing position, so it is
+    // converted at the enclosing body's own iteration and reads its bindings as they are.
     let seeds = convert_nested_seeds(keys, &enclosing_fan, ctx);
     for (k, seed) in keys.iter().zip(seeds?) {
         let field = k.name.field_key();
-        let rk = store_key(&field, Value::Unit);
+        let rk = store_key(&field);
         // A nested seed is `ᴘ ⇒ V`, so the accumulator's own type is its codomain.
         let value_ty = k.init.ty.codomain().ok_or_else(|| {
             ConversionError::TypeError(format!(
@@ -4697,7 +4671,6 @@ fn build_nested_induction_store(
     ctx.iterations.push(OpenIteration {
         source: source_fan.clone(),
         paired,
-        flattened_at: None,
     });
     let body = convert_lifted(&w.body, Some(Box::new(driver)), ctx);
     ctx.iterations.pop();
@@ -4706,6 +4679,7 @@ fn build_nested_induction_store(
         fan,
         keys: keys_map,
         kind: StoreReadKind::NestedInductionChangelog,
+        // Set by `bind_nested_store`, as `bind_store` sets a top-level store's.
         site: ContentHash(0),
     })
 }
@@ -4728,7 +4702,7 @@ fn build_induction_store_single(
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     let taps = body_tap_fields(&w.body.ty);
-    let runtime_key = |n: &Name| store_key(&n.field_key(), Value::Unit);
+    let runtime_key = |n: &Name| store_key(&n.field_key());
     let domain = strip_refinements(domain);
 
     // Whether this store continues a recurrence the retired version was running.
@@ -4761,7 +4735,7 @@ fn build_induction_store_single(
     let mut seed_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
         let field = k.name.field_key();
-        let rk = store_key(&field, Value::Unit);
+        let rk = store_key(&field);
         let value_extent = ctx.extent_of(&k.init.ty)?;
         // A variable the replaced version was carrying resumes from the value it
         // held; one this version introduces starts from the init it declares.
@@ -5042,13 +5016,11 @@ fn convert_store_read(
         // (`carry_forward: false`) is the feed's per-position value stream: only the
         // positions where the tap fired, keyed by loop position — the same `Fun(D, V)` the
         // sink reads.
-        // A nested store's read is one inner history **per enclosing position**, which is how
-        // the enclosing body consumes it: `final_or_default` reduces it row by row, and its
-        // default is that row's seed. The store *is* a collection of stores, so the read
-        // produces that shape rather than regrouping a flat one afterwards — which it
-        // could not do, since which rows are complete is not a fact about pair positions.
+        // A nested store's read is the same operator: it is one inner history **per
+        // enclosing position**, which is how the enclosing body consumes it, since the store
+        // is a collection of stores and the read carries the levels the store does.
         (
-            StoreReadKind::NestedInductionChangelog,
+            StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog,
             Some((runtime_key, value_extent, carry_forward)),
         ) => Ok(Box::new(StoreDenseRead::new(
             fan.branch(),
@@ -5056,22 +5028,13 @@ fn convert_store_read(
             value_extent,
             carry_forward,
         ))),
-        (StoreReadKind::NestedInductionChangelog, None) => Err(ConversionError::Unsupported(
-            format!("nested store {store_name} has no key {field}"),
-        )),
-        (StoreReadKind::InductionChangelog, Some((runtime_key, value_extent, carry_forward))) => {
-            Ok(Box::new(StoreDenseRead::new(
-                fan.branch(),
-                runtime_key,
-                value_extent,
-                carry_forward,
+        // Every induction read (accumulator *and* reply tap) is registered as a changelog
+        // key, so an absent key is a bug.
+        (StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog, None) => {
+            Err(ConversionError::Unsupported(format!(
+                "induction-changelog store {store_name} has no key {field}"
             )))
         }
-        // Every `InductionChangelog` read (accumulator *and* reply tap) is
-        // registered as a changelog key, so an absent key is a bug.
-        (StoreReadKind::InductionChangelog, None) => Err(ConversionError::Unsupported(format!(
-            "induction-changelog store {store_name} has no key {field}"
-        ))),
         (StoreReadKind::Commit, None) => Err(ConversionError::Unsupported(format!(
             "store {store_name} has no key {field}"
         ))),
@@ -5117,6 +5080,22 @@ fn proj_field(
     Ok(Box::new(MapResult::new_at(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
+        level,
+    )))
+}
+
+/// `strength` over `input`, a pair `(𝑥, 𝐶)` at each row of `level`: each `𝑥` beside each value
+/// of its row's collection `𝐶`, under that value's key.
+fn strength_at(
+    input: Box<dyn TileOperator>,
+    level: CurryLevel,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let pair = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+    let rows = proj_field(pair.branch(), 0, level)?;
+    let collections = proj_field(pair.branch(), 1, level)?;
+    Ok(Box::new(Product::per_row_values_at(
+        rows,
+        collections,
         level,
     )))
 }
@@ -5180,16 +5159,13 @@ fn lift_into_iteration(
     op: Box<dyn TileOperator>,
     open: &OpenIteration,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let paired: Box<dyn TileOperator> =
-        Box::new(Product::per_row_at(op, open.source.branch(), open.paired));
-    let paired = match open.flattened_at {
-        Some(level) => Box::new(Uncurry::new_at(paired, level)),
-        None => paired,
-    };
-    // The pairing adds its level at `open.paired`, so the pairs stand one level further in,
-    // or at it where the two levels were flattened into one.
-    let level = CurryLevel::new(open.paired.index() + 1 - usize::from(open.flattened_at.is_some()));
-    proj_named_field(paired, &tuple_field(0), level)
+    let paired = Box::new(Product::per_row_at(op, open.source.branch(), open.paired));
+    // The pairing adds its level at `open.paired`, so the pairs stand one level further in.
+    proj_named_field(
+        paired,
+        &tuple_field(0),
+        CurryLevel::new(open.paired.index() + 1),
+    )
 }
 
 /// Build an operator that extracts a named field from the record codomain of `input`.
@@ -5327,7 +5303,10 @@ fn union_operand_ops(
             // body once per proposal.
             // The arms partition the level the copairing is converted at, so they merge one
             // level above it.
-            let level = ctx.level().enclosing().unwrap_or(CurryLevel::OUTERMOST);
+            let level = ctx
+                .level()
+                .enclosing()
+                .expect("a fed disjoint join partitions the keys its input stands at, and a scalar has none");
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
             let ops = operands
                 .iter()
@@ -6057,7 +6036,8 @@ mod variant_ctor_tests {
         });
 
         let mut ctx = OpConversionContext::new();
-        let op = convert_impl(&transformer, Some(stream_op), &mut ctx).expect("op-conversion");
+        let op = convert_at(&transformer, Some(stream_op), CurryLevel::new(1), &mut ctx)
+            .expect("op-conversion");
         let tile = drive(op);
 
         let Tile::DataFunction {
@@ -6067,7 +6047,7 @@ mod variant_ctor_tests {
             panic!("expected Function, got {tile:?}");
         };
         assert_eq!(domain, ColumnValue::from_uints(vec![0, 1]));
-        let Tile::Record(fields) = *codomain else {
+        let Tile::Record { fields, .. } = *codomain else {
             panic!("expected a record codomain, got {codomain:?}");
         };
         // Each row keeps its own outer `time` (10, 20) paired with its own commit
@@ -6175,7 +6155,8 @@ mod variant_ctor_tests {
         });
 
         let mut ctx = OpConversionContext::new();
-        let op = convert_impl(&transformer, Some(stream_op), &mut ctx).expect("op-conversion");
+        let op = convert_at(&transformer, Some(stream_op), CurryLevel::new(1), &mut ctx)
+            .expect("op-conversion");
         let tile = drive(op);
 
         let Tile::DataFunction {
