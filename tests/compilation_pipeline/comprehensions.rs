@@ -291,23 +291,6 @@ fn test_filtered_comprehension_over_a_filtered_literal() {
     );
 }
 
-/// A **correlated filter beside a correlated body** is refused for its pair binder.
-///
-/// The inner comprehension's filter and its body both read the outer binder, so eliminating
-/// the lambda zips two morphisms of which the second is the dependent one. Taking the pair's
-/// binder from the first alone left an unnamed function whose codomain referenced a binder,
-/// and the program panicked inside `subst` before reaching any refusal of its own. What
-/// refuses it is planning: a `__pair` uid is minted fresh per elimination, and the
-/// structural producer/consumer refinement match needs the compiled predicate to be a value
-/// function. Closing that turns this into a positive test for `Value::Int(11)`.
-#[test]
-fn a_correlated_filter_beside_a_correlated_body_is_refused_for_its_pair_binder() {
-    check_compile_error(
-        "sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])",
-        "a `__pair` binder survived into a compiled predicate term",
-    );
-}
-
 /// A transactional collection read **as a collection**, once per transaction.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -454,6 +437,20 @@ fn a_let_outside_a_filtered_comprehension_moves_into_both_copies_of_its_source()
     "#},
     9
 )]
+// A correlated **filter** beside a correlated body, the filter riding the pair it filters
+// (`src/ccl/planning/correlated.rs`): 1*(2+3) + 2*3.
+#[case::correlated_filter("sum([sum([v * r for v in [1, 2, 3] if v > r]) for r in [1, 2]])", 11)]
+// A filter reading only the element, beside a body that reads the outer binder. It lifts to
+// the pair like a correlated one, because neither inner-source builder narrows the inner
+// domain itself — leaving it on the component answers 18 rather than 15. 1*(2+3) + 2*(2+3).
+#[case::uncorrelated_filter("sum([sum([v * r for v in [1, 2, 3] if v > 1]) for r in [1, 2]])", 15)]
+// Both together. The element-only bound is the one that bites at `r = 1`, so dropping
+// either filter changes the answer — unlike `v > 1` beside `v > r`, where `v > r` implies
+// it at every `r` and the case would pass with the first filter gone. 1*3 + 2*3.
+#[case::both_filters(
+    "sum([sum([v * r for v in [1, 2, 3] if v > 2 if v > r]) for r in [1, 2]])",
+    9
+)]
 // (1+2+3) twice, the inner sum shared.
 #[case::uncorrelated("sum([sum([v for v in [1, 2, 3]]) for r in [1, 2]])", 12)]
 // The outer binder outside the inner comprehension: 1*6 + 2*6, by the same broadcast.
@@ -462,6 +459,16 @@ fn a_let_outside_a_filtered_comprehension_moves_into_both_copies_of_its_source()
 // projection with no source in it for planning to name. It compiles by the second route —
 // op-conversion reading the domain off the type — which nothing else here covers: 3*(1+2).
 #[case::body_ignores_the_inner_element("sum([sum([r for v in [1, 2, 3]]) for r in [1, 2]])", 9)]
+// The same route with a filter, element-only and correlated: the inner domain is read off
+// the type and the filter rides the pair. 2 * (1 + 2), then 2 * 1 + 1 * 2.
+#[case::body_ignores_the_inner_element_filtered(
+    "sum([sum([r for v in [1, 2, 3] if v > 1]) for r in [1, 2]])",
+    6
+)]
+#[case::body_ignores_the_inner_element_correlated_filter(
+    "sum([sum([r for v in [1, 2, 3] if v > r]) for r in [1, 2]])",
+    4
+)]
 fn a_correlated_inner_comprehension_runs_per_outer_row(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
 }
@@ -639,6 +646,36 @@ fn a_correlated_comprehension_runs_inside_a_transaction(
     "sum([sum([sum([v for v in [1, 2]]) * r for r in [1, 2]]) for q in [1, 2]])",
     18
 )]
+// A correlated filter at depth three. The inner sum's domain is filtered per row, and its
+// type says so by naming the binder of the pair the outer site merged `q` and `r` into.
+// Each filter reads a different level: `q = 1` keeps 2 + 3 and `q = 2` keeps 3, so
+// (1·5 + 2·3)·(1 + 2) = 33, and by symmetry the same over `r`.
+#[case::depth_3_filter_on_the_outermost(
+    "sum([sum([sum([v * r * q for v in [1, 2, 3] if v > q]) for r in [1, 2]]) for q in [1, 2]])",
+    33
+)]
+#[case::depth_3_filter_on_the_middle(
+    "sum([sum([sum([v * r * q for v in [1, 2, 3] if v > r]) for r in [1, 2]]) for q in [1, 2]])",
+    33
+)]
+// Both levels at once, which only `q = r = 1` passes at 3.
+#[case::depth_3_filter_on_both(
+    "sum([sum([sum([v * r * q for v in [1, 2, 3] if v > r + q]) for r in [1, 2]]) for q in [1, 2]])",
+    3
+)]
+// Two pairings above the filtered one: (1·5 + 2·3)·3·3.
+#[case::depth_4_filter(
+    "sum([sum([sum([sum([v * s * r * q for v in [1, 2, 3] if v > q]) for s in [1, 2]]) \
+     for r in [1, 2]]) for q in [1, 2]])",
+    99
+)]
+// A body that never applies the inner source, so the domain is read off the type, and the
+// filter on it rides the pair one level down: `r` counts 2 elements at `q = 1` and 1 at
+// `q = 2`, so (1 + 2)·3.
+#[case::depth_3_filter_body_ignores_the_inner_element(
+    "sum([sum([sum([r for v in [1, 2, 3] if v > q]) for q in [1, 2]]) for r in [1, 2]])",
+    9
+)]
 fn a_correlated_comprehension_nests_to_any_depth(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
 }
@@ -694,4 +731,130 @@ fn a_correlated_comprehension_nests_without_an_aggregate() {
             BitSet::new(),
         ),
     );
+}
+
+/// A correlated filter **inside a transaction**, where the rows arrive one at a time. The
+/// predicate and the input are pulled from separate branches of the pairs, so the predicate
+/// answers for entries whose rows the input has not delivered yet. `Filter` reads its mask
+/// positionally, and an input with nothing in it is already filtered — it hands the rows
+/// back and the next pull finds the two in step. A non-empty input at a different count is
+/// the misalignment it still refuses, rather than reading the mask across it (which drops
+/// the wrong entries silently) or answering empty (which waits for an alignment that is not
+/// coming).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_filter_inside_a_transaction() {
+    check_scalar(
+        indoc! {r"
+            n: Mut(Int, Txn) := 0
+            for r in [1, 2]:
+                with begin():
+                    n := n + sum([v * r for v in [1, 2, 3] if v > r])
+            await_final(n)
+        "},
+        // 1*(2+3) + 2*3.
+        Value::Int(11),
+    );
+}
+
+/// A correlated inner comprehension over a **map** whose body never reads the element is
+/// refused by name. Its body never applies the source, so planning has none to name, and
+/// the inner domain is read off the type, where a map's keys are a present-key proof over
+/// the whole key type rather than anything enumerable.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
+    check_compile_error(
+        indoc! {r#"
+            c = map([("a", 1), ("b", 2)])
+            sum([sum([r for v in c]) for r in [1, 2]])
+        "#},
+        "source is a collection planning did not name",
+    );
+}
+
+/// A correlated filter with **no aggregate over it** does not compile, where the same filter
+/// under a `sum` does (`a_correlated_inner_comprehension_runs_per_outer_row`,
+/// `correlated_filter`). The one predicate ends up spelled two ways — the term reads the outer
+/// list through the iteration record, while the copy in the type reads it through a `let` —
+/// and lambda elimination's check that a node keeps its type rejects the pair:
+///
+/// ```text
+/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
+/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
+/// ```
+///
+/// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim
+/// wall, which reports the same disagreement as a collection-domain mismatch.
+///
+/// The fault is below the re-basing rewrite rather than in it: the rewrite that reaches one
+/// occurrence does not reach the other (`refinements-dependent-projection-of-a-refined-pair`
+/// in the issue tracker).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "lambda elimination changed a node's type")
+)]
+#[cfg_attr(
+    not(debug_assertions),
+    should_panic(expected = "Type mismatch for collection domain")
+)]
+fn a_correlated_filter_without_an_aggregate_does_not_compile() {
+    check_tile(
+        "[[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]",
+        // `[[2, 3], [6]]` if it compiled.
+        make_int_list(&[]),
+    );
+}
+
+/// A correlated filter whose **body** reads nothing outer. The outer binder appears in the
+/// filter alone, so it is free only in the type: lambda elimination takes the Pi-const arm
+/// and the site never becomes the pair the re-basing rewrite reads. The rewrite for this is
+/// a sibling of that one rather than an extension of it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[should_panic(expected = "unrecognised Var")]
+fn a_correlated_filter_over_an_uncorrelated_body_does_not_compile() {
+    check_scalar(
+        "sum([sum([v for v in [1, 2, 3] if v > r]) for r in [1, 2]])",
+        // (2+3) + 3.
+        Value::Int(8),
+    );
+}
+
+/// A correlated filter over a **collection** source, where the domain carries a present-key
+/// `collection_contains` beside the program's own filter.
+///
+/// The two are different kinds of refinement and `lambda_elim` separates them: the carried
+/// proof stays on the inner binder, where the lookup in the body reads it, and the filter
+/// lifts onto the pair to be applied. Compiling both as terms instead fails to compile.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_correlated_filter_over_a_collection() {
+    check_scalar(
+        indoc! {r"
+            c = map([(1, 10), (2, 20)])
+            sum([sum([v * r for v in c if v > r]) for r in [1, 2]])
+        "},
+        // 1*(10+20) + 2*(10+20).
+        Value::Int(90),
+    );
+}
+
+/// A collection that is **empty** folds to the aggregate's identity, and the row it belongs
+/// to keeps its place.
+///
+/// Read as a collection, because a scalar sum cannot tell an absent row from a row that folds
+/// to `0`. A curried tile's offsets are non-decreasing, so a row whose collection holds nothing
+/// keeps its group and holds nothing
+/// ([design-operators.md, "A correlated inner comprehension"](src/interpreter/design-operators.md#a-correlated-inner-comprehension)).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// `r = 1` keeps `v = 2`; `r = 2` keeps nothing, and its row stays, holding the identity.
+#[case::one_row_emptied("[sum([v * r for v in [1, 2] if v > r]) for r in [1, 2]]", &[2, 0])]
+// Neither row keeps anything, so both fold to the identity rather than leaving no rows.
+#[case::every_row_emptied("[sum([v * r for v in [1, 2] if v > r * 10]) for r in [1, 2]]", &[0, 0])]
+fn an_emptied_row_keeps_its_place(#[case] program: &str, #[case] expected: &[i64]) {
+    check_tile(program, make_int_list(expected));
 }

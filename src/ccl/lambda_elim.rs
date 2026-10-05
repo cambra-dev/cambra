@@ -242,16 +242,21 @@ fn refuse_escaped_pair_witness(expr: &Expr) -> Result<(), LambdaElimError> {
 // Elimination context
 // ---------------------------------------------------------------------------
 
-/// Mutable state threaded through lambda elimination.
-///
-/// Currently stateless — the nested-lambda rule mints its `__pair` binder
-/// straight from [`Name::pair`] (uid-identified, no counter to carry) — but
-/// kept as the threaded context the elimination walk already expects.
-struct ElimContext {}
+/// Mutable state threaded through lambda elimination: the memo that lets a filter lifted
+/// onto a pair be rebuilt once per shared predicate. The nested-lambda rule's `__pair`
+/// binder needs no state, being minted from [`Name::pair`] with a fresh uid.
+struct ElimContext {
+    /// The rebuilds of filters lifted onto a pair, keyed by the pair's parameter and its
+    /// bare product: one memo for the pass, so the occurrences of one filter that shared an
+    /// `Rc` share its rebuild ([`crate::ccl::ccl_utils::PredMemo`]).
+    pair_lifts: crate::ccl::ccl_utils::PredMemo<(Name, Type)>,
+}
 
 impl ElimContext {
     fn new() -> Self {
-        Self {}
+        Self {
+            pair_lifts: crate::ccl::ccl_utils::PredMemo::new(),
+        }
     }
 
     /// A fresh `__pair` binder for the nested-lambda rule.
@@ -926,35 +931,83 @@ fn elim_lambda_impl(
             // Merge λ x → λ y into λ __pair where x = pair[0], y = pair[1].
             // The pair variable has type (param_ty, y_ty).
             let pair = ctx.fresh_pair_name();
-            // `y_ty` may mention `param` — an inner comprehension filtered over the
-            // outer binder puts `param` in the refinement on its own domain. The pair
-            // type is what the `Proj` rule checks the projections against, so it must
-            // carry the same substitution the body gets, or the two disagree on which
-            // name the predicate reads. Substituting needs a `sub_x`, and `sub_x`'s
-            // annotation needs the pair type, so the annotation inside the rewritten
-            // predicate is the pre-substitution one; refinement equality is
-            // type-blind, so that is not observable.
+            // **A filter on the inner binder becomes a refinement on the pair.** `y_ty`
+            // may be refined, and its predicate may read `param` — an inner
+            // comprehension filtered over the outer binder. Left on the second
+            // component, that predicate would name `param`, whose only remaining
+            // spelling is a projection out of `pair`; a `Type::Fun`'s binder scopes over
+            // its codomain, so a domain mentioning `pair` names what nothing binds.
+            //
+            // The same set is a refinement on the product, where the refinement's own
+            // `__elem` binds both halves: `{(𝐴, 𝐾) | p(__elem.1, __elem.0)}` rather than
+            // `(𝐴, {𝐾 | p(__elem, param)})`. Written that way nothing is free, and the
+            // predicate is the closed value function a compiled refinement has to be.
+            // It also puts the refinement where `planning::iterate` looks: on the
+            // domain, which is the one place `Type::refinements` reads.
+            // **A carried proof stays; an owed restriction lifts.** A keyed collection's
+            // domain carries `collection_contains` to say the binder is a present key, and
+            // the lookup in the body reads it off the binder's own type — moving it would
+            // take the proof away from the site that needs it. A filter the program wrote
+            // is the other kind: nothing has applied it yet.
+            //
+            // A filter reading only the element lifts too, because neither inner-source
+            // builder applies a refinement left on the inner component.
+            let (lifting, staying): (Vec<Refinement>, Vec<Refinement>) = y_ty
+                .refinements()
+                .iter()
+                .cloned()
+                .partition(|r| !r.is_collection_membership());
             let y_ty = {
-                // The replacement is annotated at the *un-narrowed* second component:
-                // annotating it with `y_ty` would carry the predicate being rewritten
-                // into its own replacement, and the substitution would then find
-                // `param` still free in what it just wrote.
-                let unnarrowed = match &y_ty {
-                    Type::Refinement(base, _) => base.as_ref().clone(),
-                    other => other.clone(),
-                };
-                let pre_pair_ty = Type::Tuple(vec![param_ty.clone(), unnarrowed]);
-                let pre_sub_x = Expr::apply(
-                    Expr::var(&pair).with_ty(pre_pair_ty.clone()),
-                    Expr::proj_index(0).with_ty(Type::fun(pre_pair_ty, param_ty.clone())),
-                )
-                .with_ty(param_ty.clone());
-                crate::ccl::subst::Subst::discharge(param.clone(), pre_sub_x).apply_type(&y_ty)
+                let base = y_ty.peel_refinements().clone();
+                if staying.is_empty() {
+                    base
+                } else {
+                    let mut set = crate::ccl::ty::RefinementSet::new();
+                    set.extend(staying);
+                    Type::Refinement(Box::new(base), set)
+                }
             };
             // A `y_ty` naming the inner lambda's witness escapes the Σ binding it here.
             // [`compose_sum_generators`] keeps a generator over a sum from reaching this rule,
             // and [`refuse_escaped_pair_witness`] refuses any other `curry` that keeps one.
-            let pair_ty = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
+            let bare_pair = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
+            let pair_ty = {
+                let onto_pair = |predicate: &Rc<TypedExpr>| {
+                    let at = |index: usize, ty: &Type| {
+                        Expr::apply(
+                            Expr::var(Name::elem()).with_ty(bare_pair.clone()),
+                            Expr::proj_index(index)
+                                .with_ty(Type::fun(bare_pair.clone(), ty.clone())),
+                        )
+                        .with_ty(ty.clone())
+                    };
+                    // Innermost first: the element read introduces `__elem`, and the
+                    // `param` read must not then be rewritten as one of its occurrences.
+                    let on_element =
+                        crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &y_ty))
+                            .apply_expr(predicate);
+                    crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
+                        .apply_expr(&on_element)
+                };
+                let key = (param.clone(), bare_pair.clone());
+                let lifted: Vec<Refinement> = lifting
+                    .into_iter()
+                    .map(|mut r| {
+                        ctx.pair_lifts.rebuild(&mut r, &key, |predicate| {
+                            *predicate = onto_pair(&Rc::new(predicate.clone()));
+                            true
+                        });
+                        r
+                    })
+                    .collect();
+                if lifted.is_empty() {
+                    bare_pair.clone()
+                } else {
+                    let mut set = crate::ccl::ty::RefinementSet::new();
+                    set.extend(lifted);
+                    Type::Refinement(Box::new(bare_pair.clone()), set)
+                }
+            };
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
             // Also annotate the pair variable itself so that the identity rule in
@@ -2050,7 +2103,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     if let Ok(e) = &result {
         assert!(
             reclosed_let_ty || original_ty.without_pi_names() == e.ty.without_pi_names(),
-            "{} vs {}",
+            "lambda elimination changed a node's type: {} vs {}",
             original_ty,
             e.ty
         );
