@@ -957,6 +957,10 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
     // so dropping one here would leave the source producing a bare extent while the
     // site — and the body's `cast` — still demand the refined one. A vacuous
     // refinement is the site's business, not this constructor's.
+    //
+    // The refinement states the predicate as compiled. Planning plans the term this applies
+    // afterwards, and only the term (`src/ccl/design/optimization.md`, "Iteration-Site Marking
+    // (`insert_iterate_markers`)"); a refinement carries no planning.
     let refined_dom = Type::refined_one(
         domain.clone(),
         Refinement::born(Rc::new(bare_predicate_of_fn(&domain, predicate.clone()))),

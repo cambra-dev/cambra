@@ -317,6 +317,25 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
     }
 }
 
+/// Mark the iteration sites in the predicate each `restrict` applies.
+///
+/// A `restrict`'s predicate is compiled out of a refinement at the site it filters, during
+/// the walk, so the walk never reached a collection it aggregates: `zs` in `if x > sum(zs)`.
+/// A `restrict` evaluates its predicate per element, and the collection is an iteration site
+/// as it would be anywhere else. The refinement the `restrict` states is left as compiled: it
+/// is the predicate the types carry, and a refinement carries no planning.
+pub(super) fn plan_restrict_predicates(
+    expr: &mut Expr,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+) {
+    if let TypedExprNode::Apply { argument, function } = &mut expr.node
+        && is_builtin(function, Builtin::Restrict)
+    {
+        insert_iterate_recurse(argument, realized);
+    }
+    expr.walk_children_mut(|child| plan_restrict_predicates(child, realized));
+}
+
 /// Materialize the iteration site at `expr`, picking the best available
 /// implementation strategy.
 ///

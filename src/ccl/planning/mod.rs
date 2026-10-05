@@ -116,6 +116,7 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // fold dispatches on the operator it is handed.
     const_fold::fold_constants(&mut expr);
     insert_iterate_markers(&mut expr, &realized);
+    iterate::plan_restrict_predicates(&mut expr, &realized);
     // Normalize every remaining bare predicate tree-wide to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
     // refinement also rides **consumer contracts** that sit outside any site —

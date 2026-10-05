@@ -349,6 +349,13 @@ function transformer: it narrows the upstream collection's domain and preserves 
 values. Accordingly, `upstream ▷ (p ▷ restrict)` applies the transformer to the
 upstream function; composing it as a morphism would have the wrong input type.
 
+A `restrict`'s predicate is compiled at the site it filters, after the walk has passed that
+site, so the walk never reaches a collection the predicate aggregates, `zs` in `if x > sum(zs)`.
+Planning runs the walk over each `restrict`'s predicate once the walk over the tree is done
+(`plan_restrict_predicates`), where the collection is an iteration site like anywhere else. The
+refinement `make_restrict` writes on the narrowed domain states the predicate as compiled: the
+markers belong to the term the `restrict` applies, and a refinement carries none.
+
 `Builtin::Iterate` requires no upstream input and compiles to `IterateExtent`. A
 nontrivial predicate on that builtin adds a `Restrict` operator; the planner's default
 source uses the trivial predicate, so each later refinement is represented by its own
