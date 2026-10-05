@@ -317,6 +317,26 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
     }
 }
 
+/// Mark the iteration sites in the predicate of each `restrict` in `chain`, an
+/// iteration source a planning rewrite has just built: `[1, 2]` in `if x > sum([1, 2])`.
+/// [`wrap_with_iterate`] and [`super::join::try_hash_join_rewrite`] call it; why, and why
+/// the refinement stays unmarked, is in `src/ccl/design/optimization.md`, "Iteration-Site
+/// Marking (`insert_iterate_markers`)".
+pub(super) fn plan_filter_predicates(
+    chain: &mut Expr,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+) {
+    if let TypedExprNode::Apply { argument, function } = &mut chain.node
+        && is_builtin(function, Builtin::Restrict)
+    {
+        // A `restrict` built inside the predicate came from a nested `wrap_with_iterate`,
+        // which planned it already.
+        insert_iterate_recurse(argument, realized);
+        return;
+    }
+    chain.walk_children_mut(|child| plan_filter_predicates(child, realized));
+}
+
 /// Materialize the iteration site at `expr`, picking the best available
 /// implementation strategy.
 ///
@@ -445,7 +465,7 @@ pub(super) fn wrap_with_iterate(
     // `iterate(predicate)` fall-through are choosing how to materialise the same
     // iteration site — hash join is just a more efficient strategy when the type
     // structure permits.
-    if try_hash_join_rewrite(expr, &domain_ty) {
+    if try_hash_join_rewrite(expr, &domain_ty, realized) {
         return;
     }
     // Generic fallback. Now compile the site's refinement predicates (design
@@ -530,6 +550,7 @@ pub(super) fn wrap_with_iterate(
     for (r, elem_ty) in crate::ccl::application_order(domain_ty.refinements(), base) {
         source = make_restrict(fn_of_bare_predicate(&elem_ty, &r.predicate, &[]), source);
     }
+    plan_filter_predicates(&mut source, realized);
     // An iteration source produces the refined extent it iterates, so its
     // codomain is the *site's* refined domain `{D | p}`, mirroring
     // `make_iterate`'s `{D | p} ⇒ {D | p}` symmetry. Surfacing the refinement

@@ -133,7 +133,7 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // and this one is a codomain in. It runs after predicate compilation because it
     // matches the point-free predicate, and after the group-by rewrite because the
     // site's upstream is the `converse` chain it splices into.
-    per_group_filter::insert_per_group_filters(&mut expr);
+    per_group_filter::insert_per_group_filters(&mut expr, &realized);
     per_group_filter::reject_unmaterialized_narrowings(&expr)?;
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via

@@ -45,8 +45,11 @@ use crate::ccl::{Refinement, application_order, subst::open_codomain};
 /// would leave the site claiming a narrowing it no longer performs. Such a site is rejected
 /// by name afterwards ([`reject_unmaterialized_narrowings`]) rather than compiled without its
 /// filter.
-pub(super) fn insert_per_group_filters(expr: &mut Expr) {
-    expr.walk_children_mut(insert_per_group_filters);
+pub(super) fn insert_per_group_filters(
+    expr: &mut Expr,
+    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+) {
+    expr.walk_children_mut(|child| insert_per_group_filters(child, realized));
     let TypedExprNode::Compose(elts) = &expr.node else {
         return;
     };
@@ -76,9 +79,12 @@ pub(super) fn insert_per_group_filters(expr: &mut Expr) {
     let TypedExprNode::Compose(elts) = &mut expr.node else {
         unreachable!("matched a Compose above")
     };
-    let Some((site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
+    let Some((site_codomain, mut value_predicate)) = per_group_filter_site(&elts[site]) else {
         unreachable!("position found it")
     };
+    // The filter evaluates its predicate per value, so a collection the predicate
+    // aggregates is an iteration site (`super::iterate::plan_filter_predicates`).
+    iterate::insert_iterate_recurse(&mut value_predicate, realized);
     let narrowed = site_codomain
         .domain()
         .expect("a per-group filter site returns a collection");
@@ -328,7 +334,7 @@ mod tests {
     #[test]
     fn two_added_refinements_become_one_conjoined_filter() {
         let (mut expr, _) = site_adding(&["q1", "q2"]);
-        insert_per_group_filters(&mut expr);
+        insert_per_group_filters(&mut expr, &Default::default());
         let (filter, site_ty) = planned(&expr);
         let filter = filter.expect("the site narrows, so a filter was inserted");
         assert_eq!(
@@ -371,7 +377,7 @@ mod tests {
         refinements.insert(closed);
 
         let before = expr.clone();
-        insert_per_group_filters(&mut expr);
+        insert_per_group_filters(&mut expr, &Default::default());
         assert_eq!(planned(&expr).0, None, "no filter was inserted");
         assert_eq!(expr, before, "the site is untouched");
         let rejected = reject_unmaterialized_narrowings(&expr)
@@ -383,7 +389,7 @@ mod tests {
     #[test]
     fn a_materialized_site_is_not_rejected() {
         let (mut expr, _) = site_adding(&["q1"]);
-        insert_per_group_filters(&mut expr);
+        insert_per_group_filters(&mut expr, &Default::default());
         assert_eq!(reject_unmaterialized_narrowings(&expr), Ok(()));
     }
 }

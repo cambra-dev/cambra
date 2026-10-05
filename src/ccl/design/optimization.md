@@ -349,6 +349,22 @@ function transformer: it narrows the upstream collection's domain and preserves 
 values. Accordingly, `upstream ▷ (p ▷ restrict)` applies the transformer to the
 upstream function; composing it as a morphism would have the wrong input type.
 
+A filter's predicate is compiled out of a refinement, so the iteration walk never reaches a
+collection the predicate aggregates, `[1, 2]` in `if x > sum([1, 2])`. The filter evaluates its
+predicate per element, and the collection is an iteration site like anywhere else. Each rewrite
+that builds a filter therefore runs the walk over its predicate as it builds it.
+`wrap_with_iterate` plans the `restrict`s of its iteration source, and the hash-join rewrite the
+residual `restrict`s of its plan, both through `plan_filter_predicates`. The hash-join rewrite
+also plans each side of an equality as it builds the key, since a key is computed per row too.
+The per-group filter rewrite plans its `filter_values` predicate with `insert_iterate_recurse`.
+
+The refinement `make_restrict` writes on the narrowed domain states the predicate unmarked. It meets
+the same predicate on the site's consumers and on its body's `cast`, which predicate compilation
+leaves unmarked, and the post-planning typecheck compares refinements structurally; a marked
+refinement fails that typecheck's collection-domain check. The typecheck never compares the
+refinement with the term the `restrict` applies, because `restrict` is a builtin whose stamped type
+it trusts.
+
 `Builtin::Iterate` requires no upstream input and compiles to `IterateExtent`. A
 nontrivial predicate on that builtin adds a `Restrict` operator; the planner's default
 source uses the trivial predicate, so each later refinement is represented by its own
