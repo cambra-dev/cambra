@@ -1,23 +1,6 @@
-// ---------------------------------------------------------------------------
-// Coalesce pass + integrated monomorphization (Step 7e)
-// ---------------------------------------------------------------------------
-//
-// This pass resolves every node's inference variables into a concrete `Type`
-// and, in the same walk, fills the binder slots that aren't any node's
-// `expr.ty` (notably the `Let` binding slot) and rebuilds under-determined
-// `Compose`/`Proj` morphism domains — see `coalesce_node`. This subsumed the
-// former post-coalesce `saturate` pass.
-//
-// The coalesce walk also performs **integrated monomorphization**: let-
-// generalization is lowered to concrete, per-type code *inside* the walk. A
-// use of a generalized binding specializes at first visit (`specialize_use`,
-// from `coalesce_node`'s `Var` hook), memoized per distinct instantiation
-// (`SpecKey`) so uses that instantiate it identically share one definition. The
-// binding's `let` node then rebuilds itself as the chain of demanded
-// specializations (`coalesce_generalized_let`).
-// The coalesce and monomorphization arms are mutually recursive
-// (`coalesce_node` ↔ `specialize_use`) over one shared [`CoalesceCtx`], so they
-// live in a single module.
+// Coalescing and specialization share a context and recurse into each other:
+// parents need specialized child types before resolving their own type.
+// See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 
 use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
@@ -119,16 +102,16 @@ fn push_coalesce_err(
     }
 }
 
-/// State threaded through the coalesce walk.
+/// State for coalescing and in-walk specialization.
 ///
-/// Beyond resolving types, the walk performs **integrated monomorphization**:
-/// a use of a generalized `let` is specialized at first visit (memoized per
-/// distinct instantiation), so every parent's type is derived from concrete
-/// children on the first pass — there is no post-coalesce splice and no
-/// re-derivation of dependent types. The constraint graph is *complete* by
-/// coalesce time (emission saw the whole program), so a use's instantiation
-/// is fully determined when the walk reaches it; "specialize when
-/// dependencies are satisfied" reduces to the bottom-up visit order.
+/// A generalized use specializes before its parent reads the resolved result.
+/// The scope holds definition-site frames and shadow markers; the predicate memo
+/// preserves sharing under the walk's rewrite conditions.
+///
+/// Emission precedes the walk, but the graph remains mutable: specialization pins
+/// can add bounds. Function-before-argument traversal and the debug read-stability
+/// check guard against invalidating types already consumed by a parent. See
+/// `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 pub(super) struct CoalesceCtx {
     /// The walk's lexical scope: one [`ScopeEntry::Generalized`] frame per
     /// in-scope generalized `let`, plus a [`ScopeEntry::Shadow`] marker per
@@ -312,34 +295,18 @@ fn assert_reads_stable(reads: &[ReadRecord]) {
     }
 }
 
-/// Skeletal agreement between a type read during the walk and its
-/// re-resolution against the final graph. The ordering invariant is about
-/// **bounds on inference variables**, so this checks the *structural skeleton* a
-/// bound determines — bases, ranges, sources, Pi binder names,
-/// function/product/variant shape, and, for a [`ReadPurpose::Stamp`] read, the
-/// *number* of refinements at each position. A refinement is lattice content
-/// like a record field, so a bound determines it as much as it determines the
-/// base: one appearing on — or vanishing from — a variable an earlier read
-/// consumed is exactly the staleness this guards, and with every literal
-/// carrying a singleton, refinement-bearing types are the common case rather
-/// than the exotic one. `refinements` is `false` only for the
-/// [`Instantiation`](ReadPurpose::Instantiation) read, which documents why.
+/// Compare a recorded type's structure with its final-graph resolution.
 ///
-/// Two drifts are legitimate and out of scope:
+/// Bases, ranges, sources, binder names, and function/product/variant structure
+/// must agree. Stamped reads additionally compare refinement-wrapper depth, not
+/// the number of predicates inside each refinement set. The preliminary
+/// [`Instantiation`](ReadPurpose::Instantiation) read omits that depth check.
 ///
-/// - **Under-determined positions are wildcards.** A position with no
-///   concrete content resolves to a fresh `Infer` placeholder each time, so
-///   placeholder identity can never match — and nothing was stamped there,
-///   so nothing can have been invalidated. (`Hole` likewise, for error-path
-///   resolutions.)
-/// - **Refinement-predicate content is not compared.** A non-vacuous
-///   discharge rebuilds a fresh predicate term each time it is forced, and a later
-///   specialization rewrites a predicate's interior uses (`p` → `p__mono1`)
-///   — both lowering by the very machinery this guards, neither a stale
-///   bound. The predicate *terms* are checked elsewhere (`check_scope_valid`
-///   and the post-inference `check` reconcile). Layer *count* is therefore the
-///   strongest refinement comparison available here: it catches a refinement arriving
-///   or leaving without depending on term identity, which legitimately churns.
+/// Underdetermined positions are wildcards: re-resolution mints new `Infer`
+/// placeholders, and error paths can retain `Hole`. Predicate contents are not
+/// compared, since discharge and specialization can rebuild their terms. Scope
+/// validity and post-inference reconciliation check separate obligations; this
+/// function does not prove predicate equivalence.
 #[cfg(debug_assertions)]
 fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool {
     // Peel the refinements, counting them. The *base* under the refinements is
@@ -576,82 +543,11 @@ struct SpecializeFrame {
     /// re-walks a definition whose uses merely failed, and reports its body's
     /// conflicts a second time.
     demanded: bool,
-    /// Specializations minted so far, scanned linearly.
-    /// A candidate use's [`SpecKey`] is compared against each entry's — both
-    /// computed by the *same* procedure at the *same* point in the pin's lifecycle
-    /// (from the use's live type, before its own pin), so the comparison is
-    /// self-consistent. What it is *not* is instantaneous: an entry was keyed
-    /// before its **own** pin, a candidate after every intervening one, and a pin
-    /// can widen a key that is not its own. A consumer's pin is what makes the
-    /// demand on a nested use's result concrete, and that demand reaches the key
-    /// through the `codomain <: demand` channel the negative read follows by
-    /// design — so in `f(f(3))`, where the walk takes function before argument,
-    /// the inner use is keyed against a demand the outer use's pin deposited. Key
-    /// equality is therefore walk-order sensitive (observably so once a demand
-    /// carries structure a key records; where it resolves to a bare base the two
-    /// reads agree). The residue is over-splitting, which costs a clone rather
-    /// than sharing a wrong one. See `src/ccl/design/type-inference.md`,
-    /// "Keying a specialization".
+    /// Specializations indexed by a linear scan of their pre-pin [`SpecKey`]s.
     ///
-    /// **What keeps the scan cheap, and what would stop.** Each comparison is a
-    /// deep structural [`SpecKey`] walk, so the cost is quadratic in a binding's
-    /// specialization count. The bound on that count is *not* "one per distinct
-    /// type": every literal carries its own singleton refinement, so the rule is
-    /// one specialization per distinct argument tuple, and a definition called
-    /// with a fresh literal tuple at every site grows `specs` with **call sites**.
-    /// What holds it down today is `inline`, which beta-reduces scalar UDFs — the
-    /// definitions that survive to be cloned are the collection-producing ones it
-    /// leaves cached. If that ever bites it is the scan that has to change, not
-    /// the key.
-    ///
-    /// **Both sides being one procedure is the load-bearing part.** Keying an entry
-    /// on the clone's *coalesced* type instead is what made this table write-only:
-    /// a clone type carries whatever the pin settled, a candidate's pre-pin
-    /// resolution does not, and for any definition whose clone type acquires a
-    /// refinement across the pin the two could never be equal — so even two *identical*
-    /// call sites missed each other and minted a clone apiece. (The rationale that
-    /// justified it — that a later same-typed use resolves through the first pin's
-    /// extended chains — does not hold: every use instantiates its own fresh
-    /// variables, which the first clone's pin never touches.)
-    ///
-    /// **Why the key is not a resolved `Type`.** A resolved type is a
-    /// polarity-correct *rendering*: a domain resolves from upper bounds (what the
-    /// body demands), so a position the body ignores is narrowed away and an
-    /// argument's refinement — a *lower* bound — is invisible unless
-    /// `compact_type`'s opposite-polarity fallback happens to fire there. The
-    /// clone's interior reads its parameter at a positive position and sees exactly
-    /// those refinements. Keying on a rendering therefore compared one polarity's view
-    /// against a clone built from the other's, and two uses differing only in a
-    /// key-invisible position shared a clone whose interior asserted the *first*
-    /// use's argument (`\a, b -> a + b` at `(1, 2)` and `(1, 5)` both keyed on
-    /// `((1, Int) ⇒ Int)`, and the shared clone typed `.1` as `2`). A [`SpecKey`]
-    /// keeps *both* directed reads of the instantiation instead — including the one
-    /// whose domain follows lower bounds — so it sees what the pin transmits.
-    ///
-    /// **The remaining gap: this over-splits.** The key summarizes the pin's
-    /// *input*, so two uses that differ in a position the clone never reads still
-    /// key apart — `\a, b -> a` at `(1, 2)` and `(1, 5)` mints two identical clones,
-    /// and a definition containing a `defer` mints one per use (its channel domain is
-    /// named per instantiation, so those clones genuinely *are* distinct). Every
-    /// literal carries a singleton, so the practical rule is one clone per distinct
-    /// argument tuple; `inline` beta-reduces scalar UDFs, but a
-    /// collection-producing one stays cached, so that is where code size grows.
-    ///
-    /// Closing it means keying on the pin's *output* — the finished clone — which
-    /// cannot be a lookup, only a build-then-dedupe: build for every use, then
-    /// discard a clone that is structurally equal to an existing entry
-    /// (`TypedExpr`'s `PartialEq` already excludes `NodeId` and compares types with
-    /// type-blind refinement equality, which is the right notion). That shares
-    /// exactly when the emitted code is identical. It needs three things this does
-    /// not: α-equivalence over the names minted fresh per clone (`Name::mono` uids
-    /// from nested specializations, coalesce's `Infer` placeholders, and the
-    /// per-instantiation `ChanDom` names) — most cheaply by drawing them from a
-    /// clone-local counter and globalizing on retention; a way to undo the discarded
-    /// clone's pin, which has already deposited bounds into the live graph; and
-    /// reference-liveness filtering at the splice, since a discarded clone's walk can
-    /// leave specializations on an *enclosing* frame with no surviving use. The two
-    /// compose — this key as the fast path, clone-equality as a precision tier on a
-    /// miss — so nothing here has to be undone to get there.
+    /// Retain the originating use's key, not the materialized clone's type.
+    /// For graph-state differences and comparison cost, see
+    /// `src/ccl/design/type-inference.md`, "Key timing and precision limits".
     specs: Vec<Specialization>,
 }
 
@@ -660,7 +556,8 @@ struct Specialization {
     /// The memo key: the [`SpecKey`] of the use that minted this specialization,
     /// taken from its live instantiation type *before* its pin —
     /// the same procedure at the same point every candidate's key is taken, which
-    /// is what makes the comparison self-consistent (see [`SpecializeFrame::specs`]).
+    /// is what makes the comparison self-consistent (see
+    /// `src/ccl/design/type-inference.md`, "Keying a specialization").
     key: SpecKey,
     /// Its binding name — a [`Name::mono`] carrying the source binding's name
     /// as provenance and a globally-fresh uid for identity (so it can neither
@@ -678,8 +575,8 @@ struct Specialization {
     /// program a definition nothing references. Splitting that from the memo is
     /// what lets the clone be *shared*: declining to register instead made every
     /// dead use re-clone and re-coalesce its callee, which compounds through a
-    /// call chain (see [`SpecializeFrame::specs`], "The remaining gap", where the
-    /// same split is what reference-liveness filtering asks for).
+    /// call chain (see `src/ccl/design/type-inference.md`,
+    /// "Typechecking a never-called definition").
     ///
     /// False at mint for a discarded use; a later surviving use that *hits* this
     /// entry sets it, because sharing the clone is exactly what makes it live.
@@ -1263,38 +1160,15 @@ fn resolve_binder_slot(
     coalesce_type_predicates(slot, level, ctx);
 }
 
-/// Coalesce every node's `expr.ty` in place, resolving its inference variables
-/// into a concrete `Type` — and, in the same walk, **monomorphize**: a use of
-/// a generalized `let` is specialized at first visit ([`specialize_use`]) and
-/// the binding's `let` node is rebuilt as the chain of its per-type
-/// specializations ([`coalesce_generalized_let`]).
+/// Resolve expression and binder types while specializing generalized uses.
 ///
-/// A *monomorphic* binder's uses share its inference variable (it binds
-/// verbatim), so they coalesce to the same type with no scope lookup. A
-/// *generalized* `let`'s uses instantiate fresh variables; each use's
-/// instantiation is fully determined by the time the walk reaches it (the
-/// constraint graph is complete after emission), so the `Var` arm resolves it,
-/// specializes the definition to it, and stamps the result — every parent then
-/// derives its own type from concrete children. The definition subtree itself
-/// is never coalesced in place (its quantified variables carry no use-site
-/// bounds and must stay bound-bearing for the per-use clones); it rides in a
-/// [`SpecializeFrame`] until the body walk completes. `level` mirrors
-/// emission's polymorphism depth — only a `let` RHS bumps it (see
-/// `in_let_rhs`) — so `should_generalize` recognizes the generalized `let`.
+/// Children resolve before their parent; applications visit the function before
+/// the argument. Pins may add bounds, but must not invalidate prior reads.
+/// See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 ///
-/// The only slots the bottom-up `expr.ty` resolution doesn't reach are the
-/// **binder slots** — they carry a type but are not a node's `expr.ty` — so each
-/// is resolved explicitly here, mirroring its definition: a `Lambda`'s
-/// `param.ty` from the coalesced domain, a `Let`'s `binding.ty` from the bound
-/// expression, `Case`/`Loop` slots via `resolve_var_type`. (This is what the
-/// former post-coalesce `saturate` pass did for `Let`; it is a local
-/// binder-slot fact, not lexical scoping.)
-///
-/// Refinement predicates ride the lattice and coalesce straight onto each node
-/// (including predicate sub-trees). A free use of a generalized binding living
-/// *inside* a predicate specializes through the same `Var` arm when the
-/// predicate's expression is coalesced (`coalesce_type_predicates` runs this
-/// walk over it).
+/// Binder slots and predicates require explicit visits beyond expression children.
+/// Let RHSs and mutable initializers retain emission's one-level increment.
+/// See `src/ccl/design/type-inference.md`, "Binder-slot resolution".
 fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // Mark this node as the one whose rule is running, so `push_error` stamps
     // its errors with it; restored on exit. An inner rule overwrites the mark
@@ -1312,12 +1186,8 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
 /// bookkeeping it is wrapped in.
 fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
-    // Use of a generalized binding (innermost-out lookup; shadow markers keep
-    // inner same-name binders opaque): resolve the use's instantiation off
-    // the live graph, specialize the definition to it (memoized per distinct
-    // resolved type), rename the use to the specialization, and stamp its
-    // resolved type. The stamped type is final — fully resolved during the
-    // specialization's own coalesce — so the generic tail below is skipped.
+    // Specialization stamps the resolved type itself; skip the generic tail.
+    // Shadow markers prevent lookup through a same-named inner binder.
     if let TypedExprNode::Var(name) = &expr.node
         && let Some(frame_idx) = lookup_generalized(&ctx.scope, name)
     {
@@ -1337,10 +1207,9 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // Recurse into sub-expressions first so child types are settled
     // before we coalesce this node's (which may reference them).
     //
-    // `level` mirrors emission's polymorphism level: only a `let` RHS bumps it
-    // (see `in_let_rhs`); every other binder leaves it unchanged. It is used
-    // solely to recognize a *generalized* `let` (`should_generalize`), handled
-    // above.
+    // Mirror emission's levels: let RHSs and mutable initializers are one level
+    // deeper; their bodies return to the enclosing level. This lets
+    // `should_generalize` recognize the same generalized lets as emission.
     match &mut expr.node {
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
@@ -1349,33 +1218,15 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {
-            // Function before argument — deliberately, not just source order.
-            // Specializing a generalized use inside `function` pins its clone
-            // into the live graph, which (via the emit-time `arg <: domain`
-            // edge) deposits the clone's body demands onto the argument's
-            // variables; the argument must not have been read yet when those
-            // bounds land. (They are α-copies of demands the instantiation
-            // already deposited at emit, so a reversed order would still
-            // resolve the same types — but the invariant "specialization only
-            // adds bounds to variables the walk has not yet read" is what we
-            // rely on, so the order states it.)
+            // Specialization can deposit demands on the argument's variables.
+            // Read the argument only after those pins; see
+            // `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
             coalesce_node(function, level, ctx);
             coalesce_node(argument, level, ctx);
-            // A projection applied to a resolved argument: monomorphize its domain
-            // to the argument flowing in (see `specialize_projection_domain`). A
-            // projection is polymorphic in its input's width, so this supplies the
-            // one width the use site needs rather than repairing anything the graph
-            // lost. The cast-target / join-filter predicate case is reached the same
-            // way: `coalesce_type_predicates` (end of this fn) runs `coalesce_node`
-            // on each refinement predicate, so its projections monomorphize here
-            // too.
-            //
-            // A *lambda*'s domain needs no counterpart: its binder is one variable
-            // carrying both the argument (below) and the body's demands (above), and
-            // a negative position reads their meet
-            // (`src/ccl/design/type-inference.md`, "The collapse happens at the
-            // position"). Only a projection's domain is unreassemblable from the graph,
-            // because its untouched positions are variables nothing constrains.
+            // A projection requirement does not determine its input's width.
+            // Use the resolved argument; predicates reach this same branch.
+            // See `src/ccl/design/type-inference.md`,
+            // "Closing the single-sided blind spots (no separate pass)".
             specialize_projection_domain(function, &argument.ty);
         }
         // **A cast's predicates are read once, below, after its two slots converge.** The
@@ -1473,27 +1324,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
             }
-            // Compose morphism-domain reconstruction. inference coalesces
-            // each morphism's domain independently — the `Var <: Var`
-            // constrain rule is single-sided, so a fresh negative-position
-            // domain var only ever receives what the morphism's own body
-            // demands and compacts to an under-determined, field-narrow shape
-            // (e.g. the `.0` of a multi-accumulator loop's `step` tuple
-            // coalesces to a 1-tuple `(T)` instead of the full `(T, U)`).
-            // Rebuild each `Proj`/`Lambda` morphism's domain from the
-            // preceding morphism's coalesced codomain — the actual value
-            // flowing in — and the chain's own type from its end morphisms.
-            // Children are already resolved (bottom-up), so reading their
-            // codomains is sound.
-            //
-            // This folds in the former post-coalesce `saturate` pass.
-            // Reconstructing structurally here — after the shapes are
-            // resolved — rather than via an emit-time reverse-adjacency bound
-            // is what keeps it robust under let-polymorphism's monomorphization
-            // (which re-mints var identities a recorded bound would not follow).
-            // Destructuring looks through a morphism's outer refinements
-            // ([`Type::peel_refinements`]): a refined function is still a function,
-            // and the value flowing to the next morphism is its bare codomain.
+            // A direct projection's requirement can omit untouched input fields.
+            // Specialize its domain from the preceding resolved codomain, then
+            // rebuild the chain from its endpoints. Lambdas derive their parameter
+            // slots from their own domains; this helper only handles Proj nodes.
+            // Reading resolved inputs remains applicable after specialization has
+            // freshened the emit-time variables. Peel outer refinements to expose
+            // the preceding function without removing codomain refinements.
             for i in 1..elts.len() {
                 let Type::Fun {
                     codomain: prev_cod, ..
@@ -1988,65 +1825,19 @@ fn coalesce_type_predicates_go(
     }
 }
 
-// Integrated monomorphization (the coalesce walk's specialization arms).
-//
-// A use of a generalized binding specializes at first visit (`specialize_use`,
-// from `coalesce_node`'s `Var` hook), memoized per distinct instantiation
-// (`SpecKey`) so uses that instantiate it identically share one definition — a
-// collection/generator UDF used at several element types compiles to one
-// *cached* binding per element type rather than a copy per call site (cf.
-// [`crate::ccl::inline`]). The binding's
-// `let` node then rebuilds itself as the chain of demanded specializations
-// (`coalesce_generalized_let`). A binding used at K distinct types becomes K
-// nested `let`s; one never used at all is typechecked, then dropped as dead code
-// (`typecheck_discarded_definition`).
-//
-// Specializing *during* the walk (rather than in a post-coalesce pass) is
-// what lets every parent derive its type from concrete children on the first
-// pass: by coalesce time the constraint graph is complete, so a use's
-// instantiation is fully determined when the bottom-up walk reaches it, and a
-// parent `Apply`'s dependent-codomain discharge forces against the
-// specialization's resolved predicate terms instead of the definition's
-// quantified ones. The retired post-coalesce splice had to re-derive every
-// dependent parent type by hand — a second, graph-unreachable copy of the
-// discharge logic.
-//
-// The load-bearing ordering invariant: **specialization may only add bounds
-// to variables the walk has not yet read.** A use's pin touches its own
-// instantiation variables (read right after, at the use's own stamp), the
-// clone's fresh variables (read only inside the clone's re-entrant walk), and
-// — through emit-time edges — variables of nodes above or beside the use,
-// where any deposit is an α-copy of demands the instantiation already made at
-// emit. The `Apply` arm's function-before-argument order keeps even those
-// copies behind the read front.
-//
-// The invariant is checked **explicitly** rather than argued: `CoalesceCtx`
-// logs every graph read (`record_read`) as a `(var-laden type, resolution)`
-// pair — the snapshot shares the live `InferVar`s — and `assert_reads_stable`
-// re-resolves each against the *final* graph at end of pass, requiring the
-// skeleton *and its refinements* to be unchanged
-// (`types_agree_modulo_unread`). A pin that retroactively changed an
-// already-read variable's resolution trips it by name. The lone exception is
-// the use's own instantiation resolution, where refinements are excluded and the
-// reason is on `ReadPurpose::Instantiation`. Debug builds only; free in release.
+// Specialization runs inside coalescing while each use still exposes its live
+// instantiation graph. Parents consume resolved clones, and the enclosing let
+// retains only referenced specializations. Pins may add bounds during the walk;
+// function-before-argument order and the debug read-stability check guard reads
+// already consumed. See `src/ccl/design/type-inference.md`,
+// "Specialization scope and lifecycle" and "Coalesce ordering and read stability".
 
-/// Specialize a use of a generalized binding (frame at `frame_idx` in the
-/// walk's scope) to its instantiation, then rewrite the use to reference the
-/// specialization and stamp the specialization's resolved type on it.
+/// Rewrite a generalized use to its specialization and stamp the resolved type.
 ///
-/// Sharing is decided by the use's [`SpecKey`] — both directed reads of its
-/// instantiation, taken off the live graph before the pin. On a miss this clones
-/// the frame's definition, freshens it independently ([`freshen_expr_type_slots`]
-/// — quantified-variable renaming over every type slot, including refinement
-/// predicates and bound-edge discharge payloads), **pins it two-way to the use's
-/// live instantiation type** (the use type is itself var-laden for a use inside
-/// another clone — the chained poly-calls-poly case — and the live pin is what
-/// lets such interior uses resolve concrete), and coalesces the clone
-/// re-entrantly. The re-entrant walk runs in the *definition site's* scope —
-/// entries above the frame are suspended — so a name the definition references
-/// resolves to what was in scope where it was written, not to a same-named binder
-/// introduced between definition and use. On a hit the use is simply renamed and
-/// stamped — see the hit path for why it is deliberately *not* re-pinned.
+/// `frame_idx` identifies the generalized binding in `ctx.scope`. Key the live
+/// instantiation before pinning; coalesce new clones in the definition's scope,
+/// not the caller's. Memo hits are not pinned again.
+/// See `src/ccl/design/type-inference.md`, "Specialization scope and lifecycle".
 // `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
 // mutability; the solver relies on identity-by-`uid`, not the mutable payload
 // (matching the solver's module-level allow).
@@ -2059,10 +1850,9 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     };
     frame.demanded = true;
 
-    // The use's instantiation type, resolved off the live graph. The graph is
-    // complete (emission saw the whole program), so everything this use
-    // depends on has already been constrained — including, for a use inside
-    // another specialization's clone, that outer clone's pin.
+    // Resolve against the current graph, including pins made before this visit.
+    // A use inside another specialization sees that outer clone's pin. Later pins
+    // can still add bounds; assert_reads_stable checks the recorded structure.
     let resolved = match resolve_var_type(&use_expr.ty) {
         Ok(t) => t,
         Err(err) => {
@@ -2085,7 +1875,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // one point in the pin's lifecycle. It is deliberately not `resolved` — a
     // resolved type is a polarity-correct rendering, which narrows away positions
     // the definition body ignores and cannot see an argument's refinement on a
-    // domain's lower bounds; see `SpecializeFrame::specs`.
+    // domain's lower bounds; see `src/ccl/design/type-inference.md`,
+    // "Keying a specialization".
     //
     // An under-determined instantiation (a generic definition the program never
     // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
@@ -2217,7 +2008,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // The entry is keyed on the pre-pin key computed above — *not* on
     // `clone.ty`. A clone type is the pin's output and a candidate's key is its
     // input; keying an entry on one and the lookup on the other is what made this
-    // table write-only (see `SpecializeFrame::specs`).
+    // table write-only (see `src/ccl/design/type-inference.md`,
+    // "Keying a specialization").
     debug_assert!(
         frame.specs.iter().all(|s| s.key != key),
         "specialization memo invariant (one entry per distinct key) violated: \
@@ -2991,8 +2783,8 @@ mod tests {
         // Two `g` specializations, each demanding its own `f` specialization
         // — and every minted specialization is referenced.
         // A refinement makes two uses distinct, so a literal argument mints its own
-        // specialization — see the `specs` field doc. Sharing modulo refinements is
-        // the better rule and needs the clone built at the stripped type.
+        // specialization — see `src/ccl/design/type-inference.md`,
+        // "Key timing and precision limits".
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(specializations, 4, "per-use g + f specializations");
         assert_eq!(used_names.len(), 4, "every specialization is used");
@@ -3174,8 +2966,8 @@ mod tests {
         run_inference(&mut e).expect("chained poly with shared uses type-checks");
         let (specializations, used_names) = specialization_stats(&e);
         // A refinement makes two uses distinct, so a literal argument mints its own
-        // specialization — see the `specs` field doc. Sharing modulo refinements is
-        // the better rule and needs the clone built at the stripped type.
+        // specialization — see `src/ccl/design/type-inference.md`,
+        // "Key timing and precision limits".
         assert_eq!(specializations, 6, "per-use g + f specializations");
         assert_eq!(used_names.len(), 6);
     }
@@ -3263,7 +3055,8 @@ mod tests {
         // specialization. This is the "memo is per frame, not per demanding
         // region" property, and it is what keying on a `SpecKey` restores —
         // keying an entry on its clone's coalesced type instead made these two
-        // miss each other (see `SpecializeFrame::specs`).
+        // miss each other (see `src/ccl/design/type-inference.md`,
+        // "Keying a specialization").
         assert_eq!(specializations, 4, "one g + one f specialization per type");
         assert_eq!(used_names.len(), 4);
     }

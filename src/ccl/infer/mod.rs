@@ -1,77 +1,27 @@
-//! Cambra's inference algorithm — the constraint-emission and coalescing engine.
+//! Constraint emission, type materialization, and specialization.
 //!
-//! The canonical type inference implementation, invoked via
-//! [`crate::ccl::infer::infer`].
+//! [`infer`] writes solver types into `expr.ty` and then materializes them.
+//! Those slots expose a live bound graph until materialization; specialization
+//! can add bounds during the coalesce walk. For pass order and failure behavior,
+//! see `src/ccl/design/type-inference.md`, "2. The Inference Pipeline".
 //!
-//! # Design
+//! [`should_generalize`](context::should_generalize) selects generalized lets;
+//! [`specialize_use`](solve::specialize_use) resolves their uses for later passes.
+//! Eligibility and clone ownership are specified in `src/ccl/design/type-inference.md`,
+//! "3.1 Let-Polymorphism is Freshening (Instantiation)".
+//! Clone reuse does not imply runtime sharing; see
+//! `src/ccl/design/type-inference.md`, "Key timing and precision limits".
 //!
-//! Two passes over the expression tree:
+//! # Operator types
 //!
-//! 1. **Constraint emission**: walk the tree, emit `constrain_subtype` calls
-//!    over [`Type`] (inference variables are [`Type::Infer`] with mutable
-//!    bounds), writing each node's emitted `Type` straight onto `expr.ty`.
-//!    Because the vars are shared `Rc<InferVar>`s, later constraints
-//!    accumulate into bounds that are already visible through the stored
-//!    `Type` — no side table is needed. Domain refinements ride the type
-//!    lattice as restriction refinements on [`Type::Refinement`] (introduced by the
-//!    `cast` Apply arm), so they flow through the solver structurally.
-//! 2. **Coalesce + write-back + monomorphize**: walk the tree again and, for
-//!    each node, run
-//!    [`coalesce_compact`](crate::ccl::infer::solver::coalesce_compact) to
-//!    resolve the inference variables in its `expr.ty` in place. The same
-//!    walk lowers let-polymorphism: a use of a generalized `let` is
-//!    specialized at first visit, memoized per distinct instantiation
-//!    ([`specialize_use`](solve::specialize_use)), and the `let` rebuilds
-//!    itself as the chain of demanded specializations
-//!    ([`coalesce_generalized_let`](solve::coalesce_generalized_let)).
+//! [`OperatorSchemes`] supplies polymorphic schemes for registered operators and
+//! projection cases. Uses instantiate those schemes independently. Arithmetic and
+//! comparison use trait requirements instead; see `src/ccl/design/type-inference.md`,
+//! "Traits".
 //!
-//! # Let-polymorphism
-//!
-//! A `let` whose RHS is a *function definition* is **generalized**: its RHS is
-//! emitted one level deeper (`in_let_rhs`), then generalized into a
-//! [`PolyScheme`](crate::ccl::infer::solver::PolyScheme) at the binding site (`scoped_let`), so each use instantiates
-//! fresh quantified variables and is constrained independently. This is what
-//! lets `let id = λx.x in (id 1, id "a")` type-check
-//! where a monomorphic `let` would collide.
-//!
-//! Because `ccl::Type` has no `ForAll` and the downstream passes are
-//! monomorphic, generalization is paired with **monomorphization**,
-//! integrated into the coalesce walk: at a generalized use, the walk resolves
-//! the instantiation type off the live constraint graph (complete by then),
-//! emits one specialized clone of the definition per distinct instantiation
-//! (`freshen_expr_type_slots` + a constrain-against-the-live-use-type pin + a
-//! re-entrant coalesce), and rewrites the use to reference its
-//! specialization. So inference both type-checks the polymorphism and lowers
-//! it to concrete per-type code before lambda-elimination. Sharing one
-//! specialization across same-typed uses is what lets a collection/generator
-//! UDF used at several element types compile to one *cached* binding per
-//! element type rather than a copy per call. Specializing *inside* the walk —
-//! rather than splicing after it — is what keeps every parent type derived
-//! from concrete children (no post-hoc re-derivation of dependent types), and
-//! handles chained polymorphism (a generalized UDF used only inside another
-//! generalized definition) by plain recursion.
-//!
-//! Generalization itself is narrow ([`should_generalize`](context::should_generalize)): only *function*
-//! definitions with a quantifiable variable. Value bindings stay monomorphic
-//! and shared (the pre-let-poly behavior), since specializing a value would
-//! duplicate it, which the feed/define and join-planning machinery is sensitive
-//! to.
-//!
-//! The [`OperatorSchemes`] registry additionally contains [`PolyScheme`](crate::ccl::infer::solver::PolyScheme)s for
-//! the handful of operator/projection cases that are inherently polymorphic
-//! (`Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme is `instantiate`d at every use
-//! site, minting fresh vars per use.
-//!
-//! Arithmetic and comparison have **no** scheme: their requirement is a trait
-//! rather than a signature, because a signature could only relate their operands
-//! by sharing a variable — see `src/ccl/design/type-inference.md`, "Traits".
-//!
-//! Most `Builtin` nodes are introduced post-inference by
-//! `lambda_elim`/`planning` with their type pre-stamped on the node, and
-//! inference just rubber-stamps them. The exceptions are polymorphic
-//! builtins introduced pre-inference (e.g. `FinalOrDefault` from
-//! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and
-//! are freshened at each use site like any other scheme.
+//! Builtins introduced after inference carry stamped types. Registered polymorphic
+//! builtins that reach inference, including `FinalOrDefault`, use instantiated
+//! schemes. Predicate stripping preserves interiors that planning must compile.
 
 mod api;
 mod check;

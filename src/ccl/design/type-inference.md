@@ -259,712 +259,792 @@ requires an SMT encoding for the point-free forms.
 
 ## 2. The Inference Pipeline
 
-The inference engine drives the AST through two passes, defined in `ccl/infer/`, mirroring the academic paper's `typeTerm`/`constrain` and `coalesce` algorithms, then a third that erases what coalesce leaves inside refinement predicates ([Pass 3: Stripping Predicate Interiors](#pass-3-stripping-predicate-interiors)). Two Cambra-specific mechanisms ride *inside* the coalesce walk rather than as separate passes: binder-slot filling (see Pass 2) and let-polymorphism's per-type specialization (integrated monomorphization — see §3.1).
+Inference emits constraints, materializes types while specializing generalized definitions, and
+strips redundant refinements from predicate interiors. These are the three passes described below.
+Binder-slot resolution and specialization run inside the second pass, not as later repair passes.
+
+The entry points are `infer` in `infer/api.rs` and `run` in `infer/mod.rs`. Their order is:
+
+1. Normalize registered source types and emit constraints onto the expression tree.
+2. Resolve the operand requirements accumulated during emission. This sweep runs before
+   materialization, while generalized definitions and their variables remain available for blame.
+3. Run `coalesce_pass`, including binder-slot resolution and specialization.
+4. Run `strip_predicate_interiors`.
+5. In debug builds, check term-variable scope validity and the absence of free witnesses.
+6. On success, clear expression and binder annotations. On failure, retain annotations for
+   diagnostics.
+
+Emission returns at its first error. Coalescing can accumulate multiple errors and returns before
+predicate stripping if it finds any. The requirement sweep also has debug checks around it:
+`verify_narrowing_is_complete` audits eager narrowing, and `seal_emission` marks the end of
+definition-obligation narrowing. See [Requirements are read together, once](#requirements-are-read-together-once).
 
 ### Pass 1: Constraint Emission
 
-The algorithm walks the AST top-down. It normalizes each node's expected type into a solver-ready `ccl::Type` (via `normalize_annotation`: `Hole` → fresh `Type::Infer`; `Refinement` wrappers are *kept* — they ride the lattice natively, see §4), generates constraints, and writes each node's resulting `Type` directly onto `expr.ty`.
+`emit_node` in `infer/emit.rs` traverses the expression tree, emits constraints through
+`InferCtx`, and stores the emitted type in each node's `expr.ty`. Annotation normalization
+replaces holes with inference variables and retains refinement wrappers. The normalized solver
+type is distinct from the original `user_annotation`, which remains available until successful
+inference consumes it.
 
-Because inference variables are shared `Rc<InferVar>`s, constraints emitted *after* a node's type is stored continue to accumulate bounds that remain visible through the stored `Type` — so there is no separate side table; the AST node *is* the record of the node's inferred type.
+A stored `Type::Infer` refers to a shared `Rc<InferVar>`. Constraints added later are therefore
+visible through types already stored on other nodes. The AST slots refer to the live bound graph;
+they are not snapshots of its bounds.
 
-The constraint rules for the fundamental forms, in language-neutral pseudocode:
+The structural rules are generic over `Typing`. For example, `emit_lambda` binds the parameter
+while checking its body, and `emit_apply` checks the argument and function before calling the
+context's application rule. The context determines whether an obligation adds constraints or
+checks a recorded result. See [The post-inference check](#the-post-inference-check-shared-rules).
 
-```
-emit(Apply { function, argument }):
-    arg_ty    = emit(argument)
-    fn_ty     = emit(function)
-    result    = fresh_var()
-    constrain(fn_ty, Fun(arg_ty, result))      # fn_ty must accept arg_ty, yield result
-    return result
-
-emit(Lambda { param, body }):
-    param_ty  = fresh_var()
-    bind param.name -> param_ty in scope
-    body_ty   = emit(body)
-    return Fun(param_ty, body_ty)
-```
-
-`constrain(lhs, rhs)` then drives the recursive bound-propagation machinery from §1:
-
-```
-constrain(lhs, rhs):
-    if lhs == rhs: return
-    match (lhs, rhs):
-        (Fun(d0, c0), Fun(d1, c1)):
-            constrain(d1, d0)        # domains: contravariant (flipped)
-            constrain(c0, c1)        # codomains: covariant
-        (Record(fs0), Record(fs1)):
-            for (k, t1) in fs1:      # width subtyping: every rhs field
-                constrain(fs0[k], t1) # must exist in lhs with a compatible type
-        (Var v, _):                  # record rhs as an upper bound of v,
-            v.upper.push(rhs)        # then re-assert v's existing lower bounds
-            for low in v.lower: constrain(low, rhs)
-        (_, Var v):                  # record lhs as a lower bound of v,
-            v.lower.push(lhs)        # then re-assert v's existing upper bounds
-            for up in v.upper: constrain(lhs, up)
-        # (level-mismatch arms extrude the offending side and retry; see §1)
-```
+For ordinary compute functions, subtyping reverses the domain relation and preserves the codomain
+relation. Record subtyping requires the producer to supply every demanded field. Inference-variable
+arms record a bound and propagate it against the opposite bound list. These are distinct from data
+domain invariance and history invariance; a generic contravariant-function rule does not describe
+every function kind. See [Bounds and constraint propagation](#bounds-and-constraint-propagation)
+and [Data domains are invariant](#data-domains-are-invariant).
 
 #### Apply is one-way
 
-**Under-determined domains are recovered as use-site specialization.** The `Apply` rule emits only
-the textbook constraints — the shape edge `constrain(fn_ty, domain ⇒ codomain)` and the argument
-edge `constrain(arg_ty, domain)` (`arg <: domain`). A function domain is contravariant, so those
-one-way edges put the value on a *morphism*'s domain variable's lower side while its uses accumulate
-above. A **lambda**'s domain needs nothing further: binder and argument share one variable, and a
-negative position reads their meet
-([The collapse happens at the position](#the-collapse-happens-at-the-position)). A **projection**'s
-does, and not because anything was lost: `.𝑘` is polymorphic in its input's width, so a domain that
-does not name that width is its principal type. Op-conversion needs one width to emit a field
-access, and the use site is what has it. Where the argument's own type is concrete when
-`arg <: domain` is drawn, the width reaches the domain variable as a lower bound and the meet
-settles it; where the argument is still a variable there, the width arrives only as its coalesced
-node type. That shape — the value actually flowing in — is supplied **structurally during the
-coalesce walk**: `coalesce_node`'s `Apply` arm rewrites a projection's domain to the resolved
-argument, the `Compose` arm to the preceding morphism's codomain, and refinement predicates (the
-join-filter / cast-target case) are reached the same way since `coalesce_type_predicates` runs
-`coalesce_node` over them (see
-[Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)).
-This is the **closed-form case of use-site specialization** — the same operation `specialize_use`
-performs for a generalized `let` (specialize to the resolved use type), except the morphism's domain
-*equals* its input, so it collapses to a single overwrite instead of clone+pin+coalesce. See
-`infer::specialize_projection_domain`. `proj_requirement` still spells the demand as a dense prefix,
-`Tuple([fresh × 𝑘] ++ [field])`, because `Type::Tuple` cannot say "index 𝑘 at 𝑇, arity at least
-𝑘+1"; the fillers are placeholders for positions the projection has no opinion about, and the
-monomorphization overwrites them before any later phase reads one.
+The ordinary application rule emits a function-shape constraint and an argument constraint:
 
-The local per-morphism recovery suffices because projections and direct/argument-position lambdas are the morphisms whose domains coalesce under-determined. Function values reached through *opaque* positions (`Var`-bound functions applied at distant call sites, higher-order `Compose` of vars) are outside the closed-form recovery — the same opaque-vs-direct boundary as dependent application. (Genuine polymorphism is handled separately by generalize + per-type monomorphization — see §1, *Roadmap*.)
+```text
+fn_ty <: (x: domain) ⇒ codomain
+arg_ty <: domain
+```
+
+This is schematic compute-function notation. `InferCtx::apply` also carries function-kind
+information and discharges the dependent result binder to the argument term. Mutable
+pass-by-reference arguments and checked lookup have additional rules in `emit_apply`; the two
+edges above are not a complete specification of those cases.
+
+The rule does not emit a reverse `domain <: arg_ty` edge to determine a projection's width.
+A projection such as `.0` imposes a requirement on one field, not a closed arity. Its emitted
+tuple requirement is a dense prefix with fresh fillers before the selected field
+(`proj_requirement`), because `Type::Tuple` has no sparse, minimum-arity form.
+
+Projection width is supplied during coalescing, not by reversing the application constraint.
+See [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)
+for direct projections and [Binder-slot resolution](#binder-slot-resolution) for lambda parameters.
 
 ### Pass 2: Coalesce and Write-back
 
-The algorithm walks the AST a second time. For each node it takes the `Type` already stored on `expr.ty` (whose `Infer` variables now carry their fully accumulated bounds) and runs it through a three-step pipeline, writing the resolved, variable-free `ccl::Type` back into `expr.ty` in place. The same walk also fills the **binder slots** (which are not any node's `expr.ty`) — see *Closing the single-sided blind spots*, below — and specializes generalized `let`s per distinct resolved use type (integrated monomorphization, §3.1).
+`coalesce_node` in `infer/solve.rs` resolves children and then the enclosing expression.
+The walk also fills binder slots, visits predicates embedded in types, and replaces generalized
+bindings with their demanded specializations. Application order follows the
+[read-stability contract](#coalesce-ordering-and-read-stability).
 
-The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/upper bound lists and turn it into a flat, per-polarity-position representation that a single concrete type can be read off of:
+`resolve_var_type` runs three solver functions:
 
-1. **`compact_type`:** Walks the `Type`, transitively following each variable's bounds at the polarity of its occurrence, and collects everything reachable at a given polarity-position into one flat `CompactType` (the bundle is a `CompactGraph`: the top-level `CompactType` plus a side-table of any recursive-variable definitions). "Compacting" means gathering the scattered bounds that reach a position into a single bag of contributions (variables, atoms, a record shape, a function shape). When two record shapes meet at a position, they merge by polarity: at a **positive** position their fields are *intersected* (a value that is reliably both `{a, b}` and `{a, c}` is only reliably `{a}`); at a **negative** position their fields are *unioned*.
-   * *Opposite-polarity fallback:* if walking a variable's polarity-correct bounds yields no concrete structure, the algorithm falls back to the opposite polarity's bounds. This *is* monomorphization's coalesce-time read for a contravariant domain var, recovering its type from its lower bounds. (It handles a *bare* under-determined domain var; a projection's domain, which is a structured tuple/record with `Infer`s inside, is recovered separately by `coalesce_node`'s projection-domain specialization — see §2.) It is **sound** because every variable reaching coalesce is **monomorphically determined** — pinned to one type by its uses, or its bounds collide into `IncompatibleBounds` — never silently mis-typed. (A generalized binding's definition is never coalesced in place; only its per-use *instantiations* and its per-type specialization clones — each pinned to a single resolved use type — reach here.) This invariant, not the absence of polymorphism, is what makes the read safe; it is kept deliberately, not pending a `Type::ForAll`.
-2. **`simplify_type`:** Runs polar co-occurrence analysis to keep types from growing exponentially. "Dropping" a variable here means removing it from the contribution bags at its occurrences; the position keeps whatever concrete structure remains, and a position left with no contributions coalesces to `Type::Infer`. Three rules:
-   * *Polar-only elimination:* a variable whose every occurrence is at a single polarity carries no information (nothing constrains it from the other side), so it is dropped. A purely-negative variable means the function accepts anything there; a purely-positive one means the caller imposes nothing on it.
-   * *Co-occurrence merging:* if variable `v` and variable `w` always occur together at a given polarity (and symmetrically), they carry identical information, so `w` is merged into `v`.
-   * *Atomic absorption:* if a concrete atom `A` co-occurs with variable `v` at *both* polarities, `v` is sandwiched between two identical `A` constraints and is redundant, so it is dropped.
-   * The pass runs on both ordinary monomorphic types and the instantiated types of generalized
-     definitions. Let-polymorphism is implemented; it does not defer these simplification rules.
-   * All three rules read the variable sets `compact_type` deposits, and a negative position's
-     set holds both sides' variables — the merge unions identities as it unions fields. The
-     occurrences the analysis sees there are not the ones the coalesced type materializes.
-     Refinements are unaffected, sitting on the position while the rules rewrite variable ids.
-3. **`coalesce_compact`:** Materializes the simplified `CompactGraph` into the final `ccl::Type` by counting the concrete structural contributions (e.g. `Int`, a record, a variant) remaining at each position. Variable contributions never appear in the output — their bounds have already been expanded into the structural bags by `compact_type`.
-   * *Zero shapes:* emit a fresh `Type::Infer` placeholder.
-   * *Exactly one shape:* emit it as the `ccl::Type`. Records with dense `Index` keys (0..n) become `Type::Tuple`; `Name` keys become `Type::Record`; a *sparse* index product (a gap in the indices, which only an open/under-determined position can produce) coalesces to a fresh `Type::Infer` rather than a concrete product; variant maps preserve their tags and become `Type::Variant`.
-   * *Multiple shapes:* if several distinct concrete types survive (e.g. `Int` and `String`) with no tag to discriminate them, throw an `IncompatibleBounds` error — the solver won't invent an anonymous sum from a primitive collision. (A genuinely *tagged* `Variant` is one shape, not a collision.)
+```text
+compact_type → simplify_type → coalesce_compact
+```
+
+These functions live under `infer/solver/`; `infer/solve.rs` sequences them. A result need not
+be fully determined: unresolved positions can remain fresh `Type::Infer` placeholders.
+Materialization is not itself a guarantee that strict downstream type checking will accept the tree.
+
+#### Compaction
+
+`compact_type` follows inference-variable bounds and combines the contributions at each type
+position into a `CompactType`. A `CompactGraph` contains the root contribution and a map for
+recursive-variable definitions. Contributions include variable identities, atoms, product and
+variant shapes, function and history shapes, refinements, and kind information.
+
+Polarity selects the primary bound list: lower bounds at a positive occurrence, upper bounds at
+a negative one. Function domains reverse polarity; codomains preserve it. Compatible record
+contributions retain common fields in a positive merge and combine required fields in a negative
+merge. This describes the shape merge, not an explicit union or intersection type in `ccl::Type`.
+
+The walk also reads opposite-side bounds under two separate rules: position-local shape recovery
+and negative-position merging. A negative position can merge lower bounds even when its upper
+bounds already provide a shape. See [The collapse happens at the position](#the-collapse-happens-at-the-position).
+
+Generalized definitions follow the [specialization lifecycle](#specialization-scope-and-lifecycle),
+including the separate [diagnostic walk for unused definitions](#typechecking-a-never-called-definition).
+
+#### Simplification
+
+`simplify_type` analyzes variable co-occurrence in the compact graph and rewrites variable
+identities. It applies three rules:
+
+1. Eliminate a non-recursive variable that occurs at only one polarity.
+2. Merge variables that co-occur symmetrically. Recursive and non-recursive variables are not merged
+   with one another.
+3. Eliminate a variable absorbed by the same concrete atom at both polarities.
+
+These operations remove or replace variable contributions, not whole type positions. Concrete
+structure remains after a variable is removed; a position with no remaining structure can
+materialize as `Infer`. The rules run on ordinary monomorphic types and the instantiated types
+of generalized definitions.
+
+The analysis reads the variable sets produced by compaction. A negative-position merge includes
+identities from both bound directions, so its co-occurrence set is not just the set of variables
+visible in the final rendered type. Refinements belong to positions, not variable identities;
+`simplify_reconstruct` retains them while changing the variable sets.
+
+#### Materialization outcomes
+
+`coalesce_compact` converts structural contributions into `ccl::Type`. It does not expose the
+original bound-graph variable identities as output type variables.
+
+| Contributions at a position | Result |
+| --- | --- |
+| No concrete shape | A fresh `Type::Infer` placeholder |
+| One compatible shape | The corresponding concrete type, with materialized children |
+| Distinct incompatible shapes, such as `Int` and `String` | `IncompatibleBounds` |
+| A tagged variant shape | `Type::Variant`, retaining its tags rather than treating them as an untagged collision |
+
+Product materialization in `materialize_record` additionally distinguishes field keys:
+
+- Dense index keys produce `Type::Tuple`.
+- Name keys produce `Type::Record`; open versus closed named width is not represented at this layer.
+- Sparse index keys leave a fresh `Infer`. Their children are still visited before the shape is
+  discarded, so nested materialization errors are not skipped.
+- Mixed index and name keys produce `UnresolvedPartial`.
+
+The solver does not invent an untagged sum to resolve incompatible concrete shapes.
 
 ### Closing the single-sided blind spots (no separate pass)
 
-The solver's single-sided `Var <: Var` constrain rule leaves a few *structural* blind spots —
-positions where a variable receives a bound on only one side, so coalesce (which reads the
-polarity-correct side) can't materialize it. Refinements ride the lattice natively (see §4) and
-coalesce straight onto each node, including the predicate's own sub-expression types, but that alone
-does not exempt them: a refinement arriving on the value side of a negative position is single-sided
-like any shape, and what lands it is
-[The collapse happens at the position](#the-collapse-happens-at-the-position).
+Projection-domain specialization and binder-slot resolution are operations within
+`coalesce_node`. They are not reverse constraints inserted during emission or a post-inference
+saturation pass.
 
-**Morphism domains (projections and lambdas) — rebuilt during the coalesce walk (`Apply` and `Compose`).** A morphism's domain appears only at a negative position, and the one-way constraints emitted around it (`fn_ty <: domain ⇒ codomain` and `arg <: domain` at an `Apply`; the adjacency `prev_cod <: next_dom` in a `Compose`) deliver the concrete value flowing in only as a *lower* bound, while the uppers carry just what the morphism's own body demands — so negative-polarity coalesce materializes the narrow body-demand shape. A `Proj`'s domain coalesces field-narrow (e.g. `.0` of a multi-accumulator loop's `step` tuple coalesces to a 1-tuple `(T)` instead of the full `(T, U)`); a lambda's record param narrows to the fields its body touches (`{label}` instead of `{id, label}`), with untouched params left `Infer`.
+A projection requirement can omit fields that exist in its input. Resolving that requirement alone
+does not recover those fields. After the children resolve, `specialize_projection_domain` rebuilds
+a direct `Proj` function type from the resolved input and its existing codomain:
 
-`coalesce_node` rebuilds it **structurally, after coalescing the children**, via
-`specialize_projection_domain`: the `Apply` arm replaces a projection's domain with the resolved
-argument, the `Compose` arm with the preceding morphism's already-resolved codomain (and the chain's
-own type with `Fun(first.domain, last.codomain)`), and refinement predicates recover the same way
-through `coalesce_type_predicates`. A lambda needs no counterpart here — its binder is the domain
-variable, so its `param.ty` slot is derived from the coalesced domain (`refresh_lambda_param_slot`)
-and the body-usage refinements it carries are already in that reading. This is **use-site
-specialization** — the closed-form sibling of `specialize_use`'s per-`let` specialization (the
-morphism's domain *equals* its input, so it is one overwrite rather than clone+pin+coalesce; see
-§2). Doing it post-coalesce — rather than recording a reverse bound at emit time — is what keeps it
-robust: an emit-time bound is recorded against a specific inference variable, and let-polymorphism's
-monomorphization re-mints those variables (splicing freshened definitions at use sites), so the
-bound would not follow to the variable the node's recorded type ends up carrying. Reading the
-resolved shapes directly sidesteps that entirely.
+- In `Apply`, the input is the resolved argument.
+- In `Compose`, the input is the preceding morphism's codomain. The walk also rebuilds the
+  composition's type from its endpoint morphisms.
+- In cast targets and other type slots, `coalesce_type_predicates` reaches these same rules.
+
+The helper applies only to `Proj` nodes. A function hidden behind a `Var` does not acquire a
+projection domain through it; generalized bindings use
+[specialization](#31-let-polymorphism-is-freshening-instantiation). A lambda's domain instead carries
+argument lower bounds and body-demand upper bounds. Negative-position compaction reads both;
+[binder-slot resolution](#binder-slot-resolution) then refreshes its parameter from that domain.
+
+Using resolved inputs here avoids tying width recovery to a particular emit-time inference
+variable. Freshening a generalized definition creates new variables, whereas the specialized
+projection still has the resolved input at its own use site.
+
+A bare domain variable is not the same problem as a structured projection requirement. Compaction
+can recover a bare variable from its bounds. A projection's untouched fields may have no relevant
+bounds at all, so its complete input shape must come from the expression using it.
 
 #### The collapse happens at the position
 
-The *bare* under-determined variable — a domain variable that receives only `arg` and nothing else —
-is the half `specialize_projection_domain` cannot reassemble, and `compact_go` handles it in place:
-where a variable's polarity-correct bounds yield no shape, the opposite side supplies one. The
-principal type of such a variable is `∀α ⊒ 𝐿. …`, and with no `Type::ForAll` and concrete code to
-emit, the quantifier collapses to its bound. That elimination is how a structurally-typed position
-acquires a type at all, in both directions: a domain reading the argument that flows in, and a
-parameter used only through projections reading the open records its uses demand of it.
+`compact_go` can use opposite-side bounds to determine a position whose primary bounds do not
+determine a shape. `fallback_allowed` permits this only when collapse is enabled and the walk
+entered the variable as a structural position, rather than following another variable's bound
+chain. Each structural child starts a new position.
 
-A collapse is a *choice*, not a subtyping inference, so it does not propagate along subtyping edges — `𝐿 <: 𝑐` and `𝑎 <: 𝑐` together say nothing about `𝐿` versus `𝑎`. It belongs to the variable whose quantifier is being eliminated: the **position** the walk entered, never one reached by following another variable's bounds, which is why the walk resets its parent path at every structural child. `fallback_allowed` (`src/ccl/infer/solver/compact.rs`) carries the rule and its argument.
+This recovery chooses a materialized type; it is not an additional subtype judgment. From
+`L <: c` and `a <: c`, no relation between `L` and `a` follows. Reading `c`'s opposite
+side while traversing `a`'s bounds would otherwise attribute another use's information to `a`.
 
-**When the polarity-correct walk counts as having answered.** The shape collapse fires only where
-that walk found no shape, and a *variant* shape is read differently at the two polarities.
-Positively it comes off the lower bounds and is the value's own tags — what the thing is — so the
-collapse has nothing to add, and firing past it would replace the value with its own upper bound (a
-bounded annotation `𝑥 <: 𝑇` reading back as the binder's type). Negatively it comes off the upper
-bounds and is the arms a body can *handle*, which is not a determination of what flows in; there the
-collapse must still fetch the argument, or a domain becomes the sum of everything the `match`
-accepts. Records and atoms need no such split, being the same claim read from either side.
+Shape determination treats variants differently at the two polarities:
 
-**A negative position reads the opposite side whether or not the collapse fires.** Both sides narrow
-it — the uses state what they demand, the lower bounds what arrives — so the reading is their merge
-at the position's own polarity, which is one rule for every slot rather than one per shape. The
-collapse above is the *undetermined* case, and it replaces rather than merges because there is no
-settled structure for two sides to narrow jointly. A positive position is unaffected: its
-polarity-correct side is already the value's own facts, and a demand is not one. Merging is what
-makes an invariant [data domain](#data-domains-are-invariant) resolve to a single type where its
-two readings differ — `groupby([1], λ 𝑥 → 𝑥)`'s key variable carries `Int@1` below and `Int` above.
-That settles one position. Two spellings of one domain also have to be identified, which is what a
-shared hole states ([A shared hole naming a domain states an
-equation](#a-shared-hole-naming-a-domain-states-an-equation)); without it the spelling that reaches
-the other only through the argument edge keeps the wider reading. Pinned by
-`a_negative_position_meets_both_sides` and `a_groupby_over_a_singleton_element_literal`.
+- At a positive position, a variant contribution records the producer's tags. It counts as a
+  concrete shape, so fallback does not replace it with an upper-bound demand.
+- At a negative position, upper-bound variant tags describe the arms a body handles. That does
+  not determine the tags of the incoming value, so the opposite-side read can still supply them.
+- Atom, record, function, and history contributions count as shapes without this variant-specific
+  distinction. Variable identities, refinements, and kind information do not by themselves supply
+  the concrete shape tested by this condition.
 
-The meet reaches a **variant** in a child slot, where it intersects the tags and closes an open
-demand's marker — a `case _:` demand is open, and the value side is a producer and so closed.
-Both halves are the approximate meet `CompactVariant::meet_openness` documents, and that
-approximation now has a caller: a tag the value carries and the demand does not name is dropped,
-and the marker then claims the remainder is exhaustive. No program observes the narrowed reading,
-a default arm being compiled from the `Case` (`test_default_arm_under_a_record_field`); the
-reading itself is pinned by `a_settled_negative_position_closes_an_open_child_demand`.
+A negative entered position also merges the opposite side when its primary bounds already
+determine a shape. `compact_go` first traverses and combines opposite-side bounds at their own
+polarity. It then either uses the recovered shape for an undetermined position or merges the
+recovered contribution with the primary one at the position's polarity.
 
-**The gated merge pays a doubling of its own.** The gate confines the merge to the entered
-position, and a structural child *is* an entered position — `compact_go` takes a fresh
-`Position` at every one — so the merge re-opens one nesting level down and the walk doubles per
-contravariant flip. Measured in debug, median of three runs at equal test counts: the whole
-of `tests/type_check.rs` goes from 0.83s to 1.29s, and `test_groupby_key_relation_is_per_occurrence`
-— `def by_key(c, f): groupby(c, f)` at two types, the same program as above — from 0.56s to
-0.94s. `tests/compilation_pipeline` is flat, its time being execution rather than inference.
+For example, a grouping key can have singleton `Int@1` below it and `Int` above it. Reading the
+demand alone loses the singleton. The negative-position merge retains the contribution needed for
+the invariant data domain. Tests include `a_negative_position_meets_both_sides` in
+`infer/solver/compact.rs` and `a_groupby_over_a_singleton_element_literal` in
+`tests/compilation_pipeline/joins_aggregates_groupby.rs`.
 
-What is absent is a **result memo**. `CompactState` carries `in_process`, which prunes cycles
-and caches nothing — it is removed again as each variable's walk returns — so a position
-reached twice is compacted twice. A `(uid, pol)` key would not be a correct memo: a position's
-reading also depends on `subst_acc` and on the refinement scope `st.scope` holds, so two
-entries at one variable and polarity are not interchangeable. Hash consing the rendered
-contribution keys on what was produced instead, and sidesteps that.
+This resolves one position. Relating two spellings of an invariant domain is a separate constraint;
+see [A shared hole naming a domain states an equation](#a-shared-hole-naming-a-domain-states-an-equation).
 
-**Asking the other question.** Because the collapse answers "what must this position be", a caller that needs "what actually reached it" has to suppress the collapse — `compact_type_polarity_only`, the polarity-correct walk alone. The distinction is not academic: an upper bound deposited on a never-inhabited position (the trait-requirement sweep does exactly this) makes the ordinary resolve report a type. [The unobservable-arm pin](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require) is the caller that must not confuse the two, since a demand is precisely what an unreachable arm can acquire.
+For an open variant demand nested under a structural child, the negative merge intersects tags and
+combines openness through `CompactVariant::meet_openness`. A closed producer can therefore close
+the demand's marker while unnamed producer tags are removed from this materialized view. This is
+the documented approximation, not an exact representation of open-variant intersection.
+`a_settled_negative_position_closes_an_open_child_demand` checks the reading.
+`test_default_arm_under_a_record_field` checks the default-arm execution, which is compiled from
+the `Case` rather than inferred from that narrowed view.
+
+`compact_type_polarity_only` disables both opposite-side rules. It answers which information
+arrived along the selected bound direction, without resolving an uninhabited position from its
+demands. [Unobservable-arm payload pinning](#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)
+needs that distinction: an unreachable arm can acquire upper-bound requirements without receiving
+a value.
 
 ##### An invariant position reads both sides however the walk reached it
 
-Elsewhere the merge fires only at a position, which `fallback_allowed` answers. That gate
-belongs to the collapse: a collapse is a choice, and a choice does not propagate along
-subtyping edges. Applying it to the merge as well gives one variable **two readings at one
-polarity** — the merge where the walk entered it structurally, the demand side alone where it
-arrived along another variable's bound chain — and inside an invariant position there is no
-variance left to tell those readings apart, so the invariance check rejects the position
-against itself.
+Inside an invariant position, negative merging also applies to variables reached through bound
+chains. Shape recovery remains position-local. The merge condition in `compact_go` is:
 
-A mutable `Map` seeded with a one-entry literal is the shape that reaches it. The seed's key
-type is that key's own singleton, and `box`'s scheme shares one variable between its domain
-and the sum's single candidate, so the key domain arrives at that variable through a chain:
-entered as a position it reads the singleton, reached along the chain it reads the bare
-present-key domain, and the two are the collection the program wrote and a wider one.
-`a_one_entry_seed_reads_as_a_map` and its two keyed-write siblings are the three uses.
+```rust
+let merge = !pol && (allow_fallback || (st.collapse && pos.invariant));
+```
 
-**Scoped to an invariant position, not ungated.** Reading the opposite side at *every*
-negative variable compacts it in full there, so the walk doubles per level of type nesting —
-`def by_key(c, f): groupby(c, f)` applied at two types goes from 1.4s to 10s, where the
-scoped read costs 1.5s. It also reaches a function-typed **parameter**, which is a compute
-domain: there a suspended discharge puts two data domains together whose refinement sets
-differ only in the discharged binder's spelling, `{[0, 2] | 𝑥 == 0}` against
-`{[0, 2] | 𝑥 == __arg}`, and `data_domains_disagree` compares those sets structurally, so one
-domain reached twice reads as two that disagree
-(`higher_order_dependent_application_discharges_the_binder`). Identifying those two spellings
-is what letting the merge follow *every* chain would need first.
+Without the invariant exception, the same domain can resolve differently depending on whether the
+walk entered it structurally or followed a bound to it. Invariance then rejects two readings of
+what should be one domain.
 
-#### Binder slots — filled during the coalesce walk (no lexical scope needed)
+A mutable map seeded with one entry exercises this case. Its key has a singleton type, and the
+`box` scheme shares a variable between its domain and its sole sum candidate. Following the
+resulting chain must retain the same key-domain information as entering the position directly.
+The regression cases include `a_one_entry_seed_reads_as_a_map` and the related keyed-write tests.
 
-A `Var` use needs *no* scope lookup: it shares its binder's inference variable — a monomorphic
-`let` binds verbatim (`instantiate` freshens nothing) so every use coalesces to exactly what the
-binder coalesces to, and a *generalized* `let`'s uses are rewritten by the walk itself to
-reference per-type specializations (which does carry a scope — the walk's stack of specialization
-frames and shadow markers; see §3.1).
+The exception does not enable negative merging along every bound chain. An unrestricted read
+would revisit nested types more often and would also reach compute-function parameter domains.
+The higher-order dependent-application case can present data domains whose predicates differ
+only in the spelling of a discharged binder. Structural refinement comparison does not identify
+those spellings. See `higher_order_dependent_application_discharges_the_binder` in
+`tests/type_check.rs`.
 
-What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `For`'s target slot. Each is resolved explicitly in `coalesce_node`, mirroring its definition (inference runs before the mutability/transaction phases, so the recurrence carriers `LetRec`/`Transact` never reach coalesce):
+##### Compaction traversal cost
 
-* **`Lambda` `param.ty`** — derived from the lambda's coalesced domain (so body-usage restriction refinements, which are negative-polarity facts visible only in the contravariant domain, survive), and re-derived whenever a parent arm specializes the domain (`refresh_lambda_param_slot`).
-* **`Let` / `LetRec` / mutable-variable `binding.ty`, `Case` pattern payloads, a `For` target** — resolved *in place* by `resolve_binder_slot`. Resolving the slot is **not** copying the coalesced RHS type onto it: the two agree for an unannotated `let` (the binder is bound at its initializer's type) and disagree for the annotated ones — a deref-copy binds at the value type where the RHS is a handle, a mutable-variable introduction at the handle where the RHS is a value.
+`CompactState::in_process` prevents recursive re-entry while a variable is being visited; it is
+not a cache of completed results. The entry is removed when that visit returns. Reaching a
+position again can therefore repeat compaction, and each structural child can enable a new
+opposite-side read.
 
-**Resolving a binder slot is two jobs.** `resolve_var_type` settles the type's *structure*; the refinement predicates riding it are expression trees hanging off type slots, carrying inference variables of their own, and they are settled by `coalesce_type_predicates` — which is exactly what `coalesce_node` runs for every `expr.ty`. A slot that did only the first would keep the **pre-coalesce predicate `Rc`**: the predicate memo redirects only the occurrences it visits, so a slot the walk skipped still points at the original, and the stale copy survives with unresolved variables. `resolve_binder_slot` exists so the two halves cannot drift apart per slot.
+A result memo keyed only by variable identity and polarity would omit relevant inputs:
+`subst_acc` composes the substitutions on the path, and `st.scope` records the refinement
+scope. Reusing a result across different substitutions or scopes would conflate distinct readings.
+No such compaction result memo is implemented here. Memoization or interning would require its
+own correctness and performance checks; the traversal cost alone does not establish a safe key.
 
-That residue is invisible in most programs because something else rebuilds the binder — a *generalized* `let`'s definition is re-coalesced by `specialize_use` at each specialization. It is a **value** binding that exposes it: nothing rebuilds it, so the slot is the only chance. Two independent shapes reach it — a `groupby` (a collection, so a value binding, and dependently refined, so its binder type carries a predicate at all) and a `match` over a conditionally-built collection (whose arm domains carry the conditional's gate).
+#### Binder-slot resolution
 
-Refinement predicates are otherwise coalesced by recursing into them (in the `Lambda` arm and `coalesce_type_predicates`); their free variables share the enclosing bindings' vars and coalesce identically, just like ordinary `Var` uses — and their projections recover their domains through the same `Apply`/`Compose` arms (see §2).
+Binder types are not expression-node types. Resolving every `expr.ty` does not resolve a
+lambda parameter, let binding, match payload, or loop target automatically.
+
+`coalesce_node` handles those slots explicitly:
+
+- `refresh_lambda_param_slot` derives a lambda's `param.ty` from its coalesced domain.
+  This preserves refinements read in the domain's negative position. The helper uses
+  `Type::domain`, including sum-typed functions.
+- `resolve_binder_slot` resolves a let or mutable binding, match payload, or loop target in
+  place, then coalesces the predicates carried by the resulting type.
+- The visitor also handles `LetRec` slots, but the ordinary pipeline creates recurrence
+  carriers after inference. Their presence in the visitor is not a claim that normal inference
+  receives planned `LetRec` or `Transact` nodes.
+
+A slot is not filled by copying the RHS type. An unannotated ordinary let can agree with its RHS,
+but a dereferenced copy binds a value while its RHS is a history handle, and a mutable declaration
+binds a handle while its initializer is a value. `resolve_binder_slot` preserves the emitted
+binding rule.
+
+Resolving structure alone is insufficient. Predicates carried by a binder type have their own
+expression type slots, so `coalesce_type_predicates` must visit them too. A skipped slot retains
+its pre-coalesce predicate allocation and unresolved interior types. A value binding exposes this
+directly because no later specialization rebuilds its definition. Grouping values and matches
+over conditionally constructed collections exercise that path.
+
+Monomorphic variable uses share their binder's inference variables; they do not need a lexical
+lookup merely to read those bounds. Generalized uses do require the specialization scope, and
+lambda-parameter domain refresh is a separate operation. Slot resolution uses the type stored on
+the binder; specialization still needs its lexical scope.
 
 ### Pass 3: Stripping Predicate Interiors
 
-`strip_predicate_interiors` (`ccl/infer/strip.rs`) drops the refinements riding the type slots
-*inside* a refinement predicate.
+`strip_predicate_interiors` in `infer/strip.rs` removes refinements from expression and binder
+types inside a refinement predicate. It runs after successful coalescing and before the debug
+scope check.
 
-A predicate is a term, so every node in it carries a type, and those interior types accumulate
-refinements of their own: `^+` records its sum, which types the `1 ^+ 3` node inside the predicate
-`__elem == 1 ^+ 3 ^+ 2` as `{Int | __elem == 1 ^+ 3}`. The interior copy restates what the predicate
-holding it already says, and it is the copy a substitution leaves stale. Coalesce discharges the
-predicate a type carries as that type crosses a binder; an interior copy the discharge did not reach
-goes on naming the binder, and the end-of-inference scope-validity check (`check_scope_valid`)
-reports that as a `ScopeViolation` — a compiler-bug diagnostic on a well-typed program. Erasing the
-second copy is what closes that class; keeping two copies in step is the alternative.
+A predicate is an expression tree whose nodes carry types. Arithmetic within it can acquire a
+refinement that repeats part of the enclosing predicate. For example, an interior `1 ^+ 3`
+can carry its own sum refinement while the outer predicate states `__elem == 1 ^+ 3 ^+ 2`.
+A discharge that updates the outer predicate can leave an interior copy naming a binder that has
+gone out of scope. The stripping pass removes that redundant copy rather than relying on both
+representations remaining synchronized.
 
-Two kinds of interior type survive.
+The pass has two exceptions:
 
-A refinement on a **data function's data** is exempt, body and all. Planning compiles such a
-predicate into a `Restrict`/`Iterate` at the iteration boundary and operator conversion dispatches
-on the types of the nodes inside it, so its interior types are read rather than restated. `𝐴 ⤇ 𝐵`
-reads "the domain is the data", so the domain is the position that carries filters, at whatever
-depth its structure puts them.
+- Refinements on a data function's data domain retain their predicate interiors. Planning compiles
+  those predicates into iteration or restriction, and operator conversion reads the interior
+  types. `compiled_refinements` collects the exempt refinements before rewriting.
+- A `Cast` target remains intact. It is an operand that specifies the cast, not just metadata
+  describing the result; comprehension filters are read from it.
 
-Exemption is a property of the refinement rather than of the position it was found at, and is
-matched by `Refinement`'s structural equality. One predicate term rides many type slots — a
-comprehension's filtered domain appears on its source, map, cast, and consumer-contract types — so a
-rule keyed on position exempts that term at one slot and rewrites it at another, leaving the origin
-and the rewrite both live and structurally equal. That is the split `tests/predicate_sharing.rs`
-guards. Keying on the predicate `Rc` splits the same way wherever two structurally-equal terms
-already sit at distinct allocations.
+Exemptions are matched by `Refinement`'s structural equality, not a type-slot location or
+predicate address. One filter can occur in a source, map, cast, and consumer contract. Exempting it
+at one occurrence and rebuilding it at another would retain two equal terms at different
+allocations. The sharing tests cover that failure shape.
 
-A `Cast`'s `target` is kept wherever it sits. It is the cast's operand rather than an ascription of
-the node's type — `cast` takes the type it casts to as an argument — and a comprehension's filter is
-read off it, so replacing it changes what the term computes.
+Stripping does not establish that all later substitutions descend correctly into predicate type
+slots. It removes redundant interiors at this point in the pipeline. The remaining scope and
+sharing checks have separate responsibilities.
 
 ### The post-inference check (shared rules)
 
-Inference runs once, up front. But the pipeline re-checks types repeatedly *after* it — after inlining, after lambda-elimination, after join-planning — to confirm each transformation pass left a well-typed tree. This check shares inference's *structural* knowledge (what an `Apply` destructures, how a `Compose` chains, which product a constructor rebuilds) through the **`Typing` trait** rather than re-deriving it in a separate body of code. The per-node structural rules (`emit_apply`, `emit_compose`, `emit_proj`, …) are written *once*, generic over `C: Typing`, and two contexts implement the trait:
+The compiler runs inference before its transformation passes and checks recorded types again at
+later boundaries, including inlining, lambda elimination, and planning. The checks do not run a
+second inference pass.
 
-* **`InferCtx`** — the emission context (Pass 1). Its hooks generate constraints: `fresh` mints an inference variable, `instantiate` freshens a scheme, `require_sub` calls `constrain_subtype`, `subexpr` recurses emitting onto `expr.ty`.
-* **`CheckCtx`** — the post-inference check (`infer::check`). The *same* rules run, but the hooks now *verify* rather than *solve*: `subexpr` returns the child's already-recorded `child.ty` (what inference decided) instead of re-deriving it, `require_sub` confirms a relation the solver should already have established, and a final **reconcile** step checks the rule's reconstructed type against the node's recorded type.
+The structural expression rules in `infer/emit.rs` are generic over the `Typing` trait.
+Two contexts implement their operations:
 
-So the two passes share one description of the language's structure; they differ only in whether a rule's obligations are *emitted as constraints* or *checked against the recorded solution*. Adding or changing a structural rule updates both at once. Both contexts treat refinements strictly and identically; see §4 for how the check stays refinement-aware (adjacency flow checks *and* the reconcile) and why the passes that introduce refined types must keep each node reconstructable.
+| Context | Child types and obligations |
+| --- | --- |
+| `InferCtx` | Recursively emits children, creates inference variables, instantiates schemes, and records subtype constraints |
+| `CheckCtx` | Reads already-recorded child types, checks the required relations, and reconciles a reconstructed result with the node's recorded type |
 
-Currently, post-*planning* checks default to structural equality. Using SMT to match the previous-phase checks will require SMT encoding for point-free expressions.
+Sharing those rules keeps application decomposition, composition adjacency, and product
+construction consistent between inference and checking. It does not mean every context hook has
+the same implementation. In particular, inference can suspend dependent discharge over live
+variables, whereas checking works with recorded types.
+
+The post-inference checks retain refinements in both relation checks and reconciliation.
+They do not justify a transformation by erasing its predicates first. A pass that introduces a
+refined type must leave the node reconstructable under the checking rules; see
+[Refinements on the lattice](#refinements-on-the-lattice).
+
+Post-planning checks use structural predicate equality. Semantic entailment at that stage requires
+an SMT encoding for point-free expressions.
 
 ---
 
-## 3. Surprising Mechanics
+## 3. Specialization and Predicate Ownership
 
-Because the algorithm drops HM's union-find equality engine, it behaves in ways that can surprise developers familiar with static typing.
+Generalization creates fresh bound-graph instances at uses. Coalescing specializes definitions
+using those live instances, and predicate-rebuild memos preserve sharing where the rewrite context
+permits it. These operations have separate scopes and lifetimes.
 
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
-Vanilla algebraic subtyping makes a `let`-bound function polymorphic by **freshening**: every time a generalized binding is used, the solver copies its type graph, minting fresh variables for that use site. This is ordinary let-generalization/instantiation — the same idea as HM's `∀`-quantification — applied to the bound graph rather than to a syntactic type scheme.
+`should_generalize` in `infer/context.rs` selects a syntactic lambda whose function kind is
+not `Data` and whose type contains a variable above the enclosing level. A non-function value
+or a function with no quantifiable variable remains monomorphic. There is no use-count exception
+or separate eligibility rule for collection-producing UDFs.
 
-**How Cambra applies this — and then lowers it.** A `let` binding a *function definition* (`should_generalize`) is typed one level deeper (`in_let_rhs`) and generalized into a `PolyScheme` at the binding level (`scoped_let`); each `Var` use then `instantiate`s a fresh copy, exactly the freshening above. Because every pass after inference is monomorphic, the generalized binding is lowered to concrete code **inside the coalesce walk** (integrated monomorphization): the walk carries a scope of *specialization frames* — one per in-scope generalized `let`, plus shadow markers for every other binder — and a use of a generalized binding specializes at first visit (`specialize_use`). By coalesce time the constraint graph is *complete* (emission saw the whole program), so a use's instantiation is fully determined when the bottom-up walk reaches it: the walk resolves it off the live graph, and on a memo miss clones the definition (`freshen_expr_type_slots` freshens an independent copy — uniformly over terms and types, so a refinement predicate's slots and the suspended-substitution payloads riding the copied bound edges are renamed in the same traversal as every other slot), **pins the clone two-way to the use's live instantiation type**, coalesces the clone re-entrantly *in the definition site's scope* (entries pushed between definition and use are suspended, so a same-named binder introduced in between cannot capture the clone's references), renames the use to a synthetic `Mono` name (`Name::mono`) carrying the source binding plus a globally-fresh uid, and stamps the specialization's resolved type on it. When the `let`'s body walk completes, the node rebuilds itself as the chain of demanded specializations (`coalesce_generalized_let`), running the §6.2 `let`-closing discharge per spliced layer; a binding never demanded is resolved for its diagnostics and then dropped as dead code (see [Typechecking a never-called definition](#typechecking-a-never-called-definition)). Uses that instantiate the definition identically share one clone — the memo is keyed on a `SpecKey`, taken from the use's live type before its pin, and an entry stores the key of the use that minted it (see [Keying a specialization](#keying-a-specialization)). The definition's own subtree is never coalesced in place *while it has clones*: its quantified variables have no use-site bounds, so coalescing it would both produce an under-determined type and overwrite the bound-bearing `InferVar`s the clones freshen from. A definition with no clones is the never-called case above, where neither objection applies.
+Every let RHS is emitted one level deeper, whether or not it is generalized. A `PolyScheme`
+records the cutoff level. Instantiation freshens variables above that cutoff and preserves
+captured variables at or below it. Each generalized `Var` use receives its own instantiation
+during emission.
 
-Specializing *during* the walk — rather than splicing after it — is load-bearing twice over. First, every parent derives its type from concrete children on the first pass: in particular a parent `Apply`'s dependent-codomain discharge forces against the specialization's resolved predicate terms, so parent types are never re-derived from a second, graph-unreachable copy of the discharge logic. Second, chained polymorphism (a generalized UDF used only inside *another* generalized definition, poly-calls-poly) needs no special ordering: the inner use is reached only inside an outer clone's re-entrant walk, after that clone's pin has driven the use's instantiation concrete, and the inner binding's frame is still in scope below the outer's. The ordering invariant that makes in-walk specialization sound: **specialization may only add bounds to variables the walk has not yet read** — a use's pin touches its own instantiation variables (read right after, at its own stamp), the clone's fresh variables (read only inside the clone's walk), and otherwise deposits only α-copies of demands the instantiation already made at emit; `coalesce_node`'s `Apply` arm coalesces function before argument to keep even those copies behind the read front. The invariant is **checked explicitly, not just argued**: the walk logs every graph read as a `(var-laden type, resolution)` pair (the snapshot shares the live `InferVar`s), and `assert_reads_stable` re-resolves each against the *final* graph at end of pass, requiring the structural skeleton — bases, ranges, shapes, refinement-set cardinality, with under-determined positions wildcarded and predicate *content* deferred to `check_scope_valid` / the post-inference reconcile — to be unchanged. A pin that retroactively altered an already-read variable's resolution trips it by name (debug builds; free in release). The refinement count is part of the skeleton because a refinement is lattice content like a record field, so a bound determines it as much as it determines the base; the **one** read that excludes them is a use's own instantiation resolution, where the pin that immediately follows the read is itself what moves the refinements (`ReadPurpose::Instantiation`). That is sound because the read's consumers are refinement-insensitive — it seeds the clone's channel-domain pairings and blames a resolution failure — and, in particular, *sharing does not ride on it*: that is the `SpecKey`'s job, and a key consults both bound directions precisely so it does not depend on which polarity a rendering would have picked. The read's *skeleton* is still held fixed — a stale one would pair channel domains wrong. The contravariant-domain coalescing of §2 — the opposite-polarity fallback plus `coalesce_node`'s per-morphism domain specialization (projections and lambdas) — is the monomorphic coalescing rule for those vars; it is sound because every variable reaching coalesce is monomorphically determined (§1).
+Later compiler passes consume monomorphic expressions. `coalesce_node` therefore specializes a
+generalized binding when it reaches a use, rather than leaving a universal type for later passes.
+
+#### Specialization scope and lifecycle
+
+`CoalesceCtx::scope` contains a `SpecializeFrame` for each in-scope generalized let and shadow
+markers for other binders. `lookup_generalized` searches inward to outward, stopping at a shadow
+of the same name. A frame retains the original definition until its body's walk is complete.
+
+`specialize_use` performs these operations:
+
+1. Mark the frame `demanded` before any operation that can fail.
+2. Resolve the use's instantiation for structural checks and channel-domain pairing.
+3. Compute its `SpecKey` from the still-live type before this use's pin.
+4. On a memo hit, rename the use to the existing specialization and copy its resolved type.
+   A surviving use also marks a previously unreferenced specialization as referenced.
+5. On a miss, clone the definition and freshen its type slots with levels preserved.
+   `seed_chan_dom_pairings` aligns rigid channel-domain names with the use before freshening;
+   a two-way subtype pin cannot equate two different rigid names.
+6. Pin the clone and live use type in both directions, using a fresh `ConstrainCache`.
+   Pin errors are reported at the use site.
+7. Coalesce the clone in the definition site's scope, then restore the use site's scope.
+8. Rename the use to `Name::mono`, stamp the clone's resolved type, and register the clone under
+   the pre-pin key.
+
+Freshening reaches node types, binder slots, refinement-predicate slots, and substitution payloads
+on copied bound edges. It must not leave the clone's quantified interior variables attached to the
+original definition's inference state.
+
+The re-entrant clone walk suspends entries at and above the definition's frame. A binder introduced
+between definition and use cannot capture the clone's references. The frame itself is suspended
+because CCL lets are non-recursive; a same-named outer binding remains visible to the definition.
+Nested generalized bindings push their own frames during the clone's walk.
+
+`Name::mono` carries the source binding and a fresh uid. When the enclosing body finishes,
+`coalesce_generalized_let` rebuilds it as a chain of referenced specializations. Each layer
+discharges its binder from the body's result type when that name is free in the result's
+refinements. See [`let` binders and scope exit](#let-binders-and-scope-exit).
+
+The original definition is not coalesced in place while its uses need clones. Its quantified
+variables carry the bounds copied into each specialization; overwriting them would remove that
+input. A never-demanded definition takes the
+[diagnostic-only path](#typechecking-a-never-called-definition).
+
+A memo hit is not pinned again. A miss pins a variable-bearing clone, whereas a hit contains
+already materialized types. Constraining that concrete result against another live use is a
+stronger operation and can reject a use whose own clone would have coalesced compatibly.
+A separate non-recording subsumption check is not implemented for this purpose.
+
+#### Coalesce ordering and read stability
+
+Specialization runs during coalescing so that parents consume specialized child types on their
+first visit. Dependent application can discharge against the clone's resolved predicates without
+a second post-coalesce reconstruction. The use's `expr.ty` must still expose its live bound graph
+for keying and pinning; materializing that slot first would overwrite it. A generalized definition
+calling another generalized definition follows the same recursive walk; the outer clone is pinned
+before its body reaches the inner use.
+
+The live graph is not frozen after emission. Pins can add bounds during specialization.
+`Apply` coalesces its function before its argument so that the function's specialization can
+deposit demands before the argument is read.
+
+The ordering invariant requires specialization not to invalidate types already read by the walk.
+Debug builds log `ReadRecord` snapshots that retain the live variables and their resolved
+results. At the end of a successful coalesce pass, `assert_reads_stable` resolves them against
+the final graph.
+
+The comparison is bounded:
+
+- It checks structural shape, bases, ranges, and other materialized structure.
+- Stamped reads also compare refinement-wrapper depth, not the number of predicates in each set.
+- Underdetermined positions are wildcards; fresh `Infer` identities cannot be compared across
+  resolutions.
+- It does not compare predicate contents as a proof of semantic equality. Scope validity and the
+  post-inference reconciliation checks cover different obligations.
+- `ReadPurpose::Instantiation` excludes refinement-wrapper depth. That preliminary resolution serves
+  channel-domain pairing and error reporting, not the use's final stamped type or its
+  specialization key. The base structure is still checked.
+
+The check is debug-only. The compilation strategy relies on the ordering invariant in all builds.
 
 #### Typechecking a never-called definition
 
-Dropping a never-demanded binding as dead code is a decision about what to *lower*,
-not about what to *check*. A definition body is emitted whether or not it is called,
-so any demand that conflicts with a concrete type is already reported (`f = \a -> a
-and 3` is rejected with no call site). What emission records without judging is a
-demand on a **quantified** variable: one bound among several, a conflict only when
-the bounds are read together. Reading them together is what resolution does — so a
-definition like `f = \a -> (a.0, a.foo)`, which asks `𝑎` to be both a tuple and a
-record, was accepted for exactly as long as nobody called it. `coalesce_generalized_let`
-therefore resolves an undemanded definition (`typecheck_discarded_definition`) before
-dropping it, and keeps only the diagnostics.
+A generalized definition with no demand is checked before being dropped.
+`typecheck_discarded_definition` coalesces it in its definition-site scope and retains diagnostics,
+not its resolved expression.
 
-The general prohibition on coalescing a definition in place is about definitions with
-clones, and neither half of it survives their absence: nothing was freshened from this
-definition, and its binding leaves scope at the `let`, so nothing can freshen from it
-later. What remains is the under-determination — its quantified variables never
-received use-site bounds — which inference tolerates (`Type::Infer`'s invariant) and
-no strict check ever sees, because the resolved definition is discarded either way.
+Emission already visits the body. It can reject a conflict with a concrete type immediately.
+Other errors require reading several bounds together: `λ a → (a.0, a.foo)` demands both a tuple
+and a named record from one parameter. Resolving the unused definition detects that conflict even
+without a call site.
 
-The walk descends through uses, so it also typechecks what dead code *calls*: a use
-inside it of a generalized binding declared further out specializes normally, which is
-what makes the call's argument meet the callee's demands. That specialization must not
-be *spliced*, though — its enclosing `let` survives the dead definition and would
-gain a binding nothing references. It is still registered, which is what shares the
-clone with the next dead use, and marked unreferenced instead
-(`Specialization::referenced`), so dead code is checked without re-entering the
-program. Which frames that applies to is asked of each frame when it is pushed
-(`SpecializeFrame::inside_discarded`) rather than computed from a scope depth: a frame
-created *inside* the discarded subtree dies with it, so what it splices is moot, and
-the re-entrant clone walk truncates the scope stack, which a depth cannot survive.
+An unused definition can retain unresolved positions because no use supplies their types.
+That residue is tolerated during inference and disappears with the discarded subtree; it is not
+evidence that a surviving unresolved function can pass strict compilation checks.
 
-**Deadness is the absence of a demand, not of a specialization.** The two come apart
-in both directions — a use whose instantiation fails to resolve reports and returns
-before minting anything, and a use inside a discarded subtree deliberately does not
-register — so `specs.is_empty()` cannot decide this. `SpecializeFrame::demanded`,
-set on entry to `specialize_use`, is what does. Reading the memo instead re-walks the
-definition of a binding whose uses merely *failed*, which reports that body's conflict
-a second time from its own nodes: one defect, four diagnostics.
+Calls from discarded code are checked too. They can specialize an outer generalized binding to
+test the callee's demands against the arguments. Those specializations remain registered for memo
+reuse, but they are not spliced into a surviving outer let unless a surviving use references them.
 
-*Known gap, not fixed:* a use that fails to resolve is never renamed, so it still
-names a binding whose `let` the rebuild then drops — leaving that reference dangling
-in the tree a failed pass leaves behind. It is unobservable while an inference error
-discards the tree, and the fix is a node meaning "could not be built, errors pending"
-(today's `TypedExprNode::Error` is contracted to lowering recovery), which would also
-let the rebuild stay unconditional.
+Three frame fields distinguish these decisions:
 
-**What it costs.** The walk runs unconditionally, in release, on every definition
-nothing calls — so the specialization blowup documented under
-`SpecializeFrame::specs`, "The remaining gap" (one clone per distinct argument
-tuple, compounding through a call chain) is now reachable from code no one calls,
-where before dead code cost nothing. Two things keep that bounded rather than
-multiplied. A use inside the discarded subtree still *registers* its
-specialization, so the memo shares clones exactly as a live use does — declining to
-register instead made every dead use re-clone its callee, which measured ~5× the
-shared cost at a call-chain depth of six; splice-liveness is decided separately, at
-the rebuild (`Specialization::referenced`). And a dead definition nested inside a
-*live* generalized one is walked once per clone of its enclosing binding — which is
-correct, since its body can depend on the instantiation — but a diagnostic it
-repeats is dropped, so one defect stays one diagnostic however many specializations
-enclose it.
+| Field | Meaning |
+| --- | --- |
+| `demanded` | A use reached `specialize_use`, even if resolving it later failed |
+| `Specialization::referenced` | The specialization must be retained when its let is rebuilt |
+| `inside_discarded` | The frame was created inside a subtree that will itself be discarded |
 
-**What this does not reach.** Resolution reads the bounds a body *recorded*, so a
-requirement that takes effect only when a concrete type is **delivered** is not
-evaluated here. Trait obligations are the case: an obligation narrows as bases arrive,
-and one whose operand never receives a base rejects nothing, however few
-instances could satisfy it. Reading a value's requirements *together* covers it,
-which needs no delivery and is a separate pass
-([Requirements are read together, once](#requirements-are-read-together-once)). The two
-are complementary: that pass runs on every program, and this walk is what makes a dead
-definition's bounds resolved in the first place.
+An empty specialization list does not establish deadness: a failed use can mark a demand without
+creating a clone. Rechecking its definition as dead code would duplicate diagnostics.
+Discarded uses do register clones; registration and splice liveness are separate.
 
-**A shape that looks like an escape and is not.** `if 𝑝: [x for x in xs if 𝑞] else: xs`
-is accepted with no call site, and rejected at one. That is not laxity: both arms'
-domains are the *same* variable (`xs`'s), so the filter is recorded as a refinement on
-it rather than as a second domain alternative, and the definition types as
-`(…, {𝐷 | 𝑞} ⤇ 𝑉) ⇒ …` — *give me a collection whose domain already satisfies the
-filter*, which is exactly the condition under which the two arms share a domain and the
-join loses nothing. The requirement is in the type, not dropped. Supplying a concrete
-domain at a call site re-materializes the arms as two distinct domains and meets the
-domain-join rejection ([The domain join needs `box`](#the-domain-join-needs-box)) — which is also
-why the same body over a *literal* or *source* collection is diagnosed either way: those
-domains are concrete in the body already, so there is no shared variable for the
-refinement to land on.
+`inside_discarded` is a property recorded when the frame is created, not a saved scope depth.
+The re-entrant specialization walk truncates the scope stack, so a depth comparison would
+misclassify frames pushed inside a discarded clone.
+
+The dead-definition walk runs in release builds too. Nested dead definitions are checked once per
+specialization of their enclosing live definition because their types can depend on that
+specialization. Repeated diagnostics are deduplicated. Memo registration avoids cloning an outer
+callee independently for every dead use, but it does not remove the general specialization-growth
+problem.
+
+A failed use that returns before renaming can still refer to a binding dropped during the let
+rebuild. No pass reads that tree: `run_frontend` in `ccl/context.rs` resolves each inference
+error's blame node to a source span and then discards the tree. The fix is to replace the failed
+use with `TypedExprNode::Error`, keeping its `NodeId`, and to widen that node's contract from
+pending lowering errors to pending lowering or inference errors. The contract records how the node
+is used today. Its guarantee is that no pass running on an error-free tree meets the node, and a
+failed inference run keeps that guarantee.
+
+Trait requirements need an additional check. Eager obligation narrowing depends on concrete
+types arriving, so resolving an unused definition alone does not establish satisfiability of all
+its operand requirements. The pre-coalesce
+[requirement sweep](#requirements-are-read-together-once) reads them together.
+
+A conditional over a collection parameter illustrates the distinction between a requirement and a
+concrete conflict. In a body shaped like `if p: [x for x in xs if q] else: xs`, both domain
+spellings can refer to the same variable and record the filter as a requirement on the parameter.
+A concrete call can expose incompatible domain alternatives and be rejected. Over a literal or
+source collection, the domains are already concrete in the definition, so the same conflict need
+not wait for a call. See [The domain join needs `box`](#the-domain-join-needs-box).
+
+Regression coverage is in `tests/type_check.rs` and `infer/solve.rs`, including
+`a_dead_definitions_calls_splice_no_specialization`,
+`a_suppressed_specialization_does_not_get_its_definition_re_walked`, and
+`one_defect_does_not_multiply_by_the_enclosing_specialization_count`.
 
 #### Keying a specialization
 
-The memo that decides which uses share a specialization is keyed on a `SpecKey`
-(`src/ccl/infer/solver/spec_key.rs`), **not** on a resolved `Type`. The distinction
-is the whole content of the design here, because the two answer different questions.
+`SpecKey` in `infer/solver/spec_key.rs` determines whether two uses share a specialization.
+It is computed from the live instantiation type before that use's pin. A memo entry stores the
+key of the use that created it, not a key recomputed from the finished clone.
 
-A resolved type answers *"what should be stamped on this node"*, and is
-deliberately lossy in service of that: a domain is a negative position, so it
-resolves from upper bounds — from what the definition body demands — which narrows
-away a position the body never touches, and leaves an argument's refinement (a *lower*
-bound, from the emit-time `arg <: domain` edge) invisible except where the
-opposite-polarity fallback happens to fire. A specialization key answers *"would
-two uses' clones be the same code"*, and must be complete: a clone's interior reads
-its parameter at a **positive** position, so it sees exactly the refinements the
-domain's rendering drops. Keying on a rendering compares one polarity's view
-against a clone built from the other's, which shares a clone between two uses whose
-interiors differ — the clone then carries one call site's argument type at another's.
+Both sides of a comparison are computed by one procedure at one point in the pin's lifecycle.
+A clone's coalesced type is the pin's output, and a candidate's key is the pin's input. For a
+definition whose clone type gains a refinement across the pin, a key read from the clone never
+equals a candidate's key, so a memo keyed that way is write-only and identical call sites each
+mint a clone (`identical_instantiations_share_one_specialization` in `infer/solve.rs`).
 
-A `SpecKey` is therefore the pair of **directed reads** of the use's instantiation
-type, the root taken once at each polarity and the two *kept apart*:
+A materialized `Type` is not the key. Compaction selects and merges contributions to produce one
+type; specialization must distinguish the bound directions that affect the clone. A domain is a
+negative position, so its materialized type reads upper bounds, the definition body's demands. It
+drops positions the body never reads, and it omits an argument's refinement, which arrives as a
+lower bound through the `arg <: domain` edge. A clone's interior reads its parameter at a positive
+position and sees those refinements. In particular, the key's directed reads are not ordinary
+negative-position compaction with its opposite-side merge.
 
-* the **positive** read is the stamping view (domain from the definition's demands);
-* the **negative** read is the clone's view (domain from the argument that flowed
-  in, codomain from the consumer's demand).
+`spec_key` takes two reads of the root and keeps them separate:
 
-The negative read is the load-bearing half, and the pair is exhaustive:
-use-specific information enters an instantiation through exactly two channels — an
-`arg <: domain` edge and a consumer's `codomain <: demand` edge — and the negative
-read follows precisely those. Merging the two views is wrong, because it forgets
-which *direction* a contribution came from and the pin the key stands in for is
-direction-sensitive. *Saturating* — following both bound lists at every variable —
-is worse: the bound graph is connected across unrelated uses (two calls' arguments
-meet at the shared variable of an operator's scheme), so an undirected closure
-walks out of one use into every other and every use keys on the whole program's
-literals. Within a read, merging is always **union**: a key that narrows can only
-under-split, and under-splitting is a miscompile while over-splitting is a wasted
-clone. An under-determined position is one canonical empty view rather than a fresh
-`Infer` placeholder, so two unexercised uses can still share.
+| Root read | Function domain | Function codomain |
+| --- | --- | --- |
+| Positive | Upper-bound requirements | Lower-bound contributions |
+| Negative | Lower-bound contributions from arguments | Upper-bound requirements from consumers |
 
-Both sides of the comparison must be computed by **one procedure at one point in
-the pin's lifecycle** — from the use's live type, before its own pin — and an entry
-stores the key of the use that minted it. Keying an entry on its clone's
-*coalesced* type instead is a second, incompatible coordinate system: for any
-definition whose clone type gains a refinement across the pin, no candidate key could
-ever equal a stored one, so the memo becomes write-only and even identical call
-sites clone per site.
+Each read follows the bound list selected by its current polarity. It does not follow both lists at
+every variable. The two reads flip in lockstep, so at the root's immediate positions every bound
+list is consulted by one of them. Deeper paths diverge: a variable reached only through a lower
+bound is visited only by the read that arrived there, at that read's polarity, and its other bound
+list is read by neither. The clone's own resolution reads that position from the same side, so a
+bound the key does not see is one the clone does not see either. The guarantee is agreement with
+the pin, not coverage of the whole bound graph.
 
-**A key is not instantaneous, and it is not a function of the post-emission
-graph.** "One point in the pin's lifecycle" is exact about each use's *own* pin,
-but the two keys in a comparison are not taken at the same instant: an entry's was
-taken before the pin of the use that minted it, a candidate's later, with every
-intervening pin already in the graph. The tempting strengthening — that a pin only
-*transports* use-specific information across polarity and never creates it, so no
-other use's pin can move a key — is **false**. A pin does not only transport; for a
-*nested* use it **deposits the consumer's demand**. In `f(f(3))`,
-`coalesce_node`'s `Apply` arm takes function before argument, so the outer use of
-`f` specializes first and its pin is what drives the outer clone's domain
-concrete. That domain *is* the demand on the inner call's result, so it reaches
-the inner use through the `codomain <: demand` edge — one of the two channels the
-negative read follows *by design*. The inner use is therefore keyed against a
-demand that did not exist at end of emission.
+Combining the two views into one would lose the direction in which information arrived.
+Traversing both bound lists at every variable can instead reach shared graph components belonging
+to unrelated uses.
 
-Whether the deposit is *visible to the key* depends on how much structure the
-demand carries. Where the demand resolves to a bare base the two reads agree and
-nothing is observable, which is why a snapshot-and-compare check over the suite
-passes here. It stops passing as soon as a demand carries structure a key records:
-once an operator's effect on types is itself a type, the same `f = \x -> x * 2`,
-`f(f(3))` splits, the inner use's negative read gaining exactly the layer the
-outer pin deposited. The positive read does not move, and no key moves for any
-other reason.
+Within a directed read, `KeyView::union` accumulates contributions without polarity-dependent
+narrowing. A key that narrows can only under-split, and under-splitting is a miscompile, while
+over-splitting costs one redundant clone. Keying on a materialized type narrows this way:
+`λ a, b → a + b` at `(1, 2)` and `(1, 5)` both keyed on `((1, Int) ⇒ Int)`, and the shared
+clone typed `.1` as `2`. Undetermined positions use a canonical empty view, not a fresh
+placeholder identity. Conflicting contributions can coexist in a key; ordinary resolution, not the
+key, reports type conflicts. Refinement comparisons are type-blind and compare sets rather than
+insertion order.
 
-So key equality is walk-order sensitive, and the memo can compare keys read in two
-different graph states. The residue is **over-splitting** — a use keyed against a
-thinner demand does not match an entry keyed against a fatter one, and the cost is
-a redundant clone, the same direction as the known imprecision below. It is not
-symmetric with under-splitting: a thin key and a fat key are unequal, so a use
-carrying a real demand cannot be served by an entry that never saw one.
+The key also preserves distinctions needed by code generation, including function kind, history
+kind, and witness/kind shape. It does not use fresh inference-variable identities as a substitute
+for those distinctions.
 
-**The key is only expressible in-walk — which is an argument *for* in-walk
-specialization, not a cost of it.** A monomorphizer that ran *after* coalesce
-would have no choice but to key on a resolved type, because by then a resolved
-type is all there is: `expr.ty` has been overwritten in place and the bound graph
-it was resolved from is gone. Specializing *inside* the coalesce walk is what
-leaves a use's instantiation still var-laden with its bounds still live at the
-moment the key is taken — so `SpecKey` is not merely a better key than the
-rendering, it is one only this architecture can express. The discriminating
-information is present the instant emission finishes; the pin transports it across
-polarity rather than discovering it.
+`key_go` has a cycle guard and a completed-result memo. The memo includes variable identity,
+polarity, and enclosing binders, and is used only with an identity accumulated substitution.
+A result whose walk cut a cycle is not cached. This memo belongs to one `spec_key` calculation;
+it is distinct from the specialization list stored on a frame and from compaction's cycle guard.
 
-**Why other monomorphizers key on a finished value.** rustc keys an instance on
-its definition plus its generic arguments, C++ on the template-argument list,
-Swift on a substitution map, MLton on the type-argument list in a single
-post-inference pass. Every one of them keys on a *finished value*, and can,
-because their generic bodies are already typed and instantiation is substitution.
-Cambra has no `Type::ForAll` and never types a generic body at all — the
-definition's own subtree is never coalesced in place — so monomorphization here
-**is** the act of typing the body, not the duplication of already-typed code. That
-places it in C++'s category, the one mainstream compiler where instantiation
-genuinely re-runs semantic analysis, and it is the real reason the key has to be
-read off a live graph. A reader arriving from rustc would otherwise take that for
-an implementation choice. What is *not* the reason: poly-calls-poly on its own
-does not force the in-walk arrangement — discovering the *set* of instantiations
-is a reachability fixpoint in every monomorphizer, and recursing into each new
-specialization handles it. (Closest prior art: Lutze, Schuster & Brachthäuser,
-*The Simple Essence of Monomorphization*, OOPSLA 2025 — monomorphization as a flow
-analysis over an algebraic-subtyping system, including where it stops being
-possible, at the cyclic flow of polymorphic recursion.)
+##### Key timing and precision limits
 
-**Specializing precisely is the correct rule, not a budget choice.** A refinement
-on an iterated domain is *compiled* — `planning::iterate` emits one `restrict(p)`
-filter per refinement, in `application_order` — so a refinement is code, and two
-clones pinned to different refinements are genuinely different code. Since every literal carries its
-own singleton ([A literal is refined by its own value](#a-literal-is-refined-by-its-own-value)),
-the practical rule is one specialization per distinct argument tuple. `inline` expands non-`Data`
-function bindings, including collection-producing UDFs. It preserves bindings whose value is a
-`Data` function, rather than caching every function that returns a collection; see
-[Collection sharing](optimization.md#collection-sharing).
+A candidate and an existing entry need not have been keyed against the same graph state.
+Each is measured before its own pin, but earlier specializations can already have added bounds.
 
-**Known imprecision.** The key summarizes the pin's *input*, so two uses differing
-only in a position the clone never reads still key apart (`λ a, b → a` at `(1, 2)`
-and `(1, 5)` mints two identical clones). Keying on the pin's *output* — the
-finished clone, deduped structurally — would share exactly when the emitted code is
-identical, but it cannot be a lookup, only a build-then-dedupe, and it needs
-α-equivalence over the names minted fresh per clone (`Name::mono` uids, coalesce's
-`Infer` placeholders, per-instantiation `ChanDom` names), a way to undo a discarded
-clone's pin, and reference-liveness filtering at the splice. The two compose — this
-key as the fast path, clone-equality as a precision tier on a miss — so nothing
-here has to be undone to get there. Relatedly, a *hit* is not re-pinned: a miss
-pins a var-laden clone (identifying variables), while a hit's specialization is
-already concrete, and pinning that against a still-var-laden use type is a strictly
-stronger demand that rejects uses the key correctly considers shareable. Checking a
-hit wants a non-recording subsumption test, which the solver does not have.
+For nested calls such as `f(f(3))`, function-before-argument coalescing specializes the outer
+function use first. Its pin can place a consumer demand on the inner result, and the inner use's
+negative read follows that demand. Whether the key changes depends on the structure contributed by
+the demand. The key is therefore not a fingerprint of a graph frozen at the end of emission.
 
-**Refinement predicates under monomorphization.** A `Refinement` has no synthetic identity: it carries an *immutable* predicate term (`Rc<TypedExpr>`), and its identity is the **type-blind structural equality** of that term (`eq_term_modulo_ty_slots`) — the predicate's embedded `Type` slots are inference metadata and never participate. A predicate occurs at many sites — its syntactic origin (a `Cast` target, a `user_annotation`) and every position `constrain`/`freshen_above` propagates the refinement onto — but those are independent occurrences, not aliases of one mutable cell. Two facts make this work without the cell-retirement machinery the mutable design needed. First, a free use of a generalized binding may live *only* inside a predicate (a list-comprehension filter calling a UDF lowers to a cast-target predicate); the coalesce walk reaches such uses because `coalesce_type_predicates` runs `coalesce_node` over every predicate it encounters with the walk's specialization scope live, and the post-inference `inline` pass substitutes inside predicates likewise. Second, because predicates are immutable, **a use-site coalesce *rebuilds* a predicate rather than mutating one shared with the definition** — so there is nothing to privatize, retire, or re-point: a specialization clone freshens its predicate as a proper substitution instance (`freshen_above`'s `Refinement` arm freshens the predicate's type slots through the same cache, and its `Infer` arm freshens the discharge-payload terms riding copied bound edges), and `compact_type` simply `force_refinement`s each refinement it materializes (a vacuous force shares the `Rc`, a substituting one rebuilds). The residual case the mutable design's whole-tree fix-up swept up — a refinement materialized from the definition's bound *before* its first specialization carries the definition's quantified vars — is harmless here: equality is type-blind, so a predicate carrying the definition's quantified vars compares equal to its specialized instance. Passes that need *occurrence* identity rather than equality (visited sets that dedup a predicate term shared by `Rc` across positions — the term graph is a DAG, since immutable `Rc<TypedExpr>` cannot form a cycle) key on the predicate `Rc`'s address (`PredicateId`).
+Differently recorded demands can cause redundant specializations. Equality testing distinguishes
+a key without that demand from one containing it; the cost described here is over-splitting,
+not a rule permitting a demanded use to reuse a less-constrained entry.
 
-Generalization applies to function definitions with a quantifiable variable. Non-function value
-bindings remain monomorphic and shared; specializing them would duplicate values that feed/define
-and join planning expect to share. There is no use-count or generator exception. A generalized
-collection-producing UDF uses the same specialization-key rule as other functions, not a separate
-key based only on element type. After specialization, `inline` expands non-`Data` function bindings;
-it preserves `Data` bindings. Every `let` RHS is emitted at a deeper level, whether or not the
-binding is subsequently generalized.
+The frame scans its specialization list linearly. Building `S` distinct specializations can require
+quadratically many structural key comparisons. Inlining runs after this work and does not bound
+its cost. Per-instantiation rigid channel-domain names can also distinguish definitions containing
+a defer, even when their argument base types agree.
 
-**Refinement predicate representation.** A `Refinement` holds a single field,
-a **bare**, *immutable* boolean predicate (`Rc<TypedExpr>`), in which one
-reserved implicit binder — `REFINEMENT_BINDER` (`"__elem"`) — is free and ranges
-over the refined base type. The refinement *is a binding form*: the predicate
-references its own element through that one name, and nested refinements simply
-shadow it (a predicate only ever references its *own* element plus enclosing
-`Fun`-binders, which carry their own distinct names). Because the binder is a
-fixed shared name, refinement equality/hashing is plain type-blind structural
-comparison of the bare predicate — no α-renaming. Every traversal that descends
-into a predicate (free-variable collection, substitution, lambda-elim) treats
-`REFINEMENT_BINDER` as bound, so the shared name never captures across nested
-refinements.
+The key can also distinguish inputs a function never reads. For example, uses of
+`λ a, b → a` at `(1, 2)` and `(1, 5)` can produce identical code under different keys.
+Deduplicating completed clones is not implemented. It would require comparison modulo freshly
+minted names and placeholders, handling the effects of a discarded clone's pin, and retaining only
+referenced specialization bindings.
 
-A rewrite of a predicate (a discharge substituting an argument in, lambda-elim,
-inlining's beta step, planning's point-free compilation) produces a **new**
-term — structural `Rc` sharing keeps that cheap — rather than mutating one in
-place. A pass that processes a predicate at one occurrence must therefore reach
-*every* occurrence (each is an independent `Rc`); where a pass walks a tree it
-threads a memo keyed on the original predicate's identity so occurrences that
-shared one term are re-pointed at the same rebuild (the immutable replacement
-for "mutate the shared cell, every alias observes it"). One consequence worth
-naming: a `Cast`'s `target` slot carries the cast's **born** refinements (the
-assertion), never a copy of the recorded type — a pass that rebuilds node types
-restores the canonical split afterwards (`ccl_utils::canonicalize_cast_types`:
-`target` = born refinements on the rebuilt view's bases, `expr.ty` = value-refinements ∪
-born) rather than overwriting `target` with `expr.ty`. The post-inference check
-reconstructs a cast as value-refinements ∪ target-refinements, and a wholesale overwrite
-satisfied that check only by making the cast's refinement *identity* track whatever
-route-dependent type the rebuild derived — the arrival-order defect the
-canonical split retires (see the coalesce-time rule at `canonical_cast_ty`).
+Refinement distinctions cannot be discarded solely to reduce the clone count. Planning compiles
+iteration-domain refinements into filters in `application_order`, so different predicates can
+produce different code. Literal singleton types can therefore cause per-value specialization when
+the corresponding contributions reach the key. Exact annotations and the resulting bound graph
+affect that behavior; “one clone per argument tuple” is not an unconditional count.
+
+This is separate from runtime sharing. After inference, `inline` expands non-`Data` function
+bindings, including collection-producing UDFs, while preserving `Data` bindings. See
+[Collection sharing](optimization.md#collection-sharing) and
+[Exact annotations bound monomorphization](#exact-annotations-bound-monomorphization).
+
+The [coalesce ordering contract](#coalesce-ordering-and-read-stability) explains why specialization
+must precede the parent's materialization in this implementation.
+
+#### Refinement representation during specialization
+
+A `Refinement` contains an immutable `Rc<TypedExpr>` predicate. Its equality is type-blind
+structural term equality (`eq_term_modulo_ty_slots`); the predicate's embedded type slots are
+inference metadata, not part of that comparison.
+
+The predicate is bare: the reserved `REFINEMENT_BINDER` name, `__elem`, denotes the value of
+the refined base type. A refinement binds that name, and a nested refinement shadows it.
+Free-variable, substitution, and lambda-elimination traversals must respect that binding.
+
+A predicate function `p : D ⤇ Bool` is a term used by iteration and restriction. A refinement
+stores the bare predicate `__elem ▷ p`, not that function as its type-level predicate.
+`bare_predicate_of_fn` constructs the bare form; planning's `fn_of_bare_predicate` recovers the
+function when building a term such as `Restrict`.
+
+A generalized function can be used only inside a predicate, for example in a comprehension filter.
+`coalesce_type_predicates` visits those expression trees with the specialization scope active,
+so their uses follow the same `specialize_use` path. Inlining also traverses predicates.
+
+Freshening copies predicate type slots and substitution payloads with the rest of the clone.
+Coalescing rebuilds a predicate rather than mutating a term shared with the original definition.
+Equal predicate terms can still carry different inference metadata because equality ignores those
+slots. That does not remove the obligation to visit and resolve each relevant occurrence.
+
+When allocation identity is needed, `PredicateId` uses the predicate's address. Structural
+equality and allocation identity serve different purposes: equal terms are not necessarily one
+allocation, and a rewritten term is not identified merely by its predecessor's structural type.
+
+#### Cast targets and inferred views
+
+A `Cast` has two distinct type-bearing roles. Its target contains the refinements supplied by
+the cast itself; the expression's inferred type also includes refinements inherited from the value.
+
+`canonical_cast_ty` and `canonicalize_cast_types` preserve that distinction when types are
+rebuilt. The target retains the cast's own refinements on the rebuilt bases, while `expr.ty`
+contains the value and target refinements together.
+
+Copying the entire inferred type into the target would make an operand depend on the route by which
+the value's type was derived. It can satisfy a union-based result check while changing the cast's
+own predicate identity. Coalescing therefore resolves the cast's value and establishes the shared
+bases before coalescing its target predicates.
 
 #### Sharing is an invariant, not an optimization detail
 
-One structural predicate should be **one `Rc`** for the whole pipeline. Lowering
-establishes that (`Refinement::sharing` puts a single filter predicate on the
-source, the map, the cast target, and the consumer contract); every pass that
-rebuilds predicates must then *preserve* it, and "every pass" is the whole list —
-`uniquify`, constraint emission (`emit_bare_predicate`), `coalesce`,
-`subst`'s both modes, `inline`, `simplify`, and planning's compilation. Each
-threads one **pass-scoped** `ccl_utils::PredMemo`, whose `rebuild` maps an origin
-`Rc` to a single result. A pass that has nothing to say about a predicate reports
-no change and keeps the origin `Rc` rather than reallocating an equal one, so
-sharing survives even the passes that merely walk past.
+Predicate-rebuilding passes preserve sharing among occurrences of the same original allocation
+when they run under the same rewrite conditions. Lowering establishes shared filter predicates
+with `Refinement::sharing`. A pass-scoped memo maps an original allocation and its context to one
+rebuilt allocation; a vacuous rewrite retains the original.
 
-Two things make this load-bearing rather than housekeeping:
+This is not a global interning rule for every structurally equal predicate. Different contexts can
+require different results, and [generic instantiation](#one-known-exception-scoped-and-unfixed-generic-instantiation)
+currently creates separate allocations even for occurrences that shared an origin.
 
-- **Downstream cost.** Planning's predicate-compilation memo is `Rc`-keyed, so a
-  predicate split into 𝑛 occurrences is compiled 𝑛 times. With nested
-  comprehensions 𝑛 grows with depth, which is how a split turns into superlinear
-  compile time.
-- **The keepalive.** The memo keys on the `Rc`'s *address*
-  (`PredicateId`), which is sound only while that address cannot be reused.
-  Overwriting a slot can drop the last reference to the origin and free an
-  address a later `Rc::new` in the same walk reclaims, at which point an
-  unrelated predicate collides with the entry and inherits its rebuild. `PredMemo`
-  retains every origin for its own lifetime; that is why passes use it rather
-  than a bare map.
+Sharing affects later compilation cost. Planning memoizes predicate compilation by allocation and
+base type. Splitting one predicate into several equivalent allocations can make it compile each
+copy.
+
+The [memo context rules](#predicate-memo-contexts) specify when a rebuild may be reused.
+`tests/predicate_sharing.rs` checks for equal predicates at distinct allocations after inference.
+Its programs use distinct authored filters, so an equal group identifies a split rather than two
+independently authored equal predicates. `distinct_predicate_rcs` supports allocation-count checks;
+neither check proves global interning or measures downstream compilation cost.
 
 #### One known exception, scoped and unfixed: generic instantiation
 
-The list above
-is the *rebuilding passes*. `freshen_above`'s `Refinement` arm does not thread a
-memo — `freshen_refinement_predicate` clones the predicate term, freshens its type
-slots, and installs an unconditional `Rc::new` — so every refinement a scheme
-instantiation touches comes out `Rc`-distinct, including several slots of one
-clone that shared an `Rc` going in. This is why the invariant holds for
-comprehension-only programs and fails as soon as a UDF body carries a predicate:
-`f = \xs -> [x for x in xs if x > 1]` leaves 4 surplus `Rc`s of 9 distinct at one
-call site, 29 of 38 at two. `tests/predicate_sharing.rs` does not observe it (its
-corpus is comprehension-only and it measures post-inference). Whether this costs
-anything in planning is **unmeasured** — the superlinearity argument above comes
-from the original split's shape, not this one — and that measurement is what
-decides between fixing the producer (memoize the rebuild, or keep the origin `Rc`
-when the freshen is vacuous) and narrowing the invariant to "preserved through
-inference, deliberately re-split at instantiation". Tracked as an open decision
-in the `provenance-design` note under projects/program-inspector in the internal
-vault.
+`freshen_refinement_predicate` in `infer/solver/scheme.rs` clones the predicate, freshens its
+type slots, and installs an unconditional new `Rc`. It does not use a `PredMemo`.
+Occurrences that shared an allocation before instantiation can therefore emerge as separate
+allocations, including inside one specialization clone.
 
-A pass reaches predicates through **every type slot a node carries**, not just
-`expr.ty`: the node's own type, its `user_annotation`, a `Cast`'s `target`, and —
-per binder — both the binder's declared type *and* its annotation. Each holds an
-independent predicate `Rc`. `Expr::walk_type_slots{,_mut}` is the single source of
-truth for that set, precisely because hand-rolling it per pass is how a pass
-silently acquires a blind spot — `Cast.target`, where a comprehension filter's
-predicate actually lives, is the one that costs most. `count_free`/`is_free` are on
-it too, and that is not cosmetic: several passes *skip work* when `is_free` says
-no, so a slot the free-variable walk cannot see is a slot those passes decline to
-rewrite.
+The downstream cost of this exception is not established here. The
+[sharing corpus](#sharing-is-an-invariant-not-an-optimization-detail) uses comprehensions, not
+predicate-bearing UDF instantiation, and does not cover this exception.
 
-A binder's **annotation** is the subtle member of that set, and it is the only one
-with a bounded lifetime: it is where lowering writes a mutable variable's
-`Mut(V, D)` history (`x := e` lowers via `let_bind_annotated`), and it exists only
-*until inference consumes it* — see [The binder slot, and why annotations do not
-outlive inference](#the-binder-slot-and-why-annotations-do-not-outlive-inference).
-A walk over the slot set must still cover it, because the passes that use
-`walk_type_slots` include ones that run before and during inference (`uniquify`,
-`subst`), and — because an erasure and its own post-condition share that walk — a
-slot the walk misses is a slot the check cannot report on.
+Possible remedies include memoizing freshening under an adequate context or retaining the origin
+for a vacuous freshen. Neither is implemented. A fix must also preserve node identity: sharing one
+rebuilt term across slots is valid, but two distinct live terms must not carry equal `NodeId` sets.
+`distinct_predicate_terms_never_share_a_node_id` in `src/ccl/panes.rs` guards that distinction.
 
-The claim is *checked*, not asserted: `walk_type_slots_covers_every_carried_type_slot`
-stamps a distinct marker into every directly-carried `Type` in the AST and pins that
-the walk reaches all of them.
+#### Type-slot coverage
 
-#### The memo key is the predicate *and the conditions it was rebuilt under*
+A predicate walk must visit every carried type slot, not just `expr.ty`. The set includes
+expression annotations, cast targets, binder types, and binder annotations.
+`Expr::walk_type_slots` and `walk_type_slots_mut` define the shared traversal surface.
 
-Keying such a memo on the predicate `Rc`'s address alone is half a key: it answers
-"have I rebuilt this term?", while every pass needs "have I rebuilt this term
-**under the conditions I am rebuilding it under now**?". `PredMemo<C>` carries those
-conditions as `C`, and reuses an entry only when it was recorded under an equal
-`C`. Supplying the wrong `C` costs a sharing opportunity; it cannot produce a wrong
-answer — which is the point, because the key-only design did produce wrong answers
-(`subst` discharging a binder its inner scope owned; constraint emission skipping
-the emission that bounds an occurrence's own domain).
+Free-variable queries must see these slots too. A pass that skips a subtree after `is_free`
+returns false cannot rewrite a predicate hidden from that query. `Cast.target` is one such
+location; a comprehension's filter can live there rather than in an ordinary child expression.
 
-What each pass supplies:
+Annotations have a shorter lifetime than inferred types. Lowering writes them and inference
+consumes them, but pre-inference and in-inference traversals still need to visit them.
+`clear_annotations` removes them only after successful inference, including annotations inside
+predicate trees. See [The binder slot, and why annotations do not outlive inference](#the-binder-slot-and-why-annotations-do-not-outlive-inference).
 
-| pass | `C` | why |
-|---|---|---|
-| `simplify` | `()` | a function of the term, full stop |
-| `uniquify` | `()` | resolves against `env`, but lowering shares an `Rc` only by copying one refinement, and pre-uniquifies a subtree before cloning it |
-| `coalesce` | `()` | resolution reads one live constraint graph, so occurrences of one term resolve identically |
-| `inline` | `()` | the rewrite is fixed per sweep, and a shadowed subtree is *skipped*, never descended into |
-| `subst` | `Subst` | acting differently in different scopes is the point of a substitution |
-| planning | `Type` | compilation reads the refinement's base |
+`walk_type_slots_covers_every_carried_type_slot` tests traversal coverage with a distinct marker
+in each directly carried type. An erasure pass and its postcondition must not both omit the same
+slot; using one incomplete traversal for both would hide the omission.
 
-The `()` rows are *claims*, and each one's justification lives at its call site —
-that is where to check it. One is load-bearing in a way worth flagging: `inline`'s
-depends on its binder arms skipping rather than descending-with-a-guard.
+#### Predicate memo contexts
 
-A pass that must share *allocations* without sharing *results* uses `TermMemo`
-instead. Constraint emission is the case: it binds `REFINEMENT_BINDER` to a domain
-`emit_cast` mints fresh per cast node, so no occurrence may reuse another's answer,
-yet all should still land on one term. `TermMemo` is a separate type rather than a
-flag, so which of the two a pass is entitled to is visible in its signature.
+`PredMemo<C>` reuses a result only when both the original predicate address and context `C`
+match. The context must include every condition under which the same predicate can rebuild
+differently. A context that distinguishes unnecessary cases can lose sharing; one that omits a
+relevant distinction can reuse the wrong result.
 
-#### The protocol is a closure, so a rebuild cannot be half-done
+| Pass | Context | Required property |
+| --- | --- | --- |
+| `simplify` | `()` | The rewrite depends on the term |
+| `uniquify` | `()` | Shared occurrences preserve the same binding interpretation; copied subtrees are uniquified before copying |
+| `coalesce` | `()` | Shared occurrences are resolved under the walk's common graph and scope assumptions |
+| `inline` | `()` | The substitution is fixed for the sweep; shadowed subtrees are skipped |
+| `subst` | `Subst` | Different substitutions must not share a result merely because the origin matches |
+| Planning | `Type` | Predicate compilation depends on the refinement's base type |
 
-`PredMemo::rebuild` and `TermMemo::rebuild_always` take the transform as a closure.
-An earlier token-based shape (`begin` handing out a token that a `finish` consumed)
-could be left open: dropping the token discarded the rebuild, left the occurrence
-on its origin `Rc`, and memoized nothing — so a pass that returned early between
-the halves rewrote every occurrence *but one*. Two such leaks existed; the closure
-form makes them unrepresentable.
+Address-keyed memos retain their original allocations for their entire lifetime. Without that
+keepalive, replacing the last reference could free an address and allow an unrelated predicate
+allocated later in the same pass to collide with the old entry. `PredMemo` owns that keepalive
+alongside each rebuilt result.
 
-The closure is also what lets the memo be a cheap clonable handle
-(`Rc<RefCell<_>>`), which matters because three passes own their memo inside the
-very context their transform needs mutably — `uniquify`'s `self.expr` → `self.ty`,
-`coalesce_node` → `coalesce_type_predicates`, `subexpr` → `emit_node` →
-`emit_cast`. Reaching a handle needs only `&ctx`, and no borrow of the store is held
-across the callback, so those transforms re-enter the memo freely. Threading the
-memo as a plain parameter instead would mean changing `Typing::subexpr` and every
-emit rule.
+A unit context is a caller obligation, not a property guaranteed by the memo. For example,
+inlining's binder handling must skip shadowed subtrees rather than descend under a different
+effective substitution while retaining the same key.
 
-One consequence worth stating: the `changed` bit a callback returns is not the
-whole answer. A callback that re-enters the memo can have its copy mutated
-underneath it by a nested reuse, with nothing of its own to report; discarding the
-copy would throw that re-pointing away and memoize the staleness. `rebuild`
-therefore also consults the store's revision counter, and
-`walk_refined_predicates_mut` returns a `changed` bit for callers running a
-fixpoint.
+Constraint emission uses `TermMemo` instead. A cast can introduce a distinct domain variable for
+the reserved predicate binder at each occurrence, so the emitter must run for every occurrence.
+`rebuild_always` performs each emission and then shares the resulting term allocation with the
+other occurrences. It shares allocations without skipping the constraints each occurrence adds.
 
-The invariant is guarded by `tests/predicate_sharing.rs`, which asserts
-end-to-end that no two `Rc`-distinct refinements reachable from an inferred tree
-are structurally equal — the exact shape a split leaves. That is the sufficient
-check, and it needs no magic number. (A counting tripwire — the distinct-`Rc`
-count must not *grow* across a rewrite-only pass — used to sit around the retired
-predicate re-stamping pass; with no rewrite-only pass left to wrap, the
-end-to-end assertion is the whole guard. `ccl_utils::distinct_predicate_rcs`
-remains available for one, should a future pass need wrapping.)
+#### Predicate rebuild completion
 
-A predicate *function* `p : 𝐷 ⤇ Bool` never lives in a refinement type — only in
-a *term* (an `Apply(p, Iterate/Restrict)` argument). In a type it is represented
-bare as `__elem ▷ p` (`ccl_utils::bare_predicate_of_fn`; its inverse
-`planning::fn_of_bare_predicate` recovers `p` when a term needs the function,
-e.g. `make_restrict`).
+`PredMemo::rebuild` and `TermMemo::rebuild_always` take their transforms as closures.
+On ordinary return from the callback, the memo completes installation and recording. The caller
+does not hold a token that it must later finish; an early return inside the closure still returns
+to the memo's completion step.
+
+The memo is a clonable `Rc<RefCell<_>>` handle. It releases the store borrow before invoking the
+transform, so a transform can re-enter the context that owns the memo. Coalescing type predicates
+and emitting cast predicates require this reentrancy.
+
+A callback's reported `changed` flag is not the only change signal. A nested memo operation can
+redirect a predicate during the callback. `rebuild` therefore also compares the store's revision
+counter before deciding whether to retain the rebuilt copy or reuse the origin.
+`walk_refined_predicates_mut` reports change to callers that run a fixpoint.
 
 ### 3.2 The `InferArena`: who owns inference variables
 
-For same-level variables, recording `α <: β` adds `Type::Infer(β)` to `α`'s upper bounds;
-it does not immediately record a reciprocal bound on `β`. Other constraints and recursive bounds
-can nevertheless form cycles of strong `Rc` references between inference variables. Once the AST
-no longer references those variables, their bound cells can keep one another alive. Reference
-counting alone cannot reclaim such a cycle; see
-[Bounds and constraint propagation](#bounds-and-constraint-propagation).
+Inference-variable bounds can form strong-reference cycles. Recording a same-level
+`α <: β` adds `β` to `α`'s upper bounds, not an immediate reciprocal bound on `β`;
+other constraints or recursive bounds can still complete a cycle. Removing variables from the
+expression tree does not break the references between their bound cells.
 
-**`InferArena` (`ccl/infer/`) is the single owner that breaks the cycle.** It retains one strong handle to *every* variable at the moment it is minted (captured through a thread-local mint sink wired into `InferVar::fresh`), and on `Drop` clears each variable's lower/upper bound lists — severing all bound edges so every refcount can reach zero. A flat `Vec` suffices: variables are never looked up by id (the `Type` carries the `Rc` directly), so the arena only enumerates them once, at teardown. Clearing bounds before the `Vec` drops handles self-cycles and N-way cycles uniformly. This is an end-of-inference lifetime invariant implemented as RAII: the arena is created at the top of `infer()` and drops on the `Ok` and error paths alike.
+`InferArena` in `infer/api.rs` owns the teardown of each inference run. Its thread-local
+capture records a strong handle to every variable minted while the arena is active.
+The type itself carries the variable handle, so the arena enumerates these handles for cleanup
+rather than serving as a lookup table.
+
+On drop, the arena takes the captured variables and clears both their bound lists and trait-watch
+lists. Watches can form another cycle: a variable watches an obligation whose output type refers
+back to a variable. Clearing only bounds would leave those references intact.
+
+No borrow of a captured variable's bounds or watches may remain live across teardown, which mutably
+borrows both cells. Successful materialization creates fresh unresolved placeholders rather than
+reusing bound-bearing solver variables, so clearing the graph does not remove constraints needed by
+the successful result. Weak edges would require a separate owner and fallible upgrades; the arena
+retains strong references during solving and performs one linear cleanup.
+
+`infer` constructs the arena before running inference, so both success and error returns execute
+the same cleanup. Variables retained in an error-path expression no longer have a live solver graph
+after that teardown.
+
+The arena is thread-local and non-reentrant: at most one is active on a thread, with a debug
+assertion on nested entry. The guard is neither `Send` nor `Sync`, so it cannot be moved to
+another thread for teardown.
 
 ---
 

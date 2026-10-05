@@ -28,45 +28,15 @@ enum CoOccItem {
     Atom(AtomKey),
 }
 
-/// Simplify a [`CompactGraph`] by per-polarity co-occurrence analysis.
+/// Rewrite variable identities in a [`CompactGraph`] by polar co-occurrence.
 ///
-/// Two simplifications:
+/// Concrete contributions and position refinements survive variable elimination.
+/// [`simplify_reconstruct`] preserves them while applying `var_subst`.
+/// The three elimination/merge rules are specified in
+/// `src/ccl/design/type-inference.md`, "Simplification".
 ///
-/// 1. **Polar-only elimination.** A variable that appears at only one
-///    polarity contributes no structural information (any concrete value
-///    filling the one polarity is unconstrained on the other side). It is
-///    dropped: its position becomes empty, which coalesces to `Type::Infer`.
-///
-/// 2. **Co-occurrence merging.** If variable `v` always appears together with
-///    variable `w` at a given polarity, and symmetrically `w` always appears
-///    with `v`, they carry identical information and `w` can be merged into
-///    `v`. Only non-recursive variables are merged with non-recursive ones,
-///    and recursive with recursive (mixing would violate strict polarity for
-///    recursive types).
-///
-/// 3. **Atomic absorption.** If atom `A` co-occurs with variable `v` at both
-///    polarities, `v` is "sandwiched" between two structural `A` constraints
-///    and is redundant; it is dropped.
-///
-/// The operation is currently cosmetic (all types are monomorphic) but
-/// becomes load-bearing once let-polymorphism introduces genuine polar
-/// asymmetry. It is placed between
-/// [`compact_type`](super::compact::compact_type) and
-/// [`coalesce_compact`](super::coalesce::coalesce_compact) in the pipeline.
-///
-/// **Refinements need no special handling here.** Refinements live on
-/// each [`CompactType`] *position* (`ct.refinements`), not on variable
-/// identity, and [`simplify_reconstruct`] copies them through unchanged while
-/// `var_subst` only ever rewrites or drops variable uids. Co-occurring
-/// variables (the merge candidates) sit in the same position and therefore
-/// carry the same refinements, so merging or eliminating a variable can never move
-/// or lose a refinement. (The classic "merge x>0 with x<10" hazard applies
-/// only to representations that fold the predicate into the variable's
-/// identity; ours keeps them positional.)
-///
-/// Recursive variables: the solver never produces non-empty `rec_vars`
-/// today, so the recursive-variable merge path is guarded but remains
-/// unexercised until recursive types are supported.
+/// Recursive variables must not merge with non-recursive ones, though the current
+/// solver does not supply recursive types for that path.
 pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     // All variable UIDs encountered during the walk.
     let mut all_vars: BTreeSet<InferVarId> = cty.rec_vars.keys().cloned().collect();
