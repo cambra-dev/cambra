@@ -746,21 +746,11 @@ pub(super) fn answer_type_kinds(v: &Rc<InferVar>) -> Result<(), ConstrainError> 
     Ok(())
 }
 
-/// The **kind premise** of the Σ rule: is every type `sub` admits also admitted by `sup`?
+/// Check containment of two stated witness kinds, recording subtype edges where needed.
 ///
-/// A type kind is a type of types, and containment holds when every type `sub` classifies
-/// `sup` classifies too — no variance, and no case per pair. What differs between the four is
-/// only how each *states* which types it classifies, and that is
-/// what decides whether a membership question is answered here or drawn as an edge
-/// ([`candidate_in_kind`]).
-///
-/// **Both sides' fun kinds must state a type kind**, which is why the caller asks
-/// [`FunKind::sum_binders`] rather than reading one off a variable. A fun kind variable states
-/// none, and deriving one from what has reached the variable so far gives an answer that moves
-/// as the solve proceeds — it widens as arms arrive, and narrows the moment the first arm
-/// displaces a demand from above. A verdict against it would depend on when the edge was
-/// drawn. This is the same reason [`constrain_fun_kind`] records against a variable instead of
-/// deciding.
+/// The caller must not substitute a kind derived from a variable's current bounds: later
+/// arrivals can change that answer. The complete relation is specified in
+/// `src/ccl/design/type-inference.md`, "Type kind containment".
 #[allow(clippy::too_many_arguments)]
 fn constrain_type_kinds(
     sub: &TypeKind,
@@ -801,27 +791,12 @@ fn constrain_type_kinds(
     }
 }
 
-/// Is `d` — one candidate of `sub` — a member of `sup`?
+/// Check one candidate against a kind: equality for enumerations, a subtype edge for
+/// `SubtypesOf`, or structural membership for `UIntRanges` and `Type`.
 ///
-/// One answer per type kind, because how each states which types it classifies is what the
-/// question turns on:
-///
-/// * [`TypeKind::Enumerated`] names its members, so membership is type equality. A candidate
-///   *is* a domain and data domains are invariant ([Data domains are
-///   invariant](`src/ccl/design/type-inference.md`)), so a refined range is a different
-///   candidate from the range it refines, in either direction.
-/// * [`TypeKind::SubtypesOf`] names its members by a type, so membership is an ordinary
-///   subtyping edge — and the parameter is the one place information can flow *in*, which is
-///   what lets `Map(_, 𝑉)` take its key from the domains that reach it. Deciding this
-///   structurally instead would answer "an undecided bound admits anything" and the key
-///   would be determined by nothing.
-/// * [`TypeKind::UIntRanges`] and [`TypeKind::Type`] state a property of their members and
-///   name none, so membership is structural — [`TypeKind::refuses`], asked on `d` whole,
-///   since a refined type is not the type it refines.
-///
-/// A candidate that is still a **variable** has no shape to read a property off, so it takes
-/// the kinding edge `𝛼 :: 𝐾` and is answered wherever a type reaches it
-/// ([`answer_type_kinds`]).
+/// Only the structural case records an unresolved candidate's kinding requirement.
+/// Pass the whole type, including refinements: a refined range is not a dense range.
+/// See `src/ccl/design/type-inference.md`, "An unresolved candidate becomes a kinding edge".
 #[allow(clippy::too_many_arguments)]
 fn candidate_in_kind(
     d: &Type,

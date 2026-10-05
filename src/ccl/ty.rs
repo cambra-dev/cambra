@@ -402,15 +402,11 @@ impl FunKind {
         }
     }
 
-    /// The Σ binders this kind is **written** over — a concrete `Data` carrying a slot.
+    /// The binders and kinds stated by a concrete sum; none for a kind variable.
     ///
-    /// A consumer's kind variable carries binders too ([`FunKindVar::binder_ids`]), and they
-    /// are deliberately not reported here: they are the *scope* each arm's domain is renamed
-    /// into, not a name the consumer states. The sum it turns out to be is formed at its
-    /// domain position, where the references have merged (`named_by_domain` in
-    /// `crate::ccl::infer::solver::coalesce`) — reading the binder off the kind instead
-    /// names the index one way there and another at the position, and a reference resolving
-    /// to the second escapes the first.
+    /// A variable has binder IDs once its arity is known, but its candidate kinds still
+    /// depend on the bound graph. Use `binder_ids` for correspondence and this query for
+    /// the stated kind premise. See `src/ccl/design/type-inference.md`, "The Σ rule".
     pub fn sum_binders(&self) -> Option<Rc<Vec<Witness>>> {
         match self {
             FunKind::Data(Some(ws)) if !ws.is_empty() => Some(Rc::clone(ws)),
@@ -1514,40 +1510,15 @@ impl TypeKind {
         }
     }
 
-    /// Whether this kind **refuses** `ty` — certain non-membership, which is the half of the
-    /// membership question every caller of this needs.
+    /// Return true only for certain non-membership. False includes unresolved cases.
     ///
-    /// All three ask it to reject: `answer_type_kinds` and `candidate_in_kind` raise
-    /// `NotOfKind`, and `coalesce_compact_go` raises `KindMismatch`. So the dangerous answer
-    /// is the negative one, and a structural test that reports a difference it cannot yet
-    /// distinguish from an unresolved position refuses a program that type-checks. Membership
-    /// is three-valued while a type is partial; this answers only the value a rejection may
-    /// rest on, and abstains — returns `false` — wherever the truth is unknown.
+    /// This structural test cannot establish membership in `SubtypesOf`: the solver must
+    /// draw a subtyping edge to its parameter. It also abstains when an enumerated candidate
+    /// or the tested type has unresolved positions. Callers may reject on true, but must
+    /// not treat false as a membership proof.
     ///
-    /// **Abstaining is not the same as admitting.** Nothing reads a `false` here as
-    /// membership, so an abstention costs detection and never correctness. That is why the
-    /// bound's arm can abstain outright: the parameter's real question is subtyping, which
-    /// `constrain_type_kinds` draws as an edge, and no structural test standing in for it can
-    /// be certain in either direction.
-    ///
-    /// Membership and kind containment are different questions with different shapes: this
-    /// takes one type and answers about one kind, and it decides for itself. Containment takes
-    /// two kinds and draws edges, so it lives with the solver
-    /// (`crate::ccl::infer::solver::constrain`, `constrain_type_kinds`). They meet in one
-    /// place — candidates lie below [`UIntRanges`](TypeKind::UIntRanges) exactly when it
-    /// admits every one of them — which is why a new kind needs this and a row in the order,
-    /// and nothing else.
-    ///
-    /// That the membership question can be *asked at all* is what makes type-kind
-    /// **variables** unnecessary: it is decidable from the classified type, so the only thing
-    /// inference can be missing is that type. Contrast [`FunKind`], which classifies
-    /// provenance rather than shape and therefore has no such question and does need
-    /// [`FunKindVar`]. See `src/ccl/design/type-inference.md`, "An unresolved candidate
-    /// becomes a kinding edge".
-    ///
-    /// Note the asymmetry with a *type*: a kind admits many types, and a type is admitted by
-    /// many kinds. There is no "kind of a type" to read off — only, for a given type, the
-    /// minimal kind containing it: that one type as the sole candidate.
+    /// See `src/ccl/design/type-inference.md`, "Type kind containment" and
+    /// "An unresolved candidate becomes a kinding edge", for constraint-time behavior.
     pub fn refuses(&self, ty: &Type) -> bool {
         match self {
             // ⊤: every type, so nothing to refuse.

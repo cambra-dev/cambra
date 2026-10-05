@@ -1,11 +1,5 @@
-//! Dependent sums end to end: `box` as the way in, and what consuming a summed
-//! collection does — in particular **filtering** one.
-//!
-//! A conditional is the *usual* way two candidates end up in one sum, so these
-//! shapes are easy to mistake for conditional-specific ones. They are not: every
-//! program here has a single arm and no `Case` at all — the witness is
-//! **determined**, and that is what lets it be erased rather than materialized.
-//! `conditionals.rs` carries the undetermined half, which still needs an extent.
+//! End-to-end sum compilation: determined-witness erasure, filtering, materialized
+//! jagged rows, witness-domained comprehensions and unsupported storage/loop shapes.
 //!
 //! See `src/ccl/design/type-inference.md`, "Only a term builds a sum".
 
@@ -21,9 +15,8 @@ use crate::helpers::*;
 // Consuming a boxed collection — the unfiltered baseline
 // ---------------------------------------------------------------------------
 
-/// A one-candidate sum is consumed like the collection it wraps. `box` is a
-/// type-level introduction with no runtime content, so every one of these is
-/// the plain collection's answer.
+/// These one-candidate sums have no enclosing demand requiring a materialized witness.
+/// Planning erases their introductions, preserving the plain collection's results.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Consumed whole, without an iteration site of its own.
