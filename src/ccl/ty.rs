@@ -4310,15 +4310,15 @@ impl RefinementSet {
 /// not free is choosing *differently* in two places, since the types along the
 /// pipeline and the predicates compiled for it must agree.
 ///
-/// **The order is the set's own.** Going through one function is not enough on its own —
-/// a *derived* order is only as stable as what it derives from, and the three sites that
-/// need one (the `restrict` chain, the predicates compiled for it, and the check that
-/// re-derives both) run at different points of the pipeline. Ordering by the refinements'
-/// rendered predicates was therefore unstable in the one way that matters: compiling a
-/// predicate rewrites its term, so a key read before compilation and one read after can
-/// order two refinements differently, and predicates compiled under one order end up in a
-/// pipeline typed by the other. Reading the order off the set removes the derivation, and
-/// with it the chance of two answers.
+/// **The first compilation stamps the order.** The three sites that need an order (the
+/// `restrict` chain, the predicates compiled for it, and the check that re-derives both) run
+/// at different points of the pipeline, and compiling a predicate rewrites its rendered term.
+/// `dependency_order` breaks ties on rendered predicates, but planning's
+/// `compile_refinements` types each predicate at its stage type, so a compiled predicate
+/// carries every refinement applied before it in its own types, and the tie becomes a
+/// dependency. Every site after the first compilation recovers that order from the
+/// dependencies, whatever the predicates render to. See `src/ccl/design/type-inference.md`,
+/// "Materializing a refinement set is a pipeline, and a pipeline is ordered".
 ///
 /// Nothing in the type system may read that order back: [`RefinementSet`]'s equality is
 /// order-insensitive, so what planning fixes here never reaches an identity. That split —

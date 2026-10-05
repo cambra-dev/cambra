@@ -1273,10 +1273,16 @@ Independent predicates therefore use a content-based tie-breaker, not physical i
 If no candidate is ready, the implementation takes the first remaining member; that fallback is
 not a cycle diagnostic or a proof that arbitrary dependency cycles are supported.
 
-Compilation, restriction typing, and checking must agree on the order they use. Rebuilding a
-predicate can change its rendered term, so callers cannot assume that independently sorting
-pre- and post-rewrite terms gives the same order. The ordering helper is the shared mechanism;
-the order is not part of `RefinementSet` equality.
+Compilation, restriction typing, and checking agree on the order because the first compilation
+stamps it into the predicates. `compile_refinements` in `planning/predicates.rs` types each
+predicate at its stage type, so a compiled predicate's type slots carry `{𝐷 | earlier}` for every
+refinement applied before it. `dependency_order` reads those slots back as dependencies. Every
+later site that orders the set (map-filter insertion, re-compilation, and the post-planning check)
+therefore recovers the order of the first compilation, whatever the compiled terms render to. The
+rendered-predicate tie-break decides only among predicates that had no dependency before their
+first compilation. The argument rests on one equality: the copy of an earlier refinement inside a
+later predicate's types compares equal to its sibling in the set, which the shared
+`PredMemo<Type>` provides. The order is not part of `RefinementSet` equality.
 
 `application_elem_types` maps the chosen element types back to physical slice positions.
 An in-place rewrite uses that mapping rather than zipping application-order types onto a
@@ -1546,7 +1552,7 @@ writes the result into the AST. The standard shape cases are specified under
 [Materialization outcomes](#materialization-outcomes), rather than repeated here.
 
 An empty product contribution is a separate error case. Positive merging can intersect two field
-sets down to no common field. `coalesce_record` rejects that empty map as `IncompatibleBounds`;
+sets down to no common field. `materialize_record` rejects that empty map as `IncompatibleBounds`;
 it does not infer `Unit`. Constructing an empty product explicitly uses the language's unit rule,
 which is different from finding no shared field in a join. See
 [The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit).
