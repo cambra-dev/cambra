@@ -137,10 +137,12 @@ fn answer_tiling(keys: &Tiling, option_extent: Extent) -> Tiling {
         return Tiling::Scalar(option_extent);
     }
     match keys {
-        Tiling::DataFunction { domain, .. } => Tiling::DataFunction {
-            domain: domain.clone(),
-            codomain: Box::new(Tiling::Scalar(option_extent)),
-        },
+        // One key per row at one level, and a **collection of keys per row** deeper — what
+        // a correlated comprehension's key binder is, one group of keys per outer row. The
+        // answer keeps the shape either way: one answer per key, where its key sits.
+        keys @ Tiling::DataFunction { .. } => {
+            change_tiling_result(keys, |_| Tiling::Scalar(option_extent))
+        }
         other => panic!("CheckedLookup keys must be a scalar or a stream, got {other}"),
     }
 }
@@ -358,12 +360,17 @@ impl TileProducer for CheckedLookupProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
-            Tiling::DataFunction { codomain, .. } => codomain.extent(),
+            // One answer per row at one level, and a collection of answers per row —
+            // one per key of that row's group — deeper. Either way the answers sit where
+            // the keys do.
+            t @ Tiling::DataFunction { .. } => t.deepest_values().extent(),
             other => panic!("CheckedLookup tiling is a scalar or a stream, got {other}"),
         };
-        let empty_scalar = Tile::Scalar(ColumnValue::from_values(vec![], &out_extent));
+        // What an answer with nothing in it tiles as: an empty column where one key is
+        // answered, an empty collection where a stream of them is.
+        let empty = self.tiling().empty_tile();
         if self.released {
-            return empty_scalar;
+            return empty;
         }
         // Every leg is searched by position, and a release marks rows deleted rather than
         // removing them (`Tile::mark_deleted`), so a tile still carrying deletions answers a
@@ -383,37 +390,55 @@ impl TileProducer for CheckedLookupProducer {
                     Tile::Scalar(_) | Tile::Record(_) => {
                         let keys = scalar_tile_to_column_value(key_tile);
                         if keys.is_empty() {
-                            return empty_scalar;
+                            return empty;
                         }
                         match answer_for(&keys.index_at(0), &coll) {
                             Some(v) => Tile::Scalar(ColumnValue::from_values(vec![v], &out_extent)),
-                            None => empty_scalar,
+                            None => empty,
                         }
                     }
                     // A stream of keys, each answered against the same collection — read
-                    // once, not lifted into every row.
-                    Tile::DataFunction {
-                        ref domain,
-                        ref codomain,
+                    // once, not lifted into every row. One key per row at one level, and a
+                    // group of keys per row deeper, which is what a correlated
+                    // comprehension's key binder is.
+                    ref tile @ Tile::DataFunction {
                         ref domain_predicate,
+                        ref codomain,
                         ..
                     } => {
+                        let nested = codomain.is_data_function();
+                        let Tile::DataFunction { domain: inner, .. } = tile
+                            .innermost_level()
+                            .unwrap_or_else(|| unreachable!("the arm matched a collection"))
+                        else {
+                            unreachable!("innermost_level answers a collection")
+                        };
                         // A product key arrives as a record of columns and pivots to the one
                         // column a domain is searched with; a scalar one is already that, and
                         // borrows, so the common shape is not charged a copy per pull.
-                        let key_col = match codomain.as_ref() {
+                        let key_col = match tile.deepest_values() {
                             Tile::Scalar(col) => Cow::Borrowed(col),
-                            record @ Tile::Record(_) => {
-                                Cow::Owned(scalar_tile_to_column_value(record.clone()))
-                            }
-                            other => panic!(
-                                "CheckedLookup: a key is one value, so the key stream's codomain \
-                                 tiles as a scalar or a record of them; got {other:?}"
-                            ),
+                            record => Cow::Owned(scalar_tile_to_column_value(record.clone())),
                         };
                         let (kept, answers) =
-                            Self::answer_rows(domain, &key_col, &RowCollection::Shared(&coll));
-                        self.stream_tile(kept, answers, domain, domain_predicate, &out_extent)
+                            Self::answer_rows(inner, &key_col, &RowCollection::Shared(&coll));
+                        if !nested {
+                            // One key per row: an undecided key drops its row, and the rows
+                            // that did answer go out now.
+                            self.stream_tile(kept, answers, inner, domain_predicate, &out_extent)
+                        } else {
+                            // A group of keys per row, the grouping carried through
+                            // untouched. An undecided key would have to re-offset the groups
+                            // it left, so a tile that cannot answer them all answers none
+                            // and waits.
+                            if kept.len() < inner.len() {
+                                return empty;
+                            }
+                            let mut out = tile.clone();
+                            *out.deepest_values_mut() =
+                                Tile::Scalar(ColumnValue::from_values(answers, &out_extent));
+                            out
+                        }
                     }
                     other => {
                         panic!("CheckedLookup keys tile as a scalar or a stream, got {other:?}")
@@ -425,7 +450,7 @@ impl TileProducer for CheckedLookupProducer {
                 let mut tile = pairs.get(pairs.tiling().universal_guard());
                 compact_releasing(&mut tile, pairs);
                 // Not a shape error: a stream that has produced nothing yet answers with an
-                // empty scalar, and this operator does the same until its rows arrive.
+                // empty tile, and this operator does the same until its rows arrive.
                 let Tile::DataFunction {
                     ref domain,
                     ref codomain,
@@ -433,7 +458,7 @@ impl TileProducer for CheckedLookupProducer {
                     ..
                 } = tile
                 else {
-                    return empty_scalar;
+                    return empty;
                 };
                 // The row shape, on the other hand, `Self::paired` has already checked.
                 let Tile::Record(fields) = codomain.as_ref() else {
@@ -529,5 +554,115 @@ impl CheckedLookupProducer {
             domain_predicate,
             BitSet::new(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::TagMap;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+
+    fn int() -> Extent {
+        Extent::Base(BaseType::Int)
+    }
+
+    fn uint() -> Extent {
+        Extent::Base(BaseType::UInt)
+    }
+
+    fn option_of_int() -> Extent {
+        Extent::Union(TagMap::from_arms(vec![
+            (
+                FieldKey::Name(crate::ccl::V_NONE.into()),
+                Extent::Base(BaseType::Unit),
+            ),
+            (FieldKey::Name(crate::ccl::V_SOME.into()), int()),
+        ]))
+    }
+
+    /// Two rows holding a group of two keys each, `[1, 9]` and `[2, 10]`, as a correlated
+    /// comprehension's key binder arrives: the rows final, the groups beneath them whole.
+    fn grouped_keys() -> (Tile, Tiling) {
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                ColumnValue::UInts(vec![0, 2]),
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 9, 2, 10]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        (tile, tiling)
+    }
+
+    /// The map `{1: 10, 2: 20}`, with its domain decided or not.
+    fn collection(decided: bool) -> (Tile, Tiling) {
+        let tile = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+            if decided {
+                Predicate::True
+            } else {
+                Predicate::False
+            },
+            BitSet::new(),
+        );
+        (tile, Tiling::data_function(int(), Tiling::Scalar(int())))
+    }
+
+    fn lookup_over(keys: (Tile, Tiling), coll: (Tile, Tiling)) -> CheckedLookupProducer {
+        let tiling = answer_tiling(&keys.1, option_of_int());
+        CheckedLookupProducer {
+            base: ProducerBase::new(CheckedLookupProducer::alloc_id(), &tiling),
+            source: ProducerSource::Split {
+                collection: Box::new(TestTileProducer::new(coll.0, coll.1)),
+                keys: Box::new(TestTileProducer::new(keys.0, keys.1)),
+            },
+            released: false,
+        }
+    }
+
+    /// A group of keys per row answers one option per key where its key sits, the grouping
+    /// carried through: `9` and `10` are absent from a decided collection.
+    #[test]
+    fn a_group_of_keys_per_row_answers_each_key_in_place() {
+        let mut lookup = lookup_over(grouped_keys(), collection(true));
+        let out = lookup.get(lookup.tiling().universal_guard());
+        let levels = out.key_levels();
+        assert_eq!(*levels[0].1, ColumnValue::UInts(vec![0, 1]));
+        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 1, 0, 1]));
+        assert_eq!(
+            scalar_tile_to_column_value(out.deepest_values().clone()),
+            ColumnValue::from_values(
+                vec![
+                    some_of(Value::Int(10)),
+                    none(),
+                    some_of(Value::Int(20)),
+                    none()
+                ],
+                &option_of_int()
+            )
+        );
+    }
+
+    /// A collection that has not decided every key answers an empty collection of the
+    /// producer's own tiling, which `TileProducer::get`'s shape check accepts.
+    #[test]
+    fn an_undecided_key_in_a_group_answers_an_empty_collection() {
+        let mut lookup = lookup_over(grouped_keys(), collection(false));
+        let out = lookup.get(lookup.tiling().universal_guard());
+        assert!(
+            out.is_data_function(),
+            "the answer tiles as a collection: {out:?}"
+        );
+        assert!(out.is_empty() && !out.is_terminal());
     }
 }

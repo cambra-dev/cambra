@@ -165,7 +165,8 @@ The other combinators introduced here include `Curry`, `Const`, `Apply`, `Map`, 
 builtins, and the point-free `Copair` form. `Builtin::Copair` appears as
 `Apply(Tuple(arms), Builtin(Copair))` when a copair is lifted out of a lambda. A value-position
 `TypedExprNode::Copair` remains a value-form node. Planning later introduces `Iterate`,
-`Restrict`, `MapFilter`, `Converse`, `Uncurry`, and the domain transformations used by join plans.
+`Restrict`, `MapFilter`, `CurryOver`, `Converse`, `Uncurry`, and the domain transformations used by
+join plans.
 Lambda elimination does not introduce iteration sources.
 
 ### Conditional expressions and filters
