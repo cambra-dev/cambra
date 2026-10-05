@@ -1,0 +1,40 @@
+{
+  "name": "cambra",
+  "displayName": "Cambra",
+  "description": "Syntax highlighting for CHL, the Cambra High-level Language",
+  "version": "0.1.0",
+  "publisher": "cambra-dev",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cambra-dev/cambra"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "cambra",
+        "aliases": [
+          "Cambra",
+          "CHL"
+        ],
+        "extensions": [
+          ".cambra"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cambra",
+        "scopeName": "source.cambra",
+        "path": "./syntaxes/cambra.tmLanguage.json"
+      }
+    ]
+  }
+}

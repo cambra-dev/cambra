@@ -58,6 +58,10 @@ An unescaped physical newline before a string's closing quote gives `Unterminate
 at the opening quote. A backtick not immediately followed by an identifier gives
 `DetachedBacktick` at the backtick. Both failures precede layout processing.
 
+`KEYWORDS` lists every keyword spelling with its token. The editor grammars under `editors/` list
+the same spellings, and `tests/editor_grammars.rs` fails when they differ
+([editors/README.md](../editors/README.md#highlight-classes)).
+
 A statement opens a block either from its head keyword (`if`, `def`, …) or from
 an assignment's right-hand side, and the layout pass tells them apart by the
 line's first token. On a line that begins with `pub`, the second token is the
