@@ -307,12 +307,10 @@ fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
 /// A stream of keys answered against `coll`, one option per key where the key sits: the
 /// keys' own levels, with the answer in place of each key.
 ///
-/// **What the collection has decided goes out now.** A key it has not decided yet is left
-/// out of its group rather than holding the group back, which is `retain_keys` on the
-/// innermost level: that re-offsets the groups, and the levels above keep their rows. The
-/// completeness each level states is the keys' own, less the path of every key left out and
-/// of every row above one, since completeness closes downward and a row missing a key will
-/// gain it. A consumer releases what it has taken by path (`Tile::to_guard`), so a row
+/// **What the collection has decided goes out now.** A key it has not decided yet is
+/// withheld from its group rather than holding the group back ([`Tile::withhold`]): the
+/// groups re-offset, the levels above keep their rows, and no level calls the key's path
+/// complete, since a row missing a key will gain it. A consumer releases what it has taken by path (`Tile::to_guard`), so a row
 /// delivered in part is released in part and the rest arrives beneath it later.
 fn answer_key_stream(keys: &Tile, coll: &Tile, out_extent: &Extent) -> Tile {
     let depth = keys
@@ -331,30 +329,14 @@ fn answer_key_stream(keys: &Tile, coll: &Tile, out_extent: &Extent) -> Tile {
     let mut out = keys.clone();
     let decided = BitVec::from_fn(answers.len(), |i| answers[i].is_some());
     if !decided.all() {
-        let undecided: Vec<Vec<Value>> = keys
-            .paths_at(CurryLevel::new(depth))
-            .into_iter()
+        let paths = keys.paths_at(CurryLevel::new(depth));
+        let withheld: Vec<&[Value]> = paths
+            .iter()
             .zip(&answers)
             .filter(|(_, answer)| answer.is_none())
-            .map(|(path, _)| path)
+            .map(|(path, _)| path.as_slice())
             .collect();
-        for level in 0..=depth {
-            let missing = Predicate::flatten_or(
-                undecided
-                    .iter()
-                    .map(|path| Predicate::exactly(&path[..=level]))
-                    .collect(),
-            );
-            let Tile::DataFunction {
-                domain_predicate, ..
-            } = out.values_at_mut(CurryLevel::new(level))
-            else {
-                unreachable!("every level down to the innermost is a collection")
-            };
-            *domain_predicate = domain_predicate.minus(&missing);
-        }
-        out.values_at_mut(CurryLevel::new(depth))
-            .retain_keys(&decided);
+        out.withhold(CurryLevel::new(depth), &decided, &withheld);
     }
     *out.deepest_values_mut() = Tile::Scalar(ColumnValue::from_values(
         answers.into_iter().flatten().collect(),

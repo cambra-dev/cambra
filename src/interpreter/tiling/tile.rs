@@ -838,6 +838,37 @@ impl Tile {
         regrouped
     }
 
+    /// Keep the keys of `level` that `keep` names, as [`Self::retain_keys`] does, where some
+    /// of those left out are **withheld** rather than dropped: `withheld` holds their paths.
+    ///
+    /// A withheld key arrives later beneath the same row, so no level may call complete a
+    /// prefix of its path, and each level down to `level` stops stating the prefix that
+    /// reaches it. Completeness closes downward, so the rows above a withheld key are
+    /// incomplete too. A key `keep` leaves out and `withheld` does not name is dropped for
+    /// good.
+    ///
+    /// The levels below `level` keep their statements. Under a withheld path they speak of
+    /// entries this tile no longer holds, and a consumer releases by the keys it holds
+    /// ([`Self::to_guard`]), so nothing reads them.
+    pub(crate) fn withhold(&mut self, level: CurryLevel, keep: &BitVec, withheld: &[&[Value]]) {
+        for depth in 0..=level.index() {
+            let prefixes = Predicate::flatten_or(
+                withheld
+                    .iter()
+                    .map(|path| Predicate::exactly(&path[..=depth]))
+                    .collect(),
+            );
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = self.values_at_mut(CurryLevel::new(depth))
+            else {
+                unreachable!("every level down to {level} is a collection")
+            };
+            *domain_predicate = domain_predicate.minus(&prefixes);
+        }
+        self.values_at_mut(level).retain_keys(keep);
+    }
+
     /// Keep the keys `mask` names, dropping the rest — a filter along the *key* axis,
     /// which is within each row rather than across rows ([`Self::retain_rows`]).
     ///

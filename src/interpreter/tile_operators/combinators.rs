@@ -890,39 +890,37 @@ impl TileProducer for FilterProducer {
                 let Tile::DataFunction { domain: keys, .. } = input.values_at(self.level) else {
                     unreachable!("the input's tiling holds a collection at {}", self.level)
                 };
-                // **The mask is positional**, so it applies only while the two sides are in
-                // step. An input with nothing in it is already filtered — the predicate
-                // keeps answering for entries whose rows have been handed on.
+                // An input with nothing in it is already filtered — the predicate keeps
+                // answering for entries whose rows have been handed on. A fast path:
+                // `retain_answered` hands an empty input back unchanged too.
                 if keys.is_empty() {
                     return input;
                 }
-                // Anything else out of step is refused rather than read across the
-                // misalignment, which drops the wrong entries silently, or answered empty,
-                // which waits for an alignment that is not coming. Each side is pulled from
-                // its own branch of the pairs, so either may have reached entries the other
-                // has not.
-                assert_eq!(
-                    pred_keys.len(),
-                    keys.len(),
-                    "a filter needs its predicate and its rows in step; the predicate has \
-                     answered for a different number of entries than the rows carry",
-                );
-                // Equal counts are what a positional mask needs stated on every pull, and
-                // equal paths are what makes it the right mask. A cartesian product gives
-                // every row the same inner keys, so the masked level's column alone would
-                // pass a predicate one row ahead of the input; the whole path to each entry
-                // does not.
-                assert!(
-                    pred.row_paths_at(self.level.index() + 1)
-                        == input.row_paths_at(self.level.index() + 1),
-                    "a filter's predicate and rows agree in count but not in paths, so the \
-                     mask is positional over two different orders",
-                );
                 let pred_column = scalar_tile_to_column_value(pred.deepest_values().clone());
-                let mask = pred_column
+                let answers = pred_column
                     .as_bitvec()
                     .unwrap_or_else(|| panic!("Expected bools"));
-                input.values_at_mut(self.level).retain_keys(mask);
+                debug_assert_eq!(
+                    pred_keys.len(),
+                    answers.len(),
+                    "one answer per predicate entry"
+                );
+                // **The mask is positional while the two sides hold the same entries.** A
+                // cartesian product gives every row the same inner keys, so the masked level's
+                // column alone would pass a predicate one row ahead of the input; the levels
+                // down to it, groups and keys, do not. Equal levels hold equal paths, and
+                // unequal levels over equal paths fall to `retain_answered`, which masks them
+                // alike, so the paths are built only when the levels differ.
+                let depth = self.level.index() + 1;
+                let same_levels = (input.key_levels().into_iter().take(depth))
+                    .eq(pred.key_levels().into_iter().take(depth));
+                if same_levels {
+                    input.values_at_mut(self.level).retain_keys(answers);
+                    return input;
+                }
+                let input_paths = input.row_paths_at(depth);
+                let pred_paths = pred.row_paths_at(depth);
+                retain_answered(&mut input, self.level, &input_paths, &pred_paths, answers);
                 input
             }
             _ => panic!("Invalid Filter input tiles"),
@@ -940,6 +938,53 @@ impl TileProducer for FilterProducer {
         }
         self.input.release(obsolete_guard);
     }
+}
+
+/// Mask `input`'s entries at `level` by the predicate's answer at the same path, where the
+/// two sides hold different entries.
+///
+/// Each side is pulled from its own branch of the pairs, so either may have reached entries
+/// the other has not. An answered entry keeps or drops by its own answer. An entry the
+/// predicate has not answered yet is withheld ([`Tile::withhold`]): it arrives beneath the
+/// same row once answered.
+/// An answer for an entry the input has not reached waits in the predicate, which the filter
+/// releases only by what its output hands on (`predicate_release`).
+///
+/// Each input path looks its answer up by path, so a pull is linear in the two sides however
+/// many entries are undecided.
+fn retain_answered(
+    input: &mut Tile,
+    level: CurryLevel,
+    input_paths: &[Vec<Value>],
+    pred_paths: &[Vec<Value>],
+    answers: &BitVec,
+) {
+    let answer_at: HashMap<&[Value], bool> = pred_paths
+        .iter()
+        .enumerate()
+        .map(|(j, path)| (path.as_slice(), answers[j]))
+        .collect();
+    let Tile::DataFunction { deleted, .. } = input.values_at(level) else {
+        unreachable!("the masked level is a collection")
+    };
+    let deleted = deleted.clone();
+    let mut keep = BitVec::from_elem(input_paths.len(), false);
+    let mut withheld: Vec<&[Value]> = Vec::new();
+    for (i, path) in input_paths.iter().enumerate() {
+        match answer_at.get(path.as_slice()) {
+            Some(&answer) => keep.set(i, answer),
+            None => {
+                // The filter releases both sides by what it hands on, so a key the input
+                // still holds, deleted or not, is one the predicate has not let go of.
+                debug_assert!(
+                    !deleted.contains(i),
+                    "a key the input holds deleted is unanswered: {path:?}"
+                );
+                withheld.push(path)
+            }
+        }
+    }
+    input.withhold(level, &keep, &withheld);
 }
 
 /// What a filter's predicate no longer needs, given the release `guard` of the filter's
@@ -1653,11 +1698,15 @@ mod tests {
     }
 
     fn filter(input: Tile, levels: usize) -> Tile {
+        filter_by(per_row_predicate(), input, levels)
+    }
+
+    fn filter_by(predicate: TestTileProducer, input: Tile, levels: usize) -> Tile {
         let tiling = uint_tiling(levels);
         let mut filter = FilterProducer {
             base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
             input: Box::new(TestTileProducer::new(input, tiling.clone())),
-            predicate: Box::new(per_row_predicate()),
+            predicate: Box::new(predicate),
             level: CurryLevel::new(1),
         };
         filter.get(filter.tiling().universal_guard())
@@ -1698,6 +1747,136 @@ mod tests {
                 &[10, 30],
                 level(&[0, 2], &[5, 6, 8, 9], Tile::Scalar(uints(&[1, 2, 5, 6]))),
             )),
+        );
+    }
+
+    /// An input row the predicate has not answered yet is withheld: its entries are left out
+    /// and its key out of the outer level's completeness, while the answered rows are masked
+    /// by their own answers.
+    #[test]
+    fn a_filter_withholds_the_rows_its_predicate_has_not_answered() {
+        let rows = |codomain: Tile, complete: Predicate| {
+            Tile::data_function(
+                uints(&[1, 2, 3]),
+                Box::new(codomain),
+                complete,
+                BitSet::new(),
+            )
+        };
+        let input = rows(
+            level(
+                &[0, 2, 4],
+                &[10, 20, 10, 30, 10, 40],
+                Tile::Scalar(uints(&[100, 200, 300, 400, 500, 600])),
+            ),
+            Predicate::True,
+        );
+        let unanswered = Predicate::flatten_or(vec![Predicate::exactly(&[Value::UInt(3)])]);
+        assert_eq!(
+            filter(input, 2),
+            rows(
+                level(&[0, 1, 2], &[10, 30], Tile::Scalar(uints(&[100, 400]))),
+                Predicate::True.minus(&unanswered),
+            ),
+        );
+    }
+
+    /// A predicate a row ahead of the input, over a product: both sides hold four entries
+    /// with the same inner keys, `[10, 20]` under each row, but under different rows. The
+    /// input's row `1` is unanswered and withheld; its row `2` takes the predicate's answers
+    /// for row `2`, which keep `(2, 10)`.
+    #[test]
+    fn a_predicate_a_row_ahead_over_a_product_answers_by_path() {
+        let product = |rows: &[u64], inner: Tile| {
+            Tile::data_function(uints(rows), Box::new(inner), Predicate::True, BitSet::new())
+        };
+        let mask: BitVec = [true, false, false, true].into_iter().collect();
+        let predicate = TestTileProducer::new(
+            product(
+                &[2, 3],
+                level(
+                    &[0, 2],
+                    &[10, 20, 10, 20],
+                    Tile::Scalar(ColumnValue::Bools(mask)),
+                ),
+            ),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::data_function(
+                    Extent::Base(BaseType::UInt),
+                    Tiling::Scalar(Extent::Base(BaseType::Bool)),
+                ),
+            ),
+        );
+        let input = product(
+            &[1, 2],
+            level(
+                &[0, 2],
+                &[10, 20, 10, 20],
+                Tile::Scalar(uints(&[100, 200, 300, 400])),
+            ),
+        );
+        let row_1 = Predicate::flatten_or(vec![Predicate::exactly(&[Value::UInt(1)])]);
+        assert_eq!(
+            filter_by(predicate, input, 2),
+            Tile::data_function(
+                uints(&[1, 2]),
+                Box::new(level(&[0, 0], &[10], Tile::Scalar(uints(&[300])))),
+                Predicate::True.minus(&row_1),
+                BitSet::new(),
+            ),
+        );
+    }
+
+    /// An inner level that states its own completeness stops stating the paths of the entries
+    /// withheld from it, as the outer level stops stating their rows.
+    #[test]
+    fn a_withheld_entry_leaves_a_stated_inner_completeness() {
+        let rows = |codomain: Tile| {
+            Tile::data_function(
+                uints(&[1, 2, 3]),
+                Box::new(codomain),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let inner = |starts: &[usize], keys: &[u64], values: &[u64], complete: Predicate| {
+            Tile::grouped(
+                starts.to_vec(),
+                uints(keys),
+                Box::new(Tile::Scalar(uints(values))),
+                complete,
+                BitSet::new(),
+            )
+        };
+        let input = rows(inner(
+            &[0, 2, 4],
+            &[10, 20, 10, 30, 10, 40],
+            &[100, 200, 300, 400, 500, 600],
+            Predicate::True,
+        ));
+        let row_3 = Predicate::flatten_or(vec![Predicate::exactly(&[Value::UInt(3)])]);
+        let entries_of_row_3 = Predicate::flatten_or(vec![
+            Predicate::exactly(&[Value::UInt(3), Value::UInt(10)]),
+            Predicate::exactly(&[Value::UInt(3), Value::UInt(40)]),
+        ]);
+        let Tile::DataFunction {
+            codomain,
+            domain_predicate,
+            ..
+        } = filter(input, 2)
+        else {
+            panic!("a filter keeps a collection a collection")
+        };
+        assert_eq!(domain_predicate, Predicate::True.minus(&row_3));
+        assert_eq!(
+            *codomain,
+            inner(
+                &[0, 1, 2],
+                &[10, 30],
+                &[100, 400],
+                Predicate::True.minus(&entries_of_row_3),
+            ),
         );
     }
 

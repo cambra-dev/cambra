@@ -457,24 +457,7 @@ impl MapResultProducer {
                 }
             }
             if !withheld.is_empty() {
-                input_tile
-                    .values_at_mut(CurryLevel::new(innermost))
-                    .retain_keys(&keep);
-                for depth in 0..=innermost {
-                    let prefixes = Predicate::flatten_or(
-                        withheld
-                            .iter()
-                            .map(|path| Predicate::exactly(&path[..=depth]))
-                            .collect(),
-                    );
-                    let Tile::DataFunction {
-                        domain_predicate, ..
-                    } = input_tile.values_at_mut(CurryLevel::new(depth))
-                    else {
-                        unreachable!("retain_keys keeps a collection a collection")
-                    };
-                    *domain_predicate = domain_predicate.minus(&prefixes);
-                }
+                input_tile.withhold(CurryLevel::new(innermost), &keep, &withheld);
             }
         }
 
