@@ -556,7 +556,8 @@ struct Specialization {
     /// The memo key: the [`SpecKey`] of the use that minted this specialization,
     /// taken from its live instantiation type *before* its pin —
     /// the same procedure at the same point every candidate's key is taken, which
-    /// is what makes the comparison self-consistent (see [`SpecializeFrame::specs`]).
+    /// is what makes the comparison self-consistent (see
+    /// `src/ccl/design/type-inference.md`, "Keying a specialization").
     key: SpecKey,
     /// Its binding name — a [`Name::mono`] carrying the source binding's name
     /// as provenance and a globally-fresh uid for identity (so it can neither
@@ -574,8 +575,8 @@ struct Specialization {
     /// program a definition nothing references. Splitting that from the memo is
     /// what lets the clone be *shared*: declining to register instead made every
     /// dead use re-clone and re-coalesce its callee, which compounds through a
-    /// call chain (see [`SpecializeFrame::specs`], "The remaining gap", where the
-    /// same split is what reference-liveness filtering asks for).
+    /// call chain (see `src/ccl/design/type-inference.md`,
+    /// "Typechecking a never-called definition").
     ///
     /// False at mint for a discarded use; a later surviving use that *hits* this
     /// entry sets it, because sharing the clone is exactly what makes it live.
@@ -1874,7 +1875,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // one point in the pin's lifecycle. It is deliberately not `resolved` — a
     // resolved type is a polarity-correct rendering, which narrows away positions
     // the definition body ignores and cannot see an argument's refinement on a
-    // domain's lower bounds; see `SpecializeFrame::specs`.
+    // domain's lower bounds; see `src/ccl/design/type-inference.md`,
+    // "Keying a specialization".
     //
     // An under-determined instantiation (a generic definition the program never
     // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
@@ -2006,7 +2008,8 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // The entry is keyed on the pre-pin key computed above — *not* on
     // `clone.ty`. A clone type is the pin's output and a candidate's key is its
     // input; keying an entry on one and the lookup on the other is what made this
-    // table write-only (see `SpecializeFrame::specs`).
+    // table write-only (see `src/ccl/design/type-inference.md`,
+    // "Keying a specialization").
     debug_assert!(
         frame.specs.iter().all(|s| s.key != key),
         "specialization memo invariant (one entry per distinct key) violated: \
@@ -2780,8 +2783,8 @@ mod tests {
         // Two `g` specializations, each demanding its own `f` specialization
         // — and every minted specialization is referenced.
         // A refinement makes two uses distinct, so a literal argument mints its own
-        // specialization — see the `specs` field doc. Sharing modulo refinements is
-        // the better rule and needs the clone built at the stripped type.
+        // specialization — see `src/ccl/design/type-inference.md`,
+        // "Key timing and precision limits".
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(specializations, 4, "per-use g + f specializations");
         assert_eq!(used_names.len(), 4, "every specialization is used");
@@ -2963,8 +2966,8 @@ mod tests {
         run_inference(&mut e).expect("chained poly with shared uses type-checks");
         let (specializations, used_names) = specialization_stats(&e);
         // A refinement makes two uses distinct, so a literal argument mints its own
-        // specialization — see the `specs` field doc. Sharing modulo refinements is
-        // the better rule and needs the clone built at the stripped type.
+        // specialization — see `src/ccl/design/type-inference.md`,
+        // "Key timing and precision limits".
         assert_eq!(specializations, 6, "per-use g + f specializations");
         assert_eq!(used_names.len(), 6);
     }
@@ -3052,7 +3055,8 @@ mod tests {
         // specialization. This is the "memo is per frame, not per demanding
         // region" property, and it is what keying on a `SpecKey` restores —
         // keying an entry on its clone's coalesced type instead made these two
-        // miss each other (see `SpecializeFrame::specs`).
+        // miss each other (see `src/ccl/design/type-inference.md`,
+        // "Keying a specialization").
         assert_eq!(specializations, 4, "one g + one f specialization per type");
         assert_eq!(used_names.len(), 4);
     }

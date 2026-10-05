@@ -394,7 +394,7 @@ original bound-graph variable identities as output type variables.
 | Distinct incompatible shapes, such as `Int` and `String` | `IncompatibleBounds` |
 | A tagged variant shape | `Type::Variant`, retaining its tags rather than treating them as an untagged collision |
 
-Product materialization in `coalesce_record` additionally distinguishes field keys:
+Product materialization in `materialize_record` additionally distinguishes field keys:
 
 - Dense index keys produce `Type::Tuple`.
 - Name keys produce `Type::Record`; open versus closed named width is not represented at this layer.
@@ -752,9 +752,12 @@ callee independently for every dead use, but it does not remove the general spec
 problem.
 
 A failed use that returns before renaming can still refer to a binding dropped during the let
-rebuild. This is a known limitation of the failed-pass tree, which is discarded when inference
-returns errors. A dedicated inference-recovery node is a possible fix; the current
-`TypedExprNode::Error` contract is for lowering recovery, not that implemented solution.
+rebuild. No pass reads that tree: `run_frontend` in `ccl/context.rs` resolves each inference
+error's blame node to a source span and then discards the tree. The fix is to replace the failed
+use with `TypedExprNode::Error`, keeping its `NodeId`, and to widen that node's contract from
+pending lowering errors to pending lowering or inference errors. The contract records how the node
+is used today. Its guarantee is that no pass running on an error-free tree meets the node, and a
+failed inference run keeps that guarantee.
 
 Trait requirements need an additional check. Eager obligation narrowing depends on concrete
 types arriving, so resolving an unused definition alone does not establish satisfiability of all
@@ -779,9 +782,19 @@ Regression coverage is in `tests/type_check.rs` and `infer/solve.rs`, including
 It is computed from the live instantiation type before that use's pin. A memo entry stores the
 key of the use that created it, not a key recomputed from the finished clone.
 
+Both sides of a comparison are computed by one procedure at one point in the pin's lifecycle.
+A clone's coalesced type is the pin's output, and a candidate's key is the pin's input. For a
+definition whose clone type gains a refinement across the pin, a key read from the clone never
+equals a candidate's key, so a memo keyed that way is write-only and identical call sites each
+mint a clone (`identical_instantiations_share_one_specialization` in `infer/solve.rs`).
+
 A materialized `Type` is not the key. Compaction selects and merges contributions to produce one
-type; specialization must distinguish the bound directions that affect the clone. In particular,
-the key's directed reads are not ordinary negative-position compaction with its opposite-side merge.
+type; specialization must distinguish the bound directions that affect the clone. A domain is a
+negative position, so its materialized type reads upper bounds, the definition body's demands. It
+drops positions the body never reads, and it omits an argument's refinement, which arrives as a
+lower bound through the `arg <: domain` edge. A clone's interior reads its parameter at a positive
+position and sees those refinements. In particular, the key's directed reads are not ordinary
+negative-position compaction with its opposite-side merge.
 
 `spec_key` takes two reads of the root and keeps them separate:
 
@@ -791,17 +804,25 @@ the key's directed reads are not ordinary negative-position compaction with its 
 | Negative | Lower-bound contributions from arguments | Upper-bound requirements from consumers |
 
 Each read follows the bound list selected by its current polarity. It does not follow both lists at
-every variable. The two reads cover complementary directions at the root's immediate positions;
-deeper paths can diverge. The key is not an undirected closure of the whole reachable bound graph.
+every variable. The two reads flip in lockstep, so at the root's immediate positions every bound
+list is consulted by one of them. Deeper paths diverge: a variable reached only through a lower
+bound is visited only by the read that arrived there, at that read's polarity, and its other bound
+list is read by neither. The clone's own resolution reads that position from the same side, so a
+bound the key does not see is one the clone does not see either. The guarantee is agreement with
+the pin, not coverage of the whole bound graph.
 
 Combining the two views into one would lose the direction in which information arrived.
 Traversing both bound lists at every variable can instead reach shared graph components belonging
-to unrelated uses. Neither operation is the implemented key.
+to unrelated uses.
 
 Within a directed read, `KeyView::union` accumulates contributions without polarity-dependent
-narrowing. Undetermined positions use a canonical empty view, not a fresh placeholder identity.
-Conflicting contributions can coexist in a key; ordinary resolution, not the key, reports type
-conflicts. Refinement comparisons are type-blind and compare sets rather than insertion order.
+narrowing. A key that narrows can only under-split, and under-splitting is a miscompile, while
+over-splitting costs one redundant clone. Keying on a materialized type narrows this way:
+`λ a, b → a + b` at `(1, 2)` and `(1, 5)` both keyed on `((1, Int) ⇒ Int)`, and the shared
+clone typed `.1` as `2`. Undetermined positions use a canonical empty view, not a fresh
+placeholder identity. Conflicting contributions can coexist in a key; ordinary resolution, not the
+key, reports type conflicts. Refinement comparisons are type-blind and compare sets rather than
+insertion order.
 
 The key also preserves distinctions needed by code generation, including function kind, history
 kind, and witness/kind shape. It does not use fresh inference-variable identities as a substitute
@@ -906,7 +927,7 @@ currently creates separate allocations even for occurrences that shared an origi
 
 Sharing affects later compilation cost. Planning memoizes predicate compilation by allocation and
 base type. Splitting one predicate into several equivalent allocations can make it compile each
-copy. The existence of that repeated work does not quantify the cost for an unmeasured program.
+copy.
 
 The [memo context rules](#predicate-memo-contexts) specify when a rebuild may be reused.
 `tests/predicate_sharing.rs` checks for equal predicates at distinct allocations after inference.
@@ -926,9 +947,9 @@ The downstream cost of this exception is not established here. The
 predicate-bearing UDF instantiation, and does not cover this exception.
 
 Possible remedies include memoizing freshening under an adequate context or retaining the origin
-for a vacuous freshen. Neither is implemented by this description. A fix must also preserve node
-identity: sharing one rebuilt term across slots is valid, but two distinct live terms must not
-carry equal `NodeId` sets. The pipeline's predicate-aware node-id check guards that distinction.
+for a vacuous freshen. Neither is implemented. A fix must also preserve node identity: sharing one
+rebuilt term across slots is valid, but two distinct live terms must not carry equal `NodeId` sets.
+`distinct_predicate_terms_never_share_a_node_id` in `src/ccl/panes.rs` guards that distinction.
 
 #### Type-slot coverage
 

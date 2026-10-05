@@ -658,7 +658,8 @@ fn freshen_watches(
 ///
 /// A sharing change must retain one node-id set per term. Reusing one rebuilt
 /// predicate across slots is valid; two distinct live terms carrying equal ids
-/// are not. The pipeline's predicate-aware node-id check guards that distinction.
+/// are not. `distinct_predicate_terms_never_share_a_node_id` in
+/// `src/ccl/panes.rs` guards that distinction.
 fn freshen_refinement_predicate(
     lim: Level,
     r: &Refinement,
