@@ -109,7 +109,7 @@ pub enum Sort {
     /// Represented as `Int` where `_ >= 0`.
     UInt,
     /// Represented as `Int` where `_ >= 0 && _ < n`.
-    UIntRange(usize),
+    UIntRange(u64),
     /// A sort reached by the solver's own spelling for it, carrying no constraint
     /// of its own. `String` is the case: z3's built-in string sort, used here as a
     /// sort name. This reaches a built-in sort and not an uninterpreted one,
@@ -125,7 +125,7 @@ impl Sort {
         let sym_atom = ctx.atom(sym.clone());
         let zero = || ctx.numeral(0);
         let non_neg = |x: SExpr| ctx.gte(x, zero());
-        let lt = |x: SExpr, y: usize| ctx.lt(x, ctx.numeral(y));
+        let lt = |x: SExpr, y: u64| ctx.lt(x, ctx.numeral(y));
         let (sort_atom, constraint) = match self {
             Self::Bool => (ctx.bool_sort(), None),
             Self::Int => (ctx.int_sort(), None),

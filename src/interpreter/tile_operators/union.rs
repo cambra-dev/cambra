@@ -846,7 +846,7 @@ mod tests {
 
     /// A `DataFunction` arm holding `(key, value)` pairs — one slice of the
     /// fed element stream, as a tag fan-out or a first-match value-`Case` produces.
-    fn flat_arm(pairs: &[(usize, i64)]) -> Tile {
+    fn flat_arm(pairs: &[(u64, i64)]) -> Tile {
         Tile::data_function(
             ColumnValue::from_uints(pairs.iter().map(|(k, _)| *k).collect()),
             Box::new(Tile::Scalar(ColumnValue::Ints(
@@ -886,7 +886,7 @@ mod tests {
     /// interleave back into the fed order across both tags.
     #[test]
     fn flat_merge_reassembles_coproduct_keyed_arms() {
-        let key = |tag: usize, inner: usize| Value::Union {
+        let key = |tag: usize, inner: u64| Value::Union {
             tag: FieldKey::Index(tag),
             inner: Box::new(Value::UInt(inner)),
         };
@@ -1151,11 +1151,11 @@ mod tests {
     fn flat_merge_states_beneath_each_key_what_its_own_arm_does() {
         use bit_set::BitSet;
         let uint = || Extent::Base(BaseType::UInt);
-        let arm = |key: usize, inner: usize, inner_pred: Predicate, outer: Predicate| {
+        let arm = |key: u64, inner: u64, inner_pred: Predicate, outer: Predicate| {
             Tile::data_function(
                 ColumnValue::UInts(vec![key]),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0]),
+                    vec![0],
                     ColumnValue::UInts(vec![inner]),
                     Box::new(Tile::Scalar(ColumnValue::UInts(vec![inner]))),
                     inner_pred,
@@ -1201,7 +1201,7 @@ mod tests {
         let arm0 = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
                 Predicate::True,

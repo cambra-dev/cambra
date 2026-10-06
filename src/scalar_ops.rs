@@ -55,7 +55,7 @@ impl IntFloorDiv for i64 {
     }
 }
 
-impl IntFloorDiv for usize {
+impl IntFloorDiv for u64 {
     fn floor_div(self, divisor: Self) -> Self {
         self / divisor
     }
@@ -65,7 +65,7 @@ impl IntFloorDiv for usize {
 ///
 /// A separate trait because `**` has no `*Assign` operator to bound
 /// [`zip_arithmetic`]'s element type by. The exponent is non-negative by typing, so the
-/// two element types differ only in whether that has to be stated: `usize` has no negative
+/// two element types differ only in whether that has to be stated: `u64` has no negative
 /// value to exclude.
 pub(crate) trait IntPow: Copy {
     /// The multiplicative identity, which seeds [`Self::raised`] and is what
@@ -118,15 +118,15 @@ impl IntPow for i64 {
     }
 }
 
-impl IntPow for usize {
+impl IntPow for u64 {
     const ONE: Self = 1;
 
     fn mul_wrapping(self, rhs: Self) -> Self {
-        usize::wrapping_mul(self, rhs)
+        u64::wrapping_mul(self, rhs)
     }
 
     fn int_pow(self, exponent: Self) -> Self {
-        self.raised(exponent as u64)
+        self.raised(exponent)
     }
 }
 
@@ -338,10 +338,10 @@ mod tests {
         assert_eq!(
             zip_arithmetic(
                 ArithmeticKind::FloorDiv,
-                vec![0_usize, 7, usize::MAX],
+                vec![0_u64, 7, u64::MAX],
                 &[2, 2, 1]
             ),
-            vec![0, 3, usize::MAX]
+            vec![0, 3, u64::MAX]
         );
     }
 
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "divide by zero")]
     fn floor_division_unsigned_zero_divisor_panics() {
-        zip_arithmetic(ArithmeticKind::FloorDiv, vec![1_usize], &[0]);
+        zip_arithmetic(ArithmeticKind::FloorDiv, vec![1_u64], &[0]);
     }
 
     #[test]

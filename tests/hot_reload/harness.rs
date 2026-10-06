@@ -913,7 +913,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
         values
             .iter()
             .enumerate()
-            .map(|(i, v)| (Value::UInt(from + i), Value::Int(*v)))
+            .map(|(i, v)| (Value::uint_from_row(from + i), Value::Int(*v)))
             .collect()
     };
     let pull = |ctx: &mut GlobalContext, live: &mut LiveProgram| -> Tile {
@@ -929,7 +929,9 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     source.borrow_mut().add_data(&rows(0, before));
     source
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::UInt(before.len() - 1)));
+        .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(
+            before.len() - 1,
+        )));
     for _ in 0..20 {
         pull(&mut ctx, &mut live);
     }

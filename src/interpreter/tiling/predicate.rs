@@ -1728,21 +1728,21 @@ mod tests {
     // ── Predicate::Qualified ──────────────────────────────────────────────────
 
     /// A key of a level, as a path of one component.
-    fn at(key: usize) -> Vec<Value> {
+    fn at(key: u64) -> Vec<Value> {
         vec![Value::UInt(key)]
     }
 
     /// A node of the second level, as the path that reaches it.
-    fn under(outer: usize, key: usize) -> Vec<Value> {
+    fn under(outer: u64, key: u64) -> Vec<Value> {
         vec![Value::UInt(outer), Value::UInt(key)]
     }
 
-    fn u(v: usize) -> Value {
+    fn u(v: u64) -> Value {
         Value::UInt(v)
     }
 
     /// Exactly `{k}`.
-    fn only(k: usize) -> Predicate {
+    fn only(k: u64) -> Predicate {
         Predicate::point(u(k))
     }
 
@@ -1751,7 +1751,7 @@ mod tests {
     /// A level naming a node makes every node beneath it complete, so a depth-1 node is
     /// answered by either level — which is what lets a statement about the running
     /// enclosing row describe that row alone.
-    fn complete_pairs(levels: &[Predicate]) -> Vec<(usize, usize)> {
+    fn complete_pairs(levels: &[Predicate]) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
         for outer in 0..2 {
             for key in 0..2 {
@@ -1795,7 +1795,7 @@ mod tests {
         assert!(!deeper.contains_path(&[u(1), u(9), u(1)]));
     }
 
-    fn tagged_uint(tag: usize, v: usize) -> Value {
+    fn tagged_uint(tag: usize, v: u64) -> Value {
         Value::Union {
             tag: FieldKey::Index(tag),
             inner: Box::new(u(v)),
@@ -1838,7 +1838,7 @@ mod tests {
             ),
             (tuple_field(1), Extent::Base(BaseType::UInt)),
         ]));
-        let pair = |a: Value, b: usize| {
+        let pair = |a: Value, b: u64| {
             Value::Record(HashMap::from([(tuple_field(0), a), (tuple_field(1), u(b))]))
         };
         let upto = Predicate::at_or_below_in(pair(tagged_uint(1, 2), 5), &domain);
@@ -1857,7 +1857,7 @@ mod tests {
     /// else is one.
     #[test]
     fn as_at_or_below_reads_back_its_watermark() {
-        for w in [0usize, 3, 100] {
+        for w in [0u64, 3, 100] {
             assert_eq!(Predicate::at_or_below(u(w)).as_at_or_below(), Some(u(w)));
         }
         assert_eq!(uint_intervals(&[0, 1, 2]).as_at_or_below(), Some(u(2)));
@@ -1957,7 +1957,7 @@ mod tests {
     fn a_slice_across_every_enclosing_row_needs_no_enclosing_path() {
         let slice = Predicate::at_or_below(u(1));
         assert!(!slice.qualifies());
-        for outer in [0usize, 1, 99] {
+        for outer in [0u64, 1, 99] {
             assert!(slice.contains_path(&under(outer, 0)));
             assert!(slice.contains_path(&under(outer, 1)));
             assert!(!slice.contains_path(&under(outer, 2)));
@@ -2028,7 +2028,7 @@ mod tests {
         let all = Predicate::True;
         let taken = Predicate::qualified(only(1), Predicate::at_or_below(u(0)));
         let left = all.minus(&taken);
-        let held: Vec<(usize, usize)> = (0..2)
+        let held: Vec<(u64, u64)> = (0..2)
             .flat_map(|o| (0..2).map(move |k| (o, k)))
             .filter(|(o, k)| left.contains_path(&under(*o, *k)))
             .collect();
@@ -2263,7 +2263,7 @@ mod tests {
         );
     }
 
-    fn pair(a: usize, b: usize) -> Value {
+    fn pair(a: u64, b: u64) -> Value {
         Value::Record(HashMap::from([
             ("_0".to_string(), Value::UInt(a)),
             ("_1".to_string(), Value::UInt(b)),
@@ -2392,7 +2392,7 @@ mod tests {
     /// row, join into one componentwise predicate where their keys agree, not one arm per row.
     #[test]
     fn rows_stated_one_at_a_time_join_into_one_componentwise_predicate() {
-        let row = |r: usize| Predicate::qualified(Predicate::point(u(r)), uint_intervals(&[0, 1]));
+        let row = |r: u64| Predicate::qualified(Predicate::point(u(r)), uint_intervals(&[0, 1]));
         let rows = (1..4).fold(row(0), |acc, r| acc.union(&row(r)));
         assert_eq!(
             rows,
@@ -2402,7 +2402,7 @@ mod tests {
 
     // ── Joining record arms ───────────────────────────────────────────────────
 
-    fn pairs(outer: &[usize], inner: &[usize]) -> ColumnValue {
+    fn pairs(outer: &[u64], inner: &[u64]) -> ColumnValue {
         ColumnValue::Records(HashMap::from([
             ("_0".to_string(), ColumnValue::UInts(outer.to_vec())),
             ("_1".to_string(), ColumnValue::UInts(inner.to_vec())),
@@ -2423,7 +2423,7 @@ mod tests {
         let square = pairs(&[0, 0, 1, 1], &[0, 1, 0, 1]);
         let whole = Predicate::from_column_value(&square);
         assert_eq!(arm_count(&whole), 1, "{whole:?}");
-        let point = |a: usize, b: usize| Predicate::from_column_value(&pairs(&[a], &[b]));
+        let point = |a: u64, b: u64| Predicate::from_column_value(&pairs(&[a], &[b]));
         let one_by_one = [(0, 1), (1, 0), (1, 1)]
             .into_iter()
             .fold(point(0, 0), |acc, (a, b)| acc.union(&point(a, b)));
@@ -2444,7 +2444,7 @@ mod tests {
         let jagged = pairs(&[0, 0, 1, 2, 2], &[0, 1, 0, 0, 1]);
         let p = Predicate::from_column_value(&jagged);
         assert!(arm_count(&p) <= 3, "one arm per row at most: {p:?}");
-        let pair = |a: usize, b: usize| {
+        let pair = |a: u64, b: u64| {
             Value::Record(HashMap::from([
                 ("_0".to_string(), Value::UInt(a)),
                 ("_1".to_string(), Value::UInt(b)),
@@ -2604,13 +2604,13 @@ mod tests {
         let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
         let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6]));
         let result = a.union(&b);
-        for v in [1usize, 2, 5, 6] {
+        for v in [1u64, 2, 5, 6] {
             assert!(
                 intervals_contains(&result, Value::UInt(v)),
                 "{v} should be in union"
             );
         }
-        for v in [3usize, 4] {
+        for v in [3u64, 4] {
             assert!(
                 !intervals_contains(&result, Value::UInt(v)),
                 "{v} should not be in union"
@@ -2624,7 +2624,7 @@ mod tests {
         let a = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 4]));
         let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5]));
         let result = a.union(&b);
-        for v in [2usize, 3, 4, 5] {
+        for v in [2u64, 3, 4, 5] {
             assert!(intervals_contains(&result, Value::UInt(v)));
         }
     }
@@ -3115,8 +3115,8 @@ mod tests {
     /// not hold survives — including a row that agrees with it in some fields but not all.
     #[test]
     fn minus_record_minus_record_keeps_the_rows_the_subtrahend_never_held() {
-        let pt = |k: usize| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
-        let pair = |x: usize, y: usize| {
+        let pt = |k: u64| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
+        let pair = |x: u64, y: u64| {
             Value::Record(
                 [
                     ("a".to_string(), Value::UInt(x)),
@@ -3129,7 +3129,7 @@ mod tests {
         let all = record_pred(&[("a", pt(0).union(&pt(1))), ("b", pt(0).union(&pt(1)))]);
         let taken = record_pred(&[("a", pt(1)), ("b", pt(1))]);
         let left = all.minus(&taken);
-        let held: Vec<(usize, usize)> = (0..2)
+        let held: Vec<(u64, u64)> = (0..2)
             .flat_map(|x| (0..2).map(move |y| (x, y)))
             .filter(|(x, y)| left.contains(&pair(*x, *y)))
             .collect();
@@ -3140,7 +3140,7 @@ mod tests {
     /// into several does not stay fragmented where it need not.
     #[test]
     fn union_of_two_records_differing_in_one_field_is_one_record() {
-        let pt = |k: usize| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
+        let pt = |k: u64| Predicate::from_column_value(&ColumnValue::UInts(vec![k]));
         let left = record_pred(&[("a", pt(0)), ("b", Predicate::True)]);
         let right = record_pred(&[("a", pt(1)), ("b", Predicate::True)]);
         assert_eq!(
@@ -3206,7 +3206,7 @@ mod tests {
         Predicate::from_column_value(&ColumnValue::Ints(values.to_vec()))
     }
 
-    fn uint_intervals(values: &[usize]) -> Predicate {
+    fn uint_intervals(values: &[u64]) -> Predicate {
         Predicate::from_column_value(&ColumnValue::UInts(values.to_vec()))
     }
 

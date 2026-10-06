@@ -88,7 +88,7 @@ fn test_test_source(#[case] code: &str) {
         ColumnValue::Strings(v) => v,
         other => panic!("expected Strings codomain, got {other:?}"),
     };
-    let mut pairs: Vec<(usize, SmolStr)> = keys.into_iter().zip(vals).collect();
+    let mut pairs: Vec<(u64, SmolStr)> = keys.into_iter().zip(vals).collect();
     pairs.sort_by_key(|(k, _)| *k);
     assert_eq!(pairs, vec![(10, "foo".into()), (20, "bar".into())]);
 
@@ -191,7 +191,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
@@ -201,7 +201,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source2
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -223,7 +223,7 @@ fn test_inner_join(#[case] code: &str) {
     //   domain   = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
     //   codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
     // Returns pairs sorted by (domain._0, domain._1) for deterministic comparison.
-    type DomainKey = (usize, usize);
+    type DomainKey = (u64, u64);
     type JoinOutput = (i64, SmolStr, SmolStr);
     fn extract_join_rows(tile: Tile) -> Vec<(DomainKey, JoinOutput)> {
         let Tile::DataFunction {
@@ -304,7 +304,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
@@ -314,7 +314,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source2
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -340,7 +340,7 @@ fn test_inner_join(#[case] code: &str) {
     )]);
     data_source1
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(30usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(30u64)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -381,11 +381,11 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(100))]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(1usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(1u64)));
     src2.borrow_mut()
         .add_data(&[(Value::UInt(10), Value::Int(100))]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(10usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(10u64)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -403,7 +403,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     // Unpack Function where:
     //   domain   = Records { _0: UInts (src1 domain key), _1: UInts (src2 domain key) }
     //   codomain = Record  { _0: Scalar(Ints src1 value), _1: Scalar(Ints src2 value) }
-    fn extract_rows(tile: Tile) -> Vec<((usize, usize), i64)> {
+    fn extract_rows(tile: Tile) -> Vec<((u64, u64), i64)> {
         let Tile::DataFunction {
             domain, codomain, ..
         } = tile
@@ -422,7 +422,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
         let ColumnValue::UInts(d1) = df.remove("_1").unwrap() else {
             panic!("domain._1 not UInts");
         };
-        let mut rows: Vec<((usize, usize), i64)> = d0.into_iter().zip(d1).zip(codomain).collect();
+        let mut rows: Vec<((u64, u64), i64)> = d0.into_iter().zip(d1).zip(codomain).collect();
         rows.sort_by_key(|(k, _)| *k);
         rows
     }
@@ -433,7 +433,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src2.borrow_mut()
         .add_data(&[(Value::UInt(20), Value::Int(100))]);
     src2.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(20usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(20u64)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -446,7 +446,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     src1.borrow_mut()
         .add_data(&[(Value::UInt(2), Value::Int(100))]);
     src1.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(2usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(2u64)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -997,7 +997,7 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         source.borrow_mut().add_data(
             &rows
                 .iter()
-                .map(|(k, v)| (Value::UInt(*k as usize), Value::Int(*v)))
+                .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
                 .collect::<Vec<_>>(),
         );
         if done {
@@ -1008,7 +1008,7 @@ fn test_a_collection_component_grows_with_its_source(#[case] code: &str) {
         sort_function_by_domain(tile)
     };
 
-    let expected = |keys: Vec<usize>, vals: Vec<i64>, done: bool| {
+    let expected = |keys: Vec<u64>, vals: Vec<i64>, done: bool| {
         sort_function_by_domain(Tile::data_function(
             ColumnValue::UInts(keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
@@ -1061,7 +1061,7 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
         compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
-    let mut pull_and_release = |rows: &[(usize, i64)]| {
+    let mut pull_and_release = |rows: &[(u64, i64)]| {
         test_source.borrow_mut().add_data(
             &rows
                 .iter()
@@ -1074,7 +1074,7 @@ fn test_a_released_collection_component_is_not_redelivered(#[case] code: &str) {
         sort_function_by_domain(tile)
     };
 
-    let delivered = |keys: Vec<usize>, vals: Vec<i64>| {
+    let delivered = |keys: Vec<u64>, vals: Vec<i64>| {
         sort_function_by_domain(Tile::data_function(
             ColumnValue::UInts(keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
@@ -1118,12 +1118,12 @@ fn released_by_a_sink_over_a_live_source(code: &str, rows: &[i64], laps: usize) 
     let rows: Vec<(Value, Value)> = rows
         .iter()
         .enumerate()
-        .map(|(i, v)| (Value::UInt(i), Value::Int(*v)))
+        .map(|(i, v)| (Value::uint_from_row(i), Value::Int(*v)))
         .collect();
     test_source.borrow_mut().add_data(&rows);
     test_source
         .borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::UInt(rows.len() - 1)));
+        .set_yield_predicate(Predicate::at_or_below(Value::uint_from_row(rows.len() - 1)));
     ctx.scheduler().check_for_notifications();
     for _ in 0..laps {
         let tile = producer.get(producer.tiling().universal_guard());
@@ -1209,13 +1209,13 @@ fn test_a_dropped_filtered_row_is_released(#[case] code: &str) {
 /// Compile `code` over an Int `source1`, deliver each batch (its rows, then a yield
 /// through the given key) and pull to quiescence after each, then close the source and
 /// pull to a terminal tile.
-fn run_in_batches(code: &str, batches: &[(&[(usize, i64)], usize)]) -> Tile {
+fn run_in_batches(code: &str, batches: &[(&[(u64, i64)], u64)]) -> Tile {
     run_in_batches_seeing(code, batches).1
 }
 
 /// [`run_in_batches`], also answering the tile each batch's pull reached, so a test can
 /// say what arrived before the source closed.
-fn run_in_batches_seeing(code: &str, batches: &[(&[(usize, i64)], usize)]) -> (Vec<Tile>, Tile) {
+fn run_in_batches_seeing(code: &str, batches: &[(&[(u64, i64)], u64)]) -> (Vec<Tile>, Tile) {
     let mut ctx = GlobalContext::default();
     let source = Rc::new(RefCell::new(TestDataSource::new(
         "source1",
@@ -1432,7 +1432,7 @@ fn a_collection_per_row_released_as_it_is_read() {
         compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     // The values the pull delivers, sorted, after which the whole tile is released.
-    let mut read = |rows: &[(usize, i64)], yielded: Predicate, until: fn(&Tile) -> bool| {
+    let mut read = |rows: &[(u64, i64)], yielded: Predicate, until: fn(&Tile) -> bool| {
         let data: Vec<(Value, Value)> = rows
             .iter()
             .map(|(k, v)| (Value::UInt(*k), Value::Int(*v)))
@@ -1537,8 +1537,8 @@ fn a_correlated_lookup_answers_the_keys_its_collection_has_decided(
         m = map([(x, x) for x in source1()])
         sum([sum([or_zero(m[k]?) * r for k in [10, 3]]) for r in [1, 2]])
     "};
-    let first: (&[(usize, i64)], usize) = (&[(0, 10)], 0);
-    let second: (&[(usize, i64)], usize) = (&[(5, 3)], 5);
+    let first: (&[(u64, i64)], u64) = (&[(0, 10)], 0);
+    let second: (&[(u64, i64)], u64) = (&[(5, 3)], 5);
     let batches = if deliver_five {
         vec![first, second]
     } else {

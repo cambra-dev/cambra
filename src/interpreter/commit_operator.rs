@@ -61,7 +61,7 @@ use crate::interpreter::{
         CycleSlot, CyclicSequencingProducer, Memo, ProducerBase, TileOperator, TileProducer,
         materialize_collections, materialized_row,
     },
-    tuple_field,
+    tuple_field, uint_of_row,
 };
 use crate::pretty_graph::VizOptions;
 use crate::pretty_tree::InspectNode;
@@ -627,7 +627,7 @@ fn render_engines_level(
         return Tile::data_function(
             ColumnValue::from_values(enclosing_rows, enclosing),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(starts),
+                starts,
                 below_keys,
                 below_values,
                 below_pred,
@@ -743,7 +743,7 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
                 Tile::Scalar(ColumnValue::from_values(seeds, &codomain.extent())),
             );
             let tile = Tile::grouped(
-                ColumnValue::UInts(starts),
+                starts,
                 ColumnValue::from_values(positions, &domain),
                 Box::new(Tile::Scalar(ColumnValue::from_values(
                     written,
@@ -1157,7 +1157,7 @@ fn decided_positions_tile(rows: &[Vec<Position>], domain: &Extent, complete: Pre
     }
     let len = positions.len();
     Tile::grouped(
-        ColumnValue::UInts(starts),
+        starts,
         ColumnValue::from_values(positions, domain),
         Box::new(Tile::Scalar(ColumnValue::Units(len))),
         complete,
@@ -1889,7 +1889,7 @@ struct CommitProducer {
     base: ProducerBase,
     writer_producers: Vec<Box<dyn TileProducer>>,
     /// Per writer, how many proposal-stream steps have already been processed.
-    consumed: Vec<usize>,
+    consumed: Vec<u64>,
     /// Per writer, whether its proposal stream is terminal (the writer has
     /// finished all its transactions). The store is terminal — fully decided,
     /// no more commits coming — once every writer is.
@@ -3760,7 +3760,7 @@ impl StoreDenseReadProducer {
             }
         }
         let inner = Tile::grouped(
-            ColumnValue::UInts(starts),
+            starts,
             ColumnValue::from_values(positions, &self.domain),
             Box::new(Tile::Scalar(ColumnValue::from_values(
                 folded_values,
@@ -4412,7 +4412,7 @@ struct DriverWindow {
     /// across compaction, so a window emptied by a release still knows where it is.
     /// The induction driver takes its positions from its source instead and never
     /// reads this.
-    attempts: usize,
+    attempts: u64,
     /// The last row and position pushed, for the ascending check. A domain need carry no
     /// successor, so the window records what it has rather than what comes next, and it
     /// records the **row** beside it: a nested store restarts its positions at each
@@ -4756,7 +4756,7 @@ impl DriverWindow {
             complete_rows.len()
         );
         let mut tile = Tile::grouped(
-            ColumnValue::UInts(position_starts),
+            position_starts,
             domain,
             Box::new(codomain),
             complete_positions,
@@ -4769,7 +4769,7 @@ impl DriverWindow {
                 complete_rows[d].clone()
             };
             tile = Tile::grouped(
-                ColumnValue::UInts(std::mem::take(&mut starts[d])),
+                std::mem::take(&mut starts[d]),
                 ColumnValue::from_values(std::mem::take(&mut keys[d]), &nested.rows[d]),
                 Box::new(tile),
                 level_complete,
@@ -6547,7 +6547,7 @@ struct TransactWriterProducer {
     /// positions are absolute and consumer-indexed (`CommitProducer` reads them
     /// by value), so the released prefix is dropped without renumbering the live
     /// suffix. Bounds the writer's retained state on a long-lived store.
-    committed_base: usize,
+    committed_base: u64,
     /// Proposals not yet released — append-only within the live window. The
     /// entry at vector index `i` is absolute position `committed_base + i`.
     emitted: Vec<InFlightProposal>,
@@ -6576,7 +6576,9 @@ impl TransactWriterProducer {
         Tile::data_function(
             // Absolute positions: the live window is `[committed_base, …)`; the
             // released prefix has been compacted away. Positions never renumber.
-            ColumnValue::from_uints((self.committed_base..self.committed_base + n).collect()),
+            ColumnValue::from_uints(
+                (self.committed_base..self.committed_base + uint_of_row(n)).collect(),
+            ),
             Box::new(Tile::record(HashMap::from([
                 (
                     F_SNAP.to_string(),
@@ -6650,7 +6652,7 @@ impl TransactWriterProducer {
         let drop = self.emitted.len();
         if drop > 0 {
             self.emitted.clear();
-            self.committed_base += drop;
+            self.committed_base += uint_of_row(drop);
         }
     }
 }
@@ -6950,7 +6952,7 @@ impl TileProducer for TransactWriterProducer {
             .emitted
             .iter()
             .enumerate()
-            .filter(|(i, _)| pred.contains(&Value::UInt(self.committed_base + i)))
+            .filter(|(i, _)| pred.contains(&Value::UInt(self.committed_base + uint_of_row(*i))))
             .map(|(_, p)| p.attempt.clone())
             .max();
         if let Some(pos) = ack {
@@ -6962,12 +6964,14 @@ impl TileProducer for TransactWriterProducer {
         // the proposal records (their read/write maps) without renumbering the
         // live suffix — `CommitProducer` reads remaining positions by value.
         let mut drop = 0;
-        while drop < self.emitted.len() && pred.contains(&Value::UInt(self.committed_base + drop)) {
+        while drop < self.emitted.len()
+            && pred.contains(&Value::UInt(self.committed_base + uint_of_row(drop)))
+        {
             drop += 1;
         }
         if drop > 0 {
             self.emitted.drain(0..drop);
-            self.committed_base += drop;
+            self.committed_base += uint_of_row(drop);
         }
     }
 }
@@ -6975,12 +6979,12 @@ impl TileProducer for TransactWriterProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::tiling::{one_row_decided, row_frontier};
     // The consumer helpers own shared-cell construction for the operators here; the
     // fixtures below build their own recording cells, hence the direct imports.
     use crate::ccl::{FieldKey, TagMap, V_ABORT, V_COMMIT};
     use crate::interpreter::scheduler::pull_laps;
     use crate::interpreter::tile_operators::{Constant, FanOut, Memo};
+    use crate::interpreter::tiling::{one_row_decided, row_frontier};
     use crate::interpreter::validate_tile;
     use rstest::rstest;
     use std::{cell::RefCell, rc::Rc};
@@ -7002,7 +7006,7 @@ mod tests {
 
     /// A position of a store's domain, which every engine here runs on a `UInt`
     /// clock — an iteration position or a commit tick.
-    fn pos(n: usize) -> Position {
+    fn pos(n: u64) -> Position {
         Position::new(Value::UInt(n))
     }
 
@@ -7260,7 +7264,7 @@ mod tests {
             let tiling =
                 Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(value_extent()));
             let tile = Tile::data_function(
-                ColumnValue::from_uints((0..items.len()).collect()),
+                ColumnValue::uints_from_rows(0..items.len()),
                 Box::new(Tile::Scalar(ColumnValue::from_values(
                     items.iter().map(|n| int(*n)).collect(),
                     &value_extent(),
@@ -7305,12 +7309,12 @@ mod tests {
             let tiling =
                 Tiling::data_function(Extent::Base(BaseType::UInt), Tiling::Scalar(value_extent()));
             let tile = Tile::data_function(
-                ColumnValue::from_uints((0..items.len()).collect()),
+                ColumnValue::uints_from_rows(0..items.len()),
                 Box::new(Tile::Scalar(ColumnValue::from_values(
                     items.iter().map(|n| int(*n)).collect(),
                     &value_extent(),
                 ))),
-                Predicate::at_or_below(Value::UInt(items.len() - 1)),
+                Predicate::at_or_below(Value::uint_from_row(items.len() - 1)),
                 (0..items.len()).collect(),
             );
             Self {
@@ -7584,7 +7588,10 @@ mod tests {
             )],
             vec![acc.clone()],
             Vec::new(),
-            full_store_tiling(Extent::uint_range(items.len()), store_values(&["acc"])),
+            full_store_tiling(
+                Extent::uint_range(uint_of_row(items.len())),
+                store_values(&["acc"]),
+            ),
             // A store built with its source, not one resuming a running program.
             None,
         );
@@ -7597,7 +7604,7 @@ mod tests {
             vec![acc.clone()],
             vec![value_extent()],
             value_extent(),
-            Extent::uint_range(items.len()),
+            Extent::uint_range(uint_of_row(items.len())),
             None,
         );
         set_body(Box::new(AddIfBody::new(Box::new(driver), threshold, "acc")));
@@ -7783,7 +7790,7 @@ mod tests {
         }); // tick 3: acc = 8
         let store = e.render_full_store_tile(&store_tiling(&["acc", "other"]));
         let acc = acct("acc");
-        let queries: Vec<usize> = (0..=4).collect();
+        let queries: Vec<u64> = (0..=4).collect();
         for carry in [true, false] {
             let batched =
                 fold_changelog_key_ascending(&store, queries.iter().copied().map(pos), &acc, carry);
@@ -7811,7 +7818,7 @@ mod tests {
         let mut sched = Scheduler::new();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
 
-        let mut read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(usize, i64)> {
+        let mut read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(u64, i64)> {
             // The cycle advances one position per pull, so the first full read
             // converges over several pulls; a later re-read is already terminal
             // and returns immediately.
@@ -7844,7 +7851,7 @@ mod tests {
             Predicate::at_or_below(Value::UInt(0)),
         )));
         let after = read_values(&mut producer);
-        for (p, v) in [(1usize, 5i64), (2, 5), (3, 14)] {
+        for (p, v) in [(1u64, 5i64), (2, 5), (3, 14)] {
             assert!(
                 after.contains(&(p, v)),
                 "position {p} must still read {v} after releasing position 0; got {after:?}"
@@ -7864,7 +7871,7 @@ mod tests {
         let mut engines = Engines::Rows(Vec::new());
         let mut seed = || CommitEngine::new(balances(&[("n", 0)]));
         for row in 0..3u64 {
-            engines.store_at(&[Value::UInt(row as usize)], &mut seed);
+            engines.store_at(&[Value::UInt(row)], &mut seed);
         }
         // Rows 0 and 1 whole; row 2 only at its first position, which names part of it.
         engines.remove_covered(&TileGuard::Or(vec![
@@ -8008,7 +8015,7 @@ mod tests {
     fn gc_released_prefix_keeps_latest_drops_released_history() {
         let mut e = CommitEngine::new(balances(&[("n", 0)]));
         // Three sequential writes — ticks 1, 2, 3 all write `n`.
-        for i in 1..=3 {
+        for i in 1..=3i64 {
             let snap = e
                 .decided_watermark()
                 .cloned()
@@ -8019,9 +8026,7 @@ mod tests {
                     reads: balances(&[("n", i - 1)]),
                     writes: balances(&[("n", i)]),
                 }),
-                CommitOutcome::Committed {
-                    ts: pos(i as usize)
-                }
+                CommitOutcome::Committed { ts: pos(i as u64) }
             );
         }
         // Consumers released through tick 2. Tick 3 is above the release and stands, and
@@ -8297,7 +8302,7 @@ mod tests {
     }
 
     /// A store key's changelog as `(tick, value)` pairs.
-    fn changelog_of(tile: &Tile, key: &str) -> Vec<(usize, Value)> {
+    fn changelog_of(tile: &Tile, key: &str) -> Vec<(u64, Value)> {
         let (ticks, values) = tile.store_changelog(key).expect("a key of this store");
         (0..ticks.len())
             .map(|i| match ticks.index_at(i) {
@@ -8557,11 +8562,11 @@ mod tests {
         tiling: Tiling,
         store_op: Box<dyn TileOperator>,
         key: Value,
-        n: usize,
+        n: u64,
     }
 
     impl CounterBody {
-        fn new(store_op: Box<dyn TileOperator>, key: Value, n: usize) -> Self {
+        fn new(store_op: Box<dyn TileOperator>, key: Value, n: u64) -> Self {
             Self {
                 tiling: proposal_stream_tiling(&key_extent(), &value_extent()),
                 store_op,
@@ -8603,7 +8608,7 @@ mod tests {
         key: Value,
         /// Proposals appended and not yet committed-and-released.
         window: ProposalWindow,
-        n: usize,
+        n: u64,
     }
 
     impl TileProducer for CounterBodyProducer {
@@ -8672,7 +8677,7 @@ mod tests {
     #[derive(Default)]
     struct DriverObservation {
         max_window: usize,
-        attempts: usize,
+        attempts: u64,
     }
 
     /// A pass-through in front of a driver that records each tile it emits.
@@ -8831,7 +8836,7 @@ mod tests {
             "each of the {WRITERS} draws commits exactly once"
         );
 
-        let retries: Vec<usize> = seen
+        let retries: Vec<u64> = seen
             .iter()
             .map(|o| o.borrow().attempts.saturating_sub(1))
             .collect();
@@ -8867,7 +8872,7 @@ mod tests {
     struct ProposalWindow {
         /// Absolute position of `emitted[0]`: how many proposals have been
         /// committed and released out of the front of the window.
-        committed_base: usize,
+        committed_base: u64,
         emitted: Vec<EmittedProposal>,
     }
 
@@ -8885,8 +8890,8 @@ mod tests {
 
         /// The absolute position the next appended proposal would take — also
         /// the number of proposals ever emitted, which survives compaction.
-        fn next_position(&self) -> usize {
-            self.committed_base + self.emitted.len()
+        fn next_position(&self) -> u64 {
+            self.committed_base + uint_of_row(self.emitted.len())
         }
 
         fn tile(&self, terminal: bool) -> Tile {
@@ -8910,9 +8915,9 @@ mod tests {
     /// Build a proposal-stream tile `step → {snap, reads, writes}` from a live
     /// window of grants starting at absolute position `base`, with the
     /// map-valued read/write sets riding `Variants` columns ([`map_to_value`]).
-    fn proposal_tile(emitted: &[EmittedProposal], base: usize, terminal: bool) -> Tile {
+    fn proposal_tile(emitted: &[EmittedProposal], base: u64, terminal: bool) -> Tile {
         Tile::data_function(
-            ColumnValue::from_uints((base..base + emitted.len()).collect()),
+            ColumnValue::from_uints((base..base + uint_of_row(emitted.len())).collect()),
             Box::new(Tile::record(HashMap::from([
                 (
                     F_SNAP.to_string(),
@@ -9145,11 +9150,11 @@ mod tests {
         tiling: Tiling,
         store_op: Box<dyn TileOperator>,
         key: Value,
-        t: usize,
+        t: u64,
     }
 
     impl StoreReadAsOf {
-        fn new(store_op: Box<dyn TileOperator>, key: Value, t: usize) -> Self {
+        fn new(store_op: Box<dyn TileOperator>, key: Value, t: u64) -> Self {
             Self {
                 tiling: Tiling::Scalar(value_extent()),
                 store_op,
@@ -9188,7 +9193,7 @@ mod tests {
         base: ProducerBase,
         store_producer: Box<dyn TileProducer>,
         key: Value,
-        t: usize,
+        t: u64,
     }
 
     impl TileProducer for StoreReadAsOfProducer {
@@ -9778,10 +9783,10 @@ mod tests {
     fn store_tile(
         accounts: &[&str],
         seed: &[(&str, i64)],
-        entries: &[(usize, &[(&str, i64)])],
+        entries: &[(u64, &[(&str, i64)])],
         frontier: Predicate,
     ) -> Tile {
-        let mut written: HashMap<&str, Vec<(usize, i64)>> =
+        let mut written: HashMap<&str, Vec<(u64, i64)>> =
             accounts.iter().map(|a| (*a, Vec::new())).collect();
         for (tick, writes) in entries {
             for (account, balance) in *writes {
@@ -9837,7 +9842,7 @@ mod tests {
 
     /// A three-tick store: the seed holds both accounts, tick 1 writes only
     /// `alice`, tick 2 writes only `bob`. Decided through the watermark `w`.
-    fn skew_store(w: usize) -> Tile {
+    fn skew_store(w: u64) -> Tile {
         store_tile(
             &["alice", "bob"],
             &[("alice", 100), ("bob", 50)],
@@ -10028,8 +10033,8 @@ mod tests {
     fn validate_tile_rejects_malformed_store() {
         // Built as literals: `Tile::data_function` validates what it builds, so a malformed
         // changelog cannot be constructed through it.
-        let log = |ticks: Vec<usize>, values: Vec<i64>| Tile::DataFunction {
-            row_starts: ColumnValue::from_uints(vec![0]),
+        let log = |ticks: Vec<u64>, values: Vec<i64>| Tile::DataFunction {
+            row_starts: vec![0],
             domain: ColumnValue::from_uints(ticks),
             codomain: Box::new(Tile::Scalar(ColumnValue::from_ints(values))),
             domain_predicate: Predicate::False,
@@ -10053,7 +10058,7 @@ mod tests {
             ColumnValue::from_ints(vec![1])
         ))));
         // A position decided above the frontier, and one decided with no frontier at all.
-        let decided_through = |decided: Vec<usize>, frontier: Vec<usize>| Tile::Store {
+        let decided_through = |decided: Vec<u64>, frontier: Vec<u64>| Tile::Store {
             state: Box::new(Tile::record(HashMap::new())),
             seed: Box::new(Tile::record(HashMap::new())),
             decided: Box::new(one_row_decided(ColumnValue::from_uints(decided))),
@@ -10229,14 +10234,14 @@ mod tests {
             (tuple_field(0), uint.clone()),
             (tuple_field(1), uint.clone()),
         ]));
-        let pair = |r: usize, p: usize| {
+        let pair = |r: u64, p: u64| {
             Value::Record(HashMap::from([
                 (tuple_field(0), Value::UInt(r)),
                 (tuple_field(1), Value::UInt(p)),
             ]))
         };
         // The curried source: rows 0 and 1, one position each, no row complete yet.
-        let source_of = |row0: Vec<usize>, items0: Vec<i64>| {
+        let source_of = |row0: Vec<u64>, items0: Vec<i64>| {
             let n0 = row0.len();
             let mut positions = row0;
             positions.push(0);
@@ -10245,7 +10250,7 @@ mod tests {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0, n0]),
+                    vec![0, n0],
                     ColumnValue::from_uints(positions),
                     Box::new(Tile::Scalar(ColumnValue::from_ints(items))),
                     Predicate::False,
@@ -10348,7 +10353,7 @@ mod tests {
             (tuple_field(0), uint.clone()),
             (tuple_field(1), uint.clone()),
         ]));
-        let pair = |r: usize, p: usize| {
+        let pair = |r: u64, p: u64| {
             Value::Record(HashMap::from([
                 (tuple_field(0), Value::UInt(r)),
                 (tuple_field(1), Value::UInt(p)),
@@ -10358,7 +10363,7 @@ mod tests {
         let source = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::from_ints(vec![10]))),
                 Predicate::True,
@@ -10388,7 +10393,7 @@ mod tests {
         let reseed = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::Scalar(ColumnValue::from_ints(vec![1]))),
                 Predicate::False,
@@ -10520,7 +10525,10 @@ mod tests {
             vec![(acc.clone(), Box::new(seed))],
             vec![acc.clone()],
             Vec::new(),
-            full_store_tiling(Extent::uint_range(items.len()), store_values(&["acc"])),
+            full_store_tiling(
+                Extent::uint_range(uint_of_row(items.len())),
+                store_values(&["acc"]),
+            ),
             None,
         );
         let set_body = store.body_input_setter();
@@ -10532,7 +10540,7 @@ mod tests {
             vec![acc.clone()],
             vec![value_extent()],
             value_extent(),
-            Extent::uint_range(items.len()),
+            Extent::uint_range(uint_of_row(items.len())),
             None,
         );
         set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
@@ -10703,7 +10711,7 @@ mod tests {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::grouped(
-                    ColumnValue::from_uints(vec![0, 1]),
+                    vec![0, 1],
                     ColumnValue::from_uints(vec![0, 0]),
                     Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
                     Predicate::False,
@@ -10721,7 +10729,7 @@ mod tests {
             rows.sort();
             rows
         };
-        let row = |r: usize| Path::from(vec![Value::UInt(r)]);
+        let row = |r: u64| Path::from(vec![Value::UInt(r)]);
         assert_eq!(rows(&seeds(Predicate::True)), vec![row(0), row(1)]);
         let first = Predicate::from_column_value(&ColumnValue::from_uints(vec![0]));
         assert_eq!(rows(&seeds(first)), vec![row(0)]);

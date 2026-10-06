@@ -372,9 +372,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     0 => domain_predicate.clone(),
                     _ => above.descend(1).union(domain_predicate),
                 };
-                let ColumnValue::UInts(starts) = row_starts else {
-                    unreachable!("a collection's row starts are positions")
-                };
+                let starts = row_starts;
                 let mut keys: Vec<Option<Vec<Value>>> = vec![None; domain.len()];
                 for (row, path) in rows.iter().enumerate() {
                     let from = starts.get(row).copied().unwrap_or(domain.len());
@@ -1151,7 +1149,7 @@ pub(crate) mod test_helpers {
             )]),
         );
         let mut engine = CommitEngine::unopened();
-        let step = |engine: &mut CommitEngine, p: usize| {
+        let step = |engine: &mut CommitEngine, p: u64| {
             let writes = HashMap::from([(store_key("acc"), Value::Int(p as i64))]);
             engine.step(Position::new(Value::UInt(p)), Some(writes));
             engine.render_full_store_tile(&tiling)
@@ -1199,14 +1197,14 @@ pub(crate) mod test_helpers {
             // Built directly rather than through `Tile::data_function`, which a tile holding
             // a complete key with an empty field need not pass: this is the check's input.
             Tile::DataFunction {
-                row_starts: ColumnValue::UInts(vec![0]),
+                row_starts: vec![0],
                 domain: ColumnValue::UInts(vec![0]),
                 codomain: Box::new(Tile::record(HashMap::from([
                     ("n".to_string(), Tile::Scalar(n)),
                     (
                         "xs".to_string(),
                         Tile::grouped(
-                            ColumnValue::UInts(vec![0]),
+                            vec![0],
                             ColumnValue::UInts(vec![]),
                             Box::new(Tile::Scalar(ColumnValue::UInts(vec![]))),
                             Predicate::False,

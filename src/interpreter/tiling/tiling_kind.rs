@@ -214,7 +214,7 @@ impl Tiling {
                 Tile::record(transform_hashmap_values(m, |t| t.empty_at_rows(rows)))
             }
             Tiling::DataFunction { domain, codomain } => Tile::grouped(
-                ColumnValue::UInts(vec![0; rows]),
+                vec![0; rows],
                 ColumnValue::from_values(Vec::new(), domain),
                 Box::new(codomain.empty_at_rows(0)),
                 Predicate::False,
@@ -235,7 +235,7 @@ impl Tiling {
                 state: Box::new(self.store_state().empty_at_rows(rows)),
                 seed: Box::new(codomain.empty_at_rows(rows)),
                 decided: Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0; rows]),
+                    vec![0; rows],
                     ColumnValue::from_values(Vec::new(), domain),
                     Box::new(Tile::Scalar(ColumnValue::Units(0))),
                     Predicate::False,

@@ -151,7 +151,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.releases.carry_to_new_producers();
     }
 
-    fn first_position_for_a_new_producer(&self) -> usize {
+    fn first_position_for_a_new_producer(&self) -> u64 {
         // A test source's keys are arbitrary values rather than stream positions,
         // so it names no position for a store to start at. A store over one starts
         // at `0` and reads whatever the source still offers a new producer, which

@@ -438,7 +438,7 @@ fn test_multi_variable_transactions(#[case] code: &str, #[case] expected: i64) {
 /// commit engine allocates ticks starting at 1, exactly as the prototype did —
 /// `u1 -> …`). A feed inside a `with begin():` block produces one entry per
 /// *committed* transaction, so a denied commit contributes no tick.
-fn commit_stream(ticks: &[usize], values: &[i64]) -> Tile {
+fn commit_stream(ticks: &[u64], values: &[i64]) -> Tile {
     Tile::data_function(
         ColumnValue::UInts(ticks.to_vec()),
         Box::new(Tile::Scalar(ColumnValue::Ints(values.to_vec()))),
@@ -3283,7 +3283,7 @@ fn live_read_progresses_past_deny() {
     src.borrow_mut()
         .add_data(&[(Value::UInt(0), Value::Int(100))]);
     src.borrow_mut()
-        .set_yield_predicate(Predicate::at_or_below(Value::from(0usize)));
+        .set_yield_predicate(Predicate::at_or_below(Value::from(0u64)));
     // Drive the cyclic store — with its interior deny — to completion, then deliver
     // request 1 (req = 200). Arrival order is what makes its observation assertable:
     // it latches after the writer has drained.

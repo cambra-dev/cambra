@@ -1183,7 +1183,7 @@ fn a_refinement_may_depend_on_a_named_read(#[case] code: &str, #[case] expected:
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::UInts((0..expected.len()).collect()),
+            ColumnValue::uints_from_rows(0..expected.len()),
             Box::new(Tile::Scalar(ColumnValue::Ints(expected))),
             Predicate::True,
             BitSet::new(),

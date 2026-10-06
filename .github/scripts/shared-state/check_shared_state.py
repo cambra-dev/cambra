@@ -81,7 +81,7 @@ JUSTIFICATION = re.compile(r"//\s*shared-state-ok:\s*\S")
 # two exceptions. Test code is not listed: `_blank_test_items` skips it entirely.
 EXPECTED_EXCEPTIONS = [
     ("src/interpreter/http_server.rs", "ambient mutable state"),
-    ("src/interpreter/http_server.rs", "cell of `HashMap<usize, tiny_http::Request>`"),
+    ("src/interpreter/http_server.rs", "cell of `HashMap<u64, tiny_http::Request>`"),
     ("src/interpreter/http_server.rs", "shared cell of `HashMap<(String, String), RouteSender>`"),
     # The test sink's accumulator: a sink is a terminal consumer at the I/O boundary,
     # and `DataSink::process` takes `&self`.

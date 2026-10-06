@@ -14,24 +14,24 @@ use log::trace;
 use smol_str::SmolStr;
 
 use crate::interpreter::{
-    ColumnValue, Value, producer_releases::ProducerReleases, tiling::Predicate,
+    ColumnValue, Value, producer_releases::ProducerReleases, row_index, tiling::Predicate,
 };
 
 /// Buffer and predicate bookkeeping for a uint-indexed string stream.
 ///
 /// Maintains a sliding window of [`SmolStr`] values indexed by monotonically
-/// increasing `usize` keys.  Released indices are drained from the front of
-/// `buffer`; `start_idx` records the logical offset so that external keys
-/// remain stable across drains.
+/// increasing `u64` keys, which are CCL `UInt` values and outlive the live window.
+/// Released indices are drained from the front of `buffer`; `start_idx` records the
+/// logical offset so that external keys remain stable across drains.
 pub(crate) struct UIntStreamBuffer {
     /// Buffered values.  `buffer[j]` corresponds to logical index `start_idx + j`.
     pub(crate) buffer: Vec<SmolStr>,
 
     /// Logical index of `buffer[0]`.  Indices below this have been released.
-    pub(crate) start_idx: usize,
+    pub(crate) start_idx: u64,
 
     /// One past the highest logical index that has been pushed.
-    pub(crate) ready_size: usize,
+    pub(crate) ready_size: u64,
 
     /// `true` once the producing thread has signalled end-of-stream.
     pub(crate) eof_reached: bool,
@@ -68,21 +68,21 @@ impl UIntStreamBuffer {
         self.ready_size += 1;
     }
 
-    pub(crate) fn get_opt(&self, i: usize) -> Option<&SmolStr> {
+    pub(crate) fn get_opt(&self, i: u64) -> Option<&SmolStr> {
         if self.closed || self.start_idx > i || i >= self.ready_size {
             None
         } else {
-            Some(&self.buffer[i - self.start_idx])
+            Some(&self.buffer[row_index(i - self.start_idx)])
         }
     }
 
-    pub(crate) fn get(&self, i: usize) -> &SmolStr {
+    pub(crate) fn get(&self, i: u64) -> &SmolStr {
         self.get_opt(i)
             .unwrap_or_else(|| panic!("Invalid UIntStreamBuffer::get({i})"))
     }
 
     /// Release all entries up to and including `i`, draining the buffer front.
-    pub(crate) fn release_index(&mut self, i: usize) {
+    pub(crate) fn release_index(&mut self, i: u64) {
         if i < self.start_idx {
             return;
         }
@@ -92,7 +92,7 @@ impl UIntStreamBuffer {
                 self.ready_size
             );
         }
-        self.buffer.drain(0..(i - self.start_idx + 1));
+        self.buffer.drain(0..row_index(i - self.start_idx + 1));
         self.start_idx = i + 1;
     }
 
@@ -123,7 +123,7 @@ impl UIntStreamBuffer {
     /// union of what the readers still need rather than any one reader's view.
     /// A converged stream answers empty, because a universal release
     /// [`close`](Self::close)s the buffer.
-    pub(crate) fn retained_window(&self) -> std::ops::Range<usize> {
+    pub(crate) fn retained_window(&self) -> std::ops::Range<u64> {
         if self.closed || self.start_idx >= self.ready_size {
             0..0
         } else {
@@ -189,7 +189,7 @@ impl UIntStreamBuffer {
                 ),
             }
         }
-        ColumnValue::from_uints(indices)
+        ColumnValue::UInts(indices)
     }
 
     /// Record the agreement as the starting point for producers registering from
@@ -212,7 +212,7 @@ impl UIntStreamBuffer {
     /// store built over this source starts here: the source will never offer the
     /// positions below it, and a drive based lower waits for an element that is
     /// not coming.
-    pub(crate) fn first_index_for_a_new_producer(&self) -> usize {
+    pub(crate) fn first_index_for_a_new_producer(&self) -> u64 {
         match self.released_prefix(&Self::index_set(self.releases.on_registration())) {
             Some(last) => last + 1,
             None => self.start_idx,
@@ -251,7 +251,7 @@ impl UIntStreamBuffer {
     /// such a run. A covered region with a live index in front of it is still
     /// recorded per producer, and [`get_elements`](Self::get_elements) still
     /// withholds it; only the bytes are held until the front is released.
-    fn released_prefix(&self, agreed: &IntervalSet<Value>) -> Option<usize> {
+    fn released_prefix(&self, agreed: &IntervalSet<Value>) -> Option<u64> {
         // Intervals in a set over a discrete domain are sorted and non-adjacent,
         // so the run starting at `start_idx` is the whole of the first interval.
         let released = self.live_window().intersection(agreed);
@@ -287,7 +287,7 @@ mod tests {
 
     /// The indices `lo..=hi`, the shape a producer's accumulated released set
     /// takes once it has consumed a contiguous run.
-    fn covering(lo: usize, hi: usize) -> Predicate {
+    fn covering(lo: u64, hi: u64) -> Predicate {
         Predicate::Intervals(IntervalSet::from(Interval::closed(
             Value::UInt(lo),
             Value::UInt(hi),

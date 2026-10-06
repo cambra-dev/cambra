@@ -564,7 +564,7 @@ fn a_correlated_inner_comprehension_without_an_aggregate() {
         Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::UInts(vec![0, 1, 0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 2, 4]))),
                 Predicate::False,
@@ -787,10 +787,10 @@ fn a_correlated_comprehension_nests_without_an_aggregate() {
         Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::UInts(vec![0, 1, 0, 1]),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0, 2, 4, 6]),
+                    vec![0, 2, 4, 6],
                     ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1, 0, 1]),
                     Box::new(Tile::Scalar(ColumnValue::Ints(vec![
                         1, 2, 2, 4, 2, 4, 4, 8,

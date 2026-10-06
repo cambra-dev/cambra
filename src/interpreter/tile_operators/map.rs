@@ -1240,7 +1240,7 @@ mod tests {
             Tile::data_function(
                 ColumnValue::UInts(vec![0]),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0]),
+                    vec![0],
                     ColumnValue::UInts(vec![1]),
                     Box::new(Tile::Scalar(ColumnValue::UInts(vec![1]))),
                     Predicate::False,
@@ -1308,7 +1308,7 @@ mod tests {
         let two_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::UInts(vec![10, 20, 30]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200, 300]))),
                 Predicate::False,
@@ -1394,11 +1394,7 @@ mod tests {
                 }
 
                 // Verify offsets: [0, 2, 3]
-                if let ColumnValue::UInts(offs) = offsets {
-                    assert_eq!(*offs, vec![0, 2, 3], "offsets should be [0, 2, 3]");
-                } else {
-                    panic!("offsets should be UInts");
-                }
+                assert_eq!(*offsets, vec![0, 2, 3], "offsets should be [0, 2, 3]");
 
                 // Verify domain2: [10, 20, 30, 30]
                 if let ColumnValue::UInts(d2) = domain2 {
@@ -1444,7 +1440,7 @@ mod tests {
         let two_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::UInts(vec![10, 20]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
                 Predicate::False,
@@ -1518,7 +1514,7 @@ mod tests {
         let two_level_fn_tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::UInts(vec![10, 20]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![100, 200]))),
                 Predicate::False,
@@ -1598,7 +1594,7 @@ mod tests {
                 (
                     "xs".to_string(),
                     Tile::grouped(
-                        ColumnValue::UInts(vec![0]),
+                        vec![0],
                         ColumnValue::UInts(vec![7]),
                         Box::new(Tile::Scalar(ColumnValue::UInts(vec![70]))),
                         Predicate::True,
@@ -1610,7 +1606,7 @@ mod tests {
             BitSet::new(),
         );
         // Every input row holds argument 5, and the rows through `upto` are complete.
-        let input_at = |keys: Vec<usize>, upto: usize| {
+        let input_at = |keys: Vec<u64>, upto: u64| {
             let n = keys.len();
             Tile::data_function(
                 ColumnValue::UInts(keys),
@@ -1680,7 +1676,7 @@ mod tests {
         let input = Tile::data_function(
             ColumnValue::UInts(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0]),
+                vec![0],
                 ColumnValue::UInts(vec![0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![5, 6]))),
                 Predicate::qualified(
@@ -1692,7 +1688,7 @@ mod tests {
             Predicate::False,
             BitSet::new(),
         );
-        let f_at = |keys: Vec<usize>| {
+        let f_at = |keys: Vec<u64>| {
             let vals: Vec<i64> = keys.iter().map(|k| *k as i64 * 10).collect();
             let pred = Predicate::from_column_value(&ColumnValue::UInts(keys.clone()));
             Tile::data_function(
@@ -1740,7 +1736,7 @@ mod tests {
         let groups = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::UInts(vec![0, 1, 2]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
                 Predicate::True,
@@ -1839,7 +1835,7 @@ mod tests {
         let c_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let out_tiling = in_tiling.clone();
         // Key 0 is filtered out (deleted); every other key is live.
-        let input_at = |keys: Vec<usize>, vals: Vec<i64>, upto: usize| {
+        let input_at = |keys: Vec<u64>, vals: Vec<i64>, upto: u64| {
             Tile::data_function(
                 ColumnValue::UInts(keys),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vals))),
@@ -1907,7 +1903,7 @@ mod tests {
         let input = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::UInts(vec![10, 10]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 10]))),
                 inner_stated,
@@ -1923,7 +1919,7 @@ mod tests {
             Some(vec![TilePathStep::Codomain]),
         );
         let _ = producer.get(producer.tiling().universal_guard());
-        let beneath = |outer: usize| {
+        let beneath = |outer: u64| {
             TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
                 FunctionGuard::Domain(Predicate::qualified(
                     Predicate::point(Value::UInt(outer)),

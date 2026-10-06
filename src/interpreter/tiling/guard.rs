@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn a_domain_prefix_names_everything_up_to_its_path() {
         let g = domain_prefix(vec![Value::UInt(1), Value::UInt(2)]);
-        let covers = |a: usize, b: usize| g.covers_path(&[Value::UInt(a), Value::UInt(b)]);
+        let covers = |a: u64, b: u64| g.covers_path(&[Value::UInt(a), Value::UInt(b)]);
         assert!(
             covers(0, 0) && covers(0, 99),
             "rows before the head, whole: {g:?}"
@@ -1138,7 +1138,7 @@ mod tests {
 
     // ── TileGuard::union: absorbing what a shallower arm names whole ─────────
 
-    fn at(row: usize, positions: Predicate) -> Predicate {
+    fn at(row: u64, positions: Predicate) -> Predicate {
         Predicate::qualified(Predicate::point(Value::UInt(row)), positions)
     }
 
@@ -1180,7 +1180,7 @@ mod tests {
     /// the outermost level covers the paths two levels in that run through it.
     #[test]
     fn union_drops_a_covered_region_two_levels_in() {
-        let path = |outer: usize, middle: usize| {
+        let path = |outer: u64, middle: u64| {
             Predicate::qualified(
                 Predicate::qualified(
                     Predicate::point(Value::UInt(outer)),
@@ -1355,12 +1355,12 @@ mod tests {
     }
 
     /// A domain guard over the positions up to and including `bound`.
-    fn upto(bound: usize) -> TileGuard {
+    fn upto(bound: u64) -> TileGuard {
         domain_guard(Predicate::at_or_below(Value::UInt(bound)))
     }
 
     /// `upto` one level in, so an `Or` of the two has an arm per level.
-    fn inner_upto(bound: usize) -> TileGuard {
+    fn inner_upto(bound: u64) -> TileGuard {
         codomain_guard(upto(bound))
     }
 

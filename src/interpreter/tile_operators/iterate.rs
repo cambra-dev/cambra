@@ -114,7 +114,7 @@ struct IterateExtentProducer {
     base: ProducerBase,
     /// The extent being iterated.
     ///
-    /// For `UIntRange` extents this is an `IntervalSet<usize>` that shrinks
+    /// For `UIntRange` extents this is an `IntervalSet<u64>` that shrinks
     /// directly as sub-intervals are released.
     extent: Extent,
     /// Accumulates every predicate that has been released so far.
@@ -165,15 +165,15 @@ fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
 }
 
 /// Convert a `IntervalSet<Value::UInt>` values into an
-/// `IntervalSet<usize>`, preserving bound types.
+/// `IntervalSet<u64>`, preserving bound types.
 ///
 /// Discrete `Value` intervals are normalised to closed form by `intervalsets`,
-/// so the resulting `usize` intervals are also closed.
-fn predicate_intervals_to_usize(intervals: &IntervalSet<Value>) -> IntervalSet<usize> {
+/// so the resulting `u64` intervals are also closed.
+fn predicate_intervals_to_u64(intervals: &IntervalSet<Value>) -> IntervalSet<u64> {
     IntervalSet::from_iter(intervals.intervals().iter().map(|iv| {
         // Left-unbounded intervals (e.g. (-∞, 3]) are clamped to [0, r] since
         // UIntRange indices are always non-negative.
-        let left: usize = iv.lval().map_or(0, |v| v.as_uint());
+        let left: u64 = iv.lval().map_or(0, |v| v.as_uint());
         match iv.rval() {
             Some(r) => Interval::closed(left, r.as_uint()),
             None => Interval::closed_unbound(left),
@@ -184,7 +184,7 @@ fn predicate_intervals_to_usize(intervals: &IntervalSet<Value>) -> IntervalSet<u
 /// Release values from `extent` that are covered by `pred`.
 ///
 /// For [`Extent::UIntRange`] extents, released sub-intervals are subtracted
-/// directly from the stored [`IntervalSet<usize>`], so arbitrary non-contiguous
+/// directly from the stored [`IntervalSet<u64>`], so arbitrary non-contiguous
 /// releases are handled without any external accumulator.
 fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
     match extent {
@@ -232,12 +232,12 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
         }
         Extent::UIntRange(remaining) => match pred {
             Predicate::True => {
-                *remaining = IntervalSet::from(Interval::<usize>::empty());
+                *remaining = IntervalSet::from(Interval::<u64>::empty());
             }
             Predicate::False => {}
             Predicate::Intervals(intervals) => {
                 // Subtract the released sub-intervals directly from the remaining set.
-                let to_remove = predicate_intervals_to_usize(intervals);
+                let to_remove = predicate_intervals_to_u64(intervals);
                 *remaining = remaining.difference(&to_remove);
             }
             _ => todo!("Got {pred:?} for UIntRange"),
@@ -280,7 +280,7 @@ fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
         Extent::UIntRange(remaining) => {
             // Discrete intervals are normalised to closed bounds, so iterate
             // each [a, b] as a..=b to produce all remaining indices.
-            let values: Vec<usize> = remaining
+            let values: Vec<u64> = remaining
                 .intervals()
                 .iter()
                 .flat_map(|iv| {
@@ -425,8 +425,8 @@ mod tests {
         );
     }
 
-    /// Helper: extract the `IntervalSet<usize>` from a `UIntRange` extent.
-    fn uint_range_set(extent: &Extent) -> &IntervalSet<usize> {
+    /// Helper: extract the `IntervalSet<u64>` from a `UIntRange` extent.
+    fn uint_range_set(extent: &Extent) -> &IntervalSet<u64> {
         let Extent::UIntRange(s) = extent else {
             panic!("expected UIntRange, got {extent:?}");
         };
@@ -450,7 +450,7 @@ mod tests {
         let mut extent = Extent::uint_range(5); // [0, 4]
         release_extent(&mut extent, &Predicate::False, "");
         let s = uint_range_set(&extent);
-        for i in 0..5usize {
+        for i in 0..5u64 {
             assert!(s.contains(&i), "{i} should still be present");
         }
     }
@@ -461,10 +461,10 @@ mod tests {
         let mut extent = Extent::uint_range(10); // [0, 9]
         release_extent(&mut extent, &Predicate::at_or_below(Value::UInt(4)), "");
         let s = uint_range_set(&extent);
-        for i in 0..=4usize {
+        for i in 0..=4u64 {
             assert!(!s.contains(&i), "{i} should be released");
         }
-        for i in 5..10usize {
+        for i in 5..10u64 {
             assert!(s.contains(&i), "{i} should remain");
         }
     }
@@ -477,10 +477,10 @@ mod tests {
         let mut extent = Extent::uint_range(10);
         release_extent(&mut extent, &p, "");
         let s = uint_range_set(&extent);
-        assert!(!s.contains(&2usize), "2 should be released");
-        assert!(!s.contains(&3usize), "3 should be released");
-        assert!(!s.contains(&7usize), "7 should be released");
-        for i in [0, 1, 4, 5, 6, 8, 9usize] {
+        assert!(!s.contains(&2u64), "2 should be released");
+        assert!(!s.contains(&3u64), "3 should be released");
+        assert!(!s.contains(&7u64), "7 should be released");
+        for i in [0, 1, 4, 5, 6, 8, 9u64] {
             assert!(s.contains(&i), "{i} should remain");
         }
     }
@@ -494,10 +494,10 @@ mod tests {
         let mut extent = Extent::uint_range(10); // [0, 9]
         release_extent(&mut extent, &p, "");
         let s = uint_range_set(&extent);
-        for i in 0..5usize {
+        for i in 0..5u64 {
             assert!(s.contains(&i), "{i} should remain");
         }
-        for i in 5..10usize {
+        for i in 5..10u64 {
             assert!(!s.contains(&i), "{i} should be released");
         }
     }
@@ -516,11 +516,11 @@ mod tests {
         let Extent::UIntRange(ref remaining) = extent else {
             panic!("expected UIntRange");
         };
-        assert!(!remaining.contains(&0usize), "0 should be released");
-        assert!(!remaining.contains(&3usize), "3 should be released");
-        assert!(remaining.contains(&4usize), "4 should remain");
-        assert!(!remaining.contains(&7usize), "7 should be released");
-        assert!(remaining.contains(&9usize), "9 should remain");
+        assert!(!remaining.contains(&0u64), "0 should be released");
+        assert!(!remaining.contains(&3u64), "3 should be released");
+        assert!(remaining.contains(&4u64), "4 should remain");
+        assert!(!remaining.contains(&7u64), "7 should be released");
+        assert!(remaining.contains(&9u64), "9 should remain");
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
         let mut extent = Extent::uint_range(5);
         // release [1,3]
         if let Extent::UIntRange(ref mut set) = extent {
-            let to_remove = IntervalSet::from(Interval::closed(1usize, 3usize));
+            let to_remove = IntervalSet::from(Interval::closed(1u64, 3u64));
             *set = set.difference(&to_remove);
         }
         let tiling = Tiling::data_function(extent.clone(), Tiling::Scalar(extent.clone()));

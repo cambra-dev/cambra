@@ -1402,7 +1402,7 @@ mod tests {
         let witness = Type::WitnessRef(*wv.id());
         // Two guarded arms, each a concrete collection — the shape a conditional
         // collection has once `box` is gone and the sum has been opened.
-        let arm = |dom: usize| {
+        let arm = |dom: u64| {
             Expr::new(TypedExprNode::Var(Name::from("xs")))
                 .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
         };
@@ -1459,7 +1459,7 @@ mod tests {
         // domains have no common type, so the arms of a conditional that types as a sum
         // are one-candidate sums themselves. An unboxed arm is not merely unrealistic
         // here — it is ill-typed.
-        let arm = |dom: usize| {
+        let arm = |dom: u64| {
             let coll = Type::data_fun(Type::UIntRange(dom), int.clone());
             let aw = fresh_witness_binder_id();
             let awit = Witness::bound_to(aw, TypeKind::Enumerated(vec![Type::UIntRange(dom)]));
@@ -1473,7 +1473,7 @@ mod tests {
         };
         let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
         // `let x = (arm₀ if _ else arm₁) in x`, the conditional typed over `candidates`.
-        let bind_to = |candidates: Vec<Type>, arms: [usize; 2]| {
+        let bind_to = |candidates: Vec<Type>, arms: [u64; 2]| {
             let w = fresh_witness_binder_id();
             let wit = Witness::bound_to(w, TypeKind::Enumerated(candidates));
             let occurrence = Type::WitnessRef(*wit.id());

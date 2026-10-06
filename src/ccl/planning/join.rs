@@ -876,7 +876,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                     // incomparable — stamping the capability kind here makes the
                     // post-planning wall reject the node against its own rule.
                     .with_ty(Type::data_fun(
-                        Type::UIntRange(indices_to_flatten.len()),
+                        Type::index_range(indices_to_flatten.len()),
                         Type::Base(BaseType::Int),
                     )),
                     Builtin::FlattenDomain,
@@ -987,7 +987,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     // incomparable — the capability kind here is a claim the node's own rule
     // contradicts at the next wall.
     .with_ty(Type::data_fun(
-        Type::UIntRange(perm.len()),
+        Type::index_range(perm.len()),
         Type::Base(BaseType::Int),
     ));
 

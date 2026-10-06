@@ -630,7 +630,7 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 2]),
+                vec![0, 2],
                 ColumnValue::UInts(vec![0, 1, 0, 1]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 9, 2, 10]))),
                 Predicate::False,
@@ -679,7 +679,7 @@ mod tests {
         let out = lookup.get(lookup.tiling().universal_guard());
         let levels = out.key_levels();
         assert_eq!(*levels[0].1, ColumnValue::UInts(vec![0, 1]));
-        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(*levels[1].0, vec![0, 2]);
         assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 1, 0, 1]));
         assert_eq!(
             scalar_tile_to_column_value(out.deepest_values().clone()),
@@ -709,7 +709,7 @@ mod tests {
             ColumnValue::UInts(vec![0, 1]),
             "both rows stand"
         );
-        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 1]), "one key each");
+        assert_eq!(*levels[1].0, vec![0, 1], "one key each");
         assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 0]));
         assert_eq!(
             scalar_tile_to_column_value(out.deepest_values().clone()),
@@ -733,8 +733,8 @@ mod tests {
         else {
             panic!("a group per row: {out:?}")
         };
-        let row = |r: usize| vec![Value::UInt(r)];
-        let key = |r: usize, k: usize| vec![Value::UInt(r), Value::UInt(k)];
+        let row = |r: u64| vec![Value::UInt(r)];
+        let key = |r: u64, k: u64| vec![Value::UInt(r), Value::UInt(k)];
         assert!(!rows.contains_path(&row(0)) && !rows.contains_path(&row(1)));
         assert!(
             rows.contains_path(&row(2)),

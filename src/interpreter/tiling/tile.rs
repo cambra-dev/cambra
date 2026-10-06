@@ -12,8 +12,8 @@ use super::guard::domain_prefix;
 use crate::{
     ccl::AggregateKind,
     interpreter::{
-        BinOpKind, ColumnValue, Extent, FunctionGuard, LogicKind, Position, Predicate, TileGuard,
-        Tiling, Value, apply_binop_column, tuple_field,
+        BinOpKind, ColumnValue, Extent, FunctionGuard, LogicKind, Position, Predicate, RowIndex,
+        TileGuard, Tiling, Value, apply_binop_column, tuple_field,
     },
 };
 
@@ -58,7 +58,7 @@ pub enum Tile {
         /// gone is absent from `domain` instead.
         ///
         /// At the top level this is `[0]` — the one row, whose group is the whole collection.
-        row_starts: ColumnValue,
+        row_starts: Vec<RowIndex>,
         /// Every row's keys, run together. Unique within a row and otherwise in the order
         /// they were delivered, which is what [`valid_over`] checks and all a lookup
         /// inside a row assumes.
@@ -467,10 +467,7 @@ impl Tile {
                 "a whole collection is its one row's group"
             );
         } else {
-            let (ColumnValue::UInts(s), ColumnValue::UInts(o)) = (&mut *s_starts, o_starts) else {
-                panic!("row_starts is a column of positions")
-            };
-            s.extend(o.into_iter().map(|start| start + shift));
+            s_starts.extend(o_starts.into_iter().map(|start| start + shift));
         }
         s_domain.append(o_domain);
         s_codomain.merge_part(*o_codomain, false);
@@ -827,7 +824,7 @@ impl Tile {
             }
         }
         let regrouped = Tile::DataFunction {
-            row_starts: ColumnValue::UInts(starts),
+            row_starts: starts,
             domain: domain.select_indices(picked.iter().copied(), picked.len()),
             codomain: Box::new(codomain.select_rows(&picked)),
             domain_predicate: domain_predicate.clone(),
@@ -857,7 +854,7 @@ impl Tile {
         else {
             panic!("retain_keys is a collection's: {self:?}")
         };
-        let starts = level_offsets(row_starts).to_vec();
+        let starts = row_starts.to_vec();
         let mut new_starts = Vec::with_capacity(starts.len());
         let mut kept = 0usize;
         for row in 0..starts.len() {
@@ -874,7 +871,7 @@ impl Tile {
         }
         *domain = domain.select_indices(survivors.iter().copied(), survivors.len());
         *deleted = moved;
-        *row_starts = ColumnValue::UInts(new_starts);
+        *row_starts = new_starts;
         codomain.retain_rows(mask);
     }
 
@@ -1234,18 +1231,12 @@ impl Tile {
         domain_predicate: Predicate,
         deleted: BitSet,
     ) -> Tile {
-        Tile::grouped(
-            ColumnValue::UInts(vec![0]),
-            domain,
-            codomain,
-            domain_predicate,
-            deleted,
-        )
+        Tile::grouped(vec![0], domain, codomain, domain_predicate, deleted)
     }
 
     /// A collection grouped under `row_starts`, with dev-build-only validation.
     pub fn grouped(
-        row_starts: ColumnValue,
+        row_starts: Vec<RowIndex>,
         domain: ColumnValue,
         codomain: Box<Tile>,
         domain_predicate: Predicate,
@@ -1365,13 +1356,8 @@ impl Tile {
             panic!("a regrouped level is a collection")
         };
         let mut out = self.clone();
-        *out.values_at_mut(level) = Tile::grouped(
-            ColumnValue::UInts(starts),
-            rebuilt_keys,
-            codomain,
-            domain_predicate,
-            deleted,
-        );
+        *out.values_at_mut(level) =
+            Tile::grouped(starts, rebuilt_keys, codomain, domain_predicate, deleted);
         out
     }
 
@@ -1581,7 +1567,7 @@ impl Tile {
     ///
     /// A record ends the chain ([`Self::holds_a_level`]), so a caller comparing skeletons
     /// compares the levels the two tiles share above their values.
-    pub fn key_levels(&self) -> Vec<(&ColumnValue, &ColumnValue)> {
+    pub fn key_levels(&self) -> Vec<(&[RowIndex], &ColumnValue)> {
         let mut levels = Vec::new();
         let mut node = self;
         while let Tile::DataFunction {
@@ -1591,7 +1577,7 @@ impl Tile {
             ..
         } = node
         {
-            levels.push((row_starts, domain));
+            levels.push((row_starts.as_slice(), domain));
             node = codomain;
         }
         levels
@@ -2144,7 +2130,7 @@ impl Tile {
         else {
             panic!("row_run is a collection's: {self:?}")
         };
-        level_run(level_offsets(row_starts), row, domain.len())
+        level_run(row_starts, row, domain.len())
     }
 
     /// Every row's half-open run of `domain`, in row order: [`Self::row_run`] for each row.
@@ -2155,7 +2141,7 @@ impl Tile {
         else {
             panic!("row_runs is a collection's: {self:?}")
         };
-        let offsets = level_offsets(row_starts);
+        let offsets = row_starts;
         (0..offsets.len()).map(move |row| level_run(offsets, row, domain.len()))
     }
 
@@ -2295,25 +2281,18 @@ pub fn live_keys<'a>(
 }
 
 /// A collection's own `row_starts`, for the validation a constructor does.
-fn level_offsets_of(tile: &Tile) -> &[usize] {
+fn level_offsets_of(tile: &Tile) -> &[RowIndex] {
     let Tile::DataFunction { row_starts, .. } = tile else {
         unreachable!("only a collection is constructed this way")
     };
-    level_offsets(row_starts)
-}
-
-fn level_offsets(offsets: &ColumnValue) -> &[usize] {
-    match offsets {
-        ColumnValue::UInts(v) => v,
-        other => panic!("Function offsets must be UInts, got {other:?}"),
-    }
+    row_starts
 }
 
 /// The half-open run of level-below indices belonging to element `i`.
 ///
 /// The last element runs to the end of the level, which is why the level's length is
 /// needed: the offsets column stores starts only.
-fn level_run(offsets: &[usize], i: usize, below_len: usize) -> (usize, usize) {
+fn level_run(offsets: &[RowIndex], i: usize, below_len: usize) -> (usize, usize) {
     let start = offsets[i];
     let end = if i + 1 < offsets.len() {
         offsets[i + 1]
@@ -2330,8 +2309,8 @@ fn level_run(offsets: &[usize], i: usize, below_len: usize) -> (usize, usize) {
 /// hand rather than a tile to descend.
 pub fn nest_levels(
     levels: Vec<ColumnValue>,
-    starts: Vec<ColumnValue>,
-    innermost: Box<Tile>,
+    starts: Vec<Vec<RowIndex>>,
+    innermost: Tile,
     domain_predicate: Predicate,
 ) -> Tile {
     assert_eq!(
@@ -2339,7 +2318,7 @@ pub fn nest_levels(
         levels.len(),
         "one starts column between each adjacent pair of levels"
     );
-    let mut built = *innermost;
+    let mut built = innermost;
     for (level, keys) in levels.into_iter().enumerate().rev() {
         built = if level == 0 {
             Tile::data_function(
@@ -2381,7 +2360,7 @@ pub(crate) fn store_frontier_rows(
     }
     let len = positions.len();
     Tile::grouped(
-        ColumnValue::UInts(starts),
+        starts,
         ColumnValue::from_values(positions, domain),
         Box::new(Tile::Scalar(ColumnValue::Units(len))),
         complete,
@@ -2649,8 +2628,8 @@ fn merged_rows(
                 deleted: r_deleted,
             },
         ) => {
-            let l_offsets = level_offsets(l_starts);
-            let r_offsets = level_offsets(r_starts);
+            let l_offsets = l_starts;
+            let r_offsets = r_starts;
             // One entry per key of the result, naming which side's key column holds it.
             // The rows of the level below are this level's keys, so the same list is what
             // merges them.
@@ -2746,7 +2725,7 @@ fn merged_rows(
                 .map(|(at, _)| at)
                 .collect();
             Tile::DataFunction {
-                row_starts: ColumnValue::UInts(starts),
+                row_starts: starts,
                 domain: combined.select_indices(picked.iter().copied(), picked.len()),
                 codomain: Box::new(merged_rows(
                     l_codomain,
@@ -2999,9 +2978,7 @@ fn valid_over_settled(
             domain_predicate,
             deleted,
         } => {
-            let ColumnValue::UInts(starts) = row_starts else {
-                return false;
-            };
+            let starts = row_starts;
             // A run per row, beginning at 0, non-decreasing, and ending inside `domain`.
             if starts.len() != rows
                 || starts.first().is_some_and(|s| *s != 0)
@@ -3151,7 +3128,7 @@ mod tests {
     /// Keys `0, 1` under each of two enclosing rows, with `deleted` marking column indices.
     fn two_rows_of_two_keys(deleted: &[usize]) -> Tile {
         Tile::DataFunction {
-            row_starts: ColumnValue::UInts(vec![0, 2]),
+            row_starts: vec![0, 2],
             domain: ColumnValue::UInts(vec![0, 1, 0, 1]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 20, 21]))),
             domain_predicate: Predicate::False,
@@ -3198,7 +3175,7 @@ mod tests {
             BitSet::new(),
         );
         let guard = tile.deleted_keys_guard().expect("the deleted key is named");
-        let path = |outer: usize, inner: usize| [Value::UInt(outer), Value::UInt(inner)];
+        let path = |outer: u64, inner: u64| [Value::UInt(outer), Value::UInt(inner)];
         assert!(guard.covers_path(&path(0, 1)), "{guard:?}");
         assert!(!guard.covers_path(&path(1, 1)), "{guard:?}");
         assert!(!guard.covers_path(&path(0, 0)), "{guard:?}");
@@ -3207,11 +3184,11 @@ mod tests {
     // ── Merging a collection delivered row by row ─────────────────────────────
 
     /// One enclosing row's group, for a collection of collections.
-    fn one_group(row: usize, inner: Vec<usize>, values: Vec<i64>) -> Tile {
+    fn one_group(row: u64, inner: Vec<u64>, values: Vec<i64>) -> Tile {
         Tile::data_function(
             ColumnValue::from_uints(vec![row]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(inner),
                 Box::new(Tile::Scalar(ColumnValue::Ints(values))),
                 Predicate::True,
@@ -3225,7 +3202,7 @@ mod tests {
     // ── Three collection levels ───────────────────────────────────────────────
 
     /// One `A` key's contribution: the key, then its `B` keys, each with its `C` entries.
-    type ThreeLevelGroup<'a> = (usize, &'a [(usize, &'a [(usize, i64)])]);
+    type ThreeLevelGroup<'a> = (u64, &'a [(u64, &'a [(u64, i64)])]);
 
     /// `A ⤇ B ⤇ C ⤇ Int`, every group named.
     ///
@@ -3246,14 +3223,14 @@ mod tests {
             }
         }
         let c = Tile::grouped(
-            ColumnValue::UInts(c_starts),
+            c_starts,
             ColumnValue::from_uints(c_keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(values))),
             Predicate::False,
             BitSet::new(),
         );
         let b = Tile::grouped(
-            ColumnValue::UInts(b_starts),
+            b_starts,
             ColumnValue::from_uints(b_keys),
             Box::new(c),
             Predicate::False,
@@ -3339,7 +3316,7 @@ mod tests {
     }
 
     /// One row's group taken out as a collection of its own.
-    fn group(keys: Vec<usize>, values: Vec<i64>, stated: Predicate) -> Tile {
+    fn group(keys: Vec<u64>, values: Vec<i64>, stated: Predicate) -> Tile {
         Tile::data_function(
             ColumnValue::UInts(keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(values))),
@@ -3379,7 +3356,7 @@ mod tests {
             ColumnValue::UInts(vec![0, 1]),
             "the rows stand"
         );
-        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 1]));
+        assert_eq!(*levels[1].0, vec![0, 1]);
         assert_eq!(*levels[1].1, ColumnValue::UInts(vec![5, 6, 7]));
         let Tile::DataFunction {
             domain_predicate: stated,
@@ -3388,7 +3365,7 @@ mod tests {
         else {
             panic!("the rebuilt level is a collection: {rebuilt:?}")
         };
-        let at = |r: usize, k: usize| stated.contains_path(&[Value::UInt(r), Value::UInt(k)]);
+        let at = |r: u64, k: u64| stated.contains_path(&[Value::UInt(r), Value::UInt(k)]);
         assert!(
             at(1, 6) && at(1, 7),
             "row 1's group said it is complete: {stated:?}"
@@ -3406,7 +3383,7 @@ mod tests {
     fn regroup_beneath_with_no_rows_answers_the_empty_level() {
         let empty = two_level_uint_int(vec![], vec![], vec![], vec![], Predicate::False);
         let level = Tile::grouped(
-            ColumnValue::UInts(Vec::new()),
+            Vec::new(),
             ColumnValue::UInts(Vec::new()),
             Box::new(Tile::Scalar(ColumnValue::Ints(Vec::new()))),
             Predicate::True,
@@ -3469,7 +3446,7 @@ mod tests {
         let mut tile = abc();
         let gone = [Value::UInt(10), Value::UInt(2), Value::UInt(200)];
         tile.retain_paths(CurryLevel::new(2), &|p: &[Value]| p != gone);
-        let u = |v: [usize; 3]| v.iter().map(|k| Value::UInt(*k)).collect::<Vec<_>>();
+        let u = |v: [u64; 3]| v.iter().map(|k| Value::UInt(*k)).collect::<Vec<_>>();
         assert_eq!(
             tile.paths_at(CurryLevel::new(2)),
             vec![u([10, 1, 100]), u([10, 2, 201]), u([20, 3, 300])]
@@ -3559,7 +3536,7 @@ mod tests {
         let tile = Tile::data_function(
             domain,
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::from_uints(vec![10, 20]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
                 Predicate::False,
@@ -3597,10 +3574,10 @@ mod tests {
     #[test]
     fn an_empty_column_under_a_settled_key_is_invalid_by_its_path() {
         let tile = |inner_statement: Predicate| Tile::DataFunction {
-            row_starts: ColumnValue::from_uints(vec![0]),
+            row_starts: vec![0],
             domain: ColumnValue::from_uints(vec![0]),
             codomain: Box::new(Tile::DataFunction {
-                row_starts: ColumnValue::from_uints(vec![0]),
+                row_starts: vec![0],
                 domain: ColumnValue::from_uints(vec![5]),
                 codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
                 domain_predicate: inner_statement,
@@ -3670,7 +3647,7 @@ mod tests {
             unreachable!()
         };
         let short = Tile::DataFunction {
-            row_starts: ColumnValue::UInts(vec![0, 1]),
+            row_starts: vec![0, 1],
             domain: c_domain,
             codomain: c_values,
             domain_predicate: Predicate::False,
@@ -3846,7 +3823,7 @@ mod tests {
 
     /// One `K` key's contribution: the key, the `n` value this delivery carries for it,
     /// and the `xs` entries under it.
-    type RecordGroup<'a> = (usize, Option<i64>, &'a [(usize, i64)]);
+    type RecordGroup<'a> = (u64, Option<i64>, &'a [(u64, i64)]);
 
     /// `K ⤇ {n: Int, xs: (J ⤇ Int)}`, one `K` key per group.
     ///
@@ -3871,7 +3848,7 @@ mod tests {
             inner_values.extend(entries.iter().map(|(_, v)| *v));
         }
         let b = Tile::grouped(
-            ColumnValue::UInts(starts),
+            starts,
             ColumnValue::from_uints(inner_keys),
             Box::new(Tile::Scalar(ColumnValue::Ints(inner_values))),
             inner_pred,
@@ -4023,7 +4000,7 @@ mod tests {
         };
         // Built as a literal: the constructor would refuse it.
         let overfull = Tile::DataFunction {
-            row_starts: ColumnValue::from_uints(vec![0]),
+            row_starts: vec![0],
             domain: ColumnValue::from_uints(vec![0, 1]),
             codomain: Box::new(Tile::Record {
                 fields: HashMap::from([
@@ -4134,7 +4111,7 @@ mod tests {
         let Some(TileGuard::Function(FunctionGuard::Domain(held))) = fields.get("xs") else {
             panic!("the collection field names the inner keys it holds: {fields:?}");
         };
-        let at = |k: usize, j: usize| held.contains_path(&[Value::UInt(k), Value::UInt(j)]);
+        let at = |k: u64, j: u64| held.contains_path(&[Value::UInt(k), Value::UInt(j)]);
         assert!(
             at(0, 100) && at(1, 200),
             "each inner key is named under the row holding it: {held:?}"
@@ -4231,7 +4208,7 @@ mod tests {
     /// producer would deliver it again into a consumer that already holds it.
     #[test]
     fn to_guard_names_a_complete_key_under_an_open_row_whole() {
-        let at = |outer: usize, key: usize| {
+        let at = |outer: u64, key: u64| {
             Predicate::qualified(
                 Predicate::point(Value::UInt(outer)),
                 Predicate::point(Value::UInt(key)),
@@ -4240,14 +4217,14 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::from_uints(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::from_uints(vec![0]),
+                vec![0],
                 ColumnValue::from_uints(vec![0]),
                 Box::new(Tile::record(HashMap::from([
                     ("_0".to_string(), Tile::Scalar(ColumnValue::Ints(vec![0]))),
                     (
                         "_1".to_string(),
                         Tile::grouped(
-                            ColumnValue::from_uints(vec![0]),
+                            vec![0],
                             ColumnValue::from_uints(vec![0, 1]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
                             Predicate::qualified(at(0, 0), Predicate::True),
@@ -4447,7 +4424,7 @@ mod tests {
     #[test]
     fn compacting_reaches_a_sole_accumulator() {
         let mut accumulator = Tile::grouped(
-            ColumnValue::UInts(vec![0, 2]),
+            vec![0, 2],
             ColumnValue::from_uints(vec![100, 101, 200]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
             Predicate::False,
@@ -4483,7 +4460,7 @@ mod tests {
         );
         assert_eq!(
             row_starts,
-            &ColumnValue::UInts(vec![0, 1]),
+            &vec![0, 1],
             "the first row lost a key, so the second row's run now begins one earlier"
         );
         assert!(
@@ -4614,7 +4591,7 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![]),
+                vec![],
                 ColumnValue::UInts(vec![]),
                 Box::new(Tile::Scalar(ColumnValue::UInts(vec![]))),
                 Predicate::False,
@@ -4640,16 +4617,16 @@ mod tests {
 
     /// Two nested collections: usize keys over usize keys over an int value.
     fn two_level_uint_int(
-        d1: Vec<usize>,
+        d1: Vec<u64>,
         offsets: Vec<usize>,
-        d2: Vec<usize>,
+        d2: Vec<u64>,
         cod: Vec<i64>,
         pred: Predicate,
     ) -> Tile {
         Tile::data_function(
             ColumnValue::UInts(d1),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(offsets),
+                offsets,
                 ColumnValue::UInts(d2),
                 Box::new(Tile::Scalar(ColumnValue::Ints(cod))),
                 Predicate::False,
@@ -4688,7 +4665,7 @@ mod tests {
         // Built as a literal: the constructor's own check is what this is about.
         let mismatched = Tile::DataFunction {
             // One row above, two rows inside the component.
-            row_starts: ColumnValue::UInts(vec![0]),
+            row_starts: vec![0],
             domain: ColumnValue::UInts(vec![0]),
             codomain,
             domain_predicate: Predicate::True,
@@ -4725,7 +4702,7 @@ mod tests {
         else {
             panic!("the component holds a collection per row")
         };
-        assert_eq!(*row_starts, ColumnValue::UInts(vec![0]), "one row survives");
+        assert_eq!(*row_starts, vec![0], "one row survives");
         assert_eq!(
             *domain,
             ColumnValue::UInts(vec![0, 1]),
@@ -4764,10 +4741,10 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![0]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0]),
+                vec![0],
                 ColumnValue::UInts(vec![10, 11]),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0, 2]),
+                    vec![0, 2],
                     ColumnValue::UInts(vec![100, 101, 102, 103]),
                     Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4]))),
                     // Every group open, so every innermost key is named.
@@ -4787,7 +4764,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("level {level} carries a codomain arm, got {at:?}"));
         }
         let pred = domain_arm(at).expect("the innermost level names its keys");
-        let path = |keys: [usize; 3]| keys.map(Value::UInt);
+        let path = |keys: [u64; 3]| keys.map(Value::UInt);
         assert!(
             pred.contains_path(&path([0, 10, 100])) && pred.contains_path(&path([0, 11, 103])),
             "the arm carries the innermost keys, each under its own path, got {pred:?}"
@@ -4825,8 +4802,8 @@ mod tests {
         };
         let rows = values.len();
         Tile::grouped(
-            ColumnValue::UInts((0..rows).map(|r| r * 2).collect()),
-            ColumnValue::UInts((0..rows * 2).map(|i| i % 2).collect()),
+            (0..rows).map(|r| r * 2).collect(),
+            ColumnValue::uints_from_rows((0..rows * 2).map(|i| i % 2)),
             Box::new(Tile::Scalar(
                 values.select_indices((0..rows * 2).map(|i| i / 2), rows * 2),
             )),
@@ -4842,7 +4819,7 @@ mod tests {
         let levels = appended.key_levels();
         assert_eq!(levels.len(), 2, "the input's keys are the level above");
         assert_eq!(*levels[0].1, ColumnValue::Ints(vec![7, 8]));
-        assert_eq!(*levels[1].0, ColumnValue::UInts(vec![0, 2]));
+        assert_eq!(*levels[1].0, vec![0, 2]);
         assert_eq!(*levels[1].1, ColumnValue::UInts(vec![0, 1, 0, 1]));
     }
 
@@ -4853,12 +4830,8 @@ mod tests {
             .append_level(two_keys_per_parent);
         let levels = twice.key_levels();
         assert_eq!(levels.len(), 3, "each append adds one level");
-        assert_eq!(
-            *levels[1].0,
-            ColumnValue::UInts(vec![0, 2]),
-            "level 0 is untouched"
-        );
-        assert_eq!(*levels[2].0, ColumnValue::UInts(vec![0, 2, 4, 6]));
+        assert_eq!(*levels[1].0, vec![0, 2], "level 0 is untouched");
+        assert_eq!(*levels[2].0, vec![0, 2, 4, 6]);
         assert_eq!(levels[2].1.len(), 8);
     }
 
@@ -4952,7 +4925,7 @@ mod tests {
                 unreachable!("the test tile carries a scalar codomain")
             };
             Tile::grouped(
-                ColumnValue::UInts(vec![0, 1, 1]),
+                vec![0, 1, 1],
                 ColumnValue::UInts(vec![0, 0]),
                 Box::new(Tile::Scalar(values.select_indices([0, 2].into_iter(), 2))),
                 Predicate::False,
@@ -4970,7 +4943,7 @@ mod tests {
         else {
             panic!("the appended level is a collection")
         };
-        assert_eq!(*row_starts, ColumnValue::UInts(vec![0, 1, 1]));
+        assert_eq!(*row_starts, vec![0, 1, 1]);
         assert_eq!(
             domain.len(),
             2,
@@ -4992,20 +4965,20 @@ mod tests {
     /// Three because a level only merges its keys where its values are themselves a
     /// collection — under a scalar a repeated key is a re-delivery, not growth.
     fn three_levels_raw(
-        a: Vec<usize>,
+        a: Vec<u64>,
         b_starts: Vec<usize>,
-        b: Vec<usize>,
+        b: Vec<u64>,
         c_starts: Vec<usize>,
-        c: Vec<usize>,
+        c: Vec<u64>,
         values: Vec<i64>,
     ) -> Tile {
         Tile::data_function(
             ColumnValue::UInts(a),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(b_starts),
+                b_starts,
                 ColumnValue::UInts(b),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(c_starts),
+                    c_starts,
                     ColumnValue::UInts(c),
                     Box::new(Tile::Scalar(ColumnValue::Ints(values))),
                     Predicate::False,
@@ -5062,8 +5035,7 @@ mod tests {
             vec![1],
             vec![11],
         ));
-        let key =
-            |a: usize, b: usize, c: usize| vec![Value::UInt(a), Value::UInt(b), Value::UInt(c)];
+        let key = |a: u64, b: u64, c: u64| vec![Value::UInt(a), Value::UInt(b), Value::UInt(c)];
         assert_eq!(
             elements(&tile),
             vec![(key(0, 0, 0), 10), (key(0, 0, 1), 11), (key(0, 1, 0), 20),]
@@ -5117,7 +5089,7 @@ mod tests {
             vec![0, 0],
             vec![20, 40],
         ));
-        let key = |b: usize| vec![Value::UInt(0), Value::UInt(b), Value::UInt(0)];
+        let key = |b: u64| vec![Value::UInt(0), Value::UInt(b), Value::UInt(0)];
         let mut held = elements(&tile);
         held.sort_by_key(|(_, value)| *value);
         assert_eq!(
@@ -5133,7 +5105,7 @@ mod tests {
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(Tile::grouped(
-                ColumnValue::UInts(vec![0, 1]),
+                vec![0, 1],
                 ColumnValue::UInts(vec![3, 4, 5]),
                 Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40, 50]))),
                 Predicate::True,
@@ -5152,7 +5124,7 @@ mod tests {
     /// one under the open row `[1]` survives.
     #[test]
     fn covered_completion_is_dropped_inside_a_record_field() {
-        let under = |row: usize, here: Predicate| {
+        let under = |row: u64, here: Predicate| {
             Predicate::qualified(Predicate::exactly(&[Value::UInt(row)]), here)
         };
         let open_row = under(1, Predicate::below(Value::UInt(5)));
@@ -5161,7 +5133,7 @@ mod tests {
             Box::new(Tile::record(HashMap::from([(
                 tuple_field(0),
                 Tile::grouped(
-                    ColumnValue::UInts(vec![0, 1]),
+                    vec![0, 1],
                     ColumnValue::UInts(vec![3, 4]),
                     Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
                     under(0, Predicate::True).union(&open_row),
@@ -5501,7 +5473,7 @@ mod tests {
             panic!("a codomain arm guards the inner domain, got {codomain:?}")
         };
         // Group 1's keys, named under group 1: groups 0 and 2 are released by their own keys.
-        let at = |row: usize, key: usize| keys.contains_path(&[Value::UInt(row), Value::UInt(key)]);
+        let at = |row: u64, key: u64| keys.contains_path(&[Value::UInt(row), Value::UInt(key)]);
         assert!(at(1, 10) && at(1, 11), "the open group's keys: {keys:?}");
         assert!(
             !at(0, 10) && !at(2, 11),
@@ -5738,7 +5710,7 @@ mod tests {
             ColumnValue::UInts(vec![12]),
             "with its entries"
         );
-        assert_eq!(*row_starts, ColumnValue::UInts(vec![0]));
+        assert_eq!(*row_starts, vec![0]);
     }
 
     #[test]
@@ -6002,11 +5974,11 @@ mod tests {
     /// new keys and then `1`'s, and each aggregation follows its own key.
     #[test]
     fn merging_interleaved_rows_over_aggregations_keeps_each_with_its_key() {
-        let two_groups = |inner: usize, acc: Vec<i64>| {
+        let two_groups = |inner: u64, acc: Vec<i64>| {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::grouped(
-                    ColumnValue::UInts(vec![0, 1]),
+                    vec![0, 1],
                     ColumnValue::from_uints(vec![inner, inner]),
                     Box::new(sums(acc)),
                     Predicate::False,
@@ -6036,7 +6008,7 @@ mod tests {
     /// every key they share, and folds its two contributions by the aggregate's law.
     #[test]
     fn a_regrown_key_folds_the_aggregation_beside_it() {
-        let keyed = |xs: usize, acc: Vec<i64>| {
+        let keyed = |xs: u64, acc: Vec<i64>| {
             Tile::data_function(
                 ColumnValue::from_uints(vec![0, 1]),
                 Box::new(Tile::record(HashMap::from([
@@ -6044,7 +6016,7 @@ mod tests {
                     (
                         "xs".to_string(),
                         Tile::grouped(
-                            ColumnValue::UInts(vec![0, 1]),
+                            vec![0, 1],
                             ColumnValue::from_uints(vec![xs, xs]),
                             Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
                             Predicate::False,

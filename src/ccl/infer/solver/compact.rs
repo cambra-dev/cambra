@@ -45,7 +45,7 @@ pub enum AtomKey {
     /// Primitive (Int, UInt, String, Bool, Unit).
     Prim(BaseType),
     /// Finite index range `[0, n)`.
-    UIntRange(usize),
+    UIntRange(u64),
     /// Externally-registered data source.
     Source(SmolStr),
     /// The transaction-commit domain (nullary, like a base type).

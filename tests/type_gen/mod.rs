@@ -155,7 +155,7 @@ pub fn gen_leaf(rng: &mut Rng) -> Type {
         0 => Type::Base(BaseType::Int),
         1 => Type::Base(BaseType::Bool),
         2 => Type::Base(BaseType::String),
-        3 => Type::UIntRange(2 + rng.below(3) as usize),
+        3 => Type::UIntRange(2 + rng.below(3)),
         4 => Type::DataSource(if rng.chance(1, 2) { "s" } else { "t" }.into()),
         _ => Type::Txn,
     }

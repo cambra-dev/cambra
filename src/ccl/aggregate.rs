@@ -116,7 +116,7 @@ impl AggregateKind {
             (AggregateKind::Min, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MAX]),
             (AggregateKind::Max, Extent::Base(BaseType::UInt)) => ColumnValue::UInts(vec![0]),
             (AggregateKind::Min, Extent::Base(BaseType::UInt)) => {
-                ColumnValue::UInts(vec![usize::MAX])
+                ColumnValue::UInts(vec![u64::MAX])
             }
             (AggregateKind::Max, Extent::Base(BaseType::String)) => {
                 ColumnValue::Strings(vec![SmolStr::default()])
