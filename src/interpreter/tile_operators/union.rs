@@ -9,8 +9,6 @@ use crate::{
         ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value, forwarding_consumer,
         shared_consumer,
     },
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
 };
 
 // ---------------------------------------------------------------------------
@@ -363,7 +361,7 @@ impl TileOperator for UnionOperator {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter_mut()
@@ -381,7 +379,8 @@ impl TileOperator for UnionOperator {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             inputs: input_producers,
             flat: self.flat,
             level: self.level,
@@ -497,11 +496,10 @@ impl UnionProducer {
 impl TileProducer for UnionProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         for (i, p) in self.inputs.iter().enumerate() {
-            node = node.child(format!("_{i}"), p.inspect(opts));
+            visit(&format!("_{i}"), &**p);
         }
-        node
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

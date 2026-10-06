@@ -3,11 +3,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::{
-    interpreter::{ColumnValue, Consumer, Extent, Scheduler, tuple_field},
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
-};
+use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, tuple_field};
 
 /// An operator that permutes the fields of the domain of a `DataFunction`, according
 /// to a specified permutation of field indices.
@@ -121,8 +117,8 @@ struct PermuteRecordDomainProducer {
 }
 
 impl TileProducer for PermuteRecordDomainProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     impl_producer_base!();
@@ -460,8 +456,8 @@ struct FlattenTupleDomainProducer {
 impl TileProducer for FlattenTupleDomainProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

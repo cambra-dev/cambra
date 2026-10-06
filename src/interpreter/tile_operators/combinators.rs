@@ -6,13 +6,9 @@ use std::iter::repeat_n;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::{
-    interpreter::{
-        ColumnValue, Consumer, Extent, Scheduler, Value, forwarding_consumer, shared_consumer,
-        tuple_field,
-    },
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
+use crate::interpreter::{
+    ColumnValue, Consumer, Extent, Scheduler, Value, forwarding_consumer, shared_consumer,
+    tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -169,8 +165,8 @@ impl TileProducer for ConverseProducer {
 
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -421,8 +417,8 @@ struct MapDomainProducer {
 impl TileProducer for MapDomainProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -565,8 +561,8 @@ struct UncurryProducer {
 impl TileProducer for UncurryProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -807,7 +803,7 @@ impl TileOperator for Filter {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
             forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -824,7 +820,8 @@ impl TileOperator for Filter {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
@@ -846,9 +843,9 @@ struct FilterProducer {
 impl TileProducer for FilterProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
-            .child("predicate", self.predicate.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+        visit("predicate", &*self.predicate);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -1097,8 +1094,8 @@ struct RestrictProducer {
 impl TileProducer for RestrictProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("predicate", self.predicate.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("predicate", &*self.predicate);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -1432,7 +1429,7 @@ impl TileOperator for Product {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let level = self
             .paired
             .enclosing()
@@ -1444,7 +1441,8 @@ impl TileOperator for Product {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             outer: self.outer.subscribe(
                 self.outer.tiling().universal_guard(),
                 forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -1486,9 +1484,9 @@ struct ProductProducer {
 impl TileProducer for ProductProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("outer", self.outer.inspect(opts))
-            .child("inner", self.inner.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("outer", &*self.outer);
+        visit("inner", &*self.inner);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

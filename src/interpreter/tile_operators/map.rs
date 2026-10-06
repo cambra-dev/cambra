@@ -187,7 +187,7 @@ impl TileOperator for MapResult {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let function_producer = self.function.subscribe(
             self.function.tiling().universal_guard(),
             forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -204,7 +204,8 @@ impl TileOperator for MapResult {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input: input_producer,
             function: function_producer,
             level: self.level,
@@ -565,9 +566,9 @@ impl MapResultProducer {
 impl TileProducer for MapResultProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("fn", self.function.inspect(opts))
-            .child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("fn", &*self.function);
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -684,7 +685,7 @@ impl TileOperator for MapResultToConst {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let constant_producer = self.constant.subscribe(
             self.constant.tiling().universal_guard(),
             forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -701,7 +702,8 @@ impl TileOperator for MapResultToConst {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -792,9 +794,9 @@ impl MapResultToConstProducer {
 impl TileProducer for MapResultToConstProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
-            .child("constant", self.constant.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+        visit("constant", &*self.constant);
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -1128,6 +1130,10 @@ impl MapResultWithSourceProducer {
 
 impl TileProducer for MapResultWithSourceProducer {
     impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+    }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new(self.name())

@@ -3546,11 +3546,12 @@ fn a_fold_interrupted_partway_resumes_at_the_position_it_reached() {
 /// for a source to report new data.
 ///
 /// An operator notifies from inside `subscribe` — an induction store does, to
-/// start its loop — and a sink consumer whose producer slot is not filled yet
-/// drops that notification. A first compile does not notice, because the source
-/// that has data reports it as new on the next poll. A replacement does: the
-/// version it replaces already took that report, so the request in flight here
-/// went unanswered until another arrived.
+/// start its loop — before the sink consumer's producer slot is filled. The sink's
+/// pull waits on the scheduler's queue and runs at the next delivery. A first
+/// compile would not need it, because the source that has data reports it as new on
+/// the next poll. A replacement does: the version it replaces already took that
+/// report, so without the queued pull the request in flight here would go
+/// unanswered until another arrived.
 ///
 /// Where the fold is cut is a property of one notification round rather than
 /// anything the language promises, so this pins the invariant — every element
@@ -3563,10 +3564,13 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
 
     let (tx, rx) = mpsc::channel::<Vec<String>>();
     thread::spawn(move || tx.send(vec![http_post(port, "/read", "x")]).unwrap());
-    // Let the request arrive, then advance the fold with one poll — which both
-    // takes the source's report of new data and leaves the fold unfinished.
+    // Let the request arrive, then advance the fold a few polls: the first takes the
+    // source's report of new data and each later one runs one lap, and the fold is left
+    // unfinished.
     thread::sleep(Duration::from_millis(400));
-    ctx.scheduler().check_for_notifications();
+    for _ in 0..4 {
+        ctx.scheduler().check_for_notifications();
+    }
     assert!(
         rx.try_recv().is_err(),
         "twenty elements outlast the round that starts them, so the reply is still pending",
@@ -3598,7 +3602,7 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
     );
     // Without this the case degenerates into "a version installed before the
     // fold started is pulled", which the assertions above would still satisfy:
-    // the single poll would have advanced nothing, every element would be the
+    // the polls would have advanced nothing, every element would be the
     // new version's, and `resumed_at` would be `0`. The precondition it needs is
     // that the retired version decided something.
     assert!(

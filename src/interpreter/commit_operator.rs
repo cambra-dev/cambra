@@ -55,17 +55,15 @@ use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::ccl::F_WRITES;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Path, Position, Predicate,
-    Scheduler, SharedConsumer, Tile, TileGuard, Tiling, Value, WakeupQueue, forwarding_consumer,
-    shared_consumer,
+    BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
+    Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue,
+    forwarding_consumer, shared_consumer,
     tile_operators::{
         CycleSlot, CyclicSequencingProducer, Memo, ProducerBase, TileOperator, TileProducer,
         materialize_collections, materialized_row,
     },
     tuple_field, uint_of_row,
 };
-use crate::pretty_graph::VizOptions;
-use crate::pretty_tree::InspectNode;
 
 use crate::interpreter::operator_conversion::{store_key, store_key_name};
 use crate::interpreter::operator_graph::{EdgeRole, InputEdgeSpec, value, value_keyed, value_late};
@@ -1821,8 +1819,8 @@ impl TileOperator for CommitOperator {
         // same both-inputs-wake wiring `AsOf` uses; without it the sink reading a
         // tap off a live commit store would never be notified and would hang.
         // Kick once immediately to start the drain loop.
-        let consumer = shared_consumer(consumer);
-        consumer.borrow_mut().notify();
+        let (consumer, gate) = shared_consumer(consumer);
+        consumer.notify();
         // A seed forwards, rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -1869,7 +1867,8 @@ impl TileOperator for CommitOperator {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             writer_producers,
             consumed: vec![0; n],
             writer_terminal: vec![false; n],
@@ -1974,14 +1973,13 @@ impl CommitProducer {
 }
 
 impl TileProducer for CommitProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        let node = self
-            .writer_producers
-            .iter()
-            .fold(node, |n, w| n.child("writer", w.inspect(opts)));
-        self.seed_producers.iter().fold(node, |n, (key, s)| {
-            n.child(format!("seed {key}"), s.inspect(opts))
-        })
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        for writer in &self.writer_producers {
+            visit("writer", &**writer);
+        }
+        for (key, seed) in &self.seed_producers {
+            visit(&format!("seed {key}"), &**seed);
+        }
     }
 
     fn state_info(&self) -> ProducerStateInfo {
@@ -2481,8 +2479,8 @@ impl TileOperator for InductionStore {
         // re-pulls. Without this the store stalls at whatever prefix arrived by
         // the first pull (a batch/list source is complete on the first pull, so
         // it never needed the wiring — an async source does). Kick once to start.
-        let consumer = shared_consumer(consumer);
-        consumer.borrow_mut().notify();
+        let (consumer, gate) = shared_consumer(consumer);
+        consumer.notify();
         let mut body_op = self.body_input.take().expect(
             "InductionStore: the decision body is unwired at subscribe — either \
                  `body_input_setter` was never called, or this store is being subscribed \
@@ -2521,7 +2519,8 @@ impl TileOperator for InductionStore {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             seed_producers,
             complete_rows: vec![Predicate::False; self.tiling().levels() + 1],
             // Each store holds its accumulators' seeds as its own, so the changelog is
@@ -2551,13 +2550,13 @@ impl TileOperator for InductionStore {
 /// the change is made inside a `get`, where the producers that must re-pull are still on
 /// the stack, so the wake goes through the scheduler's queue ([`WakeupQueue`]).
 struct ChangeNotifier {
-    consumer: SharedConsumer,
+    consumer: GatedConsumer,
     wakeups: WakeupQueue,
     last: Option<Tile>,
 }
 
 impl ChangeNotifier {
-    fn new(consumer: SharedConsumer, scheduler: &Scheduler) -> Self {
+    fn new(consumer: GatedConsumer, scheduler: &Scheduler) -> Self {
         Self {
             consumer,
             wakeups: scheduler.wakeup_queue(),
@@ -2568,7 +2567,7 @@ impl ChangeNotifier {
     /// `tile`, with the consumer woken if it differs from the tile this last passed on.
     fn notify_if_changed(&mut self, tile: Tile) -> Tile {
         if self.last.as_ref() != Some(&tile) {
-            self.wakeups.request(self.consumer.clone());
+            self.wakeups.request(self.consumer.shared().clone());
             self.last = Some(tile.clone());
         }
         tile
@@ -2774,11 +2773,11 @@ impl InductionStoreProducer {
 }
 
 impl TileProducer for InductionStoreProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        let node = node.child("body", self.body_producer.inspect(opts));
-        self.seed_producers.iter().fold(node, |n, (key, s)| {
-            n.child(format!("seed {key}"), s.inspect(opts))
-        })
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("body", &*self.body_producer);
+        for (key, seed) in &self.seed_producers {
+            visit(&format!("seed {key}"), &**seed);
+        }
     }
 
     fn state_info(&self) -> ProducerStateInfo {
@@ -3104,8 +3103,8 @@ impl TileOperator for StoreValueStream {
         // value. Without this, a tap/key reader off a live commit store is only
         // woken once (the kick) and never again. The store starts at its tick-0
         // value, so kick once to start the drain loop.
-        let consumer = shared_consumer(consumer);
-        consumer.borrow_mut().notify();
+        let (consumer, gate) = shared_consumer(consumer);
+        consumer.notify();
         let g = self.store_op.tiling().universal_guard();
         let store_producer = self.store_op.subscribe(
             g,
@@ -3118,7 +3117,8 @@ impl TileOperator for StoreValueStream {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -3150,8 +3150,8 @@ struct StoreValueStreamProducer {
 }
 
 impl TileProducer for StoreValueStreamProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("store", self.store_producer.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
     }
 
     fn base(&self) -> &ProducerBase {
@@ -3346,8 +3346,8 @@ impl TileOperator for StoreFinalRead {
         // Forward store progress downstream, as [`StoreValueStream`] does: the key is
         // not settled until the store says so, and the consumer has to be woken to
         // re-pull when that happens. Kick once to start the drain loop.
-        let consumer = shared_consumer(consumer);
-        consumer.borrow_mut().notify();
+        let (consumer, gate) = shared_consumer(consumer);
+        consumer.notify();
         let g = self.store_op.tiling().universal_guard();
         let store_producer = self.store_op.subscribe(
             g,
@@ -3360,7 +3360,8 @@ impl TileOperator for StoreFinalRead {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -3382,8 +3383,8 @@ struct StoreFinalReadProducer {
 }
 
 impl TileProducer for StoreFinalReadProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("store", self.store_producer.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
     }
 
     fn base(&self) -> &ProducerBase {
@@ -3611,8 +3612,8 @@ impl TileOperator for StoreDenseRead {
         // Wake the consumer on store progress — a newly decided position is both a
         // position to emit and the value to emit there, so it is the only news this
         // read has. Kick once to start.
-        let consumer = shared_consumer(consumer);
-        consumer.borrow_mut().notify();
+        let (consumer, gate) = shared_consumer(consumer);
+        consumer.notify();
         let store_producer = {
             let g = self.store_op.tiling().universal_guard();
             self.store_op.subscribe(
@@ -3627,7 +3628,8 @@ impl TileOperator for StoreDenseRead {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
@@ -3791,8 +3793,8 @@ impl StoreDenseReadProducer {
 }
 
 impl TileProducer for StoreDenseReadProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("store", self.store_producer.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
     }
 
     impl_producer_base!();
@@ -4074,7 +4076,7 @@ impl TileOperator for AsOf {
         // already-seen trigger position finally latch a value — and, crucially,
         // re-pulls until the cyclic store converges (the source's first pull may
         // only propose; later pulls commit and render).
-        let consumer = shared_consumer(consumer);
+        let (consumer, gate) = shared_consumer(consumer);
         let tg = self.trigger.tiling().universal_guard();
         let trigger = self.trigger.subscribe(
             tg,
@@ -4097,7 +4099,8 @@ impl TileOperator for AsOf {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             trigger,
             source,
             output: self.output.clone(),
@@ -4191,9 +4194,9 @@ impl TileProducer for AsOfProducer {
 
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("trigger", self.trigger.inspect(opts))
-            .child("source", self.source.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("trigger", &*self.trigger);
+        visit("source", &*self.source);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -4789,7 +4792,9 @@ impl DriverWindow {
 /// each arrival has to wake the cycle so the new positions get driven. The
 /// **store** does not — it is the cyclic edge, and forwarding it would loop.
 struct DriverInputs {
-    consumer: SharedConsumer,
+    consumer: GatedConsumer,
+    /// The gate on `consumer`, for the drive's producer to clear on every pull.
+    gate: Gate,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
 }
@@ -4800,7 +4805,7 @@ fn subscribe_driver_inputs(
     consumer: Box<dyn Consumer>,
     scheduler: &mut Scheduler,
 ) -> DriverInputs {
-    let consumer = shared_consumer(consumer);
+    let (consumer, gate) = shared_consumer(consumer);
     let source_producer = {
         let g = source_op.tiling().universal_guard();
         source_op.subscribe(
@@ -4822,6 +4827,7 @@ fn subscribe_driver_inputs(
     };
     DriverInputs {
         consumer,
+        gate,
         store_producer,
         source_producer,
     }
@@ -5060,7 +5066,8 @@ impl TileOperator for InductionDriver {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(inputs.gate),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             nested,
@@ -5109,7 +5116,7 @@ struct InductionDriverProducer {
     /// an iteration position remains to feed. The cycle is its own trigger: a
     /// position only becomes emittable once the store has decided its
     /// predecessor, and nothing outside the cycle announces that.
-    consumer: SharedConsumer,
+    consumer: GatedConsumer,
     /// The scheduler's deferred-wakeup queue — where a pull with pending work
     /// requests its own re-pull instead of looping inside `get`.
     wakeups: WakeupQueue,
@@ -5230,24 +5237,20 @@ impl InductionDriverProducer {
             // consumed its notification, and a cache-holding one
             // (`tile_operators::Notified`) answers from that pre-final cache until
             // something tells it otherwise. `source_fully_released` makes this fire once.
-            self.wakeups.request(self.consumer.clone());
+            self.wakeups.request(self.consumer.shared().clone());
         }
     }
 }
 
 impl TileProducer for InductionDriverProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        let node = node
-            .child("store", self.store_producer.inspect(opts))
-            .child("source", self.source_producer.inspect(opts));
-        match &self.nested {
-            None => node,
-            Some(nested) => nested
-                .reseeds
-                .iter()
-                .fold(node.child("pairs", nested.pairs.inspect(opts)), |n, r| {
-                    n.child("reseed", r.inspect(opts))
-                }),
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
+        visit("source", &*self.source_producer);
+        if let Some(nested) = &self.nested {
+            visit("pairs", &*nested.pairs);
+            for reseed in &nested.reseeds {
+                visit("reseed", &**reseed);
+            }
         }
     }
 
@@ -5587,7 +5590,7 @@ impl TileProducer for InductionDriverProducer {
                 .zip(&stated)
                 .any(|(was, now)| !was.subsumes(now));
         if emitted_now || states_more {
-            self.wakeups.request(self.consumer.clone());
+            self.wakeups.request(self.consumer.shared().clone());
         }
         self.stated = stated;
         // The filtered rows this drive has read past, at every depth: the highest path the
@@ -5731,7 +5734,8 @@ impl TileOperator for TransactDriver {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(inputs.gate),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             consumer: inputs.consumer,
@@ -5760,7 +5764,7 @@ struct TransactDriverProducer {
     /// transaction remains to attempt — the one-step-per-pull cycle driver. The
     /// cycle is its own trigger: an attempt becomes emittable when the store's
     /// frontier moves, which nothing outside the cycle announces.
-    consumer: SharedConsumer,
+    consumer: GatedConsumer,
     /// The scheduler's deferred-wakeup queue — where a pull with pending work
     /// requests its own re-pull instead of looping inside `get`.
     wakeups: WakeupQueue,
@@ -5869,9 +5873,9 @@ impl TransactDriverProducer {
 }
 
 impl TileProducer for TransactDriverProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("store", self.store_producer.inspect(opts))
-            .child("source", self.source_producer.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
+        visit("source", &*self.source_producer);
     }
 
     fn state_info(&self) -> ProducerStateInfo {
@@ -5973,7 +5977,7 @@ impl TileProducer for TransactDriverProducer {
         // re-arm: a future arrival wakes it through the source, so re-arming
         // would busy-poll an idle server.
         if next_item.is_some() {
-            self.wakeups.request(self.consumer.clone());
+            self.wakeups.request(self.consumer.shared().clone());
         }
         // A release naming part of a row rather than the row leaves the row in the window
         // (`release_impl`), so what it names is withheld here.
@@ -6462,7 +6466,7 @@ impl TileOperator for TransactWriter {
         // consumer on its driver slot below. The store and body inputs need no
         // notification: the writer pulls them on demand, and forwarding the
         // cyclic store would loop.
-        let consumer = shared_consumer(consumer);
+        let (consumer, gate) = shared_consumer(consumer);
         let sg = self.store_op.tiling().universal_guard();
         let store_producer = self.store_op.subscribe(sg, Box::new(|| {}), scheduler);
         let bg = self.body_op.tiling().universal_guard();
@@ -6482,7 +6486,8 @@ impl TileOperator for TransactWriter {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             store_producer,
             body_producer,
             driver_producer,
@@ -6679,10 +6684,10 @@ impl CyclicSequencingProducer for TransactWriterProducer {
 }
 
 impl TileProducer for TransactWriterProducer {
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("store", self.store_producer.inspect(opts))
-            .child("body", self.body_producer.inspect(opts))
-            .child("driver", self.driver_producer.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("store", &*self.store_producer);
+        visit("body", &*self.body_producer);
+        visit("driver", &*self.driver_producer);
     }
 
     fn state_info(&self) -> ProducerStateInfo {

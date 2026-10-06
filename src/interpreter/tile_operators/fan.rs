@@ -5,12 +5,8 @@ use bit_set::BitSet;
 
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
-use crate::{
-    interpreter::{
-        Consumer, RowIndex, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field,
-    },
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
+use crate::interpreter::{
+    Consumer, RowIndex, Scheduler, Value, forwarding_consumer, shared_consumer, tuple_field,
 };
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
@@ -146,14 +142,15 @@ impl TileOperator for Zip {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         Box::new(ZipProducer {
             base: ProducerBase::new(
                 ZipProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             names: self.names.clone(),
             level: self.level,
             inputs: self
@@ -185,11 +182,10 @@ struct ZipProducer {
 impl TileProducer for ZipProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         for (i, input) in self.inputs.iter().enumerate() {
-            node = node.child(format!("_{i}"), input.inspect(opts));
+            visit(&format!("_{i}"), &**input);
         }
-        node
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -619,14 +615,15 @@ impl TileOperator for MakeRecord {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             names: self.names.clone(),
             inputs: self
                 .inputs
@@ -654,11 +651,10 @@ struct MakeRecordProducer {
 impl TileProducer for MakeRecordProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         for (i, input) in self.inputs.iter().enumerate() {
-            node = node.child(format!("{i}"), input.inspect(opts));
+            visit(&format!("{i}"), &**input);
         }
-        node
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -866,8 +862,8 @@ impl SelectFieldProducer {
 impl TileProducer for SelectFieldProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("input", self.input.inspect(opts))
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {

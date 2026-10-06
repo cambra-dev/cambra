@@ -11,8 +11,6 @@ use crate::{
         ColumnValue, Consumer, Scheduler, Value, forwarding_consumer, shared_consumer,
         tiling::FunctionGuard, tuple_field,
     },
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
 };
 
 // ---------------------------------------------------------------------------
@@ -181,13 +179,13 @@ impl TileOperator for CheckedLookup {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let source = match &mut self.source {
+        let (source, gate) = match &mut self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
             // absence, so when it settles after the keys it is the input that completes the
             // answer — subscribed with a consumer of its own it would settle with nobody
             // scheduled to read it (see `shared_consumer`).
             LookupSource::Split { collection, keys } => {
-                let shared = shared_consumer(consumer);
+                let (shared, gate) = shared_consumer(consumer);
                 let keys = keys.subscribe(
                     keys.tiling().universal_guard(),
                     forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -198,14 +196,17 @@ impl TileOperator for CheckedLookup {
                     forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                     scheduler,
                 );
-                ProducerSource::Split { collection, keys }
+                (ProducerSource::Split { collection, keys }, Some(gate))
             }
             // One input, carrying both operands, so there is nothing to share.
-            LookupSource::Paired(pairs) => ProducerSource::Paired(pairs.subscribe(
-                pairs.tiling().universal_guard(),
-                consumer,
-                scheduler,
-            )),
+            LookupSource::Paired(pairs) => (
+                ProducerSource::Paired(pairs.subscribe(
+                    pairs.tiling().universal_guard(),
+                    consumer,
+                    scheduler,
+                )),
+                None,
+            ),
         };
         Box::new(CheckedLookupProducer {
             base: ProducerBase::new(
@@ -213,7 +214,8 @@ impl TileOperator for CheckedLookup {
                 &self.base.tiling,
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             source,
             released: false,
         })
@@ -395,12 +397,13 @@ fn compact_releasing(tile: &mut Tile, input: &mut Box<dyn TileProducer>) {
 impl TileProducer for CheckedLookupProducer {
     impl_producer_base!();
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         match &self.source {
-            ProducerSource::Split { collection, keys } => node
-                .child("collection", collection.inspect(opts))
-                .child("keys", keys.inspect(opts)),
-            ProducerSource::Paired(pairs) => node.child("pairs", pairs.inspect(opts)),
+            ProducerSource::Split { collection, keys } => {
+                visit("collection", &**collection);
+                visit("keys", &**keys);
+            }
+            ProducerSource::Paired(pairs) => visit("pairs", &**pairs),
         }
     }
 

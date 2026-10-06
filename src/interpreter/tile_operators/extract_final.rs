@@ -174,6 +174,13 @@ impl TileProducer for ExtractFinalProducer {
 
     impl_producer_base!();
 
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("source", &*self.source);
+        if let Some(default) = &self.default {
+            visit("default", &**default);
+        }
+    }
+
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         let node = node.child("source", self.source.inspect(opts));
         match &self.default {
