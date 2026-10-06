@@ -15,6 +15,7 @@ mod differential;
 use chl_interp::{Collection, Value};
 use differential::{Compiled, run_compiled, run_interpreted};
 use indoc::indoc;
+use rstest::rstest;
 
 /// What sink `out` observed under the compiler, for a program it compiles and completes.
 fn compiled(source: &str) -> Value {
@@ -215,6 +216,51 @@ fn a_filter_reading_both_nested_binders() {
         for i in [1, 2]:
             for q in [1, 2, 3]:
                 acc := acc + sum([z * i * q for z in [1, 2, 3] if z > i - q])
+        out = test_sink()
+        out << acc
+    "#});
+}
+
+/// The forms a nested loop's write reads its two binders through, read through a sink so the
+/// scheduler drives the nest a position at a time. The filters are the forms the nest's own
+/// tests (`tests/compilation_pipeline/nested_loops.rs`) do not reach: a filter's predicate
+/// and its rows arrive at each enclosing position separately.
+#[rstest]
+#[case::a_filter_on_the_outer_binder("sum([z for z in [1, 2, 3] if z > i])")]
+#[case::a_filter_on_the_inner_binder_beside_an_outer_body(
+    "sum([z * i for z in [1, 2, 3] if z > q])"
+)]
+#[case::a_filter_on_both_binders_beside_a_closed_body("sum([z for z in [1, 2, 3] if z > i - q])")]
+#[case::a_ternary_on_both_binders("(i if q > 1 else q)")]
+#[case::a_power_of_the_outer_binder("i ** 2 + q")]
+#[case::a_nested_comprehension_reading_both_binders(
+    "sum([sum([w * z * i for w in [1, 2]]) for z in [1, 2] if z >= q - 1])"
+)]
+fn a_nested_write_reads_its_binders(#[case] term: &str) {
+    agree(&format!(
+        indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for q in [1, 2, 3]:
+                    acc := acc + {}
+            out = test_sink()
+            out << acc
+        "#},
+        term
+    ));
+}
+
+/// A mutable variable the inner loop's body introduces, restarting at its seed at every
+/// position of both loops, beside an accumulator both loops carry.
+#[test]
+fn a_mutable_variable_introduced_in_a_nested_loops_body() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2]:
+            for q in [1, 2, 3]:
+                y := sum([z for z in [1, 2, 3] if z > i - q])
+                y += i * q
+                acc += y
         out = test_sink()
         out << acc
     "#});

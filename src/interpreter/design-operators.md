@@ -543,11 +543,31 @@ A producer whose output changes on a pull wakes its consumer. The change is made
 `Memo` answers from its cache until notified, so without the wake it keeps the old output, and
 a program waiting on it stalls without an error.
 
+A notification carries no payload, so one that reaches an operator that has passed one on and not
+been pulled since says nothing the last one did not. Where notification paths branch and merge, at a
+`FanOut`'s input and at the consumer an operator shares between its inputs (`shared_consumer`), the
+operator keeps one bit: set when it passes a notification on, cleared when it is pulled
+(`GatedConsumer`, a `Notified` flag starting clear, and `FanOutShared::forwarded` for a fan-out's
+branches). A pull clears it whether or not it reads the input that notified, since a consumer
+pulling the operator is what the notification asked for. Without the bit a change reaches a sink
+once along every path from where it happened, and a cycle's notification goes around without end. A
+notification that re-enters a consumer still being notified is dropped when the bit is set, since
+nothing has pulled the operator since the notification in progress passed, and deferred to the
+wakeup queue otherwise.
+
+A sink does not pull when notified. It queues its pull on a queue of its own, which holds it
+once however many notifications arrive. `Scheduler::check_for_notifications` delivers its wakes
+first and then runs the sink pulls queued so far, so each sink is pulled once per call, in the
+call that delivered the change. Installing a version pulls its sinks at once, because a version
+a reload replaces hands its state to its successor only if it was pulled.
+
 - A store's output changes when it opens, decides a position or commits, and closes.
   `ChangeNotifier` compares each pull's output with the last and wakes the store's readers
   when they differ.
-- A `Memo` pulled without a notification, its cache still empty or a drained input a debug
-  build still probes, wakes its consumer when the pull finds data the cache did not hold.
+- A `Memo` pulled without a notification, a drained input a debug build still probes, wakes
+  its consumer when the pull finds data the cache did not hold. An empty cache is not such a
+  pull: the first pull reads, and from then on the cache is the answer until the input notifies,
+  which is what keeps each branch of a fan-out from re-reading the shared input.
 
 The contract makes a stuck program observable. A program is **quiescent** when a lap delivers no
 notification and answers what the lap before did: every operator then sees what it saw, so

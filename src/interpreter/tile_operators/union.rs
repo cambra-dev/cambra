@@ -363,7 +363,7 @@ impl TileOperator for UnionOperator {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter_mut()
@@ -381,7 +381,8 @@ impl TileOperator for UnionOperator {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             inputs: input_producers,
             flat: self.flat,
             level: self.level,

@@ -143,14 +143,15 @@ impl TileOperator for Zip {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         Box::new(ZipProducer {
             base: ProducerBase::new(
                 ZipProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             names: self.names.clone(),
             level: self.level,
             inputs: self
@@ -616,14 +617,15 @@ impl TileOperator for MakeRecord {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             names: self.names.clone(),
             inputs: self
                 .inputs

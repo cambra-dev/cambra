@@ -181,13 +181,13 @@ impl TileOperator for CheckedLookup {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let source = match &mut self.source {
+        let (source, gate) = match &mut self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
             // absence, so when it settles after the keys it is the input that completes the
             // answer — subscribed with a consumer of its own it would settle with nobody
             // scheduled to read it (see `shared_consumer`).
             LookupSource::Split { collection, keys } => {
-                let shared = shared_consumer(consumer);
+                let (shared, gate) = shared_consumer(consumer);
                 let keys = keys.subscribe(
                     keys.tiling().universal_guard(),
                     forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -198,14 +198,17 @@ impl TileOperator for CheckedLookup {
                     forwarding_consumer(&shared, &scheduler.wakeup_queue()),
                     scheduler,
                 );
-                ProducerSource::Split { collection, keys }
+                (ProducerSource::Split { collection, keys }, Some(gate))
             }
             // One input, carrying both operands, so there is nothing to share.
-            LookupSource::Paired(pairs) => ProducerSource::Paired(pairs.subscribe(
-                pairs.tiling().universal_guard(),
-                consumer,
-                scheduler,
-            )),
+            LookupSource::Paired(pairs) => (
+                ProducerSource::Paired(pairs.subscribe(
+                    pairs.tiling().universal_guard(),
+                    consumer,
+                    scheduler,
+                )),
+                None,
+            ),
         };
         Box::new(CheckedLookupProducer {
             base: ProducerBase::new(
@@ -213,7 +216,8 @@ impl TileOperator for CheckedLookup {
                 &self.base.tiling,
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             source,
             released: false,
         })

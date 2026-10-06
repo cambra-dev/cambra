@@ -4,7 +4,9 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, value_probe::ProbeSlot};
+use crate::interpreter::{
+    Consumer, DataSourceDomainExtentImpl, tile_operators::Notified, value_probe::ProbeSlot,
+};
 
 /// A handle to the scheduler's **deferred-wakeup queue**.
 ///
@@ -32,12 +34,66 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, value_probe::Prob
 /// (and that a producer can clone to re-arm on its next pull).
 pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
 
+/// One operator's consumer, shared between its inputs, behind a gate: a [`Notified`] flag
+/// set when a notification passes and cleared when the operator is pulled.
+///
+/// A notification carries no payload, so a second one that arrives before the operator has
+/// been pulled says nothing the first did not: the first has already reached every consumer
+/// downstream, and none of them has read this operator since. Without the gate a change
+/// reaches a sink once per path where notification paths branch and merge, and around a
+/// cycle it never stops. A pull clears it whether or not it reads the input that notified,
+/// since a consumer pulling the operator is what the notification asked for
+/// (`src/interpreter/design-operators.md`, "The notification contract").
+#[derive(Clone)]
+pub struct GatedConsumer {
+    shared: SharedConsumer,
+    gate: Notified,
+}
+
+/// The gate of an operator's [`GatedConsumer`], for the operator's producer to take into its
+/// base ([`ProducerBase::sharing`](crate::interpreter::tile_operators::ProducerBase::sharing)),
+/// which clears it on every pull.
+///
+/// A gate no pull clears closes on the first notification and drops every one after it, so
+/// the operator stops being woken without any error. The token is not `Clone` and is
+/// `#[must_use]`, so a `subscribe` that builds a shared consumer and leaves its gate unused does
+/// not compile cleanly.
+#[must_use = "a gate no pull clears drops every notification after the first: pass it to \
+              `ProducerBase::sharing`"]
+pub struct Gate(pub(crate) Notified);
+
+impl GatedConsumer {
+    /// `consumer` behind `gate`, which the operator's producer must clear on every pull.
+    pub fn new(mut consumer: Box<dyn Consumer>, gate: Notified) -> Self {
+        let admit = gate.clone();
+        let shared: SharedConsumer = Rc::new(RefCell::new(move || {
+            if admit.mark_news() {
+                consumer.notify();
+            }
+        }));
+        Self { shared, gate }
+    }
+
+    /// The handle a wakeup queue holds or a producer re-arms.
+    pub fn shared(&self) -> &SharedConsumer {
+        &self.shared
+    }
+
+    /// Notify the operator's consumer now, through the gate.
+    pub fn notify(&self) {
+        self.shared.borrow_mut().notify();
+    }
+}
+
 /// Share one operator's consumer between several of its inputs.
 ///
 /// An operator with more than one input has a single downstream consumer to wake,
-/// so the handle has to be shared. This is the one way to build that handle.
-pub fn shared_consumer(mut consumer: Box<dyn Consumer>) -> SharedConsumer {
-    Rc::new(RefCell::new(move || consumer.notify()))
+/// so the handle has to be shared. This is the one way to build that handle. The
+/// operator's producer takes the [`Gate`] into its base
+/// ([`ProducerBase::sharing`](crate::interpreter::tile_operators::ProducerBase::sharing)).
+pub fn shared_consumer(consumer: Box<dyn Consumer>) -> (GatedConsumer, Gate) {
+    let gate = Notified::clear();
+    (GatedConsumer::new(consumer, gate.clone()), Gate(gate))
 }
 
 /// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
@@ -47,8 +103,8 @@ pub fn shared_consumer(mut consumer: Box<dyn Consumer>) -> SharedConsumer {
 /// `Consumer`, because the blanket impl over `Rc<RefCell<C>>` needs a *sized* `C`,
 /// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
 /// impl something sized to bite on.
-pub fn forwarding_consumer(shared: &SharedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
-    let shared = shared.clone();
+pub fn forwarding_consumer(shared: &GatedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
+    let GatedConsumer { shared, gate } = shared.clone();
     let wakeups = wakeups.clone();
     Box::new(move || {
         // A notification that re-enters a consumer already being notified is deferred to
@@ -61,8 +117,14 @@ pub fn forwarding_consumer(shared: &SharedConsumer, wakeups: &WakeupQueue) -> Bo
         // a wake after one carries what arrived too late for it. Deferred, it is delivered
         // outside any cascade, where it cannot re-enter, and at worst wakes a consumer
         // whose next pull finds nothing new.
+        //
+        // A re-entering notification behind a closed gate is dropped instead: nothing has
+        // pulled the operator since the notification in progress passed, so that one already
+        // says everything this would. Deferring it would deliver it again on the next drain,
+        // and around a cycle again on every poll after.
         match shared.try_borrow_mut() {
             Ok(mut consumer) => consumer.notify(),
+            Err(_) if gate.is_set() => {}
             Err(_) => wakeups.request(shared.clone()),
         }
     })
@@ -111,6 +173,8 @@ pub struct Scheduler {
     source_handles: HashMap<String, SourceHandle>,
     wakeups: WakeupQueue,
     probes: ProbeSlot,
+    /// Sinks' pulls, run after the wakes that queued them in the same call.
+    sink_pulls: WakeupQueue,
 }
 
 type SourceHandle = (
@@ -191,6 +255,12 @@ other's subscribers",
         self.wakeups.clone()
     }
 
+    /// The queue a sink schedules its pull on. A pull queued while [`deliver`](Self::deliver)
+    /// delivers its wakes runs in the same call, after them.
+    pub fn sink_pull_queue(&self) -> WakeupQueue {
+        self.sink_pulls.clone()
+    }
+
     /// Pull what each source has received into its buffer, and return the
     /// consumers to wake, without waking them.
     ///
@@ -212,8 +282,8 @@ other's subscribers",
     }
 
     /// Notify the consumers a [`poll_sources`](Self::poll_sources) found data
-    /// for, then the deferred wakeups, and say whether anything was delivered.
-    /// A sink pulls here.
+    /// for, then the deferred wakeups, then run the sink pulls they queued, and say
+    /// whether anything was delivered. A sink pulls here, once per call.
     pub fn deliver(&mut self, mut delivery: Delivery) -> bool {
         let mut delivered = false;
         for consumer in std::mem::take(&mut delivery.0) {
@@ -223,9 +293,16 @@ other's subscribers",
         // Deliver deferred wakeups now — outside any `get`, so a notification
         // that fans through the cyclic operator graph does not re-enter an
         // operator mid-borrow (see [`WakeupQueue`]). They follow the source
-        // notifications because a wakeup is a notification too and can pull.
+        // notifications because a wakeup is a notification too and can pull. A wake
+        // queued while delivering is delivered by the next call.
         for consumer in self.wakeups.take() {
             consumer.borrow_mut().notify();
+            delivered = true;
+        }
+        // Then pull every sink the wakes above reached, once each, so a change reaches a
+        // sink in the call that delivers it.
+        for pull in self.sink_pulls.take() {
+            pull.borrow_mut().notify();
             delivered = true;
         }
         delivered
@@ -292,7 +369,12 @@ pub fn pull_laps(
         // wakeup, so every operator saw what it saw before and nothing moves until an input
         // changes: the laps left would only repeat this one. A wakeup this pull queued is
         // delivered by the next lap's check, so that lap is not a repeat.
-        if lap > 0 && !delivered && pulled == tile && scheduler.wakeups.is_empty() {
+        if lap > 0
+            && !delivered
+            && pulled == tile
+            && scheduler.wakeups.is_empty()
+            && scheduler.sink_pulls.is_empty()
+        {
             return pulled;
         }
         tile = pulled;
@@ -305,8 +387,8 @@ mod tests {
     use super::*;
 
     /// A notification that re-enters a consumer still being notified reaches it later rather
-    /// than being lost: the downstream here pulls on notify, as `SinkConsumer` does, and
-    /// the cascade then reaches the second arm, whose data changed after the pull.
+    /// than being lost: the downstream here pulls on notify, and the cascade then reaches the
+    /// second arm, whose data changed after the pull.
     #[test]
     fn a_reentrant_wake_after_a_pull_in_the_cascade_is_not_lost() {
         use std::cell::Cell;
@@ -314,8 +396,11 @@ mod tests {
         let seen = Rc::new(Cell::new(0u32));
         let feedback: Rc<RefCell<Option<Box<dyn Consumer>>>> = Rc::new(RefCell::new(None));
         let (d, s, fb) = (data.clone(), seen.clone(), feedback.clone());
+        let gate = Notified::clear();
+        let pulled = gate.clone();
         let downstream: Box<dyn Consumer> = Box::new(move || {
-            // The pull.
+            // The pull of the operator, which clears its gate as `TileProducer::get` does.
+            pulled.take();
             s.set(d.get());
             // The rest of the cascade, once: arm B's data changes, and its notification
             // re-enters the operator this notification is still inside.
@@ -325,7 +410,7 @@ mod tests {
                 arm_b.notify();
             }
         });
-        let shared = shared_consumer(downstream);
+        let shared = GatedConsumer::new(downstream, gate);
         let mut scheduler = Scheduler::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
@@ -336,6 +421,65 @@ mod tests {
             data.get(),
             "the downstream never pulled what arm B delivered after its pull"
         );
+    }
+
+    /// A second notification before the operator is pulled says nothing the first did not, so
+    /// it stops at the gate; the operator's pull lets the next one through.
+    #[test]
+    fn a_shared_consumer_passes_one_notification_per_pull() {
+        use std::cell::Cell;
+        let notified = Rc::new(Cell::new(0u32));
+        let n = notified.clone();
+        let (shared, gate) = shared_consumer(Box::new(move || n.set(n.get() + 1)));
+        let scheduler = Scheduler::new();
+        let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
+        let mut arm_b = forwarding_consumer(&shared, &scheduler.wakeup_queue());
+        arm_a.notify();
+        arm_b.notify();
+        assert_eq!(
+            notified.get(),
+            1,
+            "the second arm's notification passed an unpulled gate"
+        );
+        // The operator's pull, as `TileProducer::get` makes it.
+        gate.0.take();
+        arm_b.notify();
+        assert_eq!(
+            notified.get(),
+            2,
+            "the pull did not let the next notification through"
+        );
+    }
+
+    /// A notification that comes back around a cycle into the consumer it started from, with
+    /// nothing pulled since, is dropped rather than deferred: the one in progress already says
+    /// everything it would, and a deferred copy would go around again on every poll.
+    #[test]
+    fn a_reentrant_wake_with_no_pull_since_is_dropped() {
+        use std::cell::Cell;
+        let notified = Rc::new(Cell::new(0u32));
+        let feedback: Rc<RefCell<Option<Box<dyn Consumer>>>> = Rc::new(RefCell::new(None));
+        let (n, fb) = (notified.clone(), feedback.clone());
+        let downstream: Box<dyn Consumer> = Box::new(move || {
+            n.set(n.get() + 1);
+            // The cycle: arm B's notification re-enters the operator this one is inside.
+            let rest = fb.borrow_mut().take();
+            if let Some(mut arm_b) = rest {
+                arm_b.notify();
+            }
+        });
+        // Nothing pulls the operator here, so its gate is never cleared.
+        let (shared, _gate) = shared_consumer(downstream);
+        let mut scheduler = Scheduler::new();
+        let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
+        *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
+        arm_a.notify();
+        assert!(
+            scheduler.wakeups.is_empty(),
+            "the re-entrant notification was deferred"
+        );
+        scheduler.check_for_notifications();
+        assert_eq!(notified.get(), 1);
     }
 
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the

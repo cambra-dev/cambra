@@ -187,7 +187,7 @@ impl TileOperator for MapResult {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let function_producer = self.function.subscribe(
             self.function.tiling().universal_guard(),
             forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -204,7 +204,8 @@ impl TileOperator for MapResult {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input: input_producer,
             function: function_producer,
             level: self.level,
@@ -701,7 +702,7 @@ impl TileOperator for MapResultToConst {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let constant_producer = self.constant.subscribe(
             self.constant.tiling().universal_guard(),
             forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -718,7 +719,8 @@ impl TileOperator for MapResultToConst {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
