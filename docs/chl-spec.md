@@ -163,16 +163,15 @@ reserved for future use.
 > surface, **[Open]** as to what `static` demands). Avoid taking these names
 > for other purposes. (`with`, `:=`, `match`, `case` and `where` are
 > **already** lexed — the first two carry today's transactions and mutation,
-> §8, `match`/`case` carry tag dispatch, §4.10, and `where` is reserved ahead
-> of the refinement syntax that will use it, §6.4 — so they are not in this
-> list.)
+> §8, `match`/`case` carry tag dispatch, §4.10, and `where` separates a
+> refinement's predicate, §6.4 — so they are not in this list.)
 
 ### 1.7 Literals
 
 | Form | Token | Notes |
 |---|---|---|
 | `0`, `42`, `1234` | `Int(i64)` | Decimal only; no `_` separators, no hex/bin/oct, no negation in the token (`-3` is `UnaryOp(Neg, 3)`). |
-| `"hello\n"`, `'world'` | `String` | Double- or single-quoted. Escapes: `\n \t \r \\ \" \' \0`. Unknown escapes are preserved verbatim (the `\` is kept). No multi-line `"""..."""`, no f-strings, no raw `r"..."`. |
+| `"hello\n"`, `'world'` | `String` | Double- or single-quoted. Escapes: `\n \t \r \\ \" \' \0`. Unknown escapes are preserved verbatim (the `\` is kept). A literal closes on the line it opens on: a raw newline before the closing quote is the lex error `UnterminatedString` ([11.1 Lex errors](#111-lex-errors)), so there are no multi-line strings. No triple-quoted `"""..."""`, no f-strings, no raw `r"..."`. |
 | `True`, `False` | `Bool` | |
 
 There are no floating-point literals — CHL has no `f64` type at the
@@ -185,9 +184,9 @@ surface level.
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
-:=
+:=  <:
 <<  <<=
-(  )  [  ]  {  }  ,  :  .  ;  \  `
+(  )  [  ]  {  }  ,  :  .  ;  \  `  ?  @
 ```
 
 > **Direction [Decided].** Two tokens join the set. `::` separates a qualifier from the name
@@ -203,12 +202,20 @@ a mutable variable. It is *not* Python's walrus operator: it is an
 Algol-tradition assignment **statement**, and there is still no
 assignment-as-expression.
 
-**Notably absent vs. Python** at the lexical level: `/`, `%`, `>>`, `~`,
-walrus assignment-*expressions*, and `...`. The parser refuses these at
-the syntactic level rather than parsing-then-erroring. `@` is lexed, but
-only as the decorator introducer ([1.9 Decorators](#19-decorators)); there is no
-matrix-multiplication
-operator.
+`<:` is the bounded annotation: `x <: T` bounds the binder's inferred type
+by `T` where `x: T` fixes it
+([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+
+`?` directly after a subscript's `]` is the optional lookup, `c[k]?`
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). The decided
+direction there retires it.
+
+`@` is the decorator introducer ([1.9 Decorators](#19-decorators)); there is no
+matrix-multiplication operator.
+
+**Notably absent vs. Python**: `/`, `%`, `>>`, `~`, walrus
+assignment-*expressions*, and `...`. Writing one is an error; `//` is floor
+division, not `/` twice.
 
 `**` is exponentiation ([3.3 Arithmetic and logical operators](#33-arithmetic-and-logical-operators)). `**=` is not a
 token, so the augmented
@@ -235,8 +242,9 @@ any annotation position (§6).
 `` ` `` (backtick) prefixes a **variant tag**, in every position — type, term,
 and pattern: `` `none ``, `` `some(1) ``, ``{ `some{Int} | `none }`` (§3.15,
 §6.5). A tag is `` ` `` immediately followed by an identifier with no
-intervening whitespace; tag names are lowercase, since a tag builds a *value*
-and `Caps` means type (§6.1).
+intervening whitespace; any other backtick is the lex error `DetachedBacktick`
+([11.1 Lex errors](#111-lex-errors)). Tag names are lowercase, since a tag
+builds a *value* and `Caps` means type (§6.1).
 
 `|` is the logical-or operator in term position (§3.3) and additionally
 separates the arms of a variant **type** (§6.5). The two never meet: a variant
@@ -790,7 +798,7 @@ point of use. Mutual recursion between top-level functions is
 | `a ++ b` | Collection union (multiset sum) of two collections of the same element type. Since collections are unordered (§3), this is not "concatenation"; it is the bag union. |
 
 `a ** 0` is 1 for every `a`. **The exponent must be non-negative**, and says so in its
-type: `**` requires `{Int | _ >= 0}` of it, so `2 ** -1` is rejected where it is written
+type: `**` requires `{Int where _ >= 0}` of it, so `2 ** -1` is rejected where it is written
 rather than given a value. CHL has no fractional type for a reciprocal to produce (the
 `Real` note below), and the demand is what keeps the operator total.
 
@@ -803,8 +811,9 @@ def scaled(e: {Int where _ >= 0}) => Int:
     2 ** e
 ```
 
-Operators absent on purpose: `/` (no fractional type), `%`, `>>`,
-`~`, `@`. Attempting to use these in source is a parse error.
+Operators absent on purpose: `/` (no fractional type), `%`, `>>`, `~`,
+`@`. Using one in an expression is an error
+([1.8 Operators and punctuation](#18-operators-and-punctuation)).
 
 > **Direction [Tentative] — `Real` and `/`.** The target language has a
 > fractional type, `Real`, and a division operator `/` on it. Neither
@@ -975,10 +984,10 @@ is exactly a parenthesised, comma-separated list of expressions.
 > Recorded here only (2026-07-07, no brainstorm writeup yet).
 
 A *zero-argument* call is valid only against a name registered as a
-**data source** — `stdin()`, `http_serve(...)`, or any source
-pre-registered by the host (§7.4) — or against the builtin `defer()`
-(§7.3). A zero-argument call against any other name is a compile-time
-error.
+**data source** — `stdin()` or any source pre-registered by the host
+(§7.4) — against the builtins `defer()` (§7.3) and `empty_map()` (§3.11),
+or as the context of `with begin():` (§8.2). A zero-argument call against
+any other name is a compile-time error.
 
 ### 3.9 Subscript and attribute access
 
@@ -2211,6 +2220,7 @@ an **unmarked** entry is accepted in annotation position today; a
 marked one carries its status per "How to read this document".)
 
 - `Int` — signed 64-bit integer.
+- `UInt` — unsigned 64-bit integer.
 - `Real` — a fractional number (**[Tentative]**, §3.3). The checker has no
   fractional type, there is no fractional literal (§1.7), and `/` is not
   even lexed (§1.8, §13).
@@ -2234,10 +2244,9 @@ marked one carries its status per "How to read this document".)
 - `{T where p(_)}` — refinement type (§6.4), where `_` refers to the value being refined.
 - `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-variable
   type (§6.2, §8).
-- `Map(K, V)` — finite-map type. **[Planned]** — `Map(…)` as an annotation is
-  unimplemented, and the map literal `[k -> v, …]`
+- `Map(K, V)` — finite-map type. The map literal `[k -> v, …]`
   ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)) parses as the list of
-  entry pairs that `map([…])` re-keys.
+  entry pairs that a `Map` annotation or `map([…])` re-keys.
 - `FullMap(K, V)` — *total*-map type (**[Tentative]**, §6.3): every value
   of `K` is a key, so lookup yields `V` rather than `Option(V)` and has
   no missing case. The annotation and its total lookup are implemented;
@@ -2655,7 +2664,8 @@ postcondition: `{Int where _ >= item.cost * qty}` refines the result by a
 predicate naming two parameters (§6). Ordinary lexical scope (§5) is what
 supplies those names, and nothing narrows them to parameters: a refinement
 written at the top level may name a top-level binding, which makes that
-binding's *value* part of the type —
+binding's *value* part of the type. The example uses membership `in`, which
+is **[Planned]** ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
 
 ```python
 ks = ["a", "b"]
@@ -3005,12 +3015,14 @@ defer must be tied off later with `<<=` or fed via `<<`.
 ### 7.4 Sources
 
 Sources are built-in functions registered at compile time. A source
-call denotes the entire stream the source will produce.
+call denotes the entire stream the source will produce. `http_serve` is
+both a source and a sink: it returns a source of requests and a sink for the
+responses ([10. Sinks](#10-sinks)).
 
 | Call | Source | Domain |
 |---|---|---|
 | `stdin()` | Process standard input | One element per line of UTF-8 text. |
-| `http_serve(port, method, path)` | HTTP server | Returns a `(requests, responses)` 2-tuple. The requests stream yields request bodies; the responses are a deferred collection to feed. Must be assigned at top level via tuple destructuring (see below). |
+| `http_serve(port, method, path)` | HTTP server, a source and a sink | Returns a `(requests, responses)` 2-tuple. The requests source yields request bodies; the responses sink is a deferred collection to feed. Must be assigned at top level via tuple destructuring (see below). |
 
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.).
@@ -3026,7 +3038,7 @@ must appear in the top-level block. It binds two names:
 
 - the `reqs` side is a streaming source: each element is the
   body of one incoming request to `(method, path)` on `port`.
-- the `resps` side is a deferred output: feeds into it
+- the `resps` side is a sink, a deferred output: feeds into it
   (via `<<` from a request-handler `for` loop, or via `<<=` once)
   become the response bodies. The sink pairs each response with its
   triggering request — the request that was bound to the loop
@@ -4170,10 +4182,15 @@ Sinks may observe the indices of collections passed to them if needed.
 
 ### 11.1 Lex errors
 
-The lexer reports four error kinds and stops emitting tokens at the
+The lexer reports six error kinds and stops emitting tokens at the
 first one:
 
 - **`InvalidToken`** — no token rule matched at the position.
+- **`UnterminatedString`** — a string literal's line ended before its closing
+  quote ([1.7 Literals](#17-literals)). The span is the opening quote.
+- **`DetachedBacktick`** — a backtick not immediately followed by an
+  identifier ([1.8 Operators and punctuation](#18-operators-and-punctuation)).
+  The span is the backtick.
 - **`UnmatchedClose`** — `)`, `]`, or `}` with no matching open.
 - **`UnclosedBracket`** — EOF reached with at least one open `(`/`[`/`{`.
 - **`InconsistentIndent`** — dedented to a level not on the indent

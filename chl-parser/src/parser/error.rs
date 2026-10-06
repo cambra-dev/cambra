@@ -280,14 +280,8 @@ impl ParseError {
     ) -> Report<'a, (&'a str, std::ops::Range<usize>)> {
         match self {
             ParseError::Lex(e) => {
-                let (span, msg): (Span, &'static str) = match e {
-                    LexError::InvalidToken { span } => (*span, "invalid token"),
-                    LexError::UnmatchedClose { span } => (*span, "unmatched close-bracket"),
-                    LexError::UnclosedBracket { span } => {
-                        (*span, "unclosed bracket at end of input")
-                    }
-                    LexError::InconsistentIndent { span } => (*span, "inconsistent indentation"),
-                };
+                let span = e.span();
+                let msg = e.to_string();
                 Report::build(ReportKind::Error, src_name, span.start)
                     .with_config(config)
                     .with_message("lex error")

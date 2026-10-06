@@ -115,7 +115,7 @@ const fn entry(
 /// `docs/chl-spec.md`, "7. Built-in functions and sources" specifies most of these;
 /// `chl-parser/design-chl-parser.md`, "Surface builtins" lists the rows it does not.
 pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
-    use Arity::{Any, Exact};
+    use Arity::Exact;
     use SurfaceBuiltin as B;
     use SurfaceBuiltinKind::{Function, SinkDeclaration, Source, TransactionMarker};
     &[
@@ -127,7 +127,7 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         entry("box", B::Box, Exact(1), Function),
         entry("empty_map", B::EmptyMap, Exact(0), Function),
         entry("await_final", B::AwaitFinal, Exact(1), Function),
-        entry("defer", B::Defer, Any, Function),
+        entry("defer", B::Defer, Exact(0), Function),
         entry("begin", B::Begin, Exact(0), TransactionMarker),
         entry("http_serve", B::HttpServe, Exact(3), SinkDeclaration),
         // Listed unconditionally. The `cambra` crate recognizes it only under `cfg(test)` or

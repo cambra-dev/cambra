@@ -63,6 +63,13 @@ A layout post-pass then walks that stream and:
 `InconsistentIndent` is a hard error: dedenting to an indent level that
 never appeared on the stack (e.g. `0 → 4 → 2`) is rejected at lex time.
 
+A string literal closes on the line it opens on. A quote with no closing quote
+before the newline is `UnterminatedString`, with the opening quote as its span.
+
+A backtick begins a variant tag only when an identifier starts at its end. Any other backtick is
+`DetachedBacktick`, with the backtick as its span; `check_tags` checks the raw token stream before
+the layout pass.
+
 ### Stage 2 — Parser (`parser.rs`)
 
 A chumsky combinator parser consumes the layout-resolved token stream and
@@ -94,9 +101,14 @@ See [docs/chl-spec.md](../docs/chl-spec.md), "The one-line form" for the rule
 and why the bracket rather than the arm body carries it.
 
 Notably absent vs. Python: `/` (true division), `%` (modulo), `>>`
-(right shift), `~` (bitwise not), `is`, `in`, `not in`, `is not`. The
-lowering pass has never supported these, and the parser refuses them at
-the syntactic level rather than parsing-then-erroring.
+(right shift), `~` (bitwise not), and the comparisons `is`, `in`, `not in`
+and `is not`. `/`, `%` and `~` start no token, so the lexer rejects them with
+`InvalidToken`. `>>` lexes as two `Gt` tokens, `is` as an identifier, and `in`
+as the keyword a `for` clause consumes; the parser accepts none of them in
+operator position. `operators_absent_from_chl` in `lexer.rs` pins the lexer's
+half.
+
+The lexer also accepts `^+` and `^=`. Both are experimental, so `docs/chl-spec.md` leaves them out.
 
 ### Stage 3 — AST (`ast.rs`)
 
@@ -207,10 +219,8 @@ is the specification for most rows. Five rows are specified in other sections:
 These rows and the spec disagree:
 
 - `test_sink` has no entry in the spec.
-- `http_serve` is a source in the spec and a `SinkDeclaration` here, because lowering recognizes it
-  by `sink_declaration`. The statement binds a source and a sink.
-- `defer` takes zero arguments in the spec and any number here, because `lower_call` ignores its
-  arguments. The interpreter recognizes only `defer()`.
+- `http_serve` is a source and a sink in the spec, and its kind here is `SinkDeclaration` alone,
+  because lowering recognizes it by `sink_declaration`.
 - The spec's planned aggregates (`min`, `count`, `avg`, `len`) and tentative builtins (`str`,
   `open`, `stdout`, `restrict`) have no row.
 

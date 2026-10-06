@@ -226,8 +226,13 @@ pub enum Token {
     /// escape sequences (`\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`)
     /// processed. Unknown escapes preserve the backslash, matching the
     /// permissive behaviour the existing CHL tests rely on.
-    #[regex(r#""([^"\\]|\\.)*""#, |lex| process_string(lex.slice(), '"'))]
-    #[regex(r#"'([^'\\]|\\.)*'"#, |lex| process_string(lex.slice(), '\''))]
+    ///
+    /// A literal ends on the line it starts on: neither a character nor an
+    /// escaped character may be a raw newline, so a quote with no partner
+    /// before the line ends matches no rule, and [`lex_failure`] reports it as
+    /// [`LexError::UnterminatedString`].
+    #[regex(r#""([^"\\\n]|\\[^\n])*""#, |lex| process_string(lex.slice(), '"'))]
+    #[regex(r#"'([^'\\\n]|\\[^\n])*'"#, |lex| process_string(lex.slice(), '\''))]
     String(String),
 
     /// Identifier. Priority 2 so a longer keyword like `else` is preferred
@@ -362,6 +367,12 @@ fn process_string(raw: &str, quote: char) -> Option<String> {
 pub enum LexError {
     /// Logos failed to match any token rule starting at this span.
     InvalidToken { span: Span },
+    /// A string literal's opening quote has no closing quote before the end of
+    /// its line. The span is the opening quote.
+    UnterminatedString { span: Span },
+    /// A backtick is not immediately followed by an identifier, so it begins no
+    /// variant tag. The span is the backtick.
+    DetachedBacktick { span: Span },
     /// A close bracket appeared with no matching open.
     UnmatchedClose { span: Span },
     /// EOF was reached with at least one open `(`, `[`, or `{` still
@@ -383,6 +394,12 @@ impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             LexError::InvalidToken { .. } => "unrecognized token",
+            LexError::UnterminatedString { .. } => {
+                "string literal has no closing quote on its line"
+            }
+            LexError::DetachedBacktick { .. } => {
+                "backtick is not immediately followed by a tag name"
+            }
             LexError::UnmatchedClose { .. } => "closing bracket with no opening bracket",
             LexError::UnclosedBracket { .. } => "unclosed bracket at end of input",
             LexError::InconsistentIndent { .. } => "indentation does not match any enclosing level",
@@ -397,10 +414,40 @@ impl LexError {
     pub fn span(&self) -> Span {
         match self {
             LexError::InvalidToken { span }
+            | LexError::UnterminatedString { span }
+            | LexError::DetachedBacktick { span }
             | LexError::UnmatchedClose { span }
             | LexError::UnclosedBracket { span }
             | LexError::InconsistentIndent { span } => *span,
         }
+    }
+}
+
+/// Every backtick in `raw` begins a variant tag: an identifier starts where
+/// the backtick ends ([`LexError::DetachedBacktick`] otherwise). The check reads
+/// the raw stream because the layout pass inserts tokens of its own.
+fn check_tags(raw: &[(Token, Span)]) -> Result<(), LexError> {
+    for (i, (tok, span)) in raw.iter().enumerate() {
+        if !matches!(tok, Token::Backtick) {
+            continue;
+        }
+        match raw.get(i + 1) {
+            Some((Token::Ident(_), next)) if next.start == span.end => {}
+            _ => return Err(LexError::DetachedBacktick { span: *span }),
+        }
+    }
+    Ok(())
+}
+
+/// The error for a span at which logos matched no rule. A quote starts no
+/// token but a string literal, so a failure at a quote is a literal whose line
+/// ends before its closing quote.
+fn lex_failure(source: &str, span: Span) -> LexError {
+    match source[span.start..].chars().next() {
+        Some('"' | '\'') => LexError::UnterminatedString {
+            span: Span::new(span.start, span.start + 1),
+        },
+        _ => LexError::InvalidToken { span },
     }
 }
 
@@ -467,9 +514,10 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
         let span = Span::from(lex.span());
         match result {
             Ok(tok) => raw.push((tok, span)),
-            Err(()) => return Err(LexError::InvalidToken { span }),
+            Err(()) => return Err(lex_failure(source, span)),
         }
     }
+    check_tags(&raw)?;
 
     // Phase 2: apply the off-side rule.
     let mut out: Vec<(Token, Span)> = Vec::new();
@@ -619,6 +667,101 @@ mod tests {
         );
     }
 
+    /// A raw newline ends the line a string literal must close on, in either
+    /// quote style and after a backslash alike. The error points at the
+    /// opening quote, not at the line break.
+    #[test]
+    fn a_newline_inside_a_string_is_an_error() {
+        for source in [
+            "x = \"ab\ncd\"",
+            "x = 'ab\ncd'",
+            "x = \"ab\\\ncd\"",
+            "x = \"ab",
+        ] {
+            assert_eq!(
+                tokenize(source),
+                Err(LexError::UnterminatedString {
+                    span: Span::new(4, 5)
+                }),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A tag is a backtick with an identifier directly after it, so a backtick
+    /// followed by whitespace, a non-identifier token, or the end of input is
+    /// an error at the backtick.
+    #[test]
+    fn a_backtick_must_touch_its_tag_name() {
+        for (source, start) in [
+            ("x = ` foo", 4),
+            ("x = `(1)", 4),
+            ("x = `", 4),
+            ("x = `\nfoo", 4),
+            ("x = `if", 4),
+        ] {
+            assert_eq!(
+                tokenize(source),
+                Err(LexError::DetachedBacktick {
+                    span: Span::new(start, start + 1)
+                }),
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            tokens("x = `foo"),
+            vec![
+                Token::Ident("x".into()),
+                Token::Eq,
+                Token::Backtick,
+                Token::Ident("foo".into()),
+                Token::Newline,
+            ]
+        );
+        assert!(tokenize("x = `some(1)").is_ok());
+    }
+
+    /// The escape `\n` is two source characters on one line, so it still lexes
+    /// to a newline inside the value.
+    #[test]
+    fn an_escaped_newline_still_lexes() {
+        assert_eq!(
+            tokens(r#"x = "ab\ncd""#),
+            vec![
+                Token::Ident("x".into()),
+                Token::Eq,
+                Token::String("ab\ncd".to_string()),
+                Token::Newline,
+            ]
+        );
+    }
+
+    /// Python operators CHL lacks: `/`, `%` and `~` start no token, while `>>`
+    /// lexes as two `>` and is left for the parser to reject
+    /// (`docs/chl-spec.md`, "1.8 Operators and punctuation").
+    #[test]
+    fn operators_absent_from_chl() {
+        for (source, start) in [("a / b", 2), ("a % b", 2), ("~a", 0)] {
+            assert_eq!(
+                tokenize(source),
+                Err(LexError::InvalidToken {
+                    span: Span::new(start, start + 1)
+                }),
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            tokens("a >> b"),
+            vec![
+                Token::Ident("a".into()),
+                Token::Gt,
+                Token::Gt,
+                Token::Ident("b".into()),
+                Token::Newline,
+            ]
+        );
+    }
+
     #[test]
     fn keywords_beat_idents() {
         let toks = tokens("if elif else for in def not and or True False where");
@@ -642,10 +785,9 @@ mod tests {
         );
     }
 
-    /// `where` is reserved ahead of the syntax that uses it: refinements are not
-    /// parsed yet (`docs/chl-spec.md`, "6.4 Refinement syntax"), so the token
-    /// exists only to keep the name from being bound as an identifier and
-    /// breaking when they land.
+    /// `where` separates a refinement's base type from its predicate
+    /// (`docs/chl-spec.md`, "6.4 Refinement syntax"), so it lexes as a keyword
+    /// and never as an identifier.
     #[test]
     fn where_is_reserved_not_an_ident() {
         assert_eq!(tokens("where"), vec![Token::Where, Token::Newline]);

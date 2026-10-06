@@ -279,7 +279,15 @@ pub(super) fn lower_call(
             }
             Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
         }
-        Some(SurfaceBuiltin::Defer) => Ok(Expr::new(TypedExprNode::Defer)),
+        Some(b @ SurfaceBuiltin::Defer) => {
+            if !b.arity().accepts(args.len()) {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    format!("`defer` takes {}", b.arity()),
+                ));
+            }
+            Ok(Expr::new(TypedExprNode::Defer))
+        }
         // A transaction marker or a sink declaration is recognized by the statement that
         // holds it, and a source by its registration rather than by this table. Called
         // anywhere else, each of these lowers as an ordinary call.
@@ -1064,6 +1072,19 @@ mod tests {
             lower_expr(&three_args, &mut LoweringContext::default()),
             Err(LoweringError::Unsupported { .. })
         ));
+    }
+
+    /// `defer` with an argument returns `LoweringError::Unsupported`, and the argument is never
+    /// resolved: `undefined_name` would otherwise be an unbound-name error of its own.
+    #[test]
+    fn test_lower_defer_with_an_argument_is_refused() {
+        let expr = parse_expr("defer(undefined_name)");
+        let err = lower_expr(&expr, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
+        assert!(
+            matches!(&err, LoweringError::Unsupported { message, .. } if message.contains("`defer` takes no arguments")),
+            "expected the defer arity refusal, got {err:?}"
+        );
     }
 
     /// A single-argument call to an unknown (non-builtin, non-source) name lowers
