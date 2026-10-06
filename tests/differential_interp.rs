@@ -250,6 +250,106 @@ fn a_nested_write_reads_its_binders(#[case] term: &str) {
     ));
 }
 
+/// A feed under nested loops is keyed by the position of every loop around it
+/// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), whether the loops
+/// only feed or the outer one carries a mutable variable.
+#[rstest]
+#[case::two_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            out << i + j
+"#})]
+#[case::three_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            for k in [100, 200]:
+                out << i + j + k
+"#})]
+#[case::a_filtered_inner_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            if j > i * 10:
+                out << i + j
+"#})]
+#[case::a_binding_between_the_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        m = i * 100
+        for j in [10, 20]:
+            out << m + j
+"#})]
+#[case::feeds_at_two_depths(indoc! {r#"
+    o = defer()
+    for i in [1, 2]:
+        o << i
+        for j in [10, 20]:
+            o << i + j
+    out = test_sink()
+    out << sum(o)
+"#})]
+#[case::a_constant_value(indoc! {r#"
+    o = defer()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            o << 7
+    out = test_sink()
+    out << sum(o)
+"#})]
+#[case::a_feed_only_loop_in_an_accumulator_loop(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            out << j + i
+"#})]
+#[case::a_filtered_feed_only_loop_in_an_accumulator_loop(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            if j > 10:
+                out << j + t
+"#})]
+#[case::two_feed_only_loops_in_an_accumulator_loop(indoc! {r#"
+    t := 0
+    o = defer()
+    for i in [1, 2]:
+        t += i
+        for j in [10, 20]:
+            o << j
+            m = j + t
+            for k in [1, 2]:
+                o << m + k
+    out = test_sink()
+    out << t + sum(o)
+"#})]
+#[case::a_feed_under_three_accumulator_loops(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            for k in [1, 2]:
+                t += k
+                out << t + i + j
+"#})]
+fn a_feed_under_nested_loops(#[case] source: &str) {
+    agree(source);
+}
+
+/// A two-clause comprehension whose value reads neither binder.
+#[test]
+fn a_constant_two_clause_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << sum([7 for i in [1, 2] for q in [10, 20]])
+    "#});
+}
+
 /// A mutable variable the inner loop's body introduces, restarting at its seed at every
 /// position of both loops, beside an accumulator both loops carry.
 #[test]

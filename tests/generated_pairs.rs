@@ -641,6 +641,16 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << sum(ch)
         "#}},
+        Skeleton { name: "nested_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for q in [10, 20]:
+                    ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
 
         // Rows of a collection of collections, jagged or not.
         Skeleton { name: "rows_comp_element", hole: Ty::Int, scope: &[("v", Ty::Int)], body: indoc! {r#"

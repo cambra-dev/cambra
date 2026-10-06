@@ -102,7 +102,7 @@ Lowering does not construct a recurrence or decide whether each `MutWrite` has a
 
 `mut_elim` consumes `For` and `MutWrite`. It builds one guarded `LetRec` history per loop, whose
 decision contains a `writes` record keyed by accumulator. It supplies read-your-writes behavior
-and hoists in-loop feeds into ordinary feeds of that history. `planning::plan_loops` subsequently
+and hoists each in-loop feed out as a loop over that history feeding each value. `planning::plan_loops` subsequently
 turns the recurrence into `Transact`; operator conversion realizes an induction-domain transaction
 with `InductionStore`. See
 [The model: histories and causal recursion](mutability.md#the-model-histories-and-causal-recursion)
