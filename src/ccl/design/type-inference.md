@@ -2677,29 +2677,34 @@ and not a judgement that such types are incomparable.
 
 ### A product is answered off the table
 
-`Equatable` holds of a tuple or record when the two operands are the **same** product and
-each component is equatable. No row states it — a row accepts a base — so `narrow_product`
-answers it structurally instead: the product is recorded on the obligation, stated as an
-**upper** bound on every operand position beside the contributing one, and required of each
-component through an obligation of its own over a fresh variable the component flows into.
+`Equatable` holds of two tuples or records of the same shape when each field's components are
+`Equatable` in turn: `{𝑎₁ … 𝑎ₙ}` and `{𝑏₁ … 𝑏ₙ}` when each pair `𝑎ᵢ`, `𝑏ᵢ` is. No row states it,
+since a row accepts bases, so it is a **product rule**: a candidate beside the rows, whose state
+an obligation records (`ProductRule`). A base contribution rules the rule out; the first product
+contribution leaves it the one candidate and applies it (`apply_product_rule`), and a product
+arriving afterwards has to have the same shape. Applying it records:
 
-Three consequences follow from that shape rather than from a choice:
+- One condition per field: an obligation of the same trait over a fresh variable per operand
+  position, the component that operand holds at that field.
+- Each operand bounded above by a product of the shape over its own variables, which carries the
+  operand's components into their positions as they arrive.
 
-- **A component still unknown resolves later.** It reaches its own obligation by the
-  ordinary delivery path, so a record key whose field type has not arrived is deferred
-  rather than read early and missed.
-- **The propagation is the base case's write-back, one level up.** It is an upper bound for
-  the reason [What an obligation determines](#what-an-obligation-determines) gives, and
-  every component's refinements are peeled for the reason
-  [Refinements are transparent](#refinements-are-transparent) gives — a product carrying
-  `Int@1` would hold the operand beside it to one literal.
-- **Once answered, the table has nothing left to say.** The candidate set is untouched, so
-  the requirement sweep skips the obligation and a base arriving afterwards contradicts the
-  product rather than narrowing it.
+- **The components pair by field, one position per operand.** `𝑎ᵢ` and `𝑏ᵢ` stand at different
+  positions of one condition, so the rule relates them as a row would, and they need not be one
+  type.
+- **A component still unknown resolves later.** It reaches its condition by the ordinary
+  delivery path, so a record key whose field type has not arrived is deferred rather than read
+  early and missed.
+- **The bound is the base case's write-back, one level up.** It is an upper bound for the reason
+  [What an obligation determines](#what-an-obligation-determines) gives, and over fresh
+  variables, so no component's refinement holds the operand beside it to one literal
+  ([Refinements are transparent](#refinements-are-transparent)).
+- **Once applied, the rows have no part.** The requirement sweep skips the obligation, and a
+  base arriving afterwards contradicts the product rather than narrowing the rows.
 
-Equality is the only trait with this reading (`Trait::is_structural`). Ordering a product
-needs an order on its components and a record's fields carry none; arithmetic has no product
-reading at all.
+Equality is the only trait with a product rule (`Trait::is_structural`). Ordering a product needs
+an order on its components and a record's fields carry none; arithmetic has no product reading
+at all.
 
 ### Refinements are transparent
 
