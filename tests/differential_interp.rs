@@ -335,6 +335,17 @@ fn a_constant_two_clause_comprehension() {
     "#});
 }
 
+/// A loop over a map literal. The map is a collection keyed by its keys, and its value at a key
+/// is the one pair whose key it is, read through a `const` whose type depends on that key.
+#[test]
+fn a_loop_over_a_map_literal() {
+    agree(indoc! {r#"
+        out = test_sink()
+        for q in map([("a", 1), ("b", 2)]):
+            out << q
+    "#});
+}
+
 /// A mutable variable the inner loop's body introduces, restarting at its seed at every
 /// position of both loops, beside an accumulator both loops carry.
 #[test]
