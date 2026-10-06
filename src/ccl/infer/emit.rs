@@ -1234,14 +1234,7 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
              — bind it with `=` in the same scope, or iterate it instead"
         ));
     }
-    if let Type::Fun {
-        name: Some(binder),
-        codomain,
-        ..
-    } = collection.peel_refinements()
-        && (crate::ccl::subst::references_enclosing_function(codomain)
-            || crate::ccl::subst::type_free_vars(codomain).contains(binder))
-    {
+    if crate::ccl::subst::is_dependent(collection) {
         return InferError::Unsupported(format!(
             "{what} is not supported on a collection whose values depend on the key: \
              `{collection}`'s codomain names its key binder, so the answer at a key that is \

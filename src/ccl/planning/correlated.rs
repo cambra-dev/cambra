@@ -163,13 +163,7 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     // domain names the chain's input, which no element after the first takes. It stays one
     // node, `(𝐾, 𝑔) ▷ curry_over`, under `curry`'s own type, and op-conversion builds the
     // same operators the chain compiles to.
-    if let Type::Fun {
-        name: Some(binder),
-        codomain,
-        ..
-    } = &expr.ty
-        && crate::ccl::subst::codomain_depends_on(binder, codomain)
-    {
+    if crate::ccl::subst::is_dependent(&expr.ty) {
         let keys_ty = keys.ty.clone();
         let pair = Expr::tuple(vec![keys, g.as_ref().clone_preserving_ids()])
             .with_ty(Type::Tuple(vec![keys_ty, g.ty.clone()]));
