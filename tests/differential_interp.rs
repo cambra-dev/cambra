@@ -106,33 +106,18 @@ fn a_variant_feed() {
     "#});
 }
 
-/// A collection fed at a site that does not iterate nests under that site's one key. The
-/// compiler splices it into the channel instead: channelize takes the channel's domain from
-/// the contribution's own domain. Pinned at both answers.
+/// A collection fed at a site that does not iterate is one element, under that site's one key
+/// (`docs/chl-spec.md`, "3.7 Feed operator `<<`").
 #[test]
-fn a_collection_feed_lands_flat() {
-    let source = indoc! {r#"
+fn a_collection_feed_is_one_element() {
+    agree(indoc! {r#"
         out = test_sink()
         out << [x * 2 for x in [1, 2, 3]]
-    "#};
-    let list = |xs: &[i64]| {
-        Value::Collection(Collection::from_list(
-            xs.iter().map(|x| Value::Int(*x)).collect(),
-        ))
-    };
-    assert_eq!(compiled(source), list(&[2, 4, 6]));
-    assert_eq!(
-        interpreted(source),
-        Value::Collection(Collection::from_entries(vec![(
-            Value::Unit,
-            list(&[2, 4, 6])
-        )]))
-    );
+    "#});
 }
 
-// A fed collection lands flat (see `a_collection_feed_lands_flat`), so these fold a
-// comprehension's result to a scalar before it reaches a sink. They reach the comprehension,
-// filter, group-by and field-access machinery through that route.
+// These fold a comprehension's result to a scalar before it reaches a sink. They reach the
+// comprehension, filter, group-by and field-access machinery through that route.
 
 #[test]
 fn a_comprehension_with_a_filter() {
@@ -1218,27 +1203,14 @@ fn a_filter_reads_a_mutable_variable_its_transaction_writes() {
 
 /// Rows filtered on a mutable variable, fed right after the loop that writes it. The filter
 /// reads the variable's final value through a binder of its own, which the channel's type keeps
-/// rather than discharging: discharged, it would put the loop's history in the type. A
-/// collection fed outside any loop lands flat (`a_collection_feed_lands_flat`), so both answers
-/// are pinned.
+/// rather than discharging: discharged, it would put the loop's history in the type.
 #[test]
 fn a_filter_reads_a_mutable_variable_after_the_loop_that_writes_it() {
-    let source = indoc! {r#"
+    agree(indoc! {r#"
         out = test_sink()
         acc := 0
         for r in [1, 2]:
             acc += r
         out << [z for z in [1, 2, 3, 4] if z > acc]
-    "#};
-    let kept = || {
-        Value::Collection(Collection::from_entries(vec![(
-            Value::Int(3),
-            Value::Int(4),
-        )]))
-    };
-    assert_eq!(compiled(source), kept());
-    assert_eq!(
-        interpreted(source),
-        Value::Collection(Collection::from_entries(vec![(Value::Unit, kept())]))
-    );
+    "#});
 }
