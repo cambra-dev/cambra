@@ -200,6 +200,9 @@ impl CompileError {
                     detail: String::new(),
                 };
             }
+            CompileError::Lower(e @ LoweringError::Internal { .. }) => {
+                ("internal compiler error in lowering", e.span())
+            }
             CompileError::Lower(e) => ("lowering error", e.span()),
             CompileError::Infer { span, .. } => ("type inference error", *span),
             CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),

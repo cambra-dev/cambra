@@ -3059,7 +3059,9 @@ x";
                     1
             x"});
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message, .. } = &err;
+        let LoweringError::Unsupported { message, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             message.contains("if without else"),
             "expected the missing-else rejection, got: {message}"
@@ -3073,7 +3075,9 @@ x";
     fn test_brace_group_as_value_rejected() {
         let stmts = parse_module("{1, 2}");
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message, .. } = &err;
+        let LoweringError::Unsupported { message, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             message.contains("type syntax"),
             "expected a type-syntax hint, got: {message}"
@@ -3086,7 +3090,9 @@ x";
     fn test_brace_record_as_value_rejected() {
         let stmts = parse_module("{name: 1}");
         let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message, .. } = &err;
+        let LoweringError::Unsupported { message, .. } = &err else {
+            panic!("expected an unsupported error, got {err:?}")
+        };
         assert!(
             message.contains("(name=value)"),
             "expected a paren-record hint, got: {message}"

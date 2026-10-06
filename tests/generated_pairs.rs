@@ -65,6 +65,9 @@ const LIVE: &[&str] = &[
     "defer_feed",
     "feed",
     "feed_in_loop",
+    "four_loop_collection_feed_in_mut_loop",
+    "four_loop_feed_in_mut_loop",
+    "four_loop_feed_writing_every_loop",
     "function_arg",
     "groupby_source",
     "keyed_write_value",
@@ -640,6 +643,51 @@ fn skeletons() -> Vec<Skeleton> {
                     ch << {}
             out = test_sink()
             out << sum(ch)
+        "#}},
+        Skeleton { name: "nested_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for q in [10, 20]:
+                    ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        // Four loops deep, so the feed's key splices more than one pair of positions.
+        Skeleton { name: "four_loop_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                t += i
+                for b in [10, 20]:
+                    for c in [100, 200]:
+                        for q in [1, 2]:
+                            ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        Skeleton { name: "four_loop_feed_writing_every_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            t := 0
+            ch = defer()
+            for i in [1, 2]:
+                for b in [10, 20]:
+                    for c in [100, 200]:
+                        for q in [1, 2]:
+                            t += q
+                            ch << {}
+            out = test_sink()
+            out << t + sum(ch)
+        "#}},
+        Skeleton { name: "four_loop_collection_feed_in_mut_loop", hole: Ty::IntColl, scope: &[], body: indoc! {r#"
+            t := 0
+            out = test_sink()
+            for i in [1, 2]:
+                t += i
+                for b in [10, 20]:
+                    for c in [100, 200]:
+                        for q in [1, 2]:
+                            out << {}
         "#}},
 
         // Rows of a collection of collections, jagged or not.

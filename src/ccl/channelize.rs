@@ -14,10 +14,10 @@
 //! *before* `lambda_elim` and `planning::plan_loops` (recognition consumes
 //! the point-free normal form post-elim, so both mutable-variable and channel letrec
 //! groups travel through this step and elimination intact). The phase has
-//! already hoisted every in-loop feed to an ordinary `Feed(defer, view)` of the
-//! loop's history ([`crate::ccl::mut_elim::hoist_feeds`]), so channelization
-//! is **origin-agnostic**: it never distinguishes an accumulator-loop feed from
-//! a feed-only-loop or scalar feed.
+//! already hoisted every in-loop feed out of its recurrence as a loop over the tap it
+//! rode, `for x in tap: defer << x` ([`crate::ccl::mut_elim::hoist_feeds`]), so
+//! channelization is **origin-agnostic**: it never distinguishes an accumulator-loop
+//! feed from a feed-only-loop or scalar feed.
 //!
 //! Inference checks defer constructs on the user-shaped tree; channelization
 //! validates the channel shapes it consumes. For the history constraint rules,
@@ -41,6 +41,12 @@
 //! [`TypedExprNode::Define`], or [`TypedExprNode::ExprStmt`] nodes — and no
 //! `Feed`/`Hole`/`Infer` types — remain in the tree; every downstream pass treats
 //! those variants as `unreachable!`.
+//!
+//! A feed under nested loops is keyed by the tuple of the loops' positions
+//! (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability";
+//! [`crate::ccl::feed_nest`]). How many levels are positions is the number of loops the walk
+//! crossed to reach the feed ([`Contribution`]), never read off a type. Each
+//! contribution is recorded as the product of the `Feed` it came from (`channelize.feed`).
 //!
 //! A loop-sourced multi-arm feed `Case` — an `if`/`elif` chain or a `match` —
 //! fans out into one refined-source channel per feeding arm
@@ -115,10 +121,12 @@ use std::rc::Rc;
 use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
+use crate::ccl::feed_nest::{indexed_nest, key_by_positions};
+use crate::ccl::mut_elim::LoopFeed;
 use crate::ccl::{
-    BaseType, BindingTransparency, Branch, Builtin, Expr, FunKind, HistoryKind, Lit, Name, Pattern,
+    BaseType, BindingTransparency, Branch, Expr, FunKind, HistoryKind, Lit, Name, Pattern,
     PredicateId, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
-    ccl_utils::{apply_primitive, count_free, synthesize_arm_predicate, typed_compose, unit_expr},
+    ccl_utils::{count_free, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance::{self, Located, NodeId},
     scope::{ScopedItem, for_each_scoped_item},
@@ -595,68 +603,51 @@ fn contains_defer(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Defer) || expr.any_child(contains_defer)
 }
 
-/// A feed contribution flattened to one entry per position it was fed at.
-///
-/// `<<` appends at the site it is written, so a feed inside a loop contributes one value
-/// per position of that loop — which is what the loop's tap holds. Inside a **nest** the
-/// enclosing tap holds the inner loop's whole tap collection per enclosing position, one
-/// level per level the feed sits under, so the contribution arrives curried. Flattening
-/// each of those levels away is what makes the channel the innermost positions rather than
-/// the groups they fall into.
-///
-/// The levels a feed sits under are the contribution's levels beyond one over `element`,
-/// what one `<<` appends. A fed value may hold collections of its own, and those levels are
-/// the element's: `out << [[1, 2], [3]]` appends a collection of collections whole, so
-/// nothing of it is flattened.
-fn flatten_nested_contribution(mut value: Expr, element: Option<&Type>) -> Expr {
-    let Some(element) = element else {
-        assert!(
-            data_levels(&value.ty) < 2,
-            "a nested feed contribution needs its handle's element type to say which of its \
-             levels are positions: {}",
-            value.ty
-        );
-        return value;
-    };
-    let surplus = data_levels(&value.ty).saturating_sub(data_levels(element) + 1);
-    for _ in 0..surplus {
-        let Type::Fun {
-            fun_kind: FunKind::Data(_),
-            domain: outer,
-            codomain: inner,
-            ..
-        } = value.ty.peel_refinements()
-        else {
-            unreachable!("`data_levels` counted this level")
-        };
-        let Type::Fun {
-            fun_kind: FunKind::Data(_),
-            domain: keys,
-            codomain: elem,
-            ..
-        } = inner.peel_refinements()
-        else {
-            unreachable!("`data_levels` counted this level")
-        };
-        let flattened = Type::data_fun(
-            Type::Tuple(vec![(**outer).clone(), (**keys).clone()]),
-            (**elem).clone(),
-        );
-        value = apply_primitive(value, Builtin::Uncurry, flattened);
-    }
-    value
+/// What one feed contributes to its channel: the values it feeds, keyed by the positions of
+/// the loops around it, curried one collection level per loop, outermost first. `levels`
+/// counts those loops as the walk crosses them ([`extract_for_defer`]): 0 for a fed value
+/// still inside its loop's body, and a feed outside every loop is keyed by the unit, one
+/// level. The count is the structure's, so no type has to say which of the value's levels are
+/// positions and which are the fed value's own.
+struct Contribution {
+    value: Expr,
+    levels: usize,
+    /// The `Feed` this contribution is what became of, which records each node built
+    /// around it as its product.
+    feed: NodeId,
 }
 
-/// How many data-function levels `ty` nests, outermost first.
-fn data_levels(ty: &Type) -> usize {
-    match ty.peel_refinements() {
-        Type::Fun {
-            fun_kind: FunKind::Data(_),
-            codomain,
-            ..
-        } => 1 + data_levels(codomain),
-        _ => 0,
+/// The contributions a feed-only loop makes, one per feed in it, each with the deferred
+/// collection it feeds: what channelization assembles a loop's channel from, here for a loop
+/// that feeds from inside a recurrence. Each is in [`indexed_nest`]'s form, a collection per
+/// position of the recurrence, with the number of loops it is keyed by. `mut_elim` takes each
+/// as a tap of the recurrence and hoists it ([`crate::ccl::mut_elim::hoist_feeds`]), which
+/// flattens the levels. A feed is a tap of its own rather than combined with the loop's other
+/// feeds of the same collection, because feeds at different depths are keyed by different
+/// numbers of positions.
+///
+/// `feed_loop` is `𝑠 ≫ (λ 𝑥 → body)` with no mutable variable written in `body`.
+pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
+    let mut contributions = Vec::new();
+    let mut rest = feed_loop;
+    for defer in collect_feed_target_names(&rest) {
+        let mut feeds = Vec::new();
+        let mut define = None;
+        rest = extract_for_defer(rest, &defer, &mut feeds, &mut define, false)
+            .unwrap_or_else(|e| panic!("a feed-only loop inside a recurrence: {}", e.error));
+        assert!(
+            define.is_none(),
+            "a `<<=` inside a loop defines its collection once per iteration"
+        );
+        for Contribution { value, levels, .. } in feeds {
+            contributions.push(LoopFeed {
+                defer: defer.clone(),
+                view: indexed_nest(value, levels),
+                levels,
+            });
+        }
     }
+    contributions
 }
 
 /// Return `true` if `expr` contains any `Feed(target, …)` or
@@ -844,16 +835,11 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
     }
 }
 
-/// The element type of a feed handle: what one `<<` appends.
-fn handle_element(ty: &Type) -> Option<Type> {
-    ty.as_feed().map(|(_, element)| element.clone())
-}
-
 /// the channel domain carried by an assembled channel's
 /// type — the domain of its constructed `Fun`, or, for an alias channel that
 /// is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`), the read's
 /// handle domain (a `ChanDom` closed later by [`close_chan_domains`]).
-fn channel_domain_of(ty: &Type) -> Option<Type> {
+pub(crate) fn channel_domain_of(ty: &Type) -> Option<Type> {
     match ty.peel_refinements() {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
@@ -1228,7 +1214,7 @@ fn assert_no_type_residue(expr: &Expr) {
 /// refinement has nowhere to go and the filter would be **silently dropped**
 /// (planning reifies it off `expr.ty.domain()`, and no pass after this one could
 /// recover it). Assert rather than drop it quietly.
-fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
+pub(crate) fn refine_source_domain(source: &mut Expr, refinement: Refinement) {
     if let Type::Fun {
         domain, codomain, ..
     } = &source.ty
@@ -1443,14 +1429,6 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             {
                 chan_names.insert(binding.name.clone(), n);
             }
-            // And each defer's element type, which says how many of a contribution's levels
-            // are the loops it was fed under ([`flatten_nested_contribution`]).
-            let mut elements: HashMap<Name, Type> = HashMap::new();
-            if let Some(element) =
-                handle_element(&binding.ty).or_else(|| handle_element(&bound_expr.ty))
-            {
-                elements.insert(binding.name.clone(), element);
-            }
             ctx.defer_decls.insert(binding.name.clone(), node_id);
             let mut defer_names = vec![binding.name];
             let mut current_body = *body;
@@ -1466,11 +1444,6 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                             handle_chan_dom(&b.ty).or_else(|| handle_chan_dom(&be.ty))
                         {
                             chan_names.insert(b.name.clone(), n);
-                        }
-                        if let Some(element) =
-                            handle_element(&b.ty).or_else(|| handle_element(&be.ty))
-                        {
-                            elements.insert(b.name.clone(), element);
                         }
                         ctx.defer_decls.insert(b.name.clone(), cur_let_id);
                         defer_names.push(b.name);
@@ -1498,7 +1471,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // defer whose handle survives in a type does not.
             let _g =
                 provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
-            channelize_cluster(&defer_names, &chan_names, &elements, body_rewritten, ctx)
+            channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
         }
         TypedExprNode::Let {
             binding,
@@ -1678,7 +1651,6 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
 fn channelize_cluster(
     defer_names: &[Name],
     chan_names: &HashMap<Name, Name>,
-    elements: &HashMap<Name, Type>,
     body: Expr,
     ctx: &mut ChannelizeCtx,
 ) -> Result<Expr, Located<DeferError>> {
@@ -1694,14 +1666,23 @@ fn channelize_cluster(
         // feeds.
         let mut feeds = Vec::new();
         let mut define: Option<(NodeId, Expr)> = None;
-        rewritten = extract_for_defer(
-            rewritten,
-            name,
-            elements.get(name),
-            &mut feeds,
-            &mut define,
-            false,
-        )?;
+        rewritten = extract_for_defer(rewritten, name, &mut feeds, &mut define, false)?;
+        let feeds: Vec<Expr> = feeds
+            .into_iter()
+            .map(
+                |Contribution {
+                     value,
+                     levels,
+                     feed,
+                 }| {
+                    // Keying the contribution by the tuple of its positions is still building
+                    // what its `Feed` became.
+                    let _g =
+                        provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
+                    key_by_positions(value, levels)
+                },
+            )
+            .collect();
         let channel = match (feeds.is_empty(), define) {
             (true, None) => {
                 return Err(ctx.at_declaration(DeferError::NoFeedOrDefine(name.clone())));
@@ -2025,6 +2006,148 @@ fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
     ty.walk_children(|child| collect_free_vars_in_type(child, out));
 }
 
+/// Collect every defer-target name referenced by a `Feed`/`Define`
+/// node in `expr`, respecting `Let`/`Lambda` shadowing on the term
+/// spine, returned in deterministic (sorted) order.
+///
+/// [`loop_contributions`] takes a feed-only loop's contributions one deferred collection
+/// at a time, in this order.
+fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
+    fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
+        match &expr.node {
+            TypedExprNode::Comprehension { .. } => unreachable!(
+                "a Comprehension reached channelize; the comprehension phase eliminates it"
+            ),
+            TypedExprNode::MutDecl { .. } => {
+                unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
+            }
+            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+                if !bound.iter().any(|b| b == name) {
+                    out.insert(name.clone());
+                }
+                rec(value, bound, out);
+            }
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                rec(bound_expr, bound, out);
+                bound.push(binding.name.clone());
+                rec(body, bound, out);
+                bound.pop();
+            }
+            TypedExprNode::Lambda { param, body, .. } => {
+                bound.push(param.name.clone());
+                rec(body, bound, out);
+                bound.pop();
+            }
+            TypedExprNode::Apply { function, argument } => {
+                rec(function, bound, out);
+                rec(argument, bound, out);
+            }
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
+                rec(value, bound, out)
+            }
+            TypedExprNode::Begin { body } => rec(body, bound, out),
+            TypedExprNode::BinOp { left, right, .. } => {
+                rec(left, bound, out);
+                rec(right, bound, out);
+            }
+            TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Aggregate { input: inner, .. } => {
+                rec(inner, bound, out);
+            }
+            TypedExprNode::Tuple(elts)
+            | TypedExprNode::List(elts)
+            | TypedExprNode::Compose(elts)
+            | TypedExprNode::Copair(elts)
+            | TypedExprNode::DisjointJoin(elts) => {
+                for e in elts {
+                    rec(e, bound, out);
+                }
+            }
+            TypedExprNode::Record(fields) => {
+                for (_, e) in fields {
+                    rec(e, bound, out);
+                }
+            }
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(s) = scrutinee {
+                    rec(s, bound, out);
+                }
+                for b in branches {
+                    // A structural pattern binds its payload name over the
+                    // branch's guard and body.
+                    let pushed = if let Some(p) = &b.pattern {
+                        bound.push(p.binding.name.clone());
+                        true
+                    } else {
+                        false
+                    };
+                    rec(&b.guard, bound, out);
+                    rec(&b.body, bound, out);
+                    if pushed {
+                        bound.pop();
+                    }
+                }
+            }
+            TypedExprNode::Transact { .. } => {
+                unreachable!("channelize: Transact is born by recognition, after this pass")
+            }
+            TypedExprNode::ExprStmt { expr: e, body } => {
+                rec(e, bound, out);
+                rec(body, bound, out);
+            }
+            // Every group binder shadows across all binding bodies and the
+            // letrec body (mutual recursion).
+            TypedExprNode::LetRec { bindings, body } => {
+                for (b, _) in bindings {
+                    bound.push(b.name.clone());
+                }
+                for (_, def) in bindings {
+                    rec(def, bound, out);
+                }
+                rec(body, bound, out);
+                for _ in bindings {
+                    bound.pop();
+                }
+            }
+            // Pre-phase markers: the target binder scopes the loop body; a
+            // `MutWrite` names a mutable variable, not a feed target.
+            TypedExprNode::For { target, iter, body } => {
+                rec(iter, bound, out);
+                bound.push(target.name.clone());
+                rec(body, bound, out);
+                bound.pop();
+            }
+            TypedExprNode::MutWrite { key, value, .. } => {
+                if let Some(key) = key {
+                    rec(key, bound, out);
+                }
+                rec(value, bound, out);
+            }
+            TypedExprNode::Lit(_)
+            | TypedExprNode::Var(_)
+            | TypedExprNode::Builtin(_)
+            | TypedExprNode::Proj(_)
+            | TypedExprNode::Source(_)
+            | TypedExprNode::LoadFrom(_)
+            | TypedExprNode::Defer => {}
+            TypedExprNode::Error => crate::unexpected_error_node!(),
+            TypedExprNode::VariantCtor { payload, .. } => rec(payload, bound, out),
+        }
+    }
+    let mut targets: HashSet<Name> = HashSet::new();
+    rec(expr, &mut Vec::new(), &mut targets);
+    let mut sorted: Vec<Name> = targets.into_iter().collect();
+    // Deterministic order so generated field names compare reliably.
+    sorted.sort();
+    sorted
+}
+
 /// A single feed value passes through unchanged.  Multiple feed values
 /// are merged via [`TypedExprNode::Copair`] — the dedicated
 /// N-ary collection-union node — which compiles to a `UnionOperator`
@@ -2140,7 +2263,7 @@ fn join_refinements(a: &Type, b: &Type) -> Type {
 /// [`fun_codomain`]), so a `Hole` here means a genuinely untyped input (the
 /// untyped-mode pipeline); the debug residue assert and the strict wall
 /// backstop the typed mode.
-fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
+pub(crate) fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
     let d = elts.first().and_then(|e| fun_domain(&e.ty));
     let c = elts.last().and_then(|e| fun_codomain(&e.ty));
     // `fun_like`, not `Type::fun`: the chain is the head read through the rest, so it is a
@@ -2172,8 +2295,7 @@ fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
 fn extract_for_defer(
     expr: Expr,
     defer_name: &Name,
-    element: Option<&Type>,
-    feeds: &mut Vec<Expr>,
+    feeds: &mut Vec<Contribution>,
     define: &mut Option<(NodeId, Expr)>,
     in_inner_scope: bool,
 ) -> Result<Expr, Located<DeferError>> {
@@ -2183,7 +2305,7 @@ fn extract_for_defer(
     // — deep enough trees overflow a test thread's default stack. Every level goes
     // through this wrapper, so each one checks the remaining headroom.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        extract_for_defer_impl(expr, defer_name, element, feeds, define, in_inner_scope)
+        extract_for_defer_impl(expr, defer_name, feeds, define, in_inner_scope)
     })
 }
 
@@ -2201,8 +2323,7 @@ fn no_inner_define(define: Option<(NodeId, Expr)>) {
 fn extract_for_defer_impl(
     expr: Expr,
     defer_name: &Name,
-    element: Option<&Type>,
-    feeds: &mut Vec<Expr>,
+    feeds: &mut Vec<Contribution>,
     define: &mut Option<(NodeId, Expr)>,
     in_inner_scope: bool,
 ) -> Result<Expr, Located<DeferError>> {
@@ -2234,27 +2355,37 @@ fn extract_for_defer_impl(
             // above wraps it with its own `λ x → V` companion.
             //
             // A feed whose value is *already* a collection (`Fun(D, T)`)
-            // contributes its whole extent — a top-level `o << (h ≫ .to_o)`
-            // hoisted out of a loop by the letrec phase, or any collection
-            // feed. It is not lifted (that would double-wrap it as
-            // `Fun(Unit, Fun(D, T))`); it joins the channel union directly.
-            let value = flatten_nested_contribution(*value, element);
-            let mut vty = &value.ty;
-            while let Type::Refinement(inner, _) = vty {
-                vty = inner;
-            }
-            let is_function = matches!(vty, Type::Fun { .. });
-            let lifted = if in_inner_scope || is_function {
-                value
+            // contributes its whole extent. It is not lifted (that would
+            // double-wrap it as `Fun(Unit, Fun(D, T))`); it joins the channel
+            // union directly.
+            let value = *value;
+            let feed = node_id;
+            let _g = provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
+            let contribution = if in_inner_scope {
+                Contribution {
+                    value,
+                    levels: 0,
+                    feed,
+                }
+            } else if matches!(value.ty.peel_refinements(), Type::Fun { .. }) {
+                Contribution {
+                    value,
+                    levels: 1,
+                    feed,
+                }
             } else {
                 // The channel is a collection — inference says so on the handle, and every
                 // read of it is `⤇`. `Expr::lambda` declares `Compute`, so the wrap has to
                 // restate what the thing being wrapped is.
                 let vty = value.ty.clone();
-                Expr::lambda("__unused", Type::Base(BaseType::Unit), value)
-                    .with_ty(Type::data_fun(Type::Base(BaseType::Unit), vty))
+                Contribution {
+                    value: Expr::lambda("__unused", Type::Base(BaseType::Unit), value)
+                        .with_ty(Type::data_fun(Type::Base(BaseType::Unit), vty)),
+                    levels: 1,
+                    feed,
+                }
             };
-            feeds.push(lifted);
+            feeds.push(contribution);
             // The `Feed` wrapper's id is reused onto this `Lit(Unit)` replacement
             // (the enclosing rebuild carries `node_id`) — a preserve, not a
             // discard.
@@ -2293,14 +2424,8 @@ fn extract_for_defer_impl(
             bound_expr,
             body,
         } => {
-            let bound_expr = extract_for_defer(
-                *bound_expr,
-                defer_name,
-                element,
-                feeds,
-                define,
-                in_inner_scope,
-            )?;
+            let bound_expr =
+                extract_for_defer(*bound_expr, defer_name, feeds, define, in_inner_scope)?;
             let body = if &binding.name == defer_name {
                 // Inner let shadows the defer name; do not descend.
                 *body
@@ -2312,8 +2437,7 @@ fn extract_for_defer_impl(
                 // with `let n = … in for-loop`) would float out to the
                 // cluster's bind site with `n` unbound.
                 let prev_len = feeds.len();
-                let new_body =
-                    extract_for_defer(*body, defer_name, element, feeds, define, in_inner_scope)?;
+                let new_body = extract_for_defer(*body, defer_name, feeds, define, in_inner_scope)?;
                 // Wrap each feed extracted during the body walk with this
                 // let-binding — but only when the feed actually references the
                 // binding. A channel that escapes the scope where the binding
@@ -2329,10 +2453,20 @@ fn extract_for_defer_impl(
                 // dead ones are dropped. Inner lets wrap first as the walk
                 // unwinds, so a transitively-referenced binding is exposed as
                 // free here by the time this (outer) let checks.
-                for feed in feeds.iter_mut().skip(prev_len) {
+                for Contribution {
+                    value: feed,
+                    feed: feed_id,
+                    ..
+                } in feeds.iter_mut().skip(prev_len)
+                {
                     let mut fvs = HashSet::new();
                     collect_free_vars(feed, &mut fvs);
                     if fvs.contains(&binding.name) {
+                        let _g = provenance::enter(
+                            *feed_id,
+                            "channelize.feed",
+                            provenance::Nature::Expansion,
+                        );
                         // A `mem::take` slot, overwritten below: minting for it
                         // would log a birth for a node no tree ever holds.
                         let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
@@ -2378,7 +2512,6 @@ fn extract_for_defer_impl(
             expr: Box::new(extract_for_defer(
                 *e,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2386,7 +2519,6 @@ fn extract_for_defer_impl(
             body: Box::new(extract_for_defer(
                 *body,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2423,12 +2555,11 @@ fn extract_for_defer_impl(
                 else {
                     unreachable!("peeked above as a lambda whose param is not the defer binder")
                 };
-                let mut lambda_feeds: Vec<Expr> = Vec::new();
+                let mut lambda_feeds: Vec<Contribution> = Vec::new();
                 let mut lambda_define: Option<(NodeId, Expr)> = None;
                 let new_lambda_body = extract_for_defer(
                     *lambda_body,
                     defer_name,
-                    element,
                     &mut lambda_feeds,
                     &mut lambda_define,
                     true,
@@ -2437,20 +2568,31 @@ fn extract_for_defer_impl(
                 let new_argument = extract_for_defer(
                     *argument.clone(),
                     defer_name,
-                    element,
                     feeds,
                     define,
                     in_inner_scope,
                 )?;
-                for v in lambda_feeds {
+                for Contribution {
+                    value: v,
+                    levels,
+                    feed,
+                } in lambda_feeds
+                {
+                    let _g =
+                        provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
                     // `Apply { argument: source-element, function: λ p → v }`
                     // applies the value lambda to the per-element source, so the
                     // companion channel's type is the lambda's codomain `v.ty`
                     // (the argument matches `param.ty`). Typed at construction.
+                    // It binds one element, so it adds no position.
                     let v_ty = v.ty.clone();
                     let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
                     let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
-                    feeds.push(channel);
+                    feeds.push(Contribution {
+                        value: channel,
+                        levels,
+                        feed,
+                    });
                 }
                 let new_function = TypedExpr {
                     node: TypedExprNode::Lambda {
@@ -2467,22 +2609,10 @@ fn extract_for_defer_impl(
                     argument: Box::new(new_argument),
                 }
             } else {
-                let new_function = extract_for_defer(
-                    *function,
-                    defer_name,
-                    element,
-                    feeds,
-                    define,
-                    in_inner_scope,
-                )?;
-                let new_argument = extract_for_defer(
-                    *argument,
-                    defer_name,
-                    element,
-                    feeds,
-                    define,
-                    in_inner_scope,
-                )?;
+                let new_function =
+                    extract_for_defer(*function, defer_name, feeds, define, in_inner_scope)?;
+                let new_argument =
+                    extract_for_defer(*argument, defer_name, feeds, define, in_inner_scope)?;
                 TypedExprNode::Apply {
                     function: Box::new(new_function),
                     argument: Box::new(new_argument),
@@ -2493,7 +2623,6 @@ fn extract_for_defer_impl(
         TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(extract_for_defer(
             *value,
             defer_name,
-            element,
             feeds,
             define,
             in_inner_scope,
@@ -2503,7 +2632,6 @@ fn extract_for_defer_impl(
             value: Box::new(extract_for_defer(
                 *value,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2514,7 +2642,6 @@ fn extract_for_defer_impl(
             left: Box::new(extract_for_defer(
                 *left,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2523,7 +2650,6 @@ fn extract_for_defer_impl(
             right: Box::new(extract_for_defer(
                 *right,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2534,7 +2660,6 @@ fn extract_for_defer_impl(
             Box::new(extract_for_defer(
                 *inner,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2544,7 +2669,6 @@ fn extract_for_defer_impl(
             input: Box::new(extract_for_defer(
                 *input,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2553,12 +2677,12 @@ fn extract_for_defer_impl(
         },
         TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::List(elts) => TypedExprNode::List(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::Compose(elts) => {
@@ -2662,9 +2786,30 @@ fn extract_for_defer_impl(
                             };
                             let src_domain = source_prefix.ty.domain().unwrap_or(Type::Hole);
                             let src_item = source_prefix.ty.codomain().unwrap_or(Type::Hole);
+                            // The `Feed` each feeding arm is, in arm order: the guard form a
+                            // `match` converts to is a copy, so the originals name them.
+                            let mut arm_feeds = original_branches
+                                .iter()
+                                .filter(|b| {
+                                    matches!(
+                                        &b.body.node,
+                                        TypedExprNode::Feed { name, .. } if name == defer_name
+                                    )
+                                })
+                                .map(|b| b.body.node_id())
+                                .collect::<Vec<_>>()
+                                .into_iter();
                             let mut prior: Vec<Expr> = Vec::new();
                             for (guard, feed_value) in fanout_arms {
                                 if let Some(value) = feed_value {
+                                    let feed = arm_feeds.next().expect(
+                                        "one original `Feed` per feeding arm, asserted above",
+                                    );
+                                    let _g = provenance::enter(
+                                        feed,
+                                        "channelize.feed",
+                                        provenance::Nature::Expansion,
+                                    );
                                     let pred = synthesize_arm_predicate(&guard, &prior);
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
                                     let source_at_elem = Expr::apply(elem, source_prefix.clone())
@@ -2686,7 +2831,11 @@ fn extract_for_defer_impl(
                                     // to fill a `Hole` in.
                                     let channel_expr =
                                         compose_typed_or_hole(vec![refined_prefix, channel_lambda]);
-                                    feeds.push(channel_expr);
+                                    feeds.push(Contribution {
+                                        value: channel_expr,
+                                        levels: 1,
+                                        feed,
+                                    });
                                 }
                                 prior.push(guard);
                             }
@@ -2709,12 +2858,11 @@ fn extract_for_defer_impl(
                             new_elts.push(new_lambda);
                             continue;
                         }
-                        let mut lambda_feeds: Vec<Expr> = Vec::new();
+                        let mut lambda_feeds: Vec<Contribution> = Vec::new();
                         let mut lambda_define: Option<(NodeId, Expr)> = None;
                         let new_body = extract_for_defer(
                             *body,
                             defer_name,
-                            element,
                             &mut lambda_feeds,
                             &mut lambda_define,
                             true,
@@ -2725,7 +2873,17 @@ fn extract_for_defer_impl(
                         // up to (but not including) this element, which is
                         // exactly the surrounding context the feed value
                         // needs.
-                        for v in lambda_feeds {
+                        for Contribution {
+                            value: v,
+                            levels,
+                            feed,
+                        } in lambda_feeds
+                        {
+                            let _g = provenance::enter(
+                                feed,
+                                "channelize.feed",
+                                provenance::Nature::Expansion,
+                            );
                             // `Expr::lambda` stamps `Fun(param.ty, v.ty)`; the
                             // param carries the matched lambda's own (concrete)
                             // type, so the companion value lambda is fully typed.
@@ -2743,7 +2901,12 @@ fn extract_for_defer_impl(
                             } else {
                                 compose_typed_or_hole(channel_elts)
                             };
-                            feeds.push(channel_expr);
+                            // The loop keys the feed by its positions: one more level.
+                            feeds.push(Contribution {
+                                value: channel_expr,
+                                levels: levels + 1,
+                                feed,
+                            });
                         }
                         new_elts.push(TypedExpr {
                             node: TypedExprNode::Lambda {
@@ -2767,7 +2930,6 @@ fn extract_for_defer_impl(
                         new_elts.push(extract_for_defer(
                             elt,
                             defer_name,
-                            element,
                             feeds,
                             define,
                             in_inner_scope,
@@ -2779,7 +2941,7 @@ fn extract_for_defer_impl(
         }
         TypedExprNode::Copair(elts) => TypedExprNode::Copair(
             elts.into_iter()
-                .map(|e| extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope))
+                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope))
                 .collect::<Result<_, _>>()?,
         ),
         TypedExprNode::Record(fields) => {
@@ -2787,7 +2949,7 @@ fn extract_for_defer_impl(
             for (n, e) in fields {
                 new_fields.push((
                     n,
-                    extract_for_defer(e, defer_name, element, feeds, define, in_inner_scope)?,
+                    extract_for_defer(e, defer_name, feeds, define, in_inner_scope)?,
                 ));
             }
             TypedExprNode::Record(new_fields)
@@ -2805,32 +2967,36 @@ fn extract_for_defer_impl(
             // generic Lambda arm covers Lambdas that aren't the tail
             // element of a Compose — e.g. a top-level Lambda body that
             // contains an ExprStmt-wrapped Compose-with-feed.)
-            let mut local_feeds: Vec<Expr> = Vec::new();
+            let mut local_feeds: Vec<Contribution> = Vec::new();
             let mut local_define: Option<(NodeId, Expr)> = None;
             let body = if &param.name == defer_name {
                 *body
             } else {
-                extract_for_defer(
-                    *body,
-                    defer_name,
-                    element,
-                    &mut local_feeds,
-                    &mut local_define,
-                    true,
-                )?
+                extract_for_defer(*body, defer_name, &mut local_feeds, &mut local_define, true)?
             };
             no_inner_define(local_define);
-            for v in local_feeds {
+            for Contribution {
+                value: v,
+                levels,
+                feed,
+            } in local_feeds
+            {
+                let _g = provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
                 // The channel contribution is this lambda with the fed value for its body, so
                 // it is the same collection-or-capability the lambda was — `Expr::lambda`
-                // stamps `Compute`, so the incoming kind is carried back on.
+                // stamps `Compute`, so the incoming kind is carried back on. Its binder is
+                // one more position the contribution is keyed by.
                 let wrapped = Expr::lambda(&param.name, param.ty.clone(), v);
                 let wrapped_ty = Type::fun_like(
                     &ty,
                     param.ty.clone(),
                     wrapped.ty.codomain().expect("a lambda is a function"),
                 );
-                feeds.push(wrapped.with_ty(wrapped_ty));
+                feeds.push(Contribution {
+                    value: wrapped.with_ty(wrapped_ty),
+                    levels: levels + 1,
+                    feed,
+                });
             }
             TypedExprNode::Lambda {
                 param,
@@ -2853,7 +3019,7 @@ fn extract_for_defer_impl(
             // For arms with feeds where the feed value references arm-local
             // bindings, the Record wrap inside the arm keeps those bindings
             // in scope at the publication site.
-            let mut per_branch: Vec<(Option<Pattern>, Expr, Vec<Expr>, Expr)> =
+            let mut per_branch: Vec<(Option<Pattern>, Expr, Vec<Contribution>, Expr)> =
                 Vec::with_capacity(branches.len());
             let mut any_feed = false;
             for Branch {
@@ -2867,7 +3033,6 @@ fn extract_for_defer_impl(
                 let body = extract_for_defer(
                     body,
                     defer_name,
-                    element,
                     &mut branch_feeds,
                     &mut branch_define,
                     true,
@@ -2921,14 +3086,27 @@ fn extract_for_defer_impl(
                     } else {
                         Type::refined_one(unit_ty.clone(), Refinement::born(Rc::new(pred)))
                     };
-                    for v in branch_feeds {
+                    for Contribution {
+                        value: v,
+                        levels,
+                        feed,
+                    } in branch_feeds
+                    {
+                        let _g = provenance::enter(
+                            *feed,
+                            "channelize.feed",
+                            provenance::Nature::Expansion,
+                        );
                         // The channel is a collection, exactly as at the unconditional
                         // const-wrap above; `Expr::lambda` stamps `Compute`, so restate it.
+                        // The gated unit is one more level, as the unconditional lift's is.
                         let vty = v.ty.clone();
-                        feeds.push(
-                            Expr::lambda("__unused", refined.clone(), v.clone())
+                        feeds.push(Contribution {
+                            value: Expr::lambda("__unused", refined.clone(), v.clone())
                                 .with_ty(Type::data_fun(refined.clone(), vty)),
-                        );
+                            levels: levels + 1,
+                            feed: *feed,
+                        });
                     }
                 }
                 // Fall through: the residual value in every arm is now feed-free
@@ -2966,7 +3144,6 @@ fn extract_for_defer_impl(
             payload: Box::new(extract_for_defer(
                 *payload,
                 defer_name,
-                element,
                 feeds,
                 define,
                 in_inner_scope,
@@ -2975,18 +3152,16 @@ fn extract_for_defer_impl(
         // Recognition runs after lambda_elim, so a
         // causal `LetRec` reaches feed extraction. Walk its binding bodies
         // and continuation generically — the phase hoists every in-loop /
-        // in-block feed to the letrec *body* (`Feed(defer, tap)` ExprStmts),
+        // in-block feed to the letrec *body* (`for x in tap: defer << x` ExprStmts),
         // so extraction finds them there; binding bodies carry no feeds but
         // are walked for totality. Binder shadowing of `defer_name` is
         // impossible post-uniquify.
         TypedExprNode::LetRec { mut bindings, body } => {
             for (_, def) in bindings.iter_mut() {
                 let taken = std::mem::take(def);
-                *def =
-                    extract_for_defer(taken, defer_name, element, feeds, define, in_inner_scope)?;
+                *def = extract_for_defer(taken, defer_name, feeds, define, in_inner_scope)?;
             }
-            let body =
-                extract_for_defer(*body, defer_name, element, feeds, define, in_inner_scope)?;
+            let body = extract_for_defer(*body, defer_name, feeds, define, in_inner_scope)?;
             TypedExprNode::LetRec {
                 bindings,
                 body: Box::new(body),

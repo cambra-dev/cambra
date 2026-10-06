@@ -519,8 +519,8 @@ than on syntax. Four steps:
    commit-record binding per site over that site's loop domain, its decision evaluated at
    `begin_<site>(𝑟)`.
 4. **rebind** — each key's `let x = init` becomes `let x = as_of_read(hist_x)`, the read whose
-   sampling position `rewrite_as_of_reads` supplies later; hoisted feeds become ordinary
-   `Feed(defer, tap)`. A key read *only* by an await has no reference left to bind and is
+   sampling position `rewrite_as_of_reads` supplies later; each hoisted feed becomes a loop
+   over its tap, `for x in tap: defer << x`. A key read *only* by an await has no reference left to bind and is
    skipped.
 
 Awaits resolve across the same phase: `await_final(x)` becomes `final_read(hist_x)`. A key **no

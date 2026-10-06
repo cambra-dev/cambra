@@ -138,19 +138,37 @@
 //! each their own block, and their segments start fresh: a read inside one names
 //! its own binding rather than an enclosing block's. A fresh read denotes the
 //! variable's value at that point whatever the enclosing block did, and the
-//! binding lands per-iteration in a loop body and per-call in a lambda. A write
+//! binding lands per-call in a lambda and per-iteration in a loop body that
+//! writes the variable (below). A write
 //! anywhere inside such a block still ends the enclosing block's segment — the
 //! walk for mentions descends through the whole statement.
+//!
+//! # A loop reads what it does not write once
+//!
+//! A loop body — a `For`'s, or the lambda of a feed-only loop's `source ≫ λ` —
+//! starts with a segment open on each mutable variable it reads and never
+//! writes, under the enclosing block's binder for it ([`loop_body`]). No
+//! iteration changes such a variable, so every iteration reads the value it held
+//! when the loop began, and one binding ahead of the loop statement denotes it. A
+//! type naming the read, such as the rows of a feed in the loop filtered on it,
+//! then names a binder bound outside the loop rather than one each iteration
+//! binds anew.
+//!
+//! The variables the loop may write are read off the same mentions a segment
+//! ends at, over the whole body ([`writes`]). A block nested in the body still
+//! starts fresh, so a read in a `with begin():` body stays inside the
+//! transaction that performs it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
     BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
-    ccl_utils::spelled_in_a_type,
+    ccl_utils::{free_names_in_value, spelled_in_a_type},
     lambda_elim::substitute,
     mut_scope::{Muts, is_mut_var, under_param, with},
     provenance::{self, Nature},
     subst::Subst,
+    symbolic::symbolic,
 };
 
 /// Bind every block's mutable-variable reads. See the module docs.
@@ -320,7 +338,29 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
             body,
         } => {
             **iter = operand(std::mem::take(iter), muts, open, minted);
-            **body = block(std::mem::take(body), muts);
+            **body = loop_body(std::mem::take(body), muts, open, minted);
+            expr
+        }
+
+        // A loop that writes no mutable variable declared before it, lowered as
+        // `source ≫ (λ target → body)` (`Expr::for_loop`). Lowering builds no
+        // other `Compose` in a term, so the lambda is a loop body rather than a
+        // function value.
+        TypedExprNode::Compose(stages) => {
+            let [source, stage] = stages.as_mut_slice() else {
+                panic!(
+                    "a `Compose` before inference is a for loop's `source ≫ λ`, got {} stages",
+                    stages.len()
+                )
+            };
+            let TypedExprNode::Lambda { body, .. } = &mut stage.node else {
+                panic!(
+                    "a `Compose` before inference is a for loop's `source ≫ λ`, got stage {}",
+                    symbolic(stage)
+                )
+            };
+            *source = operand(std::mem::take(source), muts, open, minted);
+            **body = loop_body(std::mem::take(body), muts, open, minted);
             expr
         }
 
@@ -407,6 +447,69 @@ fn read_binder(name: &Name, open: &mut Open, minted: &mut Minted) -> Name {
     open.insert(name.clone(), binder.clone());
     minted.push((binder.clone(), name.clone()));
     binder
+}
+
+/// Rewrite a loop body as a block of its own whose reads of a variable the
+/// loop never writes go through the enclosing segment's binder (module docs,
+/// "A loop reads what it does not write once").
+///
+/// The body's block starts with those binders open. One the enclosing segment
+/// has not opened yet is minted provisionally and handed to `minted` only if the
+/// rewritten body uses it: a mention a nested block makes reads through a
+/// binding of that block's own, and a mention that survives the rewrite closes
+/// the body's segment as it would any other.
+fn loop_body(body: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) -> Expr {
+    let mut written = HashSet::new();
+    writes(&body, muts, &mut written);
+    let mut invariant: Vec<Name> = free_names_in_value(&body)
+        .into_iter()
+        .filter(|name| muts.contains(name) && !written.contains(name))
+        .collect();
+    // Sorted, so the bindings land in an order the program decides.
+    invariant.sort();
+    let mut inner = Open::new();
+    let mut provisional = Minted::new();
+    for name in invariant {
+        let binder = open.get(&name).cloned().unwrap_or_else(|| {
+            let binder = Name::mut_read();
+            provisional.push((binder.clone(), name.clone()));
+            binder
+        });
+        inner.insert(name, binder);
+    }
+    let body = spine(body, muts, &mut inner);
+    let used = free_names_in_value(&body);
+    for (binder, name) in provisional {
+        if used.contains(&binder) {
+            open.insert(name.clone(), binder.clone());
+            minted.push((binder, name));
+        }
+    }
+    body
+}
+
+/// Collect the mutable variables `expr` may write: a [`TypedExprNode::MutWrite`]'s
+/// target, and a bare reference in an application's function or argument, the
+/// positions a pass-by-reference writer takes its handle from (module docs,
+/// "What ends a segment"). The walk reaches every child, nested blocks
+/// included.
+fn writes(expr: &Expr, muts: &Muts, out: &mut HashSet<Name>) {
+    match &expr.node {
+        TypedExprNode::MutWrite { name, .. } => {
+            out.insert(name.clone());
+        }
+        TypedExprNode::Apply { function, argument } => {
+            for handle in [function, argument] {
+                if let TypedExprNode::Var(name) = &handle.node
+                    && muts.contains(name)
+                {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children(|child| writes(child, muts, out));
 }
 
 /// End the segment of every mutable variable `stmt` still mentions: each such
@@ -577,7 +680,7 @@ fn unbind_go(mut expr: Expr) -> Expr {
     debug_assert!(
         matches!(bound_expr.node, TypedExprNode::Var(_)),
         "a read-segment binding is bound to a bare reference, got {}",
-        crate::ccl::symbolic::symbolic(&bound_expr),
+        symbolic(&bound_expr),
     );
     substitute(*body, &binding.name, &bound_expr)
 }
@@ -585,7 +688,6 @@ fn unbind_go(mut expr: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::symbolic::symbolic;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, HistoryKind, Lit, Type};
 
     const ADD: BinOpKind = BinOpKind::Arithmetic(ArithmeticKind::Add);
@@ -684,6 +786,45 @@ mod tests {
         let out = run(accumulator(&x, Expr::var(x.clone())));
         let s = symbolic(&out);
         assert!(!s.contains("__read"), "nothing to name: {s}");
+    }
+
+    /// `for r in xs: body` in statement position, over a fresh source.
+    fn a_loop(body: Expr) -> Expr {
+        Expr::expr_stmt(
+            Expr::for_loop(Name::fresh("r"), Expr::var(Name::fresh("xs")), body),
+            Expr::lit(Lit::Unit),
+        )
+    }
+
+    /// A loop that never writes `x` reads it through one binding ahead of the
+    /// loop, and a nested loop's read hoists past both.
+    #[test]
+    fn a_loop_reads_what_it_does_not_write_once() {
+        let x = Name::fresh("x");
+        let read = Expr::let_in(
+            TypedBinding::new_unannotated(Name::fresh("y")),
+            Expr::binop(Expr::var(x.clone()), ADD, lit(1)),
+            Expr::lit(Lit::Unit),
+        );
+        let s = symbolic(&run(accumulator(&x, a_loop(a_loop(read)))));
+        let binding = s
+            .find("__read ^= x")
+            .unwrap_or_else(|| panic!("one binding: {s}"));
+        assert_eq!(s.matches("__read ^= x").count(), 1, "one binding: {s}");
+        assert!(binding < s.find('≫').unwrap(), "ahead of both loops: {s}");
+        assert!(s.contains("__read + 1"), "the read is named: {s}");
+    }
+
+    /// A loop that writes `x` reads it per iteration, through a binding inside
+    /// the body.
+    #[test]
+    fn a_loop_that_writes_reads_per_iteration() {
+        let x = Name::fresh("x");
+        let s = symbolic(&run(accumulator(&x, a_loop(two_segments(&x)))));
+        let first = s
+            .find("__read ^= x")
+            .unwrap_or_else(|| panic!("a binding: {s}"));
+        assert!(first > s.find('λ').unwrap(), "inside the body: {s}");
     }
 
     /// With no type spelling a binder, unbinding restores the tree the phase was

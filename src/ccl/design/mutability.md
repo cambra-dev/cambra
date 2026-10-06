@@ -212,6 +212,11 @@ variable, which is [what no type may do](#a-mutable-variable-read-is-an-explicit
 which nothing binds where the type travels. Read through a binder, the same operand types as
 `{Int | __elem == __read ^+ 1}`.
 
+A `for` body reads a variable it never writes through the enclosing block's segment binder, so
+the binding stands once ahead of the loop rather than once per iteration. No iteration changes the
+variable, so the two denote the same value, and a type naming the read, such as the rows of a feed
+in the loop filtered on it, names a binder bound outside the loop.
+
 A binder `mut_read` minted is substituted back immediately after inference, except where a type
 spells it: a binding on a writer's spine is an operator in the graph, and the phases below recognize
 a read by its term. Every use of such a binder precedes the write that ended the segment, which is
@@ -782,7 +787,13 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 4. **Routes feeds**: each channel becomes a letrec-body output, unioned (`++`) across sites. A
    feed outside a `with begin():` block is a function over its contributing loop's domain. A feed
    inside one reads its value off the commit record (a per-commit tap), keyed by commit time
-   through `by_commit_time`, so its domain is `Txn`.
+   through `by_commit_time`, so its domain is `Txn`. A feed under nested loops is keyed by the
+   tuple of every enclosing loop's position. An inner loop that writes nothing outside it is not
+   a recurrence: each of its feeds is a tap of the enclosing loop's decision, one collection per
+   enclosing position in the form a nested comprehension lowers to. A tap holds a collection
+   level per loop around its feed, which `mut_elim` counts as it builds the tap; the hoist
+   uncurries those levels into the tuple key and feeds each value through a loop over the
+   result, `for x in tap: defer << x`, so a `Feed` appends one element wherever it stands.
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator

@@ -465,7 +465,7 @@ impl TileProducer for FlattenTupleDomainProducer {
         let Tile::DataFunction {
             row_starts,
             domain,
-            codomain,
+            mut codomain,
             domain_predicate,
             deleted,
         } = input_tile
@@ -499,21 +499,51 @@ impl TileProducer for FlattenTupleDomainProducer {
                 .collect(),
         );
 
-        let flat_pred = flatten_predicate(&domain_predicate, &self.field_map);
+        let field_map = &self.field_map;
+        let flat_pred = flatten_predicate(&domain_predicate, field_map);
+        // A collection beneath names its paths through this level's keys, which are now flat.
+        codomain.map_level_predicates(&mut |depth, pred| {
+            pred.with_component_restated(depth + 1, 0, &|keys| flatten_predicate(keys, field_map))
+        });
 
         Tile::grouped(row_starts, flat_domain, codomain, flat_pred, deleted)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let upstream_guard = match obsolete_guard {
+        let upstream_guard = self.unflatten_guard(obsolete_guard);
+        self.input.release(upstream_guard);
+    }
+}
+
+impl FlattenTupleDomainProducer {
+    /// The input guard naming what `guard` names over the flat keys: the region of keys
+    /// restated over the nested keys, and what it names beneath them restated alike, as
+    /// [`get_impl`](TileProducer::get_impl) restated the levels beneath on the way out.
+    fn unflatten_guard(&self, guard: TileGuard) -> TileGuard {
+        let field_map = &self.field_map;
+        match guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(pred)) => TileGuard::Function(
-                FunctionGuard::Domain(unflatten_predicate(&pred, &self.field_map)),
-            ),
-            g => panic!("FlattenTupleDomain: unsupported obsolete guard: {g:?}"),
-        };
-        self.input.release(upstream_guard);
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                TileGuard::Function(FunctionGuard::Domain(unflatten_predicate(&pred, field_map)))
+            }
+            TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                    inner.map_level_predicates(&mut |depth, pred| {
+                        pred.with_component_restated(depth + 1, 0, &|keys| {
+                            unflatten_predicate(keys, field_map)
+                        })
+                    }),
+                )))
+            }
+            // Each arm names its own region, so each is restated on its own.
+            TileGuard::Or(arms) => arms
+                .into_iter()
+                .fold(self.input.tiling().empty_guard(), |all, arm| {
+                    all.union(&self.unflatten_guard(arm))
+                }),
+            g => unreachable!("FlattenTupleDomain's tiling is a collection, released by {g:?}"),
+        }
     }
 }
 

@@ -891,6 +891,36 @@ impl Predicate {
         }
     }
 
+    /// This predicate, over the paths reaching level `level`, with component `at`
+    /// (`at ≤ level`) restated by `restate`, which rewrites that level's keys one to one.
+    ///
+    /// What an operator owes the values beneath a level whose keys it respells: a statement
+    /// naming a path through the old spelling of a key now names it through the new one.
+    /// `restate` must keep `True` and `False` as they are, since an unqualified statement
+    /// says nothing of the component and reads the same either way.
+    pub(crate) fn with_component_restated(
+        &self,
+        level: usize,
+        at: usize,
+        restate: &dyn Fn(&Predicate) -> Predicate,
+    ) -> Predicate {
+        match self {
+            Predicate::Or(arms) => arms
+                .iter()
+                .map(|arm| arm.with_component_restated(level, at, restate))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+            _ if at == level => {
+                let (enclosing, here) = self.split_qualification();
+                Predicate::qualified(enclosing.clone(), restate(here))
+            }
+            Predicate::Qualified { enclosing, here } => Predicate::qualified(
+                enclosing.with_component_restated(level - 1, at, restate),
+                (**here).clone(),
+            ),
+            unqualified => unqualified.clone(),
+        }
+    }
+
     /// This predicate, over the paths reaching level `level`, restated after a level is
     /// inserted before component `at` (`at ≤ level`): every path gains a component there,
     /// and the statement admits anything in it.
@@ -1803,6 +1833,30 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Restating a component rewrites the key the path names at that component, at any depth
+    /// beneath it, and leaves an unqualified statement alone.
+    #[test]
+    fn a_restated_component_renames_the_paths_through_it() {
+        let bump = |p: &Predicate| match p {
+            Predicate::True | Predicate::False => p.clone(),
+            _ if *p == only(1) => only(5),
+            other => panic!("restated an unexpected key {other:?}"),
+        };
+        // A statement of the second level, under the first level's key 1.
+        let beneath = Predicate::exactly(&under(1, 0));
+        let restated = beneath.with_component_restated(1, 0, &bump);
+        assert!(restated.contains_path(&under(5, 0)));
+        assert!(!restated.contains_path(&under(1, 0)));
+        // The same statement one level further down.
+        let deeper = Predicate::exactly(&[u(1), u(0), u(2)]);
+        let restated = deeper.with_component_restated(2, 0, &bump);
+        assert!(restated.contains_path(&[u(5), u(0), u(2)]));
+        // A level's own keys are its last component.
+        assert_eq!(only(1).with_component_restated(0, 0, &bump), only(5));
+        // An unqualified statement of a deeper level names no key of the component.
+        assert_eq!(only(0).with_component_restated(1, 0, &bump), only(0));
     }
 
     /// `beneath` and `within` are inverse, at the group's own level and deeper.
