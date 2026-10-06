@@ -277,7 +277,7 @@ identity from a user-written one.
 
 Loop planning is where this bites. The mutable variable record a `Transact`
 denotes is typed with `Name::field_key()` labels, and folding the binder uid in
-would type the node `{acc#9: ([0, 2] ⇒ Int)}` in one compilation and `{acc#19:
+would type the node `{acc#9: (0..3 ⇒ Int)}` in one compilation and `{acc#19:
 …}` in the next, with `.acc#9` against `.acc#19` reading it — two compilations
 of the same source diffing as different, and every phase from planning down
 unusable.

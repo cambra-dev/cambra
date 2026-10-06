@@ -935,7 +935,7 @@ mod tests {
     /// still be freshened.
     ///
     /// The shape is the one a comprehension produces: a `Fun` whose every
-    /// structural position is concrete (`[0,2] ⇒ Int`), carrying a refinement whose
+    /// structural position is concrete (`0..3 ⇒ Int`), carrying a refinement whose
     /// base is also concrete — so `type_level` reports 0 for the whole thing — while
     /// the predicate holds a level-5 variable. Short-circuiting on `type_level`
     /// returns the type verbatim and the clone keeps pointing at the definition's

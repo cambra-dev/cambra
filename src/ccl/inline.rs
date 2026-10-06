@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     /// A **collection** is not inlined — it is the data, so it is bound once and
-    /// shared. The domain is deliberately the same `[0, 3)` a list has: what
+    /// shared. The domain is deliberately the same `0..3` a list has: what
     /// decides this is the kind, not the shape of the domain.
     #[test]
     fn should_not_inline_a_collection() {
@@ -1170,7 +1170,7 @@ mod tests {
     }
 
     /// The same domain at the **capability** kind is inlined. A `Compute` function
-    /// over `[0, 3)` is a function that happens to accept those inputs, not a
+    /// over `0..3` is a function that happens to accept those inputs, not a
     /// collection of them, and there is nothing behind it to share.
     #[test]
     fn should_inline_a_capability_over_an_enumerable_domain() {
@@ -1574,7 +1574,7 @@ mod tests {
         let list = fn_ty(range.clone(), int.clone());
         let udf_ty = fn_ty(singleton.clone(), list.clone());
 
-        // λ k : {Int | __elem == 5} → λ __iter_record : [0, 2] → k
+        // λ k : {Int | __elem == 5} → λ __iter_record : 0..3 → k
         let inner = TypedExpr::lambda(
             "__iter_record",
             range.clone(),

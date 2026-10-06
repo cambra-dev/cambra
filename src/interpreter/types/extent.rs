@@ -29,7 +29,7 @@ pub enum Extent {
     Union(TagMap<Extent>),
     /// A finite set of unsigned integer indices, represented as an interval set.
     ///
-    /// Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and
+    /// Created from a CCL `UIntRange(n)` type as the full set `0..n`, and
     /// shrunk directly as individual elements or sub-intervals are released.
     UIntRange(IntervalSet<usize>),
     DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
@@ -430,11 +430,45 @@ impl std::fmt::Display for Extent {
                 // on the right of a subtyping edge and cannot reach here.
                 false,
             ),
-            Extent::UIntRange(set) => write!(f, "{set}"),
+            Extent::UIntRange(set) => fmt_uint_ranges(f, set),
             Extent::DataSourceDomain(source) => write!(f, "Source({})", source.borrow().get_id()),
             Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
         }
     }
+}
+
+/// Render unsigned extents without changing the interval notation used by predicates.
+fn fmt_uint_ranges(f: &mut std::fmt::Formatter<'_>, set: &IntervalSet<usize>) -> std::fmt::Result {
+    let mut ranges = set
+        .intervals()
+        .iter()
+        .filter_map(|interval| {
+            let start = match interval.left() {
+                None => 0,
+                Some(bound) if bound.is_open() => bound.value().checked_add(1)?,
+                Some(bound) => *bound.value(),
+            };
+            let end = match interval.right() {
+                None => usize::MAX,
+                Some(bound) if bound.is_open() => bound.value().checked_sub(1)?,
+                Some(bound) => *bound.value(),
+            };
+            (start <= end).then_some((start, end))
+        })
+        .peekable();
+    if ranges.peek().is_none() {
+        return write!(f, "0..0");
+    }
+    for (i, (start, end)) in ranges.enumerate() {
+        if i != 0 {
+            write!(f, " ∪ ")?;
+        }
+        match end.checked_add(1) {
+            Some(exclusive) => write!(f, "{start}..{exclusive}")?,
+            None => write!(f, "{start}..={end}")?,
+        }
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for Extent {
@@ -444,15 +478,15 @@ impl std::fmt::Debug for Extent {
 }
 
 impl Extent {
-    /// Construct a `UIntRange` extent covering `[0, n)`.
+    /// Construct a `UIntRange` extent covering `0..n`.
     ///
-    /// The resulting interval set contains every unsigned integer in `[0, n)`.
+    /// The resulting interval set contains every unsigned integer in `0..n`.
     /// For `n == 0`, the set is empty.
     pub fn uint_range(n: usize) -> Self {
         Self::uint_range_interval(0, n)
     }
 
-    /// Construct a `UIntRange` extent covering `[start, end)`.
+    /// Construct a `UIntRange` extent covering `start..end`.
     ///
     /// Returns an empty set when `start >= end`.
     pub fn uint_range_interval(start: usize, end: usize) -> Self {
@@ -464,7 +498,7 @@ impl Extent {
     }
 
     /// If this is a `UIntRange` whose remaining set is a single contiguous
-    /// range starting at `0` (i.e. `[0, n)`), return `n`.
+    /// range starting at `0` (i.e. `0..n`), return `n`.
     ///
     /// Used to convert a compile-time extent back to a CCL `Type::UIntRange(n)`.
     pub fn as_uint_range_size(&self) -> Option<usize> {
@@ -549,6 +583,7 @@ pub use crate::ccl::BaseType;
 mod tests {
     use super::*;
     use crate::ccl::FieldKey;
+    use intervalsets::ops::Union;
     use std::collections::HashMap;
 
     // --- Display tests ---
@@ -634,9 +669,27 @@ mod tests {
 
     #[test]
     fn test_extent_display_uint_range() {
-        // Discrete intervals are normalised to closed form: [2, 5) -> [2, 4].
         let e = Extent::uint_range_interval(2, 5);
-        assert_eq!(e.to_string(), "{[2, 4]}");
+        assert_eq!(e.to_string(), "2..5");
+        assert_eq!(Extent::uint_range(0).to_string(), "0..0");
+        assert_eq!(Extent::uint_range(1).to_string(), "0..1");
+        assert_eq!(
+            Extent::uint_range(usize::MAX).to_string(),
+            format!("0..{}", usize::MAX)
+        );
+        assert_eq!(
+            Extent::UIntRange(Interval::closed(usize::MAX, usize::MAX).into()).to_string(),
+            format!("{0}..={0}", usize::MAX)
+        );
+        assert_eq!(
+            Extent::UIntRange(Interval::unbounded().into()).to_string(),
+            format!("0..={}", usize::MAX)
+        );
+        assert_eq!(
+            Extent::UIntRange(Interval::closed_open(1, 3).union(&Interval::closed_open(5, 8)))
+                .to_string(),
+            "1..3 ∪ 5..8"
+        );
     }
 
     #[test]

@@ -1746,10 +1746,9 @@ fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: V
     check_scalar(code, expected);
 }
 
-/// A variant whose payload is a **collection** is one variant value, the collection held
-/// whole in its arm, which the variant's type says: `` `some(xs) `` is a
-/// `` {`some{[0, 1] ⤇ Int}} ``, not a collection of `` `some `` values. The `match` reopens
-/// the payload as the collection it was.
+/// A variant can hold a collection as its payload. With `xs = [1, 2]`, `` `some(xs) `` has
+/// type `` {`some{0..2 ⤇ Int}} ``, not a collection of variants. The `match` arm binds the
+/// collection payload to `v`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::a_list(indoc! {"

@@ -3298,7 +3298,7 @@ mod tests {
             .collect();
         assert_eq!(
             rendered,
-            vec!["[0, 1]".to_string(), "[0, 2]".to_string()],
+            vec!["0..2".to_string(), "0..3".to_string()],
             "both joined domains lie below the key"
         );
         drop(arena);
@@ -3403,7 +3403,7 @@ mod tests {
         let consumer = Type::consumer_fun(fresh_var(0), prim(BaseType::Int));
         assert!(constrain_subtype(&cond, &consumer, &mut ConstrainCache::new()).is_ok());
         // A consumer demanding a *concrete narrower* domain fails: the concrete type
-        // meets the witness at every candidate, and `[0, 3)` is not `[0, 2)` — the
+        // meets the witness at every candidate, and `0..3` is not `0..2` — the
         // conditional collection never silently narrows to a single domain.
         let narrow = Type::consumer_fun(Type::UIntRange(2), prim(BaseType::Int));
         assert!(constrain_subtype(&cond, &narrow, &mut ConstrainCache::new()).is_err());
@@ -3466,7 +3466,7 @@ mod tests {
         // capability. A collection's domain is invariant — it *is* the data — so
         // re-viewing it as a capability, whose domain is contravariant, is not a
         // weakening of the same claim but a different one.
-        // `[0, 2] ⤇ Int ⊀ [0, 2] ⇒ Int`.
+        // `0..3 ⤇ Int ⊀ 0..3 ⇒ Int`.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
             constrain_subtype(
@@ -3481,7 +3481,7 @@ mod tests {
     #[test]
     fn kind_compute_where_data_is_rejected() {
         // `Compute ⋠ Data`: a capability supplied where a collection is demanded is
-        // the rejection (the silent-row-loss guard). `[0, 2] ⇒ Int ⊀ [0, 2] ⤇ Int`.
+        // the rejection (the silent-row-loss guard). `0..3 ⇒ Int ⊀ 0..3 ⤇ Int`.
         let mut cache = ConstrainCache::new();
         assert!(matches!(
             constrain_subtype(

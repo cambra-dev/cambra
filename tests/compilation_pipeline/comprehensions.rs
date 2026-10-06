@@ -186,8 +186,8 @@ fn a_filtered_comprehension_drives_a_mutation_loop() {
 ///
 /// It fails loudly, which is why it is recorded rather than fixed here: a **filter over a
 /// same-domain conditional** fails the post-planning typecheck: the
-///   `cast` above the realized union still says `[0, 1]`, where the union's domain is
-///   `{[0, 1] | π̂₀} | {[0, 1] | π̂₁}`. Wrapping the realization in a `Realize` that asserts
+///   `cast` above the realized union still says `0..2`, where the union's domain is
+///   `{0..2 | π̂₀} | {0..2 | π̂₁}`. Wrapping the realization in a `Realize` that asserts
 ///   the pre-realization type gets past that — and then reaches the *second* wall, which is
 ///   the interesting one: the filter's predicate holds its own copy of the source, so it
 ///   holds the `Case`, and nothing replaces it. Realization deliberately does not fire
@@ -857,8 +857,8 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
 /// and lambda elimination's check that a node keeps its type rejects the pair:
 ///
 /// ```text
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
+/// (__iter_record: 0..2) ⤇ ({0..3 | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
+/// (__iter_record: 0..2) ⤇ ({0..3 | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
 /// ```
 ///
 /// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim

@@ -656,7 +656,7 @@
             "nature": "expansion",
             "label": "mono.specialize"
           },
-          "type": "(([0, 3] ⤇ Int) ⇒ feed(chan(t) ⤇ Int))",
+          "type": "((0..4 ⤇ Int) ⇒ feed(chan(t) ⤇ Int))",
           "children": [
             {
               "id": 96,
@@ -769,7 +769,7 @@
             "nature": "expansion",
             "label": "mono.specialize"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -890,7 +890,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 13,
@@ -1284,7 +1284,7 @@
             "nature": "machinery",
             "label": "lower.image"
           },
-          "type": "(([0, 3] ⤇ Int) ⇒ feed(chan(t) ⤇ Int))",
+          "type": "((0..4 ⤇ Int) ⇒ feed(chan(t) ⤇ Int))",
           "children": []
         },
         {
@@ -1297,7 +1297,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -1340,7 +1340,7 @@
             "nature": "machinery",
             "label": "lower.image"
           },
-          "type": "([0, 3] ⤇ Unit)",
+          "type": "(0..4 ⤇ Unit)",
           "children": [
             {
               "id": 3,
@@ -1362,7 +1362,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -1497,7 +1497,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 13,
@@ -1869,7 +1869,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": [
             {
               "id": 393,
@@ -1939,7 +1939,7 @@
             "nature": "expansion",
             "label": "inline.udf"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -1956,7 +1956,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 395,
@@ -1982,7 +1982,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -2060,7 +2060,7 @@
             "nature": "machinery",
             "label": "channelize.defer_lift"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": []
         }
       ]
@@ -2107,7 +2107,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 13,
@@ -2479,7 +2479,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": [
             {
               "id": 393,
@@ -2549,7 +2549,7 @@
             "nature": "expansion",
             "label": "inline.udf"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -2566,7 +2566,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 395,
@@ -2592,7 +2592,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -2670,7 +2670,7 @@
             "nature": "machinery",
             "label": "channelize.defer_lift"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": []
         }
       ]
@@ -2721,7 +2721,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 400,
@@ -3109,7 +3109,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": [
             {
               "id": 407,
@@ -3204,7 +3204,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(([0, 3] ⤇ Int) ⇒ Int)",
+          "type": "((0..4 ⤇ Int) ⇒ Int)",
           "children": []
         },
         {
@@ -3221,7 +3221,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -3238,7 +3238,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -3281,7 +3281,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Unit | [0, 3] ⤇ Int) ⇒ Int)",
+          "type": "((Unit | 0..4 ⤇ Int) ⇒ Int)",
           "children": []
         },
         {
@@ -3298,7 +3298,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": []
         }
       ]
@@ -3349,7 +3349,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 673,
@@ -3375,7 +3375,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 3] ⤇ [0, 3])",
+          "type": "(0..4 ⤇ 0..4)",
           "children": [
             {
               "id": 672,
@@ -3401,7 +3401,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "(([0, 3] ⇒ Bool) ⇒ ([0, 3] ⤇ [0, 3]))",
+          "type": "((0..4 ⇒ Bool) ⇒ (0..4 ⤇ 0..4))",
           "children": []
         },
         {
@@ -3418,7 +3418,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 3] ⇒ Bool)",
+          "type": "(0..4 ⇒ Bool)",
           "children": [
             {
               "id": 670,
@@ -3444,7 +3444,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "(Bool ⇒ ([0, 3] ⇒ Bool))",
+          "type": "(Bool ⇒ (0..4 ⇒ Bool))",
           "children": []
         },
         {
@@ -3478,7 +3478,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 400,
@@ -4554,7 +4554,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": [
             {
               "id": 504,
@@ -4778,7 +4778,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(([0, 3] ⤇ Int) ⇒ Int)",
+          "type": "((0..4 ⤇ Int) ⇒ Int)",
           "children": []
         },
         {
@@ -4795,7 +4795,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -4812,7 +4812,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": []
         },
         {
@@ -4855,7 +4855,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Unit | [0, 3] ⤇ Int) ⇒ Int)",
+          "type": "((Unit | 0..4 ⤇ Int) ⇒ Int)",
           "children": []
         },
         {
@@ -4872,7 +4872,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | [0, 3] ⤇ Int)",
+          "type": "(Unit | 0..4 ⤇ Int)",
           "children": []
         }
       ]
@@ -4904,7 +4904,7 @@
           "label": "IterateExtent",
           "nodeId": 807,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → {[0, 3]})",
+          "tiling": "Fn(0..4 → 0..4)",
           "spans": [
             {
               "start": 73,
@@ -4922,7 +4922,7 @@
           "label": "Constant",
           "nodeId": 808,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 73,
@@ -4940,7 +4940,7 @@
           "label": "MapResult",
           "nodeId": 809,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 73,
@@ -4977,7 +4977,7 @@
           "label": "Memo",
           "nodeId": 810,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 61,
@@ -5005,7 +5005,7 @@
           "label": "FanOutBranch",
           "nodeId": 812,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 50,
@@ -5126,7 +5126,7 @@
           "label": "FanOutBranch",
           "nodeId": 816,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 125,
@@ -5154,7 +5154,7 @@
           "label": "UnionOperator",
           "nodeId": 817,
           "role": "operator",
-          "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",
+          "tiling": "Fn({`0 | `1{0..4}} → Int)",
           "spans": [
             {
               "start": 85,
@@ -5191,7 +5191,7 @@
           "label": "Memo",
           "nodeId": 818,
           "role": "operator",
-          "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",
+          "tiling": "Fn({`0 | `1{0..4}} → Int)",
           "spans": [
             {
               "start": 85,
@@ -5219,7 +5219,7 @@
           "label": "FanOutBranch",
           "nodeId": 819,
           "role": "operator",
-          "tiling": "Fn({`0 | `1{[0, 3]}} → Int)",
+          "tiling": "Fn({`0 | `1{0..4}} → Int)",
           "spans": [
             {
               "start": 155,

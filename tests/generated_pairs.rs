@@ -1046,12 +1046,12 @@ fn a_message_stem_drops_what_varies_per_program() {
         stem(r#"[Conversion(Unsupported("unrecognised Var(q) in λ-free CCL"))]"#),
     );
     assert_eq!(
-        stem("[Infer { error: Type mismatch for Apply: expected [0, 2], found Int, span: None }]"),
-        "Infer: Type mismatch for Apply: expected …, found Int",
+        stem("[Infer { error: Type mismatch for Apply: expected 0..3, found Int, span: None }]"),
+        "Infer: Type mismatch for Apply: expected #..#, found Int",
     );
     assert_eq!(
         stem("FanIn pairs collections over 1 ambient level(s), got Fn(String → Int) and Int"),
-        stem("FanIn pairs collections over 1 ambient level(s), got Fn({[0, 2]} → Int) and Int"),
+        stem("FanIn pairs collections over 1 ambient level(s), got Fn(0..3 → Int) and Int"),
     );
     assert_ne!(
         stem(r#"[Conversion(Unsupported("unrecognised Var(i) in λ-free CCL"))]"#),

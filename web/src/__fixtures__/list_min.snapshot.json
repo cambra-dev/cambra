@@ -116,7 +116,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 1,
@@ -466,7 +466,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 1,
@@ -816,7 +816,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 1,
@@ -1170,7 +1170,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 71,
@@ -1540,7 +1540,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 296,
@@ -1566,7 +1566,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 3] ⤇ [0, 3])",
+          "type": "(0..4 ⤇ 0..4)",
           "children": [
             {
               "id": 295,
@@ -1592,7 +1592,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "(([0, 3] ⇒ Bool) ⇒ ([0, 3] ⤇ [0, 3]))",
+          "type": "((0..4 ⇒ Bool) ⇒ (0..4 ⤇ 0..4))",
           "children": []
         },
         {
@@ -1609,7 +1609,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 3] ⇒ Bool)",
+          "type": "(0..4 ⇒ Bool)",
           "children": [
             {
               "id": 293,
@@ -1635,7 +1635,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "(Bool ⇒ ([0, 3] ⇒ Bool))",
+          "type": "(Bool ⇒ (0..4 ⇒ Bool))",
           "children": []
         },
         {
@@ -1669,7 +1669,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 3] ⤇ Int)",
+          "type": "(0..4 ⤇ Int)",
           "children": [
             {
               "id": 71,
@@ -2716,7 +2716,7 @@
           "label": "IterateExtent",
           "nodeId": 430,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → {[0, 3]})",
+          "tiling": "Fn(0..4 → 0..4)",
           "spans": [
             {
               "start": 1,
@@ -2734,7 +2734,7 @@
           "label": "Constant",
           "nodeId": 431,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 1,
@@ -2752,7 +2752,7 @@
           "label": "MapResult",
           "nodeId": 432,
           "role": "operator",
-          "tiling": "Fn({[0, 3]} → Int)",
+          "tiling": "Fn(0..4 → Int)",
           "spans": [
             {
               "start": 1,

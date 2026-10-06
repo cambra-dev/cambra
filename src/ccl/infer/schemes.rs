@@ -129,7 +129,7 @@ pub struct OperatorSchemes {
     /// `Hole → fresh_var` conversion cannot express: `ν` is shared between the
     /// mutable variable's value slot and the result, and the sequencing domain is the
     /// **concrete** `Txn`. The latter is what makes awaiting an induction
-    /// accumulator (`Mut(V, [0, 3])`) a type error rather than a silent success,
+    /// accumulator (`Mut(V, 0..4)`) a type error rather than a silent success,
     /// since two histories of the same kind equate invariantly in their domain.
     await_final: PolyScheme,
     /// `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)` — [`Builtin::CollectionContains`], the
@@ -161,7 +161,7 @@ impl OperatorSchemes {
         //
         // **Both functions name their element binder, and name it the same.** A dependent
         // collection's element type mentions the index — `groupby` produces
-        // `(__gb_k: Int) ⤇ ({[0, 2] | … == __gb_k} ⤇ Int)` — so the argument's binder
+        // `(__gb_k: Int) ⤇ ({0..3 | … == __gb_k} ⤇ Int)` — so the argument's binder
         // corresponds to `k` on the way in, and `ε` comes back mentioning `k`. The sum's
         // body declares it on the witness domain, which is what the binder meant: it ranges
         // over elements of whichever domain the witness picked. A body written `σ ⤇ ε`

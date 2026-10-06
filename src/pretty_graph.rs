@@ -96,7 +96,7 @@ pub fn fmt_extent(extent: &Extent) -> String {
             parts.sort();
             format!("{{{}}}", parts.join(", "))
         }
-        Extent::UIntRange(set) => format!("{set}"),
+        Extent::UIntRange(_) => extent.to_string(),
         Extent::DataSourceDomain(_) => "DataSource".to_string(),
         Extent::Union(arms) => {
             // Render the tag, since a union's arms are identified by name.
@@ -237,6 +237,12 @@ Parent
     fn fmt_extent_base() {
         assert_eq!(fmt_extent(&Extent::Base(BaseType::Int)), "Int");
         assert_eq!(fmt_extent(&Extent::Base(BaseType::String)), "String");
+    }
+
+    #[test]
+    fn fmt_extent_uint_range_matches_type_notation() {
+        assert_eq!(fmt_extent(&Extent::uint_range(3)), "0..3");
+        assert_eq!(fmt_extent(&Extent::uint_range(0)), "0..0");
     }
 
     #[test]

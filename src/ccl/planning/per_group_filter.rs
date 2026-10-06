@@ -269,7 +269,7 @@ mod tests {
 
     use crate::ccl::{RefinementSet, planning::test_helpers::*};
 
-    /// A collection over the indices `[0, 2]` carrying records, narrowed by
+    /// A collection over the indices `0..3` carrying records, narrowed by
     /// `refinements` on its domain.
     fn collection(refinements: RefinementSet, value: Type) -> Type {
         let idx = Type::UIntRange(3);

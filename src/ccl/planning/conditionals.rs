@@ -1323,7 +1323,7 @@ mod tests {
     fn a_box_inside_a_refinement_predicate_is_erased_but_a_case_is_left_alone() {
         let int = Type::Base(BaseType::Int);
         let coll = Type::data_fun(Type::UIntRange(2), int.clone());
-        // `Σ (σ : [[0, 2]]). σ ⤇ Int` — one candidate, so the witness is determined and
+        // `Σ (σ : [0..2]). σ ⤇ Int` — one candidate, so the witness is determined and
         // erasable.
         let w = fresh_witness_binder_id();
         let sum = || {

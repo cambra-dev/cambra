@@ -341,7 +341,7 @@ pub(crate) mod test_helpers {
         Expr::apply(argument, Expr::builtin(builtin).with_ty(function_ty)).with_ty(result_ty)
     }
 
-    /// Build a finite list literal `[1, 2, 3]` typed `[0, 2] ⤇ Int` — a list
+    /// Build a finite list literal `[1, 2, 3]` typed `0..3 ⤇ Int` — a list
     /// literal is a collection, so its kind is `Data`.
     pub(crate) fn list_123() -> Expr {
         let int = int_ty();

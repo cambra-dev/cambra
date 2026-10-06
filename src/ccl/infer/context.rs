@@ -690,14 +690,14 @@ impl Typing for InferCtx {
         // The reverse edge (`ann <: inferred`) additionally rejects a value whose
         // inferred type is a *strict subtype* of its annotation, which is a sound
         // widening, not an error: `x: Int = 1` with `1 : {Int | __elem == 1}`, a
-        // variant inferred as `{A}` annotated at the wider `{A | B}`, or `[0,3)⤇V`
+        // variant inferred as `{A}` annotated at the wider `{A | B}`, or `0..3⤇V`
         // ascribed at `List(V)`. It was harmless only while every source annotation
         // was a `Type::Base` leaf, where the two directions coincide; singleton
         // literals and source-reachable collection/`UIntRange` annotations both make
         // the over-restriction live. Worse for collections: a two-way `List`
-        // annotation would demand `Σ <: [0,3)⤇V` (consuming the sum *against the value*),
+        // annotation would demand `Σ <: 0..3⤇V` (consuming the sum *against the value*),
         // a coercion with no sound denotation. One-way leaves a collection annotation
-        // to be met by the Σ rule, which is the only edge into a sum — a bare `[0,3)⤇V`
+        // to be met by the Σ rule, which is the only edge into a sum — a bare `0..3⤇V`
         // does not reach `List(V)` at all without a `box`
         // (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
         //

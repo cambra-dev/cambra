@@ -2014,7 +2014,7 @@ fn a_cross_domain_read_coexists_with_a_second_store() {
                 b := b + y
         (await_final(a), await_final(b))
     "#};
-    assert_eq!(commit_stores(code), vec!["[0, 1][cnt]", "Txn[a]", "Txn[b]"]);
+    assert_eq!(commit_stores(code), vec!["0..2[cnt]", "Txn[a]", "Txn[b]"]);
     check_tile(
         code,
         Tile::record(std::collections::HashMap::from([
@@ -2044,7 +2044,7 @@ fn a_cross_domain_read_carries_across_the_positions_that_did_not_write_it() {
                 a := a + cnt
         await_final(a)
     "#};
-    assert_eq!(commit_stores(code), vec!["[0, 3][cnt]", "Txn[a]"]);
+    assert_eq!(commit_stores(code), vec!["0..4[cnt]", "Txn[a]"]);
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
 }
 
@@ -2098,7 +2098,7 @@ fn a_cross_domain_accumulator_depending_on_an_await_nests_inside_that_store() {
                 b := b + acc
         await_final(b)
     "#};
-    assert_eq!(commit_stores(code), vec!["Txn[a]", "[0, 1][acc]", "Txn[b]"]);
+    assert_eq!(commit_stores(code), vec!["Txn[a]", "0..2[acc]", "Txn[b]"]);
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![92])));
 }
 

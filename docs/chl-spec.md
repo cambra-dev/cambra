@@ -658,7 +658,7 @@ the next, forcing those iterations to run sequentially in the order
 the dependency requires. No other construct sequences iterations.
 
 Lists do retain an integer-indexed *addressing* structure (a list is
-a finite function from `[0, n)` to values, so `xs[i]` is well-defined
+a finite function from `0..n` to values, so `xs[i]` is well-defined
 — §3.9); but the order of *iteration* over a list is not the order of
 its indices, and a comprehension over `xs` does not promise any order
 on its output.
@@ -1173,8 +1173,8 @@ and by name for a record (`r.x`); neither is subscripted.
 **A component may be a collection.** In `r = (cash=10, lines=[1, 2, 3])`,
 `r.lines` is the collection the `lines` field holds. Components keep their own
 domains, so a product of collections and a collection of products are different
-types: `{a: [0, 1] ⤇ Int, b: [0, 2] ⤇ Int}` is two collections of different
-lengths, and `[0, 2] ⤇ {a: Int, b: Int}` is one collection whose elements are
+types: `{a: 0..2 ⤇ Int, b: 0..3 ⤇ Int}` is two collections of different
+lengths, and `0..3 ⤇ {a: Int, b: Int}` is one collection whose elements are
 records.
 
 **Records are not braces.** `{...}` is type syntax (§6.1) — a record *type*
@@ -2228,7 +2228,7 @@ marked one carries its status per "How to read this document".)
 - `String` — UTF-8 string.
 - `{}` — unit type, one inhabitant, and its only CHL spelling (§6.6). There is
   no *empty* (uninhabited) type.
-- `List(T)` — finite collection of `T`-values, indexed by `[0, n)`.
+- `List(T)` — finite collection of `T`-values, indexed by `0..n`.
   The index → element mapping is part of the value (so `xs[i]` is
   well-defined); iteration order, however, is unspecified (§3). Written
   `List(T)` or `List(_)`.

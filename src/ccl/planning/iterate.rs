@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_wrap_with_iterate_refined_emits_iterate_then_restrict() {
-        // Build a refined-domain list: `[1,2,3] : {[0,2] | some_pred} ⇒ Int`.
+        // Build a refined-domain list: `[1,2,3] : {0..3 | some_pred} ⇒ Int`.
         // After wrapping, the iteration source is `restrict(some_pred)`
         // *applied* to a chain-head trivially-true `iterate`, with the
         // value-producer `[1, 2, 3]` composed onto it:
