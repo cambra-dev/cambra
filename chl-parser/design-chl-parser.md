@@ -166,8 +166,12 @@ table records names and call shapes, not meaning. Each consumer keeps three deci
 - **What the builtin denotes.** Lowering and evaluation bodies stay with their consumer.
 - **A call of the wrong arity.** Lowering refuses it. The interpreter treats it as an unknown
   function.
-- **Shadowing.** Lowering resolves a builtin before consulting scope, so a user `def` of the same
-  name does not shadow it. The interpreter lets the nearest binding win
+- **Shadowing.** Lowering resolves a `Function`-kind builtin before consulting scope, so a user
+  `def` of the same name does not shadow it. A builtin of another kind called in expression
+  position lowers as an ordinary call, where a user `def` does win, and a registered source wins
+  over a user binding
+  ([src/ccl/design/lowering.md, "Builtin calls"](../src/ccl/design/lowering.md#builtin-calls)).
+  The interpreter lets the nearest binding win
   ([chl-spec.md, "3.2 Names"](../docs/chl-spec.md#32-names)).
   `a_user_function_named_like_a_builtin_is_ignored` in `tests/differential_interp.rs` pins the
   difference.

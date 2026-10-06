@@ -26,5 +26,5 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::{Expr, Module, Stmt};
-pub use builtins::{SurfaceBuiltin, SurfaceBuiltinKind};
+pub use builtins::{Arity, SurfaceBuiltin, SurfaceBuiltinKind};
 pub use parser::{ParseError, parse_expression, parse_module};

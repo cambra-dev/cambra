@@ -184,11 +184,11 @@ pub(super) fn lower_call(
         // through the value-reading `lower_expr` (whose out-of-block read gate would
         // reject the very read this is).
         Some(SurfaceBuiltin::AwaitFinal) => {
-            debug_assert_eq!(
+            // The slice pattern below states await_final's arity.
+            const _: () = assert!(matches!(
                 SurfaceBuiltin::AwaitFinal.arity(),
-                chl_parser::builtins::Arity::Exact(1),
-                "the slice pattern below states await_final's arity"
-            );
+                chl_parser::Arity::Exact(1)
+            ));
             let [arg] = args else {
                 return Err(LoweringError::unsupported(
                     func.span,
@@ -1110,6 +1110,39 @@ mod tests {
         let err = lower_expr(&expr, &mut LoweringContext::default())
             .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported { .. }));
+    }
+
+    /// The table's kind column holds lowering's recognizers: called in expression position at
+    /// its table arity, exactly the `Function` rows lower in their own arm of `lower_call`, and
+    /// every other row takes the fallthrough. With every spelling registered as a source, the
+    /// fallthrough is observable as a `source(…)` node, because it consults the registry before
+    /// anything else.
+    #[test]
+    fn only_function_rows_lower_in_their_own_arm() {
+        use chl_parser::builtins::SURFACE_BUILTINS;
+        use chl_parser::{Arity, SurfaceBuiltinKind};
+
+        for row in SURFACE_BUILTINS {
+            let mut ctx = LoweringContext::default();
+            for other in SURFACE_BUILTINS {
+                ctx.register_source(other.spelling, stub_source(other.spelling));
+            }
+            let n = match row.arity {
+                Arity::Exact(n) => n,
+                Arity::Any => 0,
+            };
+            let args = vec!["x"; n].join(", ");
+            let expr = parse_expr(&format!("{}({args})", row.spelling));
+            let fell_through = lower_expr(&expr, &mut ctx)
+                .is_ok_and(|ccl| symbolic(&ccl) == format!("source({})", row.spelling));
+            assert_eq!(
+                fell_through,
+                row.kind != SurfaceBuiltinKind::Function,
+                "`{}` is a {:?} row",
+                row.spelling,
+                row.kind
+            );
+        }
     }
 
     /// A registered source name used as a non-call expression (plain variable)

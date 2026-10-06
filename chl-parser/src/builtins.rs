@@ -55,20 +55,22 @@ impl Arity {
 /// `Exact(0)` is "no arguments".
 impl std::fmt::Display for Arity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        const WORDS: [&str; 4] = ["zero", "one", "two", "three"];
         match *self {
             Arity::Exact(0) => f.write_str("no arguments"),
             Arity::Exact(1) => f.write_str("exactly one argument"),
-            Arity::Exact(n) => match WORDS.get(n) {
-                Some(word) => write!(f, "exactly {word} arguments"),
-                None => write!(f, "exactly {n} arguments"),
-            },
+            Arity::Exact(2) => f.write_str("exactly two arguments"),
+            Arity::Exact(3) => f.write_str("exactly three arguments"),
+            Arity::Exact(n) => write!(f, "exactly {n} arguments"),
             Arity::Any => f.write_str("any number of arguments"),
         }
     }
 }
 
-/// Where a [`SurfaceBuiltin`] call is recognized.
+/// Where lowering recognizes a [`SurfaceBuiltin`] call. The kind describes lowering's
+/// recognizers only: the differential interpreter evaluates a subset of the `Function` rows and
+/// treats the rest like the other kinds, as an unknown function. A lowering test in the
+/// `cambra` crate (`src/ccl/lower/exprs.rs`, `only_function_rows_lower_in_their_own_arm`) holds
+/// the column to what `lower_call` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceBuiltinKind {
     /// A call in expression position, which denotes a value.
@@ -145,25 +147,26 @@ impl SurfaceBuiltin {
             .map(|e| e.builtin)
     }
 
-    /// This builtin's row of [`SURFACE_BUILTINS`].
-    pub fn entry(self) -> &'static SurfaceBuiltinEntry {
+    /// This builtin's row of [`SURFACE_BUILTINS`]. A `const fn`, like the accessors below, so a
+    /// consumer can assert a row's arity at build time.
+    pub const fn entry(self) -> &'static SurfaceBuiltinEntry {
         let row = &SURFACE_BUILTINS[self as usize];
-        debug_assert_eq!(
-            row.builtin, self,
+        debug_assert!(
+            row.builtin as usize == self as usize,
             "SURFACE_BUILTINS is in SurfaceBuiltin declaration order"
         );
         row
     }
 
-    pub fn spelling(self) -> &'static str {
+    pub const fn spelling(self) -> &'static str {
         self.entry().spelling
     }
 
-    pub fn arity(self) -> Arity {
+    pub const fn arity(self) -> Arity {
         self.entry().arity
     }
 
-    pub fn kind(self) -> SurfaceBuiltinKind {
+    pub const fn kind(self) -> SurfaceBuiltinKind {
         self.entry().kind
     }
 }

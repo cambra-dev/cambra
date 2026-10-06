@@ -46,10 +46,11 @@ pub(super) fn http_serve_decl(
     {
         return None;
     }
-    debug_assert!(
-        SurfaceBuiltin::HttpServe.arity().accepts(3),
-        "the slice pattern below states http_serve's arity"
-    );
+    // The slice pattern below states http_serve's arity.
+    const _: () = assert!(matches!(
+        SurfaceBuiltin::HttpServe.arity(),
+        chl_parser::Arity::Exact(3)
+    ));
     let [port, method, path] = args.as_slice() else {
         return None;
     };
