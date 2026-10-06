@@ -66,7 +66,7 @@ Concretely:
   repeated commit tick in a store's changelog.  Release before
   re-emitting.  A tile's join-shaped components combine idempotently
   and that is `∨`, not `⊕`: a store's frontier, its terminality and
-  its closed keys, and a `Max` or `Drain` accumulator.
+  its closed keys, and a `Max`, `Min`, or `Drain` accumulator.
 - `release` is the *only* operation that shrinks a tile.  It removes
   data from the producer's view (and the consumer's), but the
   consumer has already extracted whatever value it needed before

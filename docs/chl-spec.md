@@ -2942,11 +2942,11 @@ types. The traits are built in:
 | `Exponentiable` | `**` | 2 | `Output` | `Int`, `UInt` |
 | `Negatable` | unary `-` | 1 | `Output` | `Int` |
 | `Equatable` | `==`, `!=` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
-| `Orderable` | `<`, `<=`, `>`, `>=`, `max` | 2 | none | `Int`, `UInt`, `String`, `Bool` |
+| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool` |
 
-`max` places `Orderable(T, T)` on its element type `T`. A binary trait is satisfied by two operands
-of one listed type, and a tuple or record satisfies `Equatable` only against the same product
-([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it.
+`max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
+two operands of one listed type, and a tuple or record satisfies `Equatable` only against the same
+product ([3.4 Comparisons](#34-comparisons)). A trait's `Output` is the type that satisfies it.
 
 - **An associated type is written by name after the operands.** `requires Addable(A, B, Output=O)`
   states that `A` and `B` are `Addable` and that `O` is their `Output`. Omitting `Output=…` leaves
@@ -3034,15 +3034,15 @@ of built-in functions.
 |---|---|
 | `sum(xs)` | Sum of the elements of `xs`. Operates on integer collections. |
 | `max(xs)` | Maximum element of `xs`. Element type must support `<`. |
+| `min(xs)` | Minimum element of `xs`. Element type must support `<`. |
 
-Both are unary and take a collection-typed argument. Other aggregates
-(`min`, `count`, `avg`, `len`) are **[Planned]** but not yet recognised.
+All three are unary and take a collection-typed argument. Other aggregates
+(`count`, `avg`, `len`) are **[Planned]** but not yet recognised.
 
-Every aggregate's result is to become `Option(T)`, `` `none `` for an
-empty collection, as §3.9's optional lookup is **[Planned]**. A
-statically proven deref for a collection known to be non-empty goes with
-it, and is not designed yet. Until then `max` of an empty collection is
-not defined ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).
+Every aggregate's result is to become `Option(T)`, `` `none `` for an empty collection, as §3.9's
+optional lookup is **[Planned]**. A statically proven deref for a collection known to be non-empty
+goes with it, and is not designed yet. Until then `max` of an empty collection is not defined, and
+neither is `min` of one ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).
 
 The north-star programs additionally assume non-aggregate built-ins —
 `str`, `open`, `stdout`, and a stream-restriction combinator

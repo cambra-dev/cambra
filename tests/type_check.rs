@@ -2162,6 +2162,7 @@ fn test_list_comp_non_bool_filter_rejected() {
 #[rstest]
 #[case::sum("sum([1, 2, 3])", BaseType::Int)]
 #[case::max("max([1, 2, 3])", BaseType::Int)]
+#[case::min("min([1, 2, 3])", BaseType::Int)]
 fn test_aggregate(#[case] code: &str, #[case] expected: BaseType) {
     assert_eq!(infer_program(code), Type::Base(expected));
 }
@@ -4685,6 +4686,7 @@ x = box([1, 2]) if c else box([1, 2, 3])
     // Collapsing consumers discard the domain, so they never present one to be joined.
     assert_eq!(infer_program(&format!("{c}sum(x)")), int());
     assert_eq!(infer_program(&format!("{c}max(x)")), int());
+    assert_eq!(infer_program(&format!("{c}min(x)")), int());
     // The binding alone is what the `box`es built.
     assert_eq!(infer_program(&format!("{c}x")).to_string(), sum);
     // A domain-preserving consumer agrees on the sum.

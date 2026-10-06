@@ -89,6 +89,10 @@ pub struct OperatorSchemes {
     /// to the input collection (function), folding its codomain γ to a
     /// result of the same type.
     aggregate_max: PolyScheme,
+    /// `∀α γ. (α → γ) → γ` — the full Min operator type, applied directly
+    /// to the input collection (function), folding its codomain γ to a
+    /// result of the same type.
+    aggregate_min: PolyScheme,
     /// `∀α γ. (α → γ) → unit` — the terminal aggregate ([`AggregateKind::Drain`]):
     /// consume a collection of any element type and yield `unit`. Used by the
     /// `set` constructor's group collapse.
@@ -242,6 +246,15 @@ impl OperatorSchemes {
             fun(Type::consumer_fun(alpha, gamma.clone()), gamma),
         );
 
+        // Min: ∀α γ. (α ⤇ γ) → γ. Consumes a collection and folds its
+        // codomain γ to a result of the same type.
+        let alpha = fresh_var(BODY_LEVEL);
+        let gamma = fresh_var(BODY_LEVEL);
+        let aggregate_min = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(Type::consumer_fun(alpha, gamma.clone()), gamma),
+        );
+
         // Drain: ∀α γ. (α ⤇ γ) → unit. Consumes a collection of any element
         // type and yields the trivial `unit` — the terminal aggregate. `set`
         // uses it to collapse each key's (duplicate-bearing) group to the single
@@ -327,6 +340,7 @@ impl OperatorSchemes {
             not_op,
             aggregate_sum,
             aggregate_max,
+            aggregate_min,
             aggregate_drain,
             aggregate_sole,
             final_or_default,
@@ -396,6 +410,7 @@ impl OperatorSchemes {
         match kind {
             AggregateKind::Sum => &self.aggregate_sum,
             AggregateKind::Max => &self.aggregate_max,
+            AggregateKind::Min => &self.aggregate_min,
             AggregateKind::Drain => &self.aggregate_drain,
             AggregateKind::Sole => &self.aggregate_sole,
         }

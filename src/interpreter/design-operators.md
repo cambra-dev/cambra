@@ -633,7 +633,7 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
 | `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the keys at the level op-conversion states ([The level a node is converted at](#the-level-a-node-is-converted-at)), which is the predicate's innermost level, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` compiles to it, and under `map` it filters each element collection. <br>TODO the function form can probably be replaced by Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `DataFunction(A → *)` | Same as input | Filters a function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
-| `Aggregate` | `DataFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `DataFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
+| `Aggregate` | `DataFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `DataFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max, Min). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile. Constructed with an `only_terminal` flag: when `true` it emits only once the aggregation is marked terminal (the `only_terminal: false` path is currently `todo!()`). |
 | `MapAggregate` | `DataFunction(domain → codomain)` | `DataFunction(domain → Aggregation)` | Performs a per-key aggregation |
 | `MapExtractAggregate` | `DataFunction(extent → Aggregation)` | `DataFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `DataFunction(D, Aggregation)`, producing `DataFunction(D, Scalar)`. |
@@ -758,7 +758,7 @@ Op-conversion's arms split into two groups by how they handle their parent's
   argument with `input=None`.  The argument is an iteration source compiled in
   isolation, with its own iteration extent at the bottom of its chain.  Examples:
   `Iterate` (the canonical chain-head extent producer), `MapDomain`, `Uncurry`,
-  `FlattenDomain`, `PermuteDomain`, `Copair` / `DisjointJoin`, `Sum` / `Max`,
+  `FlattenDomain`, `PermuteDomain`, `Copair` / `DisjointJoin`, `Sum` / `Max` / `Min`,
   `FinalOrDefault`, and the catch-all `Apply` arm (where the function position
   is a `Proj` / `Var` / curried `Apply`).
 
@@ -913,7 +913,7 @@ Four arms share an input across multiple downstream consumers:
 
 The pipeline always bottoms out at one of three consumer shapes:
 
-1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
+1. A scalar produced by `Apply(<chain>, Sum)` / `Max` / `Min` (compiles to
    `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), FinalOrDefault)`
    (compiles to `ExtractFinal`), or `final_read` of an accumulator's history (compiles to
    `StoreFinalRead`).

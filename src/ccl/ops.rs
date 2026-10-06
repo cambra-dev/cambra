@@ -482,6 +482,9 @@ pub enum Builtin {
     /// `max : ∀α γ. (α ⤇ γ) ⇒ γ` — fold a collection's codomain to one of the
     /// same type.
     Max,
+    /// `min : ∀α γ. (α ⤇ γ) ⇒ γ` — fold a collection's codomain to one of the
+    /// same type.
+    Min,
     /// `drain` — the terminal aggregate: consume a collection of any element
     /// type and yield `unit` (see [`AggregateKind::Drain`]). Produced only by
     /// the `set` constructor's group collapse.
@@ -850,6 +853,7 @@ impl Builtin {
             Self::FilterValues => "filter_values",
             Self::Sum => "sum",
             Self::Max => "max",
+            Self::Min => "min",
             Self::Drain => "drain",
             Self::Sole => "sole",
             Self::FinalOrDefault => "final_or_default",
@@ -886,6 +890,7 @@ impl Builtin {
         match kind {
             AggregateKind::Sum => Self::Sum,
             AggregateKind::Max => Self::Max,
+            AggregateKind::Min => Self::Min,
             AggregateKind::Drain => Self::Drain,
             AggregateKind::Sole => Self::Sole,
         }
@@ -902,6 +907,7 @@ impl Builtin {
         Some(match self {
             Self::Sum => AggregateKind::Sum,
             Self::Max => AggregateKind::Max,
+            Self::Min => AggregateKind::Min,
             Self::Drain => AggregateKind::Drain,
             Self::Sole => AggregateKind::Sole,
             _ => return None,

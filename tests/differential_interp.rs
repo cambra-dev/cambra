@@ -325,6 +325,28 @@ fn max_over_a_comprehension() {
     "#});
 }
 
+/// `min` of an empty collection has no value under `docs/chl-spec.md`, "7.1 Aggregates", so the
+/// interpreter refuses it. The filter keeps the element type `Int` while emptying the group.
+#[test]
+fn min_of_an_empty_collection_is_refused_by_the_interpreter() {
+    let result = run_interpreted(indoc! {r#"
+        out = test_sink()
+        out << min([x for x in [1, 2, 3] if x > 5])
+    "#});
+    assert!(
+        result.is_err(),
+        "the interpreter produced a value: {result:?}"
+    );
+}
+
+#[test]
+fn min_over_a_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << min([x * x for x in [-3, 2, 4]])
+    "#});
+}
+
 #[test]
 fn a_collection_union_folded_to_a_scalar() {
     agree(indoc! {r#"

@@ -11,6 +11,7 @@ use crate::interpreter::{ColumnValue, Extent, Tile, Tiling};
 pub enum AggregateKind {
     Sum,
     Max,
+    Min,
     /// The terminal aggregate: consume a collection of any element type and
     /// yield the single `unit` value. Its accumulator is `unit` (identity
     /// `unit`, merge `unit ⊕ unit = unit`), so it collapses a group of any
@@ -46,7 +47,9 @@ impl AggregateKind {
     /// law (`src/ccl/design/collections.md`, "A duplicate key is a process fault today").
     pub fn is_partial(&self) -> bool {
         match self {
-            AggregateKind::Sum | AggregateKind::Max | AggregateKind::Drain => false,
+            AggregateKind::Sum | AggregateKind::Max | AggregateKind::Min | AggregateKind::Drain => {
+                false
+            }
             // `Option(𝐴)`'s partial monoid: merging two `some` values has no result.
             AggregateKind::Sole => true,
         }
@@ -68,6 +71,7 @@ impl AggregateKind {
         match (self, input_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
             (AggregateKind::Max, Extent::Base(b)) => Some(Extent::Base(b.clone())),
+            (AggregateKind::Min, Extent::Base(b)) => Some(Extent::Base(b.clone())),
             // `Drain` folds any element type to `unit`.
             (AggregateKind::Drain, _) => Some(Extent::Base(BaseType::Unit)),
             // `Sole` yields an element of the group, so the extent is unchanged.
@@ -109,12 +113,19 @@ impl AggregateKind {
         match (self, accumulator_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0]),
             (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
+            (AggregateKind::Min, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MAX]),
             (AggregateKind::Max, Extent::Base(BaseType::UInt)) => ColumnValue::UInts(vec![0]),
+            (AggregateKind::Min, Extent::Base(BaseType::UInt)) => {
+                ColumnValue::UInts(vec![usize::MAX])
+            }
             (AggregateKind::Max, Extent::Base(BaseType::String)) => {
                 ColumnValue::Strings(vec![SmolStr::default()])
             }
             (AggregateKind::Max, Extent::Base(BaseType::Bool)) => {
                 ColumnValue::Bools(BitVec::from_elem(1, false))
+            }
+            (AggregateKind::Min, Extent::Base(BaseType::Bool)) => {
+                ColumnValue::Bools(BitVec::from_elem(1, true))
             }
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
@@ -170,6 +181,18 @@ impl AggregateKind {
                     acc.set(0, true);
                 }
             }
+            (AggregateKind::Min, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
+                accumulate_min(acc, &vs[start..end]);
+            }
+            (AggregateKind::Min, ColumnValue::UInts(acc), ColumnValue::UInts(vs)) => {
+                accumulate_min(acc, &vs[start..end]);
+            }
+            // `False < True`, so the minimum is whether every element is `True`.
+            (AggregateKind::Min, ColumnValue::Bools(acc), ColumnValue::Bools(vs)) => {
+                if (start..end).any(|i| !vs[i]) {
+                    acc.set(0, false);
+                }
+            }
             // `Drain`: the accumulator already holds the single `unit` the group
             // collapses to; folding in more elements is a no-op (any positive
             // multiplicity yields one `unit`). The values column is ignored.
@@ -194,6 +217,9 @@ impl AggregateKind {
             | (AggregateKind::Max, ColumnValue::UInts(_))
             | (AggregateKind::Max, ColumnValue::Strings(_))
             | (AggregateKind::Max, ColumnValue::Bools(_))
+            | (AggregateKind::Min, ColumnValue::Ints(_))
+            | (AggregateKind::Min, ColumnValue::UInts(_))
+            | (AggregateKind::Min, ColumnValue::Bools(_))
             | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }
@@ -206,5 +232,14 @@ fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
         && max > acc[0]
     {
         acc[0] = max;
+    }
+}
+
+fn accumulate_min<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
+    let min = values.iter().min().cloned();
+    if let Some(min) = min
+        && min < acc[0]
+    {
+        acc[0] = min;
     }
 }
