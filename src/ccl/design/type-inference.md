@@ -1730,7 +1730,7 @@ Registered sources use `TypedExprNode::Source`, not a free `Var` reference. The 
 types them, while ordinary variables resolve through lexical scope. Source names therefore need
 no exemption in the term-name telescope check.
 
-The later `check_scope_valid` is a separate debug check over coalesced expression types.
+The later `check_scope_valid` checks coalesced expression types in every build.
 It reports `ScopeViolation` for an escaping term reference. Passing the record-time check does
 not prove every later rewrite preserves lexical scope, so neither check is redundant.
 
@@ -2106,9 +2106,11 @@ domains from the same list. Two sums establish a positional correspondence throu
 witness references at corresponding positions in the demanded domain and the argument.
 
 A reference must remain under a binder that classifies it. Reference equality alone does not
-check this: a free ID compares equal to itself. Bound-scope enforcement and the debug-only
-post-inference scope check validate scope separately. The debug-only `debug_assert_no_free_witness`
-also checks phase boundaries after inference, lambda elimination and planning, including type
+check this: a free ID compares equal to itself. `check_scope_valid` checks witness references
+in node types after coalescing and returns `ScopeViolation` in every build. Bound recording's
+`enforce_bound_scope` checks term names only, not witnesses. The debug-only
+`debug_assert_no_free_witness` also checks boundaries after inference, lambda elimination
+and planning, including type
 slots inside refinement predicates. `CCL_SHOW_BINDERS=1` includes witness IDs in rendered
 types; otherwise references render as `σ`.
 
@@ -2435,7 +2437,8 @@ Witness atoms resolve against the enclosing scope:
 
 The last case is required by bottom-up coalescing: a node's type can be materialized before
 the enclosing binder is known. A per-type rejection would reject references that are valid
-in the complete tree. It does not exempt an ultimately free witness from the scope check.
+in the complete tree. An ultimately free witness in a node type fails the post-inference
+scope check in every build.
 
 Data-domain disagreement is retained separately from function-kind disagreement.
 Materialization reports `DomainJoinConflict` for incompatible domains and `KindConflict`
@@ -2447,8 +2450,10 @@ introduction through `box(box(xs))`, since the outer call requires a plain colle
 
 #### Which `Case` a site realizes, and what a leg instantiates
 
-Planning gives a witness one of three dispositions: erase a determined witness, realize
-a conditional through its arms, or retain a materialized witness in the value.
+Planning realizes a conditional through its arms even when its witness has one candidate.
+The witness remains bound by the `Realize` assertion and is excluded from determined-sum
+erasure. A determined witness is erased only if it was neither realized nor retained as a
+materialized witness in the value.
 [Compiling a conditional collection](collections.md#compiling-a-conditional-collection)
 owns the compilation rules and runtime restrictions.
 
@@ -2502,9 +2507,15 @@ for the extent of the assertion.
   [Compiling a conditional collection](collections.md#compiling-a-conditional-collection).
   Jagged collections and comprehensions over witness-domained collections are supported.
   A `for` loop over a sum is rejected before constructing its history, including
-  a determined sum that planning could later erase. Collection-valued variant payloads,
-  rows fixed by mutable storage before reaching a jagged position, and some append/keyed
-  write combinations also remain unsupported; their failure stages differ.
+  a determined sum that planning could later erase. Collection-valued variant payloads
+  and rows fixed by mutable storage before reaching a jagged position remain unsupported.
+  `jagged_rows_merged_by_appends_or_a_keyed_write_do_not_compile` pins two further cases:
+
+  - Two `<<` appends of boxed rows with different domains fail the debug-only free-witness
+    assertion after channelization; without debug assertions, the post-planning type check rejects
+    the tree.
+  - A keyed write of a boxed row with a different domain fails group-by recognition's type
+    check, reported as `Bad group expr`.
 
 Inferred candidate domains cross level boundaries through `extrude_invariant`, which
 preserves both directions of bounds. A one-sided proxy can discard the upper bounds that

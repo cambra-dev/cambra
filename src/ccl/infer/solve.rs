@@ -888,28 +888,12 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
     ctx.errors
 }
 
-/// The design's scope-validity check (§6.2): a coalesced node's type must be
-/// **well-formed in the lexical scope at that node** — every free term-variable
-/// of its refinement predicates is bound by an enclosing Pi binder (subtracted
-/// by [`crate::ccl::subst::type_free_vars`]) or an enclosing AST binder
-/// (lambda / `let` / loop / case). The root `scope` is empty: a program source
-/// is referenced by a [`TypedExprNode::Source`] node rather than by a variable,
-/// so no source name reaches `type_free_vars`.
+/// Check term and witness references in each node's type against its enclosing scope.
 ///
-/// A violation means a refinement reached a position where its predicate's free
-/// variables are out of scope — e.g. a dependent-application discharge that
-/// failed to reach a contravariant use, a `let`-closing that didn't fire, or a
-/// substitution that forgot to descend into predicates (the regression case M of
-/// the proposal's matrix). On a correct implementation over a well-typed program
-/// it never fires; user-facing scoping errors are caught earlier with source
-/// context (§3.4). The uniform substitution rewrites type slots in the same
-/// pass as terms, so the dangling-binder class this walk guards is
-/// structurally unrepresentable; it runs as a debug-build regression net,
-/// reporting each ill-scoped node as an [`InferError::ScopeViolation`] blamed on
-/// that node. This walk accumulates — one error per ill-scoped node — so, like
-/// coalesce, it blames per error rather than through a shared cursor; here the
-/// node is in hand at the raise site, so it needs no frame bookkeeping.
-#[cfg(debug_assertions)]
+/// Runs in every build after coalescing. A witness retained during bottom-up materialization
+/// must be bound in the complete tree; bound recording checks term names, not witnesses.
+/// Each violation returns a `ScopeViolation` blamed on the node carrying the ill-scoped type.
+/// See `src/ccl/design/type-inference.md`, "The witness context".
 pub(super) fn check_scope_valid(
     expr: &Expr,
     scope: &std::collections::BTreeSet<Name>,
@@ -929,7 +913,6 @@ pub(super) fn check_scope_valid(
 
 /// Every [opaque](crate::ccl::BindingTransparency::Opaque) `let` binder in the
 /// tree.
-#[cfg(debug_assertions)]
 fn collect_opaque_binders(expr: &Expr, out: &mut std::collections::BTreeSet<Name>) {
     if let TypedExprNode::Let { binding, .. } = &expr.node
         && binding.transparency == BindingTransparency::Opaque
@@ -946,7 +929,6 @@ fn collect_opaque_binders(expr: &Expr, out: &mut std::collections::BTreeSet<Name
 /// `𝑤`. So a comprehension's `__iter_record` is *not* ill-scoped for naming the witness its
 /// source introduced — it is the consuming rule's `Γ, 𝑤 :: 𝐾 ⊢ 𝑓 : 𝐵[𝑤] ⇒ 𝑊` seen from
 /// the term side.
-#[cfg(debug_assertions)]
 fn witness_binders_bound_by(ty: &Type, out: &mut Vec<crate::ccl::ty::WitnessId>) {
     if let Some(ws) = ty.sum() {
         for w in ws {
@@ -956,7 +938,6 @@ fn witness_binders_bound_by(ty: &Type, out: &mut Vec<crate::ccl::ty::WitnessId>)
     ty.walk_children(|c| witness_binders_bound_by(c, out));
 }
 
-#[cfg(debug_assertions)]
 fn check_scope_valid_go(
     expr: &Expr,
     scope: &std::collections::BTreeSet<Name>,
@@ -968,6 +949,7 @@ fn check_scope_valid_go(
     // The opening tripwires (`subst::open_codomain`, this file's `Fun`/`Fun` arm)
     // fire once a name-spelled reference has already escaped its binder; this
     // catches the type that carries one before anything reads it.
+    #[cfg(debug_assertions)]
     debug_assert!(
         crate::ccl::subst::name_spelled_stored_binders(&expr.ty).is_empty(),
         "a stored function's codomain references its own binder by name ({:?}): built \
@@ -975,12 +957,9 @@ fn check_scope_valid_go(
         crate::ccl::subst::name_spelled_stored_binders(&expr.ty),
         symbolic(expr),
     );
-    // **The witness half of the same well-formedness.** A witness reference is legal only
-    // under a binder — one an enclosing sum introduced, or one this node's own type
-    // introduces for its subtree. Checking it here rather than per materialized type is
-    // what lets it be a real scope test: coalesce runs bottom-up, so at the point a type is
-    // built nothing knows what binds it from outside, and the check there could only ask
-    // about the *shape* of the type in hand.
+    // Witness scope requires the complete tree: bottom-up coalescing does not yet know
+    // which sums enclose a node. A witness must be bound by an enclosing sum or within
+    // this node's type.
     if crate::ccl::ty::has_free_witness_ref(&expr.ty, witnesses) {
         errors.push(LocatedInferError {
             error: InferError::ScopeViolation {
@@ -1612,14 +1591,10 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         // value against a handle. A `Let` needs no deref here because it does not
         // deref either (`emit_let` passes its body along; it cannot bind a mutable variable).
         TypedExprNode::ExprStmt { body, .. } => Some(read_through(&body.ty)),
-        // A mutable variable introduction lifts its body's type the same way, but has no
-        // discharge available *here*: the term that names a mutable variable's value is minted
-        // by `mut_elim`, several passes after closure is demanded. So a refinement that
-        // mentions the binder cannot be closed at this point, and the program is
-        // rejected with a source position rather than left to trip the debug-only scope
-        // net or, in release, to reach the pre-channelize wall as a surviving mutable type.
-        // Why that is staging rather than impossibility, and what lifting it would take:
-        // see `InferError::MutableInRefinedType`.
+        // A mutable introduction has no discharge term until `mut_elim`. Reject a result
+        // refinement that still names its binder here, with the source position, before
+        // the general scope check sees it. See `InferError::MutableInRefinedType` for the
+        // staging restriction and the requirements for supporting this shape.
         TypedExprNode::MutDecl { binding, body, .. } => {
             if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
                 let label = format!("mutable `{}`", binding.name);
@@ -2508,13 +2483,7 @@ mod tests {
         ));
     }
 
-    // ----- scope-validity check (design §6.2) -----
-
-    // Appendix case J: a refinement whose predicate references a binder not in
-    // scope is reported as a `ScopeViolation` naming that binder.
-    // `check_scope_valid` is a debug-only check (the §6.2 demotion gated it on
-    // `debug_assertions`), so these three tests compile only in debug builds.
-    #[cfg(debug_assertions)]
+    // Scope validation runs in debug and no-assertions builds.
     #[test]
     fn scope_check_reports_out_of_scope_binder() {
         use super::check_scope_valid;
@@ -2546,7 +2515,6 @@ mod tests {
     // The type is built through `Type::pi` rather than as a `Fun` literal because
     // the literal does not close, and a stored function carrying its own binder by
     // name is what `name_spelled_stored_binders` rejects at this same walk.
-    #[cfg(debug_assertions)]
     #[test]
     fn scope_check_accepts_enclosing_binder() {
         use super::check_scope_valid;
@@ -2566,7 +2534,6 @@ mod tests {
     // Appendix case L: a predicate whose only free variable is the
     // refinement's own implicit element binder is well-scoped in an empty
     // scope.
-    #[cfg(debug_assertions)]
     #[test]
     fn scope_check_accepts_own_element_binder() {
         use super::check_scope_valid;
@@ -2575,6 +2542,50 @@ mod tests {
         let mut errors = Vec::new();
         check_scope_valid(&e, &std::collections::BTreeSet::new(), &mut errors);
         assert_eq!(errors, vec![]);
+    }
+
+    #[test]
+    fn scope_check_rejects_free_witness() {
+        let sum = Type::sum_over(
+            crate::ccl::TypeKind::UIntRanges,
+            None,
+            Type::Base(BaseType::Int),
+        );
+        let mut expr = lit_int(0);
+        expr.ty = sum.domain().unwrap();
+        let mut errors = Vec::new();
+        super::check_scope_valid(&expr, &Default::default(), &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].node_id, expr.node_id());
+        assert!(matches!(
+            errors[0].error,
+            crate::ccl::infer::InferError::ScopeViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn scope_check_requires_the_witness_own_binder() {
+        let sum = || {
+            Type::sum_over(
+                crate::ccl::TypeKind::UIntRanges,
+                None,
+                Type::Base(BaseType::Int),
+            )
+        };
+        let own = sum();
+        let foreign = sum();
+        for (domain, accepted) in [
+            (own.domain().unwrap(), true),
+            (foreign.domain().unwrap(), false),
+        ] {
+            let mut body = lit_int(0);
+            body.ty = domain.clone();
+            let mut expr = TypedExpr::lambda("i", domain, body);
+            expr.ty = own.clone();
+            let mut errors = Vec::new();
+            super::check_scope_valid(&expr, &Default::default(), &mut errors);
+            assert_eq!(errors.is_empty(), accepted, "{errors:?}");
+        }
     }
 
     // ----- let-polymorphism / integrated monomorphization -----

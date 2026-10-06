@@ -1219,18 +1219,10 @@ fn constrain_go_impl(
             let (Type::WitnessRef(a), Type::WitnessRef(b)) = (&a, &b) else {
                 unreachable!("a witness renaming maps a reference to a reference")
             };
-            // **Two references are one index when they are one name.** The comparison runs
-            // under the correspondence its caller established — the Fun/Fun arm's rename
-            // between two Σs, [`witness_instantiation`]'s where a value meets a shape written
-            // over binders — so both sides arrive in one spelling and nothing is left for this
-            // to reconcile.
-            //
-            // **Neither Γ is read here.** `lctx`/`rctx` serve the concrete-meets-witness arm
-            // below, where a reference has to be classified before it can be constrained; two
-            // references decide by identity. A reference neither Γ classifies compares equal
-            // to itself and passes, so this arm is not the free-reference check — that is
-            // [`crate::ccl::infer_var::enforce_bound_scope`] at the `Infer` arms below and
-            // `crate::ccl::infer::debug_assert_no_free_witness`.
+            // Compare IDs after applying the caller's binder correspondence. Equal kinds
+            // do not identify independent witnesses. This arm does not inspect either scope,
+            // so even a free ID equals itself: post-inference `check_scope_valid` checks
+            // witness scope in every build. `enforce_bound_scope` checks term names only.
             if a == b {
                 Ok(())
             } else {

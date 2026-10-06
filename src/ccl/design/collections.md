@@ -590,7 +590,9 @@ cannot fill a sum-typed element position; `reject_rows_fixed_elsewhere` reports 
 
 Realization operates at a site whose type carries the witnesses and whose subtree contains
 their conditionals. Unboxed arms sharing a domain need no sum; boxed arms sharing a domain
-still have a one-candidate sum during inference. The planning rules above decide its erasure.
+still have a one-candidate sum during inference. A same-domain boxed conditional is realized,
+not erased: realization records its witness in `realized`, and `collapse_determined_sums`
+preserves it so the `Realize` assertion retains its binder.
 
 ### Realization instantiates the witness inside the predicate
 
