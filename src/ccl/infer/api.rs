@@ -802,7 +802,7 @@ fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
 /// collection's own present-key domain. So a bare `Int` index, literal or not, fails
 /// the edge — and the raw mismatch reads as an internal confusion rather than as what it
 /// is, a lookup whose proof obligation cannot be discharged. An `Array(3, 𝑇)`'s range
-/// domain `[0, 3)` is left to its own message, which already says it wanted an index in the
+/// domain `0..3` is left to its own message, which already says it wanted an index in the
 /// range. Named here rather than at the subscript form because `c[k]` lowers to
 /// exactly the application `c(k)`, so the diagnosis has to be type-directed to cover both
 /// spellings.
@@ -2346,7 +2346,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&expr),
-            "λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)"
+            "λ __list_comp_var : 0..2 → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)"
         );
     }
 
@@ -2363,7 +2363,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&expr),
-            "λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → 42)"
+            "λ __list_comp_var : 0..2 → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → 42)"
         );
     }
 
@@ -2385,7 +2385,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&expr),
-            "λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x + 2)"
+            "λ __list_comp_var : 0..2 → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x + 2)"
         );
     }
 
@@ -2404,8 +2404,8 @@ mod tests {
 
         assert_eq!(
             symbolic(&outer_comp),
-            "λ __list_comp_var : [0, 1] → __list_comp_var \
-             ▷ (λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)) \
+            "λ __list_comp_var : 0..2 → __list_comp_var \
+             ▷ (λ __list_comp_var : 0..2 → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)) \
              ▷ (λ y : Int → y)"
         );
     }
@@ -2702,7 +2702,7 @@ mod tests {
     }
 
     /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
-    /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
+    /// collection type is `box`, not a subtyping edge, so the concrete `0..3 ⤇ Int`
     /// does not inject into `Σ (𝐷 : UIntRanges). 𝐷 ⤇ Int`
     /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
     /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
@@ -3149,7 +3149,7 @@ mod tests {
     /// The unannotated lambda's domain/codomain are inferred; its kind is stamped
     /// `Data` by the `data_fun` provenance annotation lowering puts on every
     /// comprehension (a comprehension *is* a data collection). Its type is then
-    /// `[0, 1] ⤇ Int`, which `Sum` accepts, returning `Int`.
+    /// `0..2 ⤇ Int`, which `Sum` accepts, returning `Int`.
     #[test]
     fn test_infer_aggregate_sum_over_list_comp() {
         let mut ctx = TypeInferenceContext::new();

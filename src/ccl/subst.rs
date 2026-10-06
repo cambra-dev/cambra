@@ -2723,7 +2723,7 @@ mod tests {
 
         let int_ty = Type::Base(crate::ccl::BaseType::Int);
         let kind = TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]);
-        // A `Σ (σ : [[0, 2], [0, 3]]). (σ ⤇ Int)` and the reference its binder introduces.
+        // A `Σ (σ : [0..2, 0..3]). (σ ⤇ Int)` and the reference its binder introduces.
         let sum = || {
             let w = Witness::bound_to(fresh_witness_binder_id(), kind.clone());
             let occurrence = Type::WitnessRef(*w.id());

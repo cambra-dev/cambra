@@ -719,7 +719,7 @@ mod tests {
         // domain whichever way the brackets fall, which is how an unbalanced
         // one survived here.
         let s = two_level(range(4), int(), bool_ext()).to_string();
-        assert_eq!(s, "Fn({[0, 3]} → Int → Bool)");
+        assert_eq!(s, "Fn(0..4 → Int → Bool)");
     }
 
     #[test]

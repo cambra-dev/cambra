@@ -28,6 +28,18 @@ one, so the operation layer has nothing to dispatch on between them.
 > behavior in today's code, that is tagged `[Interim]`; a section whose operators are partly
 > built is tagged `[Partly implemented]`.
 
+## Index range notation
+
+`Type::UIntRange(n)` renders as `0..n`: the unsigned indices from zero up to, but not including,
+`n`. The empty domain is `0..0`; the singleton domain containing zero is `0..1`. These are
+rendered types, not CHL expressions. A source annotation uses `Array(n, T)` for a collection over
+that domain.
+
+Runtime `Extent::UIntRange` uses the same notation. Released indices can leave several intervals,
+rendered as `1..3 ∪ 5..8`. An interval containing `usize::MAX` uses an inclusive endpoint,
+`begin..=end`, because its exclusive endpoint cannot fit in `usize`. Range formatting does not
+change the bracket notation used for interval predicates.
+
 ## The six collection types
 
 With `𝐷` a witness domain and `𝑛` a length. Each entry gives the type's semantics rather
@@ -35,7 +47,7 @@ than its status: which lookups type-check today is in
 [Lookup: membership discharge](#lookup-membership-discharge), and `in` is [Planned] with the
 rest of the [operation layer](#operations-how-the-trait-layer-dispatches-planned).
 
-- **`Array(𝑛, 𝑇)`** = `[0, 𝑛) ⤇ 𝑇` — domain `UIntRange(n)`, length static.
+- **`Array(𝑛, 𝑇)`** = `0..𝑛 ⤇ 𝑇` — domain `UIntRange(n)`, length static.
   Ordered. Lookup `arr[𝑖] : 𝑇` is total, the index bound being static. This is the shape the
   compiler builds for a list literal today.
 - **`List(𝑇)`** = `Σ (𝐷 : UIntRanges). 𝐷 ⤇ 𝑇` — some index range, which one not
@@ -80,7 +92,7 @@ with.
 
 ## The empty literal names no element type
 
-`[]` is typed `[0, 0) ⤇ 𝛼`, with `𝛼` left for whatever demands an element type: an annotation on
+`[]` is typed `0..0 ⤇ 𝛼`, with `𝛼` left for whatever demands an element type: an annotation on
 the binding it seeds (`xs: List(Int) = box([])`), an operator that reads an element, or a join
 with a collection that names one.
 
@@ -123,7 +135,7 @@ cart: Mut(Map(String, Int), Txn) := empty_map()
 position is invariant and so pins to the argument's own type
 ([type-inference.md, Only a term builds a sum](type-inference.md#only-a-term-builds-a-sum)). A
 collection with no entries has no such type to offer — `box([])` against `Map(String, 𝑉)` collides
-on the domain, the empty index range `[0, 0)` being a `UIntRanges` domain rather than a key one —
+on the domain, the empty index range `0..0` being a `UIntRanges` domain rather than a key one —
 so the term names the sum itself and lets the annotation choose the witness.
 
 **What retires the term: a type-kind variable.** `empty_map()` asserts the witness kind —
@@ -553,8 +565,8 @@ c: Bool = True
 sum(box([1, 2]) if c else box([1, 2, 3]))
 ```
 
-The arms' domains are `[0, 1]` and `[0, 2]`, so the `Case` types as
-`Σ (𝜎 : [[0, 1], [0, 2]]). 𝜎 ⤇ Int` — one collection over a domain the branch picks
+The arms' domains are `0..2` and `0..3`, so the `Case` types as
+`Σ (𝜎 : [0..2, 0..3]). 𝜎 ⤇ Int` — one collection over a domain the branch picks
 ([type-inference.md, The domain join needs `box`](type-inference.md#the-domain-join-needs-box)).
 Nothing reads a witness off a value at runtime, so that type on its own gives `sum` no
 extent to iterate.

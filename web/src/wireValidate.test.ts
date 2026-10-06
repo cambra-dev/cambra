@@ -421,7 +421,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
 
     const tiledBoundary = minimalSuccess();
-    operatorNodes(tiledBoundary)[0].tiling = "SF({[0, 5]} → Int)";
+    operatorNodes(tiledBoundary)[0].tiling = "SF(0..6 → Int)";
     expect(() => validateSnapshot(tiledBoundary)).toThrow(
       new RegExp(`panes\\[${OPERATORS}\\]\\.nodes\\[0\\]\\.tiling.*boundary`),
     );
@@ -433,7 +433,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
       ...minimalOperatorNode(),
       label: "MapResult",
       role: "operator",
-      tiling: "SF({[0, 5]} → Int)",
+      tiling: "SF(0..6 → Int)",
     };
     expect(() => validateSnapshot(ok)).not.toThrow();
   });

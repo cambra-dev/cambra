@@ -26,7 +26,7 @@ values remain to be emitted or have already been released.
 | `Function { domain, codomain }` | A function type mapping one extent to another. |
 | `Record(fields)` | A record type with named field extents. |
 | `Union(variants)` | A union type: one of several possible extents. |
-| `UIntRange(IntervalSet<usize>)` | A finite, mutable set of unsigned integer indices. Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and shrunk directly as individual elements or sub-intervals are released by `IterateExtentProducer`. Constructors: `Extent::uint_range(n)` for `[0, n)`, `Extent::uint_range_interval(start, end)` for arbitrary half-open ranges. |
+| `UIntRange(IntervalSet<usize>)` | A finite, mutable set of unsigned integer indices. Created from a CCL `UIntRange(n)` type as the full set `0..n`, and shrunk directly as individual elements or sub-intervals are released by `IterateExtentProducer`. Constructors: `Extent::uint_range(n)` for `0..n`, `Extent::uint_range_interval(start, end)` for arbitrary half-open ranges. |
 | `DataSourceDomain(…)` | The domain of a streaming data source; polled externally for new elements. |
 | `Restricted { base, restriction }` | A subset of `base` filtered by a `Restriction` handle; populated at runtime by `Filter` operators. |
 

@@ -67,7 +67,7 @@ the *whole history* of the variable, not its latest snapshot.
 
 ```
   cnt := 0
-  for i in [1, 2, 3]:          cnt : [0, 2] ⤇ Int
+  for i in [1, 2, 3]:          cnt : 0..3 ⤇ Int
       cnt += i
                          position:   0     1     2
                             value:   1     3     6
@@ -135,7 +135,7 @@ A mutable variable's domain is the domain of the context that **writes** it:
 accumulation, and concurrent transactions differ only in which row of that table they
 land on. `x := 0` at the top level followed by a loop that writes it is an *induction*
 mutable variable over that loop's domain, not a degenerate one — Example A below shows it
-acquiring `[0, 2]`. The degenerate row is what a mutable variable gets when nothing but the
+acquiring `0..3`. The degenerate row is what a mutable variable gets when nothing but the
 statement sequence writes it, and it needs no letrec at all.
 
 **`Txn` is the exception to inference.** It is never inferred, always spelled at the
@@ -541,11 +541,11 @@ in for r in [10, 20, 30] do unit;
          ( (time: …, write: …) ▷ zip ⊎ (time: …, write: …) ▷ zip,   ← both sites, merged
            __t, 100 ) ▷ get_prev_txn
 
-     __commits : ([0, 2] ⤇ {…, decision: {`commit{writes: (Int), to_out_0: Int} | `abort}}) =
-       λ __r : [0, 2] → … `commit((writes: (__txp.0 - __txp.1), to_out_0: __txp.0 - __txp.1)) …
+     __commits : (0..3 ⤇ {…, decision: {`commit{writes: (Int), to_out_0: Int} | `abort}}) =
+       λ __r : 0..3 → … `commit((writes: (__txp.0 - __txp.1), to_out_0: __txp.0 - __txp.1)) …
 
-     __commits : ([0, 0] ⤇ {…, decision: {`commit{writes: (Int), to_out_1: Int} | `abort}}) =
-       λ __r : [0, 0] → … `commit((writes: (__txp.0 - 5), to_out_1: __txp.0 - 5)) …
+     __commits : (0..1 ⤇ {…, decision: {`commit{writes: (Int), to_out_1: Int} | `abort}}) =
+       λ __r : 0..1 → … `commit((writes: (__txp.0 - 5), to_out_1: __txp.0 - 5)) …
 
      to_out_0 : (Txn ⤇ Int) = (__commits ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .to_out_0
      to_out_1 : (Txn ⤇ Int) = (__commits ▷ by_commit_time) ≫ .decision ≫ variant_project(`commit) ≫ .to_out_1
@@ -554,8 +554,8 @@ in for r in [10, 20, 30] do unit;
 
 Reading it off — exactly the shape §3 predicted, now with two writers:
 
-- **one `__commits` per site**, each over its *own* request domain (`[0, 2]` for the loop,
-  `[0, 0]` for the standalone block). `__r ▷ begin` is that site's commit-time oracle.
+- **one `__commits` per site**, each over its *own* request domain (`0..3` for the loop,
+  `0..1` for the standalone block). `__r ▷ begin` is that site's commit-time oracle.
 - **`pool` merges both**: `(…) ▷ zip ⊎ (…) ▷ zip`, the union of the two sites' commit
   streams, searched by time. This is §3's "several sites writing one variable merge their
   commit streams before the search" — nothing here is single-writer.
@@ -590,8 +590,8 @@ asserts fire in **release**, not debug, because a leaked marker is a miscompile 
 ```
 let x : Int = 0
 in letrec
-     __hist : ([0, 2] ⤇ {`commit{writes: (Int)} | `abort}) =
-       λ __pos : [0, 2] →
+     __hist : (0..3 ⤇ {`commit{writes: (Int)} | `abort}) =
+       λ __pos : 0..3 →
          let __prev : (Int) = (__hist ≫ variant_project(`commit) ≫ .writes, __pos, (x))
                               ▷ get_prev_seq
          in (__prev.0, __pos ▷ [1, 2, 3])
@@ -669,7 +669,7 @@ shaped for a consumer that refuses to rebuild a body.
 
 ```
 let x : Int = 0
-in let __hist : {acc#8: ([0, 2] ⤇ Int)} =
+in let __hist : {acc#8: (0..3 ⤇ Int)} =
      transact (acc = x) { [acc]⇒[acc] over iterate ≫ [1, 2, 3] do <the decision body, verbatim> }
 in let x : Int = __hist.acc#8 ▷ final_read
 in x
@@ -700,7 +700,7 @@ rather than a dead binding, which is what a key read *only* by an await looks li
 ### `operator_conversion` — dispatch on the domain
 
 The `Transact`'s domain picks the engine: a concrete iteration extent (**Example A**'s
-`[0, 2]`) gives an `InductionStore`, `Txn` (**Example B**) gives the commit operator.
+`0..3`) gives an `InductionStore`, `Txn` (**Example B**) gives the commit operator.
 
 Reads then fall out of two independent choices. The **store kind** picks the operator, and a
 per-key `carry_forward` flag picks what it means:

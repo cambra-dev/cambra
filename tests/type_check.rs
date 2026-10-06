@@ -1317,8 +1317,8 @@ fn test_list_literal() {
 fn test_conditional_collection_forms_sigma() {
     // `box` introduces the sum; the control-flow join then relates two sums by
     // width and is lossless, keeping both domains (never a lossy meet-domain
-    // function). `box([1, 2])` is `Σ (σ : [[0, 1]]). (σ ⤇ Int)`, `box([1, 2, 3])`
-    // is `Σ (σ : [[0, 2]]). (σ ⤇ Int)`, so the join is `Σ (σ : [[0, 1], [0, 2]]).
+    // function). `box([1, 2])` is `Σ (σ : [0..2]). (σ ⤇ Int)`, `box([1, 2, 3])`
+    // is `Σ (σ : [0..3]). (σ ⤇ Int)`, so the join is `Σ (σ : [0..2, 0..3]).
     // (σ ⤇ Int)` — the witness is the runtime branch discriminant (see
     // type-inference.md §4.6). Without the `box`es the arms are plain data
     // functions and their join is the domain conflict, which is the point of
@@ -1335,7 +1335,7 @@ fn test_conditional_collection_forms_sigma() {
 #[test]
 fn test_conditional_collection_heterogeneous_domains_rejected() {
     // A conditional over a list literal and a **registered source** has two
-    // unrelated domains (`[0, 2]` and `source(mysrc)`), so it rejects for the same
+    // unrelated domains (`0..3` and `source(mysrc)`), so it rejects for the same
     // reason. This is the regression for the source-categorization invariant: a
     // registered source is a `Data` collection, and were it miscategorized as a
     // `Compute` capability the join would become an honest domain meet and
@@ -1353,7 +1353,7 @@ fn test_conditional_collection_heterogeneous_domains_rejected() {
     // to combine the two, so a diagnostic that reports the position names a domain the
     // program never wrote.
     assert!(
-        rendered.contains("[0, 2]") && rendered.contains("source(mysrc)"),
+        rendered.contains("0..3") && rendered.contains("source(mysrc)"),
         "expected both conflicting domains named, got:\n{rendered}"
     );
 }
@@ -1364,7 +1364,7 @@ fn test_conditional_collection_heterogeneous_domains_rejected() {
 #[test]
 fn test_conditional_collection_heterogeneous_domains() {
     // A conditional over a list literal and a **registered source** joins their
-    // (different-kind) domains losslessly into the Σ — `[0, 2]` and
+    // (different-kind) domains losslessly into the Σ — `0..3` and
     // `source(mysrc)`. This only holds because a registered source is a `Data`
     // collection: were it miscategorized as a `Compute` capability, the join
     // would take the contravariant meet and collide at coalesce. Regression for
@@ -1438,7 +1438,7 @@ fn test_collection_consumed_at_concrete_domain_is_rejected() {
 // arm fails the contravariant edge (`consumer_domain <: arm_domain`).
 #[test]
 fn test_conditional_collection_consumed_at_concrete_domain_is_rejected() {
-    // Arms `{[0,1], [0,2]}` (2- and 3-element); a concrete `Array(N)` consumer is
+    // Arms `{0..2, 0..3}` (2- and 3-element); a concrete `Array(N)` consumer is
     // rejected because some arm cannot supply domain N.
     let base = "def g(a: Array(3, Int)):\n    sum(a)\n";
     assert!(
@@ -1618,7 +1618,7 @@ fn full_map_lookup_needs_no_presence_proof() {
 /// parameter — so the uninhabited `FullMap(Int, Int)` above is a property of that key type
 /// and not of the form.
 ///
-/// `Array(𝑛, 𝑇)` is the control: it is already a `FullMap` over `[0, 𝑛)`, so a bare
+/// `Array(𝑛, 𝑇)` is the control: it is already a `FullMap` over `0..𝑛`, so a bare
 /// data-function parameter is nothing new. What the elided key buys over it is that the
 /// domain need not be written, which is what a producer whose domain has no surface
 /// spelling requires.
@@ -1626,7 +1626,7 @@ fn full_map_lookup_needs_no_presence_proof() {
 fn full_map_annotations_are_satisfiable() {
     assert_eq!(
         infer_program("x: FullMap(_, Int) = [1,2,3]\nx").to_string(),
-        "([0, 2] ⤇ Int)",
+        "(0..3 ⤇ Int)",
         "a binding takes the producer's own domain"
     );
     assert_eq!(
@@ -2314,7 +2314,7 @@ fn test_source_list_comp_element_type() {
 /// edge".
 #[test]
 fn test_comprehension_enters_a_list_annotation() {
-    // The comprehension's domain resolves to `[0, 3)` — a range — which realizes
+    // The comprehension's domain resolves to `0..3` — a range — which realizes
     // the length witness, so the deferred entry is discharged.
     let ty = infer_program(
         r"
@@ -3002,7 +3002,7 @@ fn infer_and_check(code: &str) -> Type {
 
 /// A `Case` whose arms are *collections* survives the consistency wall, and the
 /// restriction **both** arms establish survives with it: two identical filtered
-/// comprehensions join to that same filtered domain, not to the bare `[0, 2]`.
+/// comprehensions join to that same filtered domain, not to the bare `0..3`.
 ///
 /// A collection carries its domain as a refinement on its `Fun` *domain*, where
 /// subtyping is contravariant — which is why the arms must reach the node's type
@@ -3492,14 +3492,14 @@ mod letrec_typing {
 
     /// The design's induction-recurrence shape typechecks end-to-end through
     /// `infer` + the strict `typecheck` wall:
-    /// `letrec cnt : [0,3] ⇒ Int = λ r → get_prev_seq((cnt, r, 0)) + 1 in cnt`.
+    /// `letrec cnt : 0..4 ⇒ Int = λ r → get_prev_seq((cnt, r, 0)) + 1 in cnt`.
     /// The body's self-reference resolves against the group scope at the
     /// declared type, and the guard builtin's polymorphic scheme pins
-    /// `ι = [0,3]`, `ν = Int`.
+    /// `ι = 0..4`, `ν = Int`.
     #[test]
     fn guarded_single_binding_letrec_typechecks() {
         // The recurrence carrier is a *data collection* (`⤇`): `cnt` is indexed
-        // by the iteration domain `[0, 2]` and read back through `get_prev_seq`,
+        // by the iteration domain `0..3` and read back through `get_prev_seq`,
         // whose history argument demands `Data`. Declaring it `Compute`
         // (`Type::fun`) is the miskind the kind edge catches at the recurrence's
         // introduction.
@@ -3629,7 +3629,7 @@ f({c})"
 #[test]
 fn domain_preserving_consumption_of_a_conditional_collection() {
     let c = "box([1, 2]) if True else box([1, 2, 3])";
-    let sum = "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)";
+    let sum = "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)";
     for program in [
         // Directly over the `Case`.
         format!("[y + 1 for y in {c}]"),
@@ -4302,7 +4302,7 @@ mod annotation_kinds {
 /// one position without ever meeting at an edge.
 ///
 /// `f` is a bare lambda, so `Compute`; `xs` is a list literal, so `Data`. Both
-/// are `[0, 1] ⇒/⤇ Int` — the domains agree, so nothing rejects them before the
+/// are `0..2 ⇒/⤇ Int` — the domains agree, so nothing rejects them before the
 /// kinds are compared, and they arrive as two *lower* bounds on one variable.
 /// Subtyping closure relates a lower to an upper, never a lower to a lower, so
 /// neither arm is ever the left of an edge whose right is the other: the
@@ -4468,7 +4468,7 @@ fn two_alpha_variant_dependent_refinements_share_a_position() {
 
         [f, g]
     "#});
-    // `[0, 1] ⤇ ((k: Int) ⇒ ({[0, 2] | …} ⤇ Int))` — the two arms met at the
+    // `0..2 ⤇ ((k: Int) ⇒ ({0..3 | …} ⤇ Int))` — the two arms met at the
     // list's element position and produced one refinement, not two stacked layers.
     let Type::Fun { codomain, .. } = &ty else {
         panic!("expected the list's collection type, got {ty}");
@@ -4566,7 +4566,7 @@ fn a_result_refinement_over_the_parameter_is_well_scoped() {
 /// as an **upper** bound (the iteration key must lie in the source's domain). `extrude`'s
 /// polar one-way proxy inherits only one side, so extruding a candidate at `!pol` handed it a
 /// proxy carrying lower bounds — of which a domain variable has none — and the candidate
-/// materialized unresolved as `Σ (σ : [?93, [0, 2]]). (σ ⤇ Int)`. Candidates are matched by value, so
+/// materialized unresolved as `Σ (σ : [?93, 0..3]). (σ ⤇ Int)`. Candidates are matched by value, so
 /// they extrude through two-way proxies (`extrude_invariant`), exactly as a `History` payload
 /// does.
 ///
@@ -4574,7 +4574,7 @@ fn a_result_refinement_over_the_parameter_is_well_scoped() {
 /// come first: their candidates are bare variables with no refinement at all.
 #[test]
 fn an_arm_whose_domain_is_inferred_joins_like_a_written_one() {
-    let sum = "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)";
+    let sum = "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)";
     for arms in [
         // Written domains.
         "box([1, 2]) if True else box([1, 2, 3])",
@@ -4632,7 +4632,7 @@ x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
              [y + 1 for y in x]"
         )
         .to_string(),
-        "Σ (σ : [[0, 1], [0, 2], [0, 3]]). (σ ⤇ Int)"
+        "Σ (σ : [0..2, 0..3, 0..4]). (σ ⤇ Int)"
     );
 }
 
@@ -4652,7 +4652,7 @@ fn a_udf_call_arm_joins_through_the_bound_graph() {
                    x = box(g(0)) if True else box(h(0))\n[y + 1 for y in x]";
     assert_eq!(
         infer_program(program).to_string(),
-        "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)",
+        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)",
         "a call-shaped arm reaches the join transitively, like any other lower bound"
     );
 }
@@ -4672,7 +4672,7 @@ fn a_udf_call_arm_joins_through_the_bound_graph() {
 /// all. Which is why this is pinned together with a projection over a parameter.
 #[test]
 fn a_lambda_param_use_falls_back_to_the_param_slot() {
-    // The collection case: without the fallback this is `Conflicting Types: [0, 1] | [0, 2]`
+    // The collection case: without the fallback this is `Conflicting Types: 0..2 | 0..3`
     // at the `__iter_record` use inside the comprehension.
     assert_eq!(
         infer_program(
@@ -4682,7 +4682,7 @@ def f(c):
 f(box([1,2]) if True else box([1,2,3]))"
         )
         .to_string(),
-        "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)"
+        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
     );
     // And the standalone read stays load-bearing: a projection's domain is recovered from a
     // record-typed parameter's uses, so those reads must still resolve.
@@ -4715,7 +4715,7 @@ x = box([1, 2]) if c else box([1, 2, 3])
     // One spelling, whichever way the sum was reached. `box` boxes a data function's
     // *domain*, so the join of two boxed arms lists domains, and a consumer that rebuilds
     // the sum from what it named lists the same ones.
-    let sum = "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)";
+    let sum = "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)";
     // Collapsing consumers discard the domain, so they never present one to be joined.
     assert_eq!(infer_program(&format!("{c}sum(x)")), int());
     assert_eq!(infer_program(&format!("{c}max(x)")), int());
@@ -4737,7 +4737,7 @@ x = [1, 2] if c else [3, 4]
 [y + 1 for y in x]"
         )
         .to_string(),
-        "([0, 1] ⤇ Int)"
+        "(0..2 ⤇ Int)"
     );
     // Nothing about the join is arity-two.
     assert_eq!(
@@ -4746,7 +4746,7 @@ x = [1, 2] if c else [3, 4]
              [y + 1 for y in x]"
         )
         .to_string(),
-        "Σ (σ : [[0, 1], [0, 2], [0, 3]]). (σ ⤇ Int)"
+        "Σ (σ : [0..2, 0..3, 0..4]). (σ ⤇ Int)"
     );
     // A filtered comprehension is domain-preserving too, and its restriction rides the
     // **witness**: the filter is a fact about the domain the witness names, whichever
@@ -4793,7 +4793,7 @@ def f(a, b, d):
     // Collection arms: the candidates come from the *arguments*.
     assert_eq!(
         infer_program(&format!("{f}f(True, box([1,2]), box([1,2,3]))")).to_string(),
-        "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)"
+        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
     );
     // And a domain-preserving consumer carries it, exactly as it carries a directly-bound
     // one, because the consumer names the witness rather than handing over a named domain (`src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind").
@@ -4804,7 +4804,7 @@ def f(a, b, d):
 [y + 1 for y in x]"
         ))
         .to_string(),
-        "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)"
+        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
     );
 }
 
@@ -5070,9 +5070,9 @@ f({filtered})"
 ///
 /// This is the property a data-function join has to preserve, and the reason it is not
 /// free. A `CompactType`'s `atoms` and `refinements` are independent slots, so merging two
-/// candidates' *contents* collapses both programs to one bag — atoms `{[0, 1], [0, 2]}`
-/// with the predicate floating loose — and neither `Σ (𝐷 : [{[0, 2] | 𝑝}, {[0, 1] | 𝑝}]). 𝐷` nor
-/// `Σ (𝐷 : [[0, 2], [0, 1]]). 𝐷` is the answer. So the join must union candidates rather than merge
+/// candidates' *contents* collapses both programs to one bag — atoms `{0..2, 0..3}`
+/// with the predicate floating loose — and neither `Σ (𝐷 : [{0..3 | 𝑝}, {0..2 | 𝑝}]). 𝐷` nor
+/// `Σ (𝐷 : [0..3, 0..2]). 𝐷` is the answer. So the join must union candidates rather than merge
 /// them; see `src/ccl/design/type-inference.md`, "Where the candidates come from".
 #[test]
 fn a_refinement_belongs_to_one_candidate_not_the_sum() {
@@ -5152,7 +5152,7 @@ def make(s):
 fn box_builds_the_singleton_sum_over_its_argument() {
     assert_eq!(
         infer_program("box([1, 2, 3])").to_string(),
-        "Σ (σ : [[0, 2]]). (σ ⤇ Int)"
+        "Σ (σ : [0..3]). (σ ⤇ Int)"
     );
 }
 
@@ -5167,7 +5167,7 @@ c: Bool = True
 box([1, 2]) if c else box([1, 2, 3])"
         )
         .to_string(),
-        "Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)"
+        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
     );
 }
 
@@ -5225,9 +5225,9 @@ box(xs) if c else xs"
 /// domain rather than resolving it, and the close re-binds it there.
 ///
 /// Both routes give the annotation's own type back, because an **exact** parameter
-/// annotation is what the parameter is bound at — the caller's `[0, 2]` never reaches
+/// annotation is what the parameter is bound at — the caller's `0..3` never reaches
 /// the domain. A change that silently resolved either result to a concrete
-/// `[0, 2] ⤇ Int` is exactly the regression this pins.
+/// `0..3 ⤇ Int` is exactly the regression this pins.
 #[test]
 fn a_comprehension_over_a_list_param_stays_abstract() {
     assert_eq!(
@@ -5353,7 +5353,7 @@ fn a_boxed_conditional_collection_is_consumable() {
 fn a_boxed_conditional_keeps_both_candidates() {
     assert_eq!(
         infer_program("c: Bool = True\nbox([1]) if c else box([2, 3])").to_string(),
-        "Σ (σ : [[0, 0], [0, 1]]). (σ ⤇ Int)"
+        "Σ (σ : [0..1, 0..2]). (σ ⤇ Int)"
     );
 }
 
@@ -5582,7 +5582,7 @@ fn integer_literal_subscript_is_still_tuple_projection() {
 #[test]
 fn total_subscript_demands_a_provable_index() {
     for program in [
-        // A bare `Int` is not provably a member of `[0, 3)`.
+        // A bare `Int` is not provably a member of `0..3`.
         "def f(a: Array(3, Int), i: Int):\n    a[i]\nf([1,2,3], 5)",
         // Nor is a bare key provably present in a map's key domain.
         "def f(m: Map(Int, Int), k: Int):\n    m[k]\nf(groupby([1,2,3], \\x -> x), 5)",
@@ -5598,7 +5598,7 @@ fn total_subscript_demands_a_provable_index() {
 /// spellings, so lowering never has to guess which operation a subscript was.
 ///
 /// The **proven** form does not type-check for a range domain: an `Array(3, 𝑇)`'s domain is
-/// the range `[0, 3)`, which relates only by equality, so no integer carries the membership
+/// the range `0..3`, which relates only by equality, so no integer carries the membership
 /// proof a total lookup needs and there is no refinement for the checked form to relax
 /// either (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What this pins
 /// is that the *rejection* is uniform — `xs[0]`, `xs[i]` and `xs(0)` are one operation and
@@ -5685,7 +5685,7 @@ fn a_checked_lookup_is_not_an_application() {
 fn a_key_dependent_lookup_discharges_the_key_binder() {
     assert_eq!(
         infer_program("g = groupby([1, 2, 3], \\x -> x)\ng[1]?").to_string(),
-        "{`none | `some{({[0, 2] | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int)}}",
+        "{`none | `some{({0..3 | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int)}}",
         "the group's predicate must name the key it was looked up at"
     );
 }

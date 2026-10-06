@@ -1199,7 +1199,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         // copies).
         // A sum's candidates are domains, and the Σ rules match them by value, so two
         // sums differing only in a candidate's refinement are different types —
-        // `Σ (σ : [{[0,2] | 𝑝}]). …` is the filtered arm and `Σ (σ : [[0,2]]). …` is not.
+        // `Σ (σ : [{0..3 | 𝑝}]). …` is the filtered arm and `Σ (σ : [0..3]). …` is not.
         // Erasing there would make them compare equal, which is the opposite of what a
         // comparison up to refinements is for: it drops a distinction rather than an
         // incidental spelling.
@@ -2347,7 +2347,7 @@ mod tests {
         debug_assert_no_iteration_markers_in_type(&ty);
     }
 
-    /// `{[0, 2] | __elem}` — a refined range. The predicate's content is irrelevant
+    /// `{0..3 | __elem}` — a refined range. The predicate's content is irrelevant
     /// here; only that the two sides carry *different* ones.
     fn refined(base: Type, tag: &str) -> Type {
         Type::refined_one(base, Refinement::born(Rc::new(Expr::var(Name::from(tag)))))

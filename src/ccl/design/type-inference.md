@@ -1885,7 +1885,7 @@ Type display tracks the enclosing function binders and renders Pi references wit
 For example, a grouped collection can display as:
 
 ```text
-(k: Int) ⤇ ({[0, 2] | __elem ▷ xs ▷ key == k} ⤇ Int)
+(k: Int) ⤇ ({0..3 | __elem ▷ xs ▷ key == k} ⤇ Int)
 ```
 
 `PiRef` also carries a spelling hint for a reference displayed without its enclosing function,
@@ -1994,14 +1994,14 @@ consumer requiring fewer. A data function's domain describes the collection's ac
 Implicitly narrowing or widening it would change what the compiled program enumerates.
 
 For example, the `Iterate` conversion constructs an iteration source from the predicate's static
-domain. Treating `[0,10] ⤇ 𝑉` as `[0,5] ⤇ 𝑉` would enumerate six indices of an eleven-element
+domain. Treating `0..11 ⤇ 𝑉` as `0..6 ⤇ 𝑉` would enumerate six indices of an eleven-element
 collection. Record width subtyping does not have this effect: a record consumer reads only the
 fields named by its contract. Collection transformations also reproduce their input domain in
 their output, so the domain cannot be treated solely as a contravariant input parameter.
 
 The same requirement applies at joins. Subtyping and joining are one order, so a contravariant
 data domain would also change what a join computes. Under contravariance the join of the arms of
-`[1,2] if c else [1,2,3]` is `[0,1] ⤇ Int`, and `sum` of it returns `3` even when the else-arm
+`[1,2] if c else [1,2,3]` is `0..2 ⤇ Int`, and `sum` of it returns `3` even when the else-arm
 ran, with nothing in the type recording the dropped row. Under invariance the two collections are
 incomparable, so they have no join and the conditional is rejected. Programs that combine them
 need the explicit boxing described under [The domain join needs `box`](#the-domain-join-needs-box),
@@ -2323,7 +2323,7 @@ grammar and a Σ's witness is a data function's domain, so every type a type kin
 ### The domain join needs `box`
 
 A join of two data functions is not the contravariant meet of their domains. The domain of
-a collection is its data, so meeting `[0,1] ⤇ Int` with `[0,2] ⤇ Int` down to `[0,1] ⤇ Int`
+a collection is its data, so meeting `0..2 ⤇ Int` with `0..3 ⤇ Int` down to `0..2 ⤇ Int`
 discards the third row, with nothing in the type recording that it happened.
 
 So two collections over distinct domains have **no** join. `[1, 2] if c else [1, 2, 3]` is
@@ -2369,7 +2369,7 @@ f(True, box([1, 2]), box([1, 2, 3]))
 
 At the definition there is nothing to enumerate — both arms are inference variables and
 neither `box` is in scope — yet the use site yields
-`Σ (σ : [[0, 1], [0, 2]]). (σ ⤇ Int)`, while `f(True, 1, 2)` yields `Int` from the same
+`Σ (σ : [0..2, 0..3]). (σ ⤇ Int)`, while `f(True, 1, 2)` yields `Int` from the same
 definition. No syntactic rule at the `Case` can produce that.
 
 Every law about the candidate list is then a join property the lattice already has:
@@ -2751,7 +2751,7 @@ from](#where-the-candidates-come-from)).
   lie in its source's domain — so a candidate variable typically has no lower bounds at all.
   `extrude`'s polar proxy inherits one side only, and extruding candidates at `!pol` handed a
   sum in a negative position a *positive* proxy, which inherits lower bounds: nothing. The
-  candidate then materialized unresolved, `Σ (𝐷 : [?93, [0, 2]]). 𝐷 ⤇ Int`, which is what the
+  candidate then materialized unresolved, `Σ (𝐷 : [?93, 0..3]). 𝐷 ⤇ Int`, which is what the
   ground-domain assertion catches. Since the kind premise matches candidates *by value*,
   neither direction is the unused one, so candidates now cross a level boundary through the
   two-way proxies `extrude_invariant` builds — the same treatment, for the same reason, as a
@@ -2801,8 +2801,8 @@ from](#where-the-candidates-come-from)).
   The candidate list is **not** a redundant second alternatives mechanism layered on the
   position's atom set. A flat atom set
   cannot express *which* candidate a refinement belongs to, and that association is semantic:
-  `[q for q in [1,2,3] if 𝑝] if 𝑐 else [1,2]` must be `Σ (𝐷 : [{[0,2] | 𝑝}, [0,1]]). 𝐷 ⤇ 𝑉`,
-  not `Σ (𝐷 : [{[0,2] | 𝑝}, {[0,1] | 𝑝}]). 𝐷 ⤇ 𝑉` — the filter restricts the arm that was
+  `[q for q in [1,2,3] if 𝑝] if 𝑐 else [1,2]` must be `Σ (𝐷 : [{0..3 | 𝑝}, 0..2]). 𝐷 ⤇ 𝑉`,
+  not `Σ (𝐷 : [{0..3 | 𝑝}, {0..2 | 𝑝}]). 𝐷 ⤇ 𝑉` — the filter restricts the arm that was
   taken, not both.
   Distributing a position's refinement over its atoms produces exactly that wrong type, which
   is why `denoted_domains` refuses a position carrying refinements. Per-candidate association
