@@ -363,8 +363,9 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 
 /// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
-/// Returns [`Type::Hole`] unless both arguments match a bare [`Type::Fun`]; inference
-/// fills in the gap in that case.
+/// Returns [`Type::Hole`] unless both arguments are functions, looking through refinements
+/// ([`Type::peel_refinements`]); inference fills in the gap in that case. The pair's own type
+/// carries no refinement: it is rebuilt from the operands' domain and codomains.
 ///
 /// The domain is `f`'s, but the **kind is declared** rather than read off `f`: a zip of
 /// morphism columns denotes what the lambda being eliminated denotes, and its first column
@@ -393,7 +394,7 @@ pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 /// beside a correlated body produces that shape; the `debug_assert!` below rejects it where
 /// the type is built rather than where it is read.
 pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr, fun_kind: &FunKind) -> Type {
-    match (&f.ty, &g.ty) {
+    match (f.ty.peel_refinements(), g.ty.peel_refinements()) {
         (
             Type::Fun {
                 name,
@@ -2419,16 +2420,13 @@ mod tests {
         );
     }
 
-    /// A **refined** function operand drops the pair to [`Type::Hole`].
+    /// A **refined** function operand is still a function.
     ///
-    /// The match is on the bare [`Type::Fun`], so `{(k: Int) ⇒ B | p}` takes the fallback
-    /// arm and the pair loses the domain, the codomain and the binder that operand still
-    /// carries — the hazard [`Type::fun_kind`] peels refinements to avoid. Pinned on the
-    /// gap: an `#[ignore]` reports the same green whether it closed, regressed, or went
-    /// away, and the failure is silent otherwise, a `Hole` being what an operand of no
-    /// known shape yields too.
+    /// `{(k: Int) ⇒ B | p}` pairs as `(k: Int) ⇒ (…, B)`: the pair reads the domain, the
+    /// codomain and the binder through the refinement, as [`Type::fun_kind`] reads the kind.
+    /// Reading the bare [`Type::Fun`] instead drops the pair to [`Type::Hole`], which is also
+    /// what an operand of no known shape yields, so the loss is silent.
     #[test]
-    #[should_panic(expected = "a refined operand is still a function")]
     fn a_zip_reads_through_a_refined_operand() {
         let binder = Name::raw("k");
         let refined = Type::refined_one(
