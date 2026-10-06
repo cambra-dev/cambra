@@ -2976,8 +2976,24 @@ Neither choice would justify acquiring an arbitrary scalar refinement. Convertin
 ### Pattern-match arm binder referenced by the result type
 
 An arm-dependent result type cannot retain an arm-local binder after leaving that scope.
-For example, a collection result filtered by a field of an arm's payload needs that
-dependency expressed in terms of values still available at the result position.
+The following program panics during constraint emission in every build:
+
+```python
+def filter_against(tagged):
+    match tagged:
+        case `pair(p):
+            [x for x in [1, 2, 3] if x > p.1]
+        case `single(s):
+            [x for x in [1, 2, 3] if x > s]
+filter_against(`pair((0, 1)))
+```
+
+`enforce_bound_scope` rejects a lower bound carrying the first arm's free `p` when it is
+recorded on a variable whose telescope contains `tagged` but not `p`. Inference does not
+return a typed error or reach the post-inference scope check for this program.
+`arm_dependent_filter_result_panics_when_recording_an_escaping_bound` in
+`tests/type_check.rs` pins this outcome in debug and no-assertions builds. The result needs
+its dependency expressed in terms of values available outside the arm.
 
 One proposed construction is a result predicate that performs the same match. In
 pseudocode, a predicate local to each arm,
@@ -2997,9 +3013,7 @@ x -> match tagged:
 
 The payload names are then bound inside the predicate, whose external dependency is
 `tagged`. This needs a transformation that constructs the predicate and validates its
-typing, scope and refinement comparisons. The proposal is not a claim that every
-arm-dependent program currently has one dedicated diagnostic. The general post-inference
-scope validation is debug-only; it checks for free names left in recorded types.
+typing, scope and refinement comparisons.
 
 ---
 

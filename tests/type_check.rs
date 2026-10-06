@@ -40,6 +40,33 @@ fn candidates_of(type_kind: &TypeKind) -> Option<Vec<Type>> {
     }
 }
 
+#[test]
+fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
+    let code = indoc! {r"
+        def filter_against(tagged):
+            match tagged:
+                case `pair(p):
+                    [x for x in [1, 2, 3] if x > p.1]
+                case `single(s):
+                    [x for x in [1, 2, 3] if x > s]
+        filter_against(`pair((0, 1)))
+    "};
+    let stmts = parse_module(code);
+    let mut expr = lower_uniquified(&stmts, &mut LoweringContext::default());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        infer(&mut expr, &mut TypeInferenceContext::new())
+    }))
+    .expect_err("the arm-dependent result currently panics while recording its bound");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("scope assertion has a string panic payload");
+    assert!(message.contains("open bound recorded on"), "{message}");
+    assert!(message.contains("base: \"p\""), "{message}");
+    assert!(message.contains("free in the lower bound"), "{message}");
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

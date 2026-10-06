@@ -2190,6 +2190,9 @@ pub(super) fn emit_case<C: Typing>(
 
     // Join all value-read arm types without stripping refinements. Plain collections
     // with distinct domains conflict; boxed arms can join their candidate kinds.
+    // Relating an arm to a refinement-stripped sibling can demand D <: {D | p} and
+    // reject identical filtered arms; the join retains common refinements and drops
+    // differing singletons (if c: 1 else: 2 has type Int).
     // See `src/ccl/design/type-inference.md`, "Case inference" and
     // "The domain join needs box".
     //
