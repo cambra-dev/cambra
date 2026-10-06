@@ -14,23 +14,22 @@
 //! "Probe" here is an observation point on an operator's output. It is unrelated
 //! to the probe side of a hash join (`JoinPlan::Hash`).
 //!
-//! A reading is rendered and truncated when it is taken. The count of readings
-//! per probe does not bound their size, since one `DataFunction` off a join
-//! carries as many rows as the join produced. The row cap bounds the rows held to
-//! `probes × (readings + 1) × rows`, and [`CHARS_PER_CELL`] bounds each rendered
+//! A reading is rendered and truncated when it is taken. A probe holds at most
+//! two readings, its newest and its last flow, and one `DataFunction` off a join
+//! carries as many rows as the join produced, so the row cap is what bounds the
+//! rows held, to `probes × 2 × rows`. [`CHARS_PER_CELL`] bounds each rendered
 //! key, value, completeness and obsolete guard, however deeply the value nests.
 //! Rendering stops at the budget, so its cost is bounded by it too rather than
 //! by the value's length. Rendering happens on the driver thread, and no tile
 //! is cloned.
 //!
-//! A pane asks what flowed through a node, which a ring of recent readings
-//! cannot answer: empty readings outnumber row-carrying ones by orders of
-//! magnitude. Each probe therefore holds its last row-carrying reading outside
-//! the ring.
+//! A pane asks what flowed through a node, which the newest reading cannot
+//! answer: empty readings outnumber row-carrying ones by orders of magnitude.
+//! Each probe therefore holds its last row-carrying reading beside its newest.
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque, hash_map::Entry},
+    collections::{HashMap, hash_map::Entry},
     fmt::{self, Write as _},
     rc::Rc,
 };
@@ -48,9 +47,6 @@ pub const ROWS_PER_READING: usize = 32;
 
 /// Characters kept per rendered key or value, however deeply the value nests.
 pub const CHARS_PER_CELL: usize = 256;
-
-/// Readings kept in each probe's ring.
-pub const READINGS_PER_PROBE: usize = 16;
 
 /// The probe table of one program's producers, or nothing while no one is
 /// watching.
@@ -165,11 +161,11 @@ pub struct Reading {
     pub producer: Rc<str>,
     /// The tile's variant name.
     pub shape: &'static str,
-    /// The region of the domain the output is complete for: a collection's
-    /// `domain_predicate` or a store's `frontier`, in its `Debug` form, which
-    /// advances `False`, then `LessThanEq(uN)`, then `True`. An aggregation
-    /// reports whether it is terminal. `None` for a shape carrying no such
-    /// region.
+    /// The region of the domain the output is complete for, in its `Debug`
+    /// form, advancing from `False` through a prefix of the domain to `True`: a
+    /// collection's `domain_predicate`, or a store's running row's frontier
+    /// (`True` once the store is terminal). An aggregation reports whether it
+    /// is terminal. `None` for a shape carrying no such region.
     pub completeness: Option<String>,
     /// The producer's obsolete guard when the call returned, in its `Debug`
     /// form: the region its consumer has released, which the producer never
@@ -210,49 +206,60 @@ pub struct ProbeTable {
     next_seq: u64,
     next_flow: u64,
     rows_per_reading: usize,
-    readings_per_probe: usize,
     probes: HashMap<(Option<NodeId>, usize), Probe>,
 }
 
-/// One producer's probe: its recent readings, and the last reading that
+/// One producer's probe: its newest reading, and the last reading that
 /// carried rows.
 ///
-/// The two answer different questions. `recent` answers what the producer has
-/// been doing, empty readings included, and is where progress toward completeness is
-/// read. `last_flow` answers what flowed through it. It sits outside the ring
-/// because an operator under a settling scheduler answers empty hundreds of
-/// times per row, so a ring deep enough to hold the row would have to be deeper
-/// than the busiest pass.
+/// The two answer different questions. `last_flow` answers what flowed through
+/// the producer, and is where a frame takes its rows. `newest` answers how far
+/// the producer has got, and is where a frame takes its completeness and
+/// obsolete guard: a producer's terminal answer is usually empty, and its
+/// consumer releases after the `get` that carried the rows, so both advance on
+/// readings that carry nothing.
 ///
-/// `last_flow` is one reading under the same caps as any other, so the rows
-/// held stay `probes × (readings + 1) × rows`.
-///
-/// A reading is held behind an `Rc`, so `last_flow` and the ring share one
-/// allocation rather than each holding a copy.
+/// A reading is held behind an `Rc`, so the two share one allocation when the
+/// newest reading carried rows.
 struct Probe {
     /// The producer's display name, computed once when the probe is attached.
     name: Rc<str>,
-    /// Recent readings, empty or not, oldest first.
-    recent: VecDeque<Rc<Reading>>,
-    /// The newest reading that carried rows, which `recent` may have evicted.
+    /// The newest reading, empty or not.
+    newest: Rc<Reading>,
+    /// The newest reading that carried rows.
     last_flow: Option<Rc<Reading>>,
 }
 
+/// One probe's last flow, and its newest reading beside it.
+#[derive(Debug, Clone, Copy)]
+pub struct Flow<'a> {
+    /// The newest reading that carried rows.
+    pub rows: &'a Reading,
+    /// The newest reading, which is `rows` unless later calls carried nothing.
+    pub newest: &'a Reading,
+}
+
+impl Flow<'_> {
+    /// Whether readings newer than the rows exist that carried nothing.
+    pub fn stale(&self) -> bool {
+        self.rows.seq != self.newest.seq
+    }
+}
+
 impl ProbeTable {
-    /// A probe table with the given caps.
-    pub fn new(rows_per_reading: usize, readings_per_probe: usize) -> Self {
+    /// A probe table keeping `rows_per_reading` rows per reading.
+    pub fn new(rows_per_reading: usize) -> Self {
         Self {
             next_seq: 0,
             next_flow: 0,
             rows_per_reading,
-            readings_per_probe,
             probes: HashMap::new(),
         }
     }
 
-    /// A probe table with [`ROWS_PER_READING`] and [`READINGS_PER_PROBE`].
+    /// A probe table with [`ROWS_PER_READING`].
     pub fn with_defaults() -> Self {
-        Self::new(ROWS_PER_READING, READINGS_PER_PROBE)
+        Self::new(ROWS_PER_READING)
     }
 
     /// Readings that carried rows, since this table was built. Monotone.
@@ -297,30 +304,27 @@ impl ProbeTable {
         obsolete: &TileGuard,
     ) {
         let rendered = render(tile, self.rows_per_reading);
-        let probe = match self.probes.entry((node_id, producer_id)) {
-            Entry::Occupied(entry) => {
+        let key = (node_id, producer_id);
+        let name = match self.probes.get(&key) {
+            Some(probe) => {
                 // `alloc_id` counts per producer type, so two types built for
                 // one operator could share this key and interleave readings.
                 // An operator builds one producer per subscribe; a second name
                 // under one key is that rule breaking.
                 debug_assert_eq!(
-                    &*entry.get().name,
+                    &*probe.name,
                     name(),
                     "two producers share the probe key ({node_id:?}, {producer_id})",
                 );
-                entry.into_mut()
+                Rc::clone(&probe.name)
             }
-            Entry::Vacant(entry) => entry.insert(Probe {
-                name: name().into(),
-                recent: VecDeque::new(),
-                last_flow: None,
-            }),
+            None => name().into(),
         };
         let reading = Rc::new(Reading {
             seq: self.next_seq,
             node_id,
             producer_id,
-            producer: Rc::clone(&probe.name),
+            producer: Rc::clone(&name),
             shape: rendered.shape,
             completeness: rendered.completeness,
             obsolete: (!obsolete.is_empty()).then(|| bounded(|out| write!(out, "{obsolete:?}"))),
@@ -329,15 +333,26 @@ impl ProbeTable {
             total: rendered.total,
         });
         self.next_seq += 1;
-        let carried_rows = !reading.is_empty();
-        if carried_rows {
+        let flow = (!reading.is_empty()).then(|| Rc::clone(&reading));
+        if flow.is_some() {
             self.next_flow += 1;
-            probe.last_flow = Some(Rc::clone(&reading));
         }
-        if probe.recent.len() == self.readings_per_probe {
-            probe.recent.pop_front();
+        match self.probes.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let probe = entry.get_mut();
+                probe.newest = reading;
+                if flow.is_some() {
+                    probe.last_flow = flow;
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Probe {
+                    name,
+                    newest: reading,
+                    last_flow: flow,
+                });
+            }
         }
-        probe.recent.push_back(reading);
     }
 
     /// Detach a producer's probe, dropping its readings.
@@ -355,61 +370,27 @@ impl ProbeTable {
         self.probes.remove(&(node_id, producer_id));
     }
 
-    /// Every reading in one probe's ring, oldest first.
-    ///
-    /// An iterator rather than a slice: the backing `VecDeque` wraps once it has
-    /// evicted, so its readings are not contiguous.
-    pub fn readings(
-        &self,
-        node_id: Option<NodeId>,
-        producer_id: usize,
-    ) -> impl Iterator<Item = &Reading> + '_ {
-        self.probes
-            .get(&(node_id, producer_id))
-            .into_iter()
-            .flat_map(|probe| probe.recent.iter().map(|reading| &**reading))
-    }
-
     /// The key of every attached probe.
     pub fn probe_keys(&self) -> impl Iterator<Item = (Option<NodeId>, usize)> + '_ {
         self.probes.keys().copied()
     }
 
-    /// One probe's newest reading that carried rows, and whether newer readings
-    /// exist that carried nothing.
+    /// One probe's newest reading that carried rows, beside its newest reading.
     ///
-    /// Read from [`Probe::last_flow`], which the ring cannot evict, so a
-    /// producer that answered with rows once and empty a thousand times since
-    /// still reports the rows.
+    /// Held apart from the newest reading, so a producer that answered with
+    /// rows once and empty a thousand times since still reports the rows.
     ///
     /// The winning reading is chosen, not merged: a producer pulled twice in
     /// one pass answers the second call empty, and another answers with the
     /// same tile twice, so neither last-write-wins nor `Tile::merge` is
     /// correct. Two consumers pulling with different projection guards could
-    /// return disjoint partial answers, which this drops; the ring shows that
-    /// case if it occurs.
-    pub fn last_flow(
-        &self,
-        node_id: Option<NodeId>,
-        producer_id: usize,
-    ) -> Option<(&Reading, bool)> {
+    /// return disjoint partial answers, of which this keeps the later.
+    pub fn last_flow(&self, node_id: Option<NodeId>, producer_id: usize) -> Option<Flow<'_>> {
         let probe = self.probes.get(&(node_id, producer_id))?;
-        let found: &Reading = probe.last_flow.as_ref()?;
-        let stale = probe
-            .recent
-            .back()
-            .is_some_and(|newest| found.seq != newest.seq);
-        Some((found, stale))
-    }
-
-    /// Readings kept in every probe's ring, in total.
-    pub fn len(&self) -> usize {
-        self.probes.values().map(|probe| probe.recent.len()).sum()
-    }
-
-    /// Whether no probe holds a reading.
-    pub fn is_empty(&self) -> bool {
-        self.probes.values().all(|probe| probe.recent.is_empty())
+        Some(Flow {
+            rows: probe.last_flow.as_deref()?,
+            newest: &probe.newest,
+        })
     }
 }
 
@@ -869,6 +850,11 @@ mod tests {
         reading.rows.iter().map(|r| r.value.clone()).collect()
     }
 
+    /// One probe's newest reading.
+    fn newest(probes: &ProbeTable, node_id: Option<NodeId>, producer_id: usize) -> &Reading {
+        &probes.probes[&(node_id, producer_id)].newest
+    }
+
     /// The obsolete guard of a producer whose consumer has released nothing.
     fn unreleased() -> TileGuard {
         TileGuard::Function(FunctionGuard::Domain(Predicate::False))
@@ -885,7 +871,7 @@ mod tests {
             &unreleased(),
         );
 
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(reading.shape, "DataFunction");
         assert_eq!(reading.completeness.as_deref(), Some("True"));
         assert_eq!(
@@ -921,7 +907,7 @@ mod tests {
             &unreleased(),
         );
 
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         let marked: Vec<bool> = reading.rows.iter().map(|r| r.deleted).collect();
         assert_eq!(marked, vec![false, true, false]);
         assert_eq!(values(reading), vec!["\"a\"", "\"skip\"", "\"c\""]);
@@ -929,11 +915,11 @@ mod tests {
 
     /// A producer answers empty far more often than it answers with rows — an
     /// operator under a settling scheduler does so hundreds of times per row —
-    /// so a probe's ring of recent readings cannot be what the pane reads.
-    /// Without a slot the ring cannot evict, every such operator reports as
-    /// though it had never been pulled.
+    /// so a probe's newest reading cannot be what the pane reads. Without the
+    /// last flow held beside it, every such operator reports as though it had
+    /// never been pulled.
     #[test]
-    fn rows_survive_more_empty_readings_than_the_probe_ring_can_hold() {
+    fn rows_survive_any_number_of_empty_readings() {
         let mut probes = ProbeTable::with_defaults();
         probes.observe(
             None,
@@ -942,7 +928,7 @@ mod tests {
             &collection(&[0], &["a"], &[]),
             &unreleased(),
         );
-        for _ in 0..READINGS_PER_PROBE * 4 {
+        for _ in 0..64 {
             probes.observe(
                 None,
                 1,
@@ -952,13 +938,13 @@ mod tests {
             );
         }
 
-        let (reading, stale) = probes.last_flow(None, 1).expect("the rows are kept");
-        assert_eq!(values(reading), vec!["\"a\""]);
-        assert!(stale, "newer calls carried nothing, so the rows are stale");
+        let flow = probes.last_flow(None, 1).expect("the rows are kept");
+        assert_eq!(values(flow.rows), vec!["\"a\""]);
         assert!(
-            probes.readings(None, 1).all(Reading::is_empty),
-            "the ring itself has evicted the row-carrying call",
+            flow.stale(),
+            "newer calls carried nothing, so the rows are stale"
         );
+        assert!(flow.newest.is_empty());
     }
 
     /// Probe publishing gates on readings that carried rows: a driver polling on
@@ -988,7 +974,7 @@ mod tests {
 
     #[test]
     fn a_reading_keeps_the_last_rows_and_counts_the_rest() {
-        let mut probes = ProbeTable::new(2, 4);
+        let mut probes = ProbeTable::new(2);
         probes.observe(
             None,
             1,
@@ -997,7 +983,7 @@ mod tests {
             &unreleased(),
         );
 
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(
             values(reading),
             vec!["\"c\"", "\"d\""],
@@ -1005,24 +991,6 @@ mod tests {
         );
         assert_eq!(reading.total, 4);
         assert_eq!(reading.dropped(), 2);
-    }
-
-    #[test]
-    fn a_probe_keeps_only_its_last_readings() {
-        let mut probes = ProbeTable::new(8, 2);
-        for _ in 0..5 {
-            probes.observe(
-                None,
-                1,
-                "P#1",
-                &Tile::Scalar(strings(&["v"])),
-                &unreleased(),
-            );
-        }
-
-        let seqs: Vec<u64> = probes.readings(None, 1).map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![3, 4], "the cap evicts from the front");
-        assert_eq!(probes.len(), 2);
     }
 
     /// The shape the trace shows: a shared subtree is pulled once per consumer,
@@ -1046,9 +1014,9 @@ mod tests {
             &unreleased(),
         );
 
-        let (reading, stale) = probes.last_flow(None, 1).expect("observed");
-        assert_eq!(values(reading), vec!["\"a\""]);
-        assert!(stale, "a newer reading carried nothing");
+        let flow = probes.last_flow(None, 1).expect("observed");
+        assert_eq!(values(flow.rows), vec!["\"a\""]);
+        assert!(flow.stale(), "a newer reading carried nothing");
     }
 
     /// The other shape in the same trace: a `Memo` replays its cache, so the
@@ -1071,9 +1039,9 @@ mod tests {
             &unreleased(),
         );
 
-        let (reading, stale) = probes.last_flow(None, 1).expect("observed");
-        assert_eq!(values(reading), vec!["\"a\""]);
-        assert!(!stale, "the newest reading carried the data");
+        let flow = probes.last_flow(None, 1).expect("observed");
+        assert_eq!(values(flow.rows), vec!["\"a\""]);
+        assert!(!flow.stale(), "the newest reading carried the data");
     }
 
     #[test]
@@ -1096,14 +1064,8 @@ mod tests {
         );
 
         assert_eq!(probes.probe_keys().count(), 2);
-        assert_eq!(
-            values(probes.readings(node, 1).next().unwrap()),
-            vec!["\"left\""]
-        );
-        assert_eq!(
-            values(probes.readings(node, 2).next().unwrap()),
-            vec!["\"right\""]
-        );
+        assert_eq!(values(newest(&probes, node, 1)), vec!["\"left\""]);
+        assert_eq!(values(newest(&probes, node, 2)), vec!["\"right\""]);
     }
 
     /// `Tile::Record` is a `HashMap`, whose iteration order varies between runs
@@ -1122,7 +1084,7 @@ mod tests {
 
         let mut probes = ProbeTable::with_defaults();
         probes.observe(None, 1, "FanIn#1", &tile, &unreleased());
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(values(reading), vec!["(tagged: \"> a\", text: \"a\")"]);
     }
 
@@ -1146,7 +1108,7 @@ mod tests {
 
         let mut probes = ProbeTable::with_defaults();
         probes.observe(None, 1, "GroupBy#1", &tile, &unreleased());
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(reading.shape, "DataFunction");
         assert_eq!(
             values(reading),
@@ -1167,7 +1129,7 @@ mod tests {
             &collection(&[0], &[&long], &[]),
             &unreleased(),
         );
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         let value = &reading.rows[0].value;
         assert_eq!(value.chars().count(), CHARS_PER_CELL + 1, "{value}");
         assert!(value.starts_with("\"xxx"));
@@ -1191,7 +1153,7 @@ mod tests {
 
         let mut probes = ProbeTable::with_defaults();
         probes.observe(None, 1, "GroupBy#1", &tile, &unreleased());
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         let value = &reading.rows[0].value;
         let (shown, marker) = value.split_once('…').expect("the value was cut");
         assert_eq!(shown.chars().count(), CHARS_PER_CELL);
@@ -1215,7 +1177,7 @@ mod tests {
 
         let mut probes = ProbeTable::with_defaults();
         probes.observe(None, 1, "AsOf#1", &tile, &unreleased());
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(values(reading), vec!["(acc: [u0 ↦ \"a\", u2 ↦ \"b\"])"]);
     }
 
@@ -1225,7 +1187,7 @@ mod tests {
         let live = one_key_store("acc", vec![0, 1], strings(&["a", "b"]), Some(1), false);
         probes.observe(None, 1, "Commit#1", &live, &unreleased());
 
-        let reading = probes.readings(None, 1).next().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(reading.shape, "Store");
         assert_eq!(reading.total, 1, "a store's rows are its keys");
         assert_eq!(reading.rows[0].key.as_deref(), Some("acc"));
@@ -1238,7 +1200,7 @@ mod tests {
 
         let done = one_key_store("acc", vec![0, 1], strings(&["a", "b"]), Some(1), true);
         probes.observe(None, 1, "Commit#1", &done, &unreleased());
-        let reading = probes.readings(None, 1).last().expect("observed");
+        let reading = newest(&probes, None, 1);
         assert_eq!(reading.completeness.as_deref(), Some("True"));
     }
 
@@ -1325,8 +1287,9 @@ mod tests {
             &unreleased(),
         );
 
-        let seqs: Vec<u64> = probes.readings(None, 1).map(|r| r.seq).collect();
-        assert_eq!(seqs, vec![0, 2], "the gap is B's reading");
+        let flow = probes.last_flow(None, 1).expect("observed");
+        assert_eq!(flow.newest.seq, 2, "the gap is B's reading");
+        assert_eq!(newest(&probes, None, 2).seq, 1);
     }
 
     /// The guard ships only once the consumer has released something, so a
@@ -1336,16 +1299,16 @@ mod tests {
         let mut probes = ProbeTable::with_defaults();
         let tile = collection(&[0], &["a"], &[]);
         probes.observe(None, 1, "Memo#1", &tile, &unreleased());
+        assert_eq!(newest(&probes, None, 1).obsolete, None);
         let released = TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
             Value::UInt(0),
         )));
         probes.observe(None, 1, "Memo#1", &tile, &released);
 
-        let obsolete: Vec<Option<String>> = probes
-            .readings(None, 1)
-            .map(|reading| reading.obsolete.clone())
-            .collect();
-        assert_eq!(obsolete, vec![None, Some(format!("{released:?}"))]);
+        assert_eq!(
+            newest(&probes, None, 1).obsolete,
+            Some(format!("{released:?}"))
+        );
     }
 
     #[test]
@@ -1353,16 +1316,20 @@ mod tests {
         let slot = ProbeSlot::default();
         let tile = collection(&[0], &["a"], &[]);
         slot.observe_named(None, 1, || "P#1".into(), &tile, &unreleased());
-        assert!(slot.with_table(ProbeTable::len).is_none(), "off: no table");
+        assert!(
+            slot.with_table(|table| table.probe_keys().count())
+                .is_none(),
+            "off: no table"
+        );
 
         slot.enable();
         slot.observe_named(None, 1, || "P#1".into(), &tile, &unreleased());
-        assert_eq!(slot.with_table(ProbeTable::len), Some(1));
+        assert_eq!(slot.with_table(|table| table.probe_keys().count()), Some(1));
 
         slot.disable();
         slot.enable();
         assert_eq!(
-            slot.with_table(ProbeTable::len),
+            slot.with_table(|table| table.probe_keys().count()),
             Some(0),
             "switching off drops the readings, and switching on starts empty",
         );

@@ -54,16 +54,18 @@ conversion records — see
 A probe frame carries two records, which answer different questions.
 
 **What flowed through a node** is its probes' last flow. While probing is on, each producer's probe
-takes a reading of every result `TileProducer::get` returns. Its last flow is the newest reading
-that carried rows, held until the producer is dropped or probing switches off. A ring of recent
-readings cannot stand in for it, because a producer under a settling scheduler answers empty
-hundreds of times per row, so the ring holds nothing but empty readings by the time a frame renders.
+takes a reading of every result `TileProducer::get` returns, and holds two of them: its newest
+reading and its last flow, the newest reading that carried rows. Both are held until the producer
+is dropped or probing switches off. A frame takes a probe's rows from its last flow, because a
+producer under a settling scheduler answers empty hundreds of times per row. It takes completeness
+and the obsolete guard from the newest reading, because a producer's terminal answer is usually
+empty and its consumer releases after the `get` that carried the rows.
 
 **What a source still holds** is its window: the keys no reader has released. A consumer releases a
 row from inside the pull that reads it, so a stream every consumer keeps up with has a full last
 flow and an empty window.
 
-It does not reuse the static lookups. A live read is `node → recent readings` and a static lookup is
+It does not reuse the static lookups. A live read is `node → readings` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.
 
 ### Probing follows the live route

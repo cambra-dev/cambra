@@ -175,7 +175,7 @@ impl TileOperator for CheckedLookup {
         }
     }
 
-    fn subscribe_impl(
+    fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

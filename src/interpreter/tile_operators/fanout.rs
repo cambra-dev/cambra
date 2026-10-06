@@ -518,7 +518,7 @@ impl TileOperator for FanOutBranch {
         }
     }
 
-    fn subscribe_impl(
+    fn subscribe(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -846,7 +846,7 @@ impl TileOperator for Memo {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe_impl(
+    fn subscribe(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -1152,7 +1152,7 @@ mod tests {
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-        fn subscribe_impl(
+        fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn Consumer>,

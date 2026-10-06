@@ -162,7 +162,9 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
     // Started even without a program running: the route completes its handshake
     // and sends nothing, because nothing publishes until a run does.
     let live = LiveServer::start();
-    serve_bodies(build_bodies(code, name), name, port, &live)
+    let server = bind(name, port)?;
+    serve_bodies(&server, build_bodies(code, name), &live);
+    Ok(())
 }
 
 /// Serve an already-compiled program on a background thread, and return the
@@ -177,9 +179,11 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
 /// a later reload installs. See `src/inspector_model/design.md`,
 /// "A reload is not followed".
 ///
-/// The server thread is detached, and outlives this call by design — a run
-/// finishes long before a reader is done looking at it, which is why the binary
-/// parks afterwards.
+/// The port is bound before the server thread starts, so a port already in use
+/// is this call's `Err` rather than a run with no server behind it. The server
+/// thread is detached, and outlives this call by design — a run finishes long
+/// before a reader is done looking at it, which is why the binary parks
+/// afterwards.
 pub fn serve_compiled(
     compiled: &CompiledProgram,
     name: &str,
@@ -191,14 +195,10 @@ pub fn serve_compiled(
         snapshot: snapshot_json(compiled, name),
         diagnostics: diagnostics_body(&[]),
     };
-    let owned_name = name.to_string();
+    let server = bind(name, port)?;
     thread::Builder::new()
         .name("cambra-inspector".to_string())
-        .spawn(move || {
-            if let Err(e) = serve_bodies(bodies, &owned_name, port, &live) {
-                eprintln!("cambra: the inspector server stopped: {e}");
-            }
-        })
+        .spawn(move || serve_bodies(&server, bodies, &live))
         .map_err(io::Error::other)?;
     Ok(channel)
 }
@@ -209,14 +209,19 @@ fn route(url: &str) -> &str {
     url.split_once('?').map_or(url, |(path, _)| path)
 }
 
-/// Answer requests against pre-rendered bodies until the process is killed.
-fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io::Result<()> {
+/// Bind the inspector's port on loopback, and say where to look.
+fn bind(name: &str, port: u16) -> io::Result<tiny_http::Server> {
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
     // Names the scheme and says where to look: `https://` to a plain-HTTP port
     // fails the handshake and renders as a blank page with nothing logged here.
     eprintln!("cambra: inspecting {name} at http://localhost:{port} — Ctrl+C to stop");
+    Ok(server)
+}
 
+/// Answer requests on `server` against pre-rendered bodies until the process
+/// is killed.
+fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
     for request in server.incoming_requests() {
         // The live route takes the socket rather than answering on it, so it is
         // matched before the bodies below, which respond and drop.
@@ -248,7 +253,6 @@ fn serve_bodies(bodies: Bodies, name: &str, port: u16, live: &LiveServer) -> io:
             eprintln!("cambra: responding failed: {e}");
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -348,5 +352,19 @@ mod tests {
         assert_eq!(route("/api/live?t=1"), LIVE_PATH);
         assert_eq!(route("/api/snapshot"), "/api/snapshot");
         assert_eq!(route("/?"), "/");
+    }
+
+    /// A port already in use is `serve_compiled`'s own `Err`: the bind happens
+    /// before the server thread starts, so the caller can refuse to run.
+    #[test]
+    fn a_taken_port_is_the_callers_error() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = taken.local_addr().expect("bound").port();
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let Ok(compiled) = compile_program(&mut ctx, "1 + 2\n", consumer) else {
+            panic!("the program compiles");
+        };
+        assert!(serve_compiled(&compiled, "prog.chl", port).is_err());
     }
 }

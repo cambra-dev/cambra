@@ -1,7 +1,7 @@
 //! The websocket that carries a running program's probe readings to the pane.
 //!
 //! The static payload stays on `GET /api/snapshot`: a static lookup is
-//! `span → node` and a live read is `node → recent readings`, so the two share no
+//! `span → node` and a live read is `node → readings`, so the two share no
 //! index and keeping them on separate routes leaves the pinned snapshot
 //! untouched (`src/inspector_model/design.md`).
 //!

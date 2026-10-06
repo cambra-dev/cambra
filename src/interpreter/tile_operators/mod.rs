@@ -113,7 +113,10 @@ pub trait TileOperator {
 
     /// Subscribe to this operator with an intent guard and consumer.
     /// Returns a producer that allows the consumer to get data and release regions.
-    /// Contains generic logic for all operators.
+    ///
+    /// Builds exactly one producer, whose [`ProducerBase::new`] names this
+    /// operator and takes `scheduler`'s probe slot. An input's producer is
+    /// reached through the input's own `subscribe`.
     ///
     /// # Arguments
     /// * `intent_guard` - The region of the operator's extent that the consumer
@@ -125,20 +128,6 @@ pub trait TileOperator {
     /// # Returns
     /// A producer that provides access to the data and allows releasing regions
     fn subscribe(
-        &mut self,
-        intent_guard: TileGuard,
-        consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn TileProducer> {
-        self.subscribe_impl(intent_guard, consumer, scheduler)
-    }
-
-    /// Subscribe to this operator.  Operator-specific logic.
-    ///
-    /// Builds exactly one producer, whose [`ProducerBase::new`] names this
-    /// operator and takes `scheduler`'s probe slot. An input's producer is
-    /// reached through its own [`subscribe`](Self::subscribe).
-    fn subscribe_impl(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -753,7 +742,7 @@ pub struct ProducerBase {
 }
 
 impl ProducerBase {
-    /// The base of the producer `owner`'s `subscribe_impl` builds. Its input
+    /// The base of the producer `owner`'s `subscribe` builds. Its input
     /// notification does not reach it, so every pull reads.
     pub(crate) fn new(
         id: usize,
@@ -1385,7 +1374,7 @@ mod tests {
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-        fn subscribe_impl(
+        fn subscribe(
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,

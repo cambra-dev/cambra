@@ -137,7 +137,7 @@ impl Scheduler {
 
     /// The probe slot every producer subscribed under this scheduler holds.
     ///
-    /// The scheduler carries it because every `subscribe_impl` already receives
+    /// The scheduler carries it because every `subscribe` already receives
     /// the scheduler, so a producer takes the slot at construction with no
     /// ambient state.
     pub fn probes(&self) -> &ProbeSlot {

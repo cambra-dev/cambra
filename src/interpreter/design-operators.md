@@ -392,9 +392,9 @@ the positions the feed appended at.
 
 ## The producer protocol
 
-Four calls cross each subscription edge. `TileOperator::subscribe`, `TileProducer::get` and
-`TileProducer::release` are each a provided method that runs what every operator shares and then
-calls a required `_impl`, so no operator restates the checks below.
+Four calls cross each subscription edge. `TileProducer::get` and `TileProducer::release` are each a
+provided method that runs what every producer shares and then calls a required `_impl`, so no
+producer restates the checks below. `TileOperator::subscribe` is required and shares nothing.
 
 - **`subscribe(intent, consumer, scheduler)`** builds a `TileProducer` answering for `intent`, the
   region of the operator's tiling the consumer asks for. The producer keeps `consumer` to notify. A
@@ -419,10 +419,10 @@ two in turn.
 
 ### Producer attribution and probes
 
-A `subscribe_impl` builds exactly one producer. `ProducerBase::new` takes the building operator's
+A `subscribe` builds exactly one producer. `ProducerBase::new` takes the building operator's
 `OperatorBase` and the `Scheduler` the subscribe received, so every producer records the operator
 that built it (`ProducerBase::node_id`) and holds the scheduler's `ProbeSlot`. An input's producer
-is built by the input's own `subscribe_impl`. Two producers of different types built for one
+is built by the input's own `subscribe`. Two producers of different types built for one
 operator could share a probe key, since `alloc_id` counts per type; `ProbeTable` fails a
 `debug_assert!` when a second name arrives under one key.
 

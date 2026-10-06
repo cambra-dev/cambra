@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use crate::ccl::provenance::NodeId;
-use crate::interpreter::value_probe::{ProbeTable, Reading, ReadingRow, SourceWindow};
+use crate::interpreter::value_probe::{Flow, ProbeTable, ReadingRow, SourceWindow};
 
 /// What `/api/live` sends: the whole probe state, published after a pull that
 /// carried rows.
@@ -47,14 +47,18 @@ pub struct ProbedNode<'a> {
     pub probes: Vec<ProbeWire<'a>>,
 }
 
-/// One probe's last row-carrying reading.
+/// One probe's last row-carrying reading, with the guards of its newest.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeWire<'a> {
     pub producer_id: usize,
     pub producer: &'a str,
     pub shape: &'static str,
+    /// The newest reading's completeness, which may have advanced past the
+    /// rows'.
     pub completeness: Option<&'a str>,
+    /// The newest reading's obsolete guard, which may have grown past the
+    /// rows'.
     pub obsolete: Option<&'a str>,
     pub note: Option<&'static str>,
     /// The reading's position in the probe table's total order. A client that
@@ -96,11 +100,15 @@ pub struct SourceWindowWire<'a> {
 
 /// Build the probe frame for the probe table's current state.
 ///
-/// Each probe contributes its last flow rather than its newest reading. A
-/// producer pulled twice in one pass answers the second call empty, and
-/// another answers with the same tile twice, so the newest reading is the
-/// wrong one to send and merging the two double-counts. See
+/// Each probe contributes the rows of its last flow rather than of its newest
+/// reading. A producer pulled twice in one pass answers the second call empty,
+/// and another answers with the same tile twice, so the newest reading's rows
+/// are the wrong ones to send and merging the two double-counts. See
 /// [`ProbeTable::last_flow`](crate::interpreter::value_probe::ProbeTable::last_flow).
+///
+/// Completeness and the obsolete guard come from the newest reading instead.
+/// Both advance on readings that carry nothing, so the last flow's would report
+/// a region the producer has since grown past as current.
 pub fn probe_frame<'a>(
     probes: &'a ProbeTable,
     sources: &'a [SourceWindow],
@@ -113,13 +121,10 @@ pub fn probe_frame<'a>(
     let mut by_node: BTreeMap<NodeId, Vec<ProbeWire<'a>>> = BTreeMap::new();
     for (node_id, producer_id) in probes.probe_keys() {
         let Some(node) = node_id else { continue };
-        let Some((reading, stale)) = probes.last_flow(node_id, producer_id) else {
+        let Some(flow) = probes.last_flow(node_id, producer_id) else {
             continue;
         };
-        by_node
-            .entry(node)
-            .or_default()
-            .push(probe_wire(reading, stale));
+        by_node.entry(node).or_default().push(probe_wire(flow));
     }
     let nodes = by_node
         .into_iter()
@@ -170,16 +175,17 @@ fn row_wire(row: &ReadingRow) -> RowWire<'_> {
     }
 }
 
-fn probe_wire(reading: &Reading, stale: bool) -> ProbeWire<'_> {
+fn probe_wire(flow: Flow<'_>) -> ProbeWire<'_> {
+    let reading = flow.rows;
     ProbeWire {
         producer_id: reading.producer_id,
         producer: &reading.producer,
         shape: reading.shape,
-        completeness: reading.completeness.as_deref(),
-        obsolete: reading.obsolete.as_deref(),
+        completeness: flow.newest.completeness.as_deref(),
+        obsolete: flow.newest.obsolete.as_deref(),
         note: reading.note,
         seq: reading.seq,
-        stale,
+        stale: flow.stale(),
         total: reading.total,
         dropped: reading.dropped(),
         rows: reading.rows.iter().map(row_wire).collect(),
@@ -246,6 +252,45 @@ mod tests {
                 *id = renumbered(id);
             }
         }
+    }
+
+    /// A producer's terminal answer is usually empty, and its consumer releases
+    /// after the `get` that carried the rows, so the guards a frame ships come
+    /// from the newest reading while its rows come from the last flow.
+    #[test]
+    fn a_probe_ships_its_newest_guards_beside_its_last_rows() {
+        let mut probes = ProbeTable::with_defaults();
+        let node = NodeId::fresh();
+        let partial = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(strings(&["a", "b"]))),
+            Predicate::at_or_below(CellValue::UInt(1)),
+            BitSet::new(),
+        );
+        probes.observe(Some(node), 1, "IterateExtent#1", &partial, &released(None));
+        let terminal = Tile::data_function(
+            ColumnValue::UInts(Vec::new()),
+            Box::new(Tile::Scalar(strings(&[]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        probes.observe(
+            Some(node),
+            1,
+            "IterateExtent#1",
+            &terminal,
+            &released(Some(1)),
+        );
+
+        let frame = probe_frame(&probes, &[], 1, true);
+        let probe = &frame.nodes[0].probes[0];
+        assert_eq!(probe.rows.len(), 2, "the rows are the last flow's");
+        assert!(probe.stale);
+        assert_eq!(probe.completeness, Some("True"));
+        assert_eq!(
+            probe.obsolete.map(str::to_string),
+            Some(format!("{:?}", released(Some(1))))
+        );
     }
 
     /// One frame covering every row shape the pane renders: a stale probe, a

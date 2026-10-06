@@ -45,7 +45,7 @@ impl TileOperator for IterateExtent {
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
 
-    fn subscribe_impl(
+    fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
         mut consumer: Box<dyn Consumer>,

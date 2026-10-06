@@ -63,7 +63,7 @@ impl TileOperator for PermuteRecordDomain {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe_impl(
+    fn subscribe(
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
@@ -420,7 +420,7 @@ impl TileOperator for FlattenTupleDomain {
         visit(value("input", &*self.input));
     }
 
-    fn subscribe_impl(
+    fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,

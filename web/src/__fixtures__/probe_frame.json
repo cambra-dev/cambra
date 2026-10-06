@@ -8,7 +8,7 @@
           "completeness": "True",
           "dropped": 0,
           "note": null,
-          "obsolete": null,
+          "obsolete": "Function(Domain(Intervals(IntervalSet { intervals: [Interval(Finite(FullyBounded(Bound(Closed, u0), Bound(Closed, u1))))] })))",
           "producer": "IterateExtent#1",
           "producerId": 1,
           "rows": [
