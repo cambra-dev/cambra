@@ -108,6 +108,8 @@ as the keyword a `for` clause consumes; the parser accepts none of them in
 operator position. `operators_absent_from_chl` in `lexer.rs` pins the lexer's
 half.
 
+The lexer also accepts `^+` and `^=`. Both are experimental, so `docs/chl-spec.md` leaves them out.
+
 ### Stage 3 — AST (`ast.rs`)
 
 Key shape choices:

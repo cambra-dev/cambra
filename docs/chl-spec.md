@@ -213,14 +213,9 @@ direction there retires it.
 `@` is the decorator introducer ([1.9 Decorators](#19-decorators)); there is no
 matrix-multiplication operator.
 
-`^+` and `^=` also lex. Both are experimental, and this document does not
-specify them.
-
 **Notably absent vs. Python**: `/`, `%`, `>>`, `~`, walrus
-assignment-*expressions*, and `...`. `/`, `%` and `~` start no token, so the
-lexer rejects them (`InvalidToken`); `//` is floor division, not `/` twice.
-`>>` lexes as two `>` tokens and `...` as three `.` tokens, and the parser
-rejects both.
+assignment-*expressions*, and `...`. Writing one is an error; `//` is floor
+division, not `/` twice.
 
 `**` is exponentiation ([3.3 Arithmetic and logical operators](#33-arithmetic-and-logical-operators)). `**=` is not a
 token, so the augmented
@@ -817,9 +812,8 @@ def scaled(e: {Int where _ >= 0}) => Int:
 ```
 
 Operators absent on purpose: `/` (no fractional type), `%`, `>>`, `~`,
-`@`. `/`, `%` and `~` are lex errors (`InvalidToken`). `>>` lexes as two `>`
-tokens and `@` as the decorator introducer, and in an expression either is a
-parse error ([1.8 Operators and punctuation](#18-operators-and-punctuation)).
+`@`. Using one in an expression is an error
+([1.8 Operators and punctuation](#18-operators-and-punctuation)).
 
 > **Direction [Tentative] — `Real` and `/`.** The target language has a
 > fractional type, `Real`, and a division operator `/` on it. Neither
@@ -2671,8 +2665,7 @@ predicate naming two parameters (§6). Ordinary lexical scope (§5) is what
 supplies those names, and nothing narrows them to parameters: a refinement
 written at the top level may name a top-level binding, which makes that
 binding's *value* part of the type. The example uses membership `in`, which
-is **[Planned]** ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)),
-so it states the intended form and does not parse today:
+is **[Planned]** ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
 
 ```python
 ks = ["a", "b"]
@@ -3010,10 +3003,7 @@ what `groupby` is primarily designed to support.
 
 ### 7.3 `defer`
 
-`defer(…)` creates a deferred collection placeholder. It takes any number
-of arguments. What an argument contributes is **[Open]**: lowering accepts the
-arguments and discards them without lowering them, and the differential
-interpreter (`chl-interp`) recognizes only the zero-argument `defer()`.
+`defer()` (zero arguments) creates a deferred collection placeholder.
 It is rarely written explicitly — most users get a defer implicitly
 from `http_serve` or from generator functions. When written, the
 defer must be tied off later with `<<=` or fed via `<<`.
