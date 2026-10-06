@@ -7,6 +7,7 @@
 //! [`lower_http_serve`] at the top level only.
 
 use super::*;
+use crate::chl_parser::SurfaceBuiltin;
 use crate::chl_parser::ast::{AssignTarget, Expr as ChlExpr, Lit as ChlLit, Span, Spanned};
 use crate::interpreter::HttpServerDataSource;
 
@@ -40,9 +41,16 @@ pub(super) fn http_serve_decl(
     let ChlExpr::Call { func, args } = &value.node else {
         return None;
     };
-    if !matches!(&func.node, ChlExpr::Name(id) if id == "http_serve") {
+    if !matches!(&func.node, ChlExpr::Name(id)
+        if SurfaceBuiltin::from_name(id) == Some(SurfaceBuiltin::HttpServe))
+    {
         return None;
     }
+    // The slice pattern below states http_serve's arity.
+    const _: () = assert!(matches!(
+        SurfaceBuiltin::HttpServe.arity(),
+        chl_parser::Arity::Exact(3)
+    ));
     let [port, method, path] = args.as_slice() else {
         return None;
     };

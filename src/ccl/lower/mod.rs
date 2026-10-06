@@ -21,9 +21,8 @@
 //! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::Refinement`] predicate |
 //! | Assignment + expression blocks | nested [`TypedExprNode::Let`] |
 //! | Augmented assignment `x op= e` | desugared to [`TypedExprNode::Let`] via [`TypedExprNode::BinOp`] |
-//! | `sum(expr)` / `max(expr)` calls | [`TypedExprNode::Aggregate`] |
+//! | Calls to builtins ([`chl_parser::builtins::SURFACE_BUILTINS`]) | per builtin, in `lower_call` (`exprs.rs`), the `with` block, and the sink declarations |
 //! | Lambda expressions `\x -> body`, `\x, y -> body` | single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
-//! | `groupby(collection, key)` calls | `Lambda`/`Apply` encoding with a refinement predicate |
 //! | Unary negation (`-x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
 //! | Boolean negation (`not x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
 //! | Unary plus (`+x`) | identity — lowered to `x` directly |

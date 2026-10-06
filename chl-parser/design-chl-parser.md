@@ -153,6 +153,67 @@ Key shape choices:
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.
 
+## Surface builtins
+
+`builtins.rs` lists the names a CHL call recognizes as builtins in `SURFACE_BUILTINS`. Each row
+holds a spelling, its `SurfaceBuiltin` variant, an arity, and a kind. The parser does not read the
+table: a builtin call parses as an ordinary `Expr::Call`. The table lives in this crate because
+both of its consumers depend on this crate, and `chl-interp` depends on nothing else.
+
+A consumer resolves a called name with `SurfaceBuiltin::from_name` and matches on the variant. The
+table records names and call shapes, not meaning. Each consumer keeps three decisions:
+
+- **What the builtin denotes.** Lowering and evaluation bodies stay with their consumer.
+- **A call of the wrong arity.** Lowering refuses it. The interpreter treats it as an unknown
+  function.
+- **Shadowing.** Lowering resolves a `Function`-kind builtin before consulting scope, so a user
+  `def` of the same name does not shadow it. A builtin of another kind called in expression
+  position lowers as an ordinary call, where a user `def` does win, and a registered source wins
+  over a user binding
+  ([src/ccl/design/lowering.md, "Builtin calls"](../src/ccl/design/lowering.md#builtin-calls)).
+  The interpreter lets the nearest binding win
+  ([chl-spec.md, "3.2 Names"](../docs/chl-spec.md#32-names)).
+  `a_user_function_named_like_a_builtin_is_ignored` in `tests/differential_interp.rs` pins the
+  difference.
+
+The kind says which construct recognizes the call:
+
+| Kind | Position | Lowering's recognizer |
+|---|---|---|
+| `Function` | a call in expression position | `lower_call` |
+| `TransactionMarker` | the context of `with begin():` | `validate_begin_context` |
+| `SinkDeclaration` | the right-hand side of an assignment that declares a sink | `sink_declaration` |
+| `Source` | a call to a registered data source | `LoweringContext::sources` |
+
+A source resolves by its registration, not by the table, so a host can register a source the table
+does not list. The table lists the sources every `GlobalContext` registers, and
+`default_sources_are_the_listed_sources` in `src/ccl/context.rs` holds the two sets equal. Lowering
+does not check a source call's argument count against the table.
+
+`test_sink` is listed unconditionally. Lowering recognizes it only under `cfg(test)` or the
+`test-helpers` feature, and the interpreter recognizes it always. Gating the row would need a
+feature on this crate that only one of its consumers enables.
+
+### Rows that differ from the spec
+
+[chl-spec.md, "7. Built-in functions and sources"](../docs/chl-spec.md#7-built-in-functions-and-sources)
+is the specification for most rows. Five rows are specified in other sections:
+
+- `set`, `map`, and `empty_map` in
+  [chl-spec.md, "3.11 List, tuple, record literals"](../docs/chl-spec.md#311-list-tuple-record-literals).
+- `begin` and `await_final` in
+  [chl-spec.md, "8. Mutability, transactions, and feeds"](../docs/chl-spec.md#8-mutability-transactions-and-feeds).
+
+These rows and the spec disagree:
+
+- `test_sink` has no entry in the spec.
+- `http_serve` is a source in the spec and a `SinkDeclaration` here, because lowering recognizes it
+  by `sink_declaration`. The statement binds a source and a sink.
+- `defer` takes zero arguments in the spec and any number here, because `lower_call` ignores its
+  arguments. The interpreter recognizes only `defer()`.
+- The spec's planned aggregates (`min`, `count`, `avg`, `len`) and tentative builtins (`str`,
+  `open`, `stdout`, `restrict`) have no row.
+
 ## Error recovery
 
 There are two complementary recovery layers, both implemented with

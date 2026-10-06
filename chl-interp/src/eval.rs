@@ -33,6 +33,7 @@ use chl_parser::ast::{
 };
 
 use crate::value::{Collection, Value};
+use chl_parser::SurfaceBuiltin;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Error(pub String);
@@ -576,8 +577,8 @@ impl Interp {
             // opaque binding (`^=`) binds the same value, since its opacity only affects typing.
             Stmt::Assign { target, value, .. } => {
                 let name = name_of(target)?;
-                let is_sink = is_zero_arg_call(&value.node, "test_sink");
-                if is_sink || is_zero_arg_call(&value.node, "defer") {
+                let is_sink = is_zero_arg_call(&value.node, SurfaceBuiltin::TestSink);
+                if is_sink || is_zero_arg_call(&value.node, SurfaceBuiltin::Defer) {
                     if self.channels.contains_key(&name) {
                         return err(format!(
                             "`{name}` is declared as a channel twice, and a channel's state is \
@@ -887,7 +888,7 @@ impl Interp {
                 if binding.is_some() {
                     return err("the `with t = begin():` transaction handle is not supported");
                 }
-                if !is_zero_arg_call(&context.node, "begin") {
+                if !is_zero_arg_call(&context.node, SurfaceBuiltin::Begin) {
                     return err("the only transaction context is `begin()`");
                 }
                 if self.txn.is_some() {
@@ -1280,9 +1281,10 @@ fn name_of(target: &Spanned<AssignTarget>) -> Result<String, Error> {
     }
 }
 
-fn is_zero_arg_call(e: &Expr, name: &str) -> bool {
+fn is_zero_arg_call(e: &Expr, builtin: SurfaceBuiltin) -> bool {
     matches!(e, Expr::Call { func, args }
-        if args.is_empty() && matches!(&func.node, Expr::Name(n) if n == name))
+        if args.is_empty()
+            && matches!(&func.node, Expr::Name(n) if SurfaceBuiltin::from_name(n) == Some(builtin)))
 }
 
 /// Whether a body yields, which is what makes a `def` a generator.
@@ -1579,10 +1581,13 @@ impl Interp {
             return self.call_user(name, &function, args);
         }
 
-        match (name.as_str(), args.len()) {
+        // A call whose arity the table does not accept is not a builtin call, and reaches
+        // the unknown-function refusal below.
+        let builtin = SurfaceBuiltin::from_name(name).filter(|b| b.arity().accepts(args.len()));
+        match builtin {
             // `await_final` consumes its variable (`docs/chl-spec.md`, "8.6 `await_final`"): no
             // write may name it afterwards, so its current value is its final one.
-            ("await_final", 1) => {
+            Some(SurfaceBuiltin::AwaitFinal) => {
                 let Expr::Name(n) = &args[0].node else {
                     return err("`await_final` takes a mutable variable");
                 };
@@ -1594,7 +1599,7 @@ impl Interp {
 
             // A map is written as its entries; `box` marks a value as a whole rather than
             // a collection to iterate, which changes nothing about what it is.
-            ("map", 1) => {
+            Some(SurfaceBuiltin::Map) => {
                 let pairs = match self.eval(&args[0])? {
                     Value::Collection(pairs) => pairs,
                     Value::Pending => return Ok(Value::Pending),
@@ -1617,11 +1622,11 @@ impl Interp {
                 Ok(Value::Collection(collection(entries)?))
             }
 
-            ("box", 1) => self.eval(&args[0]),
+            Some(SurfaceBuiltin::Box) => self.eval(&args[0]),
 
             // `max` of an empty collection is not defined
             // (`docs/chl-spec.md`, "7.1 Aggregates").
-            ("max", 1) => {
+            Some(SurfaceBuiltin::Max) => {
                 let c = match self.eval(&args[0])? {
                     Value::Collection(c) => c,
                     Value::Pending => return Ok(Value::Pending),
@@ -1638,7 +1643,7 @@ impl Interp {
                     .ok_or_else(|| Error("`max` of an empty collection is not defined".into()))
             }
 
-            ("sum", 1) => {
+            Some(SurfaceBuiltin::Sum) => {
                 let c = match self.eval(&args[0])? {
                     Value::Collection(c) => c,
                     Value::Pending => return Ok(Value::Pending),
@@ -1656,7 +1661,7 @@ impl Interp {
 
             // `groupby(xs, f)` is keyed by the group key, and each group holds its members
             // under the keys they had in `xs`.
-            ("groupby", 2) => {
+            Some(SurfaceBuiltin::Groupby) => {
                 let c = match self.eval(&args[0])? {
                     Value::Collection(c) => c,
                     // The key function runs over elements that are pending, so it runs once,
@@ -1685,7 +1690,21 @@ impl Interp {
                 Ok(Value::Collection(collection(entries)?))
             }
 
-            (name, n) => err(format!("unknown function `{name}` of {n} argument(s)")),
+            // Builtins the differential suite does not reach, the ones recognized by the
+            // statement that holds them, and every other name.
+            Some(
+                SurfaceBuiltin::Set
+                | SurfaceBuiltin::EmptyMap
+                | SurfaceBuiltin::Defer
+                | SurfaceBuiltin::Begin
+                | SurfaceBuiltin::HttpServe
+                | SurfaceBuiltin::TestSink
+                | SurfaceBuiltin::Stdin,
+            )
+            | None => err(format!(
+                "unknown function `{name}` of {} argument(s)",
+                args.len()
+            )),
         }
     }
 
