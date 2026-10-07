@@ -1803,18 +1803,14 @@ fn elim_lambda_impl(
         }
 
         // A value-selecting `Case` inside a bare lambda body (`λ x → Case{[gᵢ → eᵢ]}`),
-        // where the gate `gᵢ(x)` varies with the element. A *comprehension* element
-        // conditional (`[a if g(x) else b for x in xs]`) is fanned out into
-        // `⧺ᵢ src|π̂ᵢ ≫ eᵢ` by `crate::ccl::comprehension`'s `fan_out_element_case`,
-        // so it never reaches here. This arm handles the residual
-        // shapes — a per-element conditional in a lambda whose *iteration source is not
-        // visible at lowering* (a writer decision body: `if 𝑝: a := … else: b := …`, a
-        // per-key carry-forward merge, an `if/else`-both-write accumulator).
+        // where the gate `gᵢ(x)` varies with the element: a comprehension's conditional
+        // element (`[a if g(x) else b for x in xs]`), a writer decision body
+        // (`if 𝑝: a := … else: b := …`), a per-key carry-forward merge, an
+        // `if/else`-both-write accumulator.
         //
         // It desugars to the same **union of domain-restricts** as every other
         // value-`Case` — `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` — but over the *lambda
-        // parameter's* fed element stream (the writer body's runtime input) rather
-        // than a visible comprehension source or the `UIntRange(1)` C-form driver.
+        // parameter's* fed element stream rather than the `UIntRange(1)` C-form driver.
         // Each arm filters the fed stream to the sub-domain its first-match gate
         // `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` admits (`filter_values` keeps the element value, unlike
         // the position-domain `Restrict`), then maps by `eᵢ`. So a **partial op**
