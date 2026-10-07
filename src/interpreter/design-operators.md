@@ -304,12 +304,12 @@ aggregate inside the nest would never settle.
 
 Operators split into two families by what they replace at their level:
 
-- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`. Their
+- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`, `MapDomain`. Their
   tiling is `with_values_at(input, level, new_values)` and the producer writes
   `*values_at_mut(level)`. Nothing is grouped, so nothing is split per row. A member that
   *reads* the rows above it takes them from the level they sit at rather than from the top,
   because a standing level answers for every induction store beneath it and not for those rows.
-- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`,
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Converse`, `Product`,
   `StoreDenseRead`. Each takes the level apart one row of the level above at a time and puts
   it back with `Tile::regroup_beneath`, handing it the empty level its own output tiling
   derives (`Tile::per_group` derives it on the call), so a row that has been reached by nothing
@@ -797,6 +797,12 @@ Op-conversion's arms split into two groups by how they handle their parent's
 iteration source itself by compiling its argument with `input=None`) or
 `input=Some` (wrap the standalone converse in a `MapResult` over the upstream).
 
+Composed into a chain, `Converse` and `MapDomain` take a third path: they act on the input at the
+level they are converted at ([The level a node is converted at](#the-level-a-node-is-converted-at)),
+inverting or re-valuing the collection each row of the input holds there and leaving the levels
+above it standing (`Converse::new_at`, `MapDomain::new_at`). A group-by whose key or source varies
+with an enclosing row reaches conversion this way.
+
 This dispatch is mirrored exactly by the iteration-marking pass in
 [`crate::ccl::planning::insert_iterate_markers`] — its
 `is_internalising_builtin_function` and `is_iteration_bearing` helpers both
@@ -832,6 +838,7 @@ The operators that act at one level ([Curry levels](#curry-levels)) take it from
 pairs at it, and so does a product morphism with no input, at the domains its type is curried
 over. `MapResult` and `MapResultToConst` apply at it. `Filter` masks the keys one level above it, the keys a `filter_values`' elements
 stand at; under `map`, one level in, those are the keys of each element collection. A composed
+`Converse` inverts the collections at it and a composed `MapDomain` re-values them. A composed
 `VariantWrap` wraps at it, and an applied one at the outermost level, its whole payload being one
 variant value. A fed copairing merges one level above it, and a nested `Transact` leaves standing
 the levels above its own row, one fewer than it.

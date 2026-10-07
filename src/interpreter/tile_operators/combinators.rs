@@ -17,20 +17,36 @@ use crate::interpreter::{
 /// `DataFunction { domain: codomain, codomain: domain }`.  Each codomain
 /// value maps to the list of domain values that produce it.
 pub struct Converse {
-    /// Output tiling: `DataFunction { domain: input.codomain, codomain: input.domain }`.
+    /// Output tiling: `DataFunction { domain: input.codomain, codomain: input.domain }`,
+    /// beneath the standing levels above `level`.
     base: OperatorBase,
     /// The function input to invert.
     input: Box<dyn TileOperator>,
+    /// The level inverted — see [`Converse::new_at`].
+    level: CurryLevel,
 }
 
 impl Converse {
     /// Create a `Converse` operator that inverts `input`.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
+        Self::new_at(input, CurryLevel::OUTERMOST)
+    }
+
+    /// [`Converse::new`] at `level`, leaving every level above it standing: each enclosing
+    /// row's collection is inverted on its own. A group-by whose source varies per row of
+    /// an enclosing collection is this.
+    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
         let (domain, codomain) = input
             .tiling()
+            .values_at(level)
             .split_function_extent()
-            .unwrap_or_else(|| panic!("Converse expected function, got {:?}", input.tiling()));
-        let tiling = Tiling::DataFunction {
+            .unwrap_or_else(|| {
+                panic!(
+                    "Converse expected a function at {level}, got {:?}",
+                    input.tiling()
+                )
+            });
+        let inverted = Tiling::DataFunction {
             domain: codomain,
             codomain: Box::new(Tiling::DataFunction {
                 domain: domain.clone(),
@@ -38,8 +54,9 @@ impl Converse {
             }),
         };
         Self {
-            base: OperatorBase::new(tiling),
+            base: OperatorBase::new(with_values_at(input.tiling(), level, inverted)),
             input,
+            level,
         }
     }
 }
@@ -68,6 +85,8 @@ impl TileOperator for Converse {
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             held: Vec::new(),
+            level: self.level,
+            empty_level: self.tiling().values_at(self.level).empty_at_no_rows(),
         })
     }
 
@@ -83,8 +102,12 @@ struct ConverseProducer {
     input: Box<dyn TileProducer>,
     /// Each input row last read, as the path `[value, key]` it stands at in the output. A
     /// release names output paths, and an input row is released once the path it stands
-    /// at is, which takes its value to read.
+    /// at is, which takes its value to read. Kept at the outermost level only.
     held: Vec<(Value, Value)>,
+    /// The level inverted — see [`Converse::new_at`].
+    level: CurryLevel,
+    /// The inverted level to answer with where no enclosing row has been reached.
+    empty_level: Tile,
 }
 
 impl ConverseProducer {
@@ -158,6 +181,109 @@ fn converse_group_by_key<K: PartialOrd>(
     )
 }
 
+/// Invert one collection `𝐷 ⤇ 𝐾` into `𝐾 ⤇ (𝐷 ⤇ 𝐷)`, with the rows it read as the paths
+/// `[value, key]` they stand at in the output. A group [`Tile::group_at`] takes out of a
+/// nest is such a collection, with the other enclosing rows emptied, so the row runs are
+/// not read.
+fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
+    let held: Vec<(Value, Value)>;
+    let out = match input_tile {
+        Tile::DataFunction {
+            domain,
+            codomain,
+            domain_predicate,
+            deleted,
+            ..
+        } => {
+            held = match &*codomain {
+                Tile::Scalar(values) => (0..domain.len())
+                    .filter(|row| !deleted.contains(*row))
+                    .map(|row| (values.index_at(row), domain.index_at(row)))
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            match *codomain {
+                Tile::Scalar(codomain) => {
+                    // Dispatch on the native element type of the codomain column so that
+                    // sorting uses typed comparison (PartialOrd) and avoids boxing to Value
+                    // wherever the inner type is already ordered natively.
+                    match &codomain {
+                        ColumnValue::Units(n) => {
+                            // All codomains are unit; create one group with all rows in order.
+                            let keys = vec![(); *n];
+                            converse_group_by_key(
+                                &keys,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
+                        }
+                        ColumnValue::Ints(v) => {
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
+                        }
+                        ColumnValue::UInts(v) => {
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
+                        }
+                        ColumnValue::Strings(v) => {
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
+                        }
+                        ColumnValue::Bools(bv) => {
+                            // Materialise as Vec<bool> so the element type is PartialOrd.
+                            let v: Vec<bool> = bv.iter().collect();
+                            converse_group_by_key(
+                                &v,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
+                        }
+                        ColumnValue::Variants(v) => {
+                            // Value is PartialOrd; pass the inner vec directly.
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
+                        }
+                        ColumnValue::Records(_) => {
+                            // No native slice to borrow; materialise one Value per row for sorting.
+                            // TODO: benchmark this and figure out a way to avoid if needed.
+                            let n = codomain.len();
+                            let keys: Vec<Value> = (0..n).map(|i| codomain.index_at(i)).collect();
+                            converse_group_by_key(
+                                &keys,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
+                        }
+                        ColumnValue::FunctionBindings { .. } => {
+                            panic!(
+                                "Cannot converse a function whose codomain is a function binding"
+                            )
+                        }
+                        ColumnValue::Union { .. } => {
+                            // Materialise one tagged Value per row for sorting.
+                            let n = codomain.len();
+                            let keys: Vec<Value> = (0..n).map(|i| codomain.index_at(i)).collect();
+                            converse_group_by_key(
+                                &keys,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
+                        }
+                    }
+                }
+                _ => panic!("Can only converse functions with scalar codomains"),
+            }
+        }
+        _ => panic!("Can only converse functions"),
+    };
+    (out, held)
+}
+
 impl TileProducer for ConverseProducer {
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(2 * self.held.len())
@@ -171,124 +297,26 @@ impl TileProducer for ConverseProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let mut out = match input_tile {
-            Tile::DataFunction {
-                row_starts,
-                domain,
-                codomain,
-                domain_predicate,
-                deleted,
-            } => {
-                assert_eq!(
-                    row_starts.len(),
-                    1,
-                    "converse inverts one mapping, so its input is one collection"
+        let mut out = match self.level.enclosing() {
+            None => {
+                debug_assert!(
+                    matches!(&input_tile, Tile::DataFunction { row_starts, .. } if row_starts.len() == 1),
+                    "converse inverts one mapping, so its input is one collection: {input_tile:?}"
                 );
-                self.held = match &*codomain {
-                    Tile::Scalar(values) => (0..domain.len())
-                        .filter(|row| !deleted.contains(*row))
-                        .map(|row| (values.index_at(row), domain.index_at(row)))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-
-                match *codomain {
-                    Tile::Scalar(codomain) => {
-                        // Dispatch on the native element type of the codomain column so that
-                        // sorting uses typed comparison (PartialOrd) and avoids boxing to Value
-                        // wherever the inner type is already ordered natively.
-                        match &codomain {
-                            ColumnValue::Units(n) => {
-                                // All codomains are unit; create one group with all rows in order.
-                                let keys = vec![(); *n];
-                                converse_group_by_key(
-                                    &keys,
-                                    &codomain,
-                                    &domain,
-                                    domain_predicate,
-                                    &deleted,
-                                )
-                            }
-                            ColumnValue::Ints(v) => converse_group_by_key(
-                                v,
-                                &codomain,
-                                &domain,
-                                domain_predicate,
-                                &deleted,
-                            ),
-                            ColumnValue::UInts(v) => converse_group_by_key(
-                                v,
-                                &codomain,
-                                &domain,
-                                domain_predicate,
-                                &deleted,
-                            ),
-                            ColumnValue::Strings(v) => converse_group_by_key(
-                                v,
-                                &codomain,
-                                &domain,
-                                domain_predicate,
-                                &deleted,
-                            ),
-                            ColumnValue::Bools(bv) => {
-                                // Materialise as Vec<bool> so the element type is PartialOrd.
-                                let v: Vec<bool> = bv.iter().collect();
-                                converse_group_by_key(
-                                    &v,
-                                    &codomain,
-                                    &domain,
-                                    domain_predicate,
-                                    &deleted,
-                                )
-                            }
-                            ColumnValue::Variants(v) => {
-                                // Value is PartialOrd; pass the inner vec directly.
-                                converse_group_by_key(
-                                    v,
-                                    &codomain,
-                                    &domain,
-                                    domain_predicate,
-                                    &deleted,
-                                )
-                            }
-                            ColumnValue::Records(_) => {
-                                // No native slice to borrow; materialise one Value per row for sorting.
-                                // TODO: benchmark this and figure out a way to avoid if needed.
-                                let n = codomain.len();
-                                let keys: Vec<Value> =
-                                    (0..n).map(|i| codomain.index_at(i)).collect();
-                                converse_group_by_key(
-                                    &keys,
-                                    &codomain,
-                                    &domain,
-                                    domain_predicate,
-                                    &deleted,
-                                )
-                            }
-                            ColumnValue::FunctionBindings { .. } => {
-                                panic!(
-                                    "Cannot converse a function whose codomain is a function binding"
-                                )
-                            }
-                            ColumnValue::Union { .. } => {
-                                // Materialise one tagged Value per row for sorting.
-                                let n = codomain.len();
-                                let keys: Vec<Value> =
-                                    (0..n).map(|i| codomain.index_at(i)).collect();
-                                converse_group_by_key(
-                                    &keys,
-                                    &codomain,
-                                    &domain,
-                                    domain_predicate,
-                                    &deleted,
-                                )
-                            }
-                        }
-                    }
-                    _ => panic!("Can only converse functions with scalar codomains"),
-                }
+                let (out, held) = converse_collection(input_tile);
+                self.held = held;
+                out
             }
-            _ => panic!("Can only converse functions"),
+            // Beneath standing levels each enclosing row's group is inverted on its own:
+            // a row's group is a collection in its own right, as it is for `Uncurry`.
+            Some(_) => {
+                input_tile.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| {
+                    match input_tile.group_at(self.level, row) {
+                        Some(group) => converse_collection(group.into_owned()).0,
+                        None => self.empty_level.clone(),
+                    }
+                })
+            }
         };
         // A group can be released while the input still grows, since `release_impl` frees
         // only the rows held; a row arriving later with a released value would otherwise
@@ -311,6 +339,22 @@ impl TileProducer for ConverseProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if self.level != CurryLevel::OUTERMOST {
+            // The levels above 𝐿 stand, and 𝐿's keys become values. Part of an enclosing row's
+            // inversion names input rows by their values, which the outermost converse tracks
+            // as `held` and a nested one does not yet.
+            let input_guard = crate::interpreter::tiling::through_standing_levels(
+                obsolete_guard,
+                self.level.index(),
+                self.input.tiling(),
+                &mut |inverted| {
+                    todo!(
+                        "a nested Converse cannot yet release part of a row's inversion: {inverted:?}"
+                    )
+                },
+            );
+            return self.input.release(input_guard);
+        }
         let released = match obsolete_guard {
             g if g.is_universal() => {
                 return self.input.release(self.input.tiling().universal_guard());
@@ -352,26 +396,40 @@ impl TileProducer for ConverseProducer {
 /// Takes a `DataFunction(domain → codomain)` and produces `DataFunction(domain → Scalar(domain))`.
 /// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
 pub struct MapDomain {
-    /// Output tiling: `DataFunction { domain, codomain: Scalar(domain) }`.
+    /// Output tiling: `DataFunction { domain, codomain: Scalar(domain) }`, beneath the
+    /// standing levels above `level`.
     base: OperatorBase,
     /// The function input.
     input: Box<dyn TileOperator>,
+    /// The level whose values are replaced — see [`MapDomain::new_at`].
+    level: CurryLevel,
 }
 
 impl MapDomain {
     /// Create a `MapDomain` operator that replaces the codomain with the domain values.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
-        let Tiling::DataFunction { domain, .. } = input.tiling() else {
+        Self::new_at(input, CurryLevel::OUTERMOST)
+    }
+
+    /// [`MapDomain::new`] at `level`, leaving every level above it standing: each enclosing
+    /// row's collection is re-viewed at its own keys.
+    pub fn new_at(input: Box<dyn TileOperator>, level: CurryLevel) -> Self {
+        let Tiling::DataFunction { domain, .. } = input.tiling().values_at(level) else {
             panic!(
-                "MapDomain expected a function tiling, got {:?}",
+                "MapDomain expected a function tiling at {level}, got {:?}",
                 input.tiling()
             )
         };
         let domain = domain.clone();
-        let tiling = Tiling::data_function(domain.clone(), Tiling::Scalar(domain));
+        let tiling = with_values_at(
+            input.tiling(),
+            level,
+            Tiling::data_function(domain.clone(), Tiling::Scalar(domain)),
+        );
         Self {
             base: OperatorBase::new(tiling),
             input,
+            level,
         }
     }
 }
@@ -399,6 +457,7 @@ impl TileOperator for MapDomain {
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            level: self.level,
         })
     }
 
@@ -412,6 +471,8 @@ struct MapDomainProducer {
     base: ProducerBase,
     /// The upstream producer whose codomain is replaced.
     input: Box<dyn TileProducer>,
+    /// The level whose values are replaced — see [`MapDomain::new_at`].
+    level: CurryLevel,
 }
 
 impl TileProducer for MapDomainProducer {
@@ -422,37 +483,30 @@ impl TileProducer for MapDomainProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
-        match input_tile {
-            Tile::DataFunction {
-                row_starts,
-                domain,
-                domain_predicate,
-                deleted,
-                ..
-            } => {
-                let as_data = domain.clone();
-                Tile::grouped(
-                    row_starts,
-                    domain,
-                    Box::new(Tile::Scalar(as_data)),
-                    domain_predicate,
-                    deleted,
-                )
-            }
-            other => panic!("MapDomain expected a collection, got {other:?}"),
-        }
+        let mut tile = self.input.get(self.input.tiling().universal_guard());
+        // The keys stand, so only the values at the level are replaced, in place.
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile.values_at_mut(self.level)
+        else {
+            panic!("MapDomain expected a collection at {}", self.level)
+        };
+        **codomain = Tile::Scalar(domain.clone());
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        self.input.release(match obsolete_guard {
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            g => todo!("Restrict cannot honor the release guard {g:?}"),
-        });
+        // The keys at 𝐿 stand as well as the levels above it: only the values beneath them
+        // are replaced.
+        let input_guard = crate::interpreter::tiling::through_standing_levels(
+            obsolete_guard,
+            self.level.index() + 1,
+            self.input.tiling(),
+            &mut |values| {
+                todo!("MapDomain cannot yet release part of the keys it made values: {values:?}")
+            },
+        );
+        self.input.release(input_guard);
     }
 }
 
@@ -582,7 +636,7 @@ impl TileProducer for UncurryProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let input_guard = self.split_pair_guard(obsolete_guard, self.level);
+        let input_guard = self.split_pair_guard(obsolete_guard);
         trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
     }
@@ -661,20 +715,19 @@ impl UncurryProducer {
     /// and the guard beneath it is split. At the paired level itself a pair names one inner
     /// key under one outer key, so a release of pairs is exactly a release of those inner
     /// keys, under the standing rows that qualify it.
-    fn split_pair_guard(&self, guard: TileGuard, level: CurryLevel) -> TileGuard {
+    fn split_pair_guard(&self, guard: TileGuard) -> TileGuard {
+        crate::interpreter::tiling::through_standing_levels(
+            guard,
+            self.level.index(),
+            self.input.tiling(),
+            &mut |paired| self.split_pairs(paired),
+        )
+    }
+
+    /// One arm of a released guard at the paired level, split back into the two levels the
+    /// pairs were formed from.
+    fn split_pairs(&self, guard: TileGuard) -> TileGuard {
         match guard {
-            g if g.is_empty() => self.input.tiling().empty_guard(),
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            TileGuard::Function(FunctionGuard::Codomain(inner))
-                if level != CurryLevel::OUTERMOST =>
-            {
-                TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                    self.split_pair_guard(*inner, level.in_codomain()),
-                )))
-            }
-            g @ TileGuard::Function(FunctionGuard::Domain(_)) if level != CurryLevel::OUTERMOST => {
-                g
-            }
             // Part of every pair's value: the same part of every inner key's value under every
             // outer key. What it names beneath the pairs names them by pair, and is split back
             // into the two components the pairs were formed from.
@@ -703,16 +756,13 @@ impl UncurryProducer {
                     FunctionGuard::Domain(pairs),
                 ))))
             }
-            // Each arm names its own region, so each splits on its own.
-            TileGuard::Or(arms) => arms
-                .into_iter()
-                .fold(self.input.tiling().empty_guard(), |all, arm| {
-                    all.union(&self.split_pair_guard(arm, level))
-                }),
             // `TileProducer::release` checks a guard against the producer's tiling, and
-            // Uncurry's tiling is a collection at every level this walks, so a guard reaching
-            // here is a function guard or a union of them.
-            g => unreachable!("Uncurry's tiling is a collection at {level}, released by {g:?}"),
+            // Uncurry's tiling is a collection at the paired level, so an arm reaching it is a
+            // function guard.
+            g => unreachable!(
+                "Uncurry's tiling is a collection at {}, released by {g:?}",
+                self.level
+            ),
         }
     }
 }
@@ -1638,7 +1688,7 @@ mod tests {
             )))),
         ]);
         assert_eq!(
-            TileGuard::flatten_or(vec![uncurry.split_pair_guard(released, CurryLevel::new(1))]),
+            TileGuard::flatten_or(vec![uncurry.split_pair_guard(released)]),
             expected
         );
     }
@@ -2284,6 +2334,8 @@ mod tests {
             base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
             held: Vec::new(),
+            level: CurryLevel::OUTERMOST,
+            empty_level: output_tiling.empty_at_no_rows(),
         };
         producer.get(producer.tiling().universal_guard())
     }
@@ -2320,6 +2372,8 @@ mod tests {
             base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
             input: Box::new(input),
             held: Vec::new(),
+            level: CurryLevel::OUTERMOST,
+            empty_level: output_tiling.empty_at_no_rows(),
         };
         let _ = producer.get(producer.tiling().universal_guard());
         producer.release(TileGuard::Function(FunctionGuard::Domain(
@@ -2339,6 +2393,192 @@ mod tests {
         assert!(
             upstream.covers_path(&[Value::Int(1)]) && !upstream.covers_path(&[Value::Int(2)]),
             "{upstream:?}"
+        );
+    }
+
+    /// Rows `1 ↦ [0 ↦ 10, 1 ↦ 10, 2 ↦ 20]` and `2 ↦ [0 ↦ 10]`, both complete, over `Int`s.
+    fn two_rows() -> (Tile, Tiling) {
+        let tile = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::Ints(vec![0, 1, 2, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 10, 20, 10]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::Base(BaseType::Int),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        (tile, tiling)
+    }
+
+    fn nested_converse() -> ConverseProducer {
+        let (tile, tiling) = two_rows();
+        let int = || Extent::Base(BaseType::Int);
+        let output_tiling = Tiling::data_function(
+            int(),
+            Tiling::data_function(int(), Tiling::data_function(int(), Tiling::Scalar(int()))),
+        );
+        ConverseProducer {
+            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            input: Box::new(TestTileProducer::new(tile, tiling)),
+            held: Vec::new(),
+            level: CurryLevel::new(1),
+            empty_level: output_tiling
+                .values_at(CurryLevel::new(1))
+                .empty_at_no_rows(),
+        }
+    }
+
+    fn nested_map_domain() -> MapDomainProducer {
+        let (tile, tiling) = two_rows();
+        MapDomainProducer {
+            base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &tiling),
+            input: Box::new(TestTileProducer::new(tile, tiling)),
+            level: CurryLevel::new(1),
+        }
+    }
+
+    /// A nested `MapDomain` replaces each row's values with that row's keys, and leaves the
+    /// standing level as it was.
+    #[test]
+    fn a_nested_map_domain_replaces_each_rows_values_by_its_keys() {
+        let mut map = nested_map_domain();
+        let out = map.get(map.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &out
+        else {
+            panic!("expected a collection: {out:?}")
+        };
+        assert_eq!(*domain, ColumnValue::Ints(vec![1, 2]));
+        let Tile::DataFunction {
+            row_starts,
+            codomain: values,
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("expected a collection of collections: {out:?}")
+        };
+        assert_eq!(*row_starts, vec![0, 3]);
+        assert_eq!(
+            **values,
+            Tile::Scalar(ColumnValue::Ints(vec![0, 1, 2, 0])),
+            "{out:?}"
+        );
+    }
+
+    /// A nested `MapDomain` keeps its own level's keys as well as the standing one's (two
+    /// standing levels, `through_standing_levels`), so a release of inner keys reaches the
+    /// input as those keys under every row.
+    #[test]
+    fn a_nested_map_domain_releases_its_own_keys_to_its_input() {
+        let mut map = nested_map_domain();
+        map.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::Int(0)))),
+        ))));
+        let upstream = map.input.obsolete_guard();
+        assert!(
+            upstream.covers_path(&[Value::Int(1), Value::Int(0)]),
+            "{upstream:?}"
+        );
+        assert!(
+            upstream.covers_path(&[Value::Int(2), Value::Int(0)]),
+            "{upstream:?}"
+        );
+        assert!(
+            !upstream.covers_path(&[Value::Int(1), Value::Int(1)]),
+            "{upstream:?}"
+        );
+    }
+
+    /// A nested `Converse` keeps only the standing level's keys (one standing level,
+    /// `through_standing_levels`): a release of a whole enclosing row reaches the input as
+    /// that row.
+    #[test]
+    fn a_nested_converse_releases_a_whole_enclosing_row_to_its_input() {
+        let mut converse = nested_converse();
+        converse.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(1)),
+        )));
+        let upstream = converse.input.obsolete_guard();
+        assert!(upstream.covers_path(&[Value::Int(1)]), "{upstream:?}");
+        assert!(!upstream.covers_path(&[Value::Int(2)]), "{upstream:?}");
+    }
+
+    /// A release beneath a nested `Converse`'s standing level names input rows only through
+    /// the groups it rebuilt there, which it cannot release yet, and says so.
+    #[test]
+    #[should_panic(expected = "a nested Converse cannot yet release part of a row's inversion")]
+    fn a_nested_converse_refuses_a_release_beneath_its_standing_level() {
+        let mut converse = nested_converse();
+        converse.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::Int(10)))),
+        ))));
+    }
+
+    /// A converse beneath a standing level inverts each enclosing row's collection on its
+    /// own: row `1 = {0→10, 1→10, 2→20}` and row `2 = {0→10}` keep separate groups, though
+    /// both hold the value 10. Built through [`Converse::new_at`], so the output tiling is the
+    /// one it derives.
+    #[test]
+    fn a_nested_converse_inverts_each_row_on_its_own() {
+        let input_tiling = Tiling::data_function(Extent::Base(BaseType::Int), one_level_tiling());
+        let input_tile = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::Ints(vec![0, 1, 2, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 10, 20, 10]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut converse = Converse::new_at(
+            Box::new(Constant::collection(input_tile, input_tiling)),
+            CurryLevel::new(1),
+        );
+        let int = || Extent::Base(BaseType::Int);
+        assert_eq!(
+            *converse.tiling(),
+            Tiling::data_function(
+                int(),
+                Tiling::data_function(int(), Tiling::data_function(int(), Tiling::Scalar(int()))),
+            ),
+            "the standing level stays, and each row's values become its keys"
+        );
+        let out_tiling = converse.tiling().clone();
+        let mut scheduler = Scheduler::new();
+        let mut producer = converse.subscribe(
+            out_tiling.universal_guard(),
+            Box::new(|| {}),
+            &mut scheduler,
+        );
+        let out = producer.get(out_tiling.universal_guard());
+        let groups: Vec<(Value, Value, Value)> = out
+            .paths_at(CurryLevel::new(2))
+            .into_iter()
+            .map(|p| (p[0].clone(), p[1].clone(), p[2].clone()))
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (Value::Int(1), Value::Int(10), Value::Int(0)),
+                (Value::Int(1), Value::Int(10), Value::Int(1)),
+                (Value::Int(1), Value::Int(20), Value::Int(2)),
+                (Value::Int(2), Value::Int(10), Value::Int(0)),
+            ],
+            "{out:?}"
         );
     }
 
