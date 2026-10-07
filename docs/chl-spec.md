@@ -84,17 +84,40 @@ CHL source is UTF-8 text. A span is a byte range of one source file.
 
 ### 1.3 Indentation (off-side rule)
 
-CHL uses Python-style significant indentation. At the start of each
-logical line, the byte count of leading whitespace is compared to an
-indent stack initialised to `[0]`:
+Indentation determines block boundaries. Its width is the byte count of leading spaces and
+tabs; a tab counts as one byte, not expansion to a tab stop. Blank and comment-only lines
+do not establish or close a level. Indentation inside brackets is ignored.
 
-- *greater than top* → push, emit `INDENT`
-- *less than top* → pop until equal, emitting one `DEDENT` per pop;
-  failure to find an equal level is a **hard `InconsistentIndent` error**
-- *equal to top* → no layout token
+For ordinary statement blocks, indentation levels start at zero. A line farther indented
+than the current level opens a new level. A dedent must return to an enclosing level;
+otherwise lexing fails with `InconsistentIndent`. A line at the current level leaves the
+block structure unchanged.
 
-At EOF, the stack is unwound to `[0]` and a synthetic final `NEWLINE`
-plus the requisite `DEDENT`s are emitted, so every `INDENT` is paired.
+An `if` or `match` used on the right-hand side of an assignment opens an additional level
+above the assignment's indentation. For an `if` expression, the first `elif` or `else`
+continuation fixes the chain's column. Subsequent continuations must use that column, which
+must be to the right of the assignment's column:
+
+```python
+x = if c:
+        1
+    elif d:
+        2
+    else:
+        3
+y = x
+```
+
+This continuation column need not align with the initial `if` token. When a header spans
+physical lines inside brackets, its indentation is measured from the logical statement's
+first line. A `match` expression has no `elif`/`else` continuation to fix this extra level;
+its case arms are nested within it.
+
+At EOF, the lexer inserts a final `NEWLINE` if needed and closes the remaining levels with
+`DEDENT`s. The extra assignment-side level closes without a corresponding `INDENT`; the
+parser consumes that `DEDENT` at the end of the block-valued assignment. The token-level
+contract is documented in
+[the lexer design](../chl-parser/design-chl-parser.md#stage-1--lexer-lexerrs).
 
 ### 1.4 Implicit line continuation
 

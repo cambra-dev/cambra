@@ -43,32 +43,40 @@ The pipeline is two distinct stages, both inside `chl-parser/src/`:
 
 ### Stage 1 — Lexer (`lexer.rs`)
 
-Logos tokenises the source into a flat `(Token, Span)` stream. Tokens cover
-keywords, identifiers, integer and string literals (both `"…"` and `'…'`),
-all CHL operators and punctuation, plus a physical `Newline` token.
-Comments (`# …`) and inline whitespace (`' '`, `'\t'`) are skipped.
+`tokenize` runs Logos, validates tag adjacency with `check_tags`, then resolves layout.
+Logos produces span-bearing keywords, identifiers, literals, punctuation and physical newlines.
+It skips comments and horizontal whitespace. The source-level layout rules are owned by
+[Indentation](../docs/chl-spec.md#13-indentation-off-side-rule); the implementation uses two
+level forms:
 
-A layout post-pass then walks that stream and:
+- `Fixed(column)` records an established indentation width. Increasing indentation emits
+  `Indent`; closing the level emits `Dedent`. A dedent that reaches no compatible level
+  produces `InconsistentIndent`.
+- `Pending { min }` records the assignment column when a block starts within a logical line.
+  Entering this level emits no `Indent`. The first continuation line above `min` fixes its
+  column; a line at or below `min` closes it. The parser's `block_value` consumes the extra
+  closing `Dedent` after parsing the `if` or `match` statement.
 
-- tracks bracket depth (`(`, `[`, `{`) and **suppresses newlines inside
-  brackets** (Python's implicit line continuation);
-- at each new line, computes the byte-count of leading whitespace and
-  compares it to an indent stack initialised to `[0]`;
-- emits `Indent` / `Dedent` tokens to bracket each new indentation level,
-  exactly as CPython does;
-- skips blank lines and comment-only lines (they do not affect indentation);
-- guarantees the stream ends with a `Newline` followed by enough `Dedent`s
-  to return the stack to depth zero, so the parser sees a uniform shape.
+The stack starts with `Fixed(0)`. `block_value_open` requests a pending level when a logical
+line ends in `:` but did not start with a block-opening keyword. The floor comes from the
+logical statement's first line, not a later physical line containing the colon. Blank and
+comment-only lines do not consume the pending request or change the stack.
 
-`InconsistentIndent` is a hard error: dedenting to an indent level that
-never appeared on the stack (e.g. `0 → 4 → 2`) is rejected at lex time.
+Bracket depth suppresses physical newlines and indentation processing while nonzero. The
+counter does not match opening and closing bracket kinds; the parser checks the required
+closing token. A closer at depth zero gives `UnmatchedClose`; nonzero depth at EOF gives
+`UnclosedBracket`.
 
-A string literal closes on the line it opens on. A quote with no closing quote
-before the newline is `UnterminatedString`, with the opening quote as its span.
+The successful token stream ends with a `Newline` and enough `Dedent`s to close the stack.
+Ordinary blocks balance `Indent` and `Dedent`; each pending assignment-side level contributes
+one extra `Dedent`. Tests include `block_right_hand_side_opens_a_level_of_its_own`,
+`a_wrapped_header_floors_the_level_at_the_statement`,
+`the_chain_column_is_fixed_by_its_first_line` and
+`a_match_right_hand_side_closes_its_level_unpinned`.
 
-A backtick begins a variant tag only when an identifier starts at its end. Any other backtick is
-`DetachedBacktick`, with the backtick as its span; `check_tags` checks the raw token stream before
-the layout pass.
+An unescaped physical newline before a string's closing quote gives `UnterminatedString`
+at the opening quote. A backtick not immediately followed by an identifier gives
+`DetachedBacktick` at the backtick. Both failures precede layout processing.
 
 A statement opens a block either from its head keyword (`if`, `def`, …) or from
 an assignment's right-hand side, and the layout pass tells them apart by the
