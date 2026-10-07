@@ -2188,28 +2188,16 @@ pub(super) fn emit_case<C: Typing>(
         }
     }
 
-    // Every arm joins by the **lattice**: each arm's type is a subtype of one
-    // fresh result variable, so the result is their least upper bound — what the
-    // arms have in common, exactly as a list's element type is the join of its
-    // elements. Refinements ride in untouched and the join is what decides which
-    // survive: arms depositing different singletons intersect to none (`if c: 1
-    // else: 2` is an `Int`), while a restriction *every* arm establishes is kept
-    // (identical filtered comprehensions stay filtered). Relating each arm to a
-    // *stripped* sibling instead loses that, and for a collection arm — whose
-    // domain rides the contravariant `Fun` domain — it demands `D <: {D | p}`,
-    // rejecting two arms that are the same expression.
+    // Join all value-read arm types without stripping refinements. Plain collections
+    // with distinct domains conflict; boxed arms can join their candidate kinds.
+    // Relating an arm to a refinement-stripped sibling can demand D <: {D | p} and
+    // reject identical filtered arms; the join retains common refinements and drops
+    // differing singletons (if c: 1 else: 2 has type Int).
+    // See `src/ccl/design/type-inference.md`, "Case inference" and
+    // "The domain join needs box".
     //
-    // Data-collection arms with distinct domains coalesce to a
-    // conditional-collection Sigma. (Heterogeneous *scalar* arms remain a hard
-    // `IncompatibleBounds` error — the sound union relaxation for them is
-    // deferred; see `coalesce`.)
-    //
-    // A `Mut` arm needs no special case: it derefs into the join like any other
-    // read, so a `Case` over two mutable variables types as their *value*. The
-    // second-class discipline is unaffected — what it forbids is a selected
-    // mutable variable reaching a position that writes through it, and that rule reads
-    // the argument *node*, not its type (mutability.md, "No aliasing: `Mut`
-    // values are second-class (downward-only)").
+    // Mutable-variable arms contribute values, not handles. Writable-argument validation
+    // still examines the argument node; selecting a value here does not create an alias.
     let result_ty = ctx.fresh();
     for b in branches.iter_mut() {
         let scope_info = b

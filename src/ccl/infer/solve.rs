@@ -612,82 +612,18 @@ fn with_shadows<R>(
     r
 }
 
-/// Pin the payload of a `Case` arm nothing can reach, so it resolves to *some*
-/// type rather than staying an inference variable.
+/// Pin an unreachable pattern payload to a type satisfying its recorded requirements.
 ///
-/// Width subtyping gives an arm naming a tag the scrutinee cannot carry no lower
-/// bound: nothing determines the payload, and nothing can, so it would reach the
-/// post-inference wall unresolved. The arm is ordinary code rather than an error
-/// (see `src/ccl/design/type-inference.md`, "An unobservable arm payload is
-/// pinned to what its uses require"), so a type is chosen here instead.
+/// Call only during use-site coalescing, before walking the scrutinee and branches.
+/// Generalized definitions must retain their payload variables. The pin is recorded on
+/// the variable, not merely on the binding slot, so the scrutinee and enclosing function
+/// types observe it too.
 ///
-/// **Which** type depends on what the arm's body does with the binder. In every
-/// case the rule is the same — pin to a type the payload's *requirements* accept —
-/// and the three arms below are the three ways a requirement gets recorded:
-///
-/// - **Nothing reads it.** No requirement at all, so `Unit` — carrying no
-///   information — is the choice.
-/// - **It flows somewhere.** The binder occurring in a position records a
-///   subtyping upper bound, `payload <: U`. That is a requirement as surely as a
-///   trait obligation is, and when `U` resolves to a concrete type it is the
-///   *strongest* one available: pinning anything else contradicts the flow. The
-///   commonest shape is the body that simply **is** the binder (`` `b(w) → w ``),
-///   where `U` is the arms' result join — `Unit` there does not merely lose
-///   information, it enters that join and collides with the reachable arm's type.
-/// - **It is read by an operator.** The read states what it needs as a trait
-///   obligation (`v + 1` records `Addable`), and `Unit` would contradict it: the
-///   pin would reject the very read that makes the payload observable. So the
-///   obligations choose, from the types their surviving instances still accept
-///   ([`TraitObligation::accepted_at`]).
-/// - **Neither.** Nothing observes the payload, so `Unit` — carrying no information
-///   — is the choice.
-///
-/// The two recorded forms do not compete for the same payload — an operand's
-/// upper bound is the operator's own requirement variable, not a concrete type —
-/// so the concrete flow target is taken first and the obligations decide when
-/// there is none.
-///
-/// **Each upper bound is resolved as its own position**, by a fresh
-/// [`resolve_var_type`] entered at that variable, never as a hop along this
-/// payload's bound chain. The distinction is the whole of `fallback_allowed`
-/// (`src/ccl/infer/solver/compact.rs`): reading `U` *through* the payload would
-/// collapse `U`'s quantifier as a side effect of resolving the payload, and hand
-/// the result to every other variable on the chain. Deciding it here instead is
-/// one deliberate choice, at the one variable whose quantifier is being
-/// eliminated.
-///
-/// A read need not narrow the choice to one — `v + v` leaves every `Addable` row
-/// standing (`Int`, `UInt`, `String`) — and **any of them is as good as any other
-/// here**, because the arm is unreachable: no value ever flows through the binder,
-/// so nothing observes which was picked. So one is taken, by instance-table order,
-/// for reproducibility rather than for meaning. That is a placeholder for saying
-/// what is actually true of such a payload — *for all `T` satisfying the arm's
-/// requirements* — which needs bounded quantification the type language does not
-/// have yet; with it, a dead arm would carry its requirements instead of a
-/// representative satisfying them.
-///
-/// Two things about *how* it is recorded are load-bearing:
-///
-/// - **On the variable, not the slot.** The same variable also occurs in the
-///   scrutinee's expected variant, and so in an enclosing lambda's parameter type.
-///   Writing `Unit` into `binding.ty` alone leaves those occurrences unresolved,
-///   which is the same defect with a smaller footprint.
-/// - **Inside the coalesce walk, before the branches.** A generalized definition's
-///   unconstrained payload is a type *parameter* — its uses instantiate freshened
-///   copies — so pinning it would make every instantiation `Unit` and reject a call
-///   that supplies that tag with a payload. Coalesce never walks such a definition
-///   in place, only its per-use clones, so pinning here reaches exactly the trees
-///   being resolved. And a `Lambda` resolves `param.ty` from its coalesced domain
-///   *after* its body, so the pin still reaches the parameter type — but only if it
-///   precedes the branch walk.
-///
-/// Returns whether it pinned, which
-/// [`assert_pinned_tags_are_unreachable`] checks against the scrutinee's tags: no value
-/// reaching a position is meant to imply the arm is unreachable. A live arm's binder
-/// takes its bound from the scrutinee (`scrut.c <: αᵢ`, the width rule with the
-/// scrutinee on the left), so a pinned binder on a tag the scrutinee carries would mean
-/// that edge went missing. That check reads the scrutinee's resolved tags and so cannot
-/// run here; the pin precedes the scrutinee's walk.
+/// Returns whether a pin was recorded. After resolving the scrutinee, call
+/// `assert_pinned_tags_are_unreachable` to check the reachability premise in debug builds.
+/// Choice order and bound-resolution requirements are specified in
+/// `src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to
+/// what its uses require".
 fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     // Unobservability is *transitive*: the variable's bound list is rarely empty
     // — the scrutinee constraint gives it the scrutinee's own per-tag variable as
