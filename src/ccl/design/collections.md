@@ -80,73 +80,63 @@ with.
 
 ## The empty literal names no element type
 
-`[]` is typed `[0, 0) ⤇ 𝛼`, with `𝛼` left for whatever demands an element type: an annotation on
-the binding it seeds (`xs: List(Int) = box([])`), an operator that reads an element, or a join
-with a collection that names one.
+`[]` has an empty `UIntRange(0)` domain and an initially unresolved element type. An annotation,
+an operator using an element or a join with a typed collection can constrain that element type.
+With no requirements, it becomes `unit`. No element can be read from the empty domain, and the
+type language has no uninhabited type; see
+[The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit).
 
-With nothing demanding one, `𝛼` is pinned to `unit`. The empty literal denotes the function with
-no positions, so no program reads a value out of it, and `unit` is what this type language has for
-a value carrying no information — there is no uninhabited type
-([chl-spec, 6.6 The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit)).
-`pin_empty_list_element` makes the choice after the constraints are in, on the rule an unreachable
-`Case` arm's payload takes
-([type-inference.md, An unobservable arm payload is pinned to what its uses
-require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require)).
+`pin_empty_list_elements` runs before the coalescing traversal. For an empty literal whose
+element variable has no incoming value, `pin_empty_list_element` uses the selection rule from
+[payload rule](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require).
+The choice is constrained in both directions against the element variable, so bindings and
+iteration targets that share it see the same choice. Choosing `unit` during emission would
+instead conflict with later requirements for another element type.
 
-Emptiness is the premise the pin rests on, not a stand-in for "no value reached the element type".
-A non-empty collection whose elements are themselves undetermined, such as
-`\x -> [x for z in [1, 2]]` never called, has a value-free element type too, and there the
-variable is a type parameter the program left ambiguous; pinning it would accept a program that
-has no type.
+An empty literal can have incompatible use sites. Failure to satisfy all recorded bounds is
+returned as a type error, not asserted as an internal invariant. The regression
+`an_empty_literal_read_at_two_types_is_a_type_error` in
+[the collection pipeline tests](../../../tests/compilation_pipeline/scalars_collections.rs)
+covers conflicting `List(Int)` and `List(String)` annotations.
+
+The pass selects syntactically empty `List` nodes, not every unresolved collection element type.
+A nonempty comprehension such as `\x -> [x for z in [1, 2]]` does not acquire a default element
+type through this rule. The pre-pass walks expression children, not copies stored in refinement
+predicate type slots.
 
 ### The empty collection has no key morphism [Interim]
 
-`map([])` and `set([])` are rejected. A re-keying reads its key domain off the key morphism's
-image ([The key domain is the key morphism's image](#the-key-domain-is-the-key-morphisms-image)),
-and with no elements there is no image, so nothing names the key.
+`map([])` and `set([])` fail inference with an unresolved-variable error. Their key type is
+derived from [the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and the empty
+source supplies no key value. The re-keying stores a copy of that source in a refinement
+predicate; the term-only pinning pass does not choose the copied literal's element type.
+`a_re_keying_constructor_rejects_an_empty_literal` also covers `box(map([]))` under an explicit
+`Map(String, Int)` annotation.
 
-The pin does not supply one either. The re-keyed literal is copied into the key domain's
-refinement predicate, `Clone` leaves the copy its own inference variables, and the pin runs
-over **term** nodes — a predicate rides a type slot, which that walk does not enter — so the
-copy keeps a variable nothing chooses for. Both constructors reject an empty literal as an
-unresolved inference variable.
-
-`empty_map()` is the spelling that works, because it is not a re-keying. Its type is
-`Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉` with both parameters open, stated by the term rather than derived
-from entries it does not have, and a `Map(𝐾, 𝑉)` or `Set(𝐾)` annotation pins them:
+`empty_map()` constructs a keyed sum without deriving a type from entries:
+`Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉`. A `Map(𝐾, 𝑉)` annotation fixes its parameters. A `Set(𝐾)`
+annotation also works because `Set(𝐾)` is represented as `Map(𝐾, unit)`.
 
 ```python
 cart: Mut(Map(String, Int), Txn) := empty_map()
 ```
 
-**It is a sum without `box`.** Every other collection enters one through `box`, whose candidate
-position is invariant and so pins to the argument's own type
-([type-inference.md, Only a term builds a sum](type-inference.md#only-a-term-builds-a-sum)). A
-collection with no entries has no such type to offer — `box([])` against `Map(String, 𝑉)` collides
-on the domain, the empty index range `[0, 0)` being a `UIntRanges` domain rather than a key one —
-so the term names the sum itself and lets the annotation choose the witness.
+The builtin introduces the sum directly, without `box`. Boxing an empty list retains its
+`UIntRanges` candidate domain rather than introducing a keyed `SubtypesOf(𝐾)` domain; see
+[Only a term builds a sum](type-inference.md#only-a-term-builds-a-sum). Bare and let-bound
+unannotated `empty_map()` calls leave unresolved parameters and are rejected.
+Keyed writes check the key and value against the collection's existing types; they do not
+replace the annotation that determines this empty constructor's parameters.
 
-**What retires the term: a type-kind variable.** `empty_map()` asserts the witness kind —
-`SubtypesOf(𝐾)` where `[]` would be decided as `UIntRanges` — and it has to, because `TypeKind`
-carries no variable to leave the kind open. That absence is justified on `TypeKind::refuses`
-(`src/ccl/ty.rs`) by a premise this section is the counterexample to: membership is decidable from
-the classified type, so the only thing inference can be missing is that type. `[]` has a classified
-type and zero rows, so its kind is decided and no row witnesses it. Lifting that assumption is the
-one change that removes the term.
+Operator conversion constructs an empty function value at the extent obtained from the
+inferred type. No entry is available from which to recover its key or value types.
+`an_empty_map_is_a_typed_empty_tile` checks the resulting empty tile.
 
-The name is a second concession. `empty_map()` answers a `Set(𝐾)` annotation too, which works only
-because `Set(𝐾)` is `Map(𝐾, unit)` — see [Telling `Set` and `Map` apart
-[Open]](#telling-set-and-map-apart-open). A nominal type constructor, the candidate fix there,
-would force `empty_map()` and `empty_set()` apart.
-
-**The annotation is the only source.** A keyed write states its obligation on the value it writes,
-not on the collection's key type, so writes and reads leave both parameters open; an unannotated
-`empty_map()` is an unresolved-variable error. `Set(𝐾)` needs no separate term, being `Map(𝐾, unit)`
-([Telling `Set` and `Map` apart](#telling-set-and-map-apart-open)) — the annotation's codomain is
-what distinguishes the two readings.
-
-At runtime it is one empty tile whose domain and codomain columns are born at the annotated types,
-built from the type because no entry exists to read them off.
+`TypeKind` has no inference-variable form. Generalizing the empty constructor across kinds
+would require a representation and inference rules for an unknown kind; this remains a proposal,
+not an implemented replacement for `empty_map()`. Distinguishing nominal `Set` and `Map` types
+would also require separate constructors or another explicit selection rule; see
+[Telling `Set` and `Map` apart](#telling-set-and-map-apart-open).
 
 ## The collection type is declared, not read off the shape
 
