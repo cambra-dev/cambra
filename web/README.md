@@ -63,13 +63,14 @@ to the browser — hijacking it would also remove copy/inspect and is unreliable
   `dist/index.html` with zero external requests (no CDN, no external fonts), so
   the page is offline-capable and embeddable.
 - **elkjs** — the layered layout the operator pane draws with. It is
-  EPL-2.0 / GPL-3.0-or-later against this repository's Apache-2.0, and it is
-  confined to `src/graph/`, which carries the notice. `src/graph/layout.ts`
-  states the contract with no reference to it and `OperatorView` takes a
-  `GraphLayout` rather than constructing one, so `src/graph/elk.ts` is imported
-  once outside that directory — where `main.ts` mounts the pane. `dist/index.html`
-  ships elkjs in object form, so `vite.config.ts` copies the repository's
-  `NOTICE` into it as a leading comment.
+  EPL-2.0 / GPL-3.0-or-later against this repository's Apache-2.0.
+  `src/graph/layout.ts` states the contract with no reference to it and
+  `OperatorView` takes a `GraphLayout` rather than constructing one, so
+  `src/graph/elk.ts` is imported once outside that directory, where `main.ts`
+  mounts the pane; `src/graph/NOTICE` records why that keeps the EPL out of the
+  rest of the code. `dist/index.html` ships elkjs in object form, so
+  `vite.config.ts` copies the repository's `NOTICE` and the EPL-2.0 text into it
+  as a leading comment.
 
 The IR tree is plain DOM (not a CodeMirror instance); only the source editor is
 CodeMirror. The operator pane is plain DOM too: absolutely positioned nodes over
@@ -168,9 +169,9 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
   Every suppressed id stays addressable: `viewItem` answers which element draws
   it, because a pane link may name any node on the wire.
 - `graph/layout.ts`, `graph/elk.ts` — the layout contract and its one
-  implementation, kept apart for the licence reason above. A layout that
-  rejects leaves the pane listing its operators in wire order rather than
-  blank, so every id stays selectable.
+  implementation, kept apart so replacing the engine replaces one module. A
+  layout that rejects leaves the pane listing its operators in wire order
+  rather than blank, so every id stays selectable.
 - `clipboard.ts` — the one impure clipboard call, isolated so the serializers
   that feed it stay DOM-free and directly testable.
 - `paneVisibility.ts` — which panes the layout shows, and the `localStorage`

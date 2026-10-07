@@ -1,8 +1,9 @@
 // The layout contract, stated without reference to who satisfies it.
 //
-// One implementation ships (`./elk`), under a licence the rest of this
-// repository does not use. Everything the pane knows about layout is this file,
-// so replacing the engine is replacing one module — see `./NOTICE`.
+// One implementation ships (`./elk`), on a dependency licensed under the EPL
+// rather than this repository's Apache-2.0. Everything the pane knows about
+// layout is this file, so replacing the engine is replacing one module — see
+// `./NOTICE`.
 
 /** A box to place. Sizes are measured by the caller, which owns the fonts. */
 export interface LayoutNode {
