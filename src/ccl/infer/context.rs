@@ -439,6 +439,13 @@ impl InferCtx {
                     .map(|t| self.normalize_annotation_in(t, telescope))
                     .collect(),
             ),
+            // Born after inference with its references closed, so the
+            // telescope needs no extension: no component spells an earlier one by name.
+            Type::DepTuple(cs) => Type::DepTuple(
+                cs.iter()
+                    .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
+                    .collect(),
+            ),
             Type::Record(fs) => Type::Record(
                 fs.iter()
                     .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))

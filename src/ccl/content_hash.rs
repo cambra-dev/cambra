@@ -46,6 +46,20 @@ pub fn content_hash(e: &TypedExpr) -> ContentHash {
     ))
 }
 
+/// The standalone α-invariant content hash of a type, by the same rules
+/// [`content_hash`] applies to the types inside a term.
+pub fn type_content_hash(ty: &Type) -> u64 {
+    let mut state = DefaultHasher::new();
+    hash_type(
+        ty,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        FreeVars::BySpelling,
+        &mut state,
+    );
+    state.finish()
+}
+
 /// The α-invariant hash of `e` with its free variables resolved **through the
 /// enclosing scope** rather than by spelling — the classification counterpart
 /// to [`content_hash`]. See `src/ccl/design/diffing.md`, "Three hashes, three
@@ -270,6 +284,14 @@ fn hash_type<'a>(
         T::Tuple(tys) => {
             tys.len().hash(state);
             for t in tys {
+                hash_type(t, env, wenv, free, state);
+            }
+        }
+        // References between components are indices, so the names stay out, as a
+        // `Fun`'s binder does.
+        T::DepTuple(cs) => {
+            cs.len().hash(state);
+            for (_, t) in cs {
                 hash_type(t, env, wenv, free, state);
             }
         }

@@ -1933,6 +1933,9 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        // A dependent tuple is born after inference, outside every generalized `let`,
+        // and the solver holds it as an atom.
+        | Type::DepTuple(_)
         | Type::SharedHole(_) => ty.clone(),
         // `constrain_go` refuses an edge carrying a parameter below its level before
         // it extrudes (`escaping_param`), and the level short-circuit above returns
