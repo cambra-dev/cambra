@@ -304,12 +304,12 @@ aggregate inside the nest would never settle.
 
 Operators split into two families by what they replace at their level:
 
-- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`. Their
+- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`, `MapDomain`. Their
   tiling is `with_values_at(input, level, new_values)` and the producer writes
   `*values_at_mut(level)`. Nothing is grouped, so nothing is split per row. A member that
   *reads* the rows above it takes them from the level they sit at rather than from the top,
   because a standing level answers for every induction store beneath it and not for those rows.
-- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`,
+- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Converse`, `Product`,
   `StoreDenseRead`. Each takes the level apart one row of the level above at a time and puts
   it back with `Tile::regroup_beneath`, handing it the empty level its own output tiling
   derives (`Tile::per_group` derives it on the call), so a row that has been reached by nothing

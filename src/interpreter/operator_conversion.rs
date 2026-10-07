@@ -2613,7 +2613,11 @@ fn convert_impl_inner(
                             .map_err(ConversionError::Unsupported)?,
                     ))
                 }
-                Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
+                // Both act on the collection each row of the input holds, beneath the levels
+                // it is converted under: a group-by whose source varies with an enclosing row
+                // inverts each row's collection on its own.
+                Builtin::MapDomain => Ok(Box::new(MapDomain::new_at(input, ctx.level()))),
+                Builtin::Converse => Ok(Box::new(Converse::new_at(input, ctx.level()))),
                 // `variant_project(c)` consumes the fed scrutinee stream and
                 // narrows it to that tag's restricted sub-domain, yielding the
                 // arm's inner payload column. The union extents come from the fed
