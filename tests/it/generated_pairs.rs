@@ -25,12 +25,13 @@
 //!
 //! Two tests run the grid:
 //!
-//! - `live_rows_agree` runs every cell of each skeleton in [`LIVE`], the rows known to agree
-//!   everywhere, and fails on any outcome other than agreement.
+//! - `grid_agrees` runs every cell and fails on any outcome other than agreement, except at the
+//!   cells [`UNDEFINED`] lists and the cells [`BROKEN`] lists, which it holds to the outcome kind
+//!   each entry records: a fix that makes one agree removes its entry, and a change that makes
+//!   one fail another way updates its kind.
 //! - `full_grid` is ignored by default. It runs every cell and reports the failures grouped by
-//!   cause, with a count, sample cells and the first sample's detail, lists the [`UNDEFINED`]
-//!   cells apart, and names every fully agreeing row [`LIVE`] does not list yet. A fix that
-//!   makes a row agree moves it into [`LIVE`]:
+//!   cause, with a count, sample cells and the first sample's detail, and lists the
+//!   [`UNDEFINED`] cells apart:
 //!   `cargo test --test it generated_pairs::full_grid -- --ignored --nocapture`.
 
 use crate::differential;
@@ -45,88 +46,70 @@ use differential::{Compiled, run_compiled, run_interpreted};
 use indoc::indoc;
 use panic_message::panic_message;
 
-/// The skeletons whose every cell agrees, so a change that breaks one of them fails
-/// `live_rows_agree`.
-///
-/// `function_body` is not here: its `rows_sum` cell does not compile
-/// (`a_def_body_summing_jagged_rows_does_not_compile`, in `tests/it/compilation_pipeline/sums.rs`).
-const LIVE: &[&str] = &[
-    "aggregate_arg",
-    "arg_beside_fn",
-    "binop_operand",
-    "body_mut_intro",
-    "body_mut_intro_nested",
-    "bool_feed",
-    "comp_element",
-    "comp_element_filtered",
-    "comp_element_in_loop",
-    "comp_filter",
-    "comp_filter_in_loop",
-    "comp_in_comp",
-    "comp_source",
-    "comp_source_in_loop",
-    "comp_two_generators",
-    "defer_feed",
-    "feed",
-    "feed_collection",
-    "feed_in_loop",
-    "fn_param_applied",
-    "fn_param_in_loop",
-    "fn_param_on_match_payload",
-    "four_loop_collection_feed_in_mut_loop",
-    "four_loop_feed_in_mut_loop",
-    "four_loop_feed_writing_every_loop",
-    "function_arg",
-    "groupby_source",
-    "keyed_write_value",
-    "lambda_body",
-    "lambda_body_in_loop",
-    "loop_let_filter",
-    "loop_source",
-    "match_arm",
-    "match_arm_in_loop",
-    "match_scrutinee",
-    "max_arg",
-    "mut_init",
-    "mut_reads_itself",
-    "mut_write_rhs",
-    "nested_feed_filter_in_mut_loop",
-    "nested_feed_in_mut_loop",
-    "nested_feed_let_filter_in_mut_loop",
-    "nested_loop_feed",
-    "nested_mut_over_row",
-    "nested_mut_write_rhs",
-    "rec_comp_element",
-    "rec_comp_filter",
-    "rec_comp_filter_in_loop",
-    "rec_comp_in_loop",
-    "rec_loop_feed",
-    "rec_with_coll_feed",
-    "rec_with_coll_in_loop",
-    "rec_with_coll_projected",
-    "rec_with_coll_scalar_field",
-    "record_coll_source",
-    "record_collection_field",
-    "record_feed",
-    "record_feed_in_loop",
-    "record_field",
-    "record_projected",
-    "rows_comp_element",
-    "scrutinee_beside_fn",
-    "str_coll_source",
-    "str_loop_feed",
-    "str_loop_guard",
-    "string_feed",
-    "terminal_read",
-    "terminal_read_after_guard",
-    "terminal_read_guard",
-    "ternary_branch",
-    "three_loop_feed_writing_every_loop",
-    "tuple_component",
-    "two_feed_sites",
-    "txn_guard",
-    "variant_feed",
+/// The cells known not to agree, each as a skeleton, the rest of the cell's name, which is the
+/// filler with the binders it reads (`binder_filtered_comp[i]`), naming the cell
+/// `skeleton/filler[binders]`, and the cell's [`Outcome::kind`]. `grid_agrees` holds every cell
+/// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
+/// that makes one agree removes it, and a cell that starts failing another way fails the grid.
+const BROKEN: &[(&str, &str, &str)] = &[
+    ("function_body", "rows_sum", "CompilerPanics"),
+    ("generator_yield", "rows_sum", "CompilerPanics"),
+    ("groupby_tuple_key", "rec_comp", "CompilerPanics"),
+    ("groupby_tuple_key", "rec_filtered", "CompilerPanics"),
+    ("groupby_tuple_key", "rec_list", "CompilerPanics"),
+    (
+        "loop_source_in_loop",
+        "binder_filtered_comp[i]",
+        "CompilerPanics",
+    ),
+    ("loop_source_in_loop", "dup_union", "CompilerRejects"),
+    ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
+    ("loop_source_in_loop", "map_lit", "CompilerPanics"),
+    ("loop_source_in_loop", "union", "CompilerRejects"),
+    (
+        "nested_mut_source",
+        "binder_filtered_comp[i]",
+        "CompilerPanics",
+    ),
+    ("nested_mut_source", "dup_union", "CompilerRejects"),
+    ("nested_mut_source", "generator_coll", "CompilerPanics"),
+    ("nested_mut_source", "map_arrow", "CompilerPanics"),
+    ("nested_mut_source", "map_lit", "CompilerPanics"),
+    ("nested_mut_source", "union", "CompilerRejects"),
+    ("record_in_list", "comp_sum", "CompilerRejects"),
+    ("record_in_list", "filtered_sum", "CompilerRejects"),
+    ("record_in_list", "generator_max", "CompilerRejects"),
+    ("record_in_list", "groupby_sum", "CompilerRejects"),
+    ("record_in_list", "max_lit", "CompilerRejects"),
+    ("record_in_list", "nested_comp_sum", "CompilerRejects"),
+    ("record_in_list", "record_proj", "CompilerRejects"),
+    ("record_in_list", "rows_sum", "CompilerRejects"),
+    ("record_in_list", "sum_lit", "CompilerRejects"),
+    ("record_in_list", "sum_of_empty", "CompilerRejects"),
+    ("record_in_list", "ternary", "CompilerRejects"),
+    ("record_in_list", "union_sum", "CompilerRejects"),
+    ("rows_comp_source", "rows_filtered", "CompilerPanics"),
+    ("rows_inner_filter", "rows_filtered", "CompilerPanics"),
+    ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
+    ("rows_nested_mut", "rows_filtered", "CompilerRejects"),
+    ("rows_nested_mut", "rows_jagged", "CompilerRejects"),
+    ("terminal_read", "terminal_in_agg[pool]", "CompilerRejects"),
+    (
+        "terminal_read_after_guard",
+        "terminal_in_agg[pool]",
+        "CompilerRejects",
+    ),
+    ("txn_reply", "generator_max", "CompilerRejects"),
+    ("txn_write_rhs", "generator_max", "CompilerRejects"),
 ];
+
+/// The outcome kind [`BROKEN`] records for `cell`, if it lists the cell.
+fn broken_kind(cell: &str) -> Option<&'static str> {
+    BROKEN
+        .iter()
+        .find(|(skeleton, filler, _)| cell == format!("{skeleton}/{filler}"))
+        .map(|(_, _, kind)| *kind)
+}
 
 /// Cells whose program has no defined value under `docs/chl-spec.md`, each with the rule that
 /// leaves it undefined. The interpreter's refusal is the answer, so a cell here agrees when the
@@ -231,6 +214,17 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// Every kind [`Self::kind`] answers.
+    const KINDS: [&'static str; 7] = [
+        "Agrees",
+        "Disagrees",
+        "CompilerPanics",
+        "CompilerRejects",
+        "InterpreterGap",
+        "InterpreterPanics",
+        "DidNotFinish",
+    ];
+
     /// The outcome without its detail, for tallying.
     fn kind(&self) -> &'static str {
         match self {
@@ -327,6 +321,10 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             r = (xs={}, n=1)
             out << sum(r.xs) + r.n
+        "#}},
+        Skeleton { name: "record_in_list", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            out << sum([r.a for r in [(a={}, b=1)]])
         "#}},
         Skeleton { name: "tuple_component", hole: Ty::Int, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -1014,6 +1012,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "terminal", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b})" },
         Filler { name: "terminal_arith", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b}) * 2 + 1" },
         Filler { name: "terminal_in_comp", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "sum([z2 + await_final({b}) for z2 in [1, 2]])" },
+        Filler { name: "terminal_in_agg", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "max([await_final({b}), 0])" },
         Filler { name: "terminal_ternary", ty: Ty::Int, needs: &[Ty::TxnStore], decls: "", expr: "(await_final({b}) if 2 > 1 else 0)" },
         Filler { name: "terminal_cmp", ty: Ty::Bool, needs: &[Ty::TxnStore], decls: "", expr: "await_final({b}) > 90" },
 
@@ -1441,39 +1440,61 @@ fn a_message_stem_drops_what_varies_per_program() {
     );
 }
 
-/// Run every cell of the skeletons `rows` admits, and answer each cell's outcome.
+/// Run every cell, and answer each cell's outcome.
 ///
 /// Two pairs can spell one program (`feed/sum_lit` is `aggregate_arg/list_lit`); it runs once,
-/// and every cell that spells it takes its outcome, so a failure counts against every row it
-/// sits in.
-fn run_cells(rows: impl Fn(&Skeleton) -> bool) -> BTreeMap<String, Outcome> {
+/// and every cell that spells it takes its outcome. The programs are independent, so they run on
+/// a thread per core.
+fn run_cells() -> BTreeMap<String, Outcome> {
     // A panic inside `classify` is an outcome, so the default hook's backtrace is noise
-    // there; `quiet_panics` mutes this thread's panics only, so the other tests' still print.
+    // there; `quiet_panics` mutes the calling thread's panics only, so each worker mutes its
+    // own and the other tests' still print.
     let show = std::env::var("PAIRS_SHOW_PANICS").is_ok();
     let (skeletons, fillers) = (skeletons(), fillers());
-    let mut outcomes = BTreeMap::new();
-    let mut programs: BTreeMap<String, Outcome> = BTreeMap::new();
-    for s in skeletons.iter().filter(|s| rows(s)) {
+    let mut cells: Vec<(String, String)> = Vec::new();
+    for s in &skeletons {
         for f in &fillers {
             for placement in placements(s, f) {
-                let cell = cell_name(s, f, &placement);
-                let source = program(s, f, &placement);
-                let outcome = programs
-                    .entry(source)
-                    .or_insert_with_key(|source| {
-                        if show {
-                            classify(source)
-                        } else {
-                            quiet_panics::quietly(|| classify(source))
-                        }
-                    })
-                    .clone();
-                outcomes.insert(cell, outcome);
+                cells.push((cell_name(s, f, &placement), program(s, f, &placement)));
             }
         }
     }
+    let programs: Vec<&String> = cells
+        .iter()
+        .map(|(_, source)| source)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let outcomes: std::sync::Mutex<BTreeMap<&String, Outcome>> = Default::default();
+    let workers = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while let Some(source) =
+                    programs.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    let outcome = if show {
+                        classify(source)
+                    } else {
+                        quiet_panics::quietly(|| classify(source))
+                    };
+                    outcomes
+                        .lock()
+                        .expect("no worker panics outside `classify`")
+                        .insert(source, outcome);
+                }
+            });
+        }
+    });
+    let outcomes = outcomes
+        .into_inner()
+        .expect("no worker panics outside `classify`");
 
-    outcomes
+    cells
+        .iter()
+        .map(|(cell, source)| (cell.clone(), outcomes[source].clone()))
+        .collect()
 }
 
 /// The comparison can see a disagreement: two programs whose values differ are compared, one
@@ -1550,45 +1571,81 @@ fn undefined_cells_are_refused_by_the_interpreter() {
     }
 }
 
-/// Every [`LIVE`] name is a skeleton, once.
+/// Every [`BROKEN`] entry names a cell, once, in order, none is an [`UNDEFINED`] cell, and
+/// each records a kind of failure.
 #[test]
-fn live_names_skeletons() {
-    let names: Vec<&str> = skeletons().iter().map(|s| s.name).collect();
-    let mut seen = std::collections::BTreeSet::new();
-    for live in LIVE {
-        assert!(
-            names.contains(live),
-            "`{live}` is in LIVE but is not a skeleton"
-        );
-        assert!(seen.insert(live), "`{live}` is in LIVE twice");
-    }
-}
-
-#[test]
-fn live_rows_agree() {
-    let failures: Vec<String> = run_cells(|s| LIVE.contains(&s.name))
-        .into_iter()
-        // An undefined cell's answer is the interpreter's refusal, which its own test checks.
-        .filter(|(cell, outcome)| *outcome != Outcome::Agrees && !is_undefined(cell))
-        .map(|(cell, outcome)| format!("{cell}\t{}\t{}", outcome.kind(), outcome.detail()))
+fn broken_names_cells() {
+    let (skeletons, fillers) = (skeletons(), fillers());
+    let cells: std::collections::BTreeSet<String> = skeletons
+        .iter()
+        .flat_map(|s| fillers.iter().map(move |f| (s, f)))
+        .flat_map(|(s, f)| {
+            placements(s, f)
+                .into_iter()
+                .map(move |p| cell_name(s, f, &p))
+        })
         .collect();
+    for (skeleton, filler, kind) in BROKEN {
+        let cell = format!("{skeleton}/{filler}");
+        assert!(
+            cells.contains(&cell),
+            "`{cell}` is in BROKEN but is not a cell"
+        );
+        assert!(
+            !is_undefined(&cell),
+            "`{cell}` is in both BROKEN and UNDEFINED"
+        );
+        assert!(
+            Outcome::KINDS.contains(kind) && *kind != Outcome::Agrees.kind(),
+            "`{cell}` is in BROKEN as `{kind}`, which is not a kind of failure"
+        );
+    }
     assert!(
-        failures.is_empty(),
-        "cells of a live row no longer agree:\n{}",
-        failures.join("\n")
+        BROKEN
+            .windows(2)
+            .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)),
+        "BROKEN is not sorted, or lists a cell twice"
     );
 }
 
-/// The whole grid, for choosing what to fix next: the failures by cause, most cells first,
-/// and the rows that agree everywhere but are not yet [`LIVE`].
+#[test]
+fn grid_agrees() {
+    let outcomes = run_cells();
+    let failures: Vec<String> = outcomes
+        .iter()
+        // An undefined cell's answer is the interpreter's refusal, which its own test checks.
+        .filter(|(cell, outcome)| {
+            **outcome != Outcome::Agrees && !is_undefined(cell) && broken_kind(cell).is_none()
+        })
+        .map(|(cell, outcome)| format!("{cell}\t{}\t{}", outcome.kind(), outcome.detail()))
+        .collect();
+    // A fix makes a broken cell agree, which removes its entry; any other change of kind is a
+    // regression the entry would hide.
+    let changed: Vec<String> = outcomes
+        .iter()
+        .filter_map(|(cell, outcome)| {
+            let kind = broken_kind(cell)?;
+            (outcome.kind() != kind)
+                .then(|| format!("{cell}\t{kind} -> {}\t{}", outcome.kind(), outcome.detail()))
+        })
+        .collect();
+    assert!(
+        failures.is_empty() && changed.is_empty(),
+        "cells outside BROKEN that do not agree:\n{}\n\
+         cells in BROKEN whose outcome is not the kind it records (remove one that agrees):\n{}",
+        failures.join("\n"),
+        changed.join("\n")
+    );
+}
+
+/// The whole grid, for choosing what to fix next: the failures by cause, most cells first.
 #[test]
 #[ignore = "a report for prioritizing fixes, not a check: run with --ignored --nocapture"]
 fn full_grid() {
-    let outcomes = run_cells(|_| true);
+    let outcomes = run_cells();
 
     let mut tally: BTreeMap<&str, usize> = BTreeMap::new();
     let mut by_cause: BTreeMap<(&str, String), Vec<&str>> = BTreeMap::new();
-    let mut failing_rows: BTreeMap<&str, usize> = BTreeMap::new();
     for (cell, outcome) in &outcomes {
         *tally.entry(outcome.kind()).or_default() += 1;
         if *outcome == Outcome::Agrees {
@@ -1598,8 +1655,6 @@ fn full_grid() {
         if is_undefined(cell) {
             continue;
         }
-        let row = cell.split('/').next().expect("a cell name has a skeleton");
-        *failing_rows.entry(row).or_default() += 1;
         by_cause
             .entry((outcome.kind(), cause_key(outcome)))
             .or_default()
@@ -1634,10 +1689,4 @@ fn full_grid() {
             outcomes[*cell].detail()
         );
     }
-    let promotable: Vec<&str> = skeletons()
-        .iter()
-        .map(|s| s.name)
-        .filter(|n| !failing_rows.contains_key(n) && !LIVE.contains(n))
-        .collect();
-    println!("\n=== rows that agree everywhere but are not LIVE ===\n{promotable:?}");
 }
