@@ -812,7 +812,7 @@ while their arms carry one level and two.
 | a root: a conversion with no input | a stream of its own: level 1 when its type is a collection, 0 when a scalar |
 | `map(𝑓)` | 𝑓 one level in |
 | an application `𝑓(𝑎)` | 𝑎 as a root; 𝑓 at 𝑎's level, since it runs over 𝑎's iteration |
-| `curry_over(𝐾, 𝑔)` | 𝑔 one level in, over the iteration `strength` appends; 𝐾 is a root |
+| `curry_over(𝐹, 𝑔)` | 𝑔 one level in, over the iteration `strength` appends; 𝐹 at the node's level |
 | a top-level `Transact` | its body at level 1, over the store's own domain |
 | a nested `Transact` | its source and its seeds at the `Transact`'s level, a seed being one value per enclosing position; its body one level in |
 | every other node, composition included | the level it is converted at |
@@ -994,6 +994,17 @@ depth two.
 not. A site whose type is dependent, a correlated filter narrowing the inner domain by the outer
 value, stays one node, [`Builtin::CurryOver`], which op-conversion compiles to the same
 operators.
+
+`curry_over` takes the keys as a family `𝐹` of the row, `const(𝐾)` where every row reads one
+collection, and op-conversion zips each row with `𝐹`'s collection for it,
+`⟨id, 𝐹⟩ ▷ zip ≫ strength`. **A site over a dependent tuple has keys per row**, so its `𝐹` is
+a family of distinct collections
+(`src/ccl/design/type-inference.md`, "Iterating a dependent tuple"). A group-by under a loop whose
+key reads the loop's binder has `𝐹 = 𝑀 ≫ converse ≫ map_domain`, the keys of the collection
+`𝑀` builds per row, and `converse` and `map_domain` act at that level, one row's collection at a
+time. A nested `Converse` releases the rows a standing level's guard names and fails loudly on a
+guard naming part of one row's inversion: which input rows that names depends on their values,
+which only the outermost `Converse` tracks.
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where

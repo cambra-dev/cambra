@@ -349,9 +349,9 @@ pub enum Builtin {
     EmptyMap,
     /// `curry : ((A, B) → C) → (A → (B → C))`.
     Curry,
-    /// `curry_over : (𝐾 : 𝐷 ⤇ 𝐷, (𝐴, 𝐷) ⇒ 𝑉) ⇒ (𝐴 ⇒ (𝐷 ⤇ 𝑉))` — [`Curry`](Self::Curry)
-    /// with the collection 𝐾 its result ranges over **named**, for a site whose type is
-    /// dependent.
+    /// `curry_over : (𝐹 : (𝑥 : 𝐴) ⇒ (𝐷(𝑥) ⤇ 𝐷(𝑥)), ((𝑥 : 𝐴) × 𝐷(𝑥)) ⇒ 𝑉) ⇒ ((𝑥 : 𝐴) ⇒
+    /// (𝐷(𝑥) ⤇ 𝑉))` — [`Curry`](Self::Curry) with the keys its result ranges over **named**
+    /// per row by the key family 𝐹, for a site whose type is dependent.
     ///
     /// Planning rewrites a correlated `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫ map(𝑔)`
     /// (`src/ccl/planning/correlated.rs`). A correlated filter narrows the inner domain by the
@@ -359,6 +359,12 @@ pub enum Builtin {
     /// dependency: the narrowed domain names the chain's input, which no element after the
     /// first takes. Such a site stays this one node under `curry`'s own type, and
     /// op-conversion builds the operators the chain compiles to.
+    ///
+    /// Op-conversion pairs each row with `𝐹`'s collection for it, `⟨id, 𝐹⟩ ▷ zip ≫
+    /// strength`. Where every row reads one collection 𝐾, `𝐹` is `const(𝐾)`; where the site
+    /// ranges over a dependent tuple, whose keys differ per row, it is the family the tuple's
+    /// second component picks (`src/ccl/design/type-inference.md`, "Iterating a dependent
+    /// tuple").
     ///
     /// **Born in planning**, and so carries no scheme: it stamps its own type, as planning's
     /// [`MapDomain`](Self::MapDomain) mint does.

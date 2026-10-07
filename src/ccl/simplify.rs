@@ -199,9 +199,11 @@ fn recurse_simplify(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
         let (child_changed, child_has_iteration) = simplify_once(e, memo);
         (c | child_changed, it | child_has_iteration)
     });
-    // NB: simplify is **type-preserving** — no rule mutates a node's type — so a
+    // NB: simplify is **type-preserving** — no rule changes what a node's type says — so a
     // `Let`'s recorded type (already closed over its binder by inference's
-    // let-closing) stays valid and needs no re-sync here. A former propagation
+    // let-closing) stays valid and needs no re-sync here. Product β respells types after a
+    // dependent projection it removes, since they read that projection's binder, but the
+    // respelled type denotes the same set (`product_beta_rebinding`). A former propagation
     // re-derived `Let.ty` from `body.ty` (for a since-removed union-flatten rule
     // that changed body types); it also *downgraded* a let-bound-source
     // comprehension's kind `⤇ → ⇒` and re-discharged marker-bearing sources into
@@ -399,25 +401,61 @@ fn ruled(
 /// last morphism directly, whose codomain the checker opens at its own binder. So the last
 /// morphism takes `𝑏` as its binder's name: its codomain is closed, so the name is all that
 /// changes, and it says what the nested chain's type said.
-fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
+///
+/// A nested chain whose type names a binder its codomain does not read, `(𝑏: 𝐷) ⇒ 𝐶`, binds
+/// `𝑏` only for the steps that follow the chain, and matters only where one of them reads it
+/// (`read_after`): a dependent tuple's key family, whose keys are stated at the enclosing value
+/// (`planning::correlated`'s `keys_family`). The chain's input is its first morphism's, so
+/// that morphism takes the binder, and the steps after still follow a morphism binding it.
+fn flatten_compose_arm(expr: Expr, read_after: impl Fn(&Name) -> bool) -> Vec<Expr> {
     match expr.node {
         TypedExprNode::Compose(mut elts) => {
-            if let Type::Fun { name: Some(b), .. } = expr.ty.peel_refinements()
-                && let Some(last) = elts.last_mut()
-                && let Type::Fun {
-                    name: Some(k),
-                    codomain,
-                    ..
-                } = &mut last.ty
-                && k != b
-                && crate::ccl::subst::references_enclosing_function(codomain)
+            if let Type::Fun {
+                name: Some(b),
+                codomain: chain_codomain,
+                ..
+            } = expr.ty.peel_refinements()
             {
-                debug_assert!(
-                    !crate::ccl::subst::type_free_vars(codomain).contains(k),
-                    "a codomain closed over its binder `{k}` also names it, which the rename \
-                     would leave unbound"
-                );
-                *k = b.clone();
+                if crate::ccl::subst::references_enclosing_function(chain_codomain) {
+                    if let Some(last) = elts.last_mut()
+                        && let Type::Fun {
+                            name: Some(k),
+                            codomain,
+                            ..
+                        } = &mut last.ty
+                        && k != b
+                        && crate::ccl::subst::references_enclosing_function(codomain)
+                    {
+                        debug_assert!(
+                            !crate::ccl::subst::type_free_vars(codomain).contains(k),
+                            "a codomain closed over its binder `{k}` also names it, which the \
+                             rename would leave unbound"
+                        );
+                        *k = b.clone();
+                    }
+                } else if read_after(b)
+                    && let Some(first) = elts.first_mut()
+                {
+                    let mut first_ty = &mut first.ty;
+                    while let Type::Refinement(inner, _) = first_ty {
+                        first_ty = inner;
+                    }
+                    let Type::Fun { name, .. } = first_ty else {
+                        panic!(
+                            "a chain's first morphism takes the chain's binder `{b}`, but its \
+                             type is not a function: {}",
+                            first.ty
+                        )
+                    };
+                    match name {
+                        None => *name = Some(b.clone()),
+                        Some(k) => assert!(
+                            k == b,
+                            "a chain binding `{b}` starts with a morphism binding `{k}`, so the \
+                             steps after it would read `{b}` unbound"
+                        ),
+                    }
+                }
             }
             elts
         }
@@ -898,9 +936,60 @@ fn is_dependent(ty: &Type) -> bool {
     )
 }
 
+/// The pairing a product-β rule at `index` removes, as the binder its projection binds and
+/// the components the pairing builds — `Some(None)` where the projection binds nothing the
+/// chain after it reads, `None` where it does and the pairing names no input to state the
+/// components in, so the rule must not fire.
+///
+/// A dependent projection `.𝑘 : (𝑥 : 𝑃) ⇒ 𝐶(𝑥)` binds `𝑥` over the chain after it, whose
+/// types may read `𝑥`. The rule removes both the projection and the pairing, so `𝑥` is bound
+/// nowhere after it, and the types that read it read the pairing's value instead
+/// ([`crate::ccl::subst::rewrite_pairing_projections`]): simplify keeps each node's type,
+/// and a type naming a binder no node binds is not one.
+type Rebinding = Option<(Name, Vec<Expr>)>;
+
+fn product_beta_rebinding(expr: &Expr, index: usize) -> Option<(usize, Rebinding)> {
+    let TypedExprNode::Compose(elts) = &expr.node else {
+        return None;
+    };
+    let i = elts
+        .windows(2)
+        .position(|w| is_proj_idx(&w[1], index) && as_zip(&w[0]).is_some())?;
+    match elts[i + 1].ty.peel_refinements() {
+        Type::Fun {
+            name: Some(x),
+            codomain,
+            ..
+        } if crate::ccl::subst::codomain_depends_on(x, codomain) => {
+            let components = crate::ccl::lambda_elim::pairing_components(&elts[i])?;
+            Some((i, Some((x.clone(), components))))
+        }
+        _ => Some((i, None)),
+    }
+}
+
+/// Rewrite the types of the chain elements after position `from` through `rebinding`.
+fn rebind_after(expr: &mut Expr, from: usize, rebinding: Rebinding) {
+    let Some((x, components)) = rebinding else {
+        return;
+    };
+    fn in_expr(e: &mut Expr, x: &Name, components: &[Expr]) {
+        e.walk_type_slots_mut(|t| crate::ccl::subst::rewrite_pairing_projections(x, components, t));
+        e.walk_children_mut(|c| in_expr(c, x, components));
+    }
+    if let TypedExprNode::Compose(elts) = &mut expr.node {
+        for e in elts.iter_mut().skip(from) {
+            in_expr(e, &x, &components);
+        }
+    }
+}
+
 /// Product beta (first): `⟨f, g⟩ ≫ .0  ⟹  f`
 fn try_product_beta_fst(expr: &mut Expr) -> bool {
-    try_pairwise_in_compose(
+    let Some((i, rebinding)) = product_beta_rebinding(expr, 0) else {
+        return false;
+    };
+    let fired = try_pairwise_in_compose(
         expr,
         |left, right| is_proj_idx(right, 0) && as_zip(left).is_some(),
         |left, _proj, _mint_kind| {
@@ -920,7 +1009,9 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
             };
             vec![elts.swap_remove(0)]
         },
-    )
+    );
+    rebind_after(expr, i + 1, rebinding);
+    fired
 }
 
 /// Literal tuple projection: `(e₀, …, eₙ).i  ⟹  eᵢ`
@@ -972,7 +1063,10 @@ fn try_literal_tuple_projection(expr: &mut Expr) -> bool {
 
 /// Product beta (second): `⟨f, g⟩ ≫ .1  ⟹  g`
 fn try_product_beta_snd(expr: &mut Expr) -> bool {
-    try_pairwise_in_compose(
+    let Some((i, rebinding)) = product_beta_rebinding(expr, 1) else {
+        return false;
+    };
+    let fired = try_pairwise_in_compose(
         expr,
         |left, right| is_proj_idx(right, 1) && as_zip(left).is_some(),
         |left, _proj, _mint_kind| {
@@ -992,7 +1086,9 @@ fn try_product_beta_snd(expr: &mut Expr) -> bool {
             };
             vec![elts.swap_remove(1)]
         },
-    )
+    );
+    rebind_after(expr, i + 1, rebinding);
+    fired
 }
 
 /// CCC universal property: `⟨.1, .0 ≫ curry(f)⟩ ≫ apply  ⟹  f`
@@ -1084,33 +1180,20 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             // here reaches the tuple type the zip built-in is applied at. The kind
             // the pair carries is declared rather than read off an operand:
             // `zip_pair_ty` takes it as an argument, and reads the domain off the
-            // first, the binder off either.
-            //
-            // `mint` drops the binder: a dependent `g` carries its binder reference
-            // in `g_cod`, and `name: None` leaves nothing to open it at — the shape
-            // `subst::open_codomain` rejects. It reaches the zip below because
-            // `.with_ty` overrides the type `zip_pair_ty` computed, which does carry
-            // the binder. `arm_ty` in the zip-distribution rewrite has the same
-            // shape.
-            let g_dom = g.ty.domain();
-            let g_cod = g.ty.codomain();
-            let mint = |d: Type, c: Type| Type::Fun {
-                name: None,
-                fun_kind: mint_kind.clone(),
-                domain: Box::new(d),
-                codomain: Box::new(c),
-            };
-            let id_ty = g_dom
-                .as_ref()
-                .map(|a| mint(a.clone(), a.clone()))
-                .unwrap_or(Type::Hole);
-            let zip_ty = match (g_dom.as_ref(), g_cod.as_ref()) {
-                (Some(a), Some(c)) => mint(a.clone(), Type::Tuple(vec![a.clone(), c.clone()])),
-                _ => Type::Hole,
-            };
+            // first, the binder off either, so a dependent `g`'s binder rides the pair:
+            // product β reads it there to rebind the chain after the pair
+            // (`product_beta_rebinding`).
+            let id_ty =
+                g.ty.domain()
+                    .map(|a| Type::Fun {
+                        name: None,
+                        fun_kind: mint_kind.clone(),
+                        domain: Box::new(a.clone()),
+                        codomain: Box::new(a),
+                    })
+                    .unwrap_or(Type::Hole);
             let id_node = id().with_ty(id_ty);
-            let zip_node = zip_pair(id_node, g, mint_kind).with_ty(zip_ty);
-            vec![zip_node, *h]
+            vec![zip_pair(id_node, g, mint_kind), *h]
         },
     )
 }
@@ -1591,7 +1674,14 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
     else {
         unreachable!()
     };
-    let flat: Vec<Expr> = elts.into_iter().flat_map(flatten_compose_arm).collect();
+    let mut flat: Vec<Expr> = Vec::new();
+    let mut rest = elts.into_iter();
+    while let Some(arm) = rest.next() {
+        let after = rest.as_slice();
+        flat.extend(flatten_compose_arm(arm, |b| {
+            after.iter().any(|e| crate::ccl::ccl_utils::is_free(b, e))
+        }));
+    }
     *expr = Expr::compose(flat);
     expr.ty = ty;
     expr.user_annotation = user_annotation;

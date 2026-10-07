@@ -3850,23 +3850,31 @@ impl Refinement {
     /// separates it from a filter the program wrote: a pass that compiles refinements into
     /// terms has to leave this one alone.
     pub fn is_collection_membership(&self) -> bool {
+        self.membership_collection().is_some()
+    }
+
+    /// The collection `𝑚` of a [membership](Self::is_collection_membership) refinement
+    /// `__elem ▷ (𝑚 ▷ collection_contains)`, whose keys are the ones present. `None` for any
+    /// other refinement.
+    pub fn membership_collection(&self) -> Option<&TypedExpr> {
         let TypedExprNode::Apply { argument, function } = &self.predicate.node else {
-            return false;
+            return None;
         };
         if !matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem()) {
-            return false;
+            return None;
         }
         let TypedExprNode::Apply {
+            argument: collection,
             function: characteristic,
-            ..
         } = &function.node
         else {
-            return false;
+            return None;
         };
         matches!(
             &characteristic.node,
             TypedExprNode::Builtin(crate::ccl::Builtin::CollectionContains)
         )
+        .then_some(collection)
     }
 
     /// Construct a refinement over a **genuinely new** predicate term — one this

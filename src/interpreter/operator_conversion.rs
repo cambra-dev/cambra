@@ -2425,15 +2425,19 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             };
-            // `⟨id, const(𝐾)⟩ ▷ zip ≫ strength`, the chain planning writes where the site's
-            // type is not dependent: each row beside the one collection every row reads.
-            let keys = convert_impl(source, None, ctx)?;
-            let with_keys = Box::new(MapResultToConst::new_at(
-                outer,
-                keys,
-                MapResultToConstMode::ZipRight,
-                ctx.level(),
-            ));
+            // The source is the **family** of key collections, one per enclosing value: a
+            // dependent tuple's second component (`src/ccl/planning/correlated.rs`,
+            // `keys_family`), or `const(𝐾)` where every row reads one collection. Each row
+            // goes beside its own collection, `⟨id, 𝐹⟩ ▷ zip ≫ strength`.
+            let enclosing = source.ty.domain().ok_or_else(|| {
+                ConversionError::TypeError(format!("a key family is a function, got {}", source.ty))
+            })?;
+            let with_keys = crate::ccl::lambda_elim::zip_pair(
+                Expr::builtin(Builtin::Id).with_ty(Type::fun(enclosing.clone(), enclosing)),
+                source.clone_preserving_ids(),
+                &crate::ccl::FunKind::Compute,
+            );
+            let with_keys = convert_impl(&with_keys, Some(outer), ctx)?;
             let pairs = strength_at(with_keys, ctx.level())?;
             // The morphism runs once per pair, over the iteration `strength` appends.
             convert_lifted(morphism, Some(pairs), ctx)
