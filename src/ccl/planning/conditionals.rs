@@ -37,6 +37,19 @@ use crate::ccl::{
     provenance,
 };
 
+/// What realization decided about each witness it reached: erased, realized or materialized.
+///
+/// One per program rather than one per term, because survival is a fact about a witness
+/// rather than about a position ([`realize_conditional_collections`]). A term planning lifts
+/// out of a type names the witnesses of the tree it came from, and realizing it with sets of
+/// its own would collapse a sum the tree kept.
+#[derive(Default)]
+pub(crate) struct Witnesses {
+    erased: std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
+    pub(super) realized: std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    materialized: std::collections::HashSet<crate::ccl::ty::WitnessId>,
+}
+
 /// Rewrite every collection-valued value-`Case` in `expr` into its gated union, and erase
 /// every sum whose witness is **determined** — from the types as well as the terms.
 ///
@@ -44,19 +57,22 @@ use crate::ccl::{
 /// variable ([`reject_rows_fixed_elsewhere`]).
 pub(super) fn realize_conditional_collections(
     expr: &mut Expr,
-) -> Result<std::collections::HashSet<crate::ccl::ty::WitnessId>, String> {
-    let mut erased = std::collections::HashMap::new();
-    let mut realized = std::collections::HashSet::new();
-    let mut materialized = std::collections::HashSet::new();
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
+    let Witnesses {
+        erased,
+        realized,
+        materialized,
+    } = witnesses;
     inline_undetermined_conditionals(expr);
     realize_and_unbox(
         expr,
-        &mut erased,
+        erased,
         &PredMemo::new(),
         false,
-        &mut realized,
+        realized,
         None,
-        &mut materialized,
+        materialized,
     );
     // **The other half of the erasure.** `unbox` removed the introduction from the *term*;
     // every type still says `Σ`. A type asserting an indeterminacy the term no longer has
@@ -72,7 +88,7 @@ pub(super) fn realize_conditional_collections(
     // conditional is the case that proves the distinction is needed — one candidate, two
     // legs — and instantiating its assertion breaks it.
     if !erased.is_empty() {
-        instantiate_erased_witnesses(expr, &erased, &PredMemo::new());
+        instantiate_erased_witnesses(expr, erased, &PredMemo::new());
     }
     // **And every determined sum the erasure did not name.** A consumer of a sum is a sum
     // over its *own* binder ([`crate::ccl::ty::FunKindVar::binder_ids`]), so erasing the
@@ -98,10 +114,9 @@ pub(super) fn realize_conditional_collections(
     if erased.keys().any(|w| materialized.contains(w)) {
         return Err(ROW_FIXED_ELSEWHERE.to_string());
     }
-    let survives: std::collections::HashSet<_> = realized.union(&materialized).copied().collect();
+    let survives: std::collections::HashSet<_> = realized.union(materialized).copied().collect();
     collapse_determined_sums(expr, &survives);
-    reject_rows_fixed_elsewhere(expr)?;
-    Ok(realized)
+    reject_rows_fixed_elsewhere(expr)
 }
 
 /// Why a row reaching a jagged position from elsewhere is refused.
@@ -743,7 +758,7 @@ fn realize(
         // the shapes it has no rule for, so this is the one bail-out below that a program can
         // reach on its own. The site leaves its sum standing and op-conversion rejects it by
         // name.
-        let Ok(gate_pf) = lambda_elim::run(gate) else {
+        let Ok(gate_pf) = super::predicates::eliminate_lifted(gate) else {
             return false;
         };
         let mut leg = expr.clone();
@@ -1362,7 +1377,8 @@ mod tests {
         let mut expr =
             Expr::new(TypedExprNode::Var(Name::from("site"))).with_ty(Type::data_fun(ty, int));
 
-        realize_conditional_collections(&mut expr).expect("no jagged rows here");
+        realize_conditional_collections(&mut expr, &mut Witnesses::default())
+            .expect("no jagged rows here");
 
         let Type::Fun { domain, .. } = &expr.ty else {
             panic!("expected a function type, got {}", expr.ty);
@@ -1427,7 +1443,8 @@ mod tests {
         let body_fun = Type::data_fun(witness.clone(), int.clone());
         let mut expr = Expr::new(case).with_ty(body_fun.clone());
 
-        realize_conditional_collections(&mut expr).expect("no jagged rows here");
+        realize_conditional_collections(&mut expr, &mut Witnesses::default())
+            .expect("no jagged rows here");
 
         assert_eq!(
             expr.ty, body_fun,

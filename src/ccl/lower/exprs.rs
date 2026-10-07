@@ -10,6 +10,7 @@ use crate::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Builtin,
         CompareKind, Expr, Lit, LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
+        uniquify,
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BindingTransparency as ChlTransparency, BoolOp,
@@ -362,6 +363,13 @@ fn lower_groupby(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> (Expr, Type) {
+    // Both operands are copied below — into the key domain and into the partition — so
+    // their binders are minted first ("mint before copy", `crate::ccl::uniquify`). A copy
+    // of a raw key function mints its own `λ e` per copy, while a refinement nested inside
+    // it is one shared `Rc` that uniquifies once, against whichever copy's `e` it meets
+    // first.
+    let collection = uniquify::run(collection);
+    let key_fn = uniquify::run(key_fn);
     let key_domain = {
         let key = ctx.fresh_shared_hole();
         present_key_domain(&collection, &key_fn, key, span, ctx)

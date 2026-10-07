@@ -112,6 +112,16 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
     }
 }
 
+/// A join's equality side holding a union is planned as a lifted term: the union is iterated, and
+/// the pairs `(1, 3)` and `(2, 4)` give 3 + 8.
+#[test]
+fn a_join_side_holding_a_union() {
+    check_scalar(
+        "sum([a * b for a in [1, 2, 3] for b in [1, 2, 3, 4] if a + sum([1] ++ [1]) == b])",
+        Value::Int(11),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------

@@ -63,8 +63,14 @@
 //! refinement dedup has to collapse against its origin is therefore made
 //! after this pass: [`crate::ccl::comprehension`] copies each generator source
 //! into its loop-join predicate, and runs after `uniquify`. Lowering's own
-//! copies are made before it (a chained comparison clones its middle operand),
-//! and nothing compares them. This pass treats minted names as settled: minted
+//! copies are made before it. A chained comparison clones its middle operand,
+//! and nothing compares the copies. A group-by's collection and key function
+//! are cloned into its key domain and its partition, and a refinement nested
+//! in them is one shared `Rc` across the copies, which `memo` rebuilds once,
+//! against whichever copy's binders it meets first; a raw copy would leave the
+//! others' nested refinements naming a binder they do not have. So
+//! `lower_groupby` runs this pass on both operands before cloning them. This
+//! pass treats minted names as settled: minted
 //! binding sites are not re-minted and push nothing on the environment (their
 //! bound variables are already resolved; their free variables are still raw
 //! and resolve against the environment at the position of each copy), which

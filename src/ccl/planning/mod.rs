@@ -18,8 +18,8 @@
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    self, PredMemo, apply_function, make_iterate, make_restrict, refine_extent, set_codomain,
-    trivially_true_predicate, typed_compose,
+    self, PredMemo, apply_function, make_iterate, make_restrict, make_restrict_stating,
+    refine_extent, set_codomain, trivially_true_predicate, typed_compose,
 };
 // Re-exported so the `planning` submodules (`groupby`, `join`) can keep calling
 // `is_builtin` unqualified through their `use super::*`.
@@ -44,6 +44,8 @@ mod join;
 mod loops;
 mod per_group_filter;
 mod predicates;
+
+use conditionals::Witnesses;
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
 // and prose reference (design docs link `insert_iterate_markers`; `ccl_utils` /
@@ -79,8 +81,8 @@ pub(crate) use predicates::fn_of_bare_predicate;
 ///    onto it: `(iterate ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)) ≫ body`.  Each `restrict` *applies* to
 ///    its upstream — it is a function transformer, not a morphism composed
 ///    with the source (its honest type makes the composed form ill-typed;
-///    see [`make_restrict`]).  Unrefined sites get just the chain-head
-///    iterate.
+///    see [`make_restrict`](crate::ccl::ccl_utils::make_restrict)).  Unrefined sites get
+///    just the chain-head iterate.
 ///
 /// Hash join is the specialised strategy; the iterate-then-restricts
 /// chain is the default.  Both branches are materialising the same
@@ -93,49 +95,60 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// runs before the materialisation walk.
 ///
 /// The error is an unsupported program: a jagged row realization cannot keep
-/// ([`conditionals::realize_conditional_collections`]), or a per-group narrowing no
-/// filter materializes ([`per_group_filter::reject_unmaterialized_narrowings`]).
-pub fn run(mut expr: Expr) -> Result<Expr, String> {
-    // Refinement predicates travel through inference and lambda-elim as bare
-    // expressions over the implicit `REFINEMENT_BINDER` (design §6.3) and are
-    // compiled to point-free form only when a refined type is iterated (§6.5).
-    // The group-by recognizer runs first and matches the bare predicate
-    // directly; the generic filter / hash-join paths compile the predicate
-    // lazily at each iteration site (see `wrap_with_iterate`).
-    // Realize conditional collections first: the gated union it produces is an ordinary
-    // collection, so every later phase — recognizers, iteration-site materialisation,
-    // predicate compilation — sees one shape rather than needing a `Case` case.
-    let realized = conditionals::realize_conditional_collections(&mut expr)?;
-    groupby::recognize_groupby_sites(&mut expr);
-    correlated::emit_correlated_filters(&mut expr);
-    let mut expr = simplify(expr);
-    correlated::pair_correlated_sites(&mut expr)?;
-    // Constant-fold before the iteration walk so a collection literal's elements are
-    // already values when op conversion reads them. It runs after `simplify` because
-    // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the
-    // fold dispatches on the operator it is handed.
-    const_fold::fold_constants(&mut expr);
-    insert_iterate_markers(&mut expr, &realized);
-    iterate::plan_restrict_predicates(&mut expr, &realized);
-    // Normalize every remaining bare predicate tree-wide to point-free form.
+/// ([`conditionals::realize_conditional_collections`]), a correlated site whose keys nothing
+/// enumerates, in the tree or in a lifted term (`correlated::pair_correlated_sites`), or
+/// a per-group narrowing no filter materializes
+/// ([`per_group_filter::reject_unmaterialized_narrowings`]).
+pub fn run(expr: Expr) -> Result<Expr, String> {
+    // Live cross-endpoint reads are recognized earlier, in
+    // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
+    // such read is already an `as_of` join — nothing to do at planning time.
+    plan_term(expr, Root::Program, &mut Witnesses::default())
+}
+
+/// What a term [`plan_term`] plans is: the program, or a term lifted out of a refinement.
+///
+/// The program's root is an iteration site ([`iterate::insert_iterate_markers`]). A lifted
+/// term is a predicate or a key that a consumer applies per element, so its root is not one.
+#[derive(Clone, Copy)]
+pub(super) enum Root {
+    Program,
+    Lifted,
+}
+
+/// Plan `term`: the phases before the iteration walk ([`plan_before_iteration`]), the walk,
+/// and the phases after it.
+///
+/// This is the one planning pipeline. The program runs it, and so does every term the walk
+/// lifts out of a refinement: a `restrict`'s predicate, and a hash join's keys and residual
+/// predicate (`src/ccl/design/optimization.md`, "Planning a lifted term"). A lifted term sits
+/// in the tree afterwards, so the phases after the walk reach it again with the tree; each of
+/// them leaves a term it already ran on unchanged.
+pub(super) fn plan_term(term: Expr, root: Root, witnesses: &mut Witnesses) -> Result<Expr, String> {
+    let mut term = plan_before_iteration(term, witnesses)?;
+    match root {
+        Root::Program => insert_iterate_markers(&mut term, witnesses)?,
+        Root::Lifted => iterate::insert_iterate_recurse(&mut term, witnesses)?,
+    }
+    // Normalize every remaining bare predicate to point-free form.
     // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
     // refinement also rides **consumer contracts** that sit outside any site —
     // an aggregate's domain (`sum : ({D | p} ⇒ Int) ⇒ Int`), a composition
     // adjacency — carrying the same predicate as the producer they validate
     // against. With immutable predicate terms those are independent `Rc`s, so
-    // the per-site compilation doesn't reach them; this whole-tree pass (one
+    // the per-site compilation doesn't reach them; this pass (one
     // shared memo) compiles them to the *same* point-free form, so the
     // post-planning typecheck's structural refinement match holds. It runs
     // after the recognizers (which already consumed the bare shapes they
     // match) and is idempotent on already-compiled predicates.
-    compile_refinement_predicates(&mut expr, &PredMemo::new());
+    compile_refinement_predicates(&mut term, &PredMemo::new());
     // A refinement on an inner collection's domain is materialized here rather than
     // by the iteration walk above: `wrap_with_iterate` reads a node's own domain,
     // and this one is a codomain in. It runs after predicate compilation because it
     // matches the point-free predicate, and after the group-by rewrite because the
     // site's upstream is the `converse` chain it splices into.
-    per_group_filter::insert_per_group_filters(&mut expr);
-    per_group_filter::reject_unmaterialized_narrowings(&expr)?;
+    per_group_filter::insert_per_group_filters(&mut term);
+    per_group_filter::reject_unmaterialized_narrowings(&term)?;
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`join::try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its
@@ -143,11 +156,32 @@ pub fn run(mut expr: Expr) -> Result<Expr, String> {
     // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
     // so the only rules that fire here are the always-safe cleanups (plus
     // any reduction of a fully marker-free sub-tree, which is sound).
-    let expr = simplify(expr);
-    // Live cross-endpoint reads are recognized earlier, in
-    // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
-    // such read is already an `as_of` join — nothing to do at planning time.
-    Ok(expr)
+    Ok(simplify(term))
+}
+
+/// The phases of [`plan_term`] before the iteration walk, run on `term`.
+///
+/// A term lifted out of a refinement before the walk runs these and nothing else: a group-by
+/// key, a correlated pair's filter, a dependent tuple's key family. It stays in the tree, and
+/// the walk reaches it with the rest of the tree.
+pub(super) fn plan_before_iteration(
+    mut term: Expr,
+    witnesses: &mut Witnesses,
+) -> Result<Expr, String> {
+    // Realize conditional collections first: the gated union it produces is an ordinary
+    // collection, so every later phase — recognizers, iteration-site materialisation,
+    // predicate compilation — sees one shape rather than needing a `Case` case.
+    conditionals::realize_conditional_collections(&mut term, witnesses)?;
+    groupby::recognize_groupby_sites(&mut term, witnesses)?;
+    correlated::emit_correlated_filters(&mut term, witnesses)?;
+    let mut term = simplify(term);
+    correlated::pair_correlated_sites(&mut term, witnesses)?;
+    // Constant-fold before the iteration walk so a collection literal's elements are
+    // already values when op conversion reads them. It runs after `simplify` because
+    // `try_string_add_to_concat` is what retargets `String + String` to `Concat`, and the
+    // fold dispatches on the operator it is handed.
+    const_fold::fold_constants(&mut term);
+    Ok(term)
 }
 
 /// Is `e` a bare `Var` other than the element binder (the free key binder)?
@@ -695,7 +729,7 @@ mod tests {
 
         let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
 
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
 
         let TypedExprNode::Let {
             bound_expr, body, ..
@@ -730,7 +764,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Apply { argument, function } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -766,7 +800,7 @@ mod tests {
             ("n".to_string(), int),
         ]));
 
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
 
         let TypedExprNode::Record(outs) = &expr.node else {
             panic!("expected a record, got: {}", symbolic(&expr));

@@ -1866,6 +1866,14 @@ fn collect_type_errors(
             // with the refinement walk.
             for refinement in refinements {
                 if seen_refinements.insert(refinement.predicate_id()) {
+                    // A predicate holding its own `defer` is in source form until it is
+                    // lifted, which channelizes it (`planning::predicates::eliminate_lifted`),
+                    // so it is checked as the tree before channelize is.
+                    let strictness = if crate::ccl::channelize::holds_defer(&refinement.predicate) {
+                        Strictness::PreChannelize
+                    } else {
+                        strictness
+                    };
                     collect_expr_errors(
                         &refinement.predicate,
                         strictness,

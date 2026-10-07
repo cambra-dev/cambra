@@ -38,8 +38,8 @@ use super::*;
 ///    onto it: `(iterate ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)) ≫
 ///    body`.  Each `restrict` *applies* to its upstream (it is a
 ///    function transformer, not a composed morphism — see
-///    [`make_restrict`]).  Unrefined sites get just the chain-head
-///    iterate.
+///    [`make_restrict`](crate::ccl::ccl_utils::make_restrict)).  Unrefined
+///    sites get just the chain-head iterate.
 ///
 /// Hash join is the specialised strategy; the iterate-then-restricts
 /// chain is the default.  Folding hash-join dispatch into the
@@ -65,12 +65,12 @@ use super::*;
 /// planner bug.
 pub(crate) fn insert_iterate_markers(
     expr: &mut Expr,
-    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
-) {
-    insert_iterate_recurse(expr, realized);
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
+    insert_iterate_recurse(expr, witnesses)?;
     // In addition to any deeper iteration sites materialised by the
     // recursion, the program root itself may also be an iteration site.
-    wrap_with_iterate(expr, realized, "root");
+    wrap_with_iterate(expr, witnesses, "root")
 }
 
 /// Recursively walks `expr` and materializes every iteration site that
@@ -102,14 +102,14 @@ pub(crate) fn insert_iterate_markers(
 /// root is reached.
 pub(super) fn insert_iterate_recurse(
     expr: &mut Expr,
-    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
-) {
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
     // A list literal's elements are **values**: op-conversion evaluates each with
     // `expr_to_value` and compiles none of them, so nothing inside one is an iteration
     // site. Marking a collection-valued element would leave `iterate ≫ […]` where a value
     // belongs, and constant evaluation would report a computation it cannot reduce.
     if matches!(&expr.node, TypedExprNode::List(_)) {
-        return;
+        return Ok(());
     }
     // A domain rewriter's positions, `[𝑖…] ▷ flatten_domain` or `▷ permute_domain`, are the
     // literal list op-conversion reads off it (`extract_usize_list`), not a collection anything
@@ -119,7 +119,7 @@ pub(super) fn insert_iterate_recurse(
         && (is_builtin(function, Builtin::FlattenDomain)
             || is_builtin(function, Builtin::PermuteDomain))
     {
-        return;
+        return Ok(());
     }
     // A zipped product pairs its components beneath the levels they were applied over:
     // op-conversion's `Zip` arm fans the outer input out to each component, so each is
@@ -134,21 +134,26 @@ pub(super) fn insert_iterate_recurse(
         match &mut argument.node {
             TypedExprNode::Tuple(elts) => {
                 for elt in elts.iter_mut() {
-                    insert_iterate_recurse(elt, realized);
+                    insert_iterate_recurse(elt, witnesses)?;
                 }
             }
             TypedExprNode::Record(fields) => {
                 for (_, field) in fields.iter_mut() {
-                    insert_iterate_recurse(field, realized);
+                    insert_iterate_recurse(field, witnesses)?;
                 }
             }
-            _ => insert_iterate_recurse(argument, realized),
+            _ => insert_iterate_recurse(argument, witnesses)?,
         }
-        insert_iterate_recurse(function, realized);
-        return;
+        return insert_iterate_recurse(function, witnesses);
     }
 
-    expr.walk_children_mut(|child| insert_iterate_recurse(child, realized));
+    let mut result = Ok(());
+    expr.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = insert_iterate_recurse(child, witnesses);
+        }
+    });
+    result?;
     // Read before the match takes `expr.node` mutably. A `Data` domain is one the
     // runtime sweeps, which is what makes a node an iteration site rather than a
     // morphism waiting for an input.
@@ -174,10 +179,10 @@ pub(super) fn insert_iterate_recurse(
             match &mut argument.node {
                 TypedExprNode::Tuple(elts) => {
                     if let Some(stream) = elts.first_mut() {
-                        wrap_with_iterate(stream, realized, "asof-stream");
+                        wrap_with_iterate(stream, witnesses, "asof-stream")?;
                     }
                 }
-                _ => wrap_with_iterate(argument, realized, "final-or-default"),
+                _ => wrap_with_iterate(argument, witnesses, "final-or-default")?,
             }
         }
         // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
@@ -193,7 +198,7 @@ pub(super) fn insert_iterate_recurse(
             if let TypedExprNode::Tuple(elts) = &mut argument.node
                 && let Some(trigger) = elts.first_mut()
             {
-                wrap_with_iterate(trigger, realized, "asof-trigger");
+                wrap_with_iterate(trigger, witnesses, "asof-trigger")?;
             }
         }
         // `Copair`'s function form: argument is `Tuple(ops...)`
@@ -204,7 +209,7 @@ pub(super) fn insert_iterate_recurse(
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node {
                 for elt in elts.iter_mut() {
-                    wrap_with_iterate(elt, realized, "zip-field");
+                    wrap_with_iterate(elt, witnesses, "zip-field")?;
                 }
             }
         }
@@ -222,7 +227,7 @@ pub(super) fn insert_iterate_recurse(
             if is_collection =>
         {
             for operand in operands.iter_mut() {
-                wrap_with_iterate(operand, realized, "copair-operand");
+                wrap_with_iterate(operand, witnesses, "copair-operand")?;
             }
         }
         // The **checked lookup**'s collection is compiled with `input=None` (`𝑐 ▷ lookup?`
@@ -234,20 +239,20 @@ pub(super) fn insert_iterate_recurse(
                 TypedExprNode::Builtin(Builtin::LookupChecked)
             ) =>
         {
-            wrap_with_iterate(argument, realized, "checked-lookup-collection");
+            wrap_with_iterate(argument, witnesses, "checked-lookup-collection")?;
         }
         // `𝑐 ▷ const` compiles `𝑐` with `input=None` and broadcasts what it produces over
         // the input (`MapResultToConst`), so `𝑐` is an iteration site exactly when it holds
         // a collection, as a product's component is.
         TypedExprNode::Apply { argument, function } if is_builtin(function, Builtin::Const) => {
-            mark_component_source(argument, realized);
+            mark_component_source(argument, witnesses)?;
         }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.
         TypedExprNode::Apply { argument, function }
             if is_internalising_builtin_function(function) =>
         {
-            wrap_with_iterate(argument, realized, "internalising-builtin");
+            wrap_with_iterate(argument, witnesses, "internalising-builtin")?;
         }
         // Each transaction writer's source is iterated internally by the
         // mutable variable engine (the induction store for an accumulator); op-conversion
@@ -261,7 +266,7 @@ pub(super) fn insert_iterate_recurse(
         } => {
             if parameter.is_none() {
                 for w in writers.iter_mut() {
-                    wrap_with_iterate(&mut w.source, realized, "transact-source");
+                    wrap_with_iterate(&mut w.source, witnesses, "transact-source")?;
                 }
             }
         }
@@ -271,16 +276,17 @@ pub(super) fn insert_iterate_recurse(
         // collection — see [`mark_component_source`].
         TypedExprNode::Tuple(elts) => {
             for elt in elts.iter_mut() {
-                mark_component_source(elt, realized);
+                mark_component_source(elt, witnesses)?;
             }
         }
         TypedExprNode::Record(fields) => {
             for (_, field) in fields.iter_mut() {
-                mark_component_source(field, realized);
+                mark_component_source(field, witnesses)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Mark a product's `component` as an iteration site when it holds a collection
@@ -299,21 +305,19 @@ pub(super) fn insert_iterate_recurse(
 ///
 /// A variant's payload is a component the same way: `𝑐 ▷ variant_wrap(tag)` compiles `𝑐` with
 /// the input the wrap is given and wraps what it produces, so the rule looks through the wrap.
-fn mark_component_source(
-    component: &mut Expr,
-    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
-) {
+fn mark_component_source(component: &mut Expr, witnesses: &mut Witnesses) -> Result<(), String> {
     if let TypedExprNode::Apply { argument, function } = &mut component.node
         && matches!(
             function.node,
             TypedExprNode::Builtin(Builtin::VariantWrap(_))
         )
     {
-        return mark_component_source(argument, realized);
+        return mark_component_source(argument, witnesses);
     }
     if component.ty.is_collection() {
-        wrap_with_iterate(component, realized, "product-component-source");
+        wrap_with_iterate(component, witnesses, "product-component-source")?;
     }
+    Ok(())
 }
 
 /// Returns `true` if `func` is a function position that op-conversion
@@ -344,25 +348,6 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
     }
 }
 
-/// Mark the iteration sites in the predicate each `restrict` applies.
-///
-/// A `restrict`'s predicate is compiled out of a refinement at the site it filters, during
-/// the walk, so the walk never reached a collection it aggregates: `zs` in `if x > sum(zs)`.
-/// A `restrict` evaluates its predicate per element, and the collection is an iteration site
-/// as it would be anywhere else. The refinement the `restrict` states is left as compiled: it
-/// is the predicate the types carry, and a refinement carries no planning.
-pub(super) fn plan_restrict_predicates(
-    expr: &mut Expr,
-    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
-) {
-    if let TypedExprNode::Apply { argument, function } = &mut expr.node
-        && is_builtin(function, Builtin::Restrict)
-    {
-        insert_iterate_recurse(argument, realized);
-    }
-    expr.walk_children_mut(|child| plan_restrict_predicates(child, realized));
-}
-
 /// Materialize the iteration site at `expr`, picking the best available
 /// implementation strategy.
 ///
@@ -386,7 +371,8 @@ pub(super) fn plan_restrict_predicates(
 ///    restrict)) ≫ body`.  There is exactly one `iterate` (the base
 ///    source); the per-layer filters are `restrict`s *applied* to it, not
 ///    additional iterates and not morphisms composed with it (its honest
-///    type makes the composed form ill-typed — see [`make_restrict`]).
+///    type makes the composed form ill-typed — see
+///    [`make_restrict`](crate::ccl::ccl_utils::make_restrict)).
 ///    Unrefined sites get just the chain-head iterate with a single
 ///    trivially-true predicate (`true ▷ const`) so op-conversion still
 ///    sees an explicit iteration marker; the trivially-true form is
@@ -404,9 +390,9 @@ pub(super) fn plan_restrict_predicates(
 /// report. Every caller names its own; there is no unlabelled one.
 pub(super) fn wrap_with_iterate(
     expr: &mut Expr,
-    realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
+    witnesses: &mut Witnesses,
     site: &str,
-) {
+) -> Result<(), String> {
     // `Let` nodes pass input through to both children — op-conversion's
     // `Let` arm threads its `input` into bound_expr and body.  At a
     // top-level Let (the only context that calls into this function with
@@ -430,17 +416,16 @@ pub(super) fn wrap_with_iterate(
         // for that eager compilation — #232 tracks making iteration
         // use-driven so a dead binding is dropped rather than wrapped.
         if matches!(&bound_expr.ty, Type::Fun { .. }) {
-            wrap_with_iterate(bound_expr, realized, site);
+            wrap_with_iterate(bound_expr, witnesses, site)?;
         }
-        wrap_with_iterate(body, realized, site);
-        return;
+        return wrap_with_iterate(body, witnesses, site);
     }
     if is_iteration_bearing(expr) {
-        return;
+        return Ok(());
     }
     let Some(domain_ty) = expr.ty.domain() else {
         // Non-function expressions can't be iterated; leave them alone.
-        return;
+        return Ok(());
     };
     // **A bare witness has no extent.** A sum *is* a function, so the domain read above is
     // its witness — "whichever candidate was taken" — and that is not something
@@ -471,8 +456,8 @@ pub(super) fn wrap_with_iterate(
         //
         // Emitting a chain here would restrict a second time, over a witness with no
         // extent.
-        if all_witnesses_realized(&domain_ty, realized) {
-            return;
+        if all_witnesses_realized(&domain_ty, &witnesses.realized) {
+            return Ok(());
         }
         // Otherwise the witness is the value's to carry, and iterating one is what has no
         // source yet: every site starts from `IterateExtent` over an extent read off the
@@ -480,7 +465,7 @@ pub(super) fn wrap_with_iterate(
         // through hands it to `extent_of`, which rejects it by name rather than dropping the
         // restriction silently.
         if !matches!(domain_ty, Type::Refinement(..)) {
-            return;
+            return Ok(());
         }
     }
 
@@ -491,8 +476,8 @@ pub(super) fn wrap_with_iterate(
     // `iterate(predicate)` fall-through are choosing how to materialise the same
     // iteration site — hash join is just a more efficient strategy when the type
     // structure permits.
-    if try_hash_join_rewrite(expr, &domain_ty) {
-        return;
+    if try_hash_join_rewrite(expr, &domain_ty, witnesses) {
+        return Ok(());
     }
     // Generic fallback. Now compile the site's refinement predicates (design
     // §6.5: "run the lambda-elim → simplify sub-pipeline on the lifted predicate
@@ -519,7 +504,7 @@ pub(super) fn wrap_with_iterate(
     // (re-running finds no lambdas to eliminate).
     compile_refinement_predicates(expr, &PredMemo::new());
     let Some(domain_ty) = expr.ty.domain() else {
-        return;
+        return Ok(());
     };
     // The recording names the site being wrapped, so the staging minted under it
     // — the chain-head `iterate(true)` and one `restrict` per refinement —
@@ -574,7 +559,8 @@ pub(super) fn wrap_with_iterate(
     let site_ty = body.ty.clone();
     let mut source = make_iterate(trivially_true_predicate(base.clone()));
     for (r, elem_ty) in crate::ccl::application_order(domain_ty.refinements(), base) {
-        source = make_restrict(fn_of_bare_predicate(&elem_ty, &r.predicate, &[]), source);
+        let predicate = fn_of_bare_predicate(&elem_ty, &r.predicate, &[]);
+        source = planned_restrict(predicate, source, witnesses)?;
     }
     // An iteration source produces the refined extent it iterates, so its
     // codomain is the *site's* refined domain `{D | p}`, mirroring
@@ -619,6 +605,24 @@ pub(super) fn wrap_with_iterate(
     // iteration source, so `typed_compose` gives it `Data` — where the site's own
     // declaration belongs. The site was asserted a collection on the way in.
     *expr = chain.with_ty(site_ty);
+    Ok(())
+}
+
+/// `restrict(predicate)` applied to `upstream`, applying `predicate` planned
+/// ([`plan_term`]) while the refinement states it as compiled.
+///
+/// A `restrict` evaluates its predicate per element, so a collection the predicate
+/// aggregates (`zs` in `if x > sum(zs)`) is an iteration site and a comprehension in it a
+/// correlated site, as anywhere else. The refinement is the predicate the types carry, and a
+/// refinement carries no planning.
+pub(super) fn planned_restrict(
+    predicate: Expr,
+    upstream: Expr,
+    witnesses: &mut Witnesses,
+) -> Result<Expr, String> {
+    let stated = predicate.clone();
+    let planned = plan_term(predicate, Root::Lifted, witnesses)?;
+    Ok(make_restrict_stating(stated, planned, upstream))
 }
 
 /// The morphism a `Compose` chain leads with, or the expression itself when it is
@@ -657,7 +661,7 @@ fn all_witnesses_realized(
 /// 1. Already iterate-led: `Apply(_, Iterate)` at head — or
 ///    `restrict`-led, `Apply(_, Apply(_, Restrict))` at head.  A
 ///    `restrict` application always sits on an iteration source by
-///    construction ([`make_restrict`] only ever wraps an
+///    construction ([`make_restrict`](crate::ccl::ccl_utils::make_restrict) only ever wraps an
 ///    iteration-bearing upstream), so a refined site whose head is the
 ///    outermost `restrict` filter is iteration-bearing just as its
 ///    unrefined `iterate`-led counterpart is.
@@ -768,7 +772,7 @@ mod tests {
         // And that domain is exactly what disqualifies it as an iteration source.
         let mut expr = Expr::var(Name::from("xs")).with_ty(sum);
         let before = symbolic(&expr);
-        insert_iterate_markers(&mut expr, &Default::default());
+        insert_iterate_markers(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(
             symbolic(&expr),
             before,
@@ -970,7 +974,7 @@ mod tests {
     #[test]
     fn test_wrap_with_iterate_unrefined_list_prepends_trivial_iterate() {
         let mut expr = list_123();
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
         let head = chain_head(&expr);
         assert!(
             is_iterate_apply(head),
@@ -997,7 +1001,7 @@ mod tests {
         let refined_domain = refined_ty(Type::UIntRange(3), pred.clone());
 
         let mut expr = list_123().with_ty(data_fun_ty(refined_domain, int));
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
 
         let TypedExprNode::Compose(elts) = &expr.node else {
             panic!("expected Compose, got: {}", symbolic(&expr));
@@ -1050,7 +1054,7 @@ mod tests {
         let outer_refined = refined_ty(inner_refined, outer_pred);
 
         let mut expr = list_123().with_ty(data_fun_ty(outer_refined, int));
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
 
         let TypedExprNode::Compose(elts) = &expr.node else {
             panic!("expected Compose, got: {}", symbolic(&expr));
@@ -1084,7 +1088,7 @@ mod tests {
         let pred = trivially_true_predicate(int_ty());
         let mut expr = make_iterate(pred);
         let before = symbolic(&expr);
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
         assert_eq!(
             symbolic(&expr),
             before,
@@ -1109,7 +1113,7 @@ mod tests {
         )
         .with_ty(list_ty);
 
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
 
         // Outer Let stays as a Let — no wrap inserted at the program root.
         let TypedExprNode::Let {
@@ -1148,7 +1152,7 @@ mod tests {
         ]));
 
         let before = symbolic(&expr);
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
         assert_eq!(
             symbolic(&expr),
             before,
@@ -1163,7 +1167,7 @@ mod tests {
         // to iterate; the helper bails without modifying anything.
         let mut expr = Expr::lit(Lit::Int(5)).with_ty(int_ty());
         let before = symbolic(&expr);
-        wrap_with_iterate(&mut expr, &Default::default(), "test");
+        wrap_with_iterate(&mut expr, &mut Default::default(), "test").unwrap();
         assert_eq!(symbolic(&expr), before);
     }
 
@@ -1182,7 +1186,7 @@ mod tests {
             fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
             int,
         );
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Apply { argument, .. } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -1207,7 +1211,7 @@ mod tests {
             ),
             fun_ty(int, fun_ty(Type::UIntRange(3), Type::UIntRange(3))),
         );
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Apply { argument, .. } = &expr.node else {
             panic!("expected Apply, got: {}", symbolic(&expr));
         };
@@ -1253,7 +1257,7 @@ mod tests {
             ),
         );
         let before = symbolic(&expr);
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         assert_eq!(
             symbolic(&expr),
             before,
@@ -1275,7 +1279,7 @@ mod tests {
                 ]),
                 int,
             ));
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Copair(operands) = &expr.node else {
             panic!("expected Copair, got: {}", symbolic(&expr));
         };
@@ -1303,7 +1307,7 @@ mod tests {
         // Same shape as the collection case above, differing only in kind.
         let mut expr = Expr::new(TypedExprNode::DisjointJoin(vec![list_123(), list_123()]))
             .with_ty(Type::fun(int.clone(), int));
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::DisjointJoin(operands) = &expr.node else {
             panic!("expected DisjointJoin, got: {}", symbolic(&expr));
         };
@@ -1348,7 +1352,7 @@ mod tests {
         })
         .with_ty(hist_ty);
 
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
 
         let TypedExprNode::Transact { writers, .. } = &expr.node else {
             panic!("expected Transact, got: {}", symbolic(&expr));
@@ -1377,7 +1381,7 @@ mod tests {
             Expr::new(TypedExprNode::Record(vec![("out".to_string(), component)])).with_ty(
                 Type::Record(vec![("out".to_string(), component_ty.clone())]),
             );
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("still a record: {}", symbolic(&expr));
         };
@@ -1401,7 +1405,7 @@ mod tests {
             ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
             ("n".to_string(), int),
         ]));
-        insert_iterate_recurse(&mut expr, &Default::default());
+        insert_iterate_recurse(&mut expr, &mut Default::default()).unwrap();
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("expected Record, got: {}", symbolic(&expr));
         };

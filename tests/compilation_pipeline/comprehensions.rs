@@ -120,6 +120,27 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     "sum([q for q in [1, 2, 3] if q > sum([z for z in [1, 2] if z > 1])])",
     3
 )]
+// A filter reading the element: `x` stays where a larger element remains to sum above 1.
+#[case::correlated_filter(
+    "sum([x for x in [1, 2, 3] if sum([z for z in [1, 2, 3] if z > x]) > 1])",
+    3
+)]
+// A conditional collection: the sum is 2, so `q > 2` keeps 3.
+#[case::conditional_collection(
+    indoc! {r"
+        c: Bool = True
+        sum([q for q in [1, 2, 3] if q > sum([1, 1] if c else [3, 4])])
+    "},
+    3
+)]
+// A conditional between rows of different domains: the sum is 1, so `q > 1` keeps 2 + 3.
+#[case::boxed_conditional(
+    indoc! {r"
+        c: Bool = True
+        sum([q for q in [1, 2, 3] if q > sum(box([1]) if c else box([3, 4]))])
+    "},
+    5
+)]
 fn a_filter_aggregates_a_collection(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
 }
@@ -203,32 +224,23 @@ fn a_filtered_comprehension_drives_a_mutation_loop() {
     );
 }
 
-/// A filtered-comprehension shape that does not compile. It **predates the dependent-sum
-/// work** — it reproduces unchanged on `main` — and involves no `box`, `Σ`, or witness. It
-/// is recorded here because it is otherwise easy to re-diagnose as sum fallout when it
-/// surfaces beside `sums.rs`'s `a_filter_over_a_boxed_source_is_applied`, which it resembles
-/// and is unrelated to.
+/// A filter over a same-domain conditional source fails at run time. It predates the
+/// dependent-sum work and involves no `box`, `Σ` or witness; it resembles `sums.rs`'s
+/// `a_filter_over_a_boxed_source_is_applied` without sharing its cause.
 ///
-/// It fails loudly, which is why it is recorded rather than fixed here: a **filter over a
-/// same-domain conditional** fails the post-planning typecheck: the
-///   `cast` above the realized union still says `[0, 1]`, where the union's domain is
-///   `{[0, 1] | π̂₀} | {[0, 1] | π̂₁}`. Wrapping the realization in a `Realize` that asserts
-///   the pre-realization type gets past that — and then reaches the *second* wall, which is
-///   the interesting one: the filter's predicate holds its own copy of the source, so it
-///   holds the `Case`, and nothing replaces it. Realization deliberately does not fire
-///   inside a predicate, and the per-leg discharge that stands in for it there is keyed on
-///   a **witness** — which this conditional, being same-domain and unboxed, does not have.
-///   The same rewrite would serve (under leg 𝑖 the conditional *is* `armᵢ`); what is
-///   missing is a way to identify the source without a witness to name it. Asserting
-///   unconditionally is *not* the fix on its own — it breaks
-///   `test_value_case_same_domain_collection_result`, where the realized union is the
-///   program's own result and the assertion re-imposes a domain the result no longer has.
+/// The filter's predicate holds its own copy of the source, so it holds the `Case`. Realization
+/// substitutes arm 𝑖 for a predicate's copy of a conditional source in leg 𝑖, finding the copy by
+/// the witness it names, and a same-domain unboxed conditional names none. Planning then lifts the
+/// predicate and realizes the copy with it, and the predicate applies the realized union at an
+/// index: both legs answer there, and `flat_merge` rejects the overlap
+/// (`src/ccl/design/optimization.md`, "Planning a lifted term"). The per-leg substitution would
+/// serve here too; what is missing is a way to find the copy without a witness.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether
 // the gap closed, regressed, or went away, and nothing runs ignored tests here.
-#[should_panic(expected = "CCL node Case")]
-fn a_filter_over_a_same_domain_conditional_does_not_compile() {
+#[should_panic(expected = "flat_merge: arms are not disjoint")]
+fn a_filter_over_a_same_domain_conditional_fails_at_run_time() {
     check_scalar(
         indoc! {r"
             c: Bool = True

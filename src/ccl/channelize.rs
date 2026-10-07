@@ -1448,9 +1448,20 @@ fn predicates_hold_type(
     }
     let mut found = false;
     walk_refined_predicates(ty, visited, &mut |pred, vis| {
-        found |= in_expr(pred, hit, vis);
+        // A predicate holding its own `defer` is in source form: this pass does not rewrite
+        // inside a predicate, and lifting the predicate channelizes it
+        // (`planning::predicates::eliminate_lifted`), so its channel types are its own until
+        // then.
+        if !holds_defer(pred) {
+            found |= in_expr(pred, hit, vis);
+        }
     });
     found
+}
+
+/// Whether `e` binds a `defer` anywhere in its term.
+pub(crate) fn holds_defer(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Defer) || e.fold_children(false, |acc, c| acc || holds_defer(c))
 }
 
 /// Whether one type slot holds a type satisfying `hit`, structure and refinement predicates

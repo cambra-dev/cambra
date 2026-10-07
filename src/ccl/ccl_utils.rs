@@ -667,9 +667,12 @@ fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
 /// Debug-only invariant: no refinement predicate embedded in `ty` contains an
 /// `iterate` or `restrict` planning marker. Predicates are denotational; markers
 /// are term-tree artifacts. Upheld by [`strip_iterate_markers`] at the term→type
-/// substitution boundary. A `restrict` here means a *filtered* source reached a
-/// predicate (e.g. `x in [y for y in ys if p]`) — a real but unsupported case
-/// that should surface loudly, not miscompile.
+/// substitution boundary. Planning plans a predicate only where it lifts one into a term,
+/// and leaves the refinement as compiled.
+///
+/// A predicate may still hold a term that would need iterating if it ran, a union or a
+/// realized conditional: it states a value, and a copy that runs is planned where it is
+/// lifted (`src/ccl/design/optimization.md`, "Planning a lifted term").
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
     fn expr_has_marker(e: &Expr) -> bool {
@@ -685,37 +688,11 @@ pub(crate) fn debug_assert_no_iteration_markers_in_type(ty: &Type) {
                     "iteration/restrict marker leaked into a refinement predicate: {}",
                     crate::ccl::symbolic::symbolic(&r.predicate)
                 );
-                debug_assert!(
-                    !expr_needs_iteration(&r.predicate),
-                    "a source that must be *iterated* reached a refinement predicate: {}\n\
-                     A predicate looks its collection up at an index; it never sweeps one, and \
-                     it may carry no `iterate`/`restrict` to sweep with. Realizing a conditional \
-                     source inside a predicate produces exactly this — a gated union whose legs \
-                     need the markers the assertion above forbids — and op-conversion then \
-                     compiles one leg and silently answers from the wrong arm. The predicate has \
-                     to name a *plain* collection: under leg i the conditional is `arm i`, so \
-                     substitute it.",
-                    crate::ccl::symbolic::symbolic(&r.predicate)
-                );
             }
         }
         ty.walk_children(go);
     }
     go(ty);
-}
-
-/// Whether `e` contains a collection that op-conversion could only compile by **iterating**
-/// it — a realized conditional (`Realize`) or a union of collections.
-///
-/// The complement of [`debug_assert_no_iteration_markers_in_type`]'s own check, and the half
-/// it could not see. That one catches a marker that *leaked in*; this catches a term that
-/// would *need* one. Both say the same thing about a predicate — it is denotational — and
-/// only together do they close the gap, since a term needing iteration and carrying no
-/// marker passes the first check and miscompiles.
-#[cfg(debug_assertions)]
-fn expr_needs_iteration(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::Realize(_) | TypedExprNode::Copair(_))
-        || e.fold_children(false, |acc, c| acc || expr_needs_iteration(c))
 }
 
 /// Whether `e` applies `b` as its function (`Apply { function: Builtin(b) }`).
@@ -927,7 +904,16 @@ pub fn make_iterate(predicate: Expr) -> Expr {
 ///
 /// [`typecheck`]: crate::ccl::infer::typecheck
 pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
-    let domain = predicate
+    make_restrict_stating(predicate.clone(), predicate, upstream)
+}
+
+/// [`make_restrict`] applying `predicate` while the refinement states `stated`.
+///
+/// Planning applies a predicate it has planned and states it as compiled
+/// (`src/ccl/design/optimization.md`, "Planning a lifted term"). The two denote one function,
+/// so `stated` also supplies the domain.
+pub fn make_restrict_stating(stated: Expr, predicate: Expr, upstream: Expr) -> Expr {
+    let domain = stated
         .ty
         .domain()
         .expect("restrict predicate must have a function type")
@@ -958,12 +944,9 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
     // site — and the body's `cast` — still demand the refined one. A vacuous
     // refinement is the site's business, not this constructor's.
     //
-    // The refinement states the predicate as compiled. Planning plans the term this applies
-    // afterwards, and only the term (`src/ccl/design/optimization.md`, "Iteration-Site Marking
-    // (`insert_iterate_markers`)"); a refinement carries no planning.
     let refined_dom = Type::refined_one(
         domain.clone(),
-        Refinement::born(Rc::new(bare_predicate_of_fn(&domain, predicate.clone()))),
+        Refinement::born(Rc::new(bare_predicate_of_fn(&domain, stated))),
     );
     let refined_collection = Type::fun_like(&upstream_ty, refined_dom, value_ty);
     // The transformer node `restrict(p) : (D ⤇ T) ⇒ ({d : D | p(d)} ⤇ T)`.
@@ -1801,7 +1784,7 @@ pub fn free_names(expr: &Expr) -> HashSet<Name> {
 /// [`crate::ccl::scope::for_each_scoped_item`] as [`count_free`], minus the type
 /// slots (so a refinement on a `Lambda` param — which lives in the type — is
 /// ignored).
-fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
+pub(crate) fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
     let mut sum = 0;
     for_each_scoped_item(expr, &mut |item| match item {
         ScopedItem::VarRef(n) => sum += (n == name) as usize,
@@ -2328,25 +2311,17 @@ mod tests {
     use crate::ccl::ty::TypeKind;
     use crate::ccl::{AggregateKind, CompareKind};
 
-    /// **A realized conditional inside a predicate is caught at the planning wall.**
-    ///
-    /// A predicate looks its collection up at an index; it never sweeps one, and it may
-    /// carry no `iterate`/`restrict` to sweep with. Realizing a conditional source inside a
-    /// predicate produces exactly the forbidden thing — a gated union whose legs need those
-    /// markers — and the marker check alone cannot see it, because the union arrives with
-    /// *no* markers at all. Without this the failure is a wrong arm at runtime, four passes
-    /// downstream.
-    #[test]
+    /// A realized conditional over two collections: a term op-conversion can only compile by
+    /// iterating it.
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "must be *iterated* reached a refinement predicate")]
-    fn a_source_needing_iteration_in_a_predicate_is_caught() {
+    fn realized_union() -> Expr {
         let arm = |n| {
             Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(Type::data_fun(
                 Type::UIntRange(n),
                 Type::Base(BaseType::Int),
             ))
         };
-        let realized = Expr::new(TypedExprNode::Realize(Box::new(
+        Expr::new(TypedExprNode::Realize(Box::new(
             Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
                 Type::UIntRange(2),
                 Type::Base(BaseType::Int),
@@ -2355,8 +2330,18 @@ mod tests {
         .with_ty(Type::data_fun(
             Type::UIntRange(2),
             Type::Base(BaseType::Int),
-        ));
-        let ty = Type::refined_one(Type::UIntRange(2), Refinement::born(Rc::new(realized)));
+        ))
+    }
+
+    /// A predicate in a type states a value, so it may hold a term that would need iterating
+    /// if it ran; a copy that runs is planned where it is lifted.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_predicate_may_state_a_term_needing_iteration() {
+        let ty = Type::refined_one(
+            Type::UIntRange(2),
+            Refinement::born(Rc::new(realized_union())),
+        );
         debug_assert_no_iteration_markers_in_type(&ty);
     }
 
