@@ -1,121 +1,114 @@
 # The Lean model of the CCL type system
 
-`formal/` is a Lean 4 model of the CCL type system whose purpose is **catching real bugs** in the
-Rust implementation. Confidence in the metatheory and bug-catching are the same goal here: every
-layer of the model has an executable form and a differential oracle against the Rust. Proofs pin
-down the model; the oracle pins the model to reality.
-
-The implementation being modeled is the algebraic-subtyping engine of
-[type-inference.md](../src/ccl/design/type-inference.md#1-algorithm-overview); the semantic model
-the last roadmap item targets is
-[mutability.md](../src/ccl/design/mutability.md#the-model-histories-and-causal-recursion).
+`formal/` specifies selected operations of the
+[CCL inference engine](../src/ccl/design/type-inference.md#1-algorithm-overview) in Lean 4.
+Proofs establish properties of the model. Differential tests compare five modeled operations
+with Rust on generated inputs. Neither form of validation establishes correctness outside its
+stated fragment.
 
 ## The oracle stance: the model checks, it does not reproduce
 
-Monomorphization, simplification, and coalesce ordering make the Rust's inferred types
-non-canonical, so demanding that a Lean model reproduce inference output bit-for-bit would drown the
-project in incidental divergence. Instead:
+The planned term-typing oracle checks admissibility: a type inferred by Rust must be accepted
+for the term by the declarative typing judgment. It need not reproduce Rust's choice among
+several valid types. This oracle is not implemented; see [The typing oracle](#the-typing-oracle).
 
-- **Lean infers nothing; Lean checks.** The differential property is *admissibility*: whatever type
-  the Rust inferred for a term, the Lean declarative system accepts that term at that type. That is
-  the soundness direction, it is robust to the solver choosing any of several valid types, and a
-  failure is either a solver bug or a spec gap.
-- Exact agreement is demanded of the three operations that **are** functions of their inputs: the
-  subtype relation, the polar merge, and materialization. None is order- or route-sensitive, so none
-  needs the admissibility stance.
+The implemented oracles compare subtyping, polar merge, kind refusal, kind merge and coalescing.
+They compare each operation's verdict or result using its wire representation and model
+equivalence, rather than comparing complete inference runs.
+[The differential oracles](#the-differential-oracles) describes their inputs and exclusions.
 
 ## What is pinned today, and what is not
 
-Read a claim about "the model" against this table rather than against the roadmap, which describes
-intent. Until a row says otherwise, a component's only coverage is ordinary Rust tests.
+| Solver component | Model and differential coverage | Proof coverage |
+| --- | --- | --- |
+| `constrain_subtype` | `Subtyping` / `subtypeCheck`; generated pairs in the modeled concrete fragment. | Reflexivity and transitivity for well-formed types; checker soundness and completeness. |
+| The Σ subtyping premise | `SigmaBelow` relates a candidate list, element types and a kind. No differential of the full Σ rule. | `sigma_below_iff_elementwise` and `swapped_premise_is_unsound` specify the kind-premise direction. Binder correspondence and sums nested in types are not modeled. |
+| `CompactType::merge` | `CompactTy.merge`; each generated fold step is compared. | Commutativity, idempotence, associativity and congruence; leastness and uniqueness for the induced absorption order. |
+| `TypeKind::refuses` | `refuses`; generated concrete types and kinds. | `not_admits_of_refuses`: refusal implies non-membership, not the converse. |
+| `CompactTypeKind::merge` | `mergeTypeKind`; encodable generated fold steps are compared. | Commutativity, idempotence and join associativity. Meet associativity is checked over a finite universe, not proved generally. |
+| `coalesce_compact` | `coalesce`; generated compact bounds are materialized and compared. | Total result computation, well-formedness of successful results, and the conditional bound/leastness results described under [Materialization](#materialization-the-merge-is-a-bound-and-the-least-one). |
+| Term typing | `Term` / `HasTy`; no Rust term-typing differential yet. | Progress, preservation and refinement soundness for the pure-core fragment below. |
+| Bound recording, sweeping, `extrude`, traits, `simplify_type` and schemes | Not modeled or differentially checked here. | None here. |
+| `compact_go` | Produces operands for the merge/coalesce differentials; its output shape is modeled by `CompactTy`. | The operation itself is not checked. |
 
-| Solver component | Model | Differential | Proofs |
-|---|---|---|---|
-| `constrain_subtype`, concrete pairs with no sum among them | `Subtyping` / `subtypeCheck` | yes | reflexivity, transitivity, decidability |
-| `constrain_subtype`'s Σ arm | `SigmaBelow`, the kind premise alone | no — `CompactTy` has no binder slot, so the wire refuses a slot carrying binders and drops every witness atom | the premise is the elementwise reading of what a Σ denotes, which is what fixes its direction (`sigma_below_iff_elementwise`), and the swapped premise is a different relation (`swapped_premise_is_unsound`); the binder correspondence `𝜌` has neither model nor differential |
-| `CompactType::merge` | `merge` | yes, every fold step | commutativity, idempotence, associativity, congruence, lub, uniqueness |
-| `TypeKind::refuses` | `refuses` | yes, on the concrete fragment | a refusal never lands on a member (`not_admits_of_refuses`); the pair the bound arm's equality test refused while admitting it |
-| `CompactTypeKind::merge` | `mergeTypeKind` | yes, every fold step | commutativity, idempotence, associativity at the join; the meet checked exhaustively over a bounded universe |
-| `coalesce_compact` (`CompactType` → `Type`) | `coalesce` | yes, per materialized bound | totality; well-formedness of the result (`coalesce_wellFormed`); the merge materializes to a bound of both operands (`merge_is_a_bound`) and to the least such type (`merge_is_least_type`) |
-| bound recording, sweeping, `extrude` | — | — | — |
-| `traits` (operator obligations) | — | — | — |
-| `compact_go` (bounds → `CompactType`) | its *output shape* is `CompactTy` | supplies operands; never itself checked | — |
-| `simplify_type` | — | — | — |
-| `scheme` (freshening, generalization) | — | — | — |
-| term typing as the solver infers it | `Term` / `WellTypedTermsAreSafe`, a small calculus | — (the admissibility oracle is a roadmap item) | progress, preservation, refinement soundness |
+A defect in `compact_go` can affect the shared operands before comparison and therefore escape
+the merge and coalesce oracles. Agreement on those operands does not validate their construction.
 
-One consequence: `compact_go` is unmodeled, and the merge and coalesce differentials both *use* it
-to build their operands — so a `compact_go` defect is reproduced identically on both sides of those
-comparisons rather than caught by them.
+[`CclFormal/Axioms.lean`](CclFormal/Axioms.lean) checks the axiom lists of named headline results
+with `#guard_msgs` around `#print axioms`. The expected lists contain only `propext`,
+`Classical.choice` and `Quot.sound`, with some results using only a subset. An added assumption or
+`sorryAx` changes the checked output and fails the build. This is an explicit list of checked
+results, not an automatic scan of every declaration.
 
-Every theorem cited here is **sorry-free**: no step is admitted rather than proved.
-`CclFormal/Axioms.lean` states that as a gate rather than a claim — one `#print axioms` line per
-headline result, each paired with the list it must report. That list is `propext`,
-`Classical.choice`, and `Quot.sound`, which are Lean's own classical axioms; a fourth name would be
-an assumption this development had added. `lake build` fails on a mismatch, and an admitted step is
-one of those names (`sorryAx`), so it fails the same way.
-
-The contract that keeps the table true: **a semantic change to `constrain` or coalesce either updates
-`formal/` in the same change or documents the divergence in the PR.** The differential is what
-detects a breach.
+A semantic change to modeled constraint or coalescing behavior must update the model in the same
+change or record the divergence in the PR. Generated tests exercise this agreement but do not
+prove it for all Rust inputs.
 
 ## The concrete type grammar
 
-A type is **concrete** when no inference-time unknown occurs anywhere in it (`ccl::ty::Type`'s own
-doc defines the term and tabulates the variants). `Ty` (`CclFormal/Ty.lean`) mirrors that fragment —
-every variant a fully-inferred type can contain. `Hole`, `SharedHole`, `BoundedHole`, `Infer`,
-`History`, `ChanDom`, and `FunKind::Var` are excluded: each is an inference-time transient or
-unknown, outside the fragment by the same criterion that keeps it out of a checked program's types.
-`Ty.variant` also carries no `Openness`, so a closed arm set is the only one the model represents.
-`FunKind` is in the grammar as a static two-point flag (`⇒` vs `⤇`); kind inference is a roadmap
-item, but `⇒`/`⤇` distinctness affects type equality and subtyping now.
+[`CclFormal/Ty.lean`](CclFormal/Ty.lean) defines `Ty`: base types, unsigned index ranges, data
+source domains, `Txn`, functions, tuples, records, closed variants and refinements.
+Function kinds are the two fixed values `compute` and `data`.
 
-**Concrete types are closed**, and that is the fragment property the rest of the model rests on: a
-refinement's reference to its own function is a de Bruijn index (`Predicate.piBound`, mirroring
-`Name::PiBound`) while free references stay uniquified names, so the relation carries no rename
-environments and two α-variant function types are the same term. The design of record, and the
-placements measured against it, are in
-[type-inference.md](../src/ccl/design/type-inference.md#a-binder-reference-is-stored-in-one-of-two-forms),
-"A binder reference is stored in one of two forms". Mid-solve, name-spelled forms still exist; the
-concrete fragment is the closed one.
+The grammar is a subset of concrete Rust types, not every type a fully inferred program can
+contain. It has no Σ or witness-reference constructor and no open variant form. It also excludes
+inference unknowns (`Hole`, `SharedHole`, `BoundedHole` and `Infer`), kind variables, and the
+`History`, `ChanDom`, `App` and `Below` forms. The `ty_json` encoder in
+[the differential harness](../tests/differential_oracle.rs) defines the supported wire boundary:
+it rejects sum-bearing function kinds and function binders other than a raw name or no name.
 
-`Ty.lean` states the rest where it defines it: `Ty.WellFormed`'s invariants, why the refinement set
-is a list whose order is proved unobservable, and the `Predicate` vocabulary — including the two
-type-blind exceptions `eq_term_modulo_ty_slots` makes, α-invariance and a `Cast`'s target, which the
-wire encoder discharges rather than Lean (`pred_json`, `tests/differential_oracle.rs`).
+`Ty.WellFormed` requires unique record/variant keys, recursively well-formed children, and
+nonempty refinement lists over an unrefined base. Refinements are represented as lists; the
+subtype relation observes predicate membership rather than list order.
+
+A dependent reference to an enclosing function binder is `Predicate.piBound`, corresponding to
+`Name::PiBound`. Free references remain identity-bearing names. The subtype relation compares
+closed codomains without a rename environment and does not read the function's binder-name slot;
+the slot still participates in `Ty`'s structural equality. Closing binder references therefore
+does not make the entire `Ty` representation independent of that slot.
+
+The predicate grammar omits expression type slots. Predicate-local lambda binders use positional
+references; embedded casts retain the target domain's refinement predicates. The Rust encoder
+`pred_json` supplies these forms to match `eq_term_modulo_ty_slots`. The general binder
+representation is specified in
+[Forms](../src/ccl/design/type-inference.md#a-binder-reference-is-stored-in-one-of-two-forms).
 
 ## The declarative subtype relation
 
-`Subtyping` (`CclFormal/Subtyping.lean`) is one constructor per `constrain_go` arm — the relation the
-Rust implements without ever writing down — and `subtypeCheck` (`CclFormal/SubtypeChecker.lean`) is
-the executable checker that decides it, with termination proved. Each adjudicated rule is a
-constructor carrying its decision in its own docstring, with a matching `#guard` in
-`SubtypeChecker.lean`; the three deliberate departures from `constrain_go` are recorded in
-`Subtyping.lean`'s module doc.
+[`Subtyping.lean`](CclFormal/Subtyping.lean) defines the relation;
+[`SubtypeChecker.lean`](CclFormal/SubtypeChecker.lean) implements its terminating checker.
+`subtyping_of_subtypeCheck` and `subtypeCheck_of_subtyping` establish the two directions of
+agreement. Rule examples are checked by `#guard` declarations.
 
-**Transitivity is unconditional because concrete types are closed** (`subtyping_trans`, over
-well-formed types, quantifying over nothing but the three types). Chaining dependent codomains under
-a name-spelled representation produces premises viewing the middle type under different renames,
-composing only through a reconciliation morphism — the model analogue of `constrain.rs ::
-bridge_holder_gap`. Closing into indices does not dissolve that obstruction; it never forms it. The
-fragment restrictions and environment side conditions a named representation forces are the cost of
-names, not of transitivity.
+The relation differs from the Rust implementation in three recorded ways: it has no trivial-equality
+shortcut, compares closed function codomains without binder correspondence, and has no
+partition-collapse arm. The module documentation states these boundaries. In particular, omitting
+the equality shortcut exposes the need for unique field keys in the reflexivity theorem.
+
+`subtyping_trans` requires `Ty.WellFormed` for all three types and two subtype derivations.
+It adds no rename-environment premises. This is a theorem about the modeled grammar; it does not
+extend the fragment to inference variables or dependent sums.
 
 ## Terms, typing, and safety
 
-`CclFormal/Term.lean` holds the pure-core calculus — terms, values, capture-free substitution,
-partial predicate evaluation, the call-by-value `Step`, the filter-blocked judgment, and the
-declarative `HasTy` with subsumption via `Subtyping` — and `WellTypedTermsAreSafe.lean` proves
-progress, preservation, and refinement soundness over it. Both files record their own adjudications.
-The one that reaches outside them is the **fragment**: predicates over `__elem` only
-(`Predicate.elemOnly`), enforced in the judgment rather than at the theorem boundary, which is what
-keeps types closed under term substitution.
+[`Term.lean`](CclFormal/Term.lean) defines literals, indexed variables, lambdas, application,
+let-bindings, tuples/projections, tagged variants/cases and refinement casts. It defines values,
+capture-free substitution, call-by-value stepping, a filter-blocked judgment and `HasTy`.
 
-Open: `compose`, records, wildcard `case` arms, and the dependent-fragment extension, which waits on
-the discharge machinery. The wildcard extension carries a calibration target — the Rust's `case _:`
-payload-binder defect lives in wildcard arms, which `Term.caseE` does not yet have, so the naive
-wildcard statement is refuted by a known bug and `case_binder_sound` is the tag-arm statement in the
-meantime.
+`Ty.TermFragment` restricts all refinement predicates to `Predicate.elemOnly`. Such predicates
+can use the refined element but not free names, enclosing Pi binders, predicate-local lambdas or
+embedded casts. `HasTy` enforces this restriction where a typing rule selects a type.
+
+[`WellTypedTermsAreSafe.lean`](CclFormal/WellTypedTermsAreSafe.lean) proves:
+
+- `progress`: a closed well-typed term is a value, takes a step, or is filter-blocked.
+- `preservation`: a step preserves typing when the context's types are in the term fragment.
+- `refinement_soundness`: if a closed refined term evaluates to a value, its predicates hold on
+  that value. This does not assert that evaluation terminates or that a filter never blocks.
+
+Composition, record terms, wildcard case arms and dependent term refinements remain outside this
+calculus. `case_binder_sound` covers tagged arms, not wildcards. Extending it to wildcard payloads
+requires checking the payload-binding rule; the existing tag-arm result provides no such coverage.
 
 ## The polar merge
 
