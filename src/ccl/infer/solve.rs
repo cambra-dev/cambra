@@ -197,6 +197,12 @@ pub(super) struct CoalesceCtx {
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
     reads: Vec<ReadRecord>,
+    /// How many refinement predicates enclose the walk's position within the tree being
+    /// walked. A specialization's clone is a tree of its own and starts at zero. Debug
+    /// builds only: [`specialize_use`] asserts with it that two uses in a tree never share
+    /// instantiation variables.
+    #[cfg(debug_assertions)]
+    in_predicate: usize,
     /// The right-hand sides [`pin_empty_list_elements`] skipped as generalized, whose
     /// literals only the walk's copies pin. The walk checks that it generalizes each of
     /// them too: one it walked as monomorphic would keep a literal nothing pins. Debug
@@ -688,6 +694,15 @@ struct Specialization {
     /// (`src/ccl/design/type-inference.md`, "A use the key does not determine shares no
     /// clone").
     shareable: bool,
+    /// The instantiation of the use that minted this specialization, as it stood before the
+    /// pin. A use with this same instantiation, the same variables, is a copy of that use (a
+    /// refinement predicate quotes the term it refines by), so the pins answered its join, and
+    /// it shares this clone whether or not the key determines it.
+    instantiation: Type,
+    /// Whether the use that minted this specialization sits inside a refinement
+    /// predicate. Debug builds only, for the assertion in [`specialize_use`].
+    #[cfg(debug_assertions)]
+    quoted: bool,
     /// Its binding name — a [`Name::mono`] carrying the source binding's name
     /// as provenance and a globally-fresh uid for identity (so it can neither
     /// capture nor be captured).
@@ -1380,6 +1395,8 @@ pub(super) fn coalesce_pass(
         occurrences: OccurrenceIndex::default(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
+        #[cfg(debug_assertions)]
+        in_predicate: 0,
         #[cfg(debug_assertions)]
         skipped_as_generalized: std::collections::HashSet::new(),
     };
@@ -2305,7 +2322,15 @@ fn coalesce_type_predicates_go(
             let base = inner.clone();
             refinements.rewrite_each(|_, r| {
                 memo.rebuild(r, &(), |pred| {
+                    #[cfg(debug_assertions)]
+                    {
+                        ctx.in_predicate += 1;
+                    }
                     coalesce_node(pred, level, ctx);
+                    #[cfg(debug_assertions)]
+                    {
+                        ctx.in_predicate -= 1;
+                    }
                     crate::ccl::ccl_utils::type_element_reads_from_base(pred, &base);
                     true
                 });
@@ -2441,10 +2466,29 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
     let shareable = !crate::ccl::subst::type_contains_infer(&resolved)
         && !coalesce_positive(&use_expr.ty).is_ok_and(|values| has_output_variable(&values, true));
+    // A copy of a use already specialized shares its clone: its instantiation is the same
+    // variables, so the clone's pins answered the one join around both. See
+    // `src/ccl/design/type-inference.md`, "A use the key does not determine shares no clone".
+    let instantiation = use_expr.ty.clone();
+    let shares = |s: &Specialization| {
+        s.instantiation == instantiation || (shareable && s.shareable && s.key == key)
+    };
     let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
-    if shareable && let Some(spec) = frame.specs.iter().find(|s| s.shareable && s.key == key) {
+    if let Some(spec) = frame.specs.iter().find(|s| shares(s)) {
+        // Equal instantiations identify copies of one use only while inference instantiates
+        // every use with fresh variables. Two uses in the tree itself are distinct, so where
+        // the key would not share, one of the two is a predicate's copy.
+        #[cfg(debug_assertions)]
+        assert!(
+            (shareable && spec.shareable && spec.key == key) || spec.quoted || ctx.in_predicate > 0,
+            "two uses of `{}` in the tree share the instantiation {instantiation}: \
+             inference instantiates each use with fresh variables, and only a refinement \
+             predicate's copy of a use may carry them (`src/ccl/design/type-inference.md`, \
+             \"A use the key does not determine shares no clone\")",
+            spec.name.base(),
+        );
         let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
         // Sharing is what makes an entry live: an entry minted for a discarded use
         // is spliced after all once a surviving use adopts it.
@@ -2455,7 +2499,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
             let spec = frame
                 .specs
                 .iter_mut()
-                .find(|s| s.shareable && s.key == key)
+                .find(|s| shares(s))
                 .expect("the entry just found is still there");
             spec.referenced = true;
         }
@@ -2478,7 +2522,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
         let shared: Vec<HeldError> = frame
             .specs
             .iter()
-            .find(|s| s.shareable && s.key == key)
+            .find(|s| shares(s))
             .expect("the entry just found is still there")
             .raised
             .iter()
@@ -2662,7 +2706,13 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     if !ctx.discarding {
         pin_empty_list_elements(&clone, cutoff + 1 + raise, ctx);
     }
+    #[cfg(debug_assertions)]
+    let in_predicate = std::mem::take(&mut ctx.in_predicate);
     coalesce_node(&mut clone, cutoff + 1 + raise, ctx);
+    #[cfg(debug_assertions)]
+    {
+        ctx.in_predicate = in_predicate;
+    }
     ctx.specializing.pop();
     ctx.scope.extend(suspended);
     if pin_succeeded {
@@ -2710,6 +2760,9 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     frame.specs.push(Specialization {
         key,
         shareable,
+        instantiation,
+        #[cfg(debug_assertions)]
+        quoted: ctx.in_predicate > 0,
         name: spec_name,
         def: clone,
         referenced,

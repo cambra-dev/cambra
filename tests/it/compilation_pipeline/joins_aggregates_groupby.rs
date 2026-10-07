@@ -112,6 +112,16 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
     }
 }
 
+/// A join's equality side holding a union is planned as a lifted term: the union is iterated, and
+/// the pairs `(1, 3)` and `(2, 4)` give 3 + 8.
+#[test]
+fn a_join_side_holding_a_union() {
+    check_scalar(
+        "sum([a * b for a in [1, 2, 3] for b in [1, 2, 3, 4] if a + sum([1] ++ [1]) == b])",
+        Value::Int(11),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Aggregates
 // ---------------------------------------------------------------------------
@@ -1228,18 +1238,82 @@ fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] gen
     );
 }
 
+/// A group-by in a conditional's guard: the guard becomes each leg's filter, which planning
+/// lifts from its uncompiled predicate and plans as the tree, so the group-by is recognized there
+/// too.
+#[rstest]
+#[case::summing_the_groups(r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) else 0")]
+#[case::in_a_chained_comparison(
+    r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0"
+)]
+fn a_group_by_in_a_guard(#[case] program: &str) {
+    check_scalar(program, Value::Int(1));
+}
+
+/// A group-by in the middle operand of a chained comparison, which lowering places in both
+/// comparisons: the groups sum to 4.
+#[test]
+fn a_group_by_in_a_chained_comparison() {
+    check_scalar(
+        r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100",
+        Value::Bool(true),
+    );
+}
+
+/// A group-by whose key function computes its key with a nested collection, a union, or a
+/// conditional. The key function appears in the key domain's predicate and in the partition's,
+/// and each copy's nested refinements read that copy's own parameter.
+#[rstest]
+#[case::a_filter_reading_the_element(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > e]))])
+"#}, "[() -> 4]")]
+#[case::a_nested_group_by(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2],
+        \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])
+"#}, "[() -> 4]")]
+#[case::a_conditional_on_the_element(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> (e if e > 1 else 0))])
+"#}, "[() -> 4]")]
+#[case::a_union(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([1, 2] ++ [3, 4]))])
+"#}, "[() -> 4]")]
+#[case::a_conditional_collection(indoc! {r#"
+    c: Bool = True
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 2, 3, 4], \e -> e // sum(box([1, 2]) if c else box([3, 4, 5])))])
+"#}, "[() -> 10]")]
+#[case::a_filter_in_the_key_reads_the_binder(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > i]))])
+"#}, "[4, 4]")]
+fn a_group_by_whose_key_computes_with_a_collection(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A group-by under a loop whose key reads the loop's binder, over a source the loop's binder
+/// filters: under `i = 1` the source is `[2, 3]`, two groups, and under `i = 2` it is `[3]`,
+/// one.
+#[test]
+fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
+    check_scalar(
+        indoc! {r#"
+            out = defer()
+            for i in [1, 2]:
+                out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
+            sum([v for v in out])
+        "#},
+        Value::Int(3),
+    );
+}
+
 /// A group-by under a loop whose key reads the loop's binder, in shapes the compiler does not
 /// compile yet. Each is refused as a compiler gap rather than reaching a later pass.
 #[rstest]
-#[case::over_a_source_the_loop_filters(
-    indoc! {r#"
-        out = defer()
-        for i in [1, 2]:
-            out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
-        sum([v for v in out])
-    "#},
-    "lifting a filter whose subterms' types read"
-)]
 #[case::reading_an_outer_loops_binder(
     indoc! {r#"
         out = defer()

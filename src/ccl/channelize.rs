@@ -838,6 +838,7 @@ impl ChannelizeCtx {
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
 pub fn run(expr: Expr) -> Result<Expr, Located<DeferError>> {
+    check_predicate_defers(&expr, &mut HashSet::new())?;
     let mut ctx = ChannelizeCtx::new();
     // Cluster channelization.  Walks the tree, processes `let d = Defer in …`
     // clusters, extracting feeds and building each defer's channel.
@@ -1052,9 +1053,52 @@ fn predicates_hold_type(
     }
     let mut found = false;
     walk_refined_predicates(ty, visited, &mut |pred, vis| {
-        found |= in_expr(pred, hit, vis);
+        // A predicate holding its own `defer` is in source form: this pass does not rewrite
+        // inside a predicate, and lifting the predicate channelizes it
+        // (`planning::predicates::eliminate_lifted`), so its channel types are its own until
+        // then.
+        if !holds_defer(pred) {
+            found |= in_expr(pred, hit, vis);
+        }
     });
     found
+}
+
+/// Report the first error in a `defer` block that a refinement predicate in `expr` holds.
+///
+/// This pass leaves a predicate holding a `defer` in source form, and planning channelizes
+/// it where it lifts it (`crate::ccl::planning::predicates::eliminate_lifted`). An error in
+/// the block is the program's, so this pass reports it as it reports one in the tree: it
+/// channelizes a copy of the predicate and discards the result. The copy keeps the
+/// predicate's ids, so the error points at the source.
+fn check_predicate_defers(
+    expr: &Expr,
+    visited: &mut HashSet<PredicateId>,
+) -> Result<(), Located<DeferError>> {
+    let mut result = Ok(());
+    let mut in_predicate = |pred: &Expr, visited: &mut HashSet<PredicateId>| {
+        if result.is_ok() {
+            result = if holds_defer(pred) {
+                provenance::preserving_ids(|| run(pred.clone())).map(drop)
+            } else {
+                check_predicate_defers(pred, visited)
+            };
+        }
+    };
+    expr.walk_type_slots(|ty| walk_refined_predicates(ty, visited, &mut in_predicate));
+    result?;
+    let mut result = Ok(());
+    expr.walk_children(|child| {
+        if result.is_ok() {
+            result = check_predicate_defers(child, visited);
+        }
+    });
+    result
+}
+
+/// Whether `e` binds a `defer` anywhere in its term.
+pub(crate) fn holds_defer(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Defer) || e.fold_children(false, |acc, c| acc || holds_defer(c))
 }
 
 /// Whether one type slot holds a type satisfying `hit`, structure and refinement predicates
