@@ -1199,3 +1199,38 @@ fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] gen
         sort_tile_collections(run_pipeline(generic)),
     );
 }
+
+/// A group-by under a loop whose key reads the loop's binder, in shapes the compiler does not
+/// compile yet. Each is refused as a compiler gap rather than reaching a later pass.
+#[rstest]
+#[case::over_a_source_the_loop_filters(
+    indoc! {r#"
+        out = defer()
+        for i in [1, 2]:
+            out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
+        sum([v for v in out])
+    "#},
+    "lifting a filter whose subterms' types read"
+)]
+#[case::reading_an_outer_loops_binder(
+    indoc! {r#"
+        out = defer()
+        for i in [1, 2]:
+            for j in [1, 2]:
+                out << sum([1 for g in groupby([1, 2, 3], \e -> e // (i + j))])
+        sum([v for v in out])
+    "#},
+    "reads an outer loop's binder under a nested loop"
+)]
+#[case::whose_key_is_not_a_scalar(
+    indoc! {r#"
+        out = defer()
+        for i in [1, 2]:
+            out << sum([1 for g in groupby([1, 2, 3], \e -> (e // i, e))])
+        sum([v for v in out])
+    "#},
+    "and is not a scalar is not supported yet"
+)]
+fn a_group_by_under_a_loop_not_compiled_yet(#[case] code: &str, #[case] gap: &str) {
+    check_compile_error(code, gap);
+}

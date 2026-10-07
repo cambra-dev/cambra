@@ -262,12 +262,47 @@ fn compile_predicates_in_type(
     // predicate typed as a collection over a witness carries the source's candidate types in
     // its own kind — walking them re-enters the refinements this predicate came out of.
     // A binder's candidates are compiled where the binder's own type is.
+    //
+    // A dependent tuple's components are compiled **under the names** of the components
+    // before them, then closed again. A component's predicate can hold a subterm whose type
+    // reads an earlier component — a projection out of the tuple has one — and compiled
+    // closed, that index is carried under the crossings the compiled morphisms add, where it
+    // names another function.
     match ty {
+        // A codomain is compiled in its opened form: a predicate there may hold a subterm
+        // whose type reads the binder, and compiled closed, that index is carried under the
+        // crossings the compiled morphisms add, where it names another function.
         Type::Fun {
-            domain, codomain, ..
+            name,
+            domain,
+            codomain,
+            ..
         } => {
             compile_predicates_in_type(domain, memo, slot);
-            compile_predicates_in_type(codomain, memo, slot);
+            match name {
+                Some(b) => crate::ccl::subst::map_opened_codomain(b, codomain, |opened| {
+                    compile_predicates_in_type(opened, memo, slot)
+                }),
+                None => compile_predicates_in_type(codomain, memo, slot),
+            }
+        }
+        Type::DepTuple(components) => {
+            let names = crate::ccl::subst::tuple_component_names(components);
+            let mut opened: Vec<(Option<Name>, Type)> =
+                crate::ccl::subst::open_tuple_components(components, |j, _| {
+                    crate::ccl::subst::Mapping::Rename(names[j].clone())
+                })
+                .into_iter()
+                .zip(&names)
+                .map(|(mut t, name)| {
+                    compile_predicates_in_type(&mut t, memo, slot);
+                    (Some(name.clone()), t)
+                })
+                .collect();
+            crate::ccl::subst::close_tuple_components(&mut opened);
+            for ((_, component), (_, t)) in components.iter_mut().zip(opened) {
+                *component = t;
+            }
         }
         _ => ty.walk_children_mut(|child| compile_predicates_in_type(child, memo, slot)),
     }

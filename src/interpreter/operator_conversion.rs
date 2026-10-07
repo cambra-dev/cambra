@@ -2534,17 +2534,12 @@ fn convert_impl_inner(
                     operands.len()
                 )));
             };
-            // `const(𝐾) ▷ strength_over`, the chain planning writes where the site's type is
-            // not dependent: each row beside the one collection every row reads.
-            let keys = convert_impl(source, None, ctx)?;
-            let level = ctx.level();
-            let pairs = strength_over_at(outer, ctx, |slot, _| {
-                Ok(Box::new(MapResultToConst::new_at(
-                    slot,
-                    keys,
-                    MapResultToConstMode::Replace,
-                    level,
-                )))
+            // The source is the **family** of key collections, one per enclosing value: a
+            // dependent tuple's second component (`src/ccl/planning/correlated.rs`,
+            // `keys_family`), or `const(𝐾)` where every row reads one collection. Each row
+            // goes beside its own collection, `𝐹 ▷ strength_over`.
+            let pairs = strength_over_at(outer, ctx, |slot, ctx| {
+                convert_impl(source, Some(slot), ctx)
             })?;
             // The morphism runs once per pair, over the iteration `strength_over` appends.
             convert_lifted(morphism, Some(pairs), ctx)
