@@ -411,31 +411,15 @@ impl Name {
         }
     }
 
-    /// This name as a **mutable variable record field label** for a
-    /// [`crate::ccl::TypedExprNode::Transact`] key. A variable read of a
-    /// mutable variable key projects this field of the history record
-    /// (`__hist.field_key`).
+    /// Return the uid-free spelling used for a mutable-variable record field.
     ///
-    /// It is the plain [`base`](Self::base) spelling, and carries no `uid`. The
-    /// label has to be distinct only among the keys of one history record — every
-    /// consumer resolves it against a `keys_map` built per
-    /// [`Transact`](crate::ccl::TypedExprNode::Transact) node, so accumulators in
-    /// sibling loops live in different records and cannot collide. Folding the
-    /// `uid` in would buy global distinctness nothing needs, at the cost of
-    /// rendering a run-varying identity into a `String`: once a name is a record
-    /// label, uid-robust comparison is impossible, and two compilations of one
-    /// source disagree. That made program diffing at and below loop planning
-    /// unusable — see `src/ccl/design/diffing.md`.
+    /// Labels must be distinct within the consuming history record. Generated reply taps
+    /// use `defer_tap_field`'s reserved namespace; record/key-map construction sites
+    /// debug-assert distinctness. `PiBound` is a reference, not a valid field-label binder.
     ///
-    /// The per-record uniqueness this relies on is a property of spellings. A key
-    /// spelling is the user's own variable name, distinct within the block or loop
-    /// that declares it; the reply taps sharing the record are minted into the
-    /// double-underscore namespace user code cannot bind
-    /// ([`defer_tap_field`](Self::defer_tap_field)), so they cannot collide with
-    /// one. Nothing in the type system says that, so each site that builds a
-    /// record from these labels asserts distinctness in debug: `hist_record` in
-    /// `planning/loops.rs`, and the four `keys_map` inserts in
-    /// `interpreter/operator_conversion.rs`.
+    /// Hashing cannot normalize a uid after it becomes string content. See
+    /// `src/ccl/design/diffing.md`,
+    /// "A name rendered into a string is past the point uid-robustness applies".
     pub fn field_key(&self) -> String {
         match self {
             // Not a binder, so no mutable variable is ever declared at one and

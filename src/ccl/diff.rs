@@ -11,6 +11,7 @@
 //!
 //! The matcher does not inspect [`Phase`] metadata. The caller chooses the trees and must
 //! observe the phase qualifications in `src/ccl/design/diffing.md`, "Which phase to diff".
+//! [`diff_programs`] compiles sources to a common requested stop before diffing.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -22,19 +23,13 @@ use super::scope::{ScopedItem, for_each_scoped_item};
 use super::{Name, TypedExpr};
 use crate::chl_parser::SourceMap;
 
-/// How much of the smaller of two subtrees must be common before container
-/// recovery will pair them — see the containment gate in [`bottom_up`]. The
-/// GumTree default, applied to a different measure than GumTree's.
+/// Minimum matched-descendant overlap for `bottom_up` candidate admission.
 const SIMILARITY_THRESHOLD: f64 = 0.5;
 
-/// Node-count ceiling for the optimal recovery step ([`recover`]), applied to
-/// each of the two subtrees it is asked to align.
+/// Maximum subtree size, including the root, admitted to `recover`.
 ///
-/// Recovery runs Zhang–Shasha tree edit distance, which is `O(n²m²)` in the
-/// worst case. When either subtree holds more than this many nodes, recovery
-/// declines: the pair keeps whatever the top-down and bottom-up phases matched,
-/// and their still-unmatched interiors are reported as deleted and new rather
-/// than aligned node-for-node. GumTree's default, for the same reason.
+/// Larger pairs retain their current matches and skip this tree-edit invocation.
+/// Subsequent bottom-up iterations may still match their descendants.
 const MAX_RECOVERY_SIZE: u32 = 100;
 
 /// Whether a matched node's *content* changed, and if so whether the change is
@@ -42,15 +37,12 @@ const MAX_RECOVERY_SIZE: u32 = 100;
 /// move, or stay put and change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Content {
-    /// Equal content hash — identical computation, reusable wholesale.
+    /// Equal scope-resolved subtree fingerprints; not a runtime-value equality proof.
     Same,
-    /// The subtree differs but the node's own content does not: same literal,
-    /// operator, binder, annotation and cast target, over children that
-    /// changed. The disagreement is under it and is reported there — see
-    /// [`Diff::divergences`].
+    /// Different subtree fingerprints with equal own-content fingerprints.
+    /// A visited child need not explain the change; excluded type slots can differ.
     ChangedBelow,
-    /// The node itself differs, by [`own_hash`]. Its children may differ
-    /// too, and report separately.
+    /// Different own-content fingerprints, regardless of changes below.
     Changed,
 }
 
@@ -131,32 +123,15 @@ impl<'a> Diff<'a> {
                 .all(|m| m.content == Content::Same && m.placement == Placement::InPlace)
     }
 
-    /// The places the two programs disagree, reduced to the node that owns each
-    /// disagreement, in new-program order (deletions, which have no place there,
-    /// come last).
+    /// Reduce the node inventory to change sites.
     ///
-    /// This is the actionable form of the diff, and where a version guard would
-    /// be placed. `matched`/`deleted`/`new` are complete but say the same thing
-    /// many times: every *ancestor* of an edit has changed content too, and every
-    /// *descendant* of an inserted subtree is itself new. One literal edited at
-    /// the bottom of a forty-binding spine leaves forty-two changed nodes, of
-    /// which exactly one is the edit. Divergences report that one.
+    /// Inserted wrappers precede their descendants; matched changed nodes follow theirs.
+    /// Deleted source regions are appended afterward. Own-content changes are retained
+    /// even when a child changed, so sites of the same kind can nest.
     ///
-    /// Two rules decide what is reported, and neither is a minimality theorem —
-    /// the set is small in the shapes the tests measure, not provably smallest:
-    ///
-    /// - A node whose own content is intact ([`Content::ChangedBelow`]) is
-    ///   reported only when nothing below it was, so the child that explains it
-    ///   is not joined by its container.
-    /// - A node whose own content changed ([`Content::Changed`]) is reported
-    ///   whatever its children did. Suppressing it would leave a real change with
-    ///   no site.
-    ///
-    /// Each kind is reported at its own root, so no two divergences of the same
-    /// kind nest. Across kinds they can: the walk descends under an inserted
-    /// region, because a new expression can wrap content that survived, so a
-    /// `Changed` may sit inside an `Inserted` or a `Deleted`. A consumer placing
-    /// a guard per divergence gets nested guards there.
+    /// The reduction rules and deletion-based suppression are specified in
+    /// `src/ccl/design/diffing.md`, "The actionable form: divergences and shared roots".
+    /// This is not a minimum edit script or a placement-only change list.
     pub fn divergences(&self) -> Vec<Divergence<'a>> {
         let by_dst: HashMap<*const TypedExpr, &Match<'a>> = self
             .matched
@@ -259,17 +234,12 @@ impl<'a> Diff<'a> {
         out
     }
 
-    /// The largest subtrees the two programs have in common: every node whose
-    /// content is unchanged and whose parent's is not, in new-program order.
+    /// Return the first `Same` correspondence reached on each destination path.
     ///
-    /// These are the units of reuse — a `Same` node's whole subtree is `Same`,
-    /// so reporting the descendants as well would say nothing more.
-    ///
-    /// Reuse here means *the term is the same term*, which is what a unified
-    /// tree needs. It does **not** mean the term evaluates to the same value in
-    /// both versions: `let x = 1 in x` and `let x = 2 in x` share the body `x`,
-    /// and that is right — the two `let`s are a divergence, and it is the
-    /// binding that differs, not the read.
+    /// The regions are disjoint and maximal within this correspondence. The walk stops
+    /// at each result without separately checking its descendants. Matching term content
+    /// does not establish equal runtime values when external definitions differ.
+    /// See `src/ccl/design/diffing.md`, "The actionable form: divergences and shared roots".
     pub fn shared_roots(&self) -> Vec<&Match<'a>> {
         let by_dst: HashMap<*const TypedExpr, &Match<'a>> = self
             .matched
@@ -297,14 +267,8 @@ impl<'a> Diff<'a> {
     }
 }
 
-/// One place the two programs disagree, at the granularity a version guard is
-/// placed. Each kind is reported at its own root, so no two divergences of the
-/// same kind nest; across kinds a [`Changed`] can sit inside an [`Inserted`] or
-/// a [`Deleted`], because a new expression can wrap content that survived.
-///
-/// [`Changed`]: Divergence::Changed
-/// [`Inserted`]: Divergence::Inserted
-/// [`Deleted`]: Divergence::Deleted
+/// One reduced change site. Sites can nest, including sites of the same kind.
+/// See `Diff::divergences` for traversal order and suppression rules.
 #[derive(Debug, Clone, Copy)]
 pub enum Divergence<'a> {
     /// Both programs have a node here and this node is the one that changed:
@@ -330,18 +294,10 @@ pub fn diff<'a>(src: &'a TypedExpr, dst: &'a TypedExpr) -> Diff<'a> {
     classify(&s, &d, &m)
 }
 
-/// Anchor the two roots to each other when phase 1 has not already.
+/// Pair two unmatched roots of the same node kind, then recover their interiors.
 ///
-/// Two programs being diffed are two *versions of one program*, so their roots
-/// correspond by construction — neither has anywhere else to go. [`bottom_up`]
-/// cannot reach that on its own because it is seeded by already-matched
-/// descendants and gives up when a node has none, which is exactly the case
-/// where two roots correspond but nothing *inside* them does: `Some(1)` against
-/// `Some(2)` would otherwise be a wholesale rebuild rather than an edited
-/// payload. Anchoring also hands step 4 a pair to align the interiors within.
-///
-/// Requiring the same node kind keeps the anchor honest: two genuinely
-/// unrelated programs (a `BinOp` against a `Lit`) still correspond nowhere.
+/// This creates a recovery boundary even without matched descendants. A root already
+/// anchored elsewhere is not remapped. The function does not verify shared source history.
 fn anchor_roots(s: &Indexed, d: &Indexed, m: &mut Matching) {
     const ROOT: usize = 0;
     if m.src_matched(ROOT) || m.dst_matched(ROOT) || s.nodes[ROOT].kind != d.nodes[ROOT].kind {
@@ -609,19 +565,12 @@ fn top_down(s: &Indexed, d: &Indexed, m: &mut Matching) {
     }
 }
 
-/// Pick the free candidate in `cands` (all of which are isomorphic to `u`) that
-/// sits in the most structurally corresponding position, by three criteria in
-/// descending priority:
+/// Rank free equal-hash candidates by parent correspondence, ancestor-kind prefix,
+/// depth proximity, then earliest destination index.
 ///
-/// 1. **Its parent already corresponds to `u`'s.** Exact information, when the
-///    enclosing structure happens to be matched already.
-/// 2. **The longest agreeing chain of ancestor kinds.** `1` in a branch body
-///    and `1` in that branch's guard are indistinguishable as subtrees; their
-///    ancestor chains (`Case, Let` vs `BinOp, Case, Let`) are not.
-/// 3. **The closest depth**, then source order, as a deterministic tie-break.
-///
-/// Without this the choice is arbitrary, and an arbitrary choice manufactures a
-/// spurious move plus a spurious delete/insert pair for the copy it displaced.
+/// The candidate hashes are not structural equality proofs. Ranking preserves
+/// context when literals or other small subterms repeat; see
+/// `src/ccl/design/diffing.md`, "Equal-hash anchoring".
 fn best_candidate(
     s: &Indexed,
     d: &Indexed,
@@ -667,13 +616,11 @@ fn ancestor_kinds(t: &Indexed, n: usize) -> Vec<Discriminant<super::TypedExprNod
     out
 }
 
-/// Map two subtrees known to be isomorphic (equal content hash). Children are
-/// paired by hash, not position, so the correspondence is correct even for the
-/// order-insensitive nodes (`Record`, `DisjointJoin`), whose children may be
-/// stored in a different order despite equal hashes. Already-matched nodes are
-/// skipped so a recursive mapping can never overwrite an existing pairing —
-/// reachable when a subtree shape repeats and two separate anchors descend into
-/// overlapping dst regions.
+/// Map an equal-hash pair and greedily pair its free children by hash.
+///
+/// Root arguments must be unmatched. Already-matched source children and destination
+/// children are skipped, so descent cannot overwrite their pairings. Hash pairing
+/// supports unordered child storage; no structural equality check follows it.
 fn map_isomorphic(s: &Indexed, d: &Indexed, u: usize, w: usize, m: &mut Matching) {
     m.map(u, w);
     let wc = &d.nodes[w].children;
@@ -718,10 +665,8 @@ fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
             continue;
         }
 
-        // Two questions, two measures. *Containment* decides whether `w` is a
-        // plausible counterpart at all; *tightness* picks between the plausible
-        // ones. Conflating them is what made a container that gained a
-        // statement look implausible — see the note on the two below.
+        // Admit by overlap, then rank by Dice. A Dice admission threshold
+        // would reject some containers solely because one side gained material.
         let src_desc = f64::from(s.nodes[u].size - 1);
         let mut best: Option<(usize, f64)> = None;
         for w in 0..d.len() {
@@ -736,18 +681,13 @@ fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
                 continue;
             }
             let dst_desc = f64::from(d.nodes[w].size - 1);
-            // Containment (the overlap coefficient): "is one of these two
-            // essentially inside the other?" Normalizing by the *smaller*
-            // subtree is what makes it survive an edit that grows or shrinks
-            // one side — the case Dice alone gets wrong.
+            // Exclude the candidate roots from both descendant counts.
             let contained = common as f64 / src_desc.min(dst_desc);
             if contained < SIMILARITY_THRESHOLD {
                 continue;
             }
-            // Tightness (Dice): among the plausible candidates — which are
-            // necessarily nested in one another, since they all contain the
-            // same matched descendants — the growing denominator prefers the
-            // innermost, i.e. the container that fits `u` best.
+            // Candidates can cover different subsets of the matched descendants.
+            // Strict improvement preserves the earliest candidate on a tie.
             let dice = 2.0 * common as f64 / (src_desc + dst_desc);
             if best.is_none_or(|(_, b)| dice > b) {
                 best = Some((w, dice));
@@ -765,22 +705,11 @@ fn bottom_up(s: &Indexed, d: &Indexed, m: &mut Matching) {
 // Phase 4: optimal recovery inside a paired container
 // ---------------------------------------------------------------------------
 
-/// Optimally align the still-unmatched interiors of a freshly paired
-/// container pair `(u, w)`.
+/// Adopt free same-kind pairs from bounded tree-edit recovery.
 ///
-/// Steps 1–2 match by *whole-subtree* equality and by container similarity;
-/// neither can pair two subtrees that are nearly identical but differ somewhere
-/// inside. That leaves a real gap: an edit deep in a large subtree would report
-/// the whole surrounding structure as deleted-and-reinserted. This step closes
-/// it by computing the minimum-cost edit mapping between the two subtrees
-/// ([`ted::mapping`]) and adopting every pair it aligns whose nodes are
-/// same-kind and still unmatched.
-///
-/// The mapping is *optimal* under unit edit costs. (GumTree reaches for RTED,
-/// which computes the same optimal mapping as the Zhang–Shasha dynamic program
-/// used here, faster, by choosing a better decomposition strategy — the
-/// difference is asymptotic cost, not the result.) Subtrees above
-/// [`MAX_RECOVERY_SIZE`] are left to steps 1–2 alone.
+/// The edit mapping respects existing anchors through its relabel cost. The adopted
+/// subset is not a globally optimal correspondence. Size and cost rules are specified
+/// in `src/ccl/design/diffing.md`, "Bounded tree-edit recovery".
 fn recover(s: &Indexed, d: &Indexed, u: usize, w: usize, m: &mut Matching) {
     if s.nodes[u].size > MAX_RECOVERY_SIZE || d.nodes[w].size > MAX_RECOVERY_SIZE {
         return;
@@ -792,13 +721,11 @@ fn recover(s: &Indexed, d: &Indexed, u: usize, w: usize, m: &mut Matching) {
     }
 }
 
-/// Zhang–Shasha tree edit distance, specialized to recovering the *mapping*
-/// between two subtrees of already-indexed trees.
+/// Ordered tree-edit mapping for a selected pair of indexed subtrees.
 ///
-/// Node labels are content hashes: relabelling is free when the hashes agree
-/// and costs one otherwise; deleting or inserting a node costs one. The
-/// returned mapping is the node correspondence induced by a minimum-cost edit
-/// script.
+/// The dynamic program minimizes insertion/deletion/relabel costs. Existing anchors
+/// affect relabel cost, and `recover` filters the returned mapping afterward; see
+/// `src/ccl/design/diffing.md`, "Bounded tree-edit recovery".
 mod ted {
     use super::Indexed;
 
@@ -1004,12 +931,9 @@ mod ted {
 // Classification
 // ---------------------------------------------------------------------------
 
-/// The [`resolved_hash`] of every node of `t`, indexed the same way `t` is.
+/// Combine an owner correspondence token with a binder's group position.
 ///
-/// Distinguishes the `j`th binder a node introduces from its siblings, without
-/// letting two nodes' correspondents collide: the multiplier is the 64-bit
-/// golden-ratio constant, so a one-bit change in either input spreads across the
-/// result.
+/// This is a 64-bit hash input, not a collision-free encoding of the pair.
 fn mix(correspondent: u64, j: u64) -> u64 {
     correspondent.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ j
 }
@@ -1023,19 +947,11 @@ struct NodeHashes {
     own: u64,
 }
 
-/// Walks top-down carrying the binders each node sits under, each tagged with
-/// the correspondent `correspondent_of` gives its owner, so a free variable
-/// inside a subterm
-/// hashes to *which binder it resolves to* rather than to how that binder
-/// happens to be spelled.
+/// Compute whole-subtree and own-content hashes under the binder correspondence.
 ///
-/// The binders a node puts over each of its children come from
-/// [`for_each_scoped_item`], the crate's single statement of CCL's binding
-/// structure — this walk does not restate them. It is keyed by child pointer
-/// because the differ descends into one child the scope walk does not: a cast
-/// target's refinement predicate, which is a type slot. That predicate sits in
-/// its cast's own scope, so an absent entry meaning "no binders" is exactly
-/// right for it.
+/// Scoped children come from `for_each_scoped_item`. Child pointers associate the
+/// introduced binders with the differ's child enumeration. An absent entry adds no
+/// binders; cast-target predicates therefore inherit the cast's surrounding scope.
 fn resolved_hashes(t: &Indexed<'_>, correspondent_of: &dyn Fn(usize) -> u64) -> Vec<NodeHashes> {
     fn go<'a>(
         t: &Indexed<'a>,
@@ -1152,17 +1068,11 @@ fn classify<'a>(s: &Indexed<'a>, d: &Indexed<'a>, m: &Matching) -> Diff<'a> {
     out
 }
 
-/// Decide, for every matched src node, whether it kept its position — the
-/// child-alignment step of Chawathe et al.'s edit-script derivation, which
-/// GumTree inherits.
+/// Mark matched roots and eligible children as in place.
 ///
-/// A node is in place iff it hangs off the corresponding parent **and** it did
-/// not cross any of its matched siblings. Within one matched container pair,
-/// "did not cross" is decided by taking a longest increasing subsequence of the
-/// matched children's destination positions: the children on it kept their
-/// relative order and stay put, and the rest are the minimum set of moves that
-/// explains the permutation. Order-insensitive containers skip the test —
-/// permuting their children is not an edit at all.
+/// Eligibility requires corresponding parents. Ordered siblings use one longest
+/// increasing subsequence of destination positions; unordered parents skip that test.
+/// See `src/ccl/design/diffing.md`, "Placement classification".
 fn align_children(s: &Indexed, d: &Indexed, m: &Matching) -> Vec<bool> {
     let mut in_place = vec![false; s.len()];
 
@@ -1241,15 +1151,10 @@ fn longest_increasing(seq: &[usize]) -> Vec<usize> {
 /// How wide a single node's term rendering may get before it is elided.
 const RENDER_WIDTH: usize = 68;
 
-/// One node's own line in a rendered diff: the head of its symbolic form.
+/// Render a subterm, then retain its first line up to `RENDER_WIDTH` characters.
 ///
-/// A node is shown by rendering its whole subterm with
-/// [`symbolic`](crate::ccl::symbolic::symbolic) and keeping the first line, cut
-/// to [`RENDER_WIDTH`]. That reads naturally — a leaf prints exactly, an
-/// interior node prints its head (`let a = 1 in …`) — and it costs nothing to
-/// keep in step with the AST, which a second shallow-label vocabulary would
-/// not. The price is `O(n²)` text for the whole tree; this is a debugging and
-/// inspection surface, not a hot path.
+/// The full symbolic rendering is constructed before truncation. Repeating this for
+/// overlapping subterms can perform quadratic term visits; embedded types add cost.
 fn head(e: &TypedExpr) -> String {
     let full = crate::ccl::symbolic::symbolic(e);
     let line = full.lines().next().unwrap_or("").trim_end();
@@ -1260,26 +1165,11 @@ fn head(e: &TypedExpr) -> String {
     out
 }
 
-/// Renders as an annotated tree of the **new** program, plus whatever the old
-/// program had that the new one dropped.
+/// Render destination nodes and deleted source regions.
 ///
-/// Every node of the new program is marked with what the diff concluded about
-/// it. An inserted or deleted subtree is shown by its **root** only, with its
-/// node count — printing every node of a pasted-in block is noise, and the root
-/// is the actionable unit.
-///
-/// ```text
-/// 15 shared · 3 changed · 1 moved · 0 deleted · 4 new
-///
-/// ~ let a = 1 in let b = sum(…) in a + b…
-///   = 1
-///   + let b = sum([i ▷ (λ i → i * 2) for …    (+13 nodes)
-///   ~ a + b
-///     = a
-/// ```
-///
-/// Markers: `=` unchanged, `~` content changed, `+` new, `-` deleted, and a
-/// trailing `»` on a node whose placement changed.
+/// The summary counts full node inventories, not rendered lines or divergence sites.
+/// Markers, truncation and region collapsing are specified in
+/// `src/ccl/design/diffing.md`, "Reading a diff".
 impl std::fmt::Display for Diff<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let by_dst: HashMap<*const TypedExpr, &Match> = self
@@ -1322,18 +1212,10 @@ impl std::fmt::Display for Diff<'_> {
     }
 }
 
-/// Is every node of `e`'s subtree in `set`?
+/// Whether every node in the differ's subtree belongs to `set`.
 ///
-/// This is what decides whether a wholly-inserted or wholly-deleted region may
-/// collapse to its root in the rendering. A node in `set` whose *interior* is
-/// still matched is a different thing entirely — a wrapper that appeared or
-/// vanished around content that survived — and collapsing it would claim its
-/// surviving children changed too.
-///
-/// Walks [`child_exprs`], not `all_children`, because that is the child set the
-/// differ indexed: a cast target's refinement predicate is a node the matcher
-/// can match and `all_children` does not reach. Testing the narrower set would
-/// call a cast wholly-gone while a matched node still lives in its predicate.
+/// Use `child_exprs`, not the ordinary term walk: a surviving cast predicate must
+/// prevent its wrapper from being rendered as wholly inserted or deleted.
 fn subtree_entirely_in(e: &TypedExpr, set: &HashSet<*const TypedExpr>) -> bool {
     set.contains(&(e as *const TypedExpr))
         && child_exprs(e)
@@ -1406,10 +1288,10 @@ fn render_node(
     }
 }
 
-/// Collect the topmost deleted nodes of `root`, each flagged with whether its
-/// whole subtree went with it. A wholly-deleted region is reported once, at its
-/// root; a deleted node whose children survived is reported alone, and the walk
-/// continues through it to find whatever else was dropped further down.
+/// Collect deleted nodes, stopping only at wholly deleted subtrees.
+///
+/// A deleted wrapper with surviving descendants is reported and still traversed.
+/// Results can therefore contain nested deleted sites.
 fn collect_deleted_roots<'a>(
     e: &'a TypedExpr,
     gone: &HashSet<*const TypedExpr>,
