@@ -15,7 +15,7 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Name, Type, anf, channelize,
+        Expr, Name, Type, anf, channelize, comprehension,
         infer::{
             InferError, LocatedInferError, TypeInferenceContext, check_mut_discipline,
             check_mut_write_targets, check_pre_channelize, check_pre_channelize_located, infer,
@@ -1175,6 +1175,13 @@ pub enum Phase {
     /// binding A-normalization already gave each read it could move and minting
     /// one for the position it could not.
     MutRead,
+    /// Comprehension lowering ([`crate::ccl::comprehension`]): the surface
+    /// `Comprehension` node to the `cast`/`λ`/`▷` encoding. Runs on the
+    /// A-normalized, read-named pre-inference tree, which is the point of
+    /// placing it here: the encoding is a refined cast, and A-normalization
+    /// leaves one exactly as it finds it, so a comprehension born at lowering
+    /// reached inference un-normalized.
+    Comprehension,
     /// Type inference ([`crate::ccl::infer`]): the phase that bridges the
     /// pre-inference and post-inference panes. Monomorphization is what mints
     /// inside it — cloning a generalized definition's subtree once per distinct
@@ -2024,6 +2031,20 @@ fn run_passes(
     expr = recorded(capture_provenance, Phase::MutRead, || mut_read::run(expr));
     debug!("Mutable reads named:\n{}", symbolic(&expr));
     if at_phase_output(Phase::MutRead, &expr, stop, capture, panes) {
+        return Ok(expr);
+    }
+
+    // Lower each comprehension into the `cast`/`λ`/`▷` encoding, now that the
+    // tree is A-normalized and every mutable-variable read is named — so the
+    // generator source a loop-join copies into its predicate is the term both
+    // of those passes left behind, and the two copies are equal by
+    // construction (`crate::ccl::comprehension`). `recorded` because the pass
+    // mints the whole encoding.
+    expr = recorded(capture_provenance, Phase::Comprehension, || {
+        comprehension::run(expr, ctx.lowering_ctx().shared_holes())
+    });
+    debug!("Comprehensions lowered:\n{}", symbolic(&expr));
+    if at_phase_output(Phase::Comprehension, &expr, stop, capture, panes) {
         return Ok(expr);
     }
 

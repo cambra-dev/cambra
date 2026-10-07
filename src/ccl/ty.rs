@@ -982,6 +982,32 @@ pub fn reset_fun_kind_var_counter() {
     FUN_KIND_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
+/// The [`Type::SharedHole`] id mint: one counter, so two positions carrying the
+/// same id are two positions one desugaring held to one type.
+///
+/// Shared by lowering and the comprehension phase rather than one per pass. Ids
+/// are meaningless outside the tree they were minted for, and both write into
+/// the same tree, so a second counter would spell one relation with an id the
+/// other had already spent on a different one.
+#[derive(Debug, Default, Clone)]
+pub struct SharedHoleMint {
+    next: u32,
+}
+
+impl SharedHoleMint {
+    /// A fresh id, unique within this mint.
+    ///
+    /// Use one id per *relation* a desugaring wants to state, and stamp it on
+    /// every position that relation covers: inference normalizes equal ids to
+    /// one variable, so two positions carrying the same id are held to the same
+    /// type.
+    pub fn fresh(&mut self) -> Type {
+        let id = self.next;
+        self.next += 1;
+        Type::SharedHole(id)
+    }
+}
+
 /// A CCL type annotation.
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
@@ -4012,6 +4038,9 @@ pub type WitnessRenaming = std::collections::BTreeMap<WitnessId, WitnessId>;
 fn eq_has_arm(node: &TypedExprNode) -> bool {
     use TypedExprNode as N;
     match node {
+        // A refinement predicate is assembled from already-lowered terms, so a
+        // comprehension never reaches one as a `Comprehension` node.
+        N::Comprehension { .. } => unreachable!("a Comprehension reached a refinement predicate"),
         N::Lit(_)
         | N::Var(_)
         | N::Builtin(_)

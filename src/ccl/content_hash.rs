@@ -19,7 +19,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::scope::{ScopedItem, for_each_scoped_item};
-use super::{FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode};
+use super::{
+    CompClause, FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode,
+};
 
 /// A 64-bit term fingerprint under the chosen free-variable and structural hashing rules.
 /// Equal fingerprints can collide; they do not prove term equivalence.
@@ -417,6 +419,21 @@ fn hash_payload<'a>(
 ) {
     use TypedExprNode as N;
     match &e.node {
+        // The clause *shape* — how many clauses and which kind each is — plus
+        // each generator's binder. The clause expressions and the element are
+        // children, reached by the scoped fold.
+        N::Comprehension { clauses, .. } => {
+            clauses.len().hash(h);
+            for clause in clauses {
+                match clause {
+                    CompClause::For { target, .. } => {
+                        0u8.hash(h);
+                        hash_binding(target, env, wenv, free, fold, h);
+                    }
+                    CompClause::If(_) => 1u8.hash(h),
+                }
+            }
+        }
         // `Realize` wraps the value it realizes and adds no content of its own beyond the
         // discriminant hashed by the caller.
         N::Realize(v) => hash_payload(v, env, wenv, free, fold, h),

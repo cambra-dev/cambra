@@ -46,8 +46,9 @@ even though both display as `x`. `Unique` and `Synthetic` draw identifiers from 
 space; a synthetic name records compiler origin rather than claiming a source declaration.
 
 Structural comparison of copied, already-minted terms preserves binder identity. Independently
-lowered α-equivalent terms can have different `uid`s and need not compare equal. Lowering therefore
-uniquifies a comprehension source before copying it into a loop-join predicate. The whole-program
+lowered α-equivalent terms can have different `uid`s and need not compare equal. The comprehension
+phase therefore runs after `uniquify`, so the generator source it copies into a loop-join predicate
+is already minted. The whole-program
 pass does not mint again at that copied binding site; several copied sites may carry one `uid`.
 No pass may mint fresh uids on an equality-mediated path: copying must preserve the identities
 that refinement deduplication and other structural comparisons use. Within this mint-once,
@@ -77,11 +78,15 @@ analysis and `Subst::rewrite_expr` use that walk. The scope rules are:
 | `LetRec` | Every group binder binds in every definition and in `body`. |
 | `For` | `target` binds in `body`; `iter` is outside its scope. |
 | `Case` | A branch pattern's payload binder binds in that branch's `guard` and `body` only. |
+| `Comprehension` | A generator's `target` binds in every clause to its right and in `element`; its own `iter` is outside its scope. |
 | `Feed`, `Define`, `MutWrite` | `name` is a use of an enclosing binder. |
 | `Transact` | Keys and writer footprints are history-record labels, not variable uses; the node binds nothing. |
 
 `Binders` borrows binder slots without allocating a list and implements the `shadows` check for
-each child. `Transact` labels are emitted as `KeyRef`, distinct from the `VarRef` occurrences that
+each child. A comprehension's binders come into scope one generator at a time, so its covering
+scope is a slice of the clause list (`Binders::Clauses`) and the slices nest: a binder appears in
+several of one node's scopes, and the union over them — not the concatenation — is what matches
+`walk_binders`. `Transact` labels are emitted as `KeyRef`, distinct from the `VarRef` occurrences that
 free-variable analysis counts. A node's type slots and their refinement predicates require the
 caller's type walk; the term-scope walk does not traverse them.
 
@@ -138,18 +143,34 @@ the source spelling `f(a)(b)` is rejected. Curried functions that survive inlini
 `curry` combinator that operator conversion does not currently compile. The ordinary tupled
 lowering avoids that form; see [lowering](lowering.md).
 
+### `Comprehension` — the surface comprehension node
+
+`Comprehension { element, clauses }` carries `[element for … if …]` with its clauses still a flat
+source-ordered list, mirroring `chl_parser::ast::Comprehension` one for one. Lowering builds it;
+`ccl/comprehension.rs` is the phase that eliminates it, between `mut_read` and inference.
+
+The phase is placed there because the encoding below is a refined `Cast`, and A-normalization
+leaves a refined cast's value as it finds it: the cast's value and its target's predicate hold two
+copies of one generator source, and naming a sub-expression under the cast would rewrite only one
+of them (`ccl/anf.rs`, "Five recognition contracts: positions a `Let` must never sit between").
+Built at lowering, a comprehension reached inference un-normalized. In surface form its element
+normalizes like any other term, and the copy the phase takes afterwards is a copy of the normalized
+one.
+
 ### Lambda/Apply encoding of collection iteration
 
-Collection iteration uses ordinary function nodes in two lowering shapes. A single-generator
-comprehension such as `[f(x) for x in xs]` builds an outer lambda over an iteration position:
+Collection iteration uses ordinary function nodes in two shapes. A single-generator comprehension
+such as `[f(x) for x in xs]` becomes an outer lambda over an iteration position:
 `λ __iter_record → __iter_record ▷ xs ▷ (λ x → f(x))`. The first application reads the
 source at that position; the second maps its element through the body. Multiple generators nest
-those application and lambda pairs, with a product of source domains for the outer parameter. A
-feed-only or yield-only statement loop without loop-carried mutation uses
-`xs ≫ (λ x → body)` (`Expr::for_loop`, `lower/loops.rs`). Both forms use existing function
-nodes; mutation and transaction loops instead retain a structured `For`. `lambda_elim` removes the
-lambdas and produces point-free combinators; operator conversion builds the dataflow operators. See
-[lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) and the
+those application and lambda pairs, with a product of source domains for the outer parameter.
+`ccl/comprehension.rs` builds both, and the `__iter_record` binder it mints is a `Synthetic`:
+α-uniquification has already run, so a raw spelling would shadow its twin in a nested
+comprehension. A feed-only or yield-only statement loop without loop-carried mutation uses
+`xs ≫ (λ x → body)` (`Expr::for_loop`, `lower/loops.rs`), built at lowering. Both forms use existing
+function nodes; mutation and transaction loops instead retain a structured `For`. `lambda_elim`
+removes the lambdas and produces point-free combinators; operator conversion builds the dataflow
+operators. See [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) and the
 [operational lowering model](/docs/operational-semantics/lowering.md).
 
 ### `MutDecl` — the mutable variable introduction
@@ -168,7 +189,7 @@ is structural and remains available after source annotations are cleared by infe
 ### `Cast` — explicit refinement acquisition
 
 `Cast { value, target }` attaches a refinement to a function's domain. Lowering constructs it for
-comprehension filters, loop guards, and `groupby`. The emitted target has the shape
+loop guards and `groupby`, and `ccl/comprehension.rs` for comprehension filters. The emitted target has the shape
 `{𝐷 | 𝑝} ⤇ 𝑉`, often with holes for 𝐷 and 𝑉.
 The resolved type is written to the wrapping
 expression's `ty`. Keeping `target` in the node lets type and predicate walks find it without

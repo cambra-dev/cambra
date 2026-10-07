@@ -1258,6 +1258,11 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         node_id,
     } = expr;
     let new_node = match node {
+        TypedExprNode::Comprehension { .. } => {
+            unreachable!(
+                "a Comprehension reached channelize; the comprehension phase eliminates it"
+            )
+        }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -1423,6 +1428,11 @@ fn contains_phase_marker(expr: &Expr) -> bool {
 /// report the first one left at itself.
 fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
     match &expr.node {
+        TypedExprNode::Comprehension { .. } => {
+            unreachable!(
+                "a Comprehension reached channelize; the comprehension phase eliminates it"
+            )
+        }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -2158,6 +2168,9 @@ fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
 fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
     fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
         match &expr.node {
+            TypedExprNode::Comprehension { .. } => unreachable!(
+                "a Comprehension reached channelize; the comprehension phase eliminates it"
+            ),
             TypedExprNode::MutDecl { .. } => {
                 unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
             }
@@ -2476,6 +2489,11 @@ fn extract_for_defer_impl(
         node_id,
     } = expr;
     let node = match node {
+        TypedExprNode::Comprehension { .. } => {
+            unreachable!(
+                "a Comprehension reached channelize; the comprehension phase eliminates it"
+            )
+        }
         // `mut_elim::run` (before channelize) eliminates every mutable variable
         // introduction, so this arm is unreachable in the production pipeline.
         TypedExprNode::MutDecl { .. } => {
@@ -2862,7 +2880,7 @@ fn extract_for_defer_impl(
                             // predicate `__elem ▷ source ▷ (λ p → predᵢ)`
                             // referencing the domain element `__elem` (the same
                             // form a filtered comprehension builds — see
-                            // `lower::comprehension`), then wraps the source's
+                            // `crate::ccl::comprehension`), then wraps the source's
                             // *domain* in `Refinement(_, pred)` so planning
                             // restricts the iteration to passing indices. The
                             // predicate MUST reference `__elem` in this element

@@ -26,6 +26,11 @@
 //! - [`Case`](TypedExprNode::Case) — each branch's `pattern.binding` scopes
 //!   over that branch's `guard` and `body`, and nothing else; the scrutinee and
 //!   the other branches are outside it.
+//! - [`Comprehension`](TypedExprNode::Comprehension) — each generator's
+//!   `target` scopes over every clause to its right and over `element`; its own
+//!   `iter` sits outside it. The covering scope is therefore a clause *prefix*
+//!   ([`Binders::Clauses`]), and the prefixes nest, so one binder appears in
+//!   several of a comprehension's scopes.
 //! - [`Feed`](TypedExprNode::Feed) / [`Define`](TypedExprNode::Define) /
 //!   [`MutWrite`](TypedExprNode::MutWrite) — the `name` field is a *use* of the
 //!   defer handle / mutable variable bound elsewhere, not a binder. It is
@@ -58,6 +63,10 @@
 //!   hands it the change point directly, as a [`ScopedItemMut::Scope`] item.
 //! - **Binders are innermost-last** within a scope — the order a consumer that
 //!   maintains a De Bruijn environment needs to push them in.
+//! - **A scope lists every binder covering its children**, including ones an
+//!   earlier scope of the same node already listed. A `Comprehension`'s scopes
+//!   nest for that reason, so the union over a node's scopes is what matches
+//!   [`TypedExpr::walk_binders`], not the concatenation.
 //!
 //! # What does *not* live here
 //!
@@ -68,7 +77,7 @@
 //! predicates, `is_free_in_value` deliberately does not. This module is about
 //! the *term* spine's binding structure only, matching `walk_children`.
 
-use super::{Name, TypedBinding, TypedExpr, TypedExprNode};
+use super::{CompClause, Name, TypedBinding, TypedExpr, TypedExprNode};
 
 /// The binders a node puts in scope over one of its children.
 ///
@@ -95,6 +104,17 @@ pub enum Binders<'a> {
     /// A whole mutually-recursive group: every member scopes over every child
     /// the group covers (see [`LetRec`](TypedExprNode::LetRec)).
     Group(&'a [(TypedBinding, TypedExpr)]),
+    /// The generator targets of a **prefix** of a
+    /// [`Comprehension`](TypedExprNode::Comprehension)'s clause list: the
+    /// generators whose binders are already open at the child's position.
+    /// Guards contribute no binder, so the slice is read for its
+    /// [`For`](CompClause::For) clauses alone.
+    ///
+    /// A prefix rather than a flat set because a comprehension's binders come
+    /// into scope one generator at a time — `[e for x in xs for y in f(x)]`
+    /// has `f(x)` under `x` and `e` under both — and slicing the clause list
+    /// is what states that without copying the binders out of it.
+    Clauses(&'a [CompClause]),
 }
 
 impl<'a> Binders<'a> {
@@ -105,6 +125,10 @@ impl<'a> Binders<'a> {
             Binders::Ambient => false,
             Binders::One(b) => &b.name == name,
             Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
+            Binders::Clauses(cs) => cs.iter().any(|c| match c {
+                CompClause::For { target, .. } => &target.name == name,
+                CompClause::If(_) => false,
+            }),
         }
     }
 
@@ -112,12 +136,19 @@ impl<'a> Binders<'a> {
     /// environment stack pushes them in.
     pub fn iter(self) -> impl Iterator<Item = &'a TypedBinding> {
         const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
-        let (one, group) = match self {
-            Binders::Ambient => (None, EMPTY),
-            Binders::One(b) => (Some(b), EMPTY),
-            Binders::Group(g) => (None, g),
+        const NO_CLAUSES: &[CompClause] = &[];
+        let (one, group, clauses) = match self {
+            Binders::Ambient => (None, EMPTY, NO_CLAUSES),
+            Binders::One(b) => (Some(b), EMPTY, NO_CLAUSES),
+            Binders::Group(g) => (None, g, NO_CLAUSES),
+            Binders::Clauses(cs) => (None, EMPTY, cs),
         };
-        one.into_iter().chain(group.iter().map(|(b, _)| b))
+        one.into_iter()
+            .chain(group.iter().map(|(b, _)| b))
+            .chain(clauses.iter().filter_map(|c| match c {
+                CompClause::For { target, .. } => Some(target),
+                CompClause::If(_) => None,
+            }))
     }
 
     /// Does this scope introduce nothing? True for [`Binders::Ambient`] — the
@@ -131,6 +162,9 @@ impl<'a> Binders<'a> {
             Binders::Ambient => true,
             Binders::One(_) => false,
             Binders::Group(g) => g.is_empty(),
+            // A prefix holding only guards introduces nothing, so emptiness is
+            // a question about the `for` clauses in it rather than its length.
+            Binders::Clauses(cs) => !cs.iter().any(|c| matches!(c, CompClause::For { .. })),
         }
     }
 
@@ -147,6 +181,9 @@ impl<'a> Binders<'a> {
             (Binders::Ambient, Binders::Ambient) => true,
             (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),
             (Binders::Group(a), Binders::Group(b)) => {
+                a.as_ptr() == b.as_ptr() && a.len() == b.len()
+            }
+            (Binders::Clauses(a), Binders::Clauses(b)) => {
                 a.as_ptr() == b.as_ptr() && a.len() == b.len()
             }
             _ => false,
@@ -209,7 +246,40 @@ where
         f(ScopedItem::Child { expr, binders });
     }
 
+    /// Yield a comprehension child under the generators of `clauses[..bound]`,
+    /// or in the node's own scope when no generator is open yet.
+    fn comp_child<'a, F: FnMut(ScopedItem<'a>) + ?Sized>(
+        f: &mut F,
+        expr: &'a TypedExpr,
+        clauses: &'a [CompClause],
+        bound: usize,
+    ) {
+        if bound == 0 {
+            open(f, expr);
+        } else {
+            under(f, expr, Binders::Clauses(&clauses[..bound]));
+        }
+    }
+
     match &e.node {
+        // A generator's target scopes over every clause to its right and over
+        // the element; its own `iter` sits outside it. So the scope covering a
+        // child is the clause prefix ending at the last `for` before it, and a
+        // run of guards after one generator — and the element behind them —
+        // share that one scope.
+        N::Comprehension { element, clauses } => {
+            let mut bound = 0usize;
+            for (i, clause) in clauses.iter().enumerate() {
+                match clause {
+                    CompClause::For { iter, .. } => {
+                        comp_child(f, iter, clauses, bound);
+                        bound = i + 1;
+                    }
+                    CompClause::If(guard) => comp_child(f, guard, clauses, bound),
+                }
+            }
+            comp_child(f, element, clauses, bound);
+        }
         // ---- Leaves ---------------------------------------------------------
         // `LoadFrom` is a leaf here, not a `VarRef`. Its name addresses a variable the
         // *retired* version declared, so it is the source's own spelling and stays
@@ -520,7 +590,8 @@ where
         | N::MutDecl { .. }
         | N::LetRec { .. }
         | N::For { .. }
-        | N::Case { .. } => {}
+        | N::Case { .. }
+        | N::Comprehension { .. } => {}
     }
 }
 
@@ -528,7 +599,8 @@ where
 mod tests {
     use super::*;
     use crate::ccl::{
-        Branch, Builtin, Lit, Pattern, ProjKey, Type, TypedBinding, TypedExprNode as N, WriterSite,
+        Branch, Builtin, CompClause, Lit, Pattern, ProjKey, Type, TypedBinding, TypedExprNode as N,
+        WriterSite,
     };
 
     fn var(n: &str) -> TypedExpr {
@@ -559,6 +631,7 @@ mod tests {
                 value: Box::new(var("v")),
                 target: Type::Hole,
             }),
+            comprehension_two_generators_one_guard(),
             TypedExpr::binop(
                 var("l"),
                 crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
@@ -615,6 +688,27 @@ mod tests {
             node(N::Defer),
             node(N::Error),
         ]
+    }
+
+    /// Two generators and a trailing guard — both [`CompClause`] kinds, and the
+    /// node whose scopes *nest*: the first `iter` sits outside every target, the
+    /// second under the first target alone, and the guard and the element under
+    /// both.
+    fn comprehension_two_generators_one_guard() -> TypedExpr {
+        node(N::Comprehension {
+            element: Box::new(var("ce")),
+            clauses: vec![
+                CompClause::For {
+                    target: bind("ct1"),
+                    iter: var("cxs1"),
+                },
+                CompClause::For {
+                    target: bind("ct2"),
+                    iter: var("cxs2"),
+                },
+                CompClause::If(var("cg")),
+            ],
+        })
     }
 
     /// A payload-binding branch followed by a payload-free one: the node that
@@ -681,6 +775,7 @@ mod tests {
         N::Builtin(_) => "Builtin",
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
+        N::Comprehension { .. } => "Comprehension",
         N::Realize(_) => "Realize",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",
@@ -756,16 +851,26 @@ mod tests {
 
     /// The scoped walk and [`TypedExpr::walk_binders`] must agree on which
     /// bindings a node declares — the former by scope, the latter by slot.
+    ///
+    /// Compared after dedup, because a node's scopes may *nest*: a
+    /// comprehension's binders come into scope one generator at a time, so each
+    /// run repeats the ones already open (`Binders::Clauses`). Every other node
+    /// opens disjoint scopes and the dedup takes nothing out of them.
     #[test]
     fn declared_binders_match_walk_binders() {
         for e in corpus() {
             let mut declared: Vec<*const TypedBinding> = Vec::new();
             e.walk_binders(|b| declared.push(b));
 
-            let scoped: Vec<*const TypedBinding> = scope_runs(&e)
-                .into_iter()
-                .flat_map(|s| s.iter().map(|b| b as *const _).collect::<Vec<_>>())
-                .collect();
+            let mut scoped: Vec<*const TypedBinding> = Vec::new();
+            for run in scope_runs(&e) {
+                for b in run.iter() {
+                    let p = b as *const _;
+                    if !scoped.contains(&p) {
+                        scoped.push(p);
+                    }
+                }
+            }
             assert_eq!(
                 declared,
                 scoped,

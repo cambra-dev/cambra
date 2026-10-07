@@ -145,7 +145,7 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
+    BindingTransparency, Branch, CompClause, Expr, Name, TypedBinding, TypedExprNode,
     ccl_utils::spelled_in_a_type,
     lambda_elim::substitute,
     mut_scope::{Muts, is_mut_var, under_param, with},
@@ -326,6 +326,33 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
 
         TypedExprNode::Begin { body } => {
             **body = block(std::mem::take(body), muts);
+            expr
+        }
+
+        // A comprehension is still in surface form here
+        // (`crate::ccl::comprehension` builds its `cast` after this pass), so
+        // each part is treated as the position it becomes.
+        //
+        // **The element is its own block**: it becomes the per-element lambda's
+        // body, and a read there names a binding of its own, per position,
+        // exactly as a lambda body's does.
+        //
+        // **A generator source is an ordinary operand** of the statement
+        // carrying the comprehension. The copy the loop-join predicate takes of
+        // it is taken after this pass, so both copies carry the rewrite and stay
+        // equal.
+        //
+        // **A guard is not rewritten.** It becomes the refinement predicate on
+        // the cast's domain, which is a type, and nothing inside a type is
+        // rewritten here (module docs, "Anything inside a type"). A read left
+        // standing there is what `InferError::MutableInRefinedType` reports.
+        TypedExprNode::Comprehension { element, clauses } => {
+            for clause in clauses.iter_mut() {
+                if let CompClause::For { iter, .. } = clause {
+                    *iter = operand(std::mem::take(iter), muts, open, minted);
+                }
+            }
+            **element = block(std::mem::take(element), muts);
             expr
         }
 

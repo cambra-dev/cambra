@@ -119,6 +119,10 @@ pub enum SyntheticKind {
     /// A binding minted by [`crate::ccl::mut_read`] naming the value a block's
     /// mutable-variable reads denote over one segment.
     MutRead,
+    /// The outer binder of a comprehension's encoding
+    /// ([`crate::ccl::comprehension`]): the index position the element map is
+    /// read at, which the generator sources are then indexed by.
+    IterRecord,
 }
 
 impl SyntheticKind {
@@ -133,6 +137,7 @@ impl SyntheticKind {
             SyntheticKind::SolverArg => "__arg",
             SyntheticKind::AnfTemp => "__anf",
             SyntheticKind::MutRead => "__read",
+            SyntheticKind::IterRecord => "__iter_record",
         }
     }
 }
@@ -308,6 +313,12 @@ impl Name {
     /// out of a position ANF requires be atomic.
     pub fn anf_temp() -> Self {
         Self::synthetic(SyntheticKind::AnfTemp)
+    }
+
+    /// A fresh binder for the outer index position of a comprehension's
+    /// encoding ([`crate::ccl::comprehension`]).
+    pub fn iter_record() -> Self {
+        Self::synthetic(SyntheticKind::IterRecord)
     }
 
     /// The binder naming the value a block's mutable-variable reads denote over

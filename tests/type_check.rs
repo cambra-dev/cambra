@@ -18,6 +18,7 @@ use std::{cell::RefCell, rc::Rc};
 use cambra::ccl::{
     Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode,
     ccl_utils::walk_refined_predicates,
+    comprehension,
     infer::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_channelize, infer,
         lit_singleton,
@@ -86,7 +87,7 @@ fn lower_uniquified(module: &chl_ast::Module, lctx: &mut LoweringContext) -> Exp
     let expr = lower_stmts(module, lctx)
         .into_result()
         .expect("lowering failed");
-    uniquify::run(expr)
+    comprehension::run(uniquify::run(expr), lctx.shared_holes())
 }
 
 /// Parse Python module code, lower to CCL, run type inference, and return the
@@ -5480,9 +5481,7 @@ b = box([10, 20]) if d else box([10, 20, 30])
 sum([x + y for x in a for y in b])"
             .trim(),
     );
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_channelize(&expr).expect("post-inference consistency wall must accept the tree");
 

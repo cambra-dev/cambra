@@ -83,7 +83,7 @@ use std::{
 
 use crate::{
     ccl::{
-        Branch, Expr, Lit, Type, TypedExprNode,
+        Branch, Expr, Lit, SharedHoleMint, Type, TypedExprNode,
         provenance::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
@@ -420,21 +420,23 @@ pub struct LoweringContext {
     /// a global meaning of `_`.
     pub(super) in_refinement_predicate: bool,
 
-    /// Counter behind [`fresh_shared_hole`](Self::fresh_shared_hole).
-    next_shared_hole: u32,
+    /// The [`Type::SharedHole`] id mint, shared with the comprehension phase
+    /// (`crate::ccl::comprehension`), which states the same domain equations on
+    /// the same tree and so must not reuse an id lowering already spent.
+    pub(crate) shared_holes: SharedHoleMint,
 }
 
 impl LoweringContext {
-    /// A fresh [`Type::SharedHole`] id, unique within this lowering.
-    ///
-    /// Use one id per *relation* a desugaring wants to state, and stamp it on
-    /// every position that relation covers: inference normalizes equal ids to one
-    /// variable, so two positions carrying the same id are held to the same type.
-    /// Ids are meaningless outside the tree they were minted for.
+    /// A fresh [`Type::SharedHole`] id — see [`SharedHoleMint::fresh`].
     pub(super) fn fresh_shared_hole(&mut self) -> Type {
-        let id = self.next_shared_hole;
-        self.next_shared_hole += 1;
-        Type::SharedHole(id)
+        self.shared_holes.fresh()
+    }
+
+    /// The id mint lowering spent its [`Type::SharedHole`]s from, for the phase
+    /// after it that states domain equations on the same tree
+    /// ([`crate::ccl::comprehension`]).
+    pub fn shared_holes(&mut self) -> &mut SharedHoleMint {
+        &mut self.shared_holes
     }
     /// Register a data source so that `name()` lowers to `Source(name)`.
     pub fn register_source(

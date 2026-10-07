@@ -3252,7 +3252,7 @@ mod tests {
             total += take_predicate_sweep_skips();
         }
         assert_eq!(
-            total, 30,
+            total, 8,
             "the predicate sweep skipped {total} nodes over the corpus",
         );
     }

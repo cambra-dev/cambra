@@ -1,9 +1,10 @@
+use bit_set::BitSet;
 use indoc::indoc;
 use rstest::rstest;
 
-use crate::helpers::{check_compile_error, check_scalar};
+use crate::helpers::{check_compile_error, check_scalar, check_tile};
 
-use cambra::interpreter::Value;
+use cambra::interpreter::{ColumnValue, Predicate, Tile, Value};
 
 #[test]
 fn refinement() {
@@ -943,11 +944,11 @@ x := 3
 ys = [x ^+ i for i in [1,2]]
 ys
         "#},
-        "λ i : Int → let __anf : Int@3 ^= x
-in __anf ^+ i
+        "λ i : Int → let __read : Int@3 ^= x
+in __read ^+ i
 to
-let __anf : (Int ⇒ Int@3) = x ▷ const
-in (((id, __anf ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
+let __read : (Int ⇒ Int@3) = x ▷ const
+in (((id, __read ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
 with (Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})",
     )
 }
@@ -965,5 +966,37 @@ y = x ^+ x
 z: {Int where _ >= 0} = y
 z        "#},
         "post-planning produced an invalid tree",
+    )
+}
+
+/// Type inference drops the refinement from the `ys` function, making
+/// its type `(Int => Int)`, because the refinement contains an opaque
+/// read of `x`. During lambda_elim, a debug assertion rebuilds a
+/// refined type for the codomain from the body (containing `x`, which
+/// is now immutable, and has had its opaque read erased).  The two
+/// types are not structurally equal, and so the assertion fails.
+///
+/// TODO: Fix by mirroring the opaque dropping logic in lambda_elim's
+/// type reconstruction, or by dropping non-data-fun-domain type
+/// refinements (and debug assertion logic that reconstructs them)
+/// after inference.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    should_panic(expected = "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})")
+)]
+fn filtering_a_comprehension_that_reads_a_mut() {
+    check_tile(
+        indoc! {r#"
+x := 3
+ys = [x ^+ i for i in [1,2,3] if i > 1]
+ys
+        "#},
+        Tile::data_function(
+            ColumnValue::UInts(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     )
 }

@@ -78,7 +78,7 @@
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::PredMemo;
-use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{CompClause, Expr, Name, Type, TypedBinding, TypedExprNode};
 
 /// Every **distinct** refinement-predicate term reachable from `expr`, as a
 /// multiset of their id-sets, deduped by `Rc` pointer.
@@ -372,6 +372,27 @@ impl Uniquifier {
                 }
             }
 
+            // A generator's target is minted before the clauses to its right
+            // and the element are walked; its own `iter` is walked before the
+            // mint. The scoping is `crate::ccl::scope`'s, stated there.
+            TypedExprNode::Comprehension { element, clauses } => {
+                let mut bases: Vec<Option<String>> = Vec::new();
+                for clause in clauses.iter_mut() {
+                    match clause {
+                        CompClause::For { target, iter } => {
+                            self.expr(iter);
+                            self.binding_tys(target);
+                            bases.push(self.bind(target));
+                        }
+                        CompClause::If(guard) => self.expr(guard),
+                    }
+                }
+                self.expr(element);
+                for base in bases.into_iter().rev() {
+                    self.unbind(base);
+                }
+            }
+
             // The cast target is a type slot `walk_children_mut` skips; its
             // refinement predicate is the main anchor lowering emits.
             TypedExprNode::Cast { value, target } => {
@@ -552,9 +573,16 @@ mod tests {
         lowered.value.expect("lowering produced no value")
     }
 
-    /// Parse, lower, and uniquify a CHL program.
+    /// Parse, lower, uniquify, and lower the comprehensions of a CHL program.
+    ///
+    /// The comprehension phase is what *builds* a filter refinement, out of the
+    /// guard this pass has already resolved, so a test about predicate identity
+    /// needs it to have run. It mints no binder this pass is responsible for —
+    /// its `__iter_record` is a [`crate::ccl::names::SyntheticKind::IterRecord`]
+    /// — and it renames nothing.
     fn pipeline_front(code: &str) -> Expr {
-        run(lower_only(code))
+        let mut holes = crate::ccl::SharedHoleMint::default();
+        crate::ccl::comprehension::run(run(lower_only(code)), &mut holes)
     }
 
     /// Every refinement reachable from `e`'s types (Cast targets,
@@ -723,9 +751,13 @@ mod tests {
     }
 
     // Mint-before-copy: a second run leaves a minted tree untouched.
+    //
+    // On the lowered tree, not [`pipeline_front`]'s: the comprehension phase
+    // mints a `Synthetic` binder, which this pass's post-run check rejects
+    // because at *its* boundary a synthetic means a pass minted too early.
     #[test]
     fn idempotent_on_minted_trees() {
-        let expr = pipeline_front("k = 1\n[x for x in [1, 2, 3] if x > k]\n");
+        let expr = run(lower_only("k = 1\n[x for x in [1, 2, 3] if x > k]\n"));
         // The second run must see the same nodes, not a freshened copy of them.
         let again = run(expr.clone_preserving_ids());
         assert_eq!(expr, again, "uniquify must be idempotent");
