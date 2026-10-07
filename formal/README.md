@@ -1,190 +1,148 @@
 # formal/ — the Lean model of the CCL type system
 
-The subtype relation, the solver's polar merge, and its materialization exist only operationally in
-the Rust: `constrain_go`, `CompactType::merge`, and `coalesce_compact_go` implement them without
-ever writing them down. This is a Lean 4 model that **states** them declaratively, proves their
-metatheory, and is diffed against the Rust operation-by-operation so the two cannot drift apart
-silently.
-
-Two things hold it honest, and they check different failures. **Proofs** say the model has the
-properties claimed of it. A **differential oracle** says the model is a model *of this code* —
-without it, both halves stay internally consistent while describing different systems.
+This directory contains a Lean 4 model, proofs about that model, and an executable oracle used
+by Rust differential tests. [The design reference](design.md#what-is-pinned-today-and-what-is-not)
+owns the coverage table and theorem qualifications. This README owns build, test and replay
+instructions.
 
 ## What is stated, and what is proved
 
-| Subject | Model | Headline results |
-|---|---|---|
-| Subtyping (`constrain_go`) | `Subtyping`, `subtypeCheck` | reflexivity; decidability; transitivity |
-| The polar merge (`CompactType::merge`) | `CompactTy`, `merge` | commutativity; idempotence; congruence; associativity; the merge is the unique least upper bound of the order it induces |
-| Materialization (`coalesce_compact`) | `coalesce` | totality; the result is well-formed; the merge materializes to a bound of both operands where one exists, and to the least such type |
-| Terms and typing (a small pure core) | `Term`, `HasTy`, `Step` | progress (a well-typed term is a value, steps, or is filter-blocked), preservation (a step keeps the term's type), refinement soundness |
-| What a Σ's witness ranges over (`TypeKind`) | `TypeKind`, `Admits`, `ContainedIn`, `refuses` | containment transports membership; reflexivity; transitivity; and a **refusal is sound** — what `TypeKind::refuses` rejects is never a member, which is what every caller raising `NotOfKind` rests on, with the pair the bound arm's old equality test refused while admitting it |
-| Type kinds are a **lattice** | `IsKindLub`, `IsKindGlb` | every pair has a least upper and greatest lower bound, named row by row and proved in **both** directions — wherever the type order the kinds are built on has the bound they need, and unconditionally elsewhere; both bounds are associative from leastness alone (`kind_glb_assoc`, `kind_lub_assoc`), which is what made the compact merge's loss of it a fact about that merge rather than about the order |
-| The kind premise (`constrain_type_kinds`) | `SigmaBelow` | the premise **is** the elementwise reading of what a Σ denotes, which is what fixes its direction; the swapped premise is a different relation |
-| A binder's range when contributions meet (`CompactTypeKind::merge`) | `CompactTypeKind`, `mergeTypeKind` | `equivTypeKind` is an equivalence; the merge is commutative, idempotent and **associative** — the join proved, the meet checked over every triple of the kinds built from six positions, since a proof would need the two polar orders to relate and `Merge.lean` proves one polarity at a time; a `subtypesOf` parameter must name exactly one shape, and both failures answer the empty candidate list, so the meet is a lower bound as well; the range test is invariant under `equiv`, and a union names only ranges exactly when both sides do; mutual containment is equality of the atom *sets*, so a predicate over them is invariant by construction |
+The model covers selected concrete types and operations, not the complete inference engine.
+It neither infers program types nor checks Rust's inferred term typings yet. The latter is a
+[planned oracle](design.md#the-typing-oracle).
+[The concrete type grammar](design.md#the-concrete-type-grammar) lists exclusions, including
+dependent sums as grammar nodes; `SigmaBelow` instead states a separate rule for their kind premise.
 
-A type is **concrete** when no inference-time unknown occurs anywhere in it — what a checked program
-exhibits, and the fragment everything above is stated over. The model has no node for any of the
-unknowns; [design.md](design.md#the-concrete-type-grammar) lists which `ccl::ty::Type` variants
-those are.
+The proof families have distinct scopes:
 
-Three things the model does not do: infer a type — it checks one it is given — reproduce the
-solver's choice where several types are valid, or say anything about those transients.
+- Subtyping, term safety, compact merging and materialization are summarized in
+  [the coverage table](design.md#what-is-pinned-today-and-what-is-not).
+- [`TypeKind.lean`](CclFormal/TypeKind.lean) defines membership, containment and refusal.
+  Containment transports membership; refusal implies non-membership.
+- [`TypeKindIsALattice.lean`](CclFormal/TypeKindIsALattice.lean) states kind bounds by cases.
+  Cases that require a bound in the underlying type order assume that bound exists. Associativity
+  follows from the corresponding leastness/greatestness premises, not from an unconditional
+  executable lattice operation.
+- [`TypeKindMerge.lean`](CclFormal/TypeKindMerge.lean) proves laws up to `equivTypeKind`.
+  Join associativity is proved; meet associativity is exhaustively checked only over its finite
+  `checkTys` universe. A `subtypesOf` parameter must denote one shape; parameters with no shape or
+  conflicting shapes contribute no candidates to a meet. The file also states the range-test and
+  atom-membership invariance lemmas on which those cases depend.
 
-A Σ is stated as a **rule** rather than as a grammar node: `SigmaBelow` relates a candidate
-list and an element type to a kind and an element type, and `Ty` carries no witness. Putting
-one in the grammar makes `Ty` and `TypeKind` mutually inductive — a kind names types and a
-type contains Σs — which the Rust hides behind an `Rc` and Lean would need a hand-written
-mutual `BEq` for. What the rule form already settles is the premise's direction; what it
-leaves open is any statement about a Σ *inside* a larger type.
+[The axiom gate](CclFormal/Axioms.lean) checks named headline results for unexpected axioms.
+A successful proof build validates those Lean declarations, not their correspondence to every
+Rust execution. Differential tests separately sample that correspondence.
 
 ## One rule, end to end
 
-Record width, in the four forms it takes. `constrain_go`'s record arm
-(`src/ccl/infer/solver/constrain.rs`), with the error payload elided:
+Record-width subtyping connects four definitions:
 
-```rust
-(Type::Record(a), Type::Record(b)) => {
-    for (name, t1) in b {
-        match a.iter().find(|(n, _)| n == name) {
-            Some((_, t0)) => constrain_go(t0, t1, sl, sr, cache)?,
-            None => return Err(ConstrainError::MissingField { .. }),
-        }
-    }
-    Ok(())
-}
-```
+1. Rust's `constrain_go` checks every field demanded by the right-hand record against the
+   matching left-hand field.
+2. The `record` constructor in [`Subtyping.lean`](CclFormal/Subtyping.lean) states that relation
+   using find-first field lookup.
+3. [`SubtypeChecker.lean`](CclFormal/SubtypeChecker.lean) computes a verdict.
+   [`SubtypeCheckDecidesSubtyping.lean`](CclFormal/SubtypeCheckDecidesSubtyping.lean) proves its
+   equivalence to the relation.
+4. [The Rust harness](../tests/differential_oracle.rs) sends the encoded pair to the oracle and
+   compares that verdict with `constrain_subtype`.
 
-The Lean constructor it is stated as (`CclFormal/Subtyping.lean`), one per arm:
-
-```lean
-/-- Named width: every field the rhs demands is present (find-first) in
-the lhs and covariantly below it. -/
-| record {a b} :
-    (∀ n t1, (n, t1) ∈ b → (lookupBy a n).isSome) →
-    (∀ n t0 t1, (n, t1) ∈ b → lookupBy a n = some t0 → Subtyping t0 t1) →
-    Subtyping (.record a) (.record b)
-```
-
-The executable checker `subtypeCheck` (`CclFormal/SubtypeChecker.lean`) decides exactly that
-relation — `subtyping_of_subtypeCheck` and `subtypeCheck_of_subtyping` are the two directions — so a
-`#guard` against the checker is a fact about the relation. A `#guard` is a compile-time assertion
-that a decidable proposition evaluates to `true`; `lake build` fails when one does not, which is why
-building the model is what checks it.
-
-One generated case as it crosses the wire, and the verdict the oracle answers:
-
-```
-{"op":"sub","lhs":{"k":"record","fields":[["a",{"k":"base","base":"Int"}],
-                                          ["b",{"k":"base","base":"Bool"}]]},
-            "rhs":{"k":"record","fields":[["a",{"k":"base","base":"Int"}]]}}
-→ true      # {a: Int, b: Bool} <: {a: Int}: dropping a field is width subsumption
-→ false     # the same pair reversed: the rhs demands `b` and the lhs has none
-```
-
-`tests/differential_oracle.rs` computes `constrain_subtype`'s verdict on the same pair and fails the
-test when the two disagree.
+Thus a record with `a: Int` and `b: Bool` is below a record requiring only `a: Int`, but not
+conversely. Unique field keys are part of the modeled well-formed fragment; duplicate-key behavior
+is not generalized from this example.
 
 ## The differential oracles
 
-`lake build` produces `.lake/build/bin/subverdict`, which reads one JSONL case per line tagged by
-`"op"` and answers one verdict per line (`Main.lean` documents each case shape).
-`tests/differential_oracle.rs` generates the cases, computes the solver's answer, and diffs:
+[`Main.lean`](Main.lean) reads one JSON object per line and returns one verdict line.
+[`CclFormal/Json.lean`](CclFormal/Json.lean) defines the wire codec.
 
-- `"sub"` — type pairs, `constrain_subtype`'s verdict against `subtypeCheck`.
-- `"merge"` — every step of a fold over one variable's bounds through `CompactType::merge`, against
-  `merge`, up to the model's `equiv` (the equality every merge theorem is stated over).
-- `"mergeKind"` — every step of a fold through `CompactTypeKind::merge`, against `mergeTypeKind`,
-  up to `equivTypeKind`. The `"merge"` oracle cannot reach this: `CompactTy` has no Σ binder slot,
-  so the wire encoder refuses a bound carrying binders and every case that would exercise a kind
-  is filtered out before it. Verified sensitive by reverting each of the two readings a bound
-  naming no shape gets — one answers 68 mismatches, the other trips `is_below`'s own assertion.
-- `"refuses"` — `TypeKind::refuses` against `refuses`, on the concrete fragment. `Ty` carries no
-  `Infer` and no `Hole`, so what the wire expresses of `Type::holds_an_unresolved_position` is
-  its refinement disjunct — the one that decides real cases, a refined range being what the
-  range test exists to refuse. Verified sensitive on all three deciding arms: restoring the
-  bound's equality test gives 415 mismatches of 4000, dropping the candidate list's abstention
-  448, and peeling refinements before the range test 15.
-- `"coalesce"` — each folded bound materialized, against `coalesce`.
+| Operation tag | Compared operation | Oracle response |
+| --- | --- | --- |
+| `sub` | `constrain_subtype` versus `subtypeCheck` | `true` or `false` |
+| `merge` | `CompactType::merge` versus `CompactTy.merge` | `ok` or a mismatch with the model result |
+| `mergeKind` | `CompactTypeKind::merge` versus `mergeTypeKind` | `ok` or a mismatch with the model result |
+| `refuses` | `TypeKind::refuses` versus `refuses` | `ok` or a mismatch with the model verdict |
+| `coalesce` | Materialization versus `CompactTy.coalesce` | `ok` or a mismatch with the model outcome |
 
-Each oracle found a real defect on its first sweep. The subtype oracle caught a capture in the
-solver's Fun/Fun opening; the merge oracle caught the model intersecting away refinements a hole
-should have passed through; the coalesce oracle caught the model materializing a record's payloads
-before checking its key kinds.
+Merge comparisons use `equiv` or `equivTypeKind` rather than bytewise JSON equality.
+Coalescing compares successful types, unresolved results and error kinds. The kind-merge oracle
+is separate because the compact-type wire has no Σ binder slot.
 
-[design.md](design.md#the-differential-oracles) carries what each oracle covers and what it does
-not.
+Coverage is limited by both the generators and encoders.
+[The design reference](design.md#the-differential-oracles) owns these exclusions. In particular,
+encoding failure is not uniformly fatal: subtype, polar-merge and coalesce drivers panic on
+unexpected unencodable generated cases, while refusal generation skips unencodable pairs.
+Kind merging continues its fold but omits any step that cannot be encoded. A passing run does
+not validate those omitted cases.
 
 ## Running it
 
-```bash
-(cd formal && lake build)   # elaborates every theorem, evaluates every #guard, builds the oracle
-./ci.sh formal              # the gate: lake build, then the differential suite
-```
-
-Elaborating is Lean's word for checking: `lake build` replays every proof, so a broken proof and a
-broken `#guard` both surface as a build failure.
-
-The toolchain is pinned by `lean-toolchain`; `elan` fetches it on first build. The Rust harness is
-an integration test that **skips loudly** when the oracle binary is absent, so a machine with no
-Lean toolchain stays green — `./ci.sh formal` is what turns that skip back into a gate, and it fails
-rather than skips under CI.
+From the repository root:
 
 ```bash
-cargo test --test differential_oracle                      # the three oracles
-CAMBRA_DIFF_N=20000 CAMBRA_DIFF_SEED=7 \
-  cargo test --test differential_oracle -- --nocapture     # a longer run, replayable from its seed
+(cd formal && lake build)
+./ci.sh formal
 ```
 
-`CAMBRA_DIFF_SEED` and `CAMBRA_DIFF_N` set the seed and case count for every oracle in the binary;
-`CAMBRA_DIFF_DUMP=<path>` appends the subtype oracle's cases to a file.
+[`lean-toolchain`](lean-toolchain) pins the Lean version. Lake's default targets build the
+`CclFormal` library and `subverdict` executable according to [`lakefile.toml`](lakefile.toml).
+The library imports its proofs and axiom checks through [`CclFormal.lean`](CclFormal.lean).
+Building checks those declarations and evaluates their `#guard` assertions.
+
+`./ci.sh formal` builds the model and then names the Rust integration target explicitly:
+
+```bash
+cargo test --test differential_oracle -- --nocapture
+CAMBRA_DIFF_N=20000 CAMBRA_DIFF_SEED=7 cargo test --test differential_oracle -- --nocapture
+```
+
+`Cargo.toml` sets `test = false` for this target, so a plain `cargo test` does not run it.
+The harness expects `formal/.lake/build/bin/subverdict`. Without that binary, the five
+differentials print skips locally and fail if the `CI` environment variable exists.
+The shell gate separately skips a missing `lake` locally and fails when `CI` is nonempty.
+Running the Rust target directly does not rebuild a stale oracle; use the full gate after edits.
+
+`CAMBRA_DIFF_SEED` overrides each driver's default seed; `CAMBRA_DIFF_N` defaults to 4,000.
+The count applies to accepted cases or fold steps, not raw generator attempts. A complete merge
+fold can take its step count past the requested threshold. Refusal tests also require both
+refused and non-refused samples, so very small counts are not useful smoke tests.
 
 ### Reading a mismatch
 
-A failure prints the case and both answers: the merge and coalesce oracles carry the model's own
-result in the verdict line, so the diff is in the message rather than in a second run. To re-ask the
-model about one case, pipe that line back in:
+The failure message includes the operation's JSON case and the differing answers. Replay the JSON
+object, not the entire diagnostic line, through `formal/.lake/build/bin/subverdict`.
+For example, this subtype query asks whether `Int` is below `Bool`:
 
 ```bash
 echo '{"op":"sub","lhs":{"k":"base","base":"Int"},"rhs":{"k":"base","base":"Bool"}}' \
-  | formal/.lake/build/bin/subverdict          # => false
+  | formal/.lake/build/bin/subverdict
 ```
 
-`CAMBRA_DIFF_DUMP` plus the failing seed is how to get the line; a case the encoder cannot express
-panics rather than being skipped, so a harness gap fails loudly too.
+`CAMBRA_DIFF_DUMP=<path>` appends the subtype driver's generated JSONL cases only.
+Open/write failures are ignored by that dump path; verify that the file was written.
+Keep the failing seed and source revision for replay. Unknown operation tags and malformed JSON
+produce error verdicts rather than a subtype answer.
 
 ## Reading order
 
-`design.md` is the plan of record: the coverage table (what is pinned today and what is not), the
-adjudicated rules, and the roadmap. Then the model itself, where **a file that defines a construct
-is named for it and a file that proves something is named for the sentence it proves**:
+Start with [the coverage table](design.md#what-is-pinned-today-and-what-is-not), then select the
+definition/proof family relevant to the operation being changed.
 
-| File | Contents |
-|---|---|
-| `Ty.lean` | the concrete grammar, `Ty.WellFormed`, and the refinement-predicate vocabulary |
-| `Subtyping.lean` | the relation, one constructor per `constrain_go` arm |
-| `SubtypingIsReflexive.lean` | a leaf off the relation, under `Ty.WellFormed` |
-| `SubtypeChecker.lean` | `subtypeCheck`, and the adjudicated rules as `#guard`s |
-| `SubtypeCheckDecidesSubtyping.lean` | soundness, completeness, and the `Decidable` instance |
-| `SubtypingIsTransitive.lean` | transitivity, with no fragment restriction and no side conditions |
-| `Term.lean` | the term calculus: terms, values, substitution, stepping, typing |
-| `WellTypedTermsAreSafe.lean` | progress, preservation, refinement soundness |
-| `Merge.lean` | `CompactTy`, the polar merge, `absorbedBy`, and the algebra laws |
-| `Coalesce.lean` | `coalesce`, which materializes a position into a type, and its totality |
-| `MaterializedMergeIsABound.lean` | `coalesce` carries `absorbedBy` into subtyping, so the merge lands above both operands at a positive position and below both at a negative one |
-| `MaterializedMergeIsTheLeastBound.lean` | and it lands below every well-formed type that bounds both |
-| `Json.lean` | the wire codec shared with the Rust harness |
-| `Axioms.lean` | the axiom gate |
+| Files under `CclFormal/` | Purpose |
+| --- | --- |
+| `Ty.lean` | Type/predicate grammar, equality and well-formedness. |
+| `Subtyping.lean`, `SubtypingIsReflexive.lean` | Relation and reflexivity for well-formed types. |
+| `SubtypeChecker.lean`, `SubtypeCheckDecidesSubtyping.lean` | Executable checker and its equivalence to the relation. |
+| `SubtypingIsTransitive.lean` | Transitivity assuming well-formed input types. |
+| `Term.lean`, `WellTypedTermsAreSafe.lean` | Pure-core typing, evaluation and safety. |
+| `Merge.lean` | Compact representation, polar merge, absorption order and algebraic laws. |
+| `Coalesce.lean` | Total computation of a type, unresolved outcome or error. |
+| `MaterializedMergeIsABound.lean`, `MaterializedMergeIsTheLeastBound.lean` | Materialized bound and leastness statements with their hypotheses. |
+| `TypeKind.lean`, `TypeKindIsALattice.lean`, `TypeKindMerge.lean` | Kind membership, bounds and compact-kind merging. |
+| `SigmaIsTheElementwiseReading.lean` | The kind-premise direction for the separate Σ rule. |
+| `Json.lean`, `Axioms.lean` | Codec and named-result axiom checks. |
 
-Two chains run over the same grammar and are independent of each other: `Term.lean` →
-`WellTypedTermsAreSafe.lean`, and `Merge.lean` → `Coalesce.lean` → the two bound files. The second
-rejoins the subtyping metatheory, since a bound is stated with `subtypeCheck` and leastness is
-proved with transitivity. Within `Merge.lean`, read the refinement-slot laws and `joinKind` before
-the `merge` theorems that use them; the order and uniqueness section is last and depends only on the
-semilattice laws. In each bound file, read the four case lemmas — `coalesce_monotone_*` and
-`bounds_*` — before the assembly that uses them.
-
-A lemma lives with the definition it is about: `Ty.WellFormed`'s member extractors are in `Ty.lean`,
-and the `peel` / `lookupBy` / `kindOk` / `deficit` facts are in `Subtyping.lean` beside those
-definitions. `Merge.lean` follows the same rule at a larger scale, each operation followed by its
-laws.
+Term safety and compact materialization are separate developments over the same type grammar.
+For merging, read refinement-slot and `joinKind` laws before the merge laws; then read coalescing
+and the materialized-bound proofs. Local lookup, peeling and well-formedness lemmas stay beside
+their definitions rather than in a separate utility module.
