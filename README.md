@@ -100,7 +100,7 @@ Pass `--inspect` to run the program and additionally stream the values flowing t
 printf 'hello\nworld\n' | cargo run -- --inspect tests/programs/streaming_echo/program.cambra
 ```
 
-The served frontend does not read `/api/live` yet, so the browser shows the panes and no values; the `Values` pane that renders them is a separate change.
+The browser's `Values` pane draws them: choose “inspect data” on a source or an operator to watch what it holds. The page holds `/api/live` open while it is loaded, so that is when values are recorded.
 
 Both default to port 8080 (`--inspect=9090` to change it). Under `--inspect` values are recorded only while a client holds `/api/live` open, and the process stays alive after the program finishes, so a client connected through the run can still read them; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
 

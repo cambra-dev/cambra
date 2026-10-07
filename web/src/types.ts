@@ -257,3 +257,93 @@ export interface Snapshot {
   panes: PaneEntry[];
   paneLinks: PaneLink[];
 }
+
+// ---------------------------------------------------------------------------
+// The live wire — `/api/live`
+// ---------------------------------------------------------------------------
+//
+// A frame is whole state, not an append. Each one carries every producer's last
+// answer that carried rows, and replaces the frame before it; the server has
+// already collapsed each producer's several `get`s to one answer
+// (`ProbeTable::last_flow`). The frontend keeps a per-node
+// cache so a newly pinned operator answers from the last frame rather than
+// waiting for the next one, which on a converged program never comes.
+
+// One row of a probe reading or a source's retained window.
+export interface LiveRow {
+  // The domain key this row sits at, or `null` for a shape whose positions are
+  // implicit (a `Scalar` has no domain).
+  key: string | null;
+  // The value, already rendered by the backend through `Display for Value`.
+  value: string;
+  // Whether the tile marks this position deleted. Carried rather than filtered:
+  // a `Restrict` marks a row while the `Memo` below it has compacted the same
+  // row away, so dropping the flag makes two producers look alike where they
+  // differ.
+  deleted: boolean;
+}
+
+// One probe's last reading that carried rows. A probe observes one producer,
+// and an operator can build several probes.
+export interface LiveProbe {
+  producerId: number;
+  // The producer's display name, e.g. `"MapResultWithSource#1"`.
+  producer: string;
+  // The tile's variant name, e.g. `"DataFunction"`.
+  shape: string;
+  // The region of the domain the output is complete for, rendered: `False`,
+  // then a prefix of the domain, then `True`. `null` for a shape carrying no
+  // such region.
+  completeness: string | null;
+  // The region the producer's consumer has released, rendered, or `null` while
+  // it has released nothing.
+  obsolete: string | null;
+  // Why this answer carries no rows, for a shape the backend does not render.
+  note: string | null;
+  // The reading's position in the probe table's total order. The same `seq` in
+  // two frames is the same answer, which is how the store tells how long a
+  // producer has gone without new rows.
+  seq: number;
+  // Whether a newer reading of this probe carried nothing. True for most probes
+  // in most frames.
+  stale: boolean;
+  // Rows the tile held, of which `rows` is the last `rows.length`.
+  total: number;
+  dropped: number;
+  rows: LiveRow[];
+}
+
+// Every probe on one operator, in ascending `producerId`. Nodes arrive in
+// ascending `nodeId`, which is construction order, so upstream sorts first.
+export interface LiveNode {
+  nodeId: number;
+  probes: LiveProbe[];
+}
+
+// A data source's retained window: what has arrived and not yet been released
+// by every reader. Not a probe reading — a source has no producer and takes no
+// `get`, so this is read through `&self` and sampling it releases nothing.
+export interface LiveSource {
+  // The `IterateExtent`s over the source's domain, which is what a click on the
+  // window resolves to: a source is not a node of the operator graph. Empty
+  // when the program iterates the source nowhere.
+  nodeIds: number[];
+  // The registered name, e.g. `"stdin"`.
+  name: string;
+  total: number;
+  dropped: number;
+  rows: LiveRow[];
+}
+
+export interface LiveFrame {
+  // Frames published so far, counting this one, so a client can tell it is
+  // behind. Advances only over a pass that recorded something, so it counts
+  // data rather than loop iterations.
+  published: number;
+  // Whether the run is over and this frame is the last. A reader that never
+  // sees one and then loses the socket was disconnected; a reader holding one
+  // knows the quiet is the end rather than a pause.
+  final: boolean;
+  nodes: LiveNode[];
+  sources: LiveSource[];
+}

@@ -14,6 +14,11 @@ serves.
 
 - **Source pane** — the CHL source in a read-only editor, with hover types,
   Ctrl/Cmd-click goto-definition, and diagnostic squiggles.
+- **Values pane** — the rows the operators a reader pinned currently hold, over
+  the `/api/live` websocket. Pinning is a gesture in the source rather than a
+  selection, so the pane keeps showing a construct while the reader reads
+  elsewhere. A line per producer, because one operator builds one per `FanOut`
+  branch.
 - **IR panes** — one collapsible tree per pipeline pane, ordered
   upstream → downstream: **pre-inference**, **post-inference**,
   **post-channelize**, **post-as-of-read**, **post-lambda-elim** and
