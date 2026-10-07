@@ -1,2 +1,57 @@
 Cambra
 Copyright 2026 Cambra, Inc.
+
+This product includes third-party software.
+
+elkjs 0.12.0
+Copyright (c) 2017 Kiel University and others.
+Copyright (c) 2021 Kiel University and others.
+
+elkjs is not covered by this repository's Apache-2.0 licence. It is licensed
+under the Eclipse Public License 2.0, with the GNU General Public License 3.0 or
+later as a Secondary License, and the Source Code for elkjs is available under
+the Eclipse Public License 2.0:
+
+  elkjs, its build:   https://github.com/kieler/elkjs/tree/0.12.0
+  ELK, the Java code elkjs is compiled from:
+                      https://github.com/eclipse-elk/elk/tree/v0.12.0
+  Licence:            https://www.eclipse.org/legal/epl-2.0/
+
+elkjs is the layered layout the inspector's operator pane draws with. It is
+distributed in object form inside web/dist/index.html, which is committed in
+this repository and embedded in the cambra binary. That file carries this
+notice and the full text of the Eclipse Public License 2.0 as its leading
+comment.
+
+Minifying the bundle removes the notices elkjs carries in its source. They are
+reproduced here verbatim, in the order lib/elk.bundled.js carries them:
+
+/*******************************************************************************
+ * Copyright (c) 2017 Kiel University and others.
+ * 
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * https://www.eclipse.org/legal/epl-2.0.
+ * 
+ * This Source Code may also be made available under the following Secondary
+ * Licenses when the conditions for such availability set forth in the Eclipse
+ * Public License v. 2.0 are satisfied: GPL-3.0 which is available at
+ * https://www.gnu.org/licenses/gpl-3.0-standalone.html.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR GPL-3.0-or-later
+ *******************************************************************************/
+
+/*******************************************************************************
+ * Copyright (c) 2021 Kiel University and others.
+ * 
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * https://www.eclipse.org/legal/epl-2.0.
+ * 
+ * This Source Code may also be made available under the following Secondary
+ * Licenses when the conditions for such availability set forth in the Eclipse
+ * Public License v. 2.0 are satisfied: GPL-3.0 which is available at
+ * https://www.gnu.org/licenses/gpl-3.0-standalone.html.
+ *
+ * SPDX-License-Identifier: EPL-2.0 OR GPL-3.0-or-later
+ *******************************************************************************/
