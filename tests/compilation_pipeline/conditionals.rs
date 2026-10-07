@@ -292,7 +292,7 @@ c: Bool = False
 sum(box([1, 2]) if c else box([1, 2, 3]))",
     Value::Int(6)
 )]
-// Same-domain arms — the Σ collapses to a plain data function.
+// Same-domain boxed arms are realized; their one-candidate Σ remains on the assertion.
 #[case(
     r"
 c: Bool = True

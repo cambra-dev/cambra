@@ -4309,7 +4309,7 @@ mod annotation_kinds {
 /// constraint-time `ConstrainError::KindMismatch` cannot see this. The merge
 /// does, and reports `CoalesceError::KindConflict`.
 ///
-/// See `src/ccl/design/type-inference.md`, "Deliberately incomplete here".
+/// See `src/ccl/design/type-inference.md`, "Materialization".
 #[test]
 fn joining_a_capability_with_a_collection_is_a_kind_conflict() {
     let errs = infer_program_err(indoc! {r#"

@@ -59,7 +59,6 @@ use solver::smt::SmtError;
 // `Name` is no longer debug-only: `lit_singleton` builds its predicate over the
 // refinement binder in every build.
 use crate::ccl::Name;
-#[cfg(debug_assertions)]
 use solve::check_scope_valid;
 
 /// Build a structural product [`Type`] from a `FieldKey`-keyed field map:
@@ -578,34 +577,15 @@ pub(crate) fn run(
     // leave naming a binder it has left. Runs before the scope check below, which
     // is what reports such a leftover. See `strip`.
     strip::strip_predicate_interiors(expr);
-    #[cfg(debug_assertions)]
-    // Scope-validity check (design §6.2): every coalesced node's type is
-    // well-formed in the lexical scope at that node — every free term-variable
-    // of its refinement predicates is bound by an enclosing Pi binder
-    // (subtracted by `type_free_vars`) or an enclosing AST binder. This holds at
-    // *every* node now that dependent application discharges its binder to the
-    // argument at both polarities and `let`-closing discharges bound names as
-    // the type leaves their scope. The root scope is empty: a program source is
-    // referenced by a `TypedExprNode::Source` node rather than by a variable, so
-    // no source name reaches `type_free_vars`.
-    // Debug-only: the uniform substitution traverses type slots in the same
-    // pass as the term (no value-only contract), so a type-borne occurrence of
-    // a discharged binder is rewritten where it sits and the dangling-binder
-    // class this walk guarded is structurally unrepresentable. The walk stays
-    // as the debug-build regression net for substitution-descent bugs.
-    #[cfg(debug_assertions)]
-    {
-        let mut scope_errors = Vec::new();
-        check_scope_valid(expr, &Default::default(), &mut scope_errors);
-        if !scope_errors.is_empty() {
-            return Err(scope_errors);
-        }
+    // Coalesce can retain a witness before its enclosing binder is known. Validate
+    // the complete expression before accepting inference, in every build.
+    let mut scope_errors = Vec::new();
+    check_scope_valid(expr, &Default::default(), &mut scope_errors);
+    if !scope_errors.is_empty() {
+        return Err(scope_errors);
     }
-    // The witness counterpart of the scope check above, and here rather than only at the
-    // pipeline's stage boundaries because *this* is where the close happens: a witness
-    // that materialization left with no binder is a defect of the pass that just ran, and
-    // a caller who only infers (a type-level test, a REPL) is exactly as entitled to catch
-    // it as one who goes on to compile.
+    // Also inspect predicate, binder and target type slots, which the node-type scope
+    // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
     Ok(expr.ty.clone())
@@ -636,8 +616,7 @@ pub(crate) mod test_helpers {
 
     /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares
     /// the implicit element binder ([`crate::ccl::REFINEMENT_BINDER`]) against `rhs`.
-    /// Only the debug-only `scope_check_*` tests use it.
-    #[cfg(debug_assertions)]
+    /// Used by scope-validation and type-comparison tests.
     pub(crate) fn refined_int(rhs: TypedExpr) -> Type {
         use crate::ccl::{BinOpKind, CompareKind, Refinement};
         use std::rc::Rc;

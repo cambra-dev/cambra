@@ -553,34 +553,29 @@ c: Bool = True
 sum(box([1, 2]) if c else box([1, 2, 3]))
 ```
 
-The arms' domains are `[0, 1]` and `[0, 2]`, so the `Case` types as
-`Σ (𝜎 : [[0, 1], [0, 2]]). 𝜎 ⤇ Int` — one collection over a domain the branch picks
-([type-inference.md, The domain join needs `box`](type-inference.md#the-domain-join-needs-box)).
-Nothing reads a witness off a value at runtime, so that type on its own gives `sum` no
-extent to iterate.
+The arms have domains `[0, 1]` and `[0, 2]`. The `Case` therefore has type
+`Σ (𝜎 : [[0, 1], [0, 2]]). 𝜎 ⤇ Int`, retaining the selected arm's domain; see
+[The domain join needs `box`](type-inference.md#the-domain-join-needs-box).
 
-**Realization** replaces the Σ with a term that has one. The `Case` becomes the gated union
-`⧺ᵢ (armᵢ | π̂ᵢ)` over the same domains, each leg gated by the path condition its `if`/`elif`
-compiled to. The gates are exclusive and exhaustive, so exactly one leg is non-empty and the
-union's extent is the domain the witness selected — which is what makes the union and the Σ
-the same collection. It runs in planning (`planning/conditionals.rs`) and asserts its
-pre-realization type rather than relating the two by a typing rule
-([type-inference.md, Planning asserts the type it
-replaces](type-inference.md#planning-asserts-the-type-it-replaces)).
+`planning/conditionals.rs` realizes a conditional collection as a union of restricted arms,
+`⧺ᵢ (armᵢ | π̂ᵢ)`. Each restriction is the arm's first-match path condition. Exactly one
+condition holds; only that leg can contribute rows, though the selected arm may itself be
+empty. The union's tagged domain differs from the sum's domain, so `Realize` asserts the
+original type rather than deriving it by subtyping. See
+[Planning asserts the type it replaces](type-inference.md#planning-asserts-the-type-it-replaces).
 
-**Realization is one of three dispositions a witness gets**, all decided in
-`planning/conditionals.rs`. A determined witness — one candidate — is erased, term and types
-together. One whose candidates a `Case` picks between is realized, as above. Every other is
-**materialized**: the `box` stays standing and the value carries its own keys, which is what a
-`List(𝑇)`'s `UIntRanges` and a `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` reach. `extent_of` bounds those
-keys from the witness's kind rather than enumerating them.
+Planning can instead erase a determined witness or retain a materialized one. Erasure
+removes the introduction and instantiates its type references. A materialized witness keeps
+the `box`, and the value carries its keys. This supports `List(𝑇)` over `UIntRanges` and
+`Map(𝐾, 𝑉)` over `SubtypesOf(𝐾)`: `extent_of` supplies a key bound, not an enumeration.
+A determined row must also remain materialized when its enclosing position requires a sum.
+The type-level erasure exceptions are specified in
+[Witness erasure](type-inference.md#which-case-a-site-realizes-and-what-a-leg-instantiates).
 
-Materializing does not yet give an **iteration site** over such a collection. Every site starts
-from `IterateExtent` over an extent read off the type, and a bound is not something to
-enumerate. A site that reaches op-conversion over one is rejected there by name, in `extent_of`'s
-`WitnessRef` arm. A comprehension over the collection needs no site, since its generator composes
-with the collection
-([optimization.md](optimization.md#a-generator-over-a-sum-composes-with-its-source)).
+A materialized collection still cannot supply an `IterateExtent` from its type alone.
+The standalone `WitnessRef` case in `extent_of` rejects that use. A comprehension can
+instead compose its generator with the collection, taking the keys from its values; see
+[Sum-source generators](optimization.md#a-generator-over-a-sum-composes-with-its-source).
 
 A `for` loop over a sum never reaches op-conversion. Its history is a function over the source's
 domain, and a sum's domain is a reference to the witness the sum binds, so the history would
@@ -588,16 +583,16 @@ name the witness outside its binder. `mut_elim::check_no_loop_over_a_sum` reject
 name before the history is built. The rejection covers a determined sum too, because planning
 erases one only after the history is typed.
 
-**A row keeps its `box` only where the `box` is written.** `unbox` decides from the position the
-introduction fills. Inlining moves a `let`-bound row into the literal that reads it, so its `box`
-stands at the jagged position and is kept there. A row read from a mutable variable is erased
-where the variable is introduced, its one candidate being the whole position. At a jagged position
-it then stands as a bare collection where the element type is a sum, and
-`reject_rows_fixed_elsewhere` rejects the program by name.
+`unbox` decides whether to retain a row's introduction from the position it fills. Inlining
+can move a let-bound row into a jagged literal position, where its box is preserved. A row
+read from mutable storage has already had its determined witness erased. Such a bare row
+cannot fill a sum-typed element position; `reject_rows_fixed_elsewhere` reports the mismatch.
 
-**One realization per site, at the node whose type carries the choice**: the outermost `Σ`
-binding the witness. Arms sharing a domain form no Σ at all, and substituting the arm for
-the conditional at the site leaves the arm.
+Realization operates at a site whose type carries the witnesses and whose subtree contains
+their conditionals. Unboxed arms sharing a domain need no sum; boxed arms sharing a domain
+still have a one-candidate sum during inference. A same-domain boxed conditional is realized,
+not erased: realization records its witness in `realized`, and `collapse_determined_sums`
+preserves it so the `Realize` assertion retains its binder.
 
 ### Realization instantiates the witness inside the predicate
 
@@ -621,13 +616,11 @@ but it may not name the gated union: reading the union needs the `iterate`/`rest
 markers a predicate is forbidden to contain. Substituting `armᵢ` puts the read somewhere a
 predicate is allowed to be.
 
-Over a product domain the predicate holds one read per position, and each is instantiated
-with the arm its own position chose. What the read's index ranges over does not identify the
-position: two conditionals over the same candidate domains state the same kind. The element
-position the source is applied to does, and the predicate spells those positions in the
-site's own binders ([type-inference.md, The index is named at the domain
-position](type-inference.md#the-index-is-named-at-the-domain-position)) — so a source is
-matched by the sum's kind and the index reading it together.
+Over a product domain, each predicate read is instantiated with its position's chosen arm.
+Equal candidate kinds do not identify positions: two independent conditionals can have the
+same kind. Source matching uses both the sum's kind and the index reading it. Predicate
+type slots must use the site's binder names; see
+[Binder resolution at materialization](type-inference.md#binder-resolution-at-materialization).
 
 #### A `let`-bound conditional is copied to each consumer
 

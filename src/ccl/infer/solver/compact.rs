@@ -599,28 +599,15 @@ fn denotes_several_domains_ty(ds: &[Type]) -> bool {
     seen.len() > 1
 }
 
-/// The binders of a merged position: one of the spellings that arrived, over the merge of
-/// what each side said it ranges over.
+/// Merge binder kinds positionally, retaining the lesser existing ID at each position.
 ///
-/// Position `i` against position `i`, because that is what a kind edge relates. A side with
-/// no binders is a plain collection meeting a sum and contributes nothing to range over.
+/// The ID choice must agree with witness-atom resolution in coalesce. A minimum is stable
+/// under reordering of contributions; a first-arriving ID is not. This function does not
+/// rename occurrences or mint binders.
 ///
-/// **The least of the two spellings**, which is the rule the *occurrence* resolution uses
-/// for the same position (`super::coalesce::coalesce_compact_go`), so a merged Σ declares
-/// the binder its own domain references. Answering from anything else names a binder no
-/// occurrence spells: a name is chosen here, and nothing renames the references afterwards.
-/// The choice is a min over the sides rather than a first-wins so that a fold over several
-/// bounds gives one answer whatever order they merge in (`tests/constraint_order_fuzz.rs`).
-///
-/// Two sides are two spellings of one binder, not two binders: they meet at this position
-/// because a kind edge relates them, and which of their names a type keeps is the
-/// α-invariance the comparison model already absorbs.
-///
-/// **Unequal widths align at the front and nothing depends on it.** Two sums related by an
-/// edge are two spellings of one collection and so are over the same number of positions;
-/// two of different width are a `KindPin::Conflict` on the `kind` computed beside this, and
-/// coalesce reports that before it reads a binder. So the surplus positions of the longer
-/// side pass through unmerged rather than being paired with a position that is not theirs.
+/// Unmatched positions pass through. Unequal sum arities conflict in the adjacent kind
+/// merge and remain reportable at materialization.
+/// See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
 fn merge_binders(pol: bool, a: &[CompactWitness], b: &[CompactWitness]) -> Vec<CompactWitness> {
     let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
     longer
@@ -1072,26 +1059,9 @@ impl CompactType {
         if rhs.imposes_nothing() {
             return lhs.absorbing_vars_of(rhs);
         }
-        // **The cross-slot Σ laws.** A sum meeting a *non*-sum cannot be handled
-        // slot-against-slot the way `Σ ⊔ Σ` and `Σ ⊓ Σ` are, because the two live in
-        // different slots — so it is decided here, before the per-slot merges
-        // (`src/ccl/design/type-inference.md`, "How a sum flows through the solver").
-        //
-        // Both directions reduce to **distributing over the candidates**, and both are
-        // derived rather than chosen:
-        //
-        // - **positive (`Σ ⊔ 𝑇`)** — no subtyping edge builds a sum, so none lies above a bare
-        //   `𝑇`, so every upper bound of both is a non-sum; consuming the sum then requires
-        //   it above every candidate. The sum *dissolves* into the join. This is what makes
-        //   `box(xs) if c else xs` collapse to `xs`'s type.
-        // - **negative (`Σ ⊓ 𝑇`)** — only a sum satisfies a sum demand, and a sum
-        //   satisfies a plain demand by being consumed, so `𝑇` strengthens the body. For a
-        //   witness-bodied sum the body *is* the witness, so that is again each
-        //   candidate.
-        //
-        // Restricted to a witness-bodied sum, which is the only shape this slot holds:
-        // a function-bodied one needs `𝐵[𝑑]` at the compact level, which arrives with the
-        // migration off the `fun` slot.
+        // Sums share the function slot with plain functions. Its kind merge retains
+        // boxed/plain conflicts; this merge neither introduces nor dissolves a sum.
+        // See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
         #[allow(clippy::mutable_key_type)]
