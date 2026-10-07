@@ -219,7 +219,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // The projection's function type is built here: seed it with a
             // fresh var that `emit_proj` ties to `domain ⇒ codomain`.
             let seed = ctx.fresh();
-            emit_proj(key, &seed, ctx)?
+            emit_proj(key, &seed, expr.node_id, ctx)?
         }
 
         TypedExprNode::List(elts) => emit_list(elts, &recorded_ty, ctx)?,
@@ -510,6 +510,12 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         }
         Type::Tuple(ts) => {
             for t in ts.iter_mut() {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            Ok(())
+        }
+        Type::DepTuple(cs) => {
+            for (_, t) in cs.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
             Ok(())
@@ -2302,10 +2308,47 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
 pub(super) fn emit_proj<C: Typing>(
     key: &ProjKey,
     node_ty: &Type,
+    node_id: NodeId,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (domain, codomain) = ctx.provide_function(node_ty, &|| "Proj".to_string())?;
     let codomain = crate::ccl::subst::open_codomain(node_ty, &codomain);
+    // A dependent tuple's component is its type opened at the earlier components
+    // of the projected value (`src/ccl/design/type-inference.md`, "Projection"),
+    // and the projection's Pi binder names that value.
+    if let (ProjKey::Index(k), Type::DepTuple(components)) = (key, domain.peel_refinements()) {
+        // A component that reads no earlier one opens at nothing, so an unnamed projection
+        // needs no binder for it; one that does needs the projection's.
+        let binder = match node_ty.peel_refinements() {
+            Type::Fun { name: Some(b), .. } => b.clone(),
+            _ => {
+                assert!(
+                    !components.get(*k).is_some_and(|(_, c)| {
+                        crate::ccl::subst::references_binder_within(c, *k as u32)
+                    }),
+                    "`.{k}` out of the dependent tuple {domain} reads earlier components, but \
+                     its type {node_ty} names no binder for the tuple"
+                );
+                Name::fresh("__proj")
+            }
+        };
+        let _g = crate::ccl::provenance::enter(
+            node_id,
+            "check.dependent_projection",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        let component = domain
+            .component_type(*k, |j, ty| {
+                Expr::apply(
+                    Expr::var(&binder).with_ty(domain.clone()),
+                    Expr::proj_index(j).with_ty(Type::fun(domain.clone(), ty.clone())),
+                )
+                .with_ty(ty.clone())
+            })
+            .unwrap_or_else(|| panic!("projection .{k} out of the dependent tuple {domain}"));
+        ctx.require_sub(&component, &codomain, &|| "Proj".to_string())?;
+        return Ok(node_ty.clone());
+    }
     let requirement = proj_requirement(key, codomain, ctx);
     ctx.require_sub(&domain, &requirement, &|| "Proj".to_string())?;
     Ok(node_ty.clone())

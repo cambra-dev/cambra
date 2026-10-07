@@ -1211,6 +1211,13 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain, codomain, ..
         } => Type::fun_like(ty, strip_refinements(domain), strip_refinements(codomain)),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_refinements).collect()),
+        // Stripping may remove every reference back, and the constructor then gives
+        // the plain tuple.
+        Type::DepTuple(cs) => Type::dep_tuple(
+            cs.iter()
+                .map(|(n, t)| (n.clone(), strip_refinements(t)))
+                .collect(),
+        ),
         Type::Record(fs) => Type::Record(
             fs.iter()
                 .map(|(n, t)| (n.clone(), strip_refinements(t)))

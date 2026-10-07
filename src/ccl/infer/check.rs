@@ -856,7 +856,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Record(fs) => emit_record(fs, ctx)?,
 
         // The projection's function type is already recorded; decompose it.
-        TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, ctx)?,
+        TypedExprNode::Proj(key) => emit_proj(key, &expr.ty, expr.node_id, ctx)?,
 
         TypedExprNode::List(elts) => emit_list(elts, &recorded_ty, ctx)?,
 

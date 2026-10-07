@@ -2865,6 +2865,105 @@ That the list is closed is an argument about today's code, not something the com
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and resolves its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
 
+## 4.8 Dependent tuples
+
+A dependent tuple `(𝑎 : 𝐴) × 𝐷(𝑎)` is the type of pairs whose second component ranges over a
+type chosen by the first component's value. It is the domain a nested collection has when read
+as one collection: uncurrying the family `(𝑎 : 𝐴) ⇒ (𝐷(𝑎) ⤇ 𝑉)` gives
+`((𝑎 : 𝐴) × 𝐷(𝑎)) ⤇ 𝑉`, and the two are isomorphic only with the dependent tuple on the
+uncurried side. Where `𝐷` does not depend on `𝑎` it is the product `(𝐴, 𝐷)`, and the
+isomorphism is the `curry` and `uncurry` pair the IR already has. The Pi type of
+[4.5](#45-dependent-refinements-via-pi-types) is the curried half; the dependent tuple is the
+uncurried half.
+
+A dependent tuple differs from a sum of [4.7](#47-dependent-sums): a sum's witness is a type
+fixed per collection, while a dependent tuple's first component is a value and each value has its
+own fiber.
+
+### Where a dependent tuple is born [Planned]
+
+Three passes uncurry a family, and all run after inference. `lambda_elim`'s nested-lambda rule
+packs two binders into one, so `λ 𝑎 : 𝐴 → λ 𝑏 : 𝐷(𝑎) → body` becomes
+`curry(λ 𝑝 : (𝑎 : 𝐴) × 𝐷(𝑎) → body)`. `channelize` keys a feed by the positions of every loop
+around it (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). Planning iterates
+a family's entries one outer position at a time.
+
+Inference introduces no dependent tuple, and a program cannot write one. A source value whose
+domain depends on an outer element, such as `[x for xs in xss for x in xs]`, is typed during
+inference as a sum, `Σ (σ : SubtypesOf((UInt, UInt))). σ ⤇ 𝑉`, and the dependent tuple is that
+sum's witness at the term that builds it.
+
+### Representation
+
+`Type::DepTuple(Vec<(Option<Name>, Type)>)` is a telescope: each component is a binder in the
+shape of a `Fun`'s, whose scope is the components after it. The name slot is an opening address
+and a display spelling, as `Fun::name` is; it is not part of the type's identity.
+
+A reference to an earlier component is a `Name::PiBound`, and its index counts crossings into a
+binder's scope, of which a function's codomain and the components after a tuple component are
+the two kinds. This widens
+[A binder reference is stored in one of two forms](#a-binder-reference-is-stored-in-one-of-two-forms),
+where an index counts function codomains alone. A reference from component `𝑘` to component `𝑗`
+is index `𝑘 − 1 − 𝑗`, and a reference to a function around the tuple adds `𝑘`. The index of a
+reference in a curried family is the same as in its uncurried domain: in
+`(𝑖 : 𝐴) ⇒ ((𝑗 : 𝐵(𝑖)) ⇒ (𝐶(𝑖, 𝑗) ⤇ 𝑉))`, `𝐶` reaches `𝑗` at 0 and `𝑖` at 1, and in
+`(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)` component 2 does too.
+Uncurrying copies the domains along the chain unchanged.
+
+A telescope displays as `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`, one tuple of three components. A
+component that is itself a dependent tuple displays in parentheses,
+`(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)`, and is a different type.
+
+`Type::dep_tuple` closes the components' references to earlier components' names and returns the
+`Type::Tuple` of the components when none references an earlier one, so a tuple has one spelling.
+Nested tuples are not flattened: `(𝐴, (𝐵, 𝐶))` and `(𝐴, 𝐵, 𝐶)` are different types, because a
+key's `.1` is a pair in one and a `𝐵` in the other.
+
+The closing and opening walk (`subst::PiWalk`) walks component `𝑘` at `𝑘` crossings below the
+tuple. Code that only recurses through a tuple treats `DepTuple` as it treats `Tuple`.
+
+### Projection
+
+`𝑝.𝑘` has component `𝑘`'s type opened at `𝑝.0‥𝑝.𝑘−1`, outermost first (`Type::component_type`).
+Opening the outermost binder changes no distance to a binder inside it, and the binders around the
+tuple are already open wherever the tuple is held, so no index shifts. In
+`λ 𝑝 : (𝑎 : Int) × {Int | __elem ∈ keys(𝑎)} → …`, the term `𝑝.1` has type
+`{Int | __elem ∈ keys(𝑝.0)}`. Check mode's projection rule (`emit_proj`) requires a projection's
+codomain to be that type, read with the projection's own binder as `𝑝`.
+
+### Flattening [Planned]
+
+`flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`, and channelize uses it to give a
+feed under three loops its flat key (`docs/chl-spec.md`, "8.4 Feeds are the second form of
+mutability"). Its type rule takes `(𝑝 : (𝑎 : 𝐴) × 𝐵(𝑎)) × 𝐶(𝑝.0, 𝑝.1)` to
+`(𝑎 : 𝐴) × (𝑏 : 𝐵(𝑎)) × 𝐶(𝑎, 𝑏)`, rewriting `𝐶`'s reads of `𝑝.0` and `𝑝.1` into references to
+the new components. The reshaping is an operation in the types as at run time.
+
+### Subtyping
+
+A dependent tuple never takes part in source inference, but it reaches the solver: the post-pass
+type check instantiates builtin schemes and copairings with fresh variables, and a dependent
+tuple can sit in their bounds. Compaction holds one as an atom (`AtomKey::DepTuple`), keyed by its
+α-invariant content hash, so two dependent tuples meet where they are equal up to binder names and
+nowhere else. As a collection's domain it is invariant, like every domain.
+
+### At run time
+
+A dependent tuple has no extent, and op-conversion refuses one (`extent_of`). Each value of the
+first component has its own keys, so the tuple's entries are a family of collections rather than
+one collection, and planning is to rewrite a site that ranges over one into a site over that
+family before any operator is built. A nested `Tile::DataFunction` already keeps a separate run
+of keys per row, which is the form a family's keys take at run time.
+
+### Open
+
+- A row typed by a sum and reached through a loop has its own domain as its fiber. The fiber may
+  be the key type refined by membership in that row, with a check-mode rule that a key in
+  `dom(𝑐)` indexes `𝑐`.
+- A dependent tuple as the witness of a `SubtypesOf` kind needs a membership check against the
+  kind's tuple of key types.
+- Comparing two dependent tuples componentwise under subtyping, which compaction's atom does not.
+
 ---
 
 ## 5. CCL-specific inference rules

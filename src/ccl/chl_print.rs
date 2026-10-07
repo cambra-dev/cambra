@@ -230,7 +230,9 @@ impl Printer {
                 format!("Feed({})", self.ty(value))
             }
             Type::Poly(poly) => self.poly(poly),
-            Type::ChanDom(..) | Type::WitnessRef(_) | Type::BoundedHole(_) => self.fallback(ty),
+            Type::ChanDom(..) | Type::WitnessRef(_) | Type::BoundedHole(_) | Type::DepTuple(_) => {
+                self.fallback(ty)
+            }
         }
     }
 
