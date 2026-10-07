@@ -62,7 +62,12 @@ impl TileOperator for Converse {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(ConverseProducer {
-            base: ProducerBase::new(ConverseProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ConverseProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -389,7 +394,12 @@ impl TileOperator for MapDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MapDomainProducer {
-            base: ProducerBase::new(MapDomainProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapDomainProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -526,7 +536,12 @@ impl TileOperator for Uncurry {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                UncurryProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -806,7 +821,12 @@ impl TileOperator for Filter {
             scheduler,
         );
         Box::new(FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                FilterProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
@@ -1011,7 +1031,12 @@ impl TileOperator for Restrict {
             scheduler,
         );
         Box::new(RestrictProducer {
-            base: ProducerBase::new(RestrictProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                RestrictProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             predicate: predicate_producer,
         })
     }
@@ -1371,7 +1396,12 @@ impl TileOperator for Product {
             .unwrap_or_else(|| unreachable!("the paired level is beneath a row"));
         let empty_level = self.tiling().values_at(level).empty_at_no_rows();
         Box::new(ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                ProductProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             outer: self.outer.subscribe(
                 self.outer.tiling().universal_guard(),
                 forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -1534,7 +1564,7 @@ mod tests {
             Tiling::data_function(pair_extent, Tiling::Scalar(uint())),
         );
         let uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(
                 input_tiling.empty_at_no_rows(),
                 input_tiling,
@@ -1627,7 +1657,7 @@ mod tests {
     fn filter(input: Tile, levels: usize) -> Tile {
         let tiling = uint_tiling(levels);
         let mut filter = FilterProducer {
-            base: ProducerBase::new(FilterProducer::alloc_id(), &tiling),
+            base: ProducerBase::unowned(FilterProducer::alloc_id(), &tiling),
             input: Box::new(TestTileProducer::new(input, tiling.clone())),
             predicate: Box::new(per_row_predicate()),
             level: CurryLevel::new(1),
@@ -1689,7 +1719,7 @@ mod tests {
         );
         let output_tiling = Tiling::data_function(pair_extent, Tiling::Scalar(uint()));
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(
                 input_tiling.empty_at_no_rows(),
                 input_tiling,
@@ -1767,7 +1797,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             level: CurryLevel::OUTERMOST,
             empty_pair: output_tiling.empty_at_no_rows(),
@@ -1886,7 +1916,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             level: CurryLevel::OUTERMOST,
             empty_pair: output_tiling.empty_at_no_rows(),
@@ -1975,7 +2005,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             level: CurryLevel::OUTERMOST,
             empty_pair: output_tiling.empty_at_no_rows(),
@@ -2046,7 +2076,7 @@ mod tests {
         );
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             level: CurryLevel::OUTERMOST,
             empty_pair: output_tiling.empty_at_no_rows(),
@@ -2075,7 +2105,7 @@ mod tests {
             )
         };
         let mut producer = ConverseProducer {
-            base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
             held: Vec::new(),
         };
@@ -2111,7 +2141,7 @@ mod tests {
         );
         let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![10]), one_level_tiling());
         let mut producer = ConverseProducer {
-            base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
             input: Box::new(input),
             held: Vec::new(),
         };
@@ -2314,7 +2344,7 @@ mod tests {
             ]))),
         );
         let mut producer = ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
             outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
             inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
             level: CurryLevel::OUTERMOST,
@@ -2469,7 +2499,7 @@ mod tests {
             ]))),
         );
         let mut producer = ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
             outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
             inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
             level: CurryLevel::OUTERMOST,
@@ -2546,7 +2576,7 @@ mod tests {
             ]))),
         );
         let mut producer = ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
             outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
             inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
             level: CurryLevel::new(2),
@@ -2603,7 +2633,7 @@ mod tests {
             ]))),
         );
         let mut producer = ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
             outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
             inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
             level: CurryLevel::OUTERMOST,
@@ -2668,7 +2698,7 @@ mod tests {
             ]))),
         );
         let mut producer = ProductProducer {
-            base: ProducerBase::new(ProductProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
             outer: Box::new(TestTileProducer::new(outer, outer_tiling)),
             inner: Box::new(TestTileProducer::new(inner, inner_tiling)),
             level: CurryLevel::OUTERMOST,

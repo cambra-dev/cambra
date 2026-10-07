@@ -40,6 +40,8 @@ mod misc;
 mod mutability;
 #[path = "compilation_pipeline/nested_loops.rs"]
 mod nested_loops;
+#[path = "compilation_pipeline/probes.rs"]
+mod probes;
 #[path = "compilation_pipeline/records.rs"]
 mod records;
 #[path = "compilation_pipeline/scalars_collections.rs"]

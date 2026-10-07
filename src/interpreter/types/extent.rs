@@ -393,6 +393,23 @@ pub trait DataSourceDomainExtentImpl {
     /// has none: a source that silently kept the record would replay its history
     /// into the version after next.
     fn retire_producer(&mut self, producer: &str);
+
+    /// The half-open range of indices this source still holds, or `None` for a
+    /// source that retains nothing addressable.
+    ///
+    /// A range because every source with a window keeps a contiguous run of
+    /// indices: it appends at the end and drops only a released prefix. A
+    /// reader can therefore fetch the part it wants with `get` and leave the
+    /// rest.
+    ///
+    /// `&self`, so reading it moves no data and releases nothing — unlike
+    /// [`TileProducer::get`](crate::interpreter::tile_operators::TileProducer::get),
+    /// which is a consumer taking delivery. `None` and `Some(empty)` are
+    /// different answers: the first says this kind of source has no window, the
+    /// second that its window is currently empty.
+    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+        None
+    }
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {

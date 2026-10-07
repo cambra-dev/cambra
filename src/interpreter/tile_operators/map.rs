@@ -199,7 +199,12 @@ impl TileOperator for MapResult {
             scheduler,
         );
         Box::new(MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapResultProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             function: function_producer,
             level: self.level,
@@ -708,7 +713,12 @@ impl TileOperator for MapResultToConst {
             scheduler,
         );
         Box::new(MapResultToConstProducer {
-            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), self.tiling()),
+            base: ProducerBase::new(
+                MapResultToConstProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -975,11 +985,18 @@ impl TileOperator for MapResultWithSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(MapResultWithSourceProducer::new(
+        let input =
             self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        Box::new(MapResultWithSourceProducer::new(
+            ProducerBase::new(
+                MapResultWithSourceProducer::alloc_id(),
+                self.tiling(),
+                &self.base,
+                scheduler,
+            ),
+            input,
             self.source.clone(),
-            self.tiling().clone(),
             self.input.result_correlation(),
         ))
     }
@@ -1050,13 +1067,13 @@ impl HeldBeneathKeys {
 
 impl MapResultWithSourceProducer {
     fn new(
+        base: ProducerBase,
         input: Box<dyn TileProducer>,
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-        tiling: Tiling,
         result_correlation: Option<Vec<TilePathStep>>,
     ) -> Self {
         let result = Self {
-            base: ProducerBase::new(MapResultWithSourceProducer::alloc_id(), &tiling),
+            base,
             input,
             source,
             result_correlation,
@@ -1244,7 +1261,7 @@ mod tests {
             in_tiling.clone(),
         );
         let producer = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &in_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &in_tiling),
             input: Box::new(input),
             function: Box::new(fn_spy),
             level: CurryLevel::new(1),
@@ -1336,7 +1353,7 @@ mod tests {
         );
 
         let mut map_result = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             function: Box::new(function_producer),
             level: CurryLevel::new(1),
@@ -1463,7 +1480,7 @@ mod tests {
             ),
         );
         let mut map_result = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
             level: CurryLevel::new(1),
@@ -1535,7 +1552,7 @@ mod tests {
             ),
         );
         let mut map_result = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(TestTileProducer::new(one_level_fn_tile, input_tiling)),
             function: Box::new(TestTileProducer::new(two_level_fn_tile, function_tiling)),
             level: CurryLevel::new(1),
@@ -1604,7 +1621,7 @@ mod tests {
         };
         let (input, next) = ScriptedProducer::new(input_at(vec![0], 0), in_tiling);
         let mut producer = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             function: Box::new(TestTileProducer::new(f, fn_tiling)),
             level: CurryLevel::new(1),
@@ -1687,7 +1704,7 @@ mod tests {
         };
         let (function, next) = ScriptedProducer::new(f_at(vec![5]), fn_tiling);
         let mut producer = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
             input: Box::new(TestTileProducer::new(input, in_tiling)),
             function: Box::new(function),
             level: CurryLevel::new(2),
@@ -1743,7 +1760,7 @@ mod tests {
             &Tiling::data_function(uint(), Tiling::Scalar(int()))
         );
         let mut producer = MapResultToConstProducer {
-            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), operator.tiling()),
+            base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), operator.tiling()),
             input: Box::new(TestTileProducer::new(groups, in_tiling)),
             constant: Box::new(TestTileProducer::new(
                 Tile::Scalar(ColumnValue::Ints(vec![7])),
@@ -1797,7 +1814,7 @@ mod tests {
         let fn_tiling = operator.function.tiling().clone();
         let fn_tile = Tile::Scalar(ColumnValue::single(Value::Function(Vec::new())));
         let mut producer = MapResultProducer {
-            base: ProducerBase::new(MapResultProducer::alloc_id(), operator.tiling()),
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), operator.tiling()),
             input: Box::new(TestTileProducer::new(
                 in_tiling.empty_at_no_rows(),
                 in_tiling,
@@ -1839,7 +1856,7 @@ mod tests {
         // Pull 1: only the filtered key, so the constant is not pulled.
         let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![1], 0), in_tiling);
         let mut producer = MapResultToConstProducer {
-            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), &out_tiling),
+            base: ProducerBase::unowned(MapResultToConstProducer::alloc_id(), &out_tiling),
             input: Box::new(input),
             constant: Box::new(TestTileProducer::new(
                 Tile::Scalar(ColumnValue::Ints(vec![])),
@@ -1900,9 +1917,9 @@ mod tests {
             BitSet::new(),
         );
         let mut producer = MapResultWithSourceProducer::new(
+            ProducerBase::unowned(MapResultWithSourceProducer::alloc_id(), &out_tiling),
             Box::new(TestTileProducer::new(input, in_tiling)),
             as_domain,
-            out_tiling,
             Some(vec![TilePathStep::Codomain]),
         );
         let _ = producer.get(producer.tiling().universal_guard());

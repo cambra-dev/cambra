@@ -72,6 +72,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         "stdin"
     }
 
+    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+        Some(self.buf.retained_window())
+    }
+
     /// Drains any lines that the background reader thread has buffered.
     ///
     /// Returns `true` if at least one new line (or EOF) was received, which

@@ -587,6 +587,12 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         }
     }
 
+    /// The requests still in flight, which is what the inspector renders as the
+    /// route's live tail.
+    fn retained_window(&self) -> Option<std::ops::Range<usize>> {
+        Some(self.buf.retained_window())
+    }
+
     fn output_value_extent(&self) -> Extent {
         Extent::Base(BaseType::String)
     }

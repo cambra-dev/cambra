@@ -45,17 +45,61 @@ edges it already walks, which is why a node carries no depth.
 
 ### The live model is a separate path
 
-**Planned.** Inspecting a running program means reading values: clicking a `source` shows its most
-recent, not-yet-released data. A value is data-dependent and keyed by a tick, so it cannot ride a
-payload built at compile time.
-
-That path needs node identity in operator conversion and a tick channel. The first exists —
-conversion records, and `post-conversion` is a pane — and the tick channel does not. On the first,
-see
+A value is data-dependent and changes as the run proceeds, so it cannot ride a payload built at
+compile time.
+The live path is `frame.rs` over `/api/live`, and it names its nodes with the ids operator
+conversion records — see
 [provenance.md](../ccl/design/provenance.md#operator-conversion).
 
-It does not reuse the static lookups. A live read is `(node, tick) → value` and a static lookup is
+A probe frame carries two records, which answer different questions.
+
+**What flowed through a node** is its probes' last flow. While probing is on, each producer's probe
+takes a reading of every result `TileProducer::get` returns, and holds two of them: its newest
+reading and its last flow, the newest reading that carried rows. Both are held until the producer
+is dropped or probing switches off. A frame takes a probe's rows from its last flow, because a
+producer under a settling scheduler answers empty hundreds of times per row. It takes completeness
+and the obsolete guard from the newest reading, because a producer's terminal answer is usually
+empty and its consumer releases after the `get` that carried the rows.
+
+**What a source still holds** is its window: the keys no reader has released. A consumer releases a
+row from inside the pull that reads it, so a stream every consumer keeps up with has a full last
+flow and an empty window.
+
+It does not reuse the static lookups. A live read is `node → readings` and a static lookup is
 `span → node`, so a static handler kept in anticipation of the live path gains it nothing.
+
+### Probing follows the live route
+
+Probing is on while at least one client holds `/api/live` open, and off otherwise. The switch is
+all or nothing: every producer holds a clone of one `ProbeSlot`, taken from the `Scheduler` it was
+subscribed under, and the driver fills or empties that slot before each pull to match
+`LiveChannel::is_watched`. While the slot is empty a `get` costs one `None` check and the driver
+samples no source windows, so an unwatched `--inspect` run costs what a run without `--inspect`
+does.
+
+Switching off drops the table and every reading in it, and switching on starts an empty one. A
+client therefore sees what flowed while some client was connected. Switching off also clears the
+channel's newest frame, which renders the dropped table, so a client that connects later receives
+nothing until the fresh table's first flow. A client that connects after the run has finished
+receives the `final` frame. It carries readings when a client stayed connected through the end,
+and only the source windows otherwise: nothing pulls after the run.
+
+### A reload is not followed
+
+Under `--inspect --control`, the panes and the source anchors describe the version the run started
+with, and a `/reload` does not replace them. `serve_compiled` renders `/api/snapshot` once, from the
+first compile, and the driver computes each source's anchors (`source_nodes`) once, before its first
+pull.
+
+A reload keeps some operators and rebuilds the rest. A kept operator keeps its `NodeId`, so its
+probe frame entries still resolve in the panes. A rebuilt operator mints a fresh `NodeId` that the
+served snapshot does not contain. Its entries arrive in every probe frame, but no pane node matches
+them. A source window's `nodeIds` keep naming the first version's `IterateExtent`s. For a rebuilt
+iteration, those ids name a node whose probe detached at teardown. A source first read by the new
+version ships with empty `nodeIds`.
+
+Following a reload means republishing the snapshot and the anchors with the version, and telling a
+reader which version a frame belongs to. Neither is implemented.
 
 ## The data model
 

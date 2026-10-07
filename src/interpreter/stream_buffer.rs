@@ -115,6 +115,22 @@ impl UIntStreamBuffer {
         predicate
     }
 
+    /// The buffered indices.
+    ///
+    /// Everything that has arrived and not yet been dropped, which is what the
+    /// buffer still holds: [`release`](Self::release) advances `start_idx` only
+    /// over a prefix every registered producer has released, so this is the
+    /// union of what the readers still need rather than any one reader's view.
+    /// A converged stream answers empty, because a universal release
+    /// [`close`](Self::close)s the buffer.
+    pub(crate) fn retained_window(&self) -> std::ops::Range<usize> {
+        if self.closed || self.start_idx >= self.ready_size {
+            0..0
+        } else {
+            self.start_idx..self.ready_size
+        }
+    }
+
     /// The buffered indices, `[start_idx, ready_size)`.
     fn live_window(&self) -> IntervalSet<Value> {
         if self.start_idx >= self.ready_size {

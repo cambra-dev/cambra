@@ -1125,6 +1125,33 @@ mod tests {
         }
     }
 
+    /// **A source's anchors are the iterations over its domain.**
+    ///
+    /// `source_accumulator` iterates stdin once, in the chain that reads its
+    /// values: the read after the loop is a `StoreFinalRead`, which takes no
+    /// trigger of its own. That iteration is an `IterateExtent` whose tiling
+    /// names stdin, and `source_nodes` answers it, so per-source state attached
+    /// through it shows there.
+    #[test]
+    fn a_source_is_anchored_at_every_iteration_over_its_domain() {
+        use crate::interpreter::operator_graph::{GraphNode, source_nodes};
+
+        let program = compile_ok(include_str!(
+            "../../tests/programs/source_accumulator/program.cambra"
+        ));
+        let graph = &program.operator_graph;
+        let anchors = source_nodes(graph);
+        let stdin = anchors.get("stdin").expect("the program iterates stdin");
+        assert_eq!(stdin.len(), 1, "one iteration over stdin: {stdin:?}");
+        for id in stdin {
+            let kind = graph.nodes().iter().find_map(|n| match n {
+                GraphNode::Operator { id: node, kind, .. } if node == id => Some(*kind),
+                _ => None,
+            });
+            assert_eq!(kind, Some("IterateExtent"), "anchor {id:?}");
+        }
+    }
+
     /// **The graph has its output boundary**: a sink per compiled output.
     ///
     /// Without it the graph ends in the middle of nothing, and a reader has no way
