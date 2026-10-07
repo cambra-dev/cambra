@@ -4,22 +4,14 @@ import CclFormal.SubtypingIsTransitive
 /-!
 # The materialized merge is the least bound, over types
 
-`MaterializedMergeIsABound.lean` proves leastness among positions (`merge_is_least_position`) by transporting the
-merge's own order. This module proves it over `Ty` (`merge_is_least_type`): every well-formed type
-bounding both operands' materializations bounds the merge's, with no position standing in for the
-type and `absorbedBy` never mentioned. Reflecting `Subtyping` into that order is false, so the
-induction is on the materializations.
+`bounds_merge` varies the subtype-bound direction independently of merge polarity.
+`merge_is_least_type` specializes their equality: a well-formed type bounding two
+successfully materialized concrete operands also bounds their materialized merge.
+This does not assert that the merge bounds those operands.
 
-One induction (`bounds_merge`) carries four statements, because the side the bound sits on is a
-parameter (`bounds`) independent of the merge's polarity. The two instances where side and polarity
-agree are leastness. The other two say a type both operands bound is bounded by the merge, which is
-what the function case needs of its domains: a domain flips the polarity and the subtyping edge
-together, and a `data` domain is invariant, so leastness alone does not close that case.
-
-`coalesce_wellFormed` is what connects the theorem to `MaterializedMergeIsABound.lean`'s sample: a `wellFormed`
-position materializes to a well-formed type, so every candidate bound in the pool is one
-`merge_is_least_type` applies to, and the sample's leastness line becomes
-`leastness_failures_eq_nil` rather than a `#guard`.
+`coalesce_wellFormed` establishes candidate-pool well-formedness; `leastness_failures_eq_nil`
+then derives the sample's leastness assertion from the general theorem.
+See `formal/design.md`, "Bound and leastness hypotheses" and "Checked samples and their limits".
 -/
 
 namespace CclFormal

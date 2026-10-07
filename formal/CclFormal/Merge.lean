@@ -3,62 +3,15 @@ import CclFormal.Ty
 /-!
 # The solver's polar merge and its algebra
 
-The Lean mirror of `src/ccl/infer/solver/compact.rs`'s bound-merging — the operation `coalesce`
-folds over a variable's bounds (`CompactType::merge`, `CompactFun::merge`, `merge_refinements`,
-`merge_records`, `merge_variants`) — and the theorems that make the solver's order-independence
-refinement a proof obligation instead of a fuzz observation:
+This module defines `CompactTy`, fixed-polarity merge, representation equivalence and absorption.
+Its correspondence with Rust and the hypotheses of its algebraic laws are specified in
+`formal/design.md`, "The polar merge". The model omits solver state and several function-slot
+fields; its equivalence is not equality of complete Rust compact types.
 
-- `equiv` is an equivalence relation (`equiv_refl`, `equiv_symm`, `equiv_trans`);
-- `merge` is commutative (`merge_comm`), idempotent (`merge_idem`, under `wellFormed`),
-  and a congruence for `equiv` (`merge_congr_left`/`_right`);
-- `merge` is associative (`merge_assoc`), at either polarity and with no side
-  condition — the kinds join in a semilattice (`joinKind`) and the domains are combined by polarity
-  alone, so no step reads a value a later step can change;
-- the fold `coalesce` performs is therefore invariant under permutation
-  (`foldMerge_perm`) and duplication (`foldMerge_dup`) of the bound list;
-- `merge pol` is the least upper bound of the order it induces, and the *only*
-  one up to `equiv` (`merge_is_least_absorber`, `least_absorber_unique`), with the empty position as
-  the order's least element (`merge_cempty_left`, `absorbedBy_cempty`).
-
-`differential_polar_merge_vs_lean_model` (`tests/differential_oracle.rs`) is what keeps this a
-statement about the solver: it folds generated bound lists through `CompactType::merge` exactly as
-`compact_go` does and checks every step against `merge` here, judged by `equiv`.
-
-## What the model is a mirror of, and what it drops
-
-`CompactTy` is the concrete fragment of `CompactType`: atoms, the optional record/variant maps, the
-optional function slot, and the refinement slot with its `none` sentinel. Deliberately dropped, with
-the reasoning:
-
-- **Inference variables** (`vars`) — the concrete algebra doesn't read them;
-  they union like atoms and would only pad every proof.
-- **History slots** — transients erased before the strict wall, exactly as
-  `Ty` excludes `History` (same-polarity componentwise merge; nothing new).
-- **The Pi binder** (`CompactFun::name`, merged `a.name.or(b.name)`) —
-  first-wins is order-dependent as written, but the slot carries no refinement identity: a
-  refinement's binding is its index (`Name::PiBound`), so the merged refinements agree whatever
-  spelling survives, and the slot is display plus the frame's opening address; the asymmetry is
-  unobservable.
-- **A conflicted slot's domain payload** — `compact.rs` keeps `widest`, which
-  picks between two equal-length lists by arrival order. Coalesce prints those alternatives and
-  reads nothing from them, so the model drops the payload rather than mirror an order-dependent
-  choice, and the differential's encoder drops it too. Every other slot's alternatives are mirrored
-  in full: `fn`'s domain slot is a `List CompactTy` matching `DomainSet`, because
-  `coalesce_compact_go` folds the contravariant meet over it and two slots differing in the tail
-  materialize differently.
-
-## The equivalence is the code's own equality
-
-`equiv` mirrors `CompactType`'s `PartialEq`: set-semantic on atoms and refinements (mirroring
-`BTreeSet` and `RefinementSet`), key-set + payload on the maps (mirroring `BTreeMap`), componentwise
-on the function slot. The merge's one internal comparison — `union_domains` deduplicating two `Data`
-domains — uses that same equality, which is what makes every theorem quotient-compatible: the gate
-cannot distinguish two `equiv`-equal inputs.
-
-The empty position **is** an identity (`merge_cempty_left`), because every slot including the
-refinement slot has a `none` that merges as one. `compact_go` still folds a variable's bounds from
-the *first bound* rather than from `CompactType::default()`, so the fold theorems are stated over
-nonempty lists, but that is now the code's habit rather than an algebraic requirement.
+`merge_comm` and `merge_assoc` apply at either polarity. Idempotence requires `wellFormed`.
+`foldMerge_perm` fixes the seed and permutes the remaining contributions; `foldMerge_dup`
+requires a well-formed repeated contribution. Least-absorber results concern `absorbedBy`,
+not the independently defined `Subtyping` relation.
 -/
 
 namespace CclFormal
@@ -230,14 +183,9 @@ theorem joinKind_assoc (a b c : KindMerge) :
 theorem joinKind_idem (a : KindMerge) : joinKind a a = a := by
   cases a <;> rfl
 
-/-- Mirror of the concrete fragment of `compact.rs :: CompactType`.
-
-The function slot is `(kind, domain, codomain)` with `domain : Option CompactTy` — `some d` is a
-single domain alternative, `none` is "two or more distinct alternatives" (see the module docs for
-why the tail of `union_domains`' list is diagnostic-only). `recF`/`varT` mirror the
-`Option<BTreeMap<..>>` fields: `none` is the merge identity ("no component here"), `some []` the
-absorbing
-empty shape — the distinction `compact.rs` documents as load-bearing. -/
+/-- Compact atoms, optional keyed shapes, an optional function and a refinement contribution.
+A function contains one domain and one codomain. In optional slots, `none` is absence,
+not a populated slot with empty content. See `formal/design.md`, "The polar merge". -/
 inductive CompactTy where
   | mk (atoms : List Atom)
        (recF : Option (List (FieldKey × CompactTy)))
@@ -265,13 +213,16 @@ theorem lookup_sizeOf {m : List (FieldKey × CompactTy)} {k : FieldKey} {w : Com
       simp
       omega
 
-/-! ## The equivalence (`CompactType`'s `PartialEq`) -/
+/-! ## Representation equivalence
+
+Compare modeled fields only; see `formal/design.md`, "Why the model carries `CompactTy` at all".
+-/
 
 mutual
 
-/-- Set-semantic equality, mirroring `CompactType`'s `PartialEq` (see module
-docs). Defined *before* `merge` because the merge's domain-dedup gate uses it,
-exactly as `union_domains` uses `PartialEq`. -/
+/-- Atoms and refinements compare by membership; maps compare by lookup;
+function kind, domain and codomain compare componentwise. This is representation
+equivalence, not a subtype test or equality of full Rust solver state. -/
 def equiv : CompactTy → CompactTy → Bool
   | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2 =>
     a1.all (a2.contains ·) && a2.all (a1.contains ·)
@@ -316,16 +267,11 @@ decreasing_by
 
 end
 
-/-! ## The domain alternatives, read as a set
+/-! ## Function domains
 
-`equiv`'s fn clause compares them with `subtypeDomains`, and every law below reasons through
-`anyEquiv_iff`/`subtypeDomains_iff`, so the representation is never touched again. This is the one
-place `equiv` is deliberately coarser than `CompactFun`'s derived `PartialEq`, which compares the
-`Vec` positionally: `union_domains` deduplicates the alternatives and their only readers are a
-`Data` slot's refusal to hold more than one and a `Compute` slot's commutative meet-fold at
-coalesce, so their order carries no information. That the order is unobservable downstream is what
-`tests/constraint_order_fuzz.rs` checks, by comparing coalesced outcomes across arrival
-orders. -/
+The function slot contains one recursively merged domain. There is no separate
+domain-alternative list or domain-deduplication operation in this model.
+-/
 
 /-! ## The merge -/
 
@@ -397,20 +343,10 @@ decreasing_by
   · simp
     omega
 
-/-- Mirror of `CompactFun::merge` (see module docs for the `Option CompactTy`
-domain encoding and the dropped binder/diagnostic payloads).
-
-The kinds join in the [`KindMerge`] semilattice and the domain merges **contravariantly**, as one
-ordinary position: there is no domain lattice to consult, because a `fun` slot holds one domain.
-What was a join or meet of candidate sets is the same `merge` every other position gets, and a
-candidate set lives one level up, on the witness a Σ binds (`compact.rs`, `CompactFun::domain`).
-
-Nothing reads the kind, which is what makes the operation associative — the kind a slot ends at is
-not known until the last bound has merged, so a domain rule selected from it would let association
-decide the outcome. `compact.rs` defers the kind's own rule to `coalesce_compact_go`.
-
-A conflicted kind keeps its domain rather than dropping it: `CompactFun::merge` computes the domain
-before the kinds join and stores it either way, so there is no payload for the model to drop. -/
+/-- Merge kinds, domains at opposite polarity, and codomains at the current polarity.
+The kind does not select the domain operation. A conflicting kind retains its merged children.
+Rust's disagreement and diagnostic fields are omitted; see `formal/design.md`,
+"The fn slot holds one domain". -/
 def mergeFun (pol : Bool) :
     KindMerge × CompactTy × CompactTy → KindMerge × CompactTy × CompactTy → KindMerge ×
       CompactTy × CompactTy
@@ -704,12 +640,6 @@ theorem equiv_trans : (a b c : CompactTy) → equiv a b = true → equiv b c = t
 termination_by a _ c => sizeOf a + sizeOf c
 decreasing_by all_goals omega
 
-/-! ## The domain alternatives: the algebra -/
-
-/-! ### The negative arm, characterized
-
-`meetDomains` is defined on a singleton pair and nowhere else, so every proof about
-a negative merge splits on that once, here, rather than over nine list shapes. -/
 
 /-! ## Pointwise readings of the merged maps -/
 
@@ -818,7 +748,7 @@ theorem merge_slots (pol : Bool) (a1 a2 : List Atom)
 
 /-! ## The merge algebra: commutativity -/
 
-/-- The dedup gate is symmetric as a *Bool*: `equiv x y = equiv y x`. -/
+/-- Symmetry of the Boolean comparison, including its false result. -/
 theorem equiv_comm_bool (x y : CompactTy) : equiv x y = equiv y x := by
   rcases h : equiv y x with _ | _
   · rcases h' : equiv x y with _ | _
@@ -1009,11 +939,10 @@ end
 
 /-! ## Depth
 
-The measure materialization terminates on. `merge` combines contributions pointwise and never nests
-one inside another, so a merged position is no deeper than the deeper of its inputs
-(`merge_depth_le`) — which is what bounds `coalesce`'s recursion through a `Compute` slot's folded
-alternatives, a call no
-`sizeOf` measure reaches. -/
+`depth` bounds the child recursion used by materialization. Independently,
+`merge_depth_le` proves that merging cannot exceed the larger operand depth.
+The current materializer recurses into one function domain, not a folded alternative list.
+-/
 
 mutual
 
@@ -1202,15 +1131,8 @@ theorem depth_mk_le {a1 : List Atom} {r v : Option (List (FieldKey × CompactTy)
   rw [depth]
   exact Nat.add_le_add_left (Nat.max_le.mpr ⟨hr, Nat.max_le.mpr ⟨hv, hf⟩⟩) 1
 
-/-- **`merge` does not deepen a position.** Every component of the merged position
-is built from components of the inputs — atoms and refinements union, map payloads merge pointwise,
-a function slot's alternatives come from one side or are a meet of one from each, and its codomain
-is a merge of the two — so the whole is no deeper than the deeper input.
-
-By induction on a depth bound rather than on the term, because the statement is needed exactly where
-no structural measure works: `coalesce`'s recursion through a `Compute` slot's folded alternatives
-materializes a `merge` result, not a subterm.
-`compact.rs` relies on this and states it nowhere. -/
+/-- A merge has depth at most the larger input depth.
+Induct on a common depth bound; map payloads and function children use smaller bounds. -/
 theorem merge_depth_le_bounded : ∀ (n : Nat) (pol : Bool) (a b : CompactTy),
     depth a ≤ n → depth b ≤ n →
       depth (merge pol a b) ≤ Nat.max (depth a) (depth b) := by
@@ -1335,13 +1257,13 @@ theorem merge_depth_le (pol : Bool) (a b : CompactTy) :
 
 /-! ## Well-formedness of input bounds
 
-`compact_go` builds every bound's `CompactTy` from a `Type`: a function contributes exactly one
-domain and a concrete kind (`AtomKey::from_type` / the `Type::Fun` arm), so an *input* bound never
-carries a `conflict` kind or a multi-domain slot — those states are only ever *produced* by merging.
-Idempotence (and the fold's duplicate-invariance) is stated under this invariant: a conflicted or
-domain-less slot is an error state the solver never feeds back in, and `equiv`-idempotence genuinely
-fails there (the model's conflict arm canonicalizes
-the diagnostic payload away). -/
+`wellFormed` requires unique map keys, recursively well-formed children, non-conflicting
+function kinds, and a refinement slot whenever content is present. It permits `unknown`
+kinds; `kindResolved` adds the concrete-kind requirement.
+
+Idempotence and duplicate-invariance assume this invariant. Their hypotheses do not establish
+that every Rust intermediate compact value satisfies it.
+-/
 
 mutual
 
@@ -1535,13 +1457,11 @@ decreasing_by all_goals (simp; omega)
 
 /-! ## Congruence: `merge` respects `equiv`
 
-The one gate inside `merge` — the positive `data ⊔ data` domain dedup — is `equiv` itself, so it
-cannot distinguish `equiv`-equal inputs (`equiv_congr_bool`). That is the whole reason congruence
-holds; a gate keyed on anything finer
-(e.g. structural equality, with `equiv` coarser than it) would break it. -/
+Equivalent inputs yield equivalent merged representations. The proof treats shape slots
+componentwise; there is no domain-deduplication branch in the current `merge`.
+-/
 
-/-- Replacing one side of the gate by an `equiv`-equal value leaves the gate's
-verdict unchanged. -/
+/-- Replacing a comparison operand with an equivalent value preserves its Boolean result. -/
 theorem equiv_congr_bool {x x' : CompactTy} (h : equiv x x' = true) (y : CompactTy) :
     equiv x y = equiv x' y := by
   rcases hg : equiv x' y with _ | _
@@ -2031,12 +1951,10 @@ end
 
 /-! ## The fold: coalescing a bound list is order- and duplicate-invariant
 
-`compact_go` folds a variable's bounds through `merge` from the first bound (no identity element
-exists — see the module docs). The outcome is a function of the bound *set*: permutations
-(`foldMerge_perm`) cannot change it, and neither can duplicates (`foldMerge_dup`, which needs
-`wellFormed` on the repeated bound because idempotence does). This is the algebraic statement behind
-the type-merge fuzz's
-\"outcomes agree under permuted constraint orders\". -/
+`foldMerge` merges a list into an explicit seed. Permutation fixes that seed.
+Duplication requires `wellFormed` for the repeated contribution.
+The empty position is also a merge identity; a first-bound seed does not imply its absence.
+-/
 
 /-- The fold `compact_go` performs over a variable's bound list, seeded at the
 first bound. -/
@@ -2051,8 +1969,8 @@ theorem foldMerge_congr (pol : Bool) {t t' : CompactTy} (ts : List CompactTy)
   | nil => exact h
   | cons x ts ih => exact ih (merge_congr_left pol t t' x h)
 
-/-- **Order-invariance**: permuting the bound list cannot change the coalesced
-outcome (up to `equiv`), at either polarity and with no side condition. -/
+/-- Permuting contributions preserves the merged compact result up to `equiv`,
+for any fixed seed and either polarity. This theorem does not invoke `coalesce`. -/
 theorem foldMerge_perm (pol : Bool) {l1 l2 : List CompactTy} (h : l1.Perm l2) :
     ∀ (t : CompactTy), equiv (foldMerge pol t l1) (foldMerge pol t l2) = true := by
   induction h with
@@ -2083,32 +2001,14 @@ theorem foldMerge_dup (pol : Bool) {t x : CompactTy} (l : List CompactTy)
 
 /-! ## The order the merge induces, and uniqueness
 
-`merge pol` is commutative, associative and idempotent, so it comes with an order: `absorbedBy pol a
-b` reads "merging `a` into `b` adds nothing". `merge pol` is that order's least upper bound, and any
-least upper bound is `equiv`-equal to it (`least_absorber_unique`).
+`absorbedBy pol a b` means merging `a` into `b` preserves `b` up to `equiv`.
+On well-formed operands, `merge_is_least_absorber` and `least_absorber_unique` establish
+leastness and uniqueness in that induced order.
 
-The scope is narrow and worth stating. These proofs use only commutativity, associativity,
-idempotence and congruence, so they are the semilattice-to-poset correspondence and carry exactly
-that content — `merge` is a join *of the order it defines*. That it is the join with respect to
-**subtyping** is a different statement, needing a denotation into a lattice of types, and it is not
-made here (`formal/design.md`, "The lattice is a semantic statement").
-
-Absorption and distributivity hold of the types and are not stated here, because `CompactTy` is the
-wrong carrier for them. There is one type lattice, and `merge true` computes its join while `merge
-false` computes its meet; what is polarity-indexed is the *denotation*. One `CompactTy` denotes two
-types — a contribution set is the union of its contributions read positively and their intersection
-read negatively — so `CompactTy` is one syntax carrying two representations rather than a lattice
-carrier.
-
-Writing `a ⊓ (a ⊔ b) = a` over `CompactTy` needs one syntactic `a` in both a join argument (read
-positively) and a meet argument (read negatively), which needs `⟦a⟧⁺ = ⟦a⟧⁻`. That holds for a
-single contribution (`{Int}` is `Int` either way) and fails once a set holds two, which is the case
-the law is about. So the laws proved here are the ones a single polarity's operation has, and the
-cross-polarity laws wait on a carrier where both operations act on the same object
-(`formal/design.md`, "The lattice is a semantic statement").
-
-Reflexivity needs `wellFormed` because idempotence does; nothing else here has a side
-condition. -/
+The relationship with materialized `Subtyping` has separate hypotheses; see
+`formal/design.md`, "Bound and leastness hypotheses". These fixed-polarity laws do not
+establish cross-polarity absorption or distributivity.
+-/
 
 /-- The empty position: no contribution at any slot, which is what a `Hole`
 compacts to (`CompactType::empty`). -/
@@ -2130,15 +2030,9 @@ theorem merge_cempty_right (pol : Bool) (a : CompactTy) : equiv (merge pol a emp
   exact equiv_trans _ _ _ (merge_comm pol a emptyPosition)
     (by rw [merge_cempty_left]; exact equiv_refl a)
 
-/-- `b` absorbs `a` at this polarity: merging `a` into `b` adds nothing.
-
-This is the order `merge pol` induces on *representations*, and it is **not** subtyping. It is
-strictly finer: a positive merge accumulates a function slot's domain alternatives rather than
-deciding between them, so `(Int ⇒ Int)` and `({Int | __elem} ⇒ Int)` merge to a slot carrying both —
-a different `CompactTy` from either, though `coalesce` materializes it to the second, which is their
-subtyping join. Two positions can therefore materialize to the same type and absorb neither the
-other. `Subtyping` is the subtyping relation; nothing here is stated over it except
-by way of `coalesce` (`coalesce_monotone`). -/
+/-- `b` absorbs `a` when their merge is equivalent to `b`.
+This relates representations at one polarity, not types under `Subtyping`.
+Transport to materialized subtype relations requires separate assumptions. -/
 def absorbedBy (pol : Bool) (a b : CompactTy) : Prop := equiv (merge pol a b) b = true
 
 theorem absorbedBy_refl (pol : Bool) {a : CompactTy} (h : wellFormed a = true) : absorbedBy pol a a
