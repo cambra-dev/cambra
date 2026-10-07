@@ -34,8 +34,8 @@
 //!
 //! The encoding's root keeps the comprehension's [`NodeId`]. Each generator's
 //! plumbing (its index read, its source application and its per-element lambda)
-//! is recorded against that generator's `iter`; the outer lambda, the cast, the
-//! loop-join predicate and a fan-out's arms are recorded against the element.
+//! is recorded against that generator's `iter`; the outer lambda, the cast and
+//! the loop-join predicate are recorded against the element.
 //! `crate::ccl::context` runs the phase under a
 //! [`DerivationSession`](crate::ccl::provenance::DerivationSession), so those
 //! records resolve an error to a span whether or not the compile captures
@@ -46,10 +46,7 @@ use std::rc::Rc;
 use crate::ccl::{
     BinOpKind, Expr, Generator, LogicKind, Name, SharedHoleMint, Type, TypedBinding, TypedExprNode,
     anf,
-    ccl_utils::{
-        PredMemo, flatten_trailing_value_case, make_cast, refined_data_fun,
-        synthesize_arm_predicate, walk_refined_predicates_mut,
-    },
+    ccl_utils::{PredMemo, make_cast, refined_data_fun, walk_refined_predicates_mut},
     provenance::{self, Nature, NodeId},
     ty::FunKind,
 };
@@ -151,34 +148,13 @@ impl Rewrite<'_> {
 /// Does this comprehension encode to a bare `Lambda` — an atomic term?
 ///
 /// True for the identity and loop-join shapes with no guard: those are one
-/// lambda. A guard puts the lambda under a `cast`, and an element that
-/// [`fans_out`] becomes a `++` of casts, and neither is atomic.
+/// lambda. A guard puts the lambda under a `cast`, which is not atomic.
 ///
 /// Asked by [`crate::ccl::anf`], which runs before this phase and so has to
 /// decide whether a comprehension needs naming in an operand position from the
 /// shape it will take. Stated here, beside [`encode`], which is what decides it.
-pub fn encodes_to_lambda(generators: &[Generator], element: &Expr) -> bool {
-    generators.iter().all(|g| g.guards.is_empty()) && !fans_out(generators, element)
-}
-
-/// Does this comprehension's element fan out ([`fan_out_element_case`]) into
-/// one filtered map per arm? True for a single unguarded generator whose
-/// element is a guard-only value `Case`.
-///
-/// Each arm's guard then becomes a refinement predicate, which
-/// [`crate::ccl::anf`] asks about so it leaves those guards as written.
-pub fn fans_out(generators: &[Generator], element: &Expr) -> bool {
-    matches!(generators, [g] if g.guards.is_empty()) && is_value_case(element)
-}
-
-/// Is `element` a guard-only value `Case` — the per-element conditional
-/// [`fan_out_element_case`] expands?
-fn is_value_case(element: &Expr) -> bool {
-    matches!(
-        &element.node,
-        TypedExprNode::Case { scrutinee: None, branches }
-            if branches.iter().all(|b| b.pattern.is_none())
-    )
+pub fn encodes_to_lambda(generators: &[Generator]) -> bool {
+    generators.iter().all(|g| g.guards.is_empty())
 }
 
 /// The [`Type::SharedHole`] a source annotation uses to *name* its domain, if it
@@ -261,7 +237,7 @@ fn encode(
     );
     let element_id = element.node_id();
     // Every node not minted under a generator's own recording below is the
-    // element's: the outer lambda, the cast, the predicate, a fan-out's arms.
+    // element's: the outer lambda, the cast, the predicate.
     let _element_frame = provenance::enter(element_id, "comprehension.encode", Nature::Machinery);
     let single_gen = generators.len() == 1;
     let outer_var = Name::iter_record();
@@ -288,11 +264,11 @@ fn encode(
             });
         }
     }
-    // Read before step 4 drains the sources into the body.
+    // Read before step 3 drains the sources into the body.
     let gen_ids: Vec<NodeId> = gen_sources.iter().map(Expr::node_id).collect();
 
     // Sources for the loop-join restriction lambda are copies of the sources the
-    // body chain uses. Taken here, before step 4 stamps the body copies with
+    // body chain uses. Taken here, before step 3 stamps the body copies with
     // their annotations and drains them — a copy of a minted tree stays
     // structurally equal to its origin, which is what lets inference dedup the
     // predicate-side refinements against the body-side ones.
@@ -308,7 +284,7 @@ fn encode(
     // address each one via RecordField and the runtime produces the cartesian
     // product.
     // With a guard: wrap in Restricted so the runtime filters via a correlation
-    // vector computed from the predicate (see step 5).
+    // vector computed from the predicate (see step 4).
     //
     // Helper: build the index argument for generator `i` — for the Phase-5
     // loop-join predicate chain only. Single-gen: a bare VarRef to the outer
@@ -322,28 +298,7 @@ fn encode(
         }
     };
 
-    // ---- Step 3: fan out a value-`Case` element into filtered maps ------------
-    // `[a if g(x) else b for x in xs]` — a comprehension whose *element* is a
-    // per-element conditional — carries a value-`Case` element. The `Case`
-    // cannot float out (its guards reference the comprehension variable `x`), so
-    // instead fan out the source by each arm's first-match gate:
-    // `[eᵢ if gᵢ … for x in xs]` ⟹ `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`,
-    // `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm restricts the source by its
-    // (element-dependent) gate — the ordinary filter refinement — and maps by
-    // that arm's value; the gates partition the source, so the union recombines
-    // the arms by position into the fully-mapped collection. A `Copair`
-    // (not a `Case`), so the compute-kinded per-arm maps do not need to join.
-    // Single generator, no comprehension filter; the value arms may reference `x`.
-    if single_gen && pred_op.is_none() && is_value_case(&element) {
-        let source = gen_sources.pop().expect("single generator has one source");
-        let binding = gen_bindings.pop().expect("single generator has one binder");
-        return at_id(
-            fan_out_element_case(source, &binding, element),
-            comprehension_id,
-        );
-    }
-
-    // ---- Step 4: build the body as a nested Apply/Lambda chain ----------------
+    // ---- Step 3: build the body as a nested Apply/Lambda chain ----------------
     // Working innermost-first (reverse order) we wrap the accumulated expression:
     //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
     // An **unfiltered single-generator** comprehension iterates *exactly* its
@@ -479,7 +434,7 @@ fn encode(
         "a comprehension is built over one kind per generator"
     );
 
-    // ---- Step 5: attach the restriction ---------------------------------------
+    // ---- Step 4: attach the restriction ---------------------------------------
     if let Some(pred_op) = pred_op {
         // Non-equality or multi-guard: loop-join restriction predicate.
         // The refinement's element is the implicit REFINEMENT_BINDER (the
@@ -553,80 +508,6 @@ fn per_element_lambda(target: &TypedBinding, body: Expr) -> Expr {
     Expr::lambda(target.name.clone(), target.ty.clone(), body)
 }
 
-/// Hand out a tree copy of `origin` for one arm of a fan-out. Every arm is a
-/// sibling, including the first: a fan-out places the same subtree under several
-/// arms and no arm is privileged. The copy sink records each copy as a `Copy` of
-/// the origin, so every arm's attribution mirrors the original's.
-///
-/// Keeping the first arm's ids was measured at 30 ids saved over the whole
-/// pipeline suite, max subtree 5 — which does not pay for a second code path.
-fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
-    use crate::ccl::provenance::copy_frame;
-    let _frame = copy_frame(label);
-    origin.clone()
-}
-
-/// Fan out a single-generator comprehension whose *element* is a value-`Case`
-/// into a union of filtered maps: `[eᵢ if gᵢ … for x in src]` ⟹
-/// `⧺ᵢ [eᵢ for x in src if π̂ᵢ]`, first-match `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm is a
-/// filtered map — the source restricted on its domain by the arm's
-/// (element-dependent) gate (a `cast` carrying the refinement, exactly the shape
-/// step 5 builds for a comprehension `if`-filter), composed with the arm's value
-/// map. The gates partition the source, so the `++`-union recombines the arms by
-/// position into the fully-mapped collection.
-fn fan_out_element_case(source: Expr, binding: &TypedBinding, element: Expr) -> Expr {
-    let TypedExprNode::Case { branches, .. } = element.node else {
-        unreachable!("fan_out_element_case requires a Case element")
-    };
-    // Flatten a nested `elif` element (`a if p else b if q else c`, a trailing
-    // `true → Case{…}`) into one flat partition, so each arm is a plain value.
-    let branches = flatten_trailing_value_case(branches);
-    let mut prior_guards: Vec<Expr> = Vec::new();
-    // The source subtree is placed once per arm in the element map and once more in
-    // that arm's gate, so every use after the first must be a freshened copy.
-    let arms: Vec<Expr> = branches
-        .into_iter()
-        .map(|b| {
-            let gate = synthesize_arm_predicate(&b.guard, &prior_guards);
-            prior_guards.push(b.guard);
-            // Element map: `λ __idx → __idx ▷ src ▷ (λ x → eᵢ)`. Each arm is
-            // its own lambda, so each gets its own index binder.
-            let outer_var = Name::iter_record();
-            let arm_src = fan_out_copy(&source, "comprehension.elem_case_source");
-            let read = Expr::apply(Expr::var(outer_var.clone()), arm_src);
-            let applied = Expr::apply(read, per_element_lambda(binding, b.body));
-            // The arm *is* a filtered comprehension — a collection — so it carries
-            // the `Data` stamp, like every other comprehension lambda. The cast
-            // below refines its domain by the arm's gate; the target's `Data`
-            // does not reach the lambda underneath.
-            let elem_map = Expr::lambda(outer_var, Type::Hole, applied)
-                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole));
-            // Gate over the source domain: `__elem ▷ src ▷ (λ x → π̂ᵢ)` — the bare
-            // refinement predicate, matching step 5's loop-join filter shape.
-            let gate_on_source = Expr::apply(
-                Expr::apply(
-                    Expr::var(Name::elem()),
-                    fan_out_copy(&source, "comprehension.elem_case_source"),
-                ),
-                per_element_lambda(binding, gate),
-            );
-            let target = refined_data_fun(
-                Type::Hole,
-                gate_on_source,
-                Type::Hole,
-                FunKind::fresh_data(),
-            );
-            make_cast(elem_map, target)
-        })
-        .collect();
-    // A one-arm value `Case` (degenerate) is just the single filtered map.
-    if arms.len() == 1 {
-        arms.into_iter().next().expect("checked len == 1")
-    } else {
-        Expr::copair(arms)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,11 +574,11 @@ mod tests {
         "[x + y for x in [1, 2] for y in [3, 4] if x == y]",
         "cast(({_ | __elem.0 ▷ [1, 2] ▷ (λ x → __elem.1 ▷ [3, 4] ▷ (λ y → x == y))} ⤇ _), λ __iter_record → __iter_record.0 ▷ [1, 2] ▷ (λ x → __iter_record.1 ▷ [3, 4] ▷ (λ y → x + y)))"
     )]
-    // A per-element conditional fans out into one filtered map per arm, gated by
-    // first match, recombined by `++`.
+    // A per-element conditional stays a value `Case` in the per-element lambda,
+    // which lambda elimination compiles over the element stream.
     #[case(
         "[x if x > 1 else 0 for x in [1, 2]]",
-        "let __anf = cast(({_ | __elem ▷ [1, 2] ▷ (λ x → x > 1)} ⤇ _), λ __iter_record → __iter_record ▷ [1, 2] ▷ (λ x → x))\nin let __anf = cast(({_ | __elem ▷ [1, 2] ▷ (λ x → true and not x > 1)} ⤇ _), λ __iter_record → __iter_record ▷ [1, 2] ▷ (λ x → 0))\nin __anf ⊎ __anf"
+        "λ __iter_record → let __anf = let __anf = [1, 2]\nin __iter_record ▷ __anf\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
     )]
     fn the_encoding(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);
@@ -719,11 +600,9 @@ mod tests {
     }
 
     /// No binding A-normalization or this phase seals stands inside a
-    /// predicate. A fanned-out element's guards become per-arm predicates, so
-    /// A-normalization leaves them as written; a comprehension inside
-    /// `groupby`'s predicate is encoded below depth 0, so it is not normalized.
+    /// predicate. A comprehension inside `groupby`'s predicate is encoded below
+    /// depth 0, so it is not normalized.
     #[rstest]
-    #[case::fanned_out_guard("[x + 1 if x + 1 > 2 else 0 for x in [1, 2, 3]]")]
     #[case::comprehension_in_a_predicate(
         "g = groupby([y + 10 for y in [2, 3, 4, 5, 6]], \\x -> x // 2)\ng"
     )]

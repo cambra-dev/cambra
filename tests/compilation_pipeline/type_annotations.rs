@@ -979,9 +979,12 @@ z        "#},
 /// types are not structurally equal, and so the assertion fails.
 ///
 /// This is the assert `reading_mut_in_comprehension_not_supported`
-/// pins for the unfiltered case. A filter, a nested comprehension and a
-/// conditional element each reach it too, where before the comprehension
-/// phase they failed inference with `MutableInRefinedType`.
+/// pins for the unfiltered case. A filter and a nested comprehension each
+/// reach it too, where before the comprehension phase they failed inference
+/// with `MutableInRefinedType`. A conditional element compiles: it stays a
+/// value `Case` in the element's lambda, with no refined cast to reconstruct
+/// (`a_conditional_element_reading_an_enclosing_binder` in
+/// `tests/differential_interp.rs`).
 ///
 /// TODO: Fix by mirroring the opaque dropping logic in lambda_elim's
 /// type reconstruction, or by dropping non-data-fun-domain type
@@ -1004,14 +1007,6 @@ ys = [[x ^+ j for j in [1,2]] for i in [1,2] if i > 1]
 ys
     "#},
     "(Int ⇒ Int) vs ((j: Int) ⇒ {Int | __elem == x ▷ const ^+ j})"
-)]
-#[case::conditional_element(
-    indoc! {r#"
-x := 3
-ys = [x ^+ i if i > 1 else 0 for i in [1,2,3]]
-ys
-    "#},
-    "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})"
 )]
 fn a_comprehension_that_reads_a_mut_fails_lambda_elims_reconstruction(
     #[case] code: &str,
