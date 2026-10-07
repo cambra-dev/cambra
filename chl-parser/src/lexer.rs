@@ -23,6 +23,7 @@
 //! `DEDENT`s so every `INDENT` has a partner.
 
 use crate::ast::Span;
+use crate::builtins::SurfaceBuiltin;
 use logos::Logos;
 use smol_str::SmolStr;
 use std::fmt;
@@ -272,6 +273,312 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("case", Token::Case),
 ];
 
+/// What an editor colors a span of CHL source as. The grammars under `editors/`
+/// assign each class one TextMate scope and one Vim group, recorded in
+/// `editors/highlight-classes.json`; `./ci.sh editors` checks both grammars
+/// against [`highlight`] (see `editors/README.md`, "Editor highlight check").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HighlightClass {
+    /// `# …` to the end of the line, except its [`HighlightClass::Todo`] words.
+    /// Logos skips comments, so [`highlight`] recovers them from the gaps
+    /// between tokens.
+    Comment,
+    /// A [`TODO_WORDS`] word inside a comment.
+    Todo,
+    /// A string literal's quotes and characters, except its escapes.
+    String,
+    /// An escape sequence the lexer interprets inside a string literal.
+    Escape,
+    Integer,
+    Boolean,
+    KeywordControl,
+    KeywordOther,
+    /// The identifier directly after `def`.
+    FunctionName,
+    /// An identifier that spells a [`SurfaceBuiltin`], wherever it appears,
+    /// except where the identifier after `def`, a backtick or `@` takes its
+    /// own class. A binding that shadows a builtin keeps this class.
+    Builtin,
+    /// An identifier whose first character is an ASCII capital, or the type
+    /// hole `_` directly after `:`, `<:`, `=>` or `{`.
+    Type,
+    Identifier,
+    /// A backtick and the identifier directly after it.
+    VariantTag,
+    /// `@` and the identifier directly after it.
+    Decorator,
+    Lambda,
+    Mutation,
+    Feed,
+    Define,
+    Operator,
+    Punctuation,
+    Bracket,
+}
+
+impl HighlightClass {
+    /// Every class, in declaration order. `tests/editor_grammars.rs` requires
+    /// `editors/highlight-classes.json` to name exactly these.
+    pub const ALL: &[HighlightClass] = &[
+        HighlightClass::Comment,
+        HighlightClass::Todo,
+        HighlightClass::String,
+        HighlightClass::Escape,
+        HighlightClass::Integer,
+        HighlightClass::Boolean,
+        HighlightClass::KeywordControl,
+        HighlightClass::KeywordOther,
+        HighlightClass::FunctionName,
+        HighlightClass::Builtin,
+        HighlightClass::Type,
+        HighlightClass::Identifier,
+        HighlightClass::VariantTag,
+        HighlightClass::Decorator,
+        HighlightClass::Lambda,
+        HighlightClass::Mutation,
+        HighlightClass::Feed,
+        HighlightClass::Define,
+        HighlightClass::Operator,
+        HighlightClass::Punctuation,
+        HighlightClass::Bracket,
+    ];
+
+    /// The class's key in `editors/highlight-classes.json`.
+    pub fn name(self) -> &'static str {
+        match self {
+            HighlightClass::Comment => "comment",
+            HighlightClass::Todo => "todo",
+            HighlightClass::String => "string",
+            HighlightClass::Escape => "escape",
+            HighlightClass::Integer => "integer",
+            HighlightClass::Boolean => "boolean",
+            HighlightClass::KeywordControl => "keyword-control",
+            HighlightClass::KeywordOther => "keyword-other",
+            HighlightClass::FunctionName => "function-name",
+            HighlightClass::Builtin => "builtin",
+            HighlightClass::Type => "type",
+            HighlightClass::Identifier => "identifier",
+            HighlightClass::VariantTag => "variant-tag",
+            HighlightClass::Decorator => "decorator",
+            HighlightClass::Lambda => "lambda",
+            HighlightClass::Mutation => "mutation",
+            HighlightClass::Feed => "feed",
+            HighlightClass::Define => "define",
+            HighlightClass::Operator => "operator",
+            HighlightClass::Punctuation => "punctuation",
+            HighlightClass::Bracket => "bracket",
+        }
+    }
+}
+
+/// The highlight class of `token` read on its own, or `None` for a layout
+/// token. [`highlight`] overrides it for an identifier after `def`, a backtick
+/// or `@`, and for `_` after an annotation's `:`, `<:` or `=>` or a `{`. The
+/// match has no wildcard arm, so a new `Token` variant does not compile until
+/// it is classified here.
+pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
+    use HighlightClass as C;
+    let class = match token {
+        Token::Newline | Token::Indent | Token::Dedent => return None,
+        Token::True | Token::False => C::Boolean,
+        Token::If
+        | Token::Elif
+        | Token::Else
+        | Token::For
+        | Token::In
+        | Token::Return
+        | Token::Yield
+        | Token::Pass
+        | Token::With
+        | Token::Match
+        | Token::Case => C::KeywordControl,
+        Token::Def | Token::Where | Token::And | Token::Or | Token::Not => C::KeywordOther,
+        Token::ColonEq => C::Mutation,
+        Token::LShift => C::Feed,
+        Token::LShiftEq => C::Define,
+        Token::EqEq
+        | Token::NotEq
+        | Token::LtE
+        | Token::LtColon
+        | Token::GtE
+        | Token::PlusPlus
+        | Token::PlusEq
+        | Token::CaretPlus
+        | Token::CaretEq
+        | Token::MinusEq
+        | Token::Arrow
+        | Token::DoubleArrow
+        | Token::StarStar
+        | Token::StarEq
+        | Token::DoubleSlashEq
+        | Token::DoubleSlash
+        | Token::Plus
+        | Token::Minus
+        | Token::Star
+        | Token::Amp
+        | Token::Pipe
+        | Token::Caret
+        | Token::Eq
+        | Token::Lt
+        | Token::Gt
+        | Token::Question => C::Operator,
+        Token::Comma | Token::Colon | Token::Dot | Token::Semi => C::Punctuation,
+        Token::LParen
+        | Token::RParen
+        | Token::LBracket
+        | Token::RBracket
+        | Token::LBrace
+        | Token::RBrace => C::Bracket,
+        Token::Backtick => C::VariantTag,
+        Token::At => C::Decorator,
+        Token::Backslash => C::Lambda,
+        Token::Int(_) => C::Integer,
+        Token::String(_) => C::String,
+        Token::Ident(name) => {
+            if SurfaceBuiltin::from_name(name).is_some() {
+                C::Builtin
+            } else if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                C::Type
+            } else {
+                C::Identifier
+            }
+        }
+    };
+    Some(class)
+}
+
+/// The highlight spans of `source`, in source order: one per logos token except
+/// layout tokens, a string literal split into [`HighlightClass::String`] and
+/// [`HighlightClass::Escape`] runs, and a comment split into
+/// [`HighlightClass::Comment`] and [`HighlightClass::Todo`] runs. The spans are
+/// disjoint, none contains a newline, and the bytes they leave uncovered are
+/// whitespace and newlines.
+///
+/// `_` directly after `:`, `<:`, `=>` or `{` is the type hole, so it is a
+/// [`HighlightClass::Type`]. The one `_` in that position that is a term is a
+/// one-line `match` arm body in a refinement predicate, such as
+/// `` case `some(x): _ ``, which this misclassifies (`editors/README.md`,
+/// "Type annotations").
+///
+/// It fails where [`tokenize`]'s first phase fails: at a span no token rule
+/// matches, and at a [`LexError::DetachedBacktick`]. It does not apply the
+/// off-side rule, so a layout error does not fail it.
+pub fn highlight(source: &str) -> Result<Vec<(HighlightClass, Span)>, LexError> {
+    let mut out = Vec::new();
+    let mut raw = Vec::new();
+    let mut lex = Token::lexer(source);
+    let mut previous: Option<Token> = None;
+    let mut gap_start = 0;
+    while let Some(result) = lex.next() {
+        let span = Span::from(lex.span());
+        let token = result.map_err(|()| lex_failure(source, span))?;
+        raw.push((token.clone(), span));
+        push_comment(source, gap_start, span.start, &mut out);
+        gap_start = span.end;
+        let class = match (&previous, &token) {
+            (Some(Token::Def), Token::Ident(_)) => Some(HighlightClass::FunctionName),
+            (Some(Token::Backtick), Token::Ident(_)) => Some(HighlightClass::VariantTag),
+            (Some(Token::At), Token::Ident(_)) => Some(HighlightClass::Decorator),
+            (
+                Some(Token::Colon | Token::LtColon | Token::DoubleArrow | Token::LBrace),
+                Token::Ident(name),
+            ) if name == "_" => Some(HighlightClass::Type),
+            _ => highlight_class(&token),
+        };
+        match class {
+            Some(HighlightClass::String) => push_string(source, span, &mut out),
+            Some(class) => out.push((class, span)),
+            None => {}
+        }
+        previous = Some(token);
+    }
+    push_comment(source, gap_start, source.len(), &mut out);
+    check_tags(&raw)?;
+    Ok(out)
+}
+
+/// The comment in the gap `source[start..end]` between two tokens, if any. A
+/// comment runs to the newline, which is a token, so a gap holds at most one
+/// comment and nothing but horizontal whitespace before it.
+fn push_comment(source: &str, start: usize, end: usize, out: &mut Vec<(HighlightClass, Span)>) {
+    let gap = &source[start..end];
+    let Some(hash) = gap.find('#') else {
+        debug_assert!(
+            gap.bytes().all(|b| b == b' ' || b == b'\t'),
+            "a gap between tokens holds only whitespace and a comment: {gap:?}"
+        );
+        return;
+    };
+    debug_assert!(
+        gap[..hash].bytes().all(|b| b == b' ' || b == b'\t'),
+        "only whitespace precedes a comment in a gap between tokens: {gap:?}"
+    );
+    let comment_start = start + hash;
+    let mut run_start = comment_start;
+    for (word_start, word) in todo_words(&source[comment_start..end]) {
+        let word_start = comment_start + word_start;
+        if run_start < word_start {
+            out.push((HighlightClass::Comment, Span::new(run_start, word_start)));
+        }
+        run_start = word_start + word.len();
+        out.push((HighlightClass::Todo, Span::new(word_start, run_start)));
+    }
+    if run_start < end {
+        out.push((HighlightClass::Comment, Span::new(run_start, end)));
+    }
+}
+
+/// The words an editor marks inside a comment as [`HighlightClass::Todo`].
+pub const TODO_WORDS: &[&str] = &["TODO", "FIXME", "XXX"];
+
+/// The [`TODO_WORDS`] occurrences in `comment` that stand as whole words, with
+/// their byte offsets. A word is bounded by a character that cannot continue an
+/// identifier (an ASCII letter, digit or `_`), or by the comment's ends. Both
+/// editor grammars spell the same boundary out rather than using their own
+/// word definitions, which include non-ASCII letters.
+fn todo_words(comment: &str) -> impl Iterator<Item = (usize, &'static str)> + '_ {
+    let word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    comment.char_indices().filter_map(move |(i, _)| {
+        let before = comment[..i].chars().next_back();
+        if before.is_some_and(word_char) {
+            return None;
+        }
+        TODO_WORDS
+            .iter()
+            .copied()
+            .find(|word| {
+                comment[i..].starts_with(word) && !comment[i + word.len()..].starts_with(word_char)
+            })
+            .map(|word| (i, word))
+    })
+}
+
+/// The string literal at `span`, as maximal runs of escapes and of other
+/// characters. A backslash before a character [`escaped`] does not interpret is
+/// part of the string, as [`process_string`] keeps it.
+fn push_string(source: &str, span: Span, out: &mut Vec<(HighlightClass, Span)>) {
+    let mut push = |class: HighlightClass, start: usize, end: usize| match out.last_mut() {
+        Some((last, run)) if *last == class && run.end == start => run.end = end,
+        _ => out.push((class, Span::new(start, end))),
+    };
+    let mut chars = source[span.start..span.end].char_indices().peekable();
+    while let Some((offset, c)) = chars.next() {
+        let start = span.start + offset;
+        let escape = (c == '\\')
+            .then(|| chars.peek().copied())
+            .flatten()
+            .filter(|&(_, next)| escaped(next).is_some());
+        match escape {
+            Some((next_offset, next)) => {
+                chars.next();
+                let end = span.start + next_offset + next.len_utf8();
+                push(HighlightClass::Escape, start, end);
+            }
+            None => push(HighlightClass::String, start, start + c.len_utf8()),
+        }
+    }
+}
+
 /// User-facing rendering of a token, used by the parser's `Rich` error
 /// formatter. Returns the bare symbol or literal text — chumsky's error
 /// rendering already wraps it in `'…'`, so we deliberately do not.
@@ -374,23 +681,40 @@ fn process_string(raw: &str, quote: char) -> Option<String> {
             out.push(c);
             continue;
         }
-        match chars.next()? {
-            'n' => out.push('\n'),
-            't' => out.push('\t'),
-            'r' => out.push('\r'),
-            '\\' => out.push('\\'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '0' => out.push('\0'),
+        let next = chars.next()?;
+        match escaped(next) {
+            Some(value) => out.push(value),
             // Unknown escapes: preserve the backslash, matching `rustpython`'s
             // permissive handling of source like `"\d+"` used in tests.
-            other => {
+            None => {
                 out.push('\\');
-                out.push(other);
+                out.push(next);
             }
         }
     }
     Some(out)
+}
+
+/// The escape sequences the lexer interprets: `\c` for each `(c, value)`
+/// stands for `value`. The test `editor_sample_contains_every_escape` requires
+/// `editors/sample.cambra` to contain each one.
+pub const ESCAPES: &[(char, char)] = &[
+    ('n', '\n'),
+    ('t', '\t'),
+    ('r', '\r'),
+    ('\\', '\\'),
+    ('"', '"'),
+    ('\'', '\''),
+    ('0', '\0'),
+];
+
+/// The character the escape sequence `\c` stands for, or `None` when the
+/// lexer does not interpret `\c`.
+fn escaped(c: char) -> Option<char> {
+    ESCAPES
+        .iter()
+        .find(|&&(escape, _)| escape == c)
+        .map(|&(_, value)| value)
 }
 
 /// Errors produced by [`tokenize`].
@@ -817,6 +1141,203 @@ mod tests {
     }
 
     #[test]
+    fn highlight_splits_escapes_and_recovers_comments() {
+        use HighlightClass as C;
+        let source = "def f(x): # c\n    `t <- \"a\\nb\\d\"";
+        let spans: Vec<(C, &str)> = highlight(source)
+            .unwrap()
+            .into_iter()
+            .map(|(class, span)| (class, &source[span.start..span.end]))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (C::KeywordOther, "def"),
+                (C::FunctionName, "f"),
+                (C::Bracket, "("),
+                (C::Identifier, "x"),
+                (C::Bracket, ")"),
+                (C::Punctuation, ":"),
+                (C::Comment, "# c"),
+                (C::VariantTag, "`"),
+                (C::VariantTag, "t"),
+                (C::Operator, "<"),
+                (C::Operator, "-"),
+                (C::String, "\"a"),
+                (C::Escape, "\\n"),
+                (C::String, "b\\d\""),
+            ]
+        );
+    }
+
+    /// The spans of `source` with their text, for assertions.
+    fn highlighted(source: &str) -> Vec<(HighlightClass, &str)> {
+        highlight(source)
+            .unwrap()
+            .into_iter()
+            .map(|(class, span)| (class, &source[span.start..span.end]))
+            .collect()
+    }
+
+    /// A `TODO_WORDS` word is a `Todo` only as a whole word; the rest of the
+    /// comment stays one `Comment` run on each side of it.
+    #[test]
+    fn highlight_splits_todo_words_out_of_comments() {
+        use HighlightClass as C;
+        assert_eq!(
+            highlighted("x # TODO: TODOs, _XXX and FIXME"),
+            vec![
+                (C::Identifier, "x"),
+                (C::Comment, "# "),
+                (C::Todo, "TODO"),
+                (C::Comment, ": TODOs, _XXX and "),
+                (C::Todo, "FIXME"),
+            ]
+        );
+        // Only an ASCII letter, digit or `_` continues a word, so an emoji or
+        // a non-ASCII letter after the word leaves it whole.
+        for source in ["# TODO\u{1F600}", "# TODO\u{e9}"] {
+            assert_eq!(
+                highlighted(source)
+                    .into_iter()
+                    .filter(|(class, _)| *class == C::Todo)
+                    .count(),
+                1,
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A builtin spelling is a `Builtin` wherever it stands, a shadowing
+    /// binding included, except where `def`, a backtick or `@` decides the class.
+    #[test]
+    fn highlight_marks_builtin_spellings() {
+        use HighlightClass as C;
+        assert_eq!(
+            highlighted("max = sum(xs)\ndef map(): `set"),
+            vec![
+                (C::Builtin, "max"),
+                (C::Operator, "="),
+                (C::Builtin, "sum"),
+                (C::Bracket, "("),
+                (C::Identifier, "xs"),
+                (C::Bracket, ")"),
+                (C::KeywordOther, "def"),
+                (C::FunctionName, "map"),
+                (C::Bracket, "("),
+                (C::Bracket, ")"),
+                (C::Punctuation, ":"),
+                (C::VariantTag, "`"),
+                (C::VariantTag, "set"),
+            ]
+        );
+    }
+
+    /// `_` after `:`, `<:`, `=>` or `{` is the type hole; after `where` it is the
+    /// refinement's subject, and inside a pattern it is a binder.
+    #[test]
+    fn highlight_marks_the_type_hole() {
+        use HighlightClass as C;
+        let classes = |source| -> Vec<HighlightClass> {
+            highlighted(source)
+                .into_iter()
+                .filter(|(_, text)| *text == "_")
+                .map(|(class, _)| class)
+                .collect()
+        };
+        assert_eq!(classes("x: _ = 1"), vec![C::Type]);
+        assert_eq!(classes("x <: _ = 1"), vec![C::Type]);
+        assert_eq!(classes("def f() => _:"), vec![C::Type]);
+        assert_eq!(classes("T = {_ where _ > 0}"), vec![C::Type, C::Identifier]);
+        assert_eq!(classes("case `some(_):"), vec![C::Identifier]);
+        // `==>` lexes as `==` and `>`, and `<=>` as `<=` and `>`: no arrow.
+        assert_eq!(classes("a ==> _"), vec![C::Identifier]);
+        assert_eq!(classes("b <=> _"), vec![C::Identifier]);
+    }
+
+    /// A backtick with no tag name directly after it is the same error from
+    /// `highlight` as from `tokenize`.
+    #[test]
+    fn highlight_reports_a_detached_backtick() {
+        assert_eq!(
+            highlight("x = ` foo"),
+            Err(LexError::DetachedBacktick {
+                span: Span::new(4, 5)
+            })
+        );
+    }
+
+    /// Every variant, by an exhaustive match: a new variant fails to compile
+    /// here until it is listed, and then fails the test until
+    /// [`HighlightClass::ALL`] lists it too.
+    #[test]
+    fn highlight_class_all_lists_every_variant() {
+        use HighlightClass as C;
+        let every = |c: C| match c {
+            C::Comment
+            | C::Todo
+            | C::String
+            | C::Escape
+            | C::Integer
+            | C::Boolean
+            | C::KeywordControl
+            | C::KeywordOther
+            | C::FunctionName
+            | C::Builtin
+            | C::Type
+            | C::Identifier
+            | C::VariantTag
+            | C::Decorator
+            | C::Lambda
+            | C::Mutation
+            | C::Feed
+            | C::Define
+            | C::Operator
+            | C::Punctuation
+            | C::Bracket => c,
+        };
+        let variants: Vec<C> = [
+            C::Comment,
+            C::Todo,
+            C::String,
+            C::Escape,
+            C::Integer,
+            C::Boolean,
+            C::KeywordControl,
+            C::KeywordOther,
+            C::FunctionName,
+            C::Builtin,
+            C::Type,
+            C::Identifier,
+            C::VariantTag,
+            C::Decorator,
+            C::Lambda,
+            C::Mutation,
+            C::Feed,
+            C::Define,
+            C::Operator,
+            C::Punctuation,
+            C::Bracket,
+        ]
+        .into_iter()
+        .map(every)
+        .collect();
+        assert_eq!(HighlightClass::ALL, variants.as_slice());
+    }
+
+    /// A string with no closing quote on its line is the same error from
+    /// `highlight` as from `tokenize`.
+    #[test]
+    fn highlight_reports_an_unterminated_string() {
+        assert_eq!(
+            highlight("x = 'ab\ncd'"),
+            Err(LexError::UnterminatedString {
+                span: Span::new(4, 5)
+            })
+        );
+    }
+
+    #[test]
     fn every_keyword_spelling_lexes_to_its_token() {
         for (spelling, token) in KEYWORDS {
             assert_eq!(
@@ -828,10 +1349,23 @@ mod tests {
         }
     }
 
-    /// Whether `token` is a keyword: an identifier-shaped spelling that lexes
-    /// as something other than [`Token::Ident`]. The match has no wildcard arm,
-    /// so a new variant does not compile until it is classified here.
-    fn is_keyword(token: &Token) -> bool {
+    /// How a variant is spelled in source.
+    #[derive(Debug, PartialEq)]
+    enum Spelling {
+        /// An identifier-shaped spelling that lexes as something other than
+        /// [`Token::Ident`].
+        Keyword,
+        /// An operator or punctuation spelling.
+        Symbol,
+        /// A layout token, which is a newline or synthesized, or a literal or
+        /// identifier, which has no one spelling. Its `Display` text is a
+        /// description, not source.
+        Other,
+    }
+
+    /// The match has no wildcard arm, so a new variant does not compile until it
+    /// is classified here.
+    fn spelling(token: &Token) -> Spelling {
         match token {
             Token::True
             | Token::False
@@ -850,11 +1384,14 @@ mod tests {
             | Token::Pass
             | Token::With
             | Token::Match
-            | Token::Case => true,
+            | Token::Case => Spelling::Keyword,
             Token::Newline
             | Token::Indent
             | Token::Dedent
-            | Token::LShiftEq
+            | Token::Int(_)
+            | Token::String(_)
+            | Token::Ident(_) => Spelling::Other,
+            Token::LShiftEq
             | Token::LShift
             | Token::EqEq
             | Token::NotEq
@@ -895,11 +1432,12 @@ mod tests {
             | Token::Backtick
             | Token::Semi
             | Token::Backslash
-            | Token::At
-            | Token::Int(_)
-            | Token::String(_)
-            | Token::Ident(_) => false,
+            | Token::At => Spelling::Symbol,
         }
+    }
+
+    fn is_keyword(token: &Token) -> bool {
+        spelling(token) == Spelling::Keyword
     }
 
     /// `KEYWORDS` lists a variant exactly when [`is_keyword`] classifies it as
@@ -916,6 +1454,61 @@ mod tests {
                 is_keyword(&token)
             );
         }
+    }
+
+    /// `editors/sample.cambra`, the sample the editor highlight check runs both
+    /// grammars over (`editors/README.md`, "Editor highlight check").
+    fn editor_sample() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../editors/sample.cambra");
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
+    }
+
+    /// The editor sample contains every keyword and symbol spelling, so a new
+    /// one is checked against both grammars as soon as it exists. Literals and
+    /// identifiers are covered by `sample_covers_every_highlight_class` in
+    /// `tests/editor_grammars.rs`.
+    #[test]
+    fn editor_sample_contains_every_token_spelling() {
+        use strum::IntoEnumIterator;
+        let sample = editor_sample();
+        let spans = highlight(&sample).expect("the sample lexes");
+        let present: std::collections::BTreeSet<&str> = spans
+            .iter()
+            .map(|(_, span)| &sample[span.start..span.end])
+            .collect();
+        let missing: Vec<String> = Token::iter()
+            .filter(|token| spelling(token) != Spelling::Other)
+            .map(|token| token.to_string())
+            .filter(|s| !present.contains(s.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "editors/sample.cambra has no token spelled {missing:?}"
+        );
+    }
+
+    /// The editor sample contains every escape the lexer interprets, so the
+    /// editor highlight check fails a grammar whose escape rule misses one.
+    #[test]
+    fn editor_sample_contains_every_escape() {
+        let sample = editor_sample();
+        let spans = highlight(&sample).expect("the sample lexes");
+        // An escape run holds one or more two-character escapes, `\` and the
+        // escaped character.
+        let present: std::collections::BTreeSet<char> = spans
+            .iter()
+            .filter(|(class, _)| *class == HighlightClass::Escape)
+            .flat_map(|(_, span)| sample[span.start..span.end].chars().skip(1).step_by(2))
+            .collect();
+        let missing: Vec<char> = ESCAPES
+            .iter()
+            .map(|&(escape, _)| escape)
+            .filter(|escape| !present.contains(escape))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "editors/sample.cambra has no escape of {missing:?}"
+        );
     }
 
     /// `where` separates a refinement's base type from its predicate

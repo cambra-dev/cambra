@@ -1,0 +1,107 @@
+{
+  "comment": {
+    "construct": "# to the end of the line, outside its TODO words",
+    "textmate": "comment.line.number-sign",
+    "vim": "Comment"
+  },
+  "todo": {
+    "construct": "TODO, FIXME or XXX inside a comment, with no ASCII letter, digit or _ touching it",
+    "textmate": "keyword.other.todo",
+    "vim": "Todo"
+  },
+  "string": {
+    "construct": "\"…\" or '…' string literal, outside its escapes",
+    "textmate": "string.quoted",
+    "vim": "String"
+  },
+  "escape": {
+    "construct": "Escape \\n \\t \\r \\\\ \\\" \\' \\0 inside a string",
+    "textmate": "constant.character.escape",
+    "vim": "SpecialChar"
+  },
+  "integer": {
+    "construct": "Decimal integer",
+    "textmate": "constant.numeric.integer.decimal",
+    "vim": "Number"
+  },
+  "boolean": {
+    "construct": "True, False",
+    "textmate": "constant.language.boolean",
+    "vim": "Boolean"
+  },
+  "keyword-control": {
+    "construct": "if elif else for in return yield match case pass with",
+    "textmate": "keyword.control",
+    "vim": "Statement"
+  },
+  "keyword-other": {
+    "construct": "def where and or not",
+    "textmate": "keyword.other",
+    "vim": "Keyword"
+  },
+  "function-name": {
+    "construct": "Identifier directly after def",
+    "textmate": "entity.name.function",
+    "vim": "Function"
+  },
+  "builtin": {
+    "construct": "Identifier spelling a SURFACE_BUILTINS row, unless after def, a backtick or @",
+    "textmate": "support.function.builtin",
+    "vim": "Function"
+  },
+  "type": {
+    "construct": "Identifier starting with a capital, and the type hole _ directly after : <: => or {",
+    "textmate": "entity.name.type",
+    "vim": "Type"
+  },
+  "identifier": {
+    "construct": "Any other identifier",
+    "textmate": null,
+    "vim": null
+  },
+  "variant-tag": {
+    "construct": "Backtick and the identifier after it",
+    "textmate": "variable.other.enummember",
+    "vim": "Constant"
+  },
+  "decorator": {
+    "construct": "@ and the identifier after it",
+    "textmate": "entity.name.function.decorator",
+    "vim": "PreProc"
+  },
+  "lambda": {
+    "construct": "Lambda introducer \\",
+    "textmate": "storage.type.function.lambda",
+    "vim": "Special"
+  },
+  "mutation": {
+    "construct": ":=",
+    "textmate": "keyword.other.mutation",
+    "vim": "Special"
+  },
+  "feed": {
+    "construct": "<<",
+    "textmate": "keyword.other.feed",
+    "vim": "Special"
+  },
+  "define": {
+    "construct": "<<=",
+    "textmate": "keyword.other.define",
+    "vim": "Special"
+  },
+  "operator": {
+    "construct": "Every other operator, and the checked-lookup ?",
+    "textmate": "keyword.operator",
+    "vim": "Operator"
+  },
+  "punctuation": {
+    "construct": ", ; : .",
+    "textmate": "punctuation",
+    "vim": "Delimiter"
+  },
+  "bracket": {
+    "construct": "( ) [ ] { }",
+    "textmate": null,
+    "vim": null
+  }
+}

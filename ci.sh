@@ -99,6 +99,58 @@ ci_solver() {
     return 1
   fi
 }
+# The editor grammars (`editors/`) against the lexer: `dump_tokens` prints the
+# lexer's highlight spans over every `.cambra` file under `tests/` and
+# `editors/`, and one checker per editor requires each span to carry its class's
+# scope or group from `editors/highlight-classes.json` (`editors/README.md`,
+# "Editor highlight check"). The same harness checks each editor's indentation
+# against `editors/indent-cases.json` (`editors/README.md`, "Indentation
+# tests"). Each checker needs its editor's toolchain: Node for VS Code, Neovim
+# for Neovim. A machine without one skips that editor's checkers, loudly; under
+# CI a missing toolchain fails, for the reason `ci_formal` gives.
+ci_editors() {
+  local missing=""
+  command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || missing="${missing} node"
+  command -v nvim >/dev/null 2>&1 || missing="${missing} nvim"
+  if [[ -n "${missing}" && -n "${CI:-}" ]]; then
+    echo "ci_editors: missing${missing} under CI — this gate would not check every grammar" >&2
+    return 1
+  fi
+  (
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+    # `|| exit 1` per command: `ci_all` calls this gate on the left of a `||`,
+    # which disables errexit for this subshell too.
+    find tests editors -name '*.cambra' | LC_ALL=C sort >"${tmp}/corpus" || exit 1
+    mapfile -t corpus <"${tmp}/corpus"
+    if [[ "${#corpus[@]}" -eq 0 ]]; then
+      echo "ci_editors: no .cambra file under tests/ or editors/ — nothing to check" >&2
+      exit 1
+    fi
+    cargo run -q -p chl-parser --example dump_tokens -- "${corpus[@]}" >"${tmp}/spans.jsonl" || exit 1
+    failed=0
+    if [[ "${missing}" == *node* ]]; then
+      echo "ci_editors: node/npm not found — VS Code grammar and indentation not checked" >&2
+    else
+      # Installs only what is missing, like `ci_web_tests`; the lockfile pins the tree.
+      [[ -d editors/vscode/node_modules ]] ||
+        (cd editors/vscode && npm ci --prefer-offline --no-audit) || exit 1
+      node editors/vscode/test/check-grammar.mjs "${tmp}/spans.jsonl" \
+        editors/highlight-classes.json || failed=1
+      node editors/vscode/test/check-indent.mjs editors/indent-cases.json || failed=1
+    fi
+    if [[ "${missing}" == *nvim* ]]; then
+      echo "ci_editors: nvim not found — Vim syntax file and indentation not checked" >&2
+    else
+      nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
+        -l editors/nvim/test/check_syntax.lua "${tmp}/spans.jsonl" \
+        editors/highlight-classes.json || failed=1
+      nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
+        -l editors/nvim/test/check_indent.lua editors/indent-cases.json || failed=1
+    fi
+    exit "${failed}"
+  )
+}
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc -p cambra -p chl-parser -p chl-interp --no-deps
@@ -354,6 +406,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_web || failed="${failed} web"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_editors || failed="${failed} editors"
   if [[ -n "${failed}" ]]; then
     echo "ci.sh FAILED:${failed}" >&2
     exit 1

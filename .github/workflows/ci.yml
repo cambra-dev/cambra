@@ -276,11 +276,43 @@ jobs:
       - name: Web
         run: ./ci.sh web
 
+  # The editor grammars against the lexer's highlight spans, and each editor's
+  # indentation against the shared cases. The span dump is a Rust example and
+  # the checkers run under Node and Neovim, so this needs both toolchains; no
+  # other job has them together. A missing toolchain fails the
+  # gate under CI rather than skipping it.
+  editors:
+    needs: repo_checks
+    if: ${{ !cancelled() && needs.repo_checks.outputs.is_code_change == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/rust
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4
+        with:
+          node-version: 20
+
+      # A release tarball pinned by version and verified by hash, like z3 in the
+      # Rust action, rather than Ubuntu's older apt package: the Neovim the
+      # syntax file is checked under changes only with a commit.
+      - name: Setup Neovim
+        run: |
+          curl -sSfL -o /tmp/nvim.tar.gz \
+            https://github.com/neovim/neovim/releases/download/v0.11.6/nvim-linux-x86_64.tar.gz
+          echo "2fc90b962327f73a78afbfb8203fd19db8db9cdf4ee5e2bef84704339add89cc  /tmp/nvim.tar.gz" \
+            | sha256sum -c -
+          tar xzf /tmp/nvim.tar.gz -C /tmp
+          echo "/tmp/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Editor highlight check and indentation tests
+        run: ./ci.sh editors
+
   # The one required status check: ruleset "CI" requires the context `check`.
   # Keeping that name on a job that only collects results is what lets the gates
   # above be split, renamed, or added to without a ruleset edit.
   check:
-    needs: [repo_checks, lint, clippy, clippy_release, test, test_reversed, test_no_assertions, formal, fixtures, web]
+    needs: [repo_checks, lint, clippy, clippy_release, test, test_reversed, test_no_assertions, formal, fixtures, web, editors]
     # `always()` so this runs when a gate failed; without it the job would be
     # skipped and the required check would never report.
     if: always()

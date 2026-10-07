@@ -13,11 +13,16 @@
 //! `\<\%(a\|b\|…\)\>` pattern. Each must equal the spellings in
 //! `chl_parser::builtins::SURFACE_BUILTINS`.
 //!
-//! The test reads only these rules. Whether a grammar applies them, and whether
-//! any other rule colors a keyword or a builtin, is not checked here.
+//! The keyword and builtin tests read only these rules. Whether a grammar
+//! applies them, and whether any other rule colors a keyword or a builtin, is
+//! not checked here.
+//!
+//! The remaining tests check the inputs of `./ci.sh editors`: the highlight
+//! class table and the samples (`editors/README.md`, "Editor highlight check"),
+//! and the indentation cases (`editors/README.md`, "Indentation tests").
 
 use chl_parser::builtins::SURFACE_BUILTINS;
-use chl_parser::lexer::KEYWORDS;
+use chl_parser::lexer::{HighlightClass, KEYWORDS, highlight};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -28,6 +33,13 @@ const CLASSES: &[(&str, &str)] = &[
     ("keyword-control", "cambraKeywordControl"),
     ("keyword-other", "cambraKeywordOther"),
 ];
+
+/// The purpose-built sample that exercises every highlight class.
+const SAMPLE: &str = "editors/sample.cambra";
+
+/// Inputs on which the grammars and the lexer could disagree that lex but do
+/// not parse, so they cannot sit in [`SAMPLE`].
+const LEXES_ONLY: &str = "editors/sample-lexes-only.cambra";
 
 fn read(relative: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
@@ -139,4 +151,108 @@ fn builtin_rules_list_exactly_the_surface_builtins() {
         builtins,
         "Vim `cambraBuiltin` differs from SURFACE_BUILTINS"
     );
+}
+
+/// `editors/highlight-classes.json`: the TextMate scope and Vim group of each
+/// highlight class.
+fn highlight_classes_json() -> serde_json::Map<String, serde_json::Value> {
+    let table: serde_json::Value = serde_json::from_str(&read("editors/highlight-classes.json"))
+        .expect("editors/highlight-classes.json is valid JSON");
+    table
+        .as_object()
+        .expect("editors/highlight-classes.json is a JSON object keyed by class")
+        .clone()
+}
+
+/// `editors/highlight-classes.json` names exactly the lexer's highlight
+/// classes, so the editor checkers never meet a class it does not describe.
+#[test]
+fn highlight_classes_json_names_every_highlight_class() {
+    let table: BTreeSet<String> = highlight_classes_json().keys().cloned().collect();
+    let classes: BTreeSet<String> = HighlightClass::ALL
+        .iter()
+        .map(|c| c.name().to_owned())
+        .collect();
+    assert_eq!(
+        table, classes,
+        "editors/highlight-classes.json and HighlightClass::ALL differ"
+    );
+}
+
+/// `editors/sample.cambra` is a CHL program, so what it shows each grammar is
+/// text the parser accepts.
+#[test]
+fn sample_parses() {
+    let result = chl_parser::parse_module(&read(SAMPLE));
+    assert!(result.errors.is_empty(), "{SAMPLE}: {:?}", result.errors);
+}
+
+/// `editors/sample.cambra` produces every highlight class, and every class it
+/// produces is in `HighlightClass::ALL`. A class no sample produces is a class
+/// `./ci.sh editors` never checks.
+#[test]
+fn sample_covers_every_highlight_class() {
+    let spans = highlight(&read(SAMPLE)).expect("the sample lexes");
+    let produced: BTreeSet<HighlightClass> = spans.iter().map(|(class, _)| *class).collect();
+    let all: BTreeSet<HighlightClass> = HighlightClass::ALL.iter().copied().collect();
+    assert!(
+        produced.is_subset(&all),
+        "HighlightClass::ALL is missing {:?}",
+        produced.difference(&all).collect::<Vec<_>>()
+    );
+    assert!(
+        all.is_subset(&produced),
+        "{SAMPLE} produces no span of {:?}; add a construct of that class",
+        all.difference(&produced).collect::<Vec<_>>()
+    );
+}
+
+/// `editors/sample-lexes-only.cambra` lexes, so `./ci.sh editors` checks it.
+#[test]
+fn lexes_only_sample_lexes() {
+    highlight(&read(LEXES_ONLY)).expect("the lexes-only sample lexes");
+}
+
+/// Every case in `editors/indent-cases.json` that names its `next` line forms a
+/// program `parse_module` accepts when that line sits at the case's expected
+/// indent, followed by the case's `rest`. A layout the parser rejects is not a
+/// layout the editors should produce (`editors/README.md`, "Indentation
+/// tests").
+#[test]
+fn indent_cases_lay_out_programs_the_parser_accepts() {
+    let file: serde_json::Value = serde_json::from_str(&read("editors/indent-cases.json"))
+        .expect("editors/indent-cases.json is valid JSON");
+    let cases = file["cases"]
+        .as_array()
+        .expect("editors/indent-cases.json has a `cases` array");
+    assert!(!cases.is_empty(), "editors/indent-cases.json has no case");
+    let lines = |value: &serde_json::Value| -> Vec<String> {
+        value.as_array().map_or_else(Vec::new, |lines| {
+            lines
+                .iter()
+                .map(|line| line.as_str().expect("a line is a string").to_owned())
+                .collect()
+        })
+    };
+    let mut checked = 0;
+    for case in cases {
+        let name = case["name"].as_str().expect("a case has a `name`");
+        let Some(next) = case["next"].as_str() else {
+            continue;
+        };
+        let indent = case["indent"].as_u64().expect("a case has an `indent`");
+        let indent = usize::try_from(indent).expect("an indent fits in usize");
+        let mut program = lines(&case["lines"]);
+        program.push(format!("{}{next}", " ".repeat(indent)));
+        program.extend(lines(&case["rest"]));
+        let source = program.join("\n") + "\n";
+        let result = chl_parser::parse_module(&source);
+        assert!(
+            result.errors.is_empty(),
+            "indent case `{name}` does not parse:\n{source}\n{:?}",
+            result.errors
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no indent case names a `next` line");
 }
