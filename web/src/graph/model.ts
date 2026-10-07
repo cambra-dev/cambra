@@ -14,9 +14,10 @@
 // Both are *vertex suppression*: deleting a vertex of degree two and joining its
 // neighbours. Neither may cost addressability. Every operator id in the pane is
 // a possible cross-pane selection target, so suppression records where the id
-// went and [`viewItem`](DrawGraph.viewItem) answers it.
+// went and [`viewItem`](DrawGraph.viewItem) answers it. `drawGraphOf` checks
+// that every id on the wire has a view item before it returns.
 
-import type { OperatorEdge, OperatorNode, OperatorPane } from "../types";
+import type { OperatorNode, OperatorPane } from "../types";
 import { isNamedRole, roleLabel } from "../types";
 
 /** One drawn box. */
@@ -70,20 +71,13 @@ export class DrawGraph {
   viewItem(id: number): ViewItem | undefined {
     return this.view.get(id);
   }
-
-  /** Every operator id an element answers for, the element's own id first. */
-  masterItems(item: ViewItem): number[] {
-    if (item.kind !== "glyph") return [item.id];
-    const edge = this.edges.find((e) => e.id === item.edge);
-    return edge ? [item.id, ...edge.suppressed.filter((s) => s !== item.id)] : [item.id];
-  }
 }
 
 const isConstant = (n: OperatorNode) => n.label === "Constant";
 const isBranch = (n: OperatorNode) => n.label === "FanOutBranch";
 
 /** A constant's type, which is all its node carried. */
-export function constantText(node: OperatorNode): string {
+function constantText(node: OperatorNode): string {
   const t = node.tiling ?? "?";
   return t.startsWith("Scalar(") && t.endsWith(")") ? t.slice(7, -1) : t;
 }
@@ -102,17 +96,23 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
   const outDegree = (id: number) => consumers.get(id)?.length ?? 0;
 
   // A branch is suppressed when it holds one fan edge; a constant when exactly
-  // one operator reads it. Both conditions hold for every such node measured,
-  // but neither is an invariant the wire states, so both are checked.
+  // one operator reads it and that operator is drawn. The conditions hold for
+  // every such node measured, but none is an invariant the wire states, so all
+  // are checked. Branches are decided first: a constant whose one reader is a
+  // suppressed branch would be a chip on a box that does not exist.
   const suppressed = new Set<number>();
   const chipOf = new Map<number, number>();
   for (const n of pane.nodes) {
     if (isBranch(n) && n.inputs.some((e) => isNamedRole(e.role, "fan")) && outDegree(n.nodeId) === 1) {
       suppressed.add(n.nodeId);
-    } else if (isConstant(n) && outDegree(n.nodeId) === 1) {
-      suppressed.add(n.nodeId);
-      chipOf.set(n.nodeId, consumers.get(n.nodeId)![0]);
     }
+  }
+  for (const n of pane.nodes) {
+    if (!isConstant(n) || outDegree(n.nodeId) !== 1) continue;
+    const reader = consumers.get(n.nodeId)![0];
+    if (suppressed.has(reader)) continue;
+    suppressed.add(n.nodeId);
+    chipOf.set(n.nodeId, reader);
   }
 
   const nodes: DrawNode[] = [];
@@ -152,23 +152,31 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
   };
 
   const edges: DrawEdge[] = [];
-  const seenEdge = new Set<string>();
+  const edgeById = new Map<string, DrawEdge>();
   for (const n of pane.nodes) {
     if (suppressed.has(n.nodeId)) continue;
     for (const e of n.inputs) {
       if (!byId.has(e.subscribed) || chipOf.has(e.subscribed)) continue;
       const replaced: number[] = [];
+      // A join may close on its own consumer — a store whose body is a branch
+      // of the store's own fan — and is kept: it is a deferred edge, drawn as a
+      // back edge, and the branch it replaced is addressable only through it.
       const from = resolve(e.subscribed, replaced);
-      if (!nodeById.has(from) || from === n.nodeId) continue;
+      if (!nodeById.has(from)) continue;
       // A suppressed branch's own edge to the fan carries the sharing, so the
       // joined edge takes that kind rather than the branch's `value` role.
       const through = replaced.length
         ? byId.get(replaced[replaced.length - 1])!.inputs.find((x) => isNamedRole(x.role, "fan"))!
         : e;
       const id = `${from}>${n.nodeId}|${roleLabel(e.role)}`;
-      if (seenEdge.has(id)) continue;
-      seenEdge.add(id);
-      edges.push({
+      // Two inputs whose role labels coincide draw as one edge, so the
+      // operators either replaced are recorded on the edge that remains.
+      const drawn = edgeById.get(id);
+      if (drawn) {
+        drawn.suppressed.push(...replaced);
+        continue;
+      }
+      const edge: DrawEdge = {
         id,
         from,
         to: n.nodeId,
@@ -176,7 +184,9 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
         role: roleLabel(e.role),
         deferred: e.deferred,
         suppressed: replaced,
-      });
+      };
+      edges.push(edge);
+      edgeById.set(id, edge);
     }
   }
 
@@ -188,16 +198,22 @@ export function drawGraphOf(pane: OperatorPane): DrawGraph {
   for (const e of edges) {
     for (const s of e.suppressed) view.set(s, { kind: "glyph", id: s, edge: e.id });
   }
+  const lost = pane.nodes.filter((n) => !view.has(n.nodeId)).map((n) => `${n.label} #${n.nodeId}`);
+  if (lost.length > 0) {
+    // A shape the suppression rules did not anticipate. The pane still draws;
+    // the ids named here are the selections it cannot show.
+    console.error("The operator pane suppressed operators it draws nowhere:", lost);
+  }
   return new DrawGraph(nodes, edges, view);
 }
 
 /**
  * The wire edges a drawn graph never lays out: they close the cycles.
  *
- * A `value` edge wired late is the one a `CycleSlot` filled, and a `CycleSlot`
- * is the only way an operator subscribes something built after it — so these
- * are exactly the edges whose removal leaves the graph acyclic.
+ * An edge wired late is the one a `CycleSlot` filled, and a `CycleSlot` is the
+ * only way an operator subscribes something built after it — so these are
+ * exactly the edges whose removal leaves the graph acyclic. The test is
+ * `deferred` alone. A joined edge takes its `kind` from the branch it replaced,
+ * which is `share`, while `deferred` stays the consumer's.
  */
-export const isBackEdge = (e: DrawEdge): boolean => e.kind === "value" && e.deferred;
-
-export type { OperatorEdge, OperatorNode };
+export const isBackEdge = (e: DrawEdge): boolean => e.deferred;

@@ -2,7 +2,7 @@ This directory vendors no source, but `elk.ts` imports elkjs, which is licensed
 under the Eclipse Public License 2.0 with a secondary licence under the GNU
 General Public License 3.0 or later. The rest of this repository is Apache-2.0.
 
-    elkjs — https://github.com/kieler/elkjs
+    elkjs 0.12.0 — https://github.com/kieler/elkjs/tree/0.12.0
     Copyright (c) 2017 Kiel University and others
     EPL-2.0 OR GPL-3.0-or-later
 

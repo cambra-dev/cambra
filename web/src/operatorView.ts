@@ -5,16 +5,16 @@
 // the other way round: an operator's inputs are the operators it subscribes.
 //
 // Two kinds, both on the wire. `value` is an exclusively owned subscription and
-// `share` one several consumers hold. A `value` edge wired late — the one a
+// `share` one several consumers hold. An edge wired late — the one a
 // `CycleSlot` filled, carrying `deferred` — is what closes a cycle: removing
 // those makes every graph acyclic, so they are withheld from the layout and
-// drawn as back edges rather than broken by a heuristic.
+// drawn as back edges rather than broken by the engine's heuristic.
 //
 // Two operator kinds are suppressed rather than drawn; see `./graph/model`. A
 // suppressed node keeps its id on whatever replaced it, because every id in the
 // pane is a cross-pane selection target.
 
-import type { GraphLayout, Placed, Point } from "./graph/layout";
+import type { GraphLayout, Placed, PlacedNode, Point } from "./graph/layout";
 import { type DrawEdge, type DrawGraph, type DrawNode, drawGraphOf, isBackEdge } from "./graph/model";
 import type { Resolved, Store } from "./store";
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
@@ -26,8 +26,10 @@ const NODE_HEIGHT = 22;
 const NODE_GAP = 14;
 const LAYER_GAP = 28;
 const PAD = 12;
+/** Width a node's tiling may take before it is cut with an ellipsis, in px. */
+const MAX_TILING = 110;
 /**
- * How far a back edge bows out past the widest node it joins.
+ * How far a back edge bows out past the widest node in the layers it spans.
  *
  * Reserved in the canvas's width as well as used to route the bow. The SVG
  * paints outside its box (`overflow: visible`), but painted overflow is ink
@@ -92,6 +94,8 @@ export class OperatorView {
   private marked: HTMLElement[] = [];
   private pending: Resolved | null = null;
   private drawn = false;
+  /** Bumped per `draw`, so a layout that resolves after a later one is dropped. */
+  private generation = 0;
 
   /**
    * The engine is injected rather than chosen here, which is what confines it
@@ -122,6 +126,7 @@ export class OperatorView {
 
   /** Lay the graph out and draw it. Resolves when the pane is on screen. */
   async draw(): Promise<void> {
+    const generation = ++this.generation;
     const sized = this.graph.nodes.map((n) => ({
       id: String(n.id),
       width: Math.min(
@@ -129,6 +134,7 @@ export class OperatorView {
         Math.max(
           MIN_WIDTH,
           measure(n.label) +
+            (n.tiling === null ? 0 : Math.min(MAX_TILING, measure(n.tiling)) + 5) +
             measure(`#${n.id}`) +
             n.chips.reduce((a, c) => a + Math.min(64, measure(c.text)) + 9, 0) +
             26,
@@ -143,6 +149,7 @@ export class OperatorView {
       nodeGap: NODE_GAP,
       layerGap: LAYER_GAP,
     });
+    if (generation !== this.generation) return;
     this.paint(placed);
     this.finish();
   }
@@ -214,13 +221,16 @@ export class OperatorView {
       width: String(placed.width + PAD * 2),
       height: String(placed.height + PAD * 2),
     });
+    sheet.appendChild(arrowheads(this.paneId));
     sheet.appendChild(wires);
     this.canvas.appendChild(sheet);
 
     const routed = new Map(placed.edges.map((e) => [e.id, e.points]));
+    const route = new Map<string, Point[]>();
     for (const edge of this.graph.edges) {
-      const points = isBackEdge(edge) ? this.backEdge(edge, at) : routed.get(edge.id);
+      const points = isBackEdge(edge) ? backEdge(edge, at) : routed.get(edge.id);
       if (!points || points.length < 2) continue;
+      route.set(edge.id, points);
       wires.appendChild(this.wire(edge, points));
     }
 
@@ -245,7 +255,7 @@ export class OperatorView {
     // A suppressed node draws as a glyph on the edge that replaced it. The edge
     // itself is a two-pixel target; the glyph is one a reader can hit.
     for (const edge of this.graph.edges) {
-      const points = isBackEdge(edge) ? this.backEdge(edge, at) : routed.get(edge.id);
+      const points = route.get(edge.id);
       if (!points || !edge.suppressed.length) continue;
       const mid = midpoint(points);
       edge.suppressed.forEach((id, i) => {
@@ -260,7 +270,6 @@ export class OperatorView {
         this.handles.set(id, { element: g, order: host });
       });
     }
-
   }
 
   /**
@@ -275,6 +284,7 @@ export class OperatorView {
     div.dataset.role = node.role;
     div.appendChild(el("span", "graph-strip"));
     div.appendChild(el("span", "node-label", node.label));
+    if (node.tiling !== null) div.appendChild(el("span", "node-type", node.tiling));
     for (const chip of node.chips) {
       const c = el("span", "graph-chip", chip.text);
       c.dataset.nodeId = String(chip.id);
@@ -291,22 +301,13 @@ export class OperatorView {
     const d = points
       .map((p, i) => `${i === 0 ? "M" : "L"}${p.x + PAD} ${p.y + PAD}`)
       .join(" ");
-    const cls = `graph-edge graph-edge-${edge.kind}${isBackEdge(edge) ? " graph-edge-back" : ""}`;
-    const path = svg("path", { d, class: cls });
+    const back = isBackEdge(edge);
+    const cls = `graph-edge graph-edge-${edge.kind}${back ? " graph-edge-back" : ""}`;
+    const head = back ? "back" : edge.kind === "share" ? "share" : "value";
+    const path = svg("path", { d, class: cls, "marker-end": `url(#${arrowId(this.paneId, head)})` });
     (path as SVGElement & { dataset: DOMStringMap }).dataset.edgeId = edge.id;
     (path as SVGElement & { dataset: DOMStringMap }).dataset.from = String(edge.from);
     return path;
-  }
-
-  /** A back edge, bowed out to the side so it reads as a return. */
-  private backEdge(edge: DrawEdge, at: Map<string, { x: number; y: number; width: number; height: number }>): Point[] | undefined {
-    const a = at.get(String(edge.from));
-    const b = at.get(String(edge.to));
-    if (!a || !b) return undefined;
-    const from = { x: a.x + a.width / 2, y: a.y + a.height / 2 };
-    const to = { x: b.x + b.width / 2, y: b.y + b.height / 2 };
-    const bow = Math.max(a.x + a.width, b.x + b.width) + BOW;
-    return [from, { x: bow, y: from.y }, { x: bow, y: to.y }, to];
   }
 
   private onClick(event: MouseEvent): void {
@@ -376,7 +377,7 @@ export function serializeOperatorGraph(pane: OperatorPane): string {
       } else {
         const ref = nodeById.get(input.subscribed);
         lines.push(
-          `${INDENT.repeat(depth + 1)}${input.role}: → ${ref ? ref.label : "?"} #${input.subscribed}`,
+          `${INDENT.repeat(depth + 1)}${roleLabel(input.role)}: → ${ref ? ref.label : "?"} #${input.subscribed}`,
         );
       }
     }
@@ -390,4 +391,56 @@ function midpoint(points: Point[]): Point {
   const a = points[points.length / 2 - 1];
   const b = points[points.length / 2];
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+/**
+ * A back edge, bowed out to the right so it reads as a return.
+ *
+ * It leaves the producer's right side and enters the consumer's, so the
+ * arrowhead lands on a border rather than under a box. The bow clears every
+ * node whose box overlaps the vertical span it crosses, not only its two ends:
+ * nodes paint over the edge sheet, so a bow through a wider node between them
+ * would be hidden. A self-loop — a store whose body is a branch of its own fan
+ * — leaves and enters the one box a third of its height apart.
+ */
+function backEdge(edge: DrawEdge, at: Map<string, PlacedNode>): Point[] | undefined {
+  const a = at.get(String(edge.from));
+  const b = at.get(String(edge.to));
+  if (!a || !b) return undefined;
+  const self = a === b;
+  const from = { x: a.x + a.width, y: a.y + a.height * (self ? 2 / 3 : 1 / 2) };
+  const to = { x: b.x + b.width, y: b.y + b.height * (self ? 1 / 3 : 1 / 2) };
+  const top = Math.min(a.y, b.y);
+  const bottom = Math.max(a.y + a.height, b.y + b.height);
+  let right = Math.max(from.x, to.x);
+  for (const n of at.values()) {
+    if (n.y < bottom && n.y + n.height > top) right = Math.max(right, n.x + n.width);
+  }
+  const bow = right + BOW;
+  return [from, { x: bow, y: from.y }, { x: bow, y: to.y }, to];
+}
+
+// Marker ids are document-global, so each pane names its own rather than
+// resolving to another pane's.
+const arrowId = (paneId: string, kind: string) => `graph-arrow-${paneId}-${kind}`;
+
+/** One arrowhead per edge class, coloured by the same tokens as the stroke. */
+function arrowheads(paneId: string): SVGElement {
+  const defs = svg("defs", {});
+  for (const kind of ["value", "share", "back"]) {
+    const marker = svg("marker", {
+      id: arrowId(paneId, kind),
+      class: `graph-arrow graph-arrow-${kind}`,
+      viewBox: "0 0 8 8",
+      refX: "7",
+      refY: "4",
+      markerWidth: "7",
+      markerHeight: "7",
+      markerUnits: "userSpaceOnUse",
+      orient: "auto-start-reverse",
+    });
+    marker.appendChild(svg("path", { d: "M0 0.5 L7.5 4 L0 7.5 z" }));
+    defs.appendChild(marker);
+  }
+  return defs;
 }

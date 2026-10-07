@@ -54,8 +54,8 @@ export interface Placed {
 /**
  * Places boxes and routes edges, top to bottom.
  *
- * Asynchronous because the shipping implementation is. A caller must assume the
- * pane changed under it while a layout was in flight.
+ * Asynchronous because the shipping implementation is. A caller that starts a
+ * second layout before the first resolves discards the first's result.
  */
 export interface GraphLayout {
   run(request: LayoutRequest): Promise<Placed>;

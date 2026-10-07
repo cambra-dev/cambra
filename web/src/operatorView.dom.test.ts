@@ -14,8 +14,8 @@
 
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
-import { OperatorView } from "./operatorView";
-import { drawGraphOf } from "./graph/model";
+import { OperatorView, serializeOperatorGraph } from "./operatorView";
+import { drawGraphOf, isBackEdge } from "./graph/model";
 import { Store } from "./store";
 import { TreeView } from "./treeView";
 import type { GraphLayout, LayoutRequest, Placed } from "./graph/layout";
@@ -24,6 +24,8 @@ import type { OperatorPane, Snapshot } from "./types";
 
 import { fixture, irPaneById, operatorPaneById, stubLayout } from "./__fixtures__/helpers";
 
+import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
+import deferLiftJson from "./__fixtures__/defer_lift.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
@@ -36,6 +38,14 @@ const listMin = fixture(listMinJson);
 // The only fixture with a `Source` node, and so the only one that pins a node
 // nothing subscribes getting a row.
 const sourceShared = fixture(sourceSharedJson);
+// Every committed fixture with an operator graph. `failed` has none.
+const withOperators: [string, Snapshot][] = [
+  ["arithmetic", fixture(arithmeticJson)],
+  ["defer_lift", fixture(deferLiftJson)],
+  ["list_min", listMin],
+  ["polymorphic", polymorphic],
+  ["source_shared", sourceShared],
+];
 
 /**
  * A layout that places every node on its own row, in the order given.
@@ -81,6 +91,15 @@ class RowLayout implements GraphLayout {
 class FailingLayout implements GraphLayout {
   async run(_request: LayoutRequest): Promise<Placed> {
     throw new Error("no layout");
+  }
+}
+
+/** A `RowLayout` that records what it was asked to lay out. */
+class RecordingLayout extends RowLayout {
+  readonly requests: LayoutRequest[] = [];
+  override async run(request: LayoutRequest): Promise<Placed> {
+    this.requests.push(request);
+    return super.run(request);
   }
 }
 
@@ -217,6 +236,37 @@ describe("OperatorView", () => {
     expect(treeHost.querySelectorAll(".tree-row.selected, .tree-row.linked").length)
       .toBeGreaterThan(0);
   });
+  it("shows each operator's tiling in its box", async () => {
+    const { body, pane } = await mountGraph(listMin, "post-conversion");
+    const tiled = pane.nodes.find((n) => n.tiling && n.label !== "Constant")!;
+    const box = body.querySelector<HTMLElement>(`.graph-node[data-node-id="${tiled.nodeId}"]`)!;
+    expect(box.querySelector(".node-type")?.textContent).toBe(tiled.tiling);
+  });
+
+  it("drops a layout that resolves after a later one", async () => {
+    const pending: ((placed: Placed) => void)[] = [];
+    const held: GraphLayout = {
+      run: () => new Promise<Placed>((resolve) => pending.push(resolve)),
+    };
+    const body = document.createElement("div");
+    document.body.appendChild(body);
+    const pane = operatorPaneById(listMin, "post-conversion");
+    const view = new OperatorView(body, new Store(listMin), pane, held);
+    const second = view.draw();
+    const request = drawGraphOf(pane).nodes.map((n) => ({ id: String(n.id), width: 80, height: 22 }));
+    const placed = (width: number): Placed => ({
+      width,
+      height: 40 * request.length,
+      nodes: request.map((n, i) => ({ ...n, x: 0, y: 40 * i })),
+      edges: [],
+    });
+    pending[1](placed(500));
+    await second;
+    pending[0](placed(100));
+    await settled();
+    expect(body.querySelector<HTMLElement>(".graph-canvas")!.style.width).toBe(`${500 + 24}px`);
+  });
+
   // The canvas outlives every drawing, so a listener bound per paint is a
   // second, third and fourth handler for one click.
   it("binds its click handler once, not once per draw", async () => {
@@ -230,6 +280,42 @@ describe("OperatorView", () => {
       .dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(selections).toHaveBeenCalledTimes(1);
     selections.mockRestore();
+  });
+});
+
+describe("every committed fixture", () => {
+  // The model's two guarantees, over every operator graph the corpus pins
+  // rather than the one a test happened to pick.
+  it.each(withOperators)("%s: draws every id once and lays out no cycle", async (_, snap) => {
+    const { body, pane } = await mountGraph(snap, "post-conversion");
+    const drawn = idsOf(body, "[data-node-id]").sort((a, b) => a - b);
+    expect(drawn).toEqual(pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b));
+
+    const graph = drawGraphOf(pane);
+    const next = new Map<number, number[]>();
+    for (const e of graph.edges.filter((e) => !isBackEdge(e))) {
+      next.set(e.from, [...(next.get(e.from) ?? []), e.to]);
+    }
+    const state = new Map<number, "open" | "done">();
+    const acyclic = (id: number): boolean => {
+      if (state.get(id) === "done") return true;
+      if (state.get(id) === "open") return false;
+      state.set(id, "open");
+      const ok = (next.get(id) ?? []).every(acyclic);
+      state.set(id, "done");
+      return ok;
+    };
+    expect(graph.nodes.every((n) => acyclic(n.id))).toBe(true);
+  });
+});
+
+describe("the copy text", () => {
+  // A share edge serializes as a reference row naming its role and target.
+  it("names a reference row by its role", () => {
+    const text = serializeOperatorGraph(operatorPaneById(polymorphic, "post-conversion"));
+    const refs = text.split("\n").filter((l) => l.includes(": → "));
+    expect(refs.length).toBeGreaterThan(0);
+    for (const line of refs) expect(line.trim()).toMatch(/^fan: → \w+ #\d+$/);
   });
 });
 
@@ -286,43 +372,113 @@ describe("a graph that reads a source", () => {
 });
 
 describe("a back edge and a late one", () => {
-  // No committed fixture carries either, so the shapes are built by hand. Both
-  // reach the wire — `assert_store_edge_shapes` pins that on the Rust side —
-  // and without this the two renderings would be exercised by nothing.
-  const pane: OperatorPane = {
+  // No committed fixture carries either: the programs that hold a store are
+  // asserted structurally in `tests/inspector_goldens.rs` rather than pinned
+  // whole. So the shapes are built by hand, after the ones
+  // `assert_store_edge_shapes` pins on the Rust side.
+  const op = (
+    nodeId: number,
+    label: string,
+    inputs: OperatorPane["nodes"][number]["inputs"],
+    tiling: string | null = "SF(Int)",
+  ): OperatorPane["nodes"][number] => ({
+    label,
+    nodeId,
+    role: label === "Sink" ? "sink" : "operator",
+    tiling,
+    spans: [],
+    rewritten: null,
+    inputs,
+  });
+  const value = (name: string, subscribed: number, deferred = false) => ({
+    role: { kind: "named" as const, name },
+    kind: "value",
+    deferred,
+    subscribed,
+  });
+  const fan = (subscribed: number) => ({
+    role: { kind: "named" as const, name: "fan" },
+    kind: "share",
+    deferred: false,
+    subscribed,
+  });
+  const paneOf = (nodes: OperatorPane["nodes"]): OperatorPane => ({
     id: "post-conversion",
     label: "IR (POST-CONVERSION)",
     kind: "operators",
-    nodes: [
-      { label: "InductionStore", nodeId: 1, role: "operator", tiling: "Store(UInt)", spans: [], rewritten: null,
-        inputs: [{ role: { kind: "named", name: "body" }, kind: "value", deferred: true, subscribed: 2 }] },
-      { label: "MapResult", nodeId: 2, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
-        inputs: [{ role: { kind: "named", name: "fan" }, kind: "share", deferred: false, subscribed: 1 }] },
-    ],
-  };
+    nodes,
+  });
 
-  it("draws the cycle as a back edge and never lays it out", async () => {
+  async function mountPane(pane: OperatorPane) {
     const body = document.createElement("div");
     document.body.appendChild(body);
     const snap = { ...listMin, panes: listMin.panes.map((p) => (p.id === pane.id ? pane : p)) };
-    const store = new Store(snap as Snapshot);
-    const view = new OperatorView(body, store, pane, new RowLayout());
+    const layout = new RecordingLayout();
+    const view = new OperatorView(body, new Store(snap as Snapshot), pane, layout);
     await view.draw();
+    const laidOut = layout.requests.flatMap((r) => r.edges.map((e) => `${e.source}>${e.target}`));
+    return { body, laidOut };
+  }
+
+  // The store's cycle as `for_accumulator` builds it: the body reads the
+  // store back through a branch of its fan, and the store's slot holds the
+  // body's root.
+  const store = paneOf([
+    op(1, "InductionStore", [value("body", 3, true)], "Store(UInt)"),
+    op(2, "FanOutBranch", [fan(1)]),
+    op(3, "UnionOperator", [value("input", 2)]),
+    op(4, "FanOutBranch", [fan(1)]),
+    op(5, "Sink", [value("out", 4)], null),
+  ]);
+
+  it("draws the cycle as a back edge and never lays it out", async () => {
+    const { body, laidOut } = await mountPane(store);
     expect(body.querySelectorAll(".graph-edge-back").length).toBe(1);
-    expect(body.querySelectorAll(".graph-node").length).toBe(2);
+    expect(laidOut).not.toContain("3>1");
+    expect(body.querySelectorAll(".graph-node").length).toBe(3);
+  });
+
+  // The slot can hold a branch: a body whose root is a value it shares. The
+  // joined edge's kind is the branch's `share`, and it is still the cycle.
+  it("draws a late edge onto a branch as a back edge", async () => {
+    const { body, laidOut } = await mountPane(
+      paneOf([
+        op(1, "InductionStore", [value("body", 6, true)], "Store(UInt)"),
+        op(2, "FanOutBranch", [fan(1)]),
+        op(3, "MapResult", [value("input", 2)]),
+        op(6, "FanOutBranch", [fan(3)]),
+        op(7, "FanOutBranch", [fan(3)]),
+        op(4, "FanOutBranch", [fan(1)]),
+        op(5, "Sink", [value("out", 4)], null),
+        op(8, "Sink", [value("out", 7)], null),
+      ]),
+    );
+    expect(body.querySelectorAll(".graph-edge-back").length).toBe(1);
+    expect(laidOut).not.toContain("3>1");
+    expect(body.querySelector(`.graph-glyph[data-node-id="6"]`)).not.toBeNull();
+  });
+
+  // A body that is the store's own branch joins into a loop on the store. The
+  // edge is the only element that can answer for the branch.
+  it("keeps a self-loop and the branch it replaced", async () => {
+    const { body, laidOut } = await mountPane(
+      paneOf([
+        op(1, "InductionStore", [value("body", 2, true)], "Store(UInt)"),
+        op(2, "FanOutBranch", [fan(1)]),
+        op(4, "FanOutBranch", [fan(1)]),
+        op(5, "Sink", [value("out", 4)], null),
+      ]),
+    );
+    expect(body.querySelectorAll(".graph-edge-back").length).toBe(1);
+    expect(laidOut).not.toContain("1>1");
+    expect(body.querySelector(`.graph-glyph[data-node-id="2"]`)).not.toBeNull();
   });
 
   // The SVG paints outside its box, but painted overflow is ink only: it does
   // not extend the scrollable region, so a bow past the reserved width is
   // unreachable once the graph is wider than the pane.
   it("reserves the width its back edge bows into", async () => {
-    const body = document.createElement("div");
-    document.body.appendChild(body);
-    const snap = { ...listMin, panes: listMin.panes.map((p) => (p.id === pane.id ? pane : p)) };
-    const store = new Store(snap as Snapshot);
-    const view = new OperatorView(body, store, pane, new RowLayout());
-    await view.draw();
-
+    const { body } = await mountPane(store);
     const canvas = body.querySelector<HTMLElement>(".graph-canvas")!;
     const reserved = Number.parseFloat(canvas.style.width);
     const reach = [...body.querySelectorAll<SVGPathElement>(".graph-edge-back")].flatMap((path) =>
@@ -334,5 +490,27 @@ describe("a back edge and a late one", () => {
     );
     expect(reach.length).toBeGreaterThan(0);
     expect(Math.max(...reach)).toBeLessThanOrEqual(reserved);
+  });
+});
+
+describe("a constant behind a lone branch", () => {
+  // Its one reader is a suppressed branch, so there is no box to hold it as a
+  // chip. It stays a box, and the branch a glyph on its edge.
+  it("keeps both ids addressable", () => {
+    const pane: OperatorPane = {
+      id: "post-conversion",
+      label: "IR (POST-CONVERSION)",
+      kind: "operators",
+      nodes: [
+        { label: "Constant", nodeId: 1, role: "operator", tiling: "Scalar(Int)", spans: [], rewritten: null, inputs: [] },
+        { label: "FanOutBranch", nodeId: 2, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
+          inputs: [{ role: { kind: "named", name: "fan" }, kind: "share", deferred: false, subscribed: 1 }] },
+        { label: "MapResult", nodeId: 3, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
+          inputs: [{ role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 2 }] },
+      ],
+    };
+    const graph = drawGraphOf(pane);
+    expect(graph.viewItem(1)).toEqual({ kind: "node", id: 1 });
+    expect(graph.viewItem(2)?.kind).toBe("glyph");
   });
 });

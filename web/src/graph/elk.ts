@@ -12,10 +12,10 @@
 // stays usable at the sizes the gallery reaches; a graph an order of magnitude
 // larger wants the worker back, which means giving up the single-file bundle.
 //
-// Back edges never reach here. They are the pane's cycle set — the value edges
-// the wire marks `deferred` — and giving them to a layered algorithm as ordinary
-// edges makes it rank around a cycle it cannot break. The caller draws them as
-// back edges.
+// Back edges never reach here. They are the pane's cycle set, the edges the wire
+// marks `deferred`. Given them as ordinary edges, ELK's cycle breaker reverses
+// whichever edge its heuristic picks, and the wire already names the one that
+// closes each cycle. The caller draws them as back edges.
 
 import ELK from "elkjs/lib/elk.bundled.js";
 import type { ElkExtendedEdge, ElkNode } from "elkjs/lib/elk-api";
