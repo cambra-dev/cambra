@@ -31,8 +31,12 @@ use crate::ccl::ty::FunKind;
 /// (a rewritten site's tail may contain further sites).
 ///
 /// Not matching is not an error: the site falls back to the generic iterate/restrict
-/// lowering, which is correct and unbucketized.
-pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
+/// lowering, which is correct and unbucketized. The error is planning's, from the key the
+/// rewrite lifts ([`plan_before_iteration`]).
+pub(super) fn recognize_groupby_sites(
+    expr: &mut Expr,
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
     // The recording names the composition site — the term-tree node the
     // bucketize chain replaces — and deliberately not the key morphism the
     // rewrite lifts out of the refined domain's predicate. The composition is
@@ -59,12 +63,18 @@ pub(super) fn recognize_groupby_sites(expr: &mut Expr) {
             "planning.groupby",
             provenance::Nature::Expansion,
         );
-        convert_groupby_pointful(expr)
+        convert_groupby_pointful(expr, witnesses)?
     };
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
     }
-    expr.walk_children_mut(recognize_groupby_sites);
+    let mut result = Ok(());
+    expr.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = recognize_groupby_sites(child, witnesses);
+        }
+    });
+    result
 }
 
 /// Build the bucketize-and-aggregate chain `converse(keys) ≫ map(values)`
@@ -291,7 +301,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
     if !matches!(&elem.node, TypedExprNode::Var(n) if n.is_elem()) {
         return None;
     }
-    let path_pf = lambda_elim::run((**path_of).clone()).ok()?;
+    let path_pf = predicates::eliminate_lifted((**path_of).clone()).ok()?;
     if !crate::ccl::eq_term_modulo_ty_slots(&path_pf, collection) {
         return None;
     }
@@ -320,28 +330,38 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
 /// [`PointfulSite`] to the bucketize chain [`emit_groupby`] builds. `expr` is a
 /// `Compose` whose head is the source; the head is replaced and the tail (the
 /// per-group aggregate) kept.
-fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
+fn convert_groupby_pointful(
+    expr: &Expr,
+    witnesses: &mut Witnesses,
+) -> Result<Option<Expr>, String> {
     match &expr.node {
         // Consumed in place: `groupby(c, key) ≫ <per-group aggregate>`. Replace the head
         // and keep the tail.
         TypedExprNode::Compose(elts) => {
-            let grouped = rewrite_groupby_source(elts.first()?)?;
+            let Some(head) = elts.first() else {
+                return Ok(None);
+            };
+            let Some(grouped) = rewrite_groupby_source(head, witnesses)? else {
+                return Ok(None);
+            };
             let mut new_elts = vec![grouped];
             new_elts.extend(elts.iter().skip(1).cloned());
-            Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
+            Ok(Some(typed_compose(new_elts).with_ty(expr.ty.clone())))
         }
         // **Not** consumed in place — a `let`-bound grouping, whose uses are per-key
         // lookups or iterations of the grouping itself. Matching it here is what lets it
         // stay bound and be shared: the generic fallback would try to iterate its *key*
         // domain, which is an element type rather than an index set.
-        _ => rewrite_groupby_source(expr),
+        _ => rewrite_groupby_source(expr, witnesses),
     }
 }
 
 /// The group-by source rewrite: recognize the pointful site and return the equivalent
 /// bucketize chain. See [`convert_groupby_pointful`].
-fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
-    let site = match_pointful_site(head)?;
+fn rewrite_groupby_source(head: &Expr, witnesses: &mut Witnesses) -> Result<Option<Expr>, String> {
+    let Some(site) = match_pointful_site(head) else {
+        return Ok(None);
+    };
     // Compile the pointful key function to a point-free morphism V ⇒ K, then
     // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
     // This lifts a term out of a *type* — the refined domain's predicate — into
@@ -351,7 +371,10 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
     // rebuilds the term, re-minting every node, which is what makes the crossing
     // safe; `groupby_recognition_lifts_the_key_without_aliasing` pins the property
     // rather than the mechanism.
-    let key_pf = lambda_elim::run(site.key_fn).ok()?;
+    let Ok(key_pf) = predicates::eliminate_lifted(site.key_fn) else {
+        return Ok(None);
+    };
+    let key_pf = plan_before_iteration(key_pf, witnesses)?;
     // The key stream: the collection read through its key function, so it is a
     // collection too, and it carries the kind of the source it is a read of. Its domain
     // keeps every refinement except the consumed grouping equation — dropping them here
@@ -361,14 +384,14 @@ fn rewrite_groupby_source(head: &Expr) -> Option<Expr> {
         site.value_idx_ty.clone(),
         site.key_ty.clone(),
     ));
-    Some(emit_groupby(
+    Ok(Some(emit_groupby(
         keys,
         site.collection.clone(),
         site.group_idx_ty,
         site.key_binder,
         site.key_dom,
         site.value_ty,
-    ))
+    )))
 }
 
 /// Is `e` the element-extraction `__elem ▷ …` — an application whose innermost
@@ -394,7 +417,7 @@ mod tests {
     #[test]
     fn test_recognize_groupby_sites_on_var() {
         let mut expr = var("x");
-        recognize_groupby_sites(&mut expr);
+        recognize_groupby_sites(&mut expr, &mut Witnesses::default()).unwrap();
         // Should remain unchanged
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v.base() == "x"));
     }
@@ -442,7 +465,7 @@ mod tests {
     fn groupby_recognition_lifts_the_key_without_aliasing() {
         let key = var("key").with_ty(fun_ty(int_ty(), int_ty()));
         let mut expr = groupby_source_sharing_its_key(&key);
-        recognize_groupby_sites(&mut expr);
+        recognize_groupby_sites(&mut expr, &mut Witnesses::default()).unwrap();
 
         assert!(
             !matches!(&expr.node, TypedExprNode::Compose(elts)
@@ -543,7 +566,7 @@ mod tests {
 
         let mut expr = Expr::compose(vec![head, var("agg")]);
         let before = symbolic(&expr);
-        recognize_groupby_sites(&mut expr);
+        recognize_groupby_sites(&mut expr, &mut Witnesses::default()).unwrap();
         assert_eq!(
             symbolic(&expr),
             before,
