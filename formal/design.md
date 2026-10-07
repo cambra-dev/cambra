@@ -112,202 +112,192 @@ requires checking the payload-binding rule; the existing tag-arm result provides
 
 ## The polar merge
 
-`CclFormal/Merge.lean` models `compact.rs`'s polar merge over the fragment above: `CompactTy` mirrors
-`CompactType` slot for slot, `merge` mirrors the polar `CompactType::merge` / `CompactFun::merge`,
-and `equiv` mirrors `CompactType`'s own `PartialEq`, set-semantic at every layer. Its module doc
-lists the laws it proves and what the mirror drops. One of those laws reaches beyond the merge:
-`joinKind`, the flat semilattice the kinds join in, is also the Rust's `KindPin::join`, so the three
-laws proved of it are what make a kind variable's pin independent of constraint arrival order
-(`src/ccl/ty.rs`).
+`CclFormal/Merge.lean` defines a compact representation and a polarity-indexed merge.
+It models selected fields of Rust's `CompactType`, not the complete solver state.
+A function slot is `(KindMerge, CompactTy, CompactTy)`: kind, one domain and one codomain.
+There is no list or optional domain inside that slot.
 
-**A rule whose answer depends on a value the fold is still accumulating cannot be applied
-pairwise.** The domain rule is such a rule, because it reads the kind. `compact.rs` therefore
-accumulates the alternatives at every positive join and applies the resolved kind's rule once, at
-`coalesce_compact_go` (`undetermined_kinds_join_without_deciding_the_domain_rule` pins the
-behaviour). Applying it pairwise instead makes bound arrival order decide accept-vs-reject, and is
-what associativity would carry a side condition for.
+The domain merges at `!pol` and the codomain at `pol`. Kind accumulation uses `joinKind`:
+`unknown` is its identity, `data` and `compute` are incomparable, and `conflict` absorbs
+either. The model's domain merge does not select a rule from the intermediate kind.
 
-**`absorbedBy` is not subtyping, and is strictly finer** — which is why the merge's induced order
-carries a name of its own rather than an order symbol a reader would read as subtyping. A positive
-merge accumulates a function slot's domain alternatives rather than deciding between them, so
-`(Int ⇒ Int)` and `({Int | __elem} ⇒ Int)` merge to a slot carrying both. That is a different
-`CompactTy` from either, while `coalesce` materializes it to the second — which is their subtyping
-join. Two positions can materialize to the same type and absorb neither the other, which is why
-leastness over types cannot be routed through this order.
+The principal representation laws are:
 
-### Absorption and distributivity hold of the types, not of `CompactTy`
+| Result | Scope and hypotheses |
+|---|---|
+| `equiv_refl`, `equiv_symm`, `equiv_trans` | Equivalence of compact representations. |
+| `merge_comm`, `merge_assoc` | Either polarity; no well-formedness premise. |
+| `merge_idem` | The operand is `wellFormed`. |
+| `merge_congr_left`, `merge_congr_right` | Equivalent operands give equivalent results. |
+| `foldMerge_perm` | A fixed seed and permuted remaining contributions. |
+| `foldMerge_dup` | The duplicated contribution is `wellFormed`. |
+| `merge_is_least_absorber`, `least_absorber_unique` | Both operands are `wellFormed`; leastness and uniqueness use `absorbedBy`, not `Subtyping`. |
 
-There is one type lattice, and `merge true` computes its join while `merge false` computes its meet.
-What is polarity-indexed is the denotation: one `CompactTy` value denotes two different types, since
-a contribution set means the union of its contributions read positively and their intersection read
-negatively. Write `⟦a⟧⁺` for the type a position denotes read positively and `⟦a⟧⁻` for the type the
-same position denotes read negatively. So `CompactTy` is not a lattice carrier but one syntax
-carrying two representations.
+`equiv` compares atoms and refinements by membership, maps by key lookup and recursive payload
+equivalence, and function slots componentwise. `wellFormed` requires unique map keys,
+recursively well-formed children, no conflicting function kind, and a present refinement slot
+at every content-bearing position.
 
-Writing `a ⊓ (a ⊔ b) = a` over `CompactTy` needs a single syntactic `a` in both a join argument
-(read positively) and a meet argument (read negatively) — that is, it needs `⟦a⟧⁺ = ⟦a⟧⁻`. That
-holds for a single contribution (`{Int}` is `Int` either way) and fails as soon as a set holds two,
-which is the case the law is about. Equivalently: meeting a positive result with something needs the
-*negative* representation of the type that result denotes, and converting between the two
-representations is not a syntactic operation on compact types. It is where distributivity does its
-work, and the polar normal form exists so the conversion is never needed.
+An absent refinement slot means no contribution and is the merge identity. A present empty
+set means a value with no predicates. At positive polarity, intersecting with that set removes
+predicates; merging with the absent slot retains the other contribution.
+The empty compact position is an identity at either polarity
+(`merge_cempty_left` and `merge_cempty_right`).
+
+### Cross-polarity laws require a semantic interpretation
+
+The module proves laws for each fixed-polarity merge. It does not prove cross-polarity absorption
+or distributivity by treating `CompactTy` as one lattice carrier.
+
+The intended polar interpretation reads contributions as alternatives at positive polarity and
+requirements at negative polarity. Using the same compact syntax at opposite polarities therefore
+does not establish that it denotes the same type. A semantic lattice account would need a common
+carrier and an interpretation connecting both operations to it.
+
+The materialization theorems below state the available relationship with `Subtyping`.
 
 ### The lattice is a semantic statement
 
-It needs a domain of types ordered by subtyping in which ⊔ and ⊓ both exist — the lattice algebraic
-subtyping is built on, of which the polarized compact form is a normal form.
+`absorbedBy pol a b` means `equiv (merge pol a b) b = true`. This is an order induced by
+one representation operation. Leastness in that order does not establish that every semantic
+type join has a representable `Ty` or that coalescing computes every such join.
 
-The gap is not that a join is missing or ambiguous. `merge pol` is total and is the unique least
-upper bound of the order it induces, so a join always exists and is one thing; `CompactTy`'s union
-*node* is the contribution set itself, and `atoms = {Int, Bool}` at a positive position **is** `Int
-⊔ Bool`. What is missing is a `Type` that denotes it. `Type` carries the joins and meets the
-compiler can lower — `Refinement` is a meet with a predicate, and `Variant` is a *tagged* join whose
-values carry a tag and whose eliminator is `variant_project` — and no constructor for an untagged
-"`Int` or `String`", whose values carry nothing to distinguish the sides. So `coalesce` is a partial
-function out of `CompactTy`, and `IncompatibleBounds` / `DomainJoinConflict` fire exactly where a
-unique join exists with no `Type` to name it. A lattice semantics is what turns that from an
-implementation behaviour into a theorem, and what would let the Σ work say which join Σ represents —
-Σ being a union node restricted to domains, added because that one join is worth representing.
+`coalesce` is a total Lean function whose result distinguishes a type, an unresolved position
+and an error. As a function from compact positions to successful types, it is partial.
+For example, multiple atom contributions have no untagged union constructor in `Ty`.
+An error is an outcome of the implemented model, not a theorem that a unique semantic join
+exists but lacks syntax.
 
-`simplify_type`'s atomic absorption and co-occurrence merging are rewrites whose justification *is*
-a lattice identity. That pass is observationally inert today — disabling it entirely leaves the
-suite passing and fails only its own unit tests in `simplify_type.rs` — and its own docs say it
-becomes load-bearing once let-polymorphism introduces genuine polar asymmetry. So it is not a live
-hazard; it is the consumer that would make a lattice model pay.
+A full lattice semantics and a justification of `simplify_type`'s absorption/co-occurrence
+rewrites remain outside the proved model. The documentation makes no claim that disabling
+that Rust pass preserves all observable behavior.
 
 ### Why the model carries `CompactTy` at all
 
-Two reasons, and neither is "so the algebra has a carrier".
+The merge differential needs the operation's input and output representation, not only
+materialized types. Fixed-polarity permutation and duplication laws are also representation
+properties. Agreement after materialization alone would not prove those laws.
 
-The differential needs a mirror of `CompactType`; that much is definitional. The substantive reason
-is that **order-independence is a statement about the representation, and no semantic statement
-implies it.** The solver compares compact and materialized types *structurally* — the
-trivial-equality short-circuit, cache keys, `SpecKey`, the recorded-versus-recomputed walls — so two
-structurally distinct results denoting mutually-subtyping types are two different identities to it.
-A lattice-level "joins are unique up to ≈" would not have caught the refinement-layer ordering
-defect the type-merge fuzz found at roughly one generated set in ten thousand: subtyping was
-indifferent there, because refinements compare as a set, while `Type`'s derived `PartialEq` was not.
+The comparison boundary matters. Rust carries inference-variable sets, kinding constraints,
+history slots, function names, sum binders, `domains_disagree` and a `combined` diagnostic
+snapshot that this `CompactTy` does not model. The encoder also maps Rust's `Plain` and
+`Data` kinds to the model's `data`. Model equivalence is therefore not equality of complete
+Rust `CompactType` values.
 
-What `CompactTy` cannot carry is any statement about what a merge *means* — hence the scope note on
-uniqueness above.
+The absent domain-disagreement fields are particularly relevant to acceptance: Rust can retain
+evidence about the two pre-merge domains that is no longer recoverable from the merged domain.
+That gap is specified under [The fn slot holds one domain](#the-fn-slot-holds-one-domain).
 
 ## Materialization: the merge is a bound, and the least one
 
-`CclFormal/Coalesce.lean` models `coalesce_compact_go` on the concrete fragment and proves it total.
-A position **materializes** when `coalesce` gives it a type — one concept under two spellings, the
-operation's name and the Rust's verb for what it does to a position (`materialize_record`,
-`materialize_variant`). An outcome is one of three things: a `Ty`; refused (`CoalesceError`), where
-the position has no type; or unresolved, where nothing concrete reached the position and the Rust
-emits a fresh `Type::Infer`. `Ty` has no `Infer` node, so such a position is compared only as
-"unresolved", refinements included.
+`CclFormal/Coalesce.lean` materializes compact slots into `Ty`. Its result has three forms:
 
-**`CoalesceError` has no `emptyProduct`.** [chl-spec.md](../docs/chl-spec.md#66-the-empty-product-is-unit),
-"6.6 The empty product is unit" makes unit a base type so a product cannot reach it by width. A
-positive merge that intersects two records to nothing is therefore `IncompatibleBounds` on both
-sides: bounds with no common shape is what that error already says, and the empty product is that
-read one level down.
+| Result | Meaning in the model |
+|---|---|
+| `ok (some t)` | A concrete type was produced. |
+| `ok none` | A component remains unresolved; no modeled type is available. |
+| `error e` | The modeled materializer rejected the position. |
 
-Two theorems bracket the merge — `merge_is_a_bound` (`CclFormal/MaterializedMergeIsABound.lean`) and
-`merge_is_least_type` (`CclFormal/MaterializedMergeIsTheLeastBound.lean`) — and each file states its
-own proof. What belongs here is what they rest on and what the sample measured.
+An unresolved result need not be an entirely empty position. A function with an unresolved child
+or a sparse index-keyed product can also remain unresolved. The Rust comparison records this
+category rather than an inference-variable identity or its attached predicates.
 
-**Two hypotheses beyond `concrete`, each forced and each pinned by its own counterexample in the
-module.**
+Each occupied shape contributes an entry to `combine`, even when that entry is unresolved.
+No entries produce `ok none`; one entry is returned with refinements attached; multiple entries
+produce `incompatible`. Error propagation from the shape helpers occurs before this combination.
 
-- **A kind variable is not a concrete position** (`kindResolved`). `KindMerge.unknown` materializes
-  by the capability default and a merge that pins the slot to `data` overrides that default, so an
-  `unknown` operand's own materialization is not what the merge combined: `(Int ⤇ Int)` joined with
-  an unpinned `(Int ⇒ Int)` is `(Int ⤇ Int)`, above neither operand as materialized separately.
-  Excluding it is not a restriction on the merge — `wellFormed` already excludes the other
-  non-concrete kind, `.conflict`.
-- **`DataAgree`**: at a negative position a `data` slot's two domains agree. `subtypeCheck` reads a
-  data domain invariantly, as `constrain_go` does, so no `Ty` is below both `({a: Int} ⤇ Int)` and
-  `({a: Int, b: Bool} ⤇ Int)` — a type below both would need one domain mutually-sub with two that
-  are not mutually-sub. Demanding that the merge be a lower bound there demands the impossible, and
-  the lossless answer is the Σ over both domains that the Σ roadmap item adds. So soundness is
-  guarded by the existence of a bound (`MergeIsBoundGuarded`), and `DataAgree` holds exactly when a
-  bound exists. It is a condition on the *pair*, not on which types a data domain may be — a data
-  domain is refined whenever a filter narrows a collection.
+The slot rules are:
 
-**Leastness over types is not routed through the absorption order.** Reflecting `Subtyping` into
-`absorbedBy` is false, on the function-domain shape recorded under `absorbedBy` above, and weakening
-the reflection to hold only after materialization fails on more of the sample rather than fewer;
-both were measured before being believed. The proof inducts on the materializations instead.
+- A record slot with no fields is incompatible, not unit. Dense index keys materialize a tuple
+  in index order; sparse index keys remain unresolved. Name keys materialize a record.
+  Mixed index/name keys give `partialRecord` before payload traversal. Otherwise payload
+  errors propagate even if the shape will remain unresolved.
+- Variant payloads materialize recursively. An empty closed variant is distinct from an
+  empty record slot.
+- A function first materializes its codomain. `conflict` then gives `conflictedSlot`.
+  A `data` function whose bare atom domain contains multiple distinct atoms gives `domainJoin`.
+  Otherwise its domain materializes at opposite polarity; both children must resolve to
+  produce a function type. An `unknown` kind uses the compute default.
 
-**The side the bound sits on is a parameter of that induction, independent of the polarity**
-(`bounds`). `bounds_merge` proves one statement over both parameters: a type bounding both operands'
-materializations on one side bounds the merge's materialization on that same side.
+Termination uses a lexicographic measure: `(depth t, 1)` for `coalesce` and `(depth t, 0)`
+for the shape helpers. Calls from `coalesce` to a helper keep the position and decrease the
+second component; recursive child calls decrease depth. There is no recursive materialization
+of a folded list of domain alternatives in the current implementation.
 
-| | above both operands (`above = true`) | below both operands (`above = false`) |
+Unit is a base type, not the result of width-subtyping a product down to zero fields; see
+[The empty product is unit](../docs/chl-spec.md#66-the-empty-product-is-unit).
+
+### Bound and leastness hypotheses
+
+`merge_is_a_bound` in `MaterializedMergeIsABound.lean` requires:
+
+1. `concrete a` and `concrete b`.
+2. `concrete (merge pol a b)`.
+3. `DataAgree pol a (merge pol a b)` and `DataAgree pol b (merge pol a b)`.
+
+`concrete` is `wellFormed && kindResolved`. The second condition requires every function kind
+to be `data` or `compute`; defaulting an unknown operand before merging can disagree with a
+kind resolved by another contribution.
+
+`DataAgree` recursively checks shared fields and function components. When the left function
+kind is `data`, its domain must be `equiv` to the right domain, at either polarity.
+Domain recursion checks both directions, and codomain recursion retains the current polarity.
+This is a structural sufficient hypothesis used by the proof, not a proved equivalence with
+existence of a subtype bound.
+
+The theorem concludes `MergeIsBoundAt`. When both operands and their merge materialize,
+the positive result is above both operand types and the negative result is below both.
+If any of the three does not materialize, that Boolean statement is true without asserting
+a subtype relation. The theorem does not prove successful materialization.
+
+`merge_is_least_type` in `MaterializedMergeIsTheLeastBound.lean` has different hypotheses:
+concrete operands, a well-formed candidate type `u`, successful materialization of both operands
+and the merge, and the two subtype bounds involving `u`. It does not require `DataAgree`
+or a concrete merged position. It proves that `u` also bounds the materialized result.
+That conditional leastness statement alone does not assert that the result bounds its operands.
+
+The induction `bounds_merge` varies the bound's side independently of merge polarity:
+
+| Merge polarity | `u` above both operands | `u` below both operands |
 |---|---|---|
-| positive merge (`pol = true`) | above the merge — **leastness** of the join | below the merge |
-| negative merge (`pol = false`) | above the merge | below the merge — **leastness** of the meet |
+| Positive | `u` is above the result: join leastness. | `u` is below the result. |
+| Negative | `u` is above the result. | `u` is below the result: meet greatestness. |
 
-Leastness is the diagonal, where `above = pol`. The off-diagonal is what the function case consumes:
-a domain flips the polarity and the subtyping edge together, and a `data` domain is invariant, so
-closing that case needs the bound carried on the other side as well. One induction proves all four
-cells, and leastness alone would not close the function case.
+The off-diagonal cases support function domains, where polarity and subtype direction reverse
+and data-function domains require both directions. The proof reasons about materialized types
+rather than assuming that `Subtyping` reflects into `absorbedBy`.
 
 ### The fn slot holds one domain
 
-`CompactFun` holds **one** domain, merged contravariantly like any other position, plus a
-`domains_disagree` flag and the operand pair a merge had to combine. A candidate set lives one level
-up, on the witness a Σ binds. The model followed: the slot's `List CompactTy` became a `CompactTy`,
-which retired `unionDomains`, `meetDomains`, `anyEquiv`, `subtypeDomains`, `domainsEquiv`,
-`OneDistinct`, `meetAll` and their theorems — `OneDistinct` in particular, since "at most one
-distinct domain" is now the slot's type rather than a predicate proved about it.
+Both model and Rust function slots contain one compact domain. Rust additionally records
+`domains_disagree` and `combined`. `data_domains_disagree` inspects input domains because a
+contravariant merge can erase their distinction by combining record keys or refinements.
+`coalesce_compact_go` uses the retained evidence to reject a data-domain conflict.
 
-Three consequences, each measured:
+The model has neither field. `funShapes` recognizes the bare-multiple-atom domain case,
+but cannot reconstruct every operand-level disagreement from one merged domain.
+A generated sample with no reported differences does not establish agreement on these omitted
+cases. No domain-list fold, `widest` tie-break, or `Option CompactTy` domain encoding describes
+the current model.
 
-- **`DataAgree` states the domain edge at both polarities.** A positive merge meets the domains
-  too, so the evidence that two `data` domains disagreed is erased either way, and the hypothesis
-  is needed at both. Unguarded, that is 8 failures on one surface and 4 on the other, in both
-  orders.
-- **`merge_is_a_bound` holds on 1844 of 2048 samples.** A `compute` slot carrying two domain
-  alternatives, which would materialize by meeting them, cannot arise over one domain.
-- **`merge_assoc`, `merge_is_least_absorber` and `least_absorber_unique` need no
-  `Classical.choice`**: their proofs are `rw` plus a triple of componentwise facts.
+### Checked samples and their limits
 
-**What the model does not state.** The Rust reaches `DomainJoinConflict` two ways: the merged domain
-denoting several alternatives, which `funShapes` mirrors through `denotesSeveralDomains`; and the
-`domains_disagree` flag, which `CompactFun::merge` sets from the *operands* because the meet erases
-the evidence. There is no slot for the flag here, so a disagreement whose merged position is not
-several atoms is a verdict this model does not give. The coalesce differential reports 0 mismatches
-over 4000 bounds, so the sampler does not reach it; closing it means a fourth component on the fn
-slot and a model of `data_domains_disagree`.
+`MaterializedMergeIsABound.lean` contains executable `#guard` assertions for:
 
-**A disagreement is caught loudly exactly when the domains' join is undefined, and silently whenever
-it exists.** Two distinct atoms join to a two-atom position `coalesce` rejects, so nothing
-materializes and the statement is vacuous; record keys intersect, variant tags unite, and refinement
-sets intersect, and each of those materializes to a domain that is neither operand's. The boundary
-is the domains' agreement, which is what `coalesce_monotone_fun` assumes.
+- 2,888 well-formed cases and 2,048 concrete cases.
+- 1,844 concrete cases satisfying the bound theorem's additional hypotheses.
+- No failures among those 1,844 cases.
+- Eight unguarded bound failures and four monotonicity failures among the concrete cases.
+- No failures of `MergeIsBoundGuarded` on that finite sample.
 
-No disagreement is reachable from the programs the suite compiles. Measured by counting
-negative-position `Data`-slot domain merges from `CompactFun::merge`, over every CHL program the
-integration corpus compiles: 473 such merges, and in every one the two domains are identical except
-for their variable sets. Four programs written to force a disagreement each typecheck and reach 48
-such merges, all agreeing — a parameter read raw and filtered, one parameter under two different
-filters, a source read raw and filtered, and a filtered binding filtered again. The measurement is a
-one-off instrumentation of that merge rather than a standing test, so it is a reading of today's
-corpus and not a gate. The conjectured mechanism: a filter does not demand a refined domain of its
-source, it produces a collection whose own domain is refined.
+`MergeIsBoundGuarded` searches the finite `pool` for a candidate bound. It does not quantify
+over every `Ty`. Its passing sample is not a general bound-existence theorem or a proof that
+every Rust-produced compact value meets the required hypotheses.
 
-`MaterializedMergeIsABound.lean` also carries a **bounded sample**, small enough to evaluate and
-wide enough to reach every arm of `merge`: 2888 `wellFormed` pairs, of which 2048 are kind-resolved.
-Both guards below run over those 2048. Guarded soundness is clean on all of them; unguarded, 4
-failures survive, all the `DataAgree` shape on two surfaces in both orders (record domains `{a:
-Int}` against `{a: Int, b: Bool}`, and refinement slots `Int` against `{Int | __elem}`). Of the 2048
-kind-resolved pairs, 1814 satisfy `merge_is_a_bound`'s hypotheses; the 234 that do not are a merge
-that left the input shape — a `compute` slot carrying two domain alternatives, which materializes by
-meeting them — or a data domain the merge moved.
-
-The sample's leastness line is no longer measured. Every candidate bound in the pool is a
-`wellFormed` position's materialization, `coalesce_wellFormed` makes that a well-formed type, and
-`merge_is_least_type` then applies to it — so `leastness_failures_eq_nil` proves what a `#guard`
-used to evaluate, and `merge_is_least_at_of_concrete` proves it for every concrete pair rather than
-the sample's 2048. The pool is drawn from the `wellFormed` members of the sample, since a
-duplicate-keyed position materializes to a type `Ty.WellFormed` excludes and no such type is a
-candidate bound.
+`coalesce_wellFormed` proves well-formedness of a successfully materialized well-formed position.
+`pool_wellFormed` applies it to the candidate pool, and `leastness_failures_eq_nil` derives the
+sample's leastness result from `merge_is_least_type` rather than reevaluating a Boolean sample.
+These proofs remain statements about the modeled fragment.
 
 ## The differential oracles
 
@@ -344,64 +334,54 @@ named axiom checks are separate from warning cleanliness.
 
 ## Roadmap
 
+The following extensions are proposals, not coverage supplied by the current proofs or oracles.
+
 ### The typing oracle
 
-Have the Rust dump the typed AST for generated small programs, and check admissibility of the root
-typing in Lean. This is the step at which the model would start catching inference bugs rather than
-comparison bugs, and it is what the term calculus above exists for.
+Generate small CHL programs, encode Rust's typed AST, and check admissibility of the inferred root
+type with the Lean typing judgment. This requires a term wire format and an explicit agreement
+on the supported fragment. It would compare typing results, not require both systems to choose
+the same type.
 
 ### The solver model
 
-Model `constrain` and coalesce as a state monad over a store of variables with bound lists,
-fuel-based at first. Two theorems would follow:
+Represent constraint processing as state over variables and their bound lists, initially with
+fuel. The intended proof obligations are:
 
-- **Soundness**: every bound the solver records is derivable in the declarative `<:`, and the
-  coalesced output type is admissible for the term, which would connect back to the term calculus.
-- **Termination**: replace fuel with a well-founded measure. This is the priority of the two, since
-  it is the property with live field bugs — a hanging build in this repo is, as a working rule,
-  solver non-termination. The measure would have to account for the seen-cache and for `extrude`
-  minting fresh variables, and articulating it will either yield a proof or expose that termination
-  rests on something unstated.
+- Bound-recording soundness and admissibility of the final inferred type.
+- Termination, replacing fuel with a well-founded measure that accounts for the seen-cache
+  and fresh variables introduced by extrusion.
+- Scope preservation, including levels, extrusion and escaping references.
 
-Levels and extrusion would enter the model at this step, and scope-escape soundness is the natural
-third theorem, subordinate to the two above.
+Termination is a proposed priority. A stalled build is not by itself evidence that the solver
+failed to terminate; attributing one requires a reproducer or diagnostic trace.
 
 ### Σ types and `FunKind` inference
 
-What a witness ranges over is modelled: `TypeKind`, its containment order and its lattice, the
-`refuses` test, and `CompactTypeKind`'s merge, each with a differential. `SigmaBelow` states the
-kind premise and proves it is the elementwise reading of what a Σ denotes.
+The current kind definitions and `SigmaBelow` predicate do not put dependent sums into `Ty`
+or sum binders into `CompactTy`. Extending the grammar and wire format would require modeling
+binder correspondence, witness scope, candidate-kind constraints and their materialization.
+The current kind-merge differential is not a substitute for that extension.
 
-The Σ is not. `Ty` carries no witness and `CompactTy`'s function slot no binders, so a Σ is a rule
-over a candidate list rather than a type, and no sum crosses the wire. The binder correspondence
-`𝜌` is where that costs the most: it is the premise a var-to-sum edge was found missing, its
-absence raises no error because the domain premise runs either way, and an assert in
-`constrain_subtype`'s Fun/Fun arm plus the Rust tests are the whole of what stands behind it
-([type-inference.md, "What checks each
-premise"](../src/ccl/design/type-inference.md#what-checks-each-premise)). A binder slot on
-`CompactTy` is what would put the Σ rule behind the merge differential, and it is the cheaper half
-of this step.
+The relevant Rust contracts are owned by
+[What checks each premise](../src/ccl/design/type-inference.md#what-checks-each-premise) and
+[Data vs compute functions](../src/ccl/design/type-inference.md#46-data-vs-compute-functions).
+A formal extension must preserve their distinction between a term introducing a sum and
+subtyping an existing sum. A domain disagreement must not silently acquire a sum merely because
+a merge needs a representable result.
 
-The rest is the witness discipline — **one value = one witness**, arms α-converted onto the value's
-witness (adopt if unanimous, mint on disagreement, sticky), with the join deferred to compaction —
-and kind variables resolved at coalesce ([type-inference.md, "4.6 Data vs compute
-functions"](../src/ccl/design/type-inference.md#46-data-vs-compute-functions)). The discipline was
-established only after a constraint-time-join defect was root-caused at some expense, which is the
-reason to freeze it as a theorem before the next refactor disturbs it. Modelling the kind variables
-would also supply the bound `DataAgree` currently excludes, and would let the lattice statement
-above say which join Σ represents. **If Σ comes to materialize multi-domain joins, the merge's
-"alternatives beyond one" adjudication has to be revisited.**
+Unresolved kind variables also require a model of pinning and final defaulting. Adding sums or
+kind variables does not by itself discharge `DataAgree` or supply a proof of semantic joins.
 
 ### Histories: the mutability semantic model
 
-This step is independent of the solver model and can start any time after the term calculus. It
-would be a semantics model rather than a typing model: the transient variants (`History`, `ChanDom`,
-`Hole`, `Infer`) are pipeline artifacts and stay **out** of the typing calculus.
+A history model can be developed independently of the solver-state model. Its proposed subject
+is semantic equivalence between surface mutation and the emitted `letrec`/`transact` recurrence,
+not admission of every pipeline transient into the concrete typing grammar.
 
-Model histories as functions `𝐷 ⇒ 𝑉` per [mutability.md, "The model: histories and causal
-recursion"](../src/ccl/design/mutability.md#the-model-histories-and-causal-recursion): `Overwrite`
-is last-write-wins with carry-forward at off-path positions; `Append` is the append law, with no
-carry-forward; and `Txn` reads are arbitrary as-of reads, with no terminal/"final value" read,
-matching [mutability.md, "Semantics"](../src/ccl/design/mutability.md#semantics). The headline
-theorem would be that the `letrec`/`transact` realization emitted by `mut_elim` / `plan_loops`
-denotes the same function as a direct imperative semantics of the surface program.
+The reference contracts are
+[The model: histories and causal recursion](../src/ccl/design/mutability.md#the-model-histories-and-causal-recursion)
+and [Semantics](../src/ccl/design/mutability.md#semantics).
+The model would distinguish overwrite's last-write-wins and off-path carry-forward behavior
+from append's accumulation law, and arbitrary transactional as-of reads from terminal reads.
+`History`, `ChanDom`, `Hole` and `Infer` remain outside the current concrete typing grammar.
