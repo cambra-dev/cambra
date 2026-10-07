@@ -1,45 +1,24 @@
 # CHL Parser Design
 
-This document describes the design of the Cambra High-Level Language (CHL)
-parser in `chl-parser/`.
-
-Two properties shape it: **error recovery** — parsing continues past a local
-syntax error and reports *all* problems in a file, for an interactive UX — and
-an **AST shaped to match what lowering consumes**, so lowering does no
-re-classification.
+`chl-parser` converts source text into a span-bearing AST. It also returns diagnostics and,
+when recovery succeeds, a partial AST. Recovery can preserve later statements after a local
+error; it does not guarantee a diagnostic for every invalid construct in the file.
 
 ## Stack: logos + chumsky
 
-| Need | Choice | Reason |
-|---|---|---|
-| Lexer | [`logos`](https://crates.io/crates/logos) `0.14` | DFA-based, extremely fast, declarative token attributes, well-maintained, the de-facto Rust lexer-generator |
-| Parser | [`chumsky`](https://crates.io/crates/chumsky) `1.0.0-alpha.8` | Combinator-style grammar, **first-class error recovery via `recover_with`/`nested_delimiters`**, active development |
-
-Chumsky 1.0-alpha was preferred over 0.9.x because the 0.9 line is
-unmaintained and the 1.0 alpha API (despite some lifetime ergonomics warts —
-see [Gotchas](#gotchas)) is what new chumsky users adopt.
+The crate uses Logos `0.14` for tokenization and Chumsky `1.0.0-alpha.8` for parsing, as declared
+in `Cargo.toml`. Ariadne renders the structured diagnostics. Dependency declarations, rather than
+this reference, own version requirements.
 
 ## Architecture
 
-```
-CHL source  ── logos lexer ──▶  raw token stream
-                              ──┐
-                                ▼
-                            layout post-pass
-                              (off-side rule)
-                              ──┐
-                                ▼
-                          NEWLINE / INDENT / DEDENT-aware
-                          token stream
-                              ──┐
-                                ▼
-                          chumsky parser
-                              ──┐
-                                ▼
-                            CHL AST  ⇒  CCL lowering
+```text
+source → Logos tokens → layout tokens → Chumsky grammar → CHL AST → CCL lowering
 ```
 
-The pipeline is two distinct stages, both inside `chl-parser/src/`:
+The layout pass emits `Newline`, `Indent` and `Dedent` tokens. The grammar consumes those
+tokens rather than computing indentation. AST types live in `ast.rs`; error conversion and
+rendering live in `parser/error.rs`.
 
 ### Stage 1 — Lexer (`lexer.rs`)
 
@@ -87,8 +66,7 @@ statement's head, so `pub def f():` opens its body as `def f():` does.
 ### Stage 2 — Parser (`parser.rs`)
 
 A chumsky combinator parser consumes the layout-resolved token stream and
-produces the AST defined in [`ast.rs`](#stage-3--ast-astrs). Three
-public entry points:
+produces the AST defined in [`ast.rs`](#stage-3--ast-astrs). The public interface includes:
 
 - `parse_module(FileId, &str)` — a sequence of top-level statements.
 - `parse_expression(FileId, &str)` — a single expression (used by the lowering
@@ -99,30 +77,22 @@ public entry points:
   `ParseResult`, `CATEGORIES`) live in the `parser/error.rs` submodule, re-exported
   from `parser.rs`.
 
-The grammar is precedence-climbed for binary operators, one combinator per level of
-[docs/chl-spec.md](../docs/chl-spec.md), "2.3 Expression precedence", each built from the
-one tighter than it. `**` is the exception: it straddles the unary `-`, tighter than one on
-its left and looser than one on its right, so it shares a `recursive` layer with unary `-`
-rather than sitting in its own.
+Binary-operator productions follow
+[Expression precedence](../docs/chl-spec.md#23-expression-precedence).
+Most levels build from the next tighter level. Exponentiation and unary minus share a recursive
+production because `**` binds more tightly than unary minus on its left and less tightly on
+its right.
 
-Every position a bracket encloses — a list or tuple element, a call argument, a
-subscript index, a record field, a brace item, a refinement predicate, a
-comprehension clause — goes through `bracketed_expr` rather than `expr`. That
-production is `oneline_match | expr`, which is what confines the one-line
-`match` to a position where a `)`, `]` or `}` closes its arm list. `match` is a
-keyword, so no `expr` can start with one and the choice needs no backtracking.
-See [docs/chl-spec.md](../docs/chl-spec.md), "The one-line form" for the rule
-and why the bracket rather than the arm body carries it.
+Bracket-enclosed expression positions use `bracketed_expr`, the choice between a one-line
+`match` and an ordinary expression. The closing delimiter bounds the arm list; ordinary
+expression positions do not admit that form. The surface rule is
+[The one-line form](../docs/chl-spec.md#the-one-line-form).
 
-Notably absent vs. Python: `/` (true division), `%` (modulo), `>>`
-(right shift), `~` (bitwise not), and the comparisons `is`, `in`, `not in`
-and `is not`. `/`, `%` and `~` start no token, so the lexer rejects them with
-`InvalidToken`. `>>` lexes as two `Gt` tokens, `is` as an identifier, and `in`
-as the keyword a `for` clause consumes; the parser accepts none of them in
-operator position. `operators_absent_from_chl` in `lexer.rs` pins the lexer's
-half.
-
-The lexer also accepts `^+` and `^=`. Both are experimental, so `docs/chl-spec.md` leaves them out.
+The grammar does not accept every token in operator position. For example, `in` is a keyword
+consumed by iteration clauses, not an implemented membership operator. `>>` is two `Gt`
+tokens, and `is` is an identifier. `/`, `%` and `~` fail tokenization.
+`operators_absent_from_chl` covers the lexical cases.
+Experimental `^+` and `^=` tokens are accepted but omitted from the language reference.
 
 ### Stage 3 — AST (`ast.rs`)
 
@@ -135,51 +105,30 @@ Key shape choices:
   `FileId` as chumsky's span context, and chumsky builds every span it derives
   from the end-of-input span's context, so each node's span names the file the
   entry point was given.
-- **Operators are typed enums.** `BinOp`, `CmpOp`, `BoolOp`, `UnaryOp`,
-  `AugOp` enumerate exactly what CHL accepts. Lowering can match
-  exhaustively without an "unsupported operator" arm per variant.
-- **`if`/`elif` chains flatten.** `Stmt::If` carries a `Vec<IfBranch>` (one
-  per `if`/`elif`) plus an optional `else_body`, rather than nesting an
-  `If` inside an `Else`. This matches the `Case` shape in CCL.
-- **A block statement in value position is `Expr::Block`.** `x = if c: … else:
-  …`, `x = match v: …`, and the one-line `match` all wrap the `Stmt::If` or
-  `Stmt::Match` they parsed to, so each construct keeps one AST shape and
-  lowering routes every spelling through `lower_final_stmt`. The two `match`
-  layouts share `match_arms`, a production over how an arm's body is spelled:
-  an indented `block` for the statement form, a single expression for the
-  one-line one. The six assignment operators likewise share `assign_tail`, a
-  production over the right-hand side, which is what gives every one of them a
-  block right-hand side rather than only `=`.
-- **Records are parens; braces are types.** A record *value* `(x=1)` parses
-  as `Expr::Record`; brace literals are type syntax — `{x: T}` is
-  `Expr::BraceRecord` and `{T, U}` is `Expr::BraceGroup`. Lowering reads the brace forms as types
-  and rejects them as values. Because braces are always a *product* in type position and never
-  grouping, the brace parser captures the trailing comma rather than merely allowing it: `{T,}` is
-  the one-element product and a comma-free `{T}` is a parse error, while the empty `{}` is the
-  **unit type**, which lowering reads as `Unit` (see
-  [docs/chl-spec.md](../docs/chl-spec.md), "6.6 The empty product is unit"). A `where` clause
-  after a single colon-free base turns the brace into a refinement type `{T where p}`
-  (`Expr::BraceRefinement`, [docs/chl-spec.md](../docs/chl-spec.md), "6.4 Refinement syntax");
-  the clause gates off the one-element `{T}` diagnostic, and its predicate `p` — an ordinary
-  expression whose subject `_` lowering maps to the refinement binder — is parsed with the same
-  `bracketed_expr` as every other bracketed position.
-- **The function-type arrow `=>` is the loosest binary form.** `T => U` parses
-  to `Expr::FunctionType`, a level below `feed` in the precedence chain. It is
-  right-associative — `A => B => C` is `A => (B => C)` — because it takes the
-  whole expression to its right as the codomain. A `def`'s return annotation
-  consumes its `=>` at statement level before the expression parser runs, so that
-  position is unaffected and its return type may itself be a function type. Lowering reads `Expr::FunctionType`
-  as a `Type::Fun` in annotation position and rejects it as a value
-  ([docs/chl-spec.md](../docs/chl-spec.md), "6. Types (informal sketch)").
-- **The pair arrow `k -> v` has no node of its own.** `a -> b` builds the
-  `Expr::Tuple` the parenthesised spelling builds
-  ([docs/chl-spec.md](../docs/chl-spec.md), "2.4 Atoms"), so a map literal is an
-  ordinary list of pairs, a map comprehension an ordinary comprehension of them,
-  and `for k -> v in m` an ordinary tuple target that `expr_to_assign_target`
-  already reads. It sits between `<<` and the ternary: `m << k -> v` feeds the
-  entry `(k, v)`, and `k -> v if c else w` pairs `k` with the whole conditional.
-  It does not chain, since nothing associates a third component, so
-  `a -> b -> c` is a parse error.
+- Operators use `BinOp`, `CmpOp`, `BoolOp`, `UnaryOp` and `AugOp` variants. Lowering can
+  match those enums exhaustively; their presence in the AST does not guarantee that every
+  operand type is supported.
+- `Stmt::If` stores one `IfBranch` per `if`/`elif` and an optional `else_body`. It does
+  not nest an `if` statement inside an `else` to represent the chain.
+- `Expr::Block` wraps an `if` or `match` statement in value position. Assignment-side
+  blocks and one-line `match` therefore reach the same lowering entry, `lower_final_stmt`.
+  `match_arms` parameterizes the arm-body production; `assign_tail` parameterizes the
+  right-hand side for all six assignment forms.
+- `Expr::Record` represents a record value. `BraceRecord`, `BraceGroup` and
+  `BraceRefinement` retain type syntax for lowering to interpret. The distinction between
+  `{T,}`, `{T}`, `{}` and refinements is specified under
+  [Atoms](../docs/chl-spec.md#24-atoms) and
+  [Refinement syntax](../docs/chl-spec.md#64-refinement-syntax).
+  Bracketed predicates also use `bracketed_expr`.
+- `Expr::FunctionType` represents right-associative `=>` below feed precedence.
+  Its operands are expressions; lowering validates their use as types.
+  A `def` return annotation consumes its delimiter before this production runs, so its
+  return type may itself contain `=>`.
+- `k -> v` constructs `Expr::Tuple`, the same node as `(k, v)`. No map-literal node is
+  introduced. Pair-arrow precedence places `k -> v if c else w` around the conditional
+  value, and `m << k -> v` feeds the pair. Chaining `->` reports a custom error.
+- `Expr::Feed` and `Stmt::Define` directly represent `<<` and `<<=`. They are not
+  shift-operator variants requiring later reclassification.
 - **Type parameters are split out of the parameter list.** A capitalized `def` parameter is a
   type parameter ([docs/chl-spec.md](../docs/chl-spec.md), "Type parameters"), so
   `Stmt::FunctionDef` carries `type_params: Vec<TypeParam>` beside `params`, and `params` alone
@@ -193,9 +142,6 @@ Key shape choices:
   `requires Addable(A, B, Output=O), Transaction` into `Vec<Spanned<Requirement>>`, operands
   first and associated types by name after them. It follows a `def`'s `=>` result and a
   `forall`'s body. A clause after a nested `forall`'s body belongs to the innermost one.
-- **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
-  capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
-  and `AugAssign(LShift)` that lowering must special-case.
 - **Module statements have their own variants.** `Stmt::Import`, `Stmt::Run`,
   `Stmt::Param` and `Stmt::Discard` carry the statements of
   [docs/chl-spec.md](../docs/chl-spec.md), "9. Modules [Decided]". `Stmt::Pub`
@@ -276,166 +222,112 @@ These rows and the spec disagree:
 
 ## Error recovery
 
-There are two complementary recovery layers, both implemented with
-chumsky's `recover_with(via_parser(…))`:
+The grammar installs bracket and statement recovery through `recover_with(via_parser(...))`.
+Successful recovery records the original error and returns an error node spanning the skipped
+region. Callers must inspect diagnostics even when an AST is available.
 
 ### Bracket-level recovery
 
-`recover_with(via_parser(nested_delimiters('(', ')', […], |span| Expr::Error)))`,
-plus the symmetric ones for `[…]` and `{…}`. If parsing fails inside a balanced
-bracketed region, the parser jumps to the matching close-delimiter and
-inserts an `Expr::Error` placeholder. This means `x = (1 +) + 2` reports
-the inner error and still parses the whole assignment.
+The atom parser installs `nested_delimiters` recovery for parentheses, brackets and braces,
+recognizing the other two delimiter kinds while seeking the matching closer.
+A recovered region becomes `Expr::Error`. In `x = (1 +) + 2`, recovery replaces the
+parenthesized subexpression and allows parsing the enclosing assignment.
+
+This mechanism requires a recoverable delimiter region. It does not handle every expression
+failure or repair an unclosed bracket rejected by the lexer.
 
 ### Statement-level recovery
 
-`recover_with(via_parser(skip_to_newline.then(skip_indented_block)))` —
-when an entire statement fails to parse:
+`skip_to_newline` consumes at least one token other than `Newline` or `Dedent`, followed
+by an optional `Newline`. If an `Indent` follows, `skip_indented_block` consumes its
+balanced block. The result is `Stmt::Error` over the skipped region. Discarding an attached
+body prevents a malformed header from leaving orphan block tokens in the enclosing parser.
 
-1. Consume tokens up to (and including) the next `Newline` at the current
-   bracket depth.
-2. If the next token is `Indent`, also swallow the balanced
-   `Indent…Dedent` block. This is what stops a bad header line
-   (`def 1(x):`) from leaving its attached body as orphan tokens for the
-   outer module parser to choke on.
+Recovery stops before `Dedent` rather than scanning through it. Its `at_least(1)` requirement
+makes it decline at `Newline`, `Dedent` and EOF when no token has been consumed. This prevents
+a zero-progress success inside `repeated()` and lets an enclosing block consume its own
+`Dedent` without an additional diagnostic.
+`nested_block_recovery_reports_one_error_per_mistake` covers that boundary behavior.
 
-The recovered statement is a `Stmt::Error` placeholder; the original
-chumsky error is preserved in the returned error list. Recovery doesn't
-hide diagnostics — it just lets parsing continue past them so multiple
-errors come out in one pass.
-
-**Load-bearing detail:** the `skip_to_newline` parser uses
-`.at_least(1)`. Without that, recovery would succeed by matching zero
-tokens at positions like `Dedent`/EOF, which would loop the enclosing
-`statement().repeated()` forever (chumsky panics with a "Collect making no
-progress" diagnostic). With `.at_least(1)`, recovery cleanly declines at
-those positions and the outer `repeated()` terminates normally.
-
-**Load-bearing detail #2:** every precedence layer inside `expression()`
-(`product`, `sum`, `collection_union`, `log_and`, `log_xor`, `log_or`,
-`comparison`, `bool_not`, `bool_and`, `bool_or`, `ternary`, `feed`, plus
-`atom`, `postfix`, `unary`) ends in `.boxed()`. Without that, those fifteen boxed
-combinators monomorphise into nested generic types, and each `expr.clone()` re-entry walks
-all fifteen frames on the stack. Fifteen counts the *combinators*, not the precedence
-ladder's levels: several levels share one combinator — `**` and unary `-` share `unary`,
-because the operator straddles it. Just 4 levels of nested
-function calls (`f(f(f(f(1))))`) was enough to overflow a 2 MiB test
-thread stack. Boxing collapses the type at each layer to a uniform
-`Boxed<…>` with predictable, small frame size, restoring well-bounded
-stack usage for nested expressions.
+A semicolon terminates a valid simple statement, but is not a synchronization token for this
+recovery parser. Recovery can therefore discard later semicolon-separated text on the same
+logical line. It does not promise one error per source-level mistake.
 
 ### Lexer-level: unclosed brackets at EOF
 
-A subtle interaction: the layout pass suppresses `Newline` tokens while
-inside `(`, `[`, or `{` (Python's implicit line continuation). If a
-bracket is never closed, the lexer would silently swallow every following
-newline, leaving the parser with a flat token stream and no way to find
-statement boundaries. The lexer therefore returns
-`LexError::UnclosedBracket` if EOF is reached with bracket depth > 0, so
-the failure is reported at the source of the problem rather than
-manifesting as a confusing far-from-cause parse error.
+Bracket depth suppresses layout newlines until the bracketed region closes. At EOF with nonzero
+depth, tokenization returns `LexError::UnclosedBracket`; parsing does not begin. Without that
+check, a following physical line could have no token marking a statement boundary.
+The layout mechanism is specified under [Stage 1](#stage-1--lexer-lexerrs).
 
 ### Recovery API
 
-`parse_module` and `parse_expression` both return a `ParseResult<T>` struct
-carrying *both* the (possibly partial) AST and the list of errors:
+Both public parse functions return `ParseResult<T>`:
 
 ```rust
 pub struct ParseResult<T> {
-    pub value: Option<T>,        // partial AST with Error holes, or None
-    pub errors: Vec<ParseError>, // possibly multiple, from recovery
+    pub value: Option<T>,
+    pub errors: Vec<ParseError>,
 }
 ```
 
-This is what makes recovery useful: a caller that just wants Result-style
-"all or nothing" can use `result.into_result()`, while a caller that
-wants to surface diagnostics on a partial parse can use both fields
-directly.
+`value` and `errors` are independent outputs. A lexical failure returns no AST and one error.
+An unrecovered grammar failure can also return no AST. Recovery can return an AST containing
+`Expr::Error` or `Stmt::Error`. A `validate` rule can instead report a custom error while
+retaining an ordinary node; a nonempty error list does not imply that the AST contains a hole.
+
+For example, `parse_expression(file, "1 +")` has no AST, whereas
+`parse_expression(file, "1 -> 2 -> 3")`
+retains a pair node and reports that the pair arrow does not chain.
+`is_ok()` requires both a value and no errors. `into_result()` rejects any recorded error;
+if both outputs are empty, it synthesizes a parse error at `0..0`.
 
 ### Threading partial ASTs through to lowering
 
-[`compile_program`](../src/ccl/context.rs) runs the **lowering** stage even
-when the parser reported errors, so users see parse + lowering diagnostics
-in one pass instead of having to fix parse errors before any lowering
-problem becomes visible.
+`run_frontend` in `src/ccl/context.rs` accumulates parse errors before examining the AST.
+If no module is available, it returns those errors. An empty module gets an empty-program
+diagnostic. Otherwise it invokes `lower_stmts` even when parsing reported errors, allowing
+independent lowering errors to appear in the same response.
 
-The handshake is:
+Lowering maps recovered error nodes to `TypedExprNode::Error` without reporting the same
+parse failure again. `LoweringResult` also carries an optional value and errors.
+The frontend appends lowering errors and returns if no CCL value is available or if either
+stage reported an error. Inference and later phases do not run on that result.
+This guard applies to diagnostics from validation as well as explicit AST holes.
 
-- `parse_module` returns a `ParseResult` that may carry an `Expr::Error` /
-  `Stmt::Error` placeholder for each region that hit recovery.
-- [`crate::ccl::lower`] silently maps those placeholders to the analogous
-  `TypedExprNode::Error` in CCL (no second error is reported for a parse
-  hole — it's already in the user's diagnostic list).
-- `lower_stmts` itself returns a `LoweringResult { value, errors }` shaped
-  like `ParseResult`. Statement-level recovery means an unsupported
-  construct in one top-level statement doesn't shadow lowering errors in
-  other statements. The errors are in source order.
-- [`compile_program`] returns `Result<_, Vec<CompileError>>`. Each
-  `CompileError` is single-stage (`Parse(ParseError)`, `Lower(LoweringError)`,
-  …); the `Vec` is the union of every error collected before bailing.
-- Inference and downstream stages **do not run** if any parse or lowering
-  error was recorded, because the CCL tree may contain `Error`
-  placeholders. Every pass past lowering panics via
-  `unexpected_error_node!()` if it ever encounters one, which makes a
-  forgotten-guard regression loud rather than producing silent corruption.
+The returned `Vec<CompileError>` contains stage-tagged errors, not an assertion that all
+possible errors were discovered. Regressions include `multiple_parse_errors_all_surface`
+and `multiple_lowering_errors_all_surface` in `src/ccl/context.rs`.
 
 ### Error message quality
 
-Four layers, each independent and each pulling its weight:
+`ParseErrorInfo` owns source-independent diagnostic data: a primary span, optional custom
+message, found token, categorized expected entries, and context labels with spans.
+Four mechanisms construct that information:
 
-**1. `Display` for `Token` and `Span`.** Defined in `lexer.rs` and `ast.rs`.
-`Token::LParen` displays as `(`, `Token::EqEq` as `==`,
-`Token::Int(_)` as `integer literal`, etc. So errors say
-`found '('` instead of `found 'LParen'`, with no other parser changes.
+1. `Token::Display` supplies source-like token names, such as `(` or `integer literal`,
+   rather than enum debug names.
+2. `labelled` names a production's expected input when it fails at the start.
+   `as_context` also records an enclosing production after partial progress.
+3. `rich_to_info` collapses complete expected-token categories from `CATEGORIES`.
+4. A validation rule can emit `Rich::custom`. Its message replaces the derived
+   found/expected text in both single-line and source-context rendering.
 
-**2. Targeted `.labelled(…)` annotations.** A handful of high-leverage
-productions carry labels so failure-at-start cases collapse to a single
-named expectation:
+The labeled productions include atoms and the outer expression choice (`expression`),
+attribute/lambda names (`identifier`), function and parameter names, the block opener
+(`indented block`), and the statement choice (`statement`).
+The outer expression and statement labels also contribute contexts.
 
-| Production | Label | Where it helps |
-|---|---|---|
-| `atom` (literal / name / `(…)` / list / dict) | `expression` | "expected expression" instead of 5 alternatives |
-| `ident_only` in expression context | `identifier` | postfix `.name`, lambda params |
-| `select! { Ident }` in `def_stmt` name slot | `function name` | `def 1(x):` says "expected function name" |
-| `select! { Ident }` in `def_stmt` param slot | `parameter name` | `def f(1):` says "expected parameter name" |
-| top-level `expression` choice | `expression` + `.as_context()` | "while parsing expression" secondary span |
-| `block` opener (`Newline Indent`) | `indented block` | missing block after `if x:` |
-| top-level `statement` choice | `statement` + `.as_context()` | "while parsing statement" secondary span |
+Category conversion sorts and deduplicates tokens and labels first. It replaces a category
+only when every listed member is present; a partial category remains a list of tokens.
+The final ordering is labels, categories in table order, remaining tokens, then end-of-input
+and other-pattern entries. The category table is not an exhaustive operator list: for example,
+`**` is not a member of the current binary-operator category.
 
-`.labelled(...)` only replaces the expected set when the labeled parser
-fails *at its start position*. `.as_context()` is the complementary
-behaviour: when the labeled parser fails *mid-parse* (after consuming
-input), the label is recorded as context with the partially-matched
-span, so ariadne renders it as a secondary underline like
-`while parsing expression` pointing back at the in-progress text.
-
-**3. Category collapsing in `collect_errors`.** Errors that survive label
-processing can still list 20+ tokens as valid continuations (e.g. every
-binary operator after `if x` where a `:` was expected). The
-`CATEGORIES` table in `parser/error.rs` defines disjoint operator buckets
-(`binary operator`, `comparison operator`, `boolean operator`,
-`postfix operation`, `augmented-assignment operator`). When the
-"expected" set contains *every* member of a category, those members are
-removed and one category entry takes their place. So
-`if x\n` reports
-
-```
-expected binary operator, comparison operator, boolean operator,
-         postfix operation, 'if', '<<', or ':'
-```
-
-(seven items) instead of the 22-token list.
-
-**4. Rule-raised messages.** The three layers above all shape a *derived*
-expectation — "found X, expected Y" — which only says something when the
-failure was a token that didn't match. A rule that parses a well-formed token
-sequence and then rejects what it means has nothing to derive from: `{Int}` is
-a perfectly good brace group that is not a valid type. Those rules raise their
-own message with `Rich::custom` from a `validate`, it rides
-`ParseErrorInfo::custom`, and it *replaces* the derived text at both rendering
-sites. The field is load-bearing rather than cosmetic: `found`/`expected` are both
-empty for a custom error, so without it the whole diagnostic degrades to a bare
-`found end of input`.
+Custom messages must be retained independently of the expected set. Otherwise a rule such as
+the rejection of `{Int}` could lose its explanation and render only "found end of input".
+`custom_grammar_errors_keep_their_message` and
+`custom_grammar_errors_render_with_source_context` cover both rendering paths.
 
 ### Rendering with `ariadne`
 
@@ -484,22 +376,17 @@ through ariadne.
 
 ## Gotchas
 
-Two non-obvious chumsky 1.0-alpha lifetime pitfalls — both surface as the
-unhelpful `'src must outlive 'static` error — were hit during development:
+Grammar constructors are generic over `I: ValueInput<'src, Token = Token, Span = Span>`.
+This avoids naming the mapped token-stream input and recursive parser closure types at each
+entry. Productions match typed tokens with `just` rather than parsing string keywords.
 
-1. **Recursive parsers force `'static` by default.** `recursive(|expr| …)`
-   needs the closure parameter typed explicitly *only* if the surrounding
-   function uses a concrete input type. The fix used in this module is to
-   make every parser function generic over `I: ValueInput<'src, Token =
-   Token, Span = Span>`, which lets chumsky's inference figure out the
-   recursive type without an explicit `Recursive<dyn Parser<…> + 'src>`
-   annotation. This mirrors the pattern in chumsky's own `nano_rust`
-   example.
+Boxed precedence productions replace nested concrete combinator types with a uniform `Boxed`
+type. Re-entering a recursive expression parser then does not clone a concrete type containing
+every intervening combinator layer. This limits representation-related stack costs; it does
+not establish a fixed nesting limit or prove that arbitrary nesting cannot exhaust the stack.
 
-2. **`text::ascii::keyword(…)` won't compose with a recursive parser.** Its
-   `Str` parameter forces a `'static` bound. CHL's parser uses
-   `just(Token::Foo)` against the typed token stream, sidestepping the
-   issue.
+Keep boxes at the established recursive/precedence boundaries unless stack behavior is measured.
+The grammar does not specify a portable maximum nesting depth.
 
 ## Testing
 

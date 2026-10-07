@@ -1,25 +1,7 @@
-//! Error-handling and diagnostics types for the CHL parser.
+//! Owned parser diagnostics, partial results and source-context rendering.
 //!
-//! The grammar combinators in the parent [`super`] module produce chumsky
-//! `Rich<Token, Span>` errors; this module owns the `'src`-free structured
-//! form ([`ParseError`] / [`ParseErrorInfo`]) those are converted into, the
-//! [`ParseResult`] wrapper that threads partial ASTs plus error lists out to
-//! callers, and the ariadne-based rendering.
-//!
-//! ## Error message quality
-//!
-//! Errors are stored as structured [`ParseErrorInfo`] (preserving the
-//! found token, the categorised expected set, and `.as_context()` spans)
-//! rather than pre-rendered strings, so callers can render via:
-//!
-//! - `Display` for a one-line summary,
-//! - [`ParseResult::render_errors`] / [`ParseResult::eprint_errors`] for
-//!   ariadne output with source-code context and secondary spans,
-//! - or directly off [`ParseErrorInfo`] for a custom diagnostic UI.
-//!
-//! See the design doc's "Error message quality" section for the three
-//! layers (`Display` for tokens, targeted `.labelled(…)` annotations,
-//! and operator-category collapsing in [`collect_errors`]).
+//! `ParseResult` does not equate a returned AST with a successful parse.
+//! See `chl-parser/design-chl-parser.md`, "Recovery API" and "Error message quality".
 
 use std::fmt;
 
@@ -57,15 +39,9 @@ impl From<LexError> for ParseError {
 pub struct ParseErrorInfo {
     /// Primary span — the source range where the parser failed.
     pub span: Span,
-    /// The message of a **custom** error — one a grammar rule raised itself
-    /// with `Rich::custom` from a `validate`, rather than one chumsky derived
-    /// from a failed token match. A rule raises one when the token sequence
-    /// parsed fine but says something the grammar rejects (`{T}` is a
-    /// well-formed brace group that is not a valid type), so the useful
-    /// diagnostic is the rule's own sentence, not "found X, expected Y".
-    /// Carrying it is load-bearing rather than cosmetic: `found`/`expected` are
-    /// both empty for a custom error, so without this the whole diagnostic
-    /// degrades to a bare "found end of input".
+    /// A rule-raised message, used instead of derived found/expected text.
+    /// Preserve it even when those fields are empty; see
+    /// `chl-parser/design-chl-parser.md`, "Error message quality".
     pub custom: Option<String>,
     /// Token actually found at the failure point, or `None` for EOF.
     pub found: Option<Token>,
@@ -158,22 +134,14 @@ impl fmt::Display for ParseError {
 /// Output of [`parse_module`](super::parse_module) /
 /// [`parse_expression`](super::parse_expression).
 ///
-/// Carries *both* a (possibly partial) AST and a list of errors, so callers
-/// can take advantage of error recovery: when a syntax error is hit, the
-/// parser inserts an [`Expr::Error`](crate::ast::Expr::Error) or
-/// [`Stmt::Error`](crate::ast::Stmt::Error) placeholder, records
-/// the error, and keeps going. A file with three independent syntax errors
-/// produces a `value: Some(_)` AST with three `Error` holes and a `errors`
-/// vector of length three — all reported in one pass.
-///
-/// The `value` is `None` only when recovery could not produce *anything*
-/// (currently: a lexer error, which aborts before parsing starts).
+/// An AST can accompany errors from recovery or validation. Lexical and unrecovered
+/// grammar failures can return no AST. Inspect both fields or use [`Self::into_result`].
+/// See `chl-parser/design-chl-parser.md`, "Recovery API".
 #[derive(Debug, Clone)]
 pub struct ParseResult<T> {
-    /// The (possibly partial) AST. Holes are filled with `Error` placeholders.
+    /// The complete or partial AST, when parsing produced one.
     pub value: Option<T>,
-    /// Errors collected during parsing. Non-empty implies the AST contains
-    /// `Error` placeholders.
+    /// Collected errors. Validation errors need not introduce AST error nodes.
     pub errors: Vec<ParseError>,
 }
 
@@ -332,19 +300,9 @@ fn primary_label_message(info: &ParseErrorInfo) -> String {
 // Conversion from chumsky's `Rich` to our `ParseError` (with categorisation)
 // ---------------------------------------------------------------------------
 
-/// Operator/postfix categories. Each entry is `(category_name, members)`.
-///
-/// In [`rich_to_info`], if **every** member of a category appears in the
-/// chumsky "expected" set, those members are removed from the per-token
-/// list and a single [`Expected::Category`] entry is emitted in their
-/// place. So `if x\n` (missing `:`) reports
-/// `"expected binary operator, comparison operator, …, or ':'"` instead
-/// of a 22-token wall.
-///
-/// Categories are non-overlapping. Tokens not in any category
-/// (`Newline`, `Colon`, keywords like `if`/`for`/`def`, `Eq`, `LShift`)
-/// always render individually — they carry the most disambiguating
-/// information and rarely show up in large groups anyway.
+/// Non-overlapping expected-token categories, collapsed only when every member is present.
+/// Partial categories and tokens outside the table remain individual entries.
+/// See `chl-parser/design-chl-parser.md`, "Error message quality".
 const CATEGORIES: &[(&str, &[Token])] = &[
     (
         "binary operator",
