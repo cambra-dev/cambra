@@ -353,27 +353,9 @@ pub(super) fn lower_call(
     }
 }
 
-/// Lower a group-by of `collection` by `key_fn`, with the key domain it stamps on the key
-/// binder:
-///
-/// ```text
-/// λ (k : {key | __elem ▷ ((collection ≫ key_fn) ▷ collection_contains)}) →
-///   cast(λ i → collection(i), {I | key_fn(collection(__elem)) == k} ⤇ A)
-/// ```
-///
-/// The inner cast is the dependent-refinement site; the outer binder's domain names the
-/// same `collection` and `key_fn` the inner predicate does, so the key type resolves from
-/// the morphism's codomain rather than from outside
-/// (`src/ccl/design/collections.md`, "The key domain is the key morphism's image").
-///
-/// A caller that builds further positions over the same keys — `set`'s iteration binder —
-/// takes the returned domain rather than minting its own, because the value carries two
-/// identities: the [`Type::SharedHole`] naming the key type, written into both the domain's
-/// base and the morphism's codomain, and the refinement predicate's `Rc`, which keeps the
-/// positions one predicate to `PredMemo` instead of two structurally-equal copies inferred
-/// apart.
-///
-/// Shared by the surface `groupby(c, key)` call and the `set`/`map` constructors.
+/// Lower group-by and return its present-key domain for re-keying callers.
+/// Reuse the returned domain: it shares both the key-type hole and the predicate allocation.
+/// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
 fn lower_groupby(
     collection: Expr,
     key_fn: Expr,
@@ -434,31 +416,12 @@ fn lower_groupby(
     (keyed, key_domain)
 }
 
-/// A re-keying constructor: `groupby` on `key_fn`, each group collapsed by `collapse`.
-///
-/// `set` and `map` are this one shape at two collapses — `set([𝑒…]) = groupby(xs, id) ≫
-/// (λ 𝑔 → unit)` and `map([(𝑘,𝑣)…]) = groupby(ps, .0) ≫ (λ 𝑔 → 𝑔 ▷ sole ▷ .1)`. The
-/// collapse rewrites the codomain and leaves the key domain untouched, so the result lands
-/// at `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)} ⤇ 𝑊`.
-///
-/// Three things are load-bearing here, none local to either constructor:
-///
-/// * **One key domain.** The iteration binder ranges over the group-by's own keys, so it
-///   takes the domain [`lower_groupby`] returns. A separate mint would leave the two key
-///   types unrelated and the application between them ill-typed.
-/// * **The η-expanded shape** `λ __iter_record → __iter_record ▷ keyed ▷ collapse`, rather
-///   than a bare `keyed ≫ collapse`, which would pin the collapse lambda's parameter to a
-///   type with the key binder free. Emitting one is what `subst::open_codomain` and
-///   `check_scope_valid_go` assert against.
-/// * **Two stamps on the iteration lambda.** The `data_fun` annotation is the kind stamp,
-///   without which the lambda is a `Compute` capability and `Compute ⊀ Data`. The
-///   key-domain refinement is what the iteration binder needs because it *is* the key:
-///   left off, the result domain is still an inference variable at constraint-emission
-///   time and the `Map` Σ witness cannot discharge (see [`present_key_domain`]).
-///
-/// `collapse` must consume its group, and not for typing — planning gives a source its
-/// driving `iterate` through its consumer, so a group-ignoring `λ 𝑔 → unit` leaves the
-/// underlying literal reaching op-conversion with no iteration site.
+/// Re-key elements and collapse each group without changing its present-key domain.
+/// `collapse` must consume the group so planning can assign its source an iteration site.
+/// The eta-expanded read keeps the dependent key binder scoped; bare composition would
+/// expose it in the collapse parameter. Both the domain and data-function stamps are required.
+/// See `src/ccl/design/collections.md`,
+/// "Constructor lowering: runtime `groupby` now, constant-folding later".
 fn lower_rekeyed(
     elements: Expr,
     key_fn: Expr,
@@ -486,21 +449,10 @@ fn lower_rekeyed(
     )
 }
 
-/// The **present-key domain** of a re-keying: `{𝐾 | __elem ▷ ((c ≫ key) ▷
-/// collection_contains)}` — the keys the key morphism produces, which is how a re-keying
-/// producer states its key domain (`src/ccl/design/collections.md`, "The key domain is the
-/// key morphism's image").
-///
-/// `key` is the [`Type::SharedHole`] naming the key type, written into both the
-/// refinement's base and the morphism's codomain. The builtin's scheme alone does not pin
-/// it: the refinement applies `__elem` to the characteristic predicate rather than equating
-/// the two, so the shared variable takes the base as a lower bound only, and
-/// `Map(String, _)` over `Int` keys would be accepted.
-///
-/// Every re-keying producer stamps its own key binder with this, because the gate on keyed
-/// entry runs at constraint-emission time and a domain that only became concrete at
-/// coalesce could not discharge it (same doc, "The key domain is the key morphism's
-/// image").
+/// Construct the present-key refinement, sharing `key` between its base and the
+/// key morphism's codomain. The caller supplies a `SharedHole`; a one-way builtin bound
+/// would not equate the types. The result must be available during constraint emission.
+/// See `src/ccl/design/collections.md`, "The key domain is the key morphism's image".
 fn present_key_domain(
     collection: &Expr,
     key_fn: &Expr,
@@ -508,11 +460,8 @@ fn present_key_domain(
     span: Span,
     ctx: &mut LoweringContext,
 ) -> Type {
-    // One annotation, two jobs. The chain's **kind** is decided where it is built, like
-    // every other minted `Compose`: `c ≫ key` re-images the collection's own domain, so
-    // it is a data function rather than the `Compute` default. Its **codomain** is the
-    // key type, and the caller's shared hole written there is what equates it with the
-    // refinement's base.
+    // The composition retains the collection's data domain. Its codomain must share the
+    // refinement base, not merely constrain that base through builtin application.
     let morphism = Expr::compose(vec![collection.clone(), key_fn.clone()])
         .with_user_annotation(Type::data_fun(Type::Hole, key.clone()));
     let characteristic = Expr::apply(morphism, Expr::builtin(Builtin::CollectionContains));
@@ -525,20 +474,9 @@ fn present_key_domain(
     Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
-/// Lower a subscript `target[index]`, or its **checked** form `target[index]?`.
-///
-/// Subscript and application are the *same* operation — evaluate a finite function at a
-/// point (`docs/chl-spec.md`, "3.9 Subscript and attribute access") — so the plain form
-/// lowers to exactly what the application `target(index)` does, and inherits its proof
-/// obligation: the index must be in the collection's domain, which for a `Map` means the
-/// key's type carries that collection's key domain.
-///
-/// `[…]` is therefore **only** collection lookup, with no case on the index's shape. A
-/// tuple is a heterogeneous product rather than a finite function, so projecting one is a
-/// different operation and gets a different spelling: `t.0`, alongside `r.name`. Deciding
-/// between them by whether the index happened to be a literal was a guess lowering had no
-/// types to make, and it made `xs[0]` — the commonest thing to write — mean projection and
-/// fail obscurely.
+/// Lower `target[index]` as application and `target[index]?` as checked lookup.
+/// Neither spelling projects a product; projection uses `.` regardless of the index's shape.
+/// See `docs/chl-spec.md`, "3.9 Subscript and attribute access".
 pub(super) fn lower_subscript(
     target: &Spanned<ChlExpr>,
     index: &Spanned<ChlExpr>,
@@ -549,15 +487,9 @@ pub(super) fn lower_subscript(
     let collection = lower_expr(target, ctx)?;
     let key = lower_expr(index, ctx)?;
     if checked {
-        // `(collection, key) ▷ lookup?` — tupled, so the operator's domain is a pair. It
-        // therefore never carries a function value, and the point-free form is an ordinary
-        // morphism from a zip. A keyed write takes the same shape when it lands, so the
-        // read and the write of one keyed access compile the same way.
-        //
-        // Both minted nodes are recorded: the operator and the pair it is applied to are
-        // machinery this rule introduces, and an unrecorded mint is a lineage leak at the
-        // lowering boundary (`src/ccl/design/provenance.md`, "The recorder"). The `Apply`
-        // root is tagged by the caller.
+        // Pair collection and key so point-free conversion can treat lookup as a morphism
+        // from a zip. Record both manufactured nodes; the caller tags the Apply root.
+        // See `src/ccl/design/provenance.md`, "The recorder".
         let op = ctx.tag_machinery(
             Expr::builtin(Builtin::LookupChecked),
             span,

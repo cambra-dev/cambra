@@ -989,119 +989,79 @@ any other name is a compile-time error.
 
 ### 3.9 Subscript and attribute access
 
+Current subscript syntax distinguishes proven application from checked lookup:
+
+| Form | Meaning today | Result |
+|---|---|---|
+| `c[k]` | Apply the collection to a key accepted by its domain type. | The value at `k`. |
+| `c[k]?` | Check a compatible key for membership in a keyed collection. | `Option` of the value type. |
+| `r.name` | Project a record field. | The named field's type. |
+| `t.0` | Project a tuple field. | The positional field's type. |
+
+A missing product field is a type error. Product projection and collection lookup are distinct:
+`t[0]` is rejected, not interpreted as `t.0`. Projections compose, as in `r.p.1` and `t.0.b`.
+An identifier cannot begin with a digit, so named and positional field syntax do not collide.
+
+Proven lookup is subject to application typing. A `FullMap(K, V)` parameter accepts a key of type
+`K` without a separate membership proof. Concrete `map`, `set` and `groupby` results instead carry
+a refined present-key domain. The compiler does not yet derive the required membership evidence
+from an element of the source, an application of its key function, or a projected source field.
+Those cases fail inference; integer subscripts on range-domain lists are also rejected in the
+current tested cases. The intended rule would accept indices whose presence is established,
+rather than define an absent-key runtime result for proven lookup.
+
+Checked lookup is implemented for maps and sets. `s[k]?` returns `Option(unit)`; presence gives
+`some` with a unit payload, and absence gives `none`. An exact `Map(K, V)` parameter exposes
+the keyed type needed for this operation; a bounded parameter can remain unresolved and fail
+inference. Checked lookup on a range-domain list or a tuple is rejected. A checked `groupby`
+lookup can pass inference with a key-dependent group type but fails operator conversion because
+the streamed answer would itself be a collection. The implementation contracts and regressions
+are in [The checked lookup](../src/ccl/design/collections.md#the-checked-lookup-𝑐𝑘).
+
+For a streamed collection, a present key can produce `some` before termination. A missing key
+produces `none` only after the collection becomes terminal. A live stream may therefore never
+answer an absent-key lookup. A materialized map value has a complete binding list and can decide
+absence when it arrives; the stream rule does not impose an additional wait on that value.
+
+#### Planned subscript and unwrap syntax
+
+The decided replacement makes `c[k]` the optional lookup and retires `c[k]?`. A presence proof
+would narrow its result from `Option(T)` to the single arm `some(T)`. A new postfix `!` would
+unwrap that single-arm value:
+
+```python
+def unwrap(o: {`some{T}}) => T:
+    `some(ret) = o
+    ret
 ```
-target[index]    -- subscript: list element or map lookup
-target.attr      -- attribute: record field by name
-target.0         -- attribute: tuple field by position
-```
 
-- **Subscript** on a list with integer index `i` denotes the i-th
-  element (0-based). An out-of-range subscript is a compile-time type
-  error when statically known; otherwise the expression is not
-  defined (see *Partiality*, §3).
-- **Subscript** on a map with key `k` denotes the value associated
-  with `k`. Looking up a missing key is not defined (see *Partiality*,
-  §3).
-- **Attribute** denotes the value of a field of a product (§3.11),
-  keyed either by **name** (`r.age`, on a record) or by **position**
-  (`t.0`, on a tuple). The field must exist; a missing one is a
-  compile-time type error. An identifier cannot begin with a digit, so
-  the two forms never collide. The forms compose freely, since they are
-  one operation differing only in the key: `r.p.1`, `t.0.b`.
-- **Method call [Decided].** `x.m(args)`, an attribute followed by call
-  parentheses, calls the method `m` of `x`'s type rather than a field
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
-  Calling a function a field holds takes parentheses around the
-  projection: `(r.f)(args)`.
+Under this design, `c[k]!` is accepted only when the result type excludes `none`. Failure to
+establish presence is a type error at `!`, not a runtime unwrap failure. The destructuring rule
+is [Destructuring patterns](#431-destructuring-patterns). The proposed `!` has postfix precedence;
+`!=` remains one token, so `x! == y` requires a space before `==`.
 
-Lists and maps denote *finite functions* from their index domains
-(`UInt`, `K`) to their element / value type, so a lookup evaluates the
-finite function at a point. The call `c(k)` is that evaluation and answers
-the value, as `c[k]!` does; `c[k]` answers `Option` (the direction below).
+The compiler has no postfix `!`. Today's `c[k]?` corresponds to the planned `c[k]`, and today's
+`c[k]` corresponds to the planned proven access `c[k]!`. A direct call `c(k)` remains function
+application, not an optional membership test.
 
-**`[…]` is lookup and `.` is projection — they are not
-interchangeable.** A product is heterogeneous, so it is not a finite
-function and has no domain to look up in: `t[0]` is an error pointing
-at `t.0`. Conversely `.` does not index a collection. The distinction
-is by *spelling*, not by whether the index happens to be a literal, so
-the meaning of `xs[0]` does not depend on what `xs` turns out to be.
+#### Planned methods
 
-> **Direction [Planned] — two lookup operators.** Subscript splits into two
-> operators, distinguished by whether the type system can prove the index is
-> present:
->
-> - `c[k]` — the proven lookup, result `T`/`V`. The index's type has to say it is
->   present: `{i | i < n}` for an `Array` or a comprehension index, membership in
->   the collection's keys for a `Map` or `Set` — a key drawn from iterating the
->   collection, or one refined by an `in` guard (`if k in m: m[k]`). Where presence
->   cannot be proven this is a compile-time type error pointing at `c[k]?`, never a
->   runtime failure.
-> - `c[k]?` — the optional lookup, result `Option(T)` (matched with `` `some(v) ``
->   / `` `none ``, §6.5, as in the north-star `txn_kv`). No prerequisite; always
->   well-defined.
->
-> So `arr[i]: T` and `lst[i]?: Option(T)` are one operator pair on two proof
-> outcomes, as are `m[k]: V` for a key known present and `m[k]?: Option(V)`
-> otherwise. A `Set` is `Map(K, unit)`, so `s[k]?: Option(unit)` states membership as a
-> value — `` `some `` for a present key, `` `none `` for an absent one — where `k in s`
-> (below) states it as a `Bool`. A `FullMap` (§6.3) discharges every key by construction,
-> so `m[k]: V` needs no proof. This eliminates the not-defined lookup cases above (see
-> *Partiality*, §3). **Partly implemented** — `c[k]?` answers on a `map` and a `set`; on a
-> `groupby` it types (the group's type names the key it was looked up at) and is rejected
-> when compiled, because nothing materializes a collection as an `` `some `` payload; and
-> on a list it is rejected, because a range domain carries no membership to decide.
-> `c[k]` lowers as the lookup `c(k)`, so a `FullMap` subscript answers `V` today, its key
-> set being the key type itself; for every other collection nothing discharges the index's
-> membership, so the proven subscript is a type error whatever the index.
+`x.m(args)` is intended to call a method of `x`'s type. Calling a function stored in a field
+would instead use `(r.f)(args)`. This distinction belongs to
+[Nominal types and methods](#68-nominal-types-and-methods-decided); it is not implemented method
+dispatch.
 
-> **Direction [Decided] — `c[k]` answers `Option`, and `!` unwraps a proven `` `some ``.**
-> This supersedes the operator pair above. `c[k]?` is retired, and `c[k]` takes its meaning:
-> every subscript answers `Option(T)` for a list or array and `Option(V)` for a map or set.
-> Where the index is proven present, by the evidence the proven lookup above requires, the
-> subscript's type narrows to the one arm ``{`some{V}}``.
->
-> `!` is a built-in postfix operator from ``{`some{T}}`` to `T`, for every payload type `T`.
-> `e!` means what a call of this function on `e` means:
->
-> ```python
-> def unwrap(o: {`some{T}}) => T:
->     `some(ret) = o
->     ret
-> ```
->
-> The operand type admits `` `some `` alone, so `c[k]!` type-checks exactly where the
-> lookup's type is narrowed to `` `some ``. Anywhere else it is a compile-time type error at
-> the `!`, never a runtime failure. The body is the single-tag destructuring of
-> [4.3.1 Destructuring patterns](#431-destructuring-patterns). `!` sits at the postfix level
-> ([2.3 Expression precedence](#23-expression-precedence)), and `!=` lexes as one token, so
-> `x! == y` takes the space.
->
-> **[Interim].** The compiler implements the superseded operator pair and has no `!`. Today's
-> `c[k]?` is the optional lookup this direction spells `c[k]`, and today's `c[k]` is the proven
-> lookup this direction spells `c[k]!`.
+#### Absence at a cut [Open]
 
-> **Direction [Open] — `c[k]?` decides absence at a cut.** The optional lookup is `c[k]?`
-> today and `c[k]` under the direction above; this note applies to it under either spelling.
-> Answering `` `none `` requires knowing the collection's domain has a definite value, and today's
-> condition for that is **termination**: the operator withholds `` `none `` until the domain is
-> terminal. A live source never terminates, so a lookup over one answers `` `some `` or never
-> answers.
->
-> Termination is standing in for the property actually needed, which is that the domain is
-> **pinned at a cut**. `orders.filter(\o -> o.time < txn.current_time())` is a pinned view
-> of a feed that never ends, and it is decided; a `Mut(…, Txn)` store read inside `with
-> begin():` is pinned by the transaction the same way. The condition should be the pin, so
-> that both of those answer and only a bare unpinned feed does not.
->
-> Unboundedness is the wrong predicate: it would reject the north-star `txn_kv`, which does
-> an `Option` lookup on a live transactional store. Two alternatives are declined. A
-> provisional `` `none `` corrected later is a cut with better ergonomics rather than a
-> separate design, and arrives with incremental view maintenance. A timeout or watermark
-> makes the answer a function of wall-clock, which is the nondeterminism this operator
-> already refuses when it declines to read absence off an empty tile.
->
-> Until a pin is expressible, a lookup on an unpinned live domain never decides absence
-> ([collections.md, The checked lookup](../src/ccl/design/collections.md#the-checked-lookup-𝑐𝑘)).
+The proposed readiness condition for optional lookup is a domain fixed at a cut, rather than
+termination of its producer. A time-bounded view of a live feed or a transactional store read
+could establish such a domain even when the underlying source never ends. The language does
+not yet provide a general cut interface for this rule.
+
+An unpinned live feed still cannot establish absence. A provisional `none` followed by a
+correction would require incremental view maintenance, not an irrevocable Option answer.
+A timeout-based answer would depend on wall-clock timing. These alternatives do not change
+the current rule: an empty nonterminal stream tile is not evidence of absence.
 
 ### 3.10 Lambda
 
@@ -1138,76 +1098,66 @@ polymorphic type `forall (T) V` (**[Planned]**,
 
 ### 3.11 List, tuple, record literals
 
-| Form | Denotes |
+| Form | Meaning |
 |---|---|
-| `[]`, `[e₀, e₁, …]` | A finite list — an indexed bag of elements. The element at integer index `i` is `eᵢ`, but iteration order is unspecified (§3). Element types must unify. |
-| `(e,)`, `(e₀, e₁, …)`, `e₀, e₁, …` | An anonymous heterogeneous product (tuple). Element types may differ. Tuples are positional, not unordered: `(1, 2)` and `(2, 1)` are distinct values. |
-| `(name=e, …)` | A record (named-field product). Field names are bare identifiers; field types may differ. The parentheses are the product constructor, shared with tuples (§2.4). |
+| `[]`, `[e₀, e₁, …]` | A positional collection. Element types must unify; indices are zero-based. Iteration order is unspecified by default. |
+| `(e,)`, `(e₀, e₁, …)`, `e₀, e₁, …` | A heterogeneous tuple. Positions are significant: `(1, 2)` differs from `(2, 1)`. |
+| `(name=e, …)` | A record with named fields, whose types may differ. |
 
-**List elements are constants.** Each element of a list literal has one value however the program
-runs: it may not depend on the variable of an enclosing loop or comprehension, or on a mutable
-variable an enclosing loop writes, including through a local or a call. `[x, x * 10]` inside
-`for x in xs` is a compile error (``a list element must be a constant, but this one varies with
-`x` ``). A `def` parameter is whatever its call passes, so `def f(n): [n, 1]` builds `[3, 1]`
-from `f(3)` and is refused under `for x in xs: f(x)`. A collection whose elements vary is a
-comprehension's job, as in `[n for i in [1, 2]]`.
+Trailing commas are allowed. A one-element tuple requires a comma, so `(e,)` differs from the
+parenthesized expression `(e)`. The same distinction applies to tuple types: `{T,}` is a
+one-element product and `{T}` is a parse error. A one-field record needs no comma because
+`name=value` or `name: T` identifies the form.
 
-> **Partly implemented.** A closed scalar computation such as `[1 + 1]` folds to its constant
-> during planning and is accepted. A closed element that folding does not reduce, such as
-> `[sum([1, 2])]`, is refused today (`a list element has to be a value here, and constant
-> folding did not reduce this one`): folding leaves a source, an aggregate, a collection and a
-> lambda unreduced.
+Lists require constant elements: an element must not vary with an enclosing loop or
+comprehension variable, including through a local binding or a call. The same restriction
+applies to mutable values written by an enclosing loop. A parameter can become constant at a
+call site: `def f(n): [n, 1]` accepts `f(3)` but not `f(x)` inside `for x in xs`.
+Use a comprehension, such as `[n for i in [1, 2]]`, to repeat a varying value.
 
-A trailing comma is allowed in every form (and required to disambiguate
-`(e,)` from `(e)`).
+Constant folding implements only part of this contract. `[1 + 1]` folds and is accepted;
+`[sum([1, 2])]` reaches operator conversion unreduced and is rejected with
+"a list element has to be a value here, and constant folding did not reduce this one".
+The scalar folder does not evaluate sources, aggregates, whole collections or lambdas.
 
-**One-element products carry the comma at both levels.** The same rule holds
-for the tuple *type*: `{T,}` is the one-element tuple type, and the comma is
-what distinguishes it (§2.4) — a comma-free `{T}` is a parse error. Only
-*tuples* need it: a one-field record needs no comma at either level, since
-`name=value` (`(a=1)`) and `name: T` (`{a: Int}`) already mark the form.
+Tuples and records are products, projected with `.` rather than subscripted; see
+[Subscript and attribute access](#39-subscript-and-attribute-access).
+A field may itself hold a collection, as in `(cash=10, lines=[1, 2, 3])`.
+Each field retains its own domain. A product containing a two-element collection and a
+three-element collection is not one collection of paired elements.
 
-**Tuple vs. record.** Both use `( … )`: a comma-list of bare expressions is
-a tuple (`(1, 2)`), a comma-list of `name=value` fields is a record
-(`(x=1, y=2)`). `(e)` (no field, no trailing comma) is a parenthesised `e`.
-Both are projected with `.` (§3.9), keyed by position for a tuple (`t.0`)
-and by name for a record (`r.x`); neither is subscripted.
+Braces are reserved for types: `{name: T}` and `{T, U}` are product types, not value constructors.
+Using them as values fails lowering. `()` is unit; there is no distinct zero-field record or
+tuple. Its type is `{}`; see [The empty product is unit](#66-the-empty-product-is-unit).
 
-**A component may be a collection.** In `r = (cash=10, lines=[1, 2, 3])`,
-`r.lines` is the collection the `lines` field holds. Components keep their own
-domains, so a product of collections and a collection of products are different
-types: `{a: [0, 1] ⤇ Int, b: [0, 2] ⤇ Int}` is two collections of different
-lengths, and `[0, 2] ⤇ {a: Int, b: Int}` is one collection whose elements are
-records.
+#### Keyed constructors
 
-**Records are not braces.** `{...}` is type syntax (§6.1) — a record *type*
-`{name: T}` or a tuple type `{T, U}`. A `{...}` in value position is a
-lowering error. Finite maps are a collection literal `[k -> v, …]`, not a brace
-form; the literal parses, and `map([…])` is what reads it as a `Map`
-([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
+`k -> v` and `(k, v)` produce the same tuple node. Consequently, `[k -> v, …]` is a positional
+list of pairs, not intrinsically a map. Current keyed construction requires an explicit call:
 
-**A map literal has no syntactic identity.** `k -> v` is the two-tuple
-([2.4 Atoms](#24-atoms)), so `[k -> v, …]` and `[(k, v), …]` are one term and
-nothing tells a map literal from a list of pairs. Reading either as a `Map`
-without `map([…])` is therefore type-directed, and a duplicate-key check on one
-cannot be syntactic. That is the decision the erasure records rather than a
-consequence of it: a distinct node would make both syntactic, at the cost of two
-spellings for one value.
+| Expression | Key | Value |
+|---|---|---|
+| `set(xs)` | An element of `xs`. | Unit. |
+| `map(entries)` | The first component of each pair. | The second component. |
 
-**Empty forms.** `()` is the unit value (§3.1) — there is no zero-field product
-distinct from it, so it is equally what an "empty record" would denote. Its type
-is the unit type, written `{}` (§6.6). `[]` is the empty list.
+Both return concrete data functions over the present keys. A sum annotation requires `box`,
+for example `m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))`.
+`list(...)` is not a builtin; `box([1, 2])` can satisfy a `List(Int)` annotation.
 
-**`[]` names no element type**, so the element type comes from whatever demands
-one: an annotation on the binding it seeds (`xs: List(Int) = box([])`), an
-operator that reads an element, or a collection it joins with. Where nothing
-demands one the element type is `unit` — the empty list has no position to read a
-value from, so no program can observe the choice.
+Repeated set elements produce one key. Repeated map keys are invalid, but the current check is a
+runtime assertion: `map([(1, 10), (1, 20)])` compiles and panics in both debug and no-assertions
+builds. It is not currently a compile-time diagnostic. The constructor implementation and fault
+boundary are specified in
+[Constructor lowering](../src/ccl/design/collections.md#constructor-lowering-runtime-groupby-now-constant-folding-later).
 
-The re-keying constructors need a key type and have no elements to take one from,
-so `map([])` and `set([])` are rejected. **`empty_map()` is the empty map and the
-empty set**: it takes no arguments, and its key and value types come from the
-annotation on what it seeds.
+#### Empty forms
+
+`[]` supplies no element type. Its uses or annotation constrain the type; an otherwise
+unconstrained element type becomes unit. For example, `xs: List(Int) = box([])` selects `Int`.
+This does not provide a key type to `map([])` or `set([])`; those constructors are rejected.
+
+`empty_map()` directly constructs an empty keyed sum. Its annotation must determine the key
+and value types:
 
 ```python
 cart: Mut(Map(String, Int), Txn) := empty_map()
@@ -1215,56 +1165,30 @@ prices: Map(String, Int) = empty_map()
 seen: Set(String) = empty_map()
 ```
 
-`Set(K)` is `Map(K, unit)`
-([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so one term
-answers both annotations and the codomain is what tells the readings apart. The annotation is the
-source of the empty constructor's key and value types. An unannotated `empty_map()` is an error;
-later keyed writes do not replace the annotation.
+The set annotation works because `Set(K)` currently lowers as `Map(K, unit)`. An unannotated
+`empty_map()` is rejected; later keyed writes do not replace its required type annotation.
+Inference details and the distinction between empty positional and keyed domains belong to
+[The empty literal names no element type](../src/ccl/design/collections.md#the-empty-literal-names-no-element-type).
 
-> **Direction [Decided].** The literal forms migrate with the
-> delimiter split (§2.4) and the collections model (§6.3), form by
-> form:
->
-> | Today | Target |
-> | --- | --- |
-> | `(1, 2)` — tuple | unchanged: `( … )` is the product constructor |
-> | `(name=e, …)` — record | a record is a product with named fields (and a call's keyword arguments are exactly such a record — §3.8) |
-> | finite map | `[k -> v, …]` — a collection of entry pairs (§2.4); `[ … ]` is the collection delimiter |
-> | `[1, 2, 3]` — list | same spelling, but shared across collection types: the literal can denote an `Array`, `List`, or `Set`, disambiguated by annotation or usage, with `list([…])` / `set([…])` constructors for explicitness (**[Tentative]** — §6.3) |
-> | empty record / unit | `()`, the unit value: with no fields there is nothing to tell a record from a tuple, so an empty record, an empty tuple, and unit coincide (§3.1, §6.6) |
-> | `[]` — empty list | same spelling; the empty **map** is `empty_map()` (**[Tentative]** — the term asserts a witness kind the type language cannot leave open, and it answers a `Set` annotation only because `Set(K)` is `Map(K, unit)`, which §6.3 leaves open; [3.11 List, tuple, record literals](#311-list-tuple-record-literals)) |
->
-> `{ … }` itself moves wholesale to the type level (§2.4, §6.1); no
-> term-level literal keeps braces.
+#### Type-directed literals [Decided, not implemented]
 
-> **Direction — map/set literal typing [Decided].** A collection literal
-> is primitively a **positional list** of its elements — `[e₀, …, eₙ₋₁]
-> : Array(n, T)` — and `->` is only the 2-tuple constructor, so
-> `[k -> v, …]` carries no inherent map-ness; it is a list of pairs
-> until annotation or usage says otherwise. `Set` and `Map` are
-> **re-keyings** of that list, selected by annotation, usage, or an
-> explicit constructor:
->
-> - `list([e…])` keeps it positional — `List(T)`.
-> - `set([e…])` re-keys by the **element** — `Set(K)` (the domain is the
->   set of distinct elements; the codomain is `None`).
-> - `map([kv…])` requires the elements to be 2-tuples `{K, V}` and
->   re-keys by the **first component** — `Map(K, V)` (domain = the
->   distinct keys, value = the second component). The pair `(k, v)` is
->   *split*: `k` into the key domain, `v` into the value.
->
-> Annotation or usage inserts the constructor implicitly: `m: Map(K, V)
-> = [k -> v, …]` re-keys via `map`; a keyed lookup `catalog[sku]` (a
-> non-integer subscript) forces `catalog` to a `Map`; a positional
-> `xs[i]` keeps a `List`. The same pair-literal is thus a `List({K,V})`,
-> a `Set({K,V})` (keyed by the whole pair), or a `Map(K,V)` (keyed by
-> the first) depending on that choice — there is no ambiguity because
-> the reading is named. **Duplicate keys in a map literal are a
-> compile-time error** (the out-of-line-definition non-overlap rule of
-> §6.3 applied to inline literals); a *mutable* or *fed* map resolves
-> repeats by its merge law instead. `K` must be a key type (equatable);
-> that obligation is discharged through the same contextual-parameter
-> mechanism as `Ord` (§8).
+The intended literal typing inserts constructors according to annotation or usage. A positional
+literal could supply an `Array`, `List` or `Set`; a pair literal could supply a list of pairs,
+a set keyed by whole pairs, or a map keyed by first components. The chosen collection type,
+not a distinct pair-literal AST node, would determine re-keying.
+
+The proposed explicit forms include `list([…])`, `set([…])` and `map([…])`. An annotation such
+as `m: Map(K, V) = [k -> v, …]` or a keyed lookup would select `map` implicitly.
+Current lowering does not insert these constructors.
+
+The planned constant-map rule rejects duplicate keys at compile time, applying the immutable
+non-overlap rule described under [Collection types](#63-direction-collection-types-decided).
+Mutable or fed collections instead use their declared merge law. The key type must support
+equality; general discharge through contextual parameters remains planned.
+
+The delimiter split retains `(…)` for products, `[…]` for collections and `{…}` for types.
+Whether a future empty constructor can cover all collection kinds remains open; `empty_map()`
+is the current keyed constructor, not a general empty-collection term.
 
 ### 3.12 Comprehensions
 
@@ -2544,78 +2468,64 @@ are not.
 
 ### 6.3 Direction: collection types [Decided]
 
-CHL has six collection types, and they are distinct types rather than one type
-in different clothes: each has its own lookup, its own iteration element
-(§4.6), and its own answer to whether it is ordered. How they are represented,
-and how the checker carries the distinction, is
-[src/ccl/design/collections.md](../src/ccl/design/collections.md). The lookups
-below use the decided spelling. The [Interim] note in
-[3.9 Subscript and attribute access](#39-subscript-and-attribute-access) maps it
-to the one the compiler accepts today.
+The intended collection interface has six forms. This table describes the design, including
+lookup syntax that is not yet implemented; the following paragraphs separate current behavior.
 
-- `Array(n, T)` — `n` values in order, `n` known at compile time. Lookup
-  `arr[i]!: T` is total, because `i`'s type carries the bound `{i | i < n}`
-  (§3.9).
-- `List(T)` — values in order, count known only at runtime. `lst[i]:
-  Option(T)`, since nothing bounds `i`.
-- `Set(K)` — distinct keys and no values. Membership is `k in s` (§3.4) as a
-  `Bool`, or `s[k]: Option(unit)` (§3.9) as a value. The checker does not yet
-  tell a `Set(K)` from a `Map(K, unit)`; both lower to one type
-  ([collections.md, "Telling `Set` and `Map` apart [Open]"](../src/ccl/design/collections.md#telling-set-and-map-apart-open)).
-- `Map(K, V)` — one value per key. `m[k]: Option(V)`, and `m[k]!: V` where `k`
-  is proven present (§3.9); membership `k in m`.
-- `FullMap(K, V)` — a `Map` holding a value for every `K`, so `m[k]!: V` needs no
-  proof of presence. It stands to `Map` as `Array` stands to `List`: the key set
-  is readable from the type rather than known only at runtime.
-- `Collection(T)` — some collection of `T`, saying nothing about which. Every
-  other collection type widens to it.
+| Type | Domain and elements | Intended access |
+|---|---|---|
+| `Array(n, T)` | `n` indexed values of type `T`; length is static. | `arr[i]!` when the index type establishes the bound. |
+| `List(T)` | Indexed values of type `T`; length is not named statically. | `lst[i]` returns `Option(T)`. |
+| `Set(K)` | Distinct keys with no associated data beyond unit. | Key membership, or `s[k]` returning `Option(unit)`. |
+| `Map(K, V)` | One value per present key. | `m[k]` returns `Option(V)`; `m[k]!` requires presence. |
+| `FullMap(K, V)` | A value for every inhabitant of `K`. | `m[k]!` for a key of type `K`. |
+| `Collection(T)` | Elements of type `T` with unspecified domain shape. | Generic collection operations. |
 
-A `FullMap`'s totality is earned by refining the key type down to keys known to
-exist rather than by promising it over an open type:
-`FullMap({String where _ in ks}, Int)` is total because its domain says which
-strings it holds (§6.4).
+`FullMap` totality is relative to its domain type. A group-by's domain is refined to keys
+present in its producer, not every value of the key's base type. A `List` hides its domain
+length in a sum witness; it does not store a separate length field in a product representation.
+The current representations are specified in
+[The six collection types](../src/ccl/design/collections.md#the-six-collection-types).
 
-Decided consequences:
+The implemented annotation forms are not six nominal types. `Set(K)` and `Map(K, unit)` lower
+to the same representation. `Array` and `FullMap` have explicit domains; the other four are
+dependent sums. Introducing one of those sums from a concrete collection requires `box`.
+Existing sums can widen under the sum-kind relation; that relation is not automatic insertion
+of a constructor into an unboxed term.
 
-- **Ordering follows from the type and is not stored.** `Array` and `List` are
-  ordered; `Set`, `Map`, and `Collection` are not. An order-dependent operation
-  over an unordered collection takes its ordering explicitly as a `given`
-  instance (§8) rather than inheriting whatever order the runtime happened to
-  store. `for`-in is unordered and parallel by default (§4.6); a loop-carried
-  accumulator forces sequential order, and a non-commutative fold over an
-  unordered collection needs an `Ord` given.
-- **Membership `in` follows Python [Planned].** `k in c` tests keys for `Set`
-  and `Map`, values for `List`, `Array`, and `Collection`. A key-membership
-  guard refines the key, which is what makes `if k in m: m[k]` a proven lookup
-  (§3.9). A map's values and entries are tested through `values(m)` and
-  `items(m)`.
-- **A map's keys, values, and entries are named, not implied [Planned].**
-  `keys(m): Collection(K)`, `values(m): Collection(V)`, `items(m):
-  Collection((K, V))`. `sum(m)` is an error, because a map iterates entries
-  (§4.6) and entries cannot be summed; `sum(values(m))` is how to say it.
-- **`Set(K)` and `Map(K, unit)` are distinct types [Tentative].** The two carry
-  the same information and differ only in which side of the pair is the payload,
-  so the distinction is declared rather than read off the shape, and it lands
-  with nominal types
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
-  Both widen to `Collection`.
-- **Widening to `List(T)` or `Collection(T)` is written.** Those types say nothing
-  about the domain, so reaching one forgets what the collection knew — an array's
-  length, a map's keys — and with it any proven lookup (§3.9). A literal or a
-  comprehension result is therefore `box`ed (§7.5) to reach such an annotation,
-  while a `List`, `Map`, or `Set` widens to `Collection(T)` on its own.
-- **Literal syntax is shared.** Arrays, lists, and sets are written with the
-  same literal (§3.11) and the type comes from annotation or usage, with
-  `list([…])` / `set([…])` / `map([…])` constructors for explicitness (the
-  north-star `reachability` uses `set(…)`).
-- **Out-of-line definition.** An immutable collection can be defined
-  element-wise, `c[i] = v`, with the compiler checking that multiple
-  definitions of one collection do not overlap; append is the feed operator
-  `c << v` (§3.7). A mutable collection is written `c[i] := v`.
-- **A mutable collection is keyed.** It is the keyed generalization
-  of a `Mut(…)` mutable variable whose value is a collection (§8.1) — `store[k] := v`
-  writes one key — and it gets the standard mutation operations. Immutable
-  collections remain the encouraged default.
+Current subscripts use `c[k]` for application and `c[k]?` for optional keyed lookup. Range
+lookups and collection-valued streamed lookup answers have implementation limits; see
+[Subscript and attribute access](#39-subscript-and-attribute-access).
+Current iteration binds values for every collection, so `sum(m)` can sum a map's numeric
+values. It does not implement the proposed per-type iteration interface below.
+
+#### Intended collection operations
+
+- Arrays and lists have positional order. Sets, maps and generic collections have no
+  implicit order. Order-dependent operations over unordered collections would take an explicit
+  ordering instance. Default parallel iteration and loop-carried dependencies are specified in
+  [Iteration](#46-for--iteration); storage order does not establish a source-language ordering.
+- Membership `in` is planned to test keys for sets/maps and values for arrays/lists/collections.
+  A successful key-membership guard would refine the key for proven access. No general source
+  `in` operator implements this rule today.
+- Maps would iterate entries, sets keys, and arrays/lists/collections values. Planned
+  `keys(m)`, `values(m)` and `items(m)` would expose lazy collection views. Under that design,
+  numeric `sum(m)` would reject entries and `sum(values(m))` would request value aggregation.
+  These view builtins and dispatch rules are not implemented.
+- Type-directed literals would share `[…]` across collection forms; explicit or inferred
+  constructors would select positional storage or re-keying. The current explicit constructors,
+  constant-element restriction and duplicate-key fault are in
+  [List, tuple, record literals](#311-list-tuple-record-literals).
+- Immutable collections would support non-overlapping element-wise definitions `c[i] = v`.
+  Feed uses `c << v`, and keyed mutation uses `c[i] := v`. Their current supported forms
+  belong to [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
+
+Making `Set` and `Map` distinct nominal types remains tentative. It would also require a
+decision about widening: the current structural `Map(K, V) <: Collection(V)` relation need
+not be the rule for a nominal map whose iteration element is an entry. The alternatives are
+recorded in
+[Telling Set and Map apart](../src/ccl/design/collections.md#telling-set-and-map-apart-open).
+General contextual parameters for equality and ordering belong to the planned operation
+interface, not the compiler's implemented arithmetic trait tables.
 
 ### 6.4 Refinement syntax
 

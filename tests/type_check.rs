@@ -1636,14 +1636,8 @@ fn full_map_lookup_needs_no_presence_proof() {
     );
 }
 
-/// A `FullMap` annotation is satisfiable with the key elided, as a binding and as a
-/// parameter — so the uninhabited `FullMap(Int, Int)` above is a property of that key type
-/// and not of the form.
-///
-/// `Array(𝑛, 𝑇)` is the control: it is already a `FullMap` over `[0, 𝑛)`, so a bare
-/// data-function parameter is nothing new. What the elided key buys over it is that the
-/// domain need not be written, which is what a producer whose domain has no surface
-/// spelling requires.
+/// Eliding a FullMap domain lets a literal satisfy the annotation at a binding or call.
+/// This tests concrete range domains, not whether a full unrefined Int domain is inhabited.
 #[test]
 fn full_map_annotations_are_satisfiable() {
     assert_eq!(
@@ -1663,21 +1657,10 @@ fn full_map_annotations_are_satisfiable() {
     );
 }
 
-/// A key drawn from the source does **not** yet carry its collection's key domain, so a
-/// lookup into a `groupby` is rejected.
-///
-/// This is a missing rule and not a refused one. The argument edge already relates
-/// refinements in the *dropping* direction — `Int@1` reaches a domain of `Int`
-/// ([`full_map_lookup_needs_no_presence_proof`]) — and what a proven lookup needs is the
-/// other direction: a key produced by the key morphism from an element of the source
-/// *acquires* `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, because that predicate says
-/// exactly which keys the morphism produces. Nothing in the type system stands against it
-/// (`src/ccl/design/collections.md`, "Prerequisite: the proof has to survive being
-/// consumed"), so this pins today's rejection to make its arrival visible rather than
-/// asserting the rejection is right.
-///
-/// All three spellings fail identically, which is the point: the source element, the
-/// morphism applied to it, and a projected field are one situation.
+/// Source elements, key-function applications and projected source fields all lack the
+/// membership evidence required by proven lookup. This records missing functionality.
+/// See `src/ccl/design/collections.md`,
+/// "Prerequisite: the proof has to survive being consumed".
 #[test]
 fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     for program in [
@@ -1696,27 +1679,11 @@ fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     }
 }
 
-/// A **bare-key** lookup `g(k)` on a group-by is refused, and stays refused.
-///
-/// `groupby`'s domain is the present-key domain `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`,
-/// so applying it at a plain key demands a membership proof the key does not carry
-/// (`src/ccl/design/collections.md`, "Lookup: membership discharge"). The value-level
-/// spellings these programs came from read as passing under the older total function type,
-/// which admitted any key and answered an absent one with the empty group.
-///
-/// Every spelling is one situation — a single lookup, a lookup beside an iteration, a
-/// discharge through a higher-order parameter — so one rejection covers them and the
-/// programs are carried here rather than each keeping a test of a value it cannot produce.
-/// What returns them is `g[k]?`, a different program with `Option` handling, and it needs
-/// two things that do not exist: a **dependent** lookup, because a group-by's codomain
-/// names its key binder, and then a materialization for a collection-valued `some` payload
-/// (`src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`";
-/// `a_group_valued_lookup_is_rejected_by_name` is the second one as a whole program).
-///
-/// The discharge two of them tested is re-expressed rather than dropped: a filtered
-/// comprehension over the parameter is dependent for the ordinary reason and needs no
-/// membership proof ([`dependent_application_discharges_the_binder`],
-/// [`higher_order_dependent_application_discharges_the_binder`]).
+/// A bare key does not establish membership in a group-by's present-key domain.
+/// Checked lookup can type a dependent result, but a collection-valued streamed answer
+/// still fails operator conversion. The pipeline regression is
+/// `a_group_valued_lookup_is_rejected_by_name`.
+/// See `src/ccl/design/collections.md`, "Lookup: membership discharge".
 #[test]
 fn a_bare_key_lookup_on_a_groupby_is_refused() {
     for program in [
@@ -1738,18 +1705,9 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
     }
 }
 
-/// A **boxed exact `Map`** annotation on a group-by types and cannot be consumed: the `box`
-/// names the comprehension's `__iter_record` where the group-by's own key binder belongs, so
-/// the two spellings of the one key domain do not reconcile.
-///
-/// A compiler bug rather than a rule, pinned so its fix is visible. Its exact `FullMap`
-/// counterpart compiles and runs
-/// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation form is the whole
-/// difference.
-///
-/// The claim is that the two spellings collide, not which check reports it. Pinned on the
-/// two domains the diagnostic names, because that is what says *which* binder each side
-/// carries; the wording around them belongs to whichever check gets there first.
+/// Consuming this boxed Map annotation fails inference: the reported domains name
+/// `__iter_record` and `__box_k` instead of reconciling the dependent key.
+/// The exact FullMap counterpart runs in `an_exact_keyed_annotation_compiles_and_runs`.
 #[test]
 fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     let errs = infer_program_err(indoc! {r#"
@@ -1764,13 +1722,8 @@ fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     );
 }
 
-/// A **bounded** keyed annotation on a group-by records an open bound: `__gb_k` is free in a
-/// lower bound whose holder's telescope does not carry it.
-///
-/// A compiler bug rather than a rule, and it trips the record-time invariant rather than
-/// returning an error, so the pin is on the panic. Its exact counterpart compiles and runs
-/// (`an_exact_keyed_annotation_compiles_and_runs`), so the annotation strength is the whole
-/// difference.
+/// Consuming this bounded annotation records a bound with a free `__gb_k` absent
+/// from the holder's telescope. The current failure is an invariant panic, not a diagnostic.
 #[test]
 #[should_panic(expected = "open bound recorded")]
 fn a_consumed_bounded_keyed_annotation_records_an_open_bound() {
@@ -1780,20 +1733,10 @@ fn a_consumed_bounded_keyed_annotation_records_an_open_bound() {
     "#});
 }
 
-/// A `groupby` **is** a `FullMap`, at either annotation strength, and only with its key
-/// type elided.
-///
-/// Its domain is the present-key domain `{𝐾 | 𝑘 ▷ ((c ≫ key) ▷ collection_contains)}`, and
-/// a data function's domain is invariant, so an annotation has to name that refinement
-/// rather than the bare key type. Naming it needs the key morphism's image at the surface
-/// — `keys(…)`, which does not exist — so `FullMap(_, _)` is the only form a group-by
-/// satisfies. The elided form is not a workaround: it is the honest statement that the
-/// checker knows the key set and the surface cannot spell it.
-///
-/// The **exact** form binds `g` at the annotation, so its filled codomain lands under the
-/// annotation's own binder and the group's predicate names that one
-/// ([`an_exact_keyed_annotation_aligns_the_filled_binder`]). The bounded form leaves `g`
-/// the initializer's type, binder included.
+/// FullMap(_, _) preserves the group-by domain at either annotation strength.
+/// An exact annotation also permits consuming these groups. The bounded consumption
+/// failure is tested separately in `a_consumed_bounded_keyed_annotation_records_an_open_bound`.
+/// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
 #[test]
 fn a_groupby_is_a_full_map_at_either_strength() {
     let gb = "groupby([1,2], \\v -> v)";
@@ -5659,17 +5602,9 @@ fn subscript_is_lookup_and_dot_is_projection() {
     }
 }
 
-/// The **checked** lookup `c[k]?` types as `Option(𝑉)`, and it is **not an application**.
-///
-/// An application demands its argument lie in the function's domain, and `c[k]?` is
-/// reached exactly when that is not known — so it is typed as its own total operation
-/// instead: the key owes the collection's key *base*, the answer is `Option` of the value,
-/// and presence is decided at runtime. [`Builtin::CollectionContains`] is the same shape
-/// one payload lighter, `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)`.
-///
-/// Two consequences are asserted here because they are what "not an application" buys:
-/// a key that cannot be shown present is accepted, and a key of the wrong *type* is still
-/// rejected. `Option` answers "is this key present", never "is this a key at all".
+/// Checked lookup accepts an absent key of the correct base type, rejects a wrong-base
+/// key, and does not inherit application's presence obligation.
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
 #[test]
 fn a_checked_lookup_is_not_an_application() {
     let m = "m = map([(1, 10), (2, 20)])\n";
@@ -5692,20 +5627,9 @@ fn a_checked_lookup_is_not_an_application() {
     );
 }
 
-/// A collection whose **values depend on the key** answers at that key: a group-by's group
-/// is refined by the key binder, and `𝑔[𝑘]` reads the group refined at `𝑘`.
-///
-/// The discharge is what makes the answer total. `𝑘` is only *maybe* present, and the
-/// substituted type stands for any key of the key type — denoting the empty group where
-/// the key is absent, which is what `` `none `` versus `` `some `` of an empty group then
-/// distinguishes. Sound because a keyed access is not an application: the binder's
-/// declared domain is where the binder was introduced, not an obligation the key owes
-/// ([`keyed_access_value`] relates the key to the key *base*).
-///
-/// Whether the answer can be **materialized** is a separate question, and the group-valued
-/// case cannot be — decided at op-conversion, which
-/// `tests/compilation_pipeline/joins_aggregates_groupby.rs`'s
-/// `a_group_valued_lookup_is_rejected_by_name` covers as a whole program.
+/// Inference substitutes the lookup key into the group's dependent predicate.
+/// This does not test execution: `a_group_valued_lookup_is_rejected_by_name` covers the
+/// later operator-conversion rejection of a streamed collection-valued answer.
 #[test]
 fn a_key_dependent_lookup_discharges_the_key_binder() {
     assert_eq!(
@@ -5715,21 +5639,9 @@ fn a_key_dependent_lookup_discharges_the_key_binder() {
     );
 }
 
-/// What the checked operator does **not** reach yet, pinned so the boundary is a decision
-/// rather than a surprise.
-///
-/// A **range** domain has no membership refinement to drop: `UIntRange(𝑛)` is a primitive
-/// relating only by equality (`src/ccl/design/type-inference.md`, "Data domains are
-/// invariant"), not an index type refined by a bound, so no integer discharges against it
-/// and there is nothing for the relaxation to strip. What makes `lst[𝑖]?` work is giving a
-/// range domain a relation an index can satisfy, not a missing case in this rule.
-///
-/// A **bounded** parameter target is unresolved at emit, where the relaxation runs: a use
-/// of the binder carries the binder's variable rather than its annotation, so there is no
-/// domain to read. An **exact** one is a concrete type at the binder, so it reaches —
-/// asserted below.
-///
-/// A **tuple** is not a finite function at all, so it has no lookup — `t.0` projects it.
+/// Range domains and tuple targets are rejected. A bounded parameter remains unresolved
+/// at emission, whereas the exact Map annotation exposes its keyed type.
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
 #[test]
 fn checked_lookup_boundaries() {
     for (program, why) in [

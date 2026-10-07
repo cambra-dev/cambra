@@ -1108,21 +1108,9 @@ pub(super) fn emit_apply<C: Typing>(
     }
 }
 
-/// The value type `𝑚[𝑘]` reads, with the key related to the collection's keys.
-///
-/// One shape at both uses. A read ([`emit_lookup_checked`]) wraps it in `Option`; a write
-/// ([`emit_keyed_write`]) requires the written value against it. That is what makes
-/// `m[k] := v` and `m[k]?` agree about what `m[k]` is, rather than two rules kept in step
-/// by hand.
-///
-/// **Not an application.** A keyed access is reached precisely when the key is *not* known
-/// to lie in the collection's domain, and application demands that it does — so typing one
-/// as the other would have to relax the domain first, and a relaxed collection type is a
-/// type no value has. The relation that does hold is `SubtypesOf`'s: the collection's keys
-/// and this key are both keys, so both are below one key type
-/// (`src/ccl/design/type-inference.md`, "Type kind containment"). Whether *this* key is
-/// present is decided at runtime, exactly as [`Builtin::CollectionContains`] decides membership
-/// behind a total `𝜅 ⇒ Bool`.
+/// Check the key against the collection domain's base and return the supplied value type.
+/// Presence is not a typing obligation here: reads check it at runtime, and writes can add keys.
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
 fn keyed_access_value<C: Typing>(
     keys: &Type,
     value: Type,
@@ -1130,16 +1118,8 @@ fn keyed_access_value<C: Typing>(
     at: &dyn Fn() -> String,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // The key owes the collection's key **base**. A data function's domain refinement is
-    // what describes which keys are present — the membership predicate a re-keying
-    // constructor writes, the filter a comprehension writes — and deciding presence is the
-    // operator's job at runtime, so none of it is the key's obligation. An abstract
-    // `Map(𝐾, 𝑉)` arrives already at `𝐾`, its kind having stated it.
-    //
-    // Reading the key type off the collection alone is load-bearing. Relating the key and
-    // the collection's keys to a *common* type instead — the literal reading of
-    // `SubtypesOf` — is satisfied by any join, so a `String` key against an `Int`-keyed map
-    // widens the key type rather than failing.
+    // A common-supertype constraint would widen mismatched key types instead of rejecting
+    // them. Keep the collection's base as the upper bound; only presence is checked later.
     ctx.require_sub(key_ty, keys.peel_refinements(), at)?;
     Ok(value)
 }
@@ -1234,11 +1214,8 @@ fn emit_keyed_write<C: Typing>(
     })
 }
 
-/// Why `what` has no keyed access on `collection`.
-///
-/// An unresolved target is the natural shape of an access through a parameter, and a
-/// dependent codomain is the deferred `m[𝑘] : 𝑉(𝑘)` — both say what is missing rather than
-/// reporting a shape mismatch.
+/// Describe a target that `keyed_access_types` could not expose.
+/// This fallback does not define the supported dependent-lookup cases.
 fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
     if matches!(collection, Type::Infer(_) | Type::Hole) {
         return InferError::Unsupported(format!(
@@ -1269,25 +1246,11 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
     }
 }
 
-/// The **key type and value type** a `Map` reads at — what `𝑐[𝑘]?` and `𝑚[𝑘] := 𝑣` both
-/// need. `None` when `collection` is not a `Map`.
-///
-/// An **abstract** `Map(𝐾, 𝑉)` states its key type in its kind: `SubtypesOf(𝐾)` says
-/// "some domain over `𝐾`", so instantiating the sum there is the Σ elimination rule
-/// (`src/ccl/design/type-inference.md`, "How a sum flows through the solver") and `𝐾`
-/// comes back without anything being taken apart. A **concrete** `Map` states its own
-/// present-key domain instead, and the key type is what that domain and the
-/// looked-up key have in common — recovered by the caller's edges, not by this function.
-///
-/// A **dependent** codomain comes back with its key binder, for
-/// [`Typing::keyed_value_at`] to discharge to the key term: a group-by's group is refined
-/// by that binder, and `𝑔[𝑘]` reads the group refined at `𝑘`. The discharge is sound at a
-/// key that is only *maybe* present precisely because a keyed access is not an
-/// application — the binder's declared domain is where the binder was introduced, not an
-/// obligation the key owes — and the substituted type stands for any key of the key type,
-/// denoting the empty group when the key is absent. Whether the answer can be
-/// *materialized* is a separate question, decided at op-conversion
-/// (`reject_unanswerable_lookup_collection`).
+/// Expose a function's domain, key binder and codomain for keyed access.
+/// A sum must begin with a `SubtypesOf(K)` witness; instantiate it at `K`.
+/// Return the binder without discharging it: `Typing::keyed_value_at` owns that step.
+/// This helper checks the function shape, not the function kind or runtime answer extent.
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
 fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
     let viewed = match collection.sum() {
