@@ -1,64 +1,11 @@
-//! Compile time per gallery program, as a table.
+//! Compile-time measurements over the demo gallery.
 //!
-//! Every `.cambra` file under `tests/programs/` is compiled on its own, and the
-//! fastest of `CAMBRA_PERF_REPS` repetitions is reported — best-of-N because a
-//! single repetition on a shared machine measures the machine. The driver
-//! asserts nothing: it is a measurement, like the library's
-//! `provenance_pane_perf` and `lowering_session_cost_canary`, and is `#[ignore]`d
-//! so `cargo test` never pays for it.
+//! Commands and measured intervals are specified in `docs/demo-programs.md`, "Timing a compile".
 //!
-//! Three drivers share the table and differ in what they time.
-//! [`gallery_compile_timing`] runs `compile_program`: the whole frontend through
-//! `Phase::Planning`, then operator conversion. [`gallery_infer_timing`] runs
-//! `compile_to` stopped at `Phase::Infer`, so a row covers lowering, uniquify,
-//! A-normalization, mutable-read naming and inference, and nothing after them.
-//! [`gallery_post_infer_timing`] runs `compile_to` to both stops and attributes
-//! the difference, so a row covers inline, transact, letrec, channelize, the
-//! as-of-read rewrite, lambda elimination and planning.
-//!
-//! The compile row minus the infer row is not the post-infer row.
-//! `compile_program` captures panes, records provenance, and runs operator
-//! conversion; `compile_to` does none of the three. The post-infer row takes both
-//! its halves from `compile_to`, so panes and provenance cancel out of it and
-//! operator conversion sits outside what it measures.
-//!
-//! Run them in release, which is the configuration whose numbers mean anything:
-//!
-//! ```text
-//! cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
-//! cargo test --release --test programs -- --ignored --nocapture gallery_infer_timing
-//! cargo test --release --test programs -- --ignored --nocapture gallery_post_infer_timing
-//! ```
-//!
-//! A bare `--ignored` runs all three. They hold [`SERIAL`] for the length of a
-//! run, so the tables never interleave.
-//!
-//! One program, timed without the rest of the gallery's noise:
-//!
-//! ```text
-//! CAMBRA_TIMING_ONLY=storefront CAMBRA_PERF_REPS=9 \
-//!   cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
-//! ```
-//!
-//! What the `compile` numbers cover: `compile_program` alone — not evaluation,
-//! which is where the rest of a gallery test's wall clock goes
-//! (`common::run_to_tile` pumps the scheduler up to 100 rounds after the
-//! compile). A sink program's sinks bind their resources inside the compile, so
-//! a `{PORT}` program's row includes that bind; each compile takes a freshly
-//! reserved port. `compile_to` binds the same resources from its own fresh
-//! context, so the `infer` rows carry the bind too, and the `post-infer` row
-//! cancels it between its two halves.
-//!
-//! Pane capture is part of what `gallery_compile_timing` measures. To separate
-//! it, run the two arms interleaved so both see the same machine state, and
-//! compare the totals:
-//!
-//! ```text
-//! for i in 1 2 3; do
-//!   CAMBRA_PROVENANCE=1 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
-//!   CAMBRA_PROVENANCE=0 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
-//! done
-//! ```
+//! These ignored tests report compilation outcomes, not correctness assertions.
+//! [`SERIAL`] protects the process-wide panic hook and keeps tables from interleaving.
+//! Measured products remain alive until their durations have been recorded. A fresh source
+//! provider allocates a port per compile, including both calls of a post-inference measurement.
 
 use std::{
     env::VarError,
