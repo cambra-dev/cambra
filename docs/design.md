@@ -143,45 +143,42 @@ Self-referential *collection* definitions solve an equation as a least fixpoint 
 
 ## Program Execution Pipeline
 
-```
-CHL source
-  → parse            (chl_parser, see chl-parser/design-chl-parser.md)
-  → lower            (ccl/lower/: CHL AST → CCL Expr)
-  → uniquify         (ccl/uniquify.rs: α-uniquify binders — Barendregt convention, base+uid Names)
-  → infer            (ccl/infer/: type inference; delegates to ccl/infer/solver/, the constraint solver;
-                      runs on the user-shaped tree so type errors report against the program as written)
-  → inline           (ccl/inline.rs: inline capability (non-collection) Let bindings; beta-reduce at
-                      call sites. Runs *before* channelize so the letrec phase can route an in-loop
-                      feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
-  → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut(V, Txn) variables folds into
-                      a get_prev_txn-causal LetRec over the commit domain (per-key histories + per-site
-                      commit records). 
-                      See src/ccl/design/mutability.md)
-  → mut_elim     (ccl/mut_elim.rs: the induction mutability phase — every non-transactional
-                      mutation loop (For/MutWrite markers, feed-free or feeding) becomes a causal LetRec
-                      group over the induction domain (get_prev_seq recurrence, final_read trailing
-                      read); see src/ccl/design/mutability.md. Runs before channelize so a
-                      per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
-  → channelize       (ccl/channelize.rs: Defer/Feed/Define → `++`-union channel bindings, each defer
-                      cluster emitted as a mutually-scoped Feed-kind LetRec group; the feed-routing step
-                      of mutability elimination (mut_elim + channelize), type-preserving by construction. Feed reads type concretely
-                      via rigid ChanDom channel domains, erased here by substitution — no retype pass.
-                      Runs after the letrec phase, so an in-loop feed is already hoisted to a feed of the
-                      loop's history)
-  → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators, then CCC-simplified)
-  → plan_loops       (ccl/planning/loops.rs::plan_loops: AFTER lambda_elim, on the point-free normal form,
-                      lower each causal LetRec group onto the domain-parameterized Transact —
-                      induction domain → InductionStore, Txn domain → commit operator. Anchors on the guard
-                      builtins (which survive elimination), so one LetRec travels through channelize +
-                      lambda_elim and is planned point-free — no pointful/point-free double
-                      representation. Transact is loop planning's output node to op-conversion)
-  → planning        (ccl/planning/: hash-join and keyed aggregate optimization; brackets iteration-marking with ccl/simplify.rs)
-  → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
-  → subscribe()
-  → tile producer/consumer dataflow
-```
+The phase order is implemented by `run_frontend` and `run_passes` in
+[`ccl/context.rs`](../src/ccl/context.rs). This table is the navigation reference for the
+pipeline; individual pass contracts belong to the linked design documents.
 
-Why the pass order is what it is: parsing recovers from errors (partial ASTs with placeholder nodes, multiple diagnostics per file — see [chl-parser/design-chl-parser.md](../chl-parser/design-chl-parser.md)); uniquify establishes the Barendregt convention so every later pass can substitute without capture; inference runs early, on the user-shaped tree, so type errors report against the program as written and every later pass transforms fully-typed trees. The three-pass middle — `transact_phase`, `mut_elim`, `channelize` — is **mutability elimination**: transactions, mutation loops, and feeds each become pure, causally-guarded `letrec` groups, so everything downstream sees only the pure value language. Lambda elimination then rewrites the program into point-free combinators because **operators are point-free** — an operator graph has no binders, so lambdas must be compiled away, not closed over; loop planning lowers the letrec groups onto `Transact` nodes on that same point-free form; and planning is where comprehension shapes become joins and keyed aggregates. Each pass's own design doc is indexed in [src/ccl/design/README.md](../src/ccl/design/README.md) and [src/design.md](../src/design.md).
+| Stage | Transformation |
+| --- | --- |
+| Parse | CHL source to a recoverable CHL AST; see [parser design](../chl-parser/design-chl-parser.md#stage-2--parser-parserrs). |
+| Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). |
+| Uniquify | Give term binders distinct identities; see [structured names](../src/ccl/design/ir.md#structured-names-and-α-uniquification-barendregt-convention). |
+| A-normalize | `anf::run` names compound operands before inference. |
+| Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
+| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Read naming is undone before the post-inference snapshot. |
+| Inline | Inline capability bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
+| Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |
+| Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
+| Channelize | `channelize::run` resolves deferred collections and feeds; see [mutability compilation](../src/ccl/design/mutability.md#compilation-pipeline). |
+| Rewrite as-of reads | `transact_phase::rewrite_as_of_reads` rewrites fed-out mutable reads after channelization, before lambda elimination. |
+| Eliminate lambdas | Convert to point-free combinators; see [lambda elimination](../src/ccl/design/optimization.md#lambda-elimination-ccllambda_elimrs). |
+| Plan | `planning::plan_loops` recognizes causal histories as `Transact`, then `planning::run` plans joins and iteration; see [planning](../src/ccl/design/optimization.md#planning-cclplanning). |
+| Convert and subscribe | Build tile operators and subscribe output consumers; see [compilation](../src/ccl/design/optimization.md#compilation). |
+
+Inference precedes inlining and mutability elimination, but follows A-normalization and mutable-read
+naming. Diagnostics therefore refer to a tree that has already been rewritten, using the lowering
+projection to recover source spans. Inlining exposes called writers before the mutability passes
+process them. Channelization follows induction elimination so it can route feeds lifted from loops.
+
+As-of-read rewriting runs before lambda elimination because its computed replies still need lambda
+elimination. Loop recognition runs after lambda elimination and is part of `Phase::Planning`, not
+a separate phase boundary. The recognized transaction or induction domain determines the runtime
+engine during operator conversion. The detailed history contracts are owned by
+[the mutability reference](../src/ccl/design/mutability.md#compilation-pipeline).
+
+`compile_to` stops at a requested frontend phase and returns CCL; it does not build or subscribe
+an operator graph. `compile_program` continues through planning, converts outputs and subscribes
+their consumers. The scheduler then drives execution. The compiler's `Phase` names also identify
+capture boundaries, so a named phase need not correspond to exactly one function call.
 
 ## The execution model
 
