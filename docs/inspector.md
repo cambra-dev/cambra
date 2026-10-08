@@ -24,6 +24,12 @@ serves.
   **post-channelize**, **post-as-of-read**, **post-lambda-elim** and
   **post-planning**. The set is the compiler's `PANES` table, not a list the
   inspector keeps.
+- **Operator pane** — the dataflow graph conversion built, drawn as a layered
+  graph. **Operators** draws one box per operator, less the two kinds
+  `web/src/graph/model.ts` suppresses. **Steps**, the default, merges recurring
+  plumbing into composite boxes by the rules in `web/src/graph/rules.ts`. The
+  level is remembered per browser. Hovering a box lists everything it stands for,
+  and double-click pins that card.
 - **Cross-pane links** — clicking in any pane highlights the corresponding
   node(s) in every other pane and the source span(s) they trace to, following
   the retained per-phase provenance shipped dense (self-edges included, so a
