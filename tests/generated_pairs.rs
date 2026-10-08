@@ -52,22 +52,34 @@ use panic_message::panic_message;
 /// `skeleton/filler[binders]`. `grid_agrees` holds every cell outside this list and [`UNDEFINED`]
 /// to agreement and every cell here to disagreement, so a fix that makes one agree removes it.
 const BROKEN: &[(&str, &str)] = &[
+    ("comp_source_in_loop", "binder_cond_coll[i]"),
+    ("feed_collection", "cond_boxed"),
     ("function_body", "rows_sum"),
     ("generator_yield", "rows_sum"),
     ("groupby_tuple_key", "rec_comp"),
     ("groupby_tuple_key", "rec_filtered"),
     ("groupby_tuple_key", "rec_list"),
+    ("loop_source", "cond_boxed"),
+    ("loop_source_in_loop", "binder_cond_boxed[i]"),
+    ("loop_source_in_loop", "binder_cond_coll[i]"),
     ("loop_source_in_loop", "binder_filtered_comp[i]"),
+    ("loop_source_in_loop", "cond_boxed"),
+    ("loop_source_in_loop", "cond_coll"),
     ("loop_source_in_loop", "dup_union"),
     ("loop_source_in_loop", "map_arrow"),
     ("loop_source_in_loop", "map_lit"),
     ("loop_source_in_loop", "union"),
+    ("nested_mut_source", "binder_cond_boxed[i]"),
+    ("nested_mut_source", "binder_cond_coll[i]"),
     ("nested_mut_source", "binder_filtered_comp[i]"),
+    ("nested_mut_source", "cond_boxed"),
+    ("nested_mut_source", "cond_coll"),
     ("nested_mut_source", "dup_union"),
     ("nested_mut_source", "generator_coll"),
     ("nested_mut_source", "map_arrow"),
     ("nested_mut_source", "map_lit"),
     ("nested_mut_source", "union"),
+    ("record_collection_field", "cond_boxed"),
     ("record_in_list", "comp_sum"),
     ("record_in_list", "filtered_sum"),
     ("record_in_list", "generator_max"),
@@ -83,6 +95,7 @@ const BROKEN: &[(&str, &str)] = &[
     ("rows_comp_source", "rows_filtered"),
     ("rows_inner_filter", "rows_filtered"),
     ("rows_loop_feed", "rows_filtered"),
+    ("rows_nested_mut", "rows_cond"),
     ("rows_nested_mut", "rows_filtered"),
     ("rows_nested_mut", "rows_jagged"),
     ("terminal_read", "terminal_in_agg[pool]"),
@@ -721,6 +734,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_arith", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "{b} * 2 + 1" },
         Filler { name: "binder_in_comp", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum([z2 * {b} for z2 in [1, 2]])" },
         Filler { name: "binder_in_comp_filter", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum([z2 for z2 in [1, 2, 3] if z2 > {b}])" },
+        Filler { name: "binder_cond_sum", ty: Ty::Int, needs: &[Ty::Int], decls: "", expr: "sum(box([1, 2]) if {b} > 1 else box([3, 4, 5]))" },
         Filler { name: "binder_in_call", ty: Ty::Int, needs: &[Ty::Int], decls: indoc! {r#"
             def helper_fn2(hn):
                 hn * 2
@@ -760,6 +774,11 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "binder_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2]]" },
         Filler { name: "binder_filtered_comp", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "[z2 * {b} for z2 in [1, 2, 3] if z2 > {b}]" },
         Filler { name: "map_arrow", ty: Ty::IntColl, needs: &[], decls: "", expr: "map([\"a\" -> 1, \"b\" -> 2])" },
+        // --- conditional collections: same-domain arms and boxed ones, chosen once or per row
+        Filler { name: "cond_coll", ty: Ty::IntColl, needs: &[], decls: "", expr: "([1, 2] if 2 > 1 else [3, 4])" },
+        Filler { name: "cond_boxed", ty: Ty::IntColl, needs: &[], decls: "", expr: "(box([1, 2]) if 2 > 1 else box([3, 4, 5]))" },
+        Filler { name: "binder_cond_coll", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "([1, 2] if {b} > 1 else [3, 4])" },
+        Filler { name: "binder_cond_boxed", ty: Ty::IntColl, needs: &[Ty::Int], decls: "", expr: "(box([1, 2]) if {b} > 1 else box([3, 4, 5]))" },
         Filler { name: "generator_coll", ty: Ty::IntColl, needs: &[], decls: indoc! {r#"
             def helper_gen2(hxs):
                 for hx in hxs:
@@ -832,6 +851,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "rows_jagged", ty: Ty::Rows, needs: &[], decls: "", expr: "[box([1, 2]), box([3, 4, 5])]" },
         Filler { name: "rows_comp", ty: Ty::Rows, needs: &[], decls: "", expr: "[[z3 * z2 for z3 in [1, 2]] for z2 in [1, 2]]" },
         Filler { name: "rows_filtered", ty: Ty::Rows, needs: &[], decls: "", expr: "[[z3 for z3 in [1, 2, 3] if z3 > z2] for z2 in [1, 2]]" },
+        Filler { name: "rows_cond", ty: Ty::Rows, needs: &[], decls: "", expr: "[(box([1, 2]) if z2 > 1 else box([3])) for z2 in [1, 2]]" },
     ]
 }
 

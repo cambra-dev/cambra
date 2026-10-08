@@ -2714,13 +2714,9 @@ for the extent of the assertion.
   A `for` loop over a sum is rejected before constructing its history, including
   a determined sum that planning could later erase. Collection-valued variant payloads
   and rows fixed by mutable storage before reaching a jagged position remain unsupported.
-  `jagged_rows_merged_by_appends_or_a_keyed_write_do_not_compile` pins two further cases:
-
-  - Two `<<` appends of boxed rows with different domains fail the debug-only free-witness
-    assertion after channelization; without debug assertions, the post-planning type check rejects
-    the tree.
-  - A keyed write of a boxed row with a different domain fails group-by recognition's type
-    check, reported as `Bad group expr`.
+  `jagged_rows_merged_by_a_keyed_write_do_not_compile` pins a keyed write of a boxed row with
+  a different domain, which fails group-by recognition's type check, reported as
+  `Bad group expr`.
 
 Inferred candidate domains cross level boundaries through `extrude_invariant`, which
 preserves both directions of bounds. A one-sided proxy can discard the upper bounds that
