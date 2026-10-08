@@ -1,75 +1,64 @@
 # Program diffing — content addressing and correspondence
 
-For two compiled programs, this analysis decides which parts are **the same
-computation** and where they diverge. Running two versions concurrently with
-their storage and compute shared rests on it, as does a denotationally precise
-transition between them. Neither is built; the model they need is recorded
-below.
+[`diff`](../diff.rs) matches nodes in two CCL trees and classifies changes to their content and
+placement. It uses [`content_hash`](../content_hash.rs) to select candidate matches, then resolves
+free variables through the resulting binder correspondence to classify them.
 
-Implemented by [`ccl/content_hash.rs`](../content_hash.rs) (the equivalence) and
-[`ccl/diff.rs`](../diff.rs) (the correspondence). Neither is wired into
-[`compile_program`](../context.rs) — the analysis is a library the versioning
-work will consume, not a pipeline pass.
+The result identifies candidates for shared computation; it does not construct shared operators,
+migrate state or switch running versions. The analysis is a library, not a pass called by
+[`compile_program`](../context.rs). Runtime uses are described separately under
+[Beyond the analysis: branching](#beyond-the-analysis-branching).
 
 ---
 
 ## Inputs, output, and what holds of it
 
-**In**: two [`TypedExpr`](../expr.rs) trees, each a whole program compiled to the
-same [`Phase`](../context.rs). They are taken to be two versions of one program;
-nothing requires that, and unrelated programs share little.
+`diff` accepts two [`TypedExpr`](../expr.rs) trees. Callers comparing program versions supply
+trees from the same [`Phase`](../context.rs); the function does not inspect phase metadata or
+require a shared source history. `diff_programs` compiles both source programs to one requested
+phase and passes the borrowed result to a callback. Compilation errors are returned before diffing.
 
-**Out**: a [`Diff`](../diff.rs) — a correspondence between the two trees' nodes,
-each pair classified on content and on placement, plus the nodes of each side
-left unpaired. Two derived forms are what a consumer reads: `divergences()`, the
-places the two programs disagree, and `shared_roots()`, the largest subtrees they
-compute the same way.
+[`Diff`](../diff.rs) borrows both trees. Its `matched` entries classify content and placement
+independently; `deleted` and `new` contain source-only and target-only nodes. `divergences()`
+reduces these entries to change sites. `shared_roots()` returns the maximal disjoint regions
+classified as unchanged under this correspondence, not a globally maximal sharing arrangement.
 
-What holds of the output, and the test that holds it:
+The following tests cover the stated cases:
 
 | | Held by |
 | --- | --- |
-| Two compilations of one source diff as identical, at every phase | `every_phase_diffs_identical_source_as_identical` |
-| Identical trees have no divergences, and one shared root: the program | `identical_programs_have_no_divergences` |
-| An identity that varies between compilations (a `Name` uid) never reaches the result | `diff_is_robust_to_uid_nondeterminism` |
-| Renaming a binding is not a change | `renaming_a_binding_is_not_a_change` |
-| One edit is one divergence, however deep in the `let` spine it sits | `one_edit_is_one_divergence` |
+| Two compilations of each corpus source diff as identical, at every phase | `every_phase_diffs_identical_source_as_identical` |
+| Identical programs have no divergences and one shared root | `identical_programs_have_no_divergences` |
+| Two lowerings that differ only in binder uids diff as identical | `diff_is_robust_to_uid_nondeterminism` |
+| A renamed binding retains its correspondence | `renaming_a_binding_is_not_a_change` |
+| One edit deep in a `let` spine is exactly one divergence, at the edited node | `one_edit_is_one_divergence` |
 | Shared roots are pairwise disjoint, each the top of its region | `shared_roots_are_maximal_and_disjoint` |
 | Two terms differing only in an inferred type hash apart | `inference_adds_type_signal` |
 
-Two properties are absent, and stated as absent rather than approximated.
-`divergences()` is not minimal: it is small on the shapes the tests measure, and
-the two reduction rules are not a minimality theorem
-([The actionable form](#the-actionable-form-divergences-and-shared-roots)).
-Sharing is not maximal: where the matching is suboptimal the result reports
-change, which costs a sharing opportunity rather than producing an unsound share
-([Direction of error](#direction-of-error)).
+There is no minimality guarantee for `divergences()`; its reduction rules are specified under
+[The actionable form](#the-actionable-form-divergences-and-shared-roots). A correspondence can
+miss sharing opportunities; see [Direction of error](#direction-of-error). Hash comparison also
+assumes no collisions; see [Content addressing modulo α](#content-addressing-modulo-α).
 
 ---
 
 ## Diffing at a glance
 
-Two compiled trees in, a classified node correspondence out, in four steps.
+1. `Indexed::build` hashes each subterm independently. Variables bound outside that subterm
+   contribute their spellings; variables bound inside it contribute positional references.
+2. `top_down` anchors equal-hash subtrees largest-first. `anchor_roots` pairs the roots only
+   when both are unmatched and have the same node kind. `bottom_up` recovers containers from
+   matched descendants. `recover` aligns unmatched interiors of selected container pairs by
+   tree edit distance, subject to its size limit.
+3. `classify` computes `resolved_hash` and `own_hash` using the binder correspondence. The first
+   includes the subtree; the second excludes children and selected type slots to distinguish
+   a local edit from changes propagated from descendants.
+4. `classify` assigns content and placement independently. The `Diff` methods derive change
+   sites and shared roots from these classifications.
 
-1. **Hash every subterm by content, modulo α** (`content_hash`). A variable free
-   in the subterm is identified by its spelling, so a subterm hashes the same
-   wherever it sits and in whichever program.
-2. **Match the two trees on those hashes**, GumTree-style: anchor equal-hash
-   subtrees largest-first, anchor the two roots to each other, recover the
-   containers above an anchor by how much of it they hold, then close the
-   remaining gaps inside a paired container with tree edit distance.
-3. **Re-hash every matched node against the correspondence.** `resolved_hash`
-   identifies a free variable by which binder it resolves to, so a binding
-   renamed between versions is invisible; `own_hash` takes what is authored at
-   the node alone, which separates "this node changed" from "something under it
-   did".
-4. **Classify** each correspondence on two axes, content and placement, and
-   reduce the result to `divergences()` — where the two programs disagree — and
-   `shared_roots()` — what they can compute once.
-
-The order is fixed: step 2 has no correspondence to resolve names through, and
-step 3 exists only because step 2 produced one. Matching never consults a
-classification.
+Matching precedes classification: it has no binder correspondence to resolve free names through.
+The matching algorithm and recovery limits are specified under
+[The correspondence: a GumTree matcher](#the-correspondence-a-gumtree-matcher).
 
 ---
 
@@ -102,170 +91,130 @@ That buys three things:
 
 ## Content addressing modulo α
 
-The whole analysis rests on one primitive: a hash under which two subterms
-collide **iff** they are the same computation. `content_hash` assigns every
-subterm a 64-bit `ContentHash` such that two subterms hash equal iff they are
-structurally identical up to (a) consistent renaming of variables *bound within*
-the subterm and (b) the identity of variables *free* in it.
+`ContentHash` is a 64-bit fingerprint computed with `DefaultHasher`. Bound term variables are
+hashed positionally; free-variable identity depends on the selected hash operation. Hashing also
+normalizes the order of designated set-shaped structures and omits unresolved type identities.
+The rules below define those comparisons, not general denotational equivalence.
+
+The matcher and classifier compare fingerprints without a subsequent structural equality check.
+Their interpretation of equal hashes assumes no collisions; 64-bit equality is not a proof of
+equivalence. A collision can produce a false match or a false unchanged classification.
 
 ### Why α-invariance is the problem
 
-Two independently compiled programs do not share their binders' identities.
-Before uniquification a source binder is a `Name::Raw` spelling, so the same
-source binder yields the same name in both versions. After uniquification every
-binder carries a globally fresh **`uid`**, allocated in traversal order, so the
-same source binder gets a different one in each compilation and identical code
-compares unequal. A hash meant to recognize "the same computation" across versions
-therefore cannot hash a bound variable by its name at all. It hashes it
-positionally:
+Uniquification gives binders fresh uids that can differ between compilations of the same source.
+`hash_name_ref` therefore searches the current binder environment from innermost to outermost
+and hashes the matching De Bruijn index. Renaming a binder and its bound references does not
+change that index; lexical shadowing resolves to the innermost matching name.
 
-- a variable whose binder lies *inside* the subterm contributes its De Bruijn
-  index, which is invisible to α-renaming;
-- a variable *free* in the subterm contributes its stable **spelling**
-  (`Name::base`), which is what survives independent compilation.
+In `content_hash`, a reference with no binder inside the hashed subterm contributes `Name::base`
+through `hash_free_var`. Consequently, the standalone hash of `x + 2` differs from that of
+`y + 2`, even when the surrounding programs differ only by renaming that binding. Hashing the
+whole binding scope still treats its bound references positionally.
 
-Lexical shadowing then falls out for free: a name resolves against the innermost
-enclosing binder, which is the one a reader would pick.
-
-Under this rule a rename is a change: `x = 1; x + 2` → `y = 1; y + 2` hashes
-every mention of the binding differently, even though the two programs denote
-the same thing. That is correct for the matcher, which is looking for a
-subterm's twin and has no correspondence to consult, and wrong for the
-classifier, which does — hence the second hash below. Reordering two independent
-bindings is a separate problem, in the representation rather than the hash; see
-[Open threads](#open-threads).
-
-The free-variable rule is also crude in the other direction: two distinct
-binders that share a spelling compare equal. It is isolated in one function
-(`hash_free_var`) so a finer cross-version binder correspondence can replace it
-without touching anything else.
+Conversely, standalone references to distinct external binders with the same spelling hash alike.
+Classification resolves this ambiguity through the binder correspondence described below.
+Reordering independent bindings can change the correspondence; see [Open threads](#open-threads).
 
 ### Three hashes, three questions
 
-Three questions come up, and each wants a different answer to "what is this
-node's identity". Everything else about the fold — the traversal, the De Bruijn
-treatment of bound variables, the type-awareness, the order-insensitivity — is
-shared, so the table below is the whole difference between them.
+The operations differ in their treatment of external binders and the fields they include:
 
-| | `content_hash` | `resolved_hash` | `own_hash` |
+| Property | `content_hash` | `resolved_hash` | `own_hash` |
 | --- | --- | --- | --- |
-| Question | where else does this subterm appear? | is this the same computation? | did *this node* change? |
-| Used by | matching (phases 1–4) | classification (phase 5) | classification (phase 5) |
-| A **free variable** identified by | its spelling (`Name::base`) | the binder it resolves to | the binder it resolves to |
-| The node's **children** | fold in | fold in | left out |
-| Needs a correspondence | no | yes | yes |
+| Purpose | Select candidate matches | Classify a matched subtree | Localize a change to a node |
+| External reference found in supplied scope | No supplied scope; use `Name::base` | Use binder token | Use binder token |
+| External reference absent from supplied scope | Use `Name::base` | Use tagged spelling fallback | Use tagged spelling fallback |
+| Child terms | Include | Include | Exclude |
+| Node and binder `ty`; cast target | Include | Include | Exclude |
+| Node and binder `user_annotation` | Include | Include | Include |
 
-**Matching** asks *where else does this subterm appear?* — of two programs that
-do not share binder identities. That needs a **context-free** answer, so a
-subterm hashes the same wherever it sits: free variables go by **spelling**
-(`content_hash`). Everything the matcher does is built on this.
+`resolved_hashes` builds the external scope from the node correspondence. A matched source node
+uses its destination node's index as its owner token. An unmatched source node uses an index
+outside the destination tree's range. `mix` combines that token with each binder's position
+within its owner, distinguishing the binders of a `LetRec` group. `hash_free_var` searches this
+scope from innermost to outermost. A reference absent from the scope falls back to its spelling,
+with a tag distinct from the resolved-token case.
 
-**Classification** asks *is this the same computation?* — of two nodes already
-known to correspond. Spelling is both too strict and too loose for that. Too
-strict: a rename hashes every mention differently, as above. Too loose: two
-same-spelled variables bound to different things hash the same, so the hash has
-to be taken over the subterm together with its resolved bindings rather than
-over its AST text alone.
+Corresponding binders can therefore have different spellings without changing the resolved hash.
+Distinct binders with the same spelling are distinguished by their tokens. Using a root-relative
+De Bruijn index instead would make an inserted enclosing binder change references to otherwise
+unchanged outer bindings; correspondence tokens identify the binder rather than its distance.
 
-So classification uses `resolved_hash`, which identifies a free variable by
-**which binder it resolves to**, taken up to the correspondence. Each binder
-carries a **correspondent**: a 64-bit token naming the binder it corresponds to
-in the other program, minted from the correspondence itself. A src binder's is
-the index of the dst node its owner matched; an unmatched binder gets a token
-outside dst's index range, so it corresponds to nothing and can never look like a
-match. A free variable hashes to the correspondent of the binder it resolves to.
-A renamed binding is then invisible, and a same-spelled binding of something else
-is not confused with it. A node introducing several binders at once — a `LetRec`
-group — gives each its own correspondent, keyed by position within the group,
-since they are distinct binders.
+`own_hash` includes the node discriminant, local payload from `hash_payload`, direct variable
+and register-key references, and user annotations. Local payload includes literal values,
+operators, variant tags, record labels, binding transparency and the domain and parameter types
+of `Transact`. Excluding a node's inferred `ty` does not exclude every type-valued payload.
 
-**Localizing** asks *did this node change, or only something under it?* — of a
-node already known to differ. `own_hash` answers it by folding what is authored
-at the node and stopping there: its discriminant, its literal value, operator,
-variant tag, binder annotation or record labels, and the correspondents its
-variable occurrences resolve to.
+The excluded node and binder types can change because a descendant changed. Including them
+would report the same edit at both the descendant and its enclosing binding. Cast targets are
+also excluded: the differ visits their domain-refinement predicates as children, so including
+the target again would duplicate a predicate edit at the cast.
 
-Derivedness, not child-ness, is the boundary, and three things fall outside it.
-The children, which is the point. The node's inferred `ty`, computed from the
-node and its children — folding it would report `let a = 1` → `let a = 2` at the
-`Let` as well as at the literal, since the `Let`'s type is the literal's
-singleton. And a binder's declared `ty`, on the same ground. A reader who takes
-the boundary to be children alone gets the two type exclusions wrong, and those
-are where the design decision sits.
+For a `Let`, the own hash includes its discriminant, binding transparency and the node's and
+binder's user annotations. It excludes the binder's name, inferred type, definition and body.
+Changing only the definition's literal or consistently renaming the binder leaves this own hash
+unchanged. Changing an annotation or binding transparency can change it.
 
-A container therefore has close to no own content. A `Let`'s is its discriminant
-plus two `user_annotation`s — the binder's name is De Bruijn and its type is
-skipped — so `let a = 1 in a`, `let a = 2 in a`, `let b = 1 in b` and
-`let a = 1 + 5 in a` all share one own hash at the `Let`, and only an annotation
-moves it. A container is never a disagreement site on its own, which is what
-puts the site on the literal that changed.
-
-*What a correspondent is not.* Threading the binder chain from the root and
-using raw De Bruijn indices throughout looks equivalent and is not: inserting a
-binder above a subterm shifts the index of every reference that reaches past it,
-so adding one statement would report the entire tail below it as changed. A
-correspondent is stable under that, because it names the binder rather than the
-distance to it.
+`classify` compares the resolved hashes first. Equality gives `Content::Same`; otherwise, equal
+own hashes give `Content::ChangedBelow`, and unequal own hashes give `Content::Changed`.
+`divergences()` can still report a `ChangedBelow` node when no descendant explains the change.
+Thus a type-only change can be reported at a container even though `own_hash` excludes its `ty`.
 
 #### Direction of error
 
-Where the matching itself is suboptimal, resolved hashing reports change rather
-than sharing. Reordering two independent bindings, for instance, pairs the `let`
-**spine** — the chain of nested `Let` nodes a run of statements lowers to —
-positionally, so the bindings genuinely do differ under the correspondence
-produced and the uses read as changed. That is the safe direction:
-over-reporting change costs a sharing opportunity, under-reporting it makes an
-unsound share.
+A suboptimal correspondence can report unchanged work as changed. For example, positional
+matching of reordered independent `Let` bindings can assign different tokens to corresponding
+uses. This loses a sharing opportunity. An incorrect `Content::Same` would instead permit sharing
+different computations. The intended conservative direction of matching errors does not remove
+the [hash-collision assumption](#content-addressing-modulo-α).
 
 ### Standalone hashing is the matcher's precondition
 
-Every node of the tree gets a hash, and each one is computed over that node's
-whole subterm: a node's hash folds its children's, so the root's hash covers the
-program. `hash_all` walks the tree once and returns the map.
+`hash_all` enumerates expression nodes and computes each node's whole-subterm `content_hash`
+with a fresh binder environment. Its map keys are pointers into the input tree and are valid
+only while that tree remains at those addresses. The matcher computes standalone hashes during
+`Indexed::build` rather than consuming this map.
 
-Each of those hashes is *standalone*: free variables are resolved against the
-empty environment, so a variable bound above the subterm counts as free. This is
-what lets a subterm match its twin in the other program regardless of how deeply
-each one sits — which is exactly what the top-down matcher needs.
+A binder above the subterm is absent from the fresh environment, so its references hash as free.
+This lets the matcher compare a subterm at different depths without incorporating its enclosing
+binder chain. The classifier adds that context after matching.
 
-The cost is `O(𝑛 · depth)`, since each subterm's hash is recomputed with a fresh
-binder environment. That is comfortable for real programs even with their deep
-`let` spine; the asymptotically tight scheme (Maziarz et al., *Hashing Modulo
-Alpha-Equivalence*, PLDI 2021 — `O(𝑛 log²𝑛)`) slots in behind the same interface
-if a program ever grows large enough to feel it.
+The sum of subterm sizes bounds the repeated term visits by `O(𝑛 · depth)` for a tree of `𝑛`
+nodes. This is not a complete running-time bound: binder lookup scans the environment, types
+can contain predicate terms, and set-shaped structures sort their hash contributions. The
+implementation does not cache per-subterm free-variable summaries.
 
 ### The hash is type-aware
 
-A node's inferred type, its user annotation, its binders' types, and a `Cast`'s
-target all participate. Two terms differing only in a type are not the same
-computation — a change from `{Int | __elem >= 18}` to `{Int | __elem >= 21}` is
-a change to the program even though the term structure is untouched.
+`content_hash` and `resolved_hash` include each node's inferred type, user annotation, binder
+types and cast target. `hash_type` hashes the type discriminant and the payload selected by
+its constructor. A changed refinement predicate can therefore change the fingerprint without
+changing the enclosing expression's term structure. The exclusions for `own_hash` are listed
+under [Three hashes, three questions](#three-hashes-three-questions).
 
-This section describes `content_hash` and `resolved_hash`, which agree on all of
-it. `own_hash` keeps the user annotation and drops the rest: a node's `ty`
-and a binder's `ty` because both are derived from the node and its children,
-and a `Cast`'s target because the differ reaches that target's refinement
-predicate as a *child* of the cast — the one place `diff`'s child enumeration
-departs from `TypedExpr::walk_children` — so folding it here too would report one
-threshold edit at the literal and again at the cast above it.
+Refinement predicates are terms and are hashed by `hash_rel` with the current term environment
+and free-variable policy. Their hashes are sorted before folding. Record and variant fields
+likewise contribute sorted hashes of their key/type pairs; variant openness also participates.
+Tuple fields remain positional. A `ChanDom` contributes its channel's spelling, not its uid or
+channel level. Function Pi-binder names are not hashed.
 
-Types are hashed with the same **uid-robust** discipline as terms: no identity
-that varies between two compilations of one source reaches the hash. Refinement
-predicates (which are *terms* living in type positions) go back through the term
-hasher, `Fun` Pi-binder names are ignored, and a `ChanDom`'s channel name
-contributes its spelling rather than its `Name`.
+A function contributes its `FunKind` discriminant. A kind variable additionally contributes its
+resolved kind, but not its allocation identity. Sum binders contribute their count, kinds and
+kind children; their IDs extend a witness environment over the domain and codomain. A
+`WitnessRef` found in that environment contributes its innermost-first position.
 
-A `Fun`'s `FunKind` participates. `A ⇒ B` and `A ⤇ B` are different
-computations — a data function's domain is its data, which is what drives
-iteration and forces its joins to be lossless — so the two must not collide. A
-`FunKind::Var` contributes what it was pinned to and not its `uid`, on the same
-grounds as `Infer`: the pin is determined by the one value that reaches the
-variable, the `uid` by allocation order.
+Recursive type fields and refinement predicate terms retain the enclosing witness environment,
+including the types attached to predicate nodes. Nested sums extend that environment for their
+body and restore it on return. A witness absent from the environment contributes only the
+`WitnessRef` discriminant, so external witness identities remain indistinguishable. This limitation
+is separate from accidental 64-bit collisions.
 
-`Hole` and `Infer` hash to a bare tag. Before inference every type is `Hole`,
-and a resolved tree contains no `Infer`, so collapsing unresolved structure to
-one value is a safe fallback rather than a determinism hazard — the diff never
-runs mid-inference.
+`Hole`, `SharedHole` and `Infer` contribute their respective discriminants, without IDs or
+inference bounds. A `BoundedHole` includes its bound. Before inference, annotations and
+lowering-built types can already contribute concrete structure; node types are not uniformly
+`Hole`. The public hashing functions do not enforce a compiler-phase precondition, so callers
+must not use these fingerprints as a complete comparison of unresolved inference state.
 
 ### A name rendered into a string is past the point uid-robustness applies
 
@@ -351,11 +300,10 @@ thing that holds other nodes — the word is used where the point is what a node
 contains rather than what it is, and every container is the root of a subtree.
 
 **1. Top-down anchoring.** Map the largest subtrees whose content hash is equal.
-Equal hash means isomorphic modulo α, so a single hash comparison at the root
-settles the whole subtree: the two are the same computation node for node, and
-the matcher maps the descendants along with it in one pass without comparing
-them again. Tallest-first, so a big anchor claims its descendants before
-anything inside it is considered separately.
+The interpretation of hash equality is specified in
+[Content addressing modulo α](#content-addressing-modulo-α). The matcher pairs the descendants
+by hash without a structural equality check. Tallest-first traversal lets an anchor claim its
+descendants before they are considered separately.
 
 Equal hash does not fix child order. The hash canonicalizes the nodes whose
 order carries nothing — a `Record`'s fields fold sorted by label, a
@@ -824,9 +772,10 @@ pipeline does not already understand.
 Running two versions side by side means giving each its own copy of any state
 they could disagree about, and of no other state. The question is per mutable
 variable and per sink: **is any divergence upstream of it in the dataflow
-graph?** If none is, the two versions provably write it identically and it needs
-one store; if one is, it needs a store per version (or copy-on-write, where the
-values happen to agree anyway — a runtime concern, not this one).
+graph?** If none is, the proposed analysis would share one store under the comparison assumptions
+in [Content addressing modulo α](#content-addressing-modulo-α). Otherwise it would use a store per
+version, or copy-on-write when runtime values agree. Hash-based classification alone does not prove
+that the versions write identical values.
 
 It is a reachability query over `divergences()` rather than new matching work,
 and it is what makes a second version cost the diff rather than 2×. Not built.

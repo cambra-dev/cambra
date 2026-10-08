@@ -1,85 +1,18 @@
-//! Content-addressing of CCL terms, modulo α-equivalence.
+//! Fingerprints of CCL terms for matching and change classification.
 //!
-//! Assigns every subterm a [`ContentHash`] such that two subterms hash equal
-//! **iff** they are structurally identical up to (a) consistent renaming of
-//! variables *bound within the subterm* and (b) the identity of variables that
-//! are *free* in the subterm. This is the primitive the program-differ is built
-//! on: equal hash ⇒ "the same computation", which the GumTree matcher (see
-//! [`crate::ccl::diff`]) turns into the shared / moved / updated / new /
-//! deleted classification. See `src/ccl/design/diffing.md`, "Content addressing
-//! modulo α".
+//! [`content_hash`] hashes free variables by spelling. [`resolved_hash`] instead uses
+//! caller-supplied binder correspondences; [`own_hash`] uses those correspondences but
+//! excludes children and selected type slots to localize changes. Bound term references
+//! are positional in all three operations.
 //!
-//! The hash is **type-aware**: a node's inferred type, user annotations, binder
-//! types, and cast targets all participate ([`hash_type`]) — two terms that
-//! differ only in a type (a refinement predicate, a base type, an annotation)
-//! are *not* the same computation. Types are hashed with the same uid-robust
-//! discipline as terms; the one thing skipped is *unresolved* type structure
-//! (`Hole`/`Infer`), which carries no identity. (Pre-inference most `ty`s are
-//! `Hole`, so type sensitivity there comes from annotations and lowering-built
-//! types like cast refinements; the full payoff lands once types are inferred.)
+//! These 64-bit hashes are not collision-free equality proofs. The comparison contract,
+//! type participation and ordering rules are owned by `src/ccl/design/diffing.md`,
+//! "Content addressing modulo α" and "Three hashes, three questions".
 //!
-//! # Why α-invariance is the whole problem
-//!
-//! Two independently-lowered programs that share a subexpression do not share
-//! its binders' identities. Pre-uniquify, a source binder is a
-//! [`Name::Raw`](crate::ccl::Name) spelling, so the *same* source binder yields
-//! the *same* name across versions — but post-uniquify every binder carries a
-//! globally-fresh `uid`, so even identical code compares unequal. A hash that
-//! is to recognize "the same computation" across versions therefore cannot hash
-//! a bound variable by its name/uid. It hashes it **positionally**:
-//!
-//! * A variable whose binder lies *inside* the subterm being hashed contributes
-//!   its De Bruijn index — invisible to α-renaming.
-//! * A variable that is *free* in the subterm contributes an identity supplied
-//!   by [`hash_free_var`] — the one place the hash's meaning is a choice
-//!   rather than a consequence of the term (see below).
-//!
-//! Lexical shadowing falls out for free: [`hash_rel`] resolves a name against
-//! the *innermost* enclosing binder, so a shadowed `Raw` name resolves to the
-//! binder a reader would pick.
-//!
-//! # Three hashes, one traversal
-//!
-//! The free-variable seam ([`FreeVars`]) is the one place the hash's meaning is
-//! a choice, and the two choices answer different questions:
-//!
-//! * [`content_hash`] identifies a free variable by its **spelling**. That is
-//!   context-free — a subterm hashes the same wherever it sits and in whichever
-//!   program — which is exactly the property a matcher looking for a subterm's
-//!   twin needs.
-//! * [`resolved_hash`] identifies it by **which binder it resolves to**, taken
-//!   up to a correspondence between the two programs. That is what "the same
-//!   computation" actually means, but it presupposes a correspondence, so it is
-//!   for classifying a matching rather than producing one.
-//!
-//! [`own_hash`] answers a third question over the same traversal: not "is this
-//! the same computation" but "did this node change", which a differ needs to
-//! report a disagreement at the node that owns it rather than at every ancestor.
-//! It resolves free variables like [`resolved_hash`] and folds only what is
-//! authored at the node — dropping its children, its inferred `ty`, and a
-//! binder's declared type, all three of which are derived from the first two.
-//!
-//! Everything else — the traversal, the De Bruijn treatment of bound variables,
-//! the type-awareness — is shared. See `src/ccl/design/diffing.md`, "Three
-//! hashes, three questions".
-//!
-//! # Phase-agnostic by construction
-//!
-//! The hash is a pure function of a [`TypedExpr`] plus the binder-scoping rules
-//! of [`crate::ccl::scope`], which cover **every** [`TypedExprNode`] variant —
-//! including the ones (`LetRec`, `Transact`) that exist only below the
-//! mutability phases. Nothing else is phase-sensitive, so one hash serves every
-//! [`Phase`](crate::ccl::context::Phase).
-//!
-//! # Complexity
-//!
-//! [`hash_all`] recomputes each subterm's standalone hash with a fresh binder
-//! environment, which is `O(n · depth)`. That is comfortable for real Cambra
-//! programs even with their deep `let`-spine. The asymptotically-tight scheme
-//! (Maziarz et al., *Hashing Modulo Alpha-Equivalence*, PLDI 2021 — `O(n
-//! log²n)` via per-subterm free-variable summaries and a commutative position
-//! combiner) slots in behind this same interface if a program ever grows large
-//! enough to feel it.
+//! Binding scopes come from [`crate::ccl::scope::for_each_scoped_item`]. The implementation
+//! accepts every [`TypedExprNode`] variant without inspecting compiler phase metadata.
+//! [`hash_all`] recomputes each subterm independently; see `src/ccl/design/diffing.md`,
+//! "Standalone hashing is the matcher's precondition".
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -88,9 +21,8 @@ use std::hash::{Hash, Hasher};
 use super::scope::{ScopedItem, for_each_scoped_item};
 use super::{FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode};
 
-/// The α-invariant content hash of a (sub)term. Two terms with equal
-/// `ContentHash` are α-equivalent up to free-variable identity (modulo the
-/// negligible collision probability of a 64-bit hash).
+/// A 64-bit term fingerprint under the chosen free-variable and structural hashing rules.
+/// Equal fingerprints can collide; they do not prove term equivalence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentHash(pub u64);
 
@@ -133,37 +65,10 @@ pub fn resolved_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
     ))
 }
 
-/// The α-invariant hash of what is **authored at** `e`: everything the node
-/// carries that is not derived from something else in the tree.
-///
-/// [`resolved_hash`] answers "is this the same computation", which a change
-/// anywhere below also answers no to. This answers the narrower question a
-/// differ needs to keep its set of disagreement sites minimal: did this node
-/// change, or is it only reflecting a change in a child that is already
-/// reported on its own?
-///
-/// Folds the node's discriminant, its payload ([`hash_payload`] under
-/// [`Fold::Own`]: a literal's value, an operator, a variant tag, a record's
-/// labels), the binders its variable occurrences resolve to, and its
-/// `user_annotation`. `scope` has the same meaning as in [`resolved_hash`].
-///
-/// Three things are left out, and derivedness rather than child-ness is what
-/// they have in common:
-///
-/// 1. the children's hashes, which is the point;
-/// 2. the node's inferred `ty`, computed from the payload and the children —
-///    folding it would report `let a = 1` → `let a = 2` at the `Let` as well as
-///    at the literal, since the `Let`'s type is the literal's singleton;
-/// 3. a binder's declared `ty`, on the same ground, and a `Cast`'s target,
-///    whose refinement predicate the differ reaches as a child of the cast.
-///
-/// A type change with no payload or child change still surfaces: the content
-/// hash sees it, at the node whose type it is.
-///
-/// A container therefore has close to no own content — a `Let`'s is its
-/// discriminant plus two `user_annotation`s, since its binder's name is De
-/// Bruijn and its type is skipped. That is the design working: a container is
-/// never a disagreement site on its own.
+/// Hash the node-local payload used to distinguish a change here from a change below.
+/// `scope` has the same correspondence-token contract as in [`resolved_hash`].
+/// Included fields and omitted type slots are specified in `src/ccl/design/diffing.md`,
+/// "Three hashes, three questions". Equal fingerprints do not prove equivalence.
 pub fn own_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
     let free = FreeVars::ByBinder(scope);
     let env = &mut Vec::new();
@@ -287,29 +192,10 @@ fn hash_name_ref(name: &Name, env: &[&Name], free: FreeVars<'_>, state: &mut Def
     }
 }
 
-/// Structurally hash a [`Type`] — the type-level companion to [`hash_rel`].
-/// The two are mutually recursive because terms carry types (a node's `ty`,
-/// annotations, cast targets) and types carry terms (refinement predicates).
-///
-/// Like the term hash, this is **uid-robust**: refinement predicates go through
-/// [`hash_rel`] (free names by spelling), `Fun` Pi-binder names are ignored — a
-/// `Some`-binder unreferenced by its codomain is observationally `None`, and a
-/// referenced one is matched through the spelling of its `Var` occurrences in
-/// the codomain's refinement — a [`Type::ChanDom`]'s channel name is folded by
-/// spelling, and `Variant` tags are [`FieldKey`]s (string/index, never a uid).
-/// `Record`/`Variant` fields are folded order-insensitively, mirroring the
-/// term-level record rule.
-///
-/// `Hole` and `Infer` hash to a bare discriminant tag: pre-inference every type
-/// is `Hole`, and a resolved AST contains no `Infer`, so collapsing all
-/// unresolved types to one value is a safe fallback rather than a determinism
-/// hazard (the diff never runs mid-inference).
-///
-/// `wenv` contains the enclosing Σ binders, innermost last. Bound witness references hash by
-/// De Bruijn index, so [`Type::alpha_convert_sum`] preserves the hash. Every recursive type
-/// and predicate-term traversal retains this scope, including types attached to predicate nodes.
-///
-/// [`FieldKey`]: crate::ccl::FieldKey
+/// Hash a type with the caller's term and witness environments. Recursive type fields and
+/// predicate terms retain the witness scope. Unresolved type identities and witness references
+/// outside that scope are not distinguished; see
+/// `src/ccl/design/diffing.md`, "The hash is type-aware".
 fn hash_type<'a>(
     ty: &'a Type,
     env: &mut Vec<&'a Name>,
@@ -499,9 +385,8 @@ enum Fold {
     /// Everything the node carries — what [`hash_rel`] wants, since the whole
     /// subtree's identity is the question.
     Whole,
-    /// Only what is authored at this node and not derived from anything else
-    /// in the tree — what [`own_hash`] wants. Three exclusions, not one: the
-    /// children, the node's inferred `ty`, and a binder's declared `ty`.
+    /// The node-local payload for [`own_hash`]; see `src/ccl/design/diffing.md`,
+    /// "Three hashes, three questions" for the exclusions.
     Own,
 }
 
