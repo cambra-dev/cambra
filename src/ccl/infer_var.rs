@@ -449,6 +449,22 @@ impl Telescope {
         self.opaque.borrow().contains(name)
     }
 
+    /// This scope cut at `binder`'s entry: the scope whose innermost lexical entry is
+    /// `binder`, and the lexical entries entered after it, innermost first. `None` when
+    /// `binder` is not a lexical entry.
+    pub fn split_at(&self, binder: &Name) -> Option<(Telescope, Vec<Name>)> {
+        let mut after = Vec::new();
+        let mut cur = self;
+        loop {
+            let node = cur.lexical.as_ref()?;
+            if node.binder == *binder {
+                return Some((cur.clone(), after));
+            }
+            after.push(node.binder.clone());
+            cur = &node.parent;
+        }
+    }
+
     /// The lexical binders, innermost first.
     pub fn iter(&self) -> impl Iterator<Item = &Name> {
         let mut cur = &self.lexical;

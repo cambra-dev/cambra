@@ -78,6 +78,15 @@ pub enum CoalesceError {
         /// Pretty representation of the cycle entry point.
         details: String,
     },
+    /// A collection's domain names a binder the type leaves the scope of as the join over
+    /// every value it takes, and its keys differ per value, so there is no join
+    /// ([`super::compact::JoinViolation`]).
+    NoJoinOverBinder {
+        /// The joined binders the domain's refinement names.
+        binders: Vec<crate::ccl::Name>,
+        /// The domain's refinement naming them.
+        refinement: crate::ccl::Refinement,
+    },
     /// A data function carrying >= 2 candidate domains (a conditional collection) met a compute
     /// function at a positive join, so collapsing to the ordinary meet would
     /// drop domains. Reported loudly rather than silently losing data (no
@@ -314,6 +323,12 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
     if !graph.rec_vars.is_empty() {
         return Err(CoalesceError::RecursiveType {
             details: format!("{} recursive variable(s) in graph", graph.rec_vars.len()),
+        });
+    }
+    if let Some(violation) = graph.join_violations.first() {
+        return Err(CoalesceError::NoJoinOverBinder {
+            binders: violation.binders.clone(),
+            refinement: violation.refinement.clone(),
         });
     }
     coalesce_compact_go(&graph.term, true, &[])
@@ -960,6 +975,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            join_violations: Vec::new(),
         };
         assert_eq!(
             coalesce_compact(&graph).unwrap(),
@@ -1000,6 +1016,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            join_violations: Vec::new(),
         };
         assert!(matches!(
             coalesce_compact(&graph),
@@ -1028,6 +1045,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            join_violations: Vec::new(),
         };
         assert!(matches!(
             coalesce_compact(&graph),
@@ -1090,6 +1108,7 @@ mod tests {
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
+            join_violations: Vec::new(),
         };
         let t = coalesce_compact(&graph).unwrap();
         assert!(matches!(t, Type::Infer(_)), "expected Infer, got {t:?}");
