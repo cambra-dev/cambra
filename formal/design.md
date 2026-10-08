@@ -324,7 +324,8 @@ The compared fragment is bounded by the encoders, not just by whether Rust accep
   diagnostic domain-conflict payloads. It rejects a history slot, a function with binders, a
   sum-kind pin, and unsupported atoms or predicates.
 - `KindPin::Data` and `KindPin::Plain` both encode as the model's data kind. Their distinction
-  is therefore not checked by that comparison.
+  is therefore not checked by that comparison. The active
+  `bug_plain_and_data_pins_have_the_same_wire_encoding` test pins this missing distinction.
 - The subtype generator excludes duplicate record/variant keys, which violate
   `Ty.WellFormed`. The model's find-first field rules and Rust's equality shortcut must not be
   assumed equivalent for duplicate-keyed inputs.
@@ -332,9 +333,8 @@ The compared fragment is bounded by the encoders, not just by whether Rust accep
   application, predicate-local lambdas and cast-domain refinements. Expression nodes without a
   corresponding predicate constructor, such as let-bindings and aggregates, are outside it.
 
-Subtype, polar-merge and coalesce drivers panic when a generated case unexpectedly falls outside
-their wire schema. Refusal generation skips an unencodable pair; kind merging omits an
-unencodable step but continues folding. Those exclusions are not successful comparisons.
+All five drivers panic when a generated case unexpectedly falls outside their wire schema.
+The generators target the modeled fragment; encoding failures are not omitted from comparisons.
 The drivers check the number of returned verdicts as well as their agreement.
 
 The documentation-reference checker scans Markdown and Rust, not Lean comments. Markdown

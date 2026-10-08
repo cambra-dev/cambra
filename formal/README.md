@@ -69,11 +69,9 @@ Coalescing compares successful types, unresolved results and error kinds. The ki
 is separate because the compact-type wire has no Σ binder slot.
 
 Coverage is limited by both the generators and encoders.
-[The design reference](design.md#the-differential-oracles) owns these exclusions. In particular,
-encoding failure is not uniformly fatal: subtype, polar-merge and coalesce drivers panic on
-unexpected unencodable generated cases, while refusal generation skips unencodable pairs.
-Kind merging continues its fold but omits any step that cannot be encoded. A passing run does
-not validate those omitted cases.
+[The design reference](design.md#the-differential-oracles) owns these exclusions. All five drivers
+fail on unexpected unencodable cases or steps; a passing run establishes agreement only for the
+generated fragment.
 
 ## Running it
 
@@ -119,7 +117,7 @@ echo '{"op":"sub","lhs":{"k":"base","base":"Int"},"rhs":{"k":"base","base":"Bool
 ```
 
 `CAMBRA_DIFF_DUMP=<path>` appends the subtype driver's generated JSONL cases only.
-Open/write failures are ignored by that dump path; verify that the file was written.
+Opening or writing the dump fails the test with a diagnostic naming the path.
 Keep the failing seed and source revision for replay. Unknown operation tags and malformed JSON
 produce error verdicts rather than a subtype answer.
 

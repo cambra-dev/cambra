@@ -6,9 +6,7 @@
 //!
 //! Each driver compares generated cases and checks the returned verdict count.
 //! [`oracle_or_skip`] permits a missing binary locally but rejects it under CI.
-//! The subtype, polar-merge and coalesce drivers reject unexpected encoding gaps;
-//! the refusal and kind-merge drivers omit unencodable cases or steps. Those omissions
-//! do not establish agreement outside the encodable fragment.
+//! All five drivers reject unexpected encoding gaps rather than omitting cases or steps.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
