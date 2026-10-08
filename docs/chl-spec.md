@@ -989,9 +989,9 @@ any other name is a compile-time error.
 
 ### 3.9 Subscript and attribute access
 
-Current subscript syntax distinguishes proven application from checked lookup:
+Subscript syntax distinguishes proven application from checked lookup:
 
-| Form | Meaning today | Result |
+| Form | Meaning | Result |
 |---|---|---|
 | `c[k]` | Apply the collection to a key accepted by its domain type. | The value at `k`. |
 | `c[k]?` | Check a compatible key for membership in a keyed collection. | `Option` of the value type. |
@@ -1002,32 +1002,18 @@ A missing product field is a type error. Product projection and collection looku
 `t[0]` is rejected, not interpreted as `t.0`. Projections compose, as in `r.p.1` and `t.0.b`.
 An identifier cannot begin with a digit, so named and positional field syntax do not collide.
 
-Proven lookup is subject to application typing. A `FullMap(K, V)` parameter accepts a key of type
-`K` without a separate membership proof. Concrete `map`, `set` and `groupby` results instead carry
-a refined present-key domain. The compiler does not yet derive the required membership evidence
-from an element of the source, an application of its key function, or a projected source field.
-Those cases fail inference; integer subscripts on range-domain lists are also rejected in the
-current tested cases. The intended rule would accept indices whose presence is established,
-rather than define an absent-key runtime result for proven lookup.
+`c[k]` evaluates a finite function at a point and requires a proof that `k` is in its domain.
+A `FullMap(K, V)` accepts a key of type `K`; a refined present-key domain instead requires
+membership in that refinement. Proven lookup does not define an absent-key runtime result.
 
-Checked lookup is implemented for maps and sets. `s[k]?` returns `Option(unit)`; presence gives
-`some` with a unit payload, and absence gives `none`. An exact `Map(K, V)` parameter exposes
-the keyed type needed for this operation; a bounded parameter can remain unresolved and fail
-inference. Checked lookup on a range-domain list or a tuple is rejected. A checked `groupby`
-lookup can pass inference with a key-dependent group type but fails operator conversion because
-the streamed answer would itself be a collection. The implementation contracts and regressions
-are in [The checked lookup](../src/ccl/design/collections.md#the-checked-lookup-𝑐𝑘).
+Checked lookup returns `some` with the value when the key is present and `none` when absent.
+For a set, the value is unit. Presence can be established before the domain is final; absence
+requires the final domain. A live feed with no final domain may never answer an absent-key lookup.
 
-For a streamed collection, a present key can produce `some` before termination. A missing key
-produces `none` only after the collection becomes terminal. A live stream may therefore never
-answer an absent-key lookup. A materialized map value has a complete binding list and can decide
-absence when it arrives; the stream rule does not impose an additional wait on that value.
+#### Subscript and unwrap syntax [Decided]
 
-#### Planned subscript and unwrap syntax
-
-The decided replacement makes `c[k]` the optional lookup and retires `c[k]?`. A presence proof
-would narrow its result from `Option(T)` to the single arm `some(T)`. A new postfix `!` would
-unwrap that single-arm value:
+The replacement makes `c[k]` the optional lookup and retires `c[k]?`. A presence proof narrows
+its result from `Option(T)` to the single arm `some(T)`. Postfix `!` unwraps that single-arm value:
 
 ```python
 def unwrap(o: {`some{T}}) => T:
@@ -1040,16 +1026,16 @@ establish presence is a type error at `!`, not a runtime unwrap failure. The des
 is [Destructuring patterns](#431-destructuring-patterns). The proposed `!` has postfix precedence;
 `!=` remains one token, so `x! == y` requires a space before `==`.
 
-The compiler has no postfix `!`. Today's `c[k]?` corresponds to the planned `c[k]`, and today's
-`c[k]` corresponds to the planned proven access `c[k]!`. A direct call `c(k)` remains function
-application, not an optional membership test.
+> **[Interim]** The compiler has no postfix `!`. Today's `c[k]?` corresponds to the decided
+> `c[k]`, and today's `c[k]` corresponds to the decided proven access `c[k]!`.
 
-#### Planned methods
+A direct call `c(k)` remains function application, not an optional membership test.
 
-`x.m(args)` is intended to call a method of `x`'s type. Calling a function stored in a field
-would instead use `(r.f)(args)`. This distinction belongs to
-[Nominal types and methods](#68-nominal-types-and-methods-decided); it is not implemented method
-dispatch.
+#### Method calls [Decided]
+
+`x.m(args)` calls a method of `x`'s type. Calling a function stored in a field takes parentheses
+around the projection: `(r.f)(args)`. See
+[Nominal types and methods](#68-nominal-types-and-methods-decided).
 
 #### Absence at a cut [Open]
 
@@ -1061,7 +1047,7 @@ not yet provide a general cut interface for this rule.
 An unpinned live feed still cannot establish absence. A provisional `none` followed by a
 correction would require incremental view maintenance, not an irrevocable Option answer.
 A timeout-based answer would depend on wall-clock timing. These alternatives do not change
-the current rule: an empty nonterminal stream tile is not evidence of absence.
+the current rule: a lookup decides absence only once the collection's domain is final.
 
 ### 3.10 Lambda
 
@@ -1115,10 +1101,8 @@ applies to mutable values written by an enclosing loop. A parameter can become c
 call site: `def f(n): [n, 1]` accepts `f(3)` but not `f(x)` inside `for x in xs`.
 Use a comprehension, such as `[n for i in [1, 2]]`, to repeat a varying value.
 
-Constant folding implements only part of this contract. `[1 + 1]` folds and is accepted;
-`[sum([1, 2])]` reaches operator conversion unreduced and is rejected with
-"a list element has to be a value here, and constant folding did not reduce this one".
-The scalar folder does not evaluate sources, aggregates, whole collections or lambdas.
+> **Partly implemented.** `[1 + 1]` is accepted, but `[sum([1, 2])]` is not yet accepted as a
+> constant list literal.
 
 Tuples and records are products, projected with `.` rather than subscripted; see
 [Subscript and attribute access](#39-subscript-and-attribute-access).
@@ -1144,11 +1128,8 @@ Both return concrete data functions over the present keys. A sum annotation requ
 for example `m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))`.
 `list(...)` is not a builtin; `box([1, 2])` can satisfy a `List(Int)` annotation.
 
-Repeated set elements produce one key. Repeated map keys are invalid, but the current check is a
-runtime assertion: `map([(1, 10), (1, 20)])` compiles and panics in both debug and no-assertions
-builds. It is not currently a compile-time diagnostic. The constructor implementation and fault
-boundary are specified in
-[Constructor lowering](../src/ccl/design/collections.md#constructor-lowering-runtime-groupby-now-constant-folding-later).
+Repeated set elements produce one key. Duplicate keys in a constant map are a compile-time error;
+see [Type-directed literals](#type-directed-literals-decided).
 
 #### Empty forms
 
@@ -1170,18 +1151,17 @@ The set annotation works because `Set(K)` currently lowers as `Map(K, unit)`. An
 Inference details and the distinction between empty positional and keyed domains belong to
 [The empty literal names no element type](../src/ccl/design/collections.md#the-empty-literal-names-no-element-type).
 
-#### Type-directed literals [Decided, not implemented]
+#### Type-directed literals [Decided]
 
-The intended literal typing inserts constructors according to annotation or usage. A positional
-literal could supply an `Array`, `List` or `Set`; a pair literal could supply a list of pairs,
-a set keyed by whole pairs, or a map keyed by first components. The chosen collection type,
-not a distinct pair-literal AST node, would determine re-keying.
+Literal typing inserts constructors according to annotation or usage. A positional literal can
+supply an `Array`, `List` or `Set`; a pair literal can supply a list of pairs, a set keyed by whole
+pairs, or a map keyed by first components. The chosen collection type, not a distinct pair-literal
+AST node, determines re-keying.
 
-The proposed explicit forms include `list([…])`, `set([…])` and `map([…])`. An annotation such
-as `m: Map(K, V) = [k -> v, …]` or a keyed lookup would select `map` implicitly.
-Current lowering does not insert these constructors.
+The explicit forms are `list([…])`, `set([…])` and `map([…])`. An annotation such
+as `m: Map(K, V) = [k -> v, …]` or a keyed lookup selects `map` implicitly.
 
-The planned constant-map rule rejects duplicate keys at compile time, applying the immutable
+The constant-map rule rejects duplicate keys at compile time, applying the immutable
 non-overlap rule described under [Collection types](#63-direction-collection-types-decided).
 Mutable or fed collections instead use their declared merge law. The key type must support
 equality; general discharge through contextual parameters remains planned.
@@ -2468,10 +2448,9 @@ are not.
 
 ### 6.3 Direction: collection types [Decided]
 
-The intended collection interface has six forms. This table describes the design, including
-lookup syntax that is not yet implemented; the following paragraphs separate current behavior.
+The collection interface has six forms:
 
-| Type | Domain and elements | Intended access |
+| Type | Domain and elements | Access |
 |---|---|---|
 | `Array(n, T)` | `n` indexed values of type `T`; length is static. | `arr[i]!` when the index type establishes the bound. |
 | `List(T)` | Indexed values of type `T`; length is not named statically. | `lst[i]` returns `Option(T)`. |
@@ -2492,30 +2471,22 @@ dependent sums. Introducing one of those sums from a concrete collection require
 Existing sums can widen under the sum-kind relation; that relation is not automatic insertion
 of a constructor into an unboxed term.
 
-Current subscripts use `c[k]` for application and `c[k]?` for optional keyed lookup. Range
-lookups and collection-valued streamed lookup answers have implementation limits; see
-[Subscript and attribute access](#39-subscript-and-attribute-access).
-Current iteration binds values for every collection, so `sum(m)` can sum a map's numeric
-values. It does not implement the proposed per-type iteration interface below.
-
-#### Intended collection operations
+#### Collection operations
 
 - Arrays and lists have positional order. Sets, maps and generic collections have no
-  implicit order. Order-dependent operations over unordered collections would take an explicit
+  implicit order. Ordering follows from the type and is not stored. Order-dependent operations
+  over unordered collections take an explicit
   ordering instance. Default parallel iteration and loop-carried dependencies are specified in
   [Iteration](#46-for--iteration); storage order does not establish a source-language ordering.
-- Membership `in` is planned to test keys for sets/maps and values for arrays/lists/collections.
-  A successful key-membership guard would refine the key for proven access. No general source
-  `in` operator implements this rule today.
-- Maps would iterate entries, sets keys, and arrays/lists/collections values. Planned
-  `keys(m)`, `values(m)` and `items(m)` would expose lazy collection views. Under that design,
-  numeric `sum(m)` would reject entries and `sum(values(m))` would request value aggregation.
-  These view builtins and dispatch rules are not implemented.
-- Type-directed literals would share `[…]` across collection forms; explicit or inferred
-  constructors would select positional storage or re-keying. The current explicit constructors,
-  constant-element restriction and duplicate-key fault are in
+- Membership `in` tests keys for sets/maps and values for arrays/lists/collections.
+  A successful key-membership guard refines the key for proven access.
+- Maps iterate entries, sets keys, and arrays/lists/collections values. `keys(m)`, `values(m)` and
+  `items(m)` expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(values(m))`
+  requests value aggregation.
+- Type-directed literals share `[…]` across collection forms; explicit or inferred
+  constructors select positional storage or re-keying. The constructors and constant-element rule are in
   [List, tuple, record literals](#311-list-tuple-record-literals).
-- Immutable collections would support non-overlapping element-wise definitions `c[i] = v`.
+- Immutable collections support non-overlapping element-wise definitions `c[i] = v`.
   Feed uses `c << v`, and keyed mutation uses `c[i] := v`. Their current supported forms
   belong to [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 

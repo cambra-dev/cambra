@@ -247,14 +247,16 @@ proposal, not the current error stage.
 in both debug and no-assertions builds. The assertion is not a returned compile diagnostic or
 an Option-valued lookup result.
 
-The runtime has no query-data fault channel for this operation. A caller can observe a process
-panic rather than a query-local error; the effect on other requests depends on the host's panic
-handling. Replacing the assertion with an arbitrary winner would change map construction semantics.
+The runtime has no query-data fault channel for this operation. The CLI host does not catch this
+panic in its scheduler loop, so a duplicate key terminates the process and fails every request it
+is serving. Replacing the assertion with an arbitrary winner would change map construction semantics.
 A query-local fault channel and compile-time checking of constant collections are separate work.
 
 `set([1, 1])` instead consumes the repeated group with `Drain` and produces one key.
 Explicit `map([k -> v for ...])` uses the same constructor path. Implicit re-keying selected
 only by an annotation or lookup remains planned.
+Literals are not the fault boundary: a map comprehension built from request data inherits this
+process fault. The appropriate failure behavior for that case remains an open decision.
 
 ## Operations: how the trait layer dispatches [Planned]
 

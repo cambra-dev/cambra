@@ -452,6 +452,8 @@ fn lower_rekeyed(
 /// Construct the present-key refinement, sharing `key` between its base and the
 /// key morphism's codomain. The caller supplies a `SharedHole`; a one-way builtin bound
 /// would not equate the types. The result must be available during constraint emission.
+/// Without the shared hole, the base receives only a lower bound, admitting `Map(String, _)`
+/// over `Int` keys.
 /// See `src/ccl/design/collections.md`, "The key domain is the key morphism's image".
 fn present_key_domain(
     collection: &Expr,

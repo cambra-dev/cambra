@@ -5588,8 +5588,8 @@ fn subscript_is_lookup_and_dot_is_projection() {
         "a tuple has no domain to look up in"
     );
 
-    // Lookup on a collection is one operation however it is spelled, and all three
-    // spellings fail the same undischarged-membership edge.
+    // BUG: these valid lookups should have type Int and evaluate to 10. All three spellings
+    // fail the same undischarged-membership edge. Replace rejection with success when fixed.
     for program in [
         "xs = [10, 20, 30]\nxs[0]",
         "xs = [10, 20, 30]\ni = 0\nxs[i]",
@@ -5597,7 +5597,7 @@ fn subscript_is_lookup_and_dot_is_projection() {
     ] {
         assert!(
             !infer_program_err(program).is_empty(),
-            "no index proves membership yet, so `{program}` must be rejected"
+            "BUG pin: valid range lookup now succeeds; replace this rejection assertion: {program}"
         );
     }
 }
