@@ -105,9 +105,9 @@ inferred type. No entry is available from which to recover its key or value type
 
 `TypeKind` has no inference-variable form. Generalizing the empty constructor across kinds
 would require a representation and inference rules for an unknown kind; this remains a proposal,
-not an implemented replacement for `empty_map()`. Distinguishing nominal `Set` and `Map` types
-would also require separate constructors or another explicit selection rule; see
-[Telling `Set` and `Map` apart](#telling-set-and-map-apart-open).
+not an implemented replacement for `empty_map()`. The decided nominal `Set` and `Map` replace it
+with the two values `Set::empty` and `Map::empty`; see
+[Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided).
 
 ## The collection type is declared, not read off the shape
 
@@ -117,31 +117,40 @@ identify that intent. A set and a map with unit values have the same representat
 positional and a keyed collection can expose overlapping domain shapes.
 
 Current loops bind the codomain unconditionally. The type-directed choice below is proposed
-work, not a dispatch mechanism already implemented by the compiler. Structural subtyping remains
-a separate relation: a set is structurally a collection of unit values even when the intended
-set interface iterates keys.
+work, not a dispatch mechanism already implemented by the compiler. `Set` is a nominal builtin with
+no edge to `Collection` ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided)), so
+its keys are reached through `keys` rather than through a structural reading of its values.
 
-## Telling `Set` and `Map` apart [Open]
+## Telling `Set` and `Map` apart [Decided]
 
-`Type` has no nominal collection constructor distinguishing `Set(K)` from `Map(K, unit)`.
-One candidate is to make those two nominal types while retaining structural array/list/collection
-representations. This proposal must decide:
+`Type` has no nominal collection constructor distinguishing `Set(K)` from `Map(K, unit)` today.
+The decision is that `Set`, `Map` and `FullMap` become **nominal builtins**: type constructors the
+compiler declares, opaque as a `type` declaration is
+([chl-spec, 6.8 Nominal types and methods [Decided]](../../../docs/chl-spec.md#68-nominal-types-and-methods-decided)),
+with no constructors or `extract` a program can reach. `Array`, `List` and `Collection` stay
+structural: the kind already tells a bare range `Fun`, `UIntRanges` and `Type` apart. `FullMap` is nominal
+because it iterates entries as `Map` does, which a structural `(𝑘: 𝐾) ⤇ 𝑉` does not.
 
-- Whether a nominal constructor remains around the sum. Expanding it to the same structural sum
-  and discarding its name would not provide a dispatch distinction.
-- Whether `Map(K, V) <: Collection(V)` remains an implicit relation. The current structural
-  sum relation admits that widening. A nominal design could instead require `values(m)`.
-- How the nominal parameters vary under subtyping. The current structural relation derives
-  its constraints from the sum body and kind; a nominal constructor would need stated rules.
+The three questions the decision answers:
 
-The proposal and its interaction with
-[nominal types](../../../docs/chl-spec.md#68-nominal-types-and-methods-decided) are unresolved.
-The explicit-domain `FullMap` remains a data-function form, including dependent group-by
-codomains; nominalizing `Set` and `Map` does not itself replace it.
+- **The nominal constructor remains around the sum.** `Map(𝐾, 𝑉)` wraps
+  `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, `Set(𝐾)` wraps `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ unit`, and
+  `FullMap(𝐾, 𝑉)` wraps `(𝑘: 𝐾) ⤇ 𝑉`. Inference resolves the builtin's operations on the
+  name, and the first implementation erases it once they are resolved. Erasure is
+  [open in the spec](../../../docs/chl-spec.md#a-nominal-type-is-opaque).
+- **`Map(𝐾, 𝑉) <: Collection(𝑉)` does not hold**, and no edge leads from `Set` or `FullMap` to a
+  structural type. A nominal type is related only to itself, so reaching a `Collection` takes
+  the method `keys`, `values` or `items`, and `sum(m)` is rejected at the missing edge.
+- **Variance is read off the wrapped representation**, as a declared type's is read off its
+  constructors' parameter types.
 
-Current codomain iteration makes `for g in groupby(xs, key)` bind groups. Uniform entry
-iteration is another possible interim design: a set entry would be `(K, unit)` rather than `K`.
-That would change source-visible behavior and is not implemented here.
+`FullMap(𝐾, 𝑉)`'s second parameter is a family over the key, since `𝑉` may depend on `𝑘` for a
+group-by. A nominal builtin's parameter therefore accepts a type family where a declared type's
+parameter takes a type.
+
+None of this is implemented. Current codomain iteration makes `for g in groupby(xs, key)` bind
+groups. Uniform entry iteration is a possible interim design: a set entry would be `(K, unit)`
+rather than `K`. That would change source-visible behavior and is not implemented here.
 
 ## `groupby`'s exact type
 
@@ -271,20 +280,33 @@ The proposal assigns per-type `Iterable`, `Index`, `Membership` and `Ordering` o
 These collection interfaces are distinct from the solver's implemented arithmetic/comparison
 trait tables. General contextual-parameter/typeclass resolution remains future work.
 
-- Iteration would select values, keys or entries after inference determines the collection
-  type. The proposed coalescing hook would choose which part of the existing iteration
-  record to expose. Current lowering binds values and does not implement that dispatch.
+- `for x in c` places the requirement `Iterable(𝐶, Item=𝐸)` on `c`'s type and binds `x: 𝐸`
+  ([chl-spec, 4.6 `for` — iteration](../../../docs/chl-spec.md#46-for--iteration)). The solver
+  discharges it once `𝐶`'s head is known, as it discharges an operator's requirement, and a
+  polymorphic `def` generalizes over it. The instances are built in: values for a structural
+  collection, including every comprehension result; keys for `Set`; entries for `Map` and
+  `FullMap`. A nominal type is related only to itself, so every producer of a value names the same
+  head and the instance does not depend on where the value flows. The instance chooses which part
+  of the existing iteration record to expose. Current lowering binds values and does not
+  implement that dispatch.
 - Optional lookup would decide membership at runtime; proven access would require a key
   refinement. The surface spellings are governed by the CHL reference, not duplicated here.
 - Membership would test map/set domains and list/collection values. A key-membership guard
   would introduce the evidence required for proven lookup.
+- `len(c)` places the built-in requirement `HasLen(𝐶)`
+  ([chl-spec, Trait requirements](../../../docs/chl-spec.md#trait-requirements)). Each instance
+  reads the size of the collection's domain: an `Array`'s static `𝑛`, a `List`'s witness range,
+  the key count of a `Set`, `Map` or `FullMap`, and the position count of a `Collection`. A
+  `FullMap`'s key type is a finite present-key domain, the only kind a producer constructs.
+  Nothing implements it yet.
 - Ordering would come from positional domains or an explicit ordering instance, rather than
   the incidental storage order of keyed data. Loop-carried dependencies and collection order
   remain distinct questions.
-- `keys`, `values` and `items` would expose lazy views without copying collection data.
-  Whether conversion to `Collection(V)` is implicit depends on the nominal-type decision.
-  Entry iteration would make numeric `sum(m)` inappropriate for maps, whereas current value
-  iteration permits it when the values support summation.
+- The methods `keys`, `values` and `items` of `Map` and `FullMap`, and `keys` of `Set`, would
+  expose lazy views without copying collection data. The nominal `Map` has no edge to
+  `Collection(V)` ([Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided)), so these
+  views are the only route to one, and `sum(m)` is an error where `sum(m.values())` is not.
+  Current value iteration permits `sum(m)` when the values support summation.
 
 The suggested re-pairing of an existing keyed domain is a representation plan, not an implemented
 runtime-free conversion API. No surface view constructor should be inferred from these names.

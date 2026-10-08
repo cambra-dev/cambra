@@ -1571,12 +1571,11 @@ fn test_list_map_reseals_to_list() {
 /// in the kind lattice withholds it and a map handed to a `Collection(𝑉)` slot is read as
 /// its values.
 ///
-/// Whether the edge should exist is undecided
-/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"). Withholding it
-/// is what a declared type constructor would be for, and nothing in [`Type`] carries one, so
-/// neither side is implemented. Answering the question that way turns the first assertion
-/// into a rejection pointing at `values(m)`; the `List` assertion is not interim, being the
-/// same structural arm at a positional kind, where no nominal question arises.
+/// The edge is decided against: `Map` becomes a nominal builtin related only to itself
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Decided]"). Nothing in
+/// [`Type`] carries a nominal type yet, so the decision is not implemented. When it is, the
+/// first assertion turns into a rejection pointing at `m.values()`; the `List` assertion is not
+/// interim, being the same structural arm at a positional kind, where no nominal type arises.
 ///
 /// [`test_map_consumption_is_kind_blind_interim`] pins the other route into a map's values.
 #[test]
@@ -1881,15 +1880,15 @@ fn a_set_annotation_is_a_unit_valued_map() {
 /// group-by, so the map takes it too.
 ///
 /// Direct consumption is the second route into a map's values, beside the widening
-/// [`test_a_map_widens_to_collection_interim`] pins, and the same open question covers which
-/// of the two rejects `sum(m)`
-/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]"). This route is
+/// [`test_a_map_widens_to_collection_interim`] pins, and the nominal `Map` closes both: it has
+/// no edge to a structural collection
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Decided]"). This route is
 /// the [Interim] "`for`-in binds the codomain for every kind" state rather than a second
-/// subtyping hole: closing it means giving `Map` a per-kind `Iterable` instance, which needs
-/// the kind represented
+/// subtyping hole: closing it means giving `Map` its own `Iterable` instance, chosen by its
+/// nominal head
 /// (`src/ccl/design/collections.md`, "The collection type is declared, not read off the shape").
 /// When the operation layer lands this assertion flips to a rejection pointing at
-/// `values(m)`.
+/// `m.values()`.
 #[test]
 fn test_map_consumption_is_kind_blind_interim() {
     assert_eq!(

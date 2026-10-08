@@ -105,7 +105,7 @@
 //! `tests/chl_parser_roundtrip.rs`; recovery here stops before those lines, so this run
 //! says nothing about them.  What the rollup still needs is entry iteration:
 //! `for key -> g in groupby(…)` binds a pair only once a keyed collection iterates entries
-//! (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Open]").
+//! (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart [Decided]").
 
 use super::common::expect_compile_error_past;
 
