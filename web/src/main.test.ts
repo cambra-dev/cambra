@@ -19,10 +19,12 @@ import {
   renderApp,
   serializeDiagnostics,
 } from "./main";
+import { LiveStore } from "./liveStore";
 import { Store } from "./store";
 import { isIrPane } from "./types";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
 
+import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import failedJson from "./__fixtures__/failed.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
@@ -307,5 +309,41 @@ describe("renderApp: pane visibility", () => {
         "hidden",
       ),
     ).toBe(true);
+  });
+});
+
+describe("the header's values badge", () => {
+  beforeAll(stubLayout);
+
+  const badges = (root: HTMLElement) =>
+    Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
+
+  it("says values are awaited before a frame arrives", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)), new LiveStore());
+    expect(badges(root)).toContain("waiting for values");
+    expect(badges(root)).not.toContain("static (no values)");
+  });
+
+  it("says a run is live once it publishes", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    renderApp(root, new Store(fixture(arithmeticJson)), live);
+    live.apply({ published: 3, final: false, nodes: [], sources: [] });
+    expect(badges(root)).toContain("live · frame 3");
+  });
+
+  it("says a run is finished once its last frame arrives", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    renderApp(root, new Store(fixture(arithmeticJson)), live);
+    live.apply({ published: 4, final: true, nodes: [], sources: [] });
+    expect(badges(root)).toContain("finished");
+  });
+
+  it("stays static when nothing drives the program", () => {
+    const root = document.createElement("div");
+    renderApp(root, new Store(fixture(arithmeticJson)));
+    expect(badges(root)).toContain("static (no values)");
   });
 });
