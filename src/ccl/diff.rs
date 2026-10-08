@@ -1,64 +1,16 @@
-//! Structural diff of two CCL programs — the shared / new / deleted analysis
-//! that whole-program branching is built on. See `src/ccl/design/diffing.md`.
+//! Match two CCL trees and classify their content and placement changes.
 //!
-//! Given two [`TypedExpr`] trees, [`diff`] computes a node correspondence and
-//! classifies it. It is a GumTree-style matcher (Falleri et al., *Fine-grained
-//! and accurate source code differencing*, ASE 2014) over the α-invariant
-//! [`content_hash`](super::content_hash::content_hash):
+//! [`diff`] borrows two [`TypedExpr`] trees and returns a correspondence, not a rewrite.
+//! Its matching stages and recovery bounds are specified in `src/ccl/design/diffing.md`,
+//! "The correspondence: a GumTree matcher". Hash equality relies on the assumptions in
+//! `src/ccl/design/diffing.md`, "Content addressing modulo α"; it is not an equality proof.
 //!
-//! 1. **Top-down anchors.** Map the *largest* subtrees whose content hash is
-//!    equal — equal hash means isomorphic modulo α, so the whole subtree is
-//!    *shared*. Larger subtrees are claimed first; once a node is matched its
-//!    descendants are matched with it (paired by hash, which is correct for the
-//!    order-insensitive nodes too).
-//! 2. **Root anchoring.** Two programs being diffed are two versions of *one*
-//!    program, so their roots correspond by construction ([`anchor_roots`]).
-//!    Nothing else can establish that — a root that gained a statement scores
-//!    too low for step 3 to pair it, and the whole program would read as
-//!    deleted-and-reinserted for a one-statement edit.
-//! 3. **Bottom-up container recovery.** An interior node left unmatched is
-//!    paired with the best same-kind candidate in the other tree that
-//!    *contains* enough of its already-matched descendants. This is what keeps
-//!    an inserted statement from desynchronizing the whole `let`-spine below
-//!    it: the unchanged tail anchors in step 1, and the containers above it are
-//!    recovered here rather than reported as wholesale rewrites.
-//! 4. **Optimal recovery inside a paired container.** Two containers paired in
-//!    step 2 or 3 still have unmatched descendants — near-identical subtrees
-//!    whose hashes differ somewhere inside. [`recover`] maps those *optimally*,
-//!    by tree edit distance ([`ted`]), so an edit deep inside a large subtree
-//!    does not read as a wholesale replacement of everything around it.
+//! [`Match`] separates [`Content`] from [`Placement`]. [`Diff::divergences`] and
+//! [`Diff::shared_roots`] reduce those classifications; see `src/ccl/design/diffing.md`,
+//! "The actionable form: divergences and shared roots".
 //!
-//! The result is then classified along two independent axes ([`Match`]):
-//! whether the node's **content** changed ([`Content`]) and whether its
-//! **placement** did ([`Placement`]). A source-only node is **deleted**; a
-//! target-only node is **new**.
-//!
-//! That classification is complete but says the same thing many times — every
-//! *ancestor* of an edit has changed content, and every *descendant* of an
-//! inserted subtree is new. [`Diff::divergences`] reduces it to the places the programs actually
-//! disagree, and [`Diff::shared_roots`] to the largest pieces they have in
-//! common. Those two are the actionable form: the first says where a version
-//! guard goes, the second says what the two versions can compute once.
-//!
-//! # Phase-agnostic
-//!
-//! [`diff`] is a pure function of two [`TypedExpr`] trees and does not care
-//! which pipeline phase produced them, so one implementation serves every
-//! [`Phase`]: the caller chooses how much of the compiler's own
-//! rewriting to diff through by choosing which trees to pass. Nothing in the
-//! matcher is phase-specific — [`content_hash`] is uid-robust (free names by
-//! spelling) and type-aware, which is what lets one core cover the lot,
-//! including the `LetRec` and `Transact` shapes that exist only below the
-//! mutability phases. Which phase answers which question is
-//! `src/ccl/design/diffing.md`, "Which phase to diff".
-//!
-//! # Scope of this implementation
-//!
-//! This is the analysis, not a rewrite: it computes a correspondence and says
-//! nothing about what to build from it. The one place it departs from full
-//! GumTree is candidate selection in step 3, which picks the best-scoring
-//! container greedily rather than solving a global assignment — GumTree does
-//! the same.
+//! The matcher does not inspect [`Phase`] metadata. The caller chooses the trees and must
+//! observe the phase qualifications in `src/ccl/design/diffing.md`, "Which phase to diff".
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -641,16 +593,9 @@ fn top_down(s: &Indexed, d: &Indexed, m: &mut Matching) {
     let mut order: Vec<usize> = (0..s.len()).collect();
     order.sort_by_key(|&i| Reverse((s.nodes[i].height, s.nodes[i].size)));
 
-    // Anchor each unmatched src subtree to an unmatched dst subtree of equal
-    // hash. Equal hash means isomorphic-modulo-α, so *every* such pairing is a
-    // valid "shared" classification — but not every one is equally *useful*:
-    // when a subtree shape repeats (and small ones always do — `0`, `true`,
-    // `x`), the copy we pick decides whether the node reads as sitting still or
-    // as having moved, and it decides which of its siblings are left over for
-    // the later phases to pair. So among equal-hash candidates, take the one in
-    // the most structurally corresponding position ([`best_candidate`]).
-    // Refusing to anchor ambiguous duplicates at all would instead strand them
-    // with no bottom-up seed, which is strictly worse.
+    // Equal-hash anchors rely on `src/ccl/design/diffing.md`, "Content addressing modulo α".
+    // Repeated subtrees can have several candidates. Position breaks ties because the chosen
+    // correspondence determines placement and leaves the other copies for later matching.
     for u in order {
         if m.src_matched(u) {
             continue;

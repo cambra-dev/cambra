@@ -27,11 +27,11 @@ The following tests cover the stated cases:
 
 | | Held by |
 | --- | --- |
-| Recompiling the tested source produces an identical diff at every phase | `every_phase_diffs_identical_source_as_identical` |
+| Two compilations of each corpus source diff as identical, at every phase | `every_phase_diffs_identical_source_as_identical` |
 | Identical programs have no divergences and one shared root | `identical_programs_have_no_divergences` |
-| Different binder uids do not change the tested diff | `diff_is_robust_to_uid_nondeterminism` |
+| Two lowerings that differ only in binder uids diff as identical | `diff_is_robust_to_uid_nondeterminism` |
 | A renamed binding retains its correspondence | `renaming_a_binding_is_not_a_change` |
-| An edit in a nested `let` is reported at the changed node | `one_edit_is_one_divergence` |
+| One edit deep in a `let` spine is exactly one divergence, at the edited node | `one_edit_is_one_divergence` |
 | Shared roots are pairwise disjoint, each the top of its region | `shared_roots_are_maximal_and_disjoint` |
 | Two terms differing only in an inferred type hash apart | `inference_adds_type_signal` |
 
@@ -301,11 +301,10 @@ thing that holds other nodes — the word is used where the point is what a node
 contains rather than what it is, and every container is the root of a subtree.
 
 **1. Top-down anchoring.** Map the largest subtrees whose content hash is equal.
-Equal hash means isomorphic modulo α, so a single hash comparison at the root
-settles the whole subtree: the two are the same computation node for node, and
-the matcher maps the descendants along with it in one pass without comparing
-them again. Tallest-first, so a big anchor claims its descendants before
-anything inside it is considered separately.
+The interpretation of hash equality is specified in
+[Content addressing modulo α](#content-addressing-modulo-α). The matcher pairs the descendants
+by hash without a structural equality check. Tallest-first traversal lets an anchor claim its
+descendants before they are considered separately.
 
 Equal hash does not fix child order. The hash canonicalizes the nodes whose
 order carries nothing — a `Record`'s fields fold sorted by label, a
@@ -774,9 +773,10 @@ pipeline does not already understand.
 Running two versions side by side means giving each its own copy of any state
 they could disagree about, and of no other state. The question is per mutable
 variable and per sink: **is any divergence upstream of it in the dataflow
-graph?** If none is, the two versions provably write it identically and it needs
-one store; if one is, it needs a store per version (or copy-on-write, where the
-values happen to agree anyway — a runtime concern, not this one).
+graph?** If none is, the proposed analysis would share one store under the comparison assumptions
+in [Content addressing modulo α](#content-addressing-modulo-α). Otherwise it would use a store per
+version, or copy-on-write when runtime values agree. Hash-based classification alone does not prove
+that the versions write identical values.
 
 It is a reachability query over `divergences()` rather than new matching work,
 and it is what makes a second version cost the diff rather than 2×. Not built.
