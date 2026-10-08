@@ -311,43 +311,36 @@ candidate bound.
 
 ## The differential oracles
 
-`lake build` produces `.lake/build/bin/subverdict`, and `tests/differential_oracle.rs` generates
-cases with the seeded generator it shares with the type-merge fuzz (`tests/type_gen/mod.rs`),
-computes the solver's answer, and diffs it. [README.md](README.md#the-differential-oracles) lists
-the three operations and [README.md](README.md#running-it) how to run one case by hand; the harness's
-module doc carries the generator's shape. The harness is an integration test rather than a
-`#[cfg(test)]` module in the library: it is a test, and the only solver internal it cannot otherwise
-reach is `CompactType::merge`, which the `test-helpers` feature opens a door to (`merge_bounds`).
+[The README](README.md#the-differential-oracles) owns the operation table, run commands and
+replay instructions. [The harness](../tests/differential_oracle.rs) uses the seeded generator in
+[`tests/type_gen/mod.rs`](../tests/type_gen/mod.rs). The `test-helpers` feature exposes the compact
+operations needed by this integration target.
 
-**Not checked, each for a stated reason rather than by omission.** The model's abstractions are
-applied by the *encoder*, so no comparison is made against a slot the model does not model.
+The compared fragment is bounded by the encoders, not just by whether Rust accepts a type:
 
-- **Inference variables** (`vars`) and **history slots** have no field. A generated concrete `Type`
-  produces neither, so the history slots' same-polarity componentwise merge is uncovered outright.
-- **The Pi binder**'s first-wins selection (`a.name.or(b.name)`) is dropped, as is a **conflicted
-  slot's domain payload** and **`Openness`** (every generated arm set is closed, so `meet_openness`
-  is only ever exercised at `Closed`/`Closed`).
-- **`ChanDom` atoms** are outside the model's `Atom`, matching `Ty`'s exclusion of the pipeline
-  transients.
-- **Duplicate record and variant keys** — outside `Ty.WellFormed`, and the one place the Rust's
-  trivial-equality short-circuit and its find-first arms disagree. Harness sensitivity is tested
-  rather than assumed: fed through the pipe by hand, the duplicate-keyed reflexivity case flags as a
-  mismatch, and `dup_key_record_trips_the_uniquely_keyed_invariant` pins that the debug assert
-  fires.
-- **Open variant arm sets**, which `Ty` has no node for.
-- **A refinement predicate node outside the modeled vocabulary.** Every `Predicate` constructor is
-  exercised: `gen_pred` emits each one and `pred_json` encodes it, `lam`, `boundVar`, and `cast`
-  included, so both of `eq_term_modulo_ty_slots`'s type-blind exceptions reach the comparison. What
-  no case reaches is a `TypedExpr` node the vocabulary has no constructor for — a predicate built
-  from a `Let` or an aggregate. `pred_json` answers `None` there and the harness panics, so this gap
-  is in the generator and is loud rather than silent.
+- `ty_json` encodes closed variant arm sets and functions without sum binders. It has no
+  representation for inference unknowns, histories, channel domains or witness references.
+- `cty_json` omits inference-variable identity, the Pi binder name, variant openness and
+  diagnostic domain-conflict payloads. It rejects a history slot, a function with binders, a
+  sum-kind pin, and unsupported atoms or predicates.
+- `KindPin::Data` and `KindPin::Plain` both encode as the model's data kind. Their distinction
+  is therefore not checked by that comparison. The active
+  `bug_plain_and_data_pins_have_the_same_wire_encoding` test pins this missing distinction.
+- The subtype generator excludes duplicate record/variant keys, which violate
+  `Ty.WellFormed`. The model's find-first field rules and Rust's equality shortcut must not be
+  assumed equivalent for duplicate-keyed inputs.
+- The predicate wire carries element/free/Pi references, literals, operations, projections,
+  application, predicate-local lambdas and cast-domain refinements. Expression nodes without a
+  corresponding predicate constructor, such as let-bindings and aggregates, are outside it.
 
-**Two gaps in the gate itself.** `./ci.sh doc_refs` scans `.rs` and `.md` only, so the eight `.md`
-citations in `CclFormal/*.lean` are outside it and a renamed heading does not fail CI; extending the
-checker to Lean comments is the fix. And `lake build` reports eight `unusedVariables` warnings, all
-on the `match h : e with` form where the hypothesis is used in some branches and not others, so until
-they are gone the Lean half cannot be gated the way the Rust half is (`-D warnings` in four
-configurations).
+All five drivers panic when a generated case unexpectedly falls outside their wire schema.
+The generators target the modeled fragment; encoding failures are not omitted from comparisons.
+The drivers check the number of returned verdicts as well as their agreement.
+
+The documentation-reference checker scans Markdown and Rust, not Lean comments. Markdown
+citations in Lean therefore require manual review when a heading changes. The Lake configuration
+does not promote every warning to an error; proof elaboration, executable assertions and the
+named axiom checks are separate from warning cleanliness.
 
 ## Roadmap
 

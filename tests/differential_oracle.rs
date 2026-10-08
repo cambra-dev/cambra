@@ -1,51 +1,12 @@
-//! Differential oracles: five solver operations diffed against the Lean model
-//! (plan and adjudications in `formal/design.md`).
+//! Differential tests for five solver operations against the Lean model.
 //!
-//! - **Subtyping.** `constrain_subtype`'s verdict on type pairs carrying no
-//!   `Infer` on either side — the model's *concrete* fragment — against `subtypeCheck`
-//!   (`formal/CclFormal/SubtypeChecker.lean`).
-//! - **The polar merge.** Every step of a fold through `CompactType::merge`
-//!   against `CompactTy.merge` (`formal/CclFormal/Merge.lean`), judged by the model's
-//!   `equiv` — the equality every theorem there is stated up to. Nothing else
-//!   checks that correspondence, and the merge algebra is proved rather than
-//!   fuzzed, so without this the model can drift from the solver while both
-//!   stay internally consistent.
-//! - **The kind merge.** Every step of a fold through `CompactTypeKind::merge` against
-//!   `mergeTypeKind` (`formal/CclFormal/TypeKindMerge.lean`), judged by `equivTypeKind`. The
-//!   polar merge's oracle cannot reach this: the model's `CompactTy` has no Σ binder slot, so
-//!   `cty_json` refuses a bound carrying binders and every case that would exercise a kind is
-//!   filtered out before the wire. Without this the kind lattice and its model can diverge
-//!   with both gates green, which they did.
-//! - **Certain non-membership.** `TypeKind::refuses` against the model's `refuses`
-//!   (`formal/CclFormal/TypeKind.lean`) on the concrete fragment. Every caller of it raises,
-//!   so a disagreement is a program refused or an error missed. The model proves a refusal
-//!   never lands on a member (`not_admits_of_refuses`); this checks the two sides refuse the
-//!   same things.
-//! - **Materialization.** Each bound the fold produces, coalesced and checked
-//!   against `CompactTy.coalesce` (`formal/CclFormal/Coalesce.lean`) — the pass on
-//!   the other side of the merge, and where the resolved kind's domain rule
-//!   lives.
+//! Operation tags, execution and replay are specified in `formal/README.md`,
+//! "The differential oracles" and "Running it". Encoder exclusions are specified in
+//! `formal/design.md`, "The differential oracles".
 //!
-//! Each oracle generates cases with a seeded PRNG, serializes them to the wire
-//! schema the Lean codec defines (`formal/CclFormal/Json.lean`), and streams
-//! them through the oracle binary. All five **skip loudly** when it is
-//! not built (`cd formal && lake build`) so the suite stays green on machines
-//! without a Lean toolchain — except under `CI`, where a skipped differential is
-//! a gate reporting a pass without having compared anything, so it fails
-//! (`oracle_or_skip`).
-//!
-//! A generated value the wire schema cannot express **panics** rather than being
-//! counted. A tally of such cases reports zero whether the encoder covers the
-//! fragment or the generator never reaches it, which is the same silent-skip
-//! failure a default-off feature has: the two readings are indistinguishable and
-//! only one of them is a working gate.
-//!
-//! Deliberately not generated for the subtype oracle: duplicate record/variant
-//! keys — outside `Ty.WellFormed`, where the Rust's trivial-equality short-circuit and
-//! its find-first arms genuinely disagree (pinned below as
-//! `dup_key_record_trips_the_uniquely_keyed_invariant`) — and open variant arm
-//! sets, which the model's `Ty` has no node for. Everything else in that
-//! fragment is fair game.
+//! Each driver compares generated cases and checks the returned verdict count.
+//! [`oracle_or_skip`] permits a missing binary locally but rejects it under CI.
+//! All five drivers reject unexpected encoding gaps rather than omitting cases or steps.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
