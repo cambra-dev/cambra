@@ -16,6 +16,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # `dev`, and `no-assertions`, which inherits it, emit line tables only. No CI
+  # step runs a debugger, and a panic backtrace still names file and line.
+  # Full debug info is 88% of the bytes in this repo's debug test binaries,
+  # which the test jobs link, and it is in every dependency artifact a
+  # `rust-cache` entry stores. Local builds keep Cargo.toml's default.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 permissions:
   contents: read
