@@ -11,6 +11,7 @@ import { EditorView } from "@codemirror/view";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  attachLive,
   byteLineStarts,
   describePanes,
   diagnosticLines,
@@ -29,6 +30,7 @@ import { Store } from "./store";
 import { isIrPane } from "./types";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
 
+import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import failedJson from "./__fixtures__/failed.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
 
@@ -391,5 +393,73 @@ describe("following a reload", () => {
     expect(fetchSnapshot).toHaveBeenCalledTimes(1);
     expect(live.get().tags).toHaveLength(1);
     expect(root.querySelector(".panels")).not.toBeNull();
+  });
+});
+
+describe("the header's values badge", () => {
+  beforeAll(stubLayout);
+
+  const badges = (root: HTMLElement) =>
+    Array.from(root.querySelectorAll(".badge")).map((b) => b.textContent);
+
+  // A payload a run produced: every committed fixture is version 0.
+  const ran = (): Snapshot => {
+    const snap = fixture(arithmeticJson);
+    return { ...snap, meta: { ...snap.meta, version: 1 } };
+  };
+  // A socket that opens and never speaks; `connectLive` only listens on it.
+  const silentSocket = () => vi.fn(() => new EventTarget() as unknown as WebSocket);
+
+  it("says values are awaited before a run's first frame arrives", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    const open = silentSocket();
+    const snap = ran();
+    attachLive(live, snap, open);
+    renderApp(root, new Store(snap), live);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(badges(root)).toContain("waiting for values");
+    expect(badges(root)).not.toContain("static (no values)");
+  });
+
+  it("says a run is live once it publishes", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    renderApp(root, new Store(ran()), live);
+    live.apply({ version: 1, published: 3, final: false, nodes: [], sources: [] });
+    expect(badges(root)).toContain("live · frame 3");
+  });
+
+  it("says a run is finished once its last frame arrives", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    renderApp(root, new Store(ran()), live);
+    live.apply({ version: 1, published: 4, final: true, nodes: [], sources: [] });
+    expect(badges(root)).toContain("finished");
+  });
+
+  // `--inspect-only` serves `/api/live` and never publishes, so a socket would
+  // leave the badge waiting for good.
+  it("stays static for a payload no run produced, without opening a socket", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    const open = silentSocket();
+    const snap = fixture(arithmeticJson);
+    attachLive(live, snap, open);
+    renderApp(root, new Store(snap), live);
+    expect(open).not.toHaveBeenCalled();
+    expect(badges(root)).toContain("static (no values)");
+  });
+
+  // A reload disposes the render it replaces and draws another on the same
+  // store, so a badge left subscribed would be one leaked listener per reload.
+  it("stops following the store once its render is disposed", () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    const dispose = renderApp(root, new Store(ran()), live);
+    const badge = root.querySelectorAll(".badge")[1]!;
+    dispose();
+    live.apply({ version: 1, published: 5, final: false, nodes: [], sources: [] });
+    expect(badge.textContent).toBe("waiting for values");
   });
 });

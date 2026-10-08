@@ -66,15 +66,17 @@ export type LiveGroup = {
  * What the pane draws, as one value.
  *
  * A union rather than a set of booleans, so a state nobody handled is a compile
- * error at the `never` arm rather than a blank pane. The four cases are
- * genuinely different sentences, and conflating them is the failure this exists
- * to prevent.
+ * error at the `never` arm rather than a blank pane. Each case is a different
+ * sentence, and conflating them is the failure this exists to prevent.
  */
 export type LivePanelState =
   | { kind: "no-tags" }
   // Tags exist but every one is unchecked, which is a choice rather than an
   // absence and reads differently from having inspected nothing.
   | { kind: "all-hidden"; tags: readonly LiveTag[] }
+  // A run exists and has not published its first frame yet.
+  | { kind: "connecting"; tags: readonly LiveTag[] }
+  // No run exists: the payload was compiled and not run.
   | { kind: "not-run"; tags: readonly LiveTag[] }
   | { kind: "lost"; clean: boolean; tags: readonly LiveTag[] }
   | { kind: "groups"; status: LiveStatus; tags: readonly LiveTag[]; groups: LiveGroup[] };
@@ -103,12 +105,12 @@ export function livePanelState(
   if (nodes.size === 0) {
     return lost ? { kind: "lost", clean: lost.clean, tags } : { kind: "all-hidden", tags };
   }
-  // Nothing has been published, so the program was compiled and not run. Said
-  // separately from "asked for but silent": the machine is not in a state that
-  // produces data, as against being in it and having produced none.
-  if (state.status.kind === "connecting" || state.status.kind === "not-run") {
-    return { kind: "not-run", tags };
-  }
+  // Nothing has been published. Said separately from "asked for but silent": the
+  // machine is not in a state that produces data, as against being in it and
+  // having produced none. `connecting` and `not-run` differ in whether a run
+  // exists to publish later, and the header's badge says the same split.
+  if (state.status.kind === "connecting") return { kind: "connecting", tags };
+  if (state.status.kind === "not-run") return { kind: "not-run", tags };
 
   // Ascending node id is construction order, so upstream sorts first.
   const groups: LiveGroup[] = [...nodes]
@@ -149,6 +151,8 @@ export function serializeLivePanel(panel: LivePanelState): string {
       return "nothing inspected";
     case "all-hidden":
       return `every tag hidden (${panel.tags.map((t) => t.label).join(", ")})`;
+    case "connecting":
+      return "waiting for values — the run has not published yet";
     case "not-run":
       return "static (no values) — compiled, not run";
     case "lost":
@@ -458,6 +462,12 @@ export class LiveView {
       return;
     }
 
+    // The message the previous render left, if that render had no groups. It is
+    // dropped rather than left in place: a run that has started publishing must
+    // not still be saying it has no values, and groups are appended to the root
+    // rather than replacing it.
+    this.root.querySelector(".live-empty")?.remove();
+
     const seen = new Set<string>();
     for (const group of panel.groups) {
       const key = groupKey(group);
@@ -625,13 +635,15 @@ function metaText(group: LiveGroup): string | null {
   }
 }
 
-/** The four states, each its own sentence. */
+/** Each state that draws no groups, as its own sentence. */
 function emptyText(panel: LivePanelState): string {
   switch (panel.kind) {
     case "no-tags":
       return "Choose “inspect data” on a source or an operator to watch its values here.";
     case "all-hidden":
       return "Every tag is hidden. Check one in the ☰ menu to show its values.";
+    case "connecting":
+      return "waiting for values — the run has not published its first frame yet.";
     case "not-run":
       return "static (no values) — this program was compiled, not run.";
     case "lost":
