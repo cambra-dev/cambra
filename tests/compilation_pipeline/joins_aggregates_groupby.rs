@@ -271,8 +271,8 @@ fn test_map(#[case] code: &str, #[case] expected: Vec<(Value, Value)>) {
     check_map_entries(code, expected);
 }
 
-// BUG: a repeated key gives one group two entries, which `Sole` rejects at runtime. The spec makes a
-// duplicate key in a map literal a *compile-time* error; enforcing it here is later
+// BUG: a repeated key gives one group two entries, which `Sole` rejects at runtime. The spec makes
+// a duplicate key in a map literal a *compile-time* error; enforcing it here is later
 // than that, because only the key values decide it and planning's constant fold stops at
 // the scalar (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
 // now, constant-folding later"). `set` has no such fault — `Drain` absorbs duplicates,

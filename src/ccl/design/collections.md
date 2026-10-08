@@ -249,7 +249,8 @@ an Option-valued lookup result.
 
 The runtime has no query-data fault channel for this operation. The CLI host does not catch this
 panic in its scheduler loop, so a duplicate key terminates the process and fails every request it
-is serving. Replacing the assertion with an arbitrary winner would change map construction semantics.
+is serving. Replacing the assertion with an arbitrary winner would change map construction
+semantics.
 A query-local fault channel and compile-time checking of constant collections are separate work.
 
 `set([1, 1])` instead consumes the repeated group with `Drain` and produces one key.

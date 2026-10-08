@@ -2484,8 +2484,8 @@ of a constructor into an unboxed term.
   `items(m)` expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(values(m))`
   requests value aggregation.
 - Type-directed literals share `[…]` across collection forms; explicit or inferred
-  constructors select positional storage or re-keying. The constructors and constant-element rule are in
-  [List, tuple, record literals](#311-list-tuple-record-literals).
+  constructors select positional storage or re-keying. The constructors and constant-element rule
+  are in [List, tuple, record literals](#311-list-tuple-record-literals).
 - Immutable collections support non-overlapping element-wise definitions `c[i] = v`.
   Feed uses `c << v`, and keyed mutation uses `c[i] := v`. Their current supported forms
   belong to [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
