@@ -830,20 +830,35 @@ fn a_seeded_mutable_collection_aggregates() {
     "#});
 }
 
-/// `//` is floor division (`docs/chl-spec.md`, "3.3 Arithmetic and logical operators"). The
-/// runtime's integer kernel (`src/scalar_ops.rs`) truncates toward zero instead, which
-/// differs when the operands' signs differ. Pinned at both answers.
-#[test]
-fn floor_division_with_a_negative_divisor_truncates() {
-    let source = indoc! {r#"
+/// The comprehension binder keeps division in the runtime rather than constant folding it.
+#[rstest::rstest]
+#[case("7", "2", 3)]
+#[case("-7", "2", -4)]
+#[case("7", "-2", -4)]
+#[case("-7", "-2", 3)]
+#[case("6", "-2", -3)]
+#[case("0", "-2", 0)]
+#[case("-9223372036854775807 - 1", "3", -3_074_457_345_618_258_603)]
+#[case("1", "-9223372036854775807 - 1", -1)]
+fn signed_floor_division_agrees(
+    #[case] dividend: &str,
+    #[case] divisor: &str,
+    #[case] expected: i64,
+) {
+    let source = format!(
+        indoc! {r#"
         out = test_sink()
-        n = -2
-        out << 7 // n
-    "#};
-    let at_unit =
-        |v: i64| Value::Collection(Collection::from_entries(vec![(Value::Unit, Value::Int(v))]));
-    assert_eq!(compiled(source), at_unit(-3));
-    assert_eq!(interpreted(source), at_unit(-4));
+        out << sum([x // ({divisor}) for x in [{dividend}]])
+    "#},
+        divisor = divisor,
+        dividend = dividend
+    );
+    let expected = Value::Collection(Collection::from_entries(vec![(
+        Value::Unit,
+        Value::Int(expected),
+    )]));
+    assert_eq!(compiled(&source), expected);
+    assert_eq!(interpreted(&source), expected);
 }
 
 /// A constant whole-collection write in a loop body replaces the collection at each iteration.
