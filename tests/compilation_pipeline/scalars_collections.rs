@@ -506,36 +506,33 @@ fn a_provably_non_negative_exponent_is_accepted(#[case] code: &str, #[case] expe
     check_scalar(code, expected);
 }
 
-/// **This test pins a defect, not a decision — it should start failing when the defect is
-/// fixed.**
-///
-/// Inference admits the program: each of the source's elements discharges the exponent's
-/// `{Int | __elem >= 0}`. The join of `[1, 2, 3]`'s singletons is a bare `Int`, so the
-/// discharge leaves nothing in the element read's type, and the post-inference check then
-/// finds the mapped function's domain demanding a refinement the value reaching it does not
-/// carry. A well-typed program reports an internal invariant failure. The same panic
-/// arises with no `**`, from an annotated function called in a comprehension; `**` makes it
-/// reachable without refinement syntax. Once it passes, the program evaluates to `14`.
+/// BUG: a valid comprehension loses the exponent's non-negative bound after inference.
+/// Each source element satisfies the bound, but their joined type is bare `Int`; the
+/// post-inference consistency check rejects the mapped call. The expected result is `14`.
+/// Remove `should_panic` when fixed; the assertion then checks the language result.
 #[test]
 #[should_panic(expected = "post-inference produced an invalid tree: [Type mismatch")]
-fn a_comprehension_exponent_reaches_the_wall() {
+fn bug_comprehension_exponent_loses_its_bound() {
     check_scalar("sum([2 ** x for x in [1, 2, 3]])", Value::Int(14));
 }
 
-/// A negative element is still rejected, and as a type error rather than at the wall.
+/// A negative element is rejected as a type error, not an internal invariant failure.
 #[test]
 fn a_negative_comprehension_element_is_rejected_as_an_exponent() {
     check_compile_error("sum([2 ** x for x in [1, 2, -3]])", "__elem >= 0");
 }
 
-/// Exponentiation wraps on overflow in every profile. Addition, subtraction, and
-/// multiplication retain profile-dependent overflow behavior, tracked in the vault issue
-/// `interpreter-integer-arithmetic-divergences`.
+/// BUG: exponentiation silently wraps an unrepresentable result in every profile.
+/// These cases pin the current wrong values, not a language overflow policy. CHL has not
+/// chosen how to handle integer overflow; see `docs/chl-spec.md`, "Partiality is not yet
+/// defined [Open]". Replace these expectations when that policy is implemented.
+/// Addition, subtraction, and multiplication retain profile-dependent overflow behavior,
+/// tracked in the vault issue `interpreter-integer-arithmetic-divergences`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::past_the_width("2 ** 64", Value::Int(0))]
 #[case::the_sign_bit("2 ** 63", Value::Int(i64::MIN))]
-fn exponentiation_wraps(#[case] code: &str, #[case] expected: Value) {
+fn bug_exponentiation_silently_wraps(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 

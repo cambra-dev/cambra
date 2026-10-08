@@ -758,178 +758,141 @@ they appear on consecutive source lines.
 
 ### Partiality is not yet defined [Open]
 
-Some expressions are *partial*: an out-of-range list index, a missing
-map key, division by zero, integer overflow. Where this document says
-such an expression "is not defined", it stops there deliberately: CHL
-has **no defined divergence semantics yet**. Whether a partial
-expression traps at runtime, diverges, is statically excluded by
-refinement types (§6), or something else, is **[Open]** — do not read
-a runtime-trap model into this spec; it is an undecided question, not
-an implicit decision.
+CHL has not defined the result of partial operations such as out-of-range indexing, missing-key
+lookup, division by zero, or integer overflow. A runtime trap, divergence, or static rejection by
+refinement types remain possible decisions. None permits C-style undefined behaviour: an
+implementation cannot assign arbitrary behaviour to an accepted program.
 
-One resolution is ruled out in advance: C-style undefined behaviour —
-**Cambra has no UB**, a foundational principle stated at the top of
-this document. The gap here is also distinct from the *deliberate*
-nondeterminism elsewhere in §3: unordered collections and unspecified
-evaluation order are decided semantics (order simply is not
-observable), not gaps.
+This gap differs from unordered collections and unspecified evaluation order, which are defined
+parts of the language. The planned result of an aggregate over an empty collection is covered in
+[Aggregates](#71-aggregates).
 
-An aggregate over an empty collection is not defined today; §7.1 gives
-its planned `Option(T)` result.
-
-What the semantic rules in this document *do* rely on is only the
-notion of definedness itself: short-circuit `and`/`or` (§3.5), the
-ternary (§3.6), and `if`/`elif` (§4.5) guarantee that a non-selected
-operand being undefined does not make the selecting construct
-undefined. Those guarantees hold under any resolution of the question
-above. (The Option-returning-lookup direction in §3.9 is one way part
-of the partiality disappears entirely.)
+The selection rules of [Short-circuit `not`, `and`, `or`](#35-short-circuit-not-and-or),
+[Ternary](#36-ternary) and `if`/`elif` let an unselected operand be undefined without making the
+selecting expression undefined. These guarantees hold under any resolution of the question above.
 
 ### 3.1 Literals
 
-`Int`, `String`, and `Bool` literals denote themselves, and `()` is the literal
-for the unit type `{}` (§6.6).
+`Int`, `String`, and `Bool` literals have singleton refinement types. For example, `5` has type
+`{Int where _ == 5}`, displayed as `Int@5`. Unit `()` has the
+[empty product type](#66-the-empty-product-is-unit) `{}`; it needs no additional refinement.
 
-A literal's **type says which literal it is**, not merely its base: `5` has type
-`{Int where _ == 5}` (§6.4), the refinement pinning that one value. So `x = 5`
-gives `x` the type `Int@5`, and it keeps that unless a binder discards it:
-`x: Int = 5` binds `x` at `Int` (an exact annotation *is* the binder's type),
-while `x <: Int = 5` leaves `x` at `Int@5` (a bounded annotation only has to admit
-the value) — see
-[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded). Any
-operation that computes a *new* value drops it, since it is a fact about one
-value and not about the operation: `x + x` is an `Int`, and a mutable variable
-never takes it (a mutable variable is the sequence its writes produce, so no one write's
-value describes it). Unit is the exception with nothing to say: it has one
-inhabitant, so pinning it would add nothing to the base.
+An inferred immutable binding preserves the literal's singleton. An exact annotation can replace
+it with the base type, whereas a bounded annotation retains it:
 
-> **Direction [Decided] — `true`/`false`.** The boolean literals are spelled
-> `True`/`False` today, the one exception to the capitalization rule above. They
-> are renamed to `true`/`false`, which is not yet implemented: a boolean literal
-> is a *term*, so `Caps` becomes exceptionless.
+| Binding | Inferred binding type |
+|---|---|
+| `x = 5` | `Int@5` |
+| `x: Int = 5` | `Int` |
+| `x <: Int = 5` | `Int@5` |
+
+[Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded) defines the
+annotation rules. Mutable bindings do not retain the singleton of an individual write.
+
+Computed results do not inherit operand refinements: `2 + 3` has type `Int`.
+
+> **Direction [Decided] — Boolean spelling.** The implemented literals are `True` and `False`.
+> The planned spellings are `true` and `false`, following the lowercase convention for terms.
 
 ### 3.2 Names
 
-A name refers to the value bound by the nearest enclosing scope
-(parameter, lambda parameter, assignment, or function definition).
-Name resolution is purely static — there is no dynamic lookup, no
-introspection of the binding environment.
+Name resolution is static. A name refers to the nearest enclosing binding in scope at its use;
+there is no dynamic lookup or introspection of the binding environment. Forward references are
+not supported. Mutual recursion between top-level functions is **[Planned]**.
 
-Forward references are not allowed: a name must be in scope at the
-point of use. Mutual recursion between top-level functions is
-**[Planned]** — see the 2026-03-05 recursion design notes.
+[Scoping and binding](#5-scoping-and-binding) owns the scope rules.
 
 ### 3.3 Arithmetic and logical operators
 
-| Operator | Semantics |
+[Expression precedence](#23-expression-precedence) defines parsing precedence and associativity.
+
+| Operator | Meaning |
 |---|---|
-| `a + b`, `a - b`, `a * b` | Integer arithmetic. Overflow is not defined (see *Partiality*, §3). |
+| `a + b`, `a - b`, `a * b` | Integer addition, subtraction, and multiplication. `+` also joins two strings. |
 | `a // b` | Integer division rounded toward negative infinity: `-7 // 3` is `-3`, not `-2`. This matches [Python's floor division](https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations), so the shared syntax retains its meaning. Division by zero and overflow are not defined (see [Partiality](#3-expression-semantics)). |
-| `a ** b` | Integer exponentiation, *right*-associative ([2.3 Expression precedence](#23-expression-precedence)). The exponent must be non-negative. Overflow is not defined (see *Partiality*, [3. Expression semantics](#3-expression-semantics)). |
-| `-a` | Integer negation. |
-| `a & b`, `a \| b`, `a ^ b` | **Logical** and / or / xor. Both sides must be `Bool`. (CHL re-uses Python's bitwise tokens for logical operators; there is no separate bitwise operator family.) |
+| `a ** b` | Integer exponentiation. The exponent must be provably non-negative. |
+| `-a` | Signed integer negation. |
+| `a & b`, `a \| b`, `a ^ b` | Boolean conjunction, disjunction, and exclusive-or. Both operands must be `Bool`; these are not integer bitwise operators. |
 | `not a` | Boolean negation. |
-| `a and b`, `a or b` | Boolean conjunction / disjunction with short-circuit semantics — the right operand need not be defined when the left settles the result. See §3.5. |
-| `a ++ b` | Collection union (multiset sum) of two collections of the same element type. Since collections are unordered (§3), this is not "concatenation"; it is the bag union. |
+| `a and b`, `a or b` | Boolean conjunction and disjunction. The right operand need not be defined when the left settles the result; see [Short-circuit `not`, `and`, `or`](#35-short-circuit-not-and-or). |
+| `a ++ b` | Multiset union of collections with the same element type, not ordered concatenation. See [Collections are unordered](#collections-are-unordered). |
 
-`a ** 0` is 1 for every `a`. **The exponent must be non-negative**, and says so in its
-type: `**` requires `{Int where _ >= 0}` of it, so `2 ** -1` is rejected where it is written
-rather than given a value. CHL has no fractional type for a reciprocal to produce (the
-`Real` note below), and the demand is what keeps the operator total.
-
-The requirement is discharged, not assumed, so what compiles is what the program can show.
-A literal carries its own value and passes; an `Int` that carries no such refinement is
-rejected, and a caller that has one passes it in:
+For every integer base `a`, `a ** 0` is `1`, including `0 ** 0`. The exponent must satisfy
+`{Int where _ >= 0}`. A non-negative literal or a parameter with that
+refinement is accepted:
 
 ```python
 def scaled(e: {Int where _ >= 0}) => Int:
     2 ** e
 ```
 
-Operators absent on purpose: `/` (no fractional type), `%`, `>>`, `~`,
-`@`. Using one in an expression is an error
-([1.8 Operators and punctuation](#18-operators-and-punctuation)).
+A negative exponent or an exponent of unrefined type `Int` is rejected. Exponentiation is
+right-associative, so `2 ** 3 ** 2` is rejected: the inner `3 ** 2` has type `Int`, which does
+not establish the outer exponent's bound. `(2 ** 3) ** 2` is accepted.
 
-> **Direction [Tentative] — `Real` and `/`.** The target language has a
-> fractional type, `Real`, and a division operator `/` on it. Neither
-> exists today: `Real` is no type the checker knows, `/` is not lexed
-> (§1.8), and there is no fractional literal (§1.7), so a quantity that
-> wants a fraction has nothing to write it with. Everything else is
-> **[Open]** — what `Real` denotes (exact rationals, a decimal, or the
-> `f64` §13 rules out), whether `/` is total or partial at zero
-> (*Partiality*, §3), whether `//` survives beside it, and how an `Int`
-> literal acquires the type in a `Real`-typed position.
+The expression operators `/`, `%`, `>>`, `~`, and `@` are not supported; see
+[Operators and punctuation](#18-operators-and-punctuation).
+
+> **Direction [Tentative] — Fractional arithmetic.** A fractional type `Real` and division
+> operator `/` are proposed, not implemented. Their representation, behaviour at zero,
+> relationship to `//`, and conversion from integer literals are **[Open]**.
+> There are no fractional literals.
 
 ### 3.4 Comparisons
 
-Comparisons chain Python-style: `a < b < c` denotes `a < b and b < c`.
-General form: `a op₀ b op₁ c op₂ d` denotes
-`a op₀ b and b op₁ c and c op₂ d` — a conjunction of adjacent pairwise
-comparisons, not a left-fold.
+The comparators are `==`, `!=`, `<`, `<=`, `>`, and `>=`. A chain `a < b < c`
+compares adjacent operands and conjoins the results: `a < b and b < c`. It is not the
+left-associated comparison `(a < b) < c`. This equivalence does not add a short-circuit guarantee
+beyond the [Boolean-operator rules](#35-short-circuit-not-and-or).
 
-Supported comparators: `==`, `!=`, `<`, `<=`, `>`, `>=`. `is`, `is not`,
-`in`, `not in` are **not** supported (no identity, no membership
-operator). Membership over a collection is written as a comprehension
-with a guard or as an aggregate.
+Incompatible operand types produce a compile-time type error. Product equality is componentwise:
+two tuples or records must have the same shape, and every corresponding component must support
+equality. A wider record is not compared only on its shared fields. Products do not support the
+ordering comparators; collection elements are not product fields, so this rule does not provide
+collection equality.
 
-Comparing values of incompatible types is a compile-time type error,
-not a runtime error.
+`is`, `is not`, `in`, and `not in` are not comparison operators. A comprehension with a
+guard or an aggregate can express a membership query.
 
-**`==` and `!=` compare a product componentwise.** Two tuples or two
-records are equal when they are the same shape and every field is
-equal, which is what makes a product a key type
-([3.11 List, tuple, record literals](#311-list-tuple-record-literals)) and so a key of a
-`Set` or a `Map` ([6.3 Direction: collection types](#63-direction-collection-types-decided)). The two operands must be the *same*
-product: a wider one is a different shape, not a comparison over the
-fields they share. The ordering comparators have no product reading —
-`<` needs an order on the components and a record's fields carry none
-— and neither does a collection, whose elements are not fields.
-
-> **Direction [Decided].** Planned membership *expressions*: `e in s` tests set membership, `k in m` tests for a key
-> in a map (2026-06-29 §2).
-> `in` as the iteration keyword (`for x in xs`) is unchanged; the
-> expression form is what's new.
+> **Direction [Decided] — Membership expressions.** `e in s` is planned for set membership,
+> and `k in m` for map-key membership. This does not change `in` as an iteration keyword in
+> `for x in xs`.
 
 ### 3.5 Short-circuit `not`, `and`, `or`
 
-`not e` is unary boolean negation.
+`not e` negates a Boolean. `and` is true when all its operands are true; `or` is true when
+at least one operand is true. All operands must have type `Bool`, and the result is `Bool`.
+There is no truthiness conversion or Python-style return of an operand.
 
-`and` and `or` are short-circuiting n-ary boolean operators:
+Once a prefix of the operands determines the result, the remaining operands need not be defined.
+This is a definedness rule, not a requirement to evaluate operands in source order:
 
-- `and(a₀, a₁, …, aₙ₋₁)` is `True` iff every `aᵢ` is `True`.
-- `or(a₀, a₁, …, aₙ₋₁)` is `True` iff some `aᵢ` is `True`.
+```python
+b: Int = 0
+False and (10 // b > 0)
+```
 
-The short-circuit property is **semantic**, not an operational
-constraint: the result is determined as soon as some prefix of the
-operands settles the answer, so the remaining operands need not be
-defined for the whole expression to be defined. For example,
-`xs == [] or xs[0] > 0` is well-defined when `xs` is empty even
-though `xs[0]` is not defined there (see *Partiality*, §3); the `or`
-result is fixed by the first operand and the second is never
-required.
-
-CHL `and`/`or` always return `Bool`. There is no "return the truthy
-operand" coercion (Python's `a or default` idiom). All operands of
-`and` / `or` must be `Bool`-typed.
+is `False`, though `10 // b` is not defined.
 
 ### 3.6 Ternary
 
-```
+```python
 then_expr if cond else else_expr
 ```
 
-The result is `then_expr` when `cond` is `True`, and `else_expr`
-when `cond` is `False`. Like short-circuit `and`/`or` (§3.5), this
-is a semantic property: the non-taken branch contributes nothing to
-the result, so it need not be defined (it could index an empty list,
-look up a missing key, etc. — see *Partiality*, §3) without making
-the ternary itself ill-defined. If the non-taken branch contains a feed
-or yield, that effect does not occur.
+The condition must have type `Bool`. The result is `then_expr` when the condition is `True`
+and `else_expr` otherwise. An unselected branch need not have a defined value and contributes
+no feed or yield effect. Both branches must still type-check.
 
-The ternary's type is the join of its two branches — see
-[Joining the types of several values](#joining-the-types-of-several-values) (§6).
+This guarded division evaluates to `0` without evaluating the division by zero:
 
-Right-associative: `x if a else y if b else z` parses as
+```python
+b: Int = 0
+0 if b == 0 else 10 // b
+```
+
+The result type is the [join of the branch types](#joining-the-types-of-several-values).
+Ternaries associate to the right: `x if a else y if b else z` parses as
 `x if a else (y if b else z)`.
 
 ### 3.7 Feed operator `<<`
