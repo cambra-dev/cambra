@@ -59,15 +59,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ),
     ("def_feed_called_twice", "rows_sum", "CompilerPanics"),
     ("def_feed_through_a_def", "rows_sum", "CompilerPanics"),
-    ("feed_collection", "cond_boxed", "Disagrees"),
-    (
-        "four_loop_collection_feed_in_mut_loop",
-        "cond_boxed",
-        "CompilerPanics",
-    ),
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
-    ("loop_source", "cond_boxed", "Disagrees"),
     (
         "loop_source_in_loop",
         "binder_cond_boxed[i]",
@@ -112,7 +105,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
     ("nominal_key_join", "rows_sum", "CompilerPanics"),
-    ("record_collection_field", "cond_boxed", "CompilerRejects"),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),
     ("record_in_list", "generator_max", "CompilerRejects"),

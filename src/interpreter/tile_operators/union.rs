@@ -25,9 +25,10 @@ pub struct UnionOperator {
     base: OperatorBase,
     /// Input operators; each must have a `DataFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
-    /// Flat-merge mode (see [`new_flat`](Self::new_flat)): arms share one domain
-    /// extent with disjoint positions, merged into a single flat `DataFunction`
-    /// (sorted by domain key) rather than a tagged `ColumnValue::Union`.
+    /// Flat-merge mode (see [`new_flat`](Self::new_flat) and
+    /// [`new_flat_over`](Self::new_flat_over)): arms with disjoint keys, merged into a
+    /// single flat `DataFunction` (sorted by domain key) over the domain they share or a
+    /// declared bound, rather than a tagged `ColumnValue::Union`.
     flat: bool,
     /// The level the union merges at, which leaves every level above it standing — the
     /// same parameter [`Zip::new_at`](super::Zip::new_at) takes, and for the same reason. A
@@ -158,15 +159,19 @@ impl UnionOperator {
         beneath.all(|b| b == Some(first)).then_some(first)
     }
 
-    /// Collapse the coproduct domain [`new`](Self::new) built back to the one
-    /// extent the arms share.
+    /// Collapse the coproduct domain [`new`](Self::new) built back to one extent: the one
+    /// the arms share, or `declared_domain` where one is given.
     ///
-    /// Sharing it is the precondition — the arms are disjoint slices of one
-    /// collection, which is what makes the merge a reassembly rather than a
-    /// concatenation — so this is a check, not a reconciliation. Arms that
-    /// genuinely differ are a copairing, and [`new`](Self::new) is the
-    /// constructor for those.
-    fn flatten_domain(tiling: Tiling) -> Tiling {
+    /// With no declared domain, sharing one is the precondition — the arms are disjoint
+    /// slices of one collection, which is what makes the merge a reassembly rather than a
+    /// concatenation — so this is a check, not a reconciliation. Arms that genuinely differ
+    /// are a copairing, and [`new`](Self::new) is the constructor for those.
+    ///
+    /// A `declared_domain` is the bound the arms' keys range over where their domains
+    /// differ, the legs of a realized sum ([`new_flat_over`](Self::new_flat_over)). The
+    /// check is then that the bound includes every arm's domain. The legs are disjoint
+    /// only by their gates, which [`flat_merge`] checks as it merges.
+    fn flatten_domain(tiling: Tiling, declared_domain: Option<Extent>) -> Tiling {
         let (domain, codomain) = match tiling {
             Tiling::DataFunction { domain, codomain } => (domain, codomain),
             other => return other,
@@ -176,6 +181,16 @@ impl UnionOperator {
             other => vec![other],
         }
         .into_iter();
+        if let Some(domain) = declared_domain {
+            for arm in arms {
+                assert!(
+                    domain.includes(&arm),
+                    "a flat merge over a declared domain keys every arm's rows in it, but the \
+                     declared {domain:?} does not include an arm's {arm:?}"
+                );
+            }
+            return Tiling::DataFunction { domain, codomain };
+        }
         let domain = arms.next().expect("at least one arm");
         for other in arms {
             assert_eq!(
@@ -192,7 +207,9 @@ impl UnionOperator {
     /// `Extent::Union`, so the result co-iterates with a sibling field. This is the
     /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`: every arm
     /// filters the *same* fed element stream, so their domains share one extent and
-    /// their positions are disjoint by first-match. (The tagged [`new`](Self::new)
+    /// their positions are disjoint by first-match. Arms over different domains that are
+    /// disjoint by their gates merge under a declared bound instead
+    /// ([`new_flat_over`](Self::new_flat_over)). (The tagged [`new`](Self::new)
     /// is for a sourceless union whose arms have genuinely distinct extents — a Σ /
     /// C-form dispatch read by `final_or_default`.)
     pub fn new_flat(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
@@ -210,11 +227,30 @@ impl UnionOperator {
         declared_codomain: Extent,
         level: CurryLevel,
     ) -> Self {
+        Self::new_flat_over(inputs, None, declared_codomain, level)
+    }
+
+    /// [`new_flat_at`](Self::new_flat_at) whose merged keys range over `declared_domain`
+    /// where one is given, rather than over the one domain the arms share.
+    ///
+    /// The legs of a realized sum are the case: each is over its own arm's domain, at most
+    /// one holds rows (their first-match gates are disjoint), and the merged collection is
+    /// keyed as that leg is, under the bound the sum's type declares
+    /// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+    pub fn new_flat_over(
+        inputs: Vec<Box<dyn TileOperator>>,
+        declared_domain: Option<Extent>,
+        declared_codomain: Extent,
+        level: CurryLevel,
+    ) -> Self {
         // Narrow before minting, so the identity an operator is born with carries
         // the tiling it keeps. Reaching into `base.tiling` afterwards would leave
         // the shape recorded at construction stale.
         let arms = Self::inner_tilings(&inputs, level);
-        let merged = Self::flatten_domain(Self::coproduct_of(&arms, declared_codomain));
+        let merged = Self::flatten_domain(
+            Self::coproduct_of(&arms, declared_codomain),
+            declared_domain,
+        );
         let tiling = with_values_at(inputs[0].tiling(), level, merged);
         Self {
             base: OperatorBase::new(tiling),
@@ -226,10 +262,13 @@ impl UnionOperator {
 }
 
 /// Flat-merge disjoint `DataFunction` arms into one flat tile, sorted by domain
-/// key. Each arm is a filtered slice of the *same* fed element stream (a
+/// key. An arm is either a filtered slice of the *same* fed element stream (a
 /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`, or a `match`'s
-/// tag fan-out), so the arms' keys are disjoint and reassemble the full column —
-/// which then co-iterates with the decision record's sibling `commit` field. The
+/// tag fan-out), whose keys are disjoint and reassemble the full column — which then
+/// co-iterates with the decision record's sibling `commit` field — or a leg of a
+/// realized sum, over its own arm's domain, of which the first-match gates leave at most
+/// one holding rows. Either way the arms' keys are disjoint, and a key two arms claim
+/// fails the merge. The
 /// codomain is a scalar decision-field value, or a materialized compound `Tile::Record`
 /// for a tuple/record accumulator. A key is complete once every arm calls it complete,
 /// and beneath a key each level states what the arm holding it says.
@@ -536,8 +575,8 @@ impl TileProducer for UnionProducer {
 
         if self.flat {
             // The merged column is described by the operator's *declared* tiling at
-            // both ends: the domain the arms share, and the codomain shape the
-            // decision field carries. Under a standing level the same description sits
+            // both ends: the merged domain, the one the arms share or the declared bound,
+            // and the codomain shape the decision field carries. Under a standing level the same description sits
             // `level` levels in, and the merge runs once per row of the level above.
             let merged_at = self.tiling().values_at(self.level);
             let (domain_extent, codomain_tiling) = match merged_at {
@@ -981,6 +1020,45 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         )
+    }
+
+    /// An arm over `[0, 𝑛)` holding `Int`s, for the tiling a flat merge declares.
+    fn uint_range_arm(n: u64) -> Box<dyn TileOperator> {
+        Box::new(TilingOnly(Tiling::data_function(
+            Extent::uint_range(n),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )))
+    }
+
+    /// The legs of a realized sum are each over their own arm's domain, and merge under the
+    /// bound the sum's type declares.
+    #[test]
+    fn a_flat_merge_over_a_declared_domain_keys_arms_over_different_domains() {
+        let op = UnionOperator::new_flat_over(
+            vec![uint_range_arm(2), uint_range_arm(3)],
+            Some(Extent::Base(BaseType::UInt)),
+            Extent::Base(BaseType::Int),
+            CurryLevel::OUTERMOST,
+        );
+        assert_eq!(
+            *op.tiling(),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            )
+        );
+    }
+
+    /// A declared domain that leaves out an arm's keys cannot key that arm's rows.
+    #[test]
+    #[should_panic(expected = "does not include an arm's")]
+    fn a_flat_merge_over_a_declared_domain_refuses_an_arm_outside_it() {
+        let _ = UnionOperator::new_flat_over(
+            vec![uint_range_arm(2), uint_range_arm(3)],
+            Some(Extent::uint_range(2)),
+            Extent::Base(BaseType::Int),
+            CurryLevel::OUTERMOST,
+        );
     }
 
     /// The precondition holding: disjoint arms reassemble into the full column,
