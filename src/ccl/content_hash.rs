@@ -106,7 +106,12 @@ pub type NodeId = *const TypedExpr;
 /// [`hash_free_var`]. This is what makes a subterm match its twin in another
 /// program regardless of how deeply each sits — the GumTree precondition.
 pub fn content_hash(e: &TypedExpr) -> ContentHash {
-    ContentHash(hash_rel(e, &mut Vec::new(), FreeVars::BySpelling))
+    ContentHash(hash_rel(
+        e,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        FreeVars::BySpelling,
+    ))
 }
 
 /// The α-invariant hash of `e` with its free variables resolved **through the
@@ -120,7 +125,12 @@ pub fn content_hash(e: &TypedExpr) -> ContentHash {
 /// resolves to, so a binding renamed between versions is invisible, and a
 /// same-spelled binding of something else is not mistaken for it.
 pub fn resolved_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
-    ContentHash(hash_rel(e, &mut Vec::new(), FreeVars::ByBinder(scope)))
+    ContentHash(hash_rel(
+        e,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        FreeVars::ByBinder(scope),
+    ))
 }
 
 /// The α-invariant hash of what is **authored at** `e`: everything the node
@@ -157,15 +167,16 @@ pub fn resolved_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
 pub fn own_hash(e: &TypedExpr, scope: &[(&Name, u64)]) -> ContentHash {
     let free = FreeVars::ByBinder(scope);
     let env = &mut Vec::new();
+    let wenv = &mut Vec::new();
     let mut h = DefaultHasher::new();
     std::mem::discriminant(&e.node).hash(&mut h);
-    hash_payload(e, env, free, Fold::Own, &mut h);
+    hash_payload(e, env, wenv, free, Fold::Own, &mut h);
     for_each_scoped_item(e, &mut |item| match item {
         ScopedItem::VarRef(name) => hash_name_ref(name, env, free, &mut h),
         ScopedItem::KeyRef(name) => hash_key_ref(name, &mut h),
         ScopedItem::Child { .. } => {}
     });
-    hash_opt_type(e.user_annotation.as_ref(), env, free, &mut h);
+    hash_opt_type(e.user_annotation.as_ref(), env, wenv, free, &mut h);
     ContentHash(h.finish())
 }
 
@@ -294,25 +305,12 @@ fn hash_name_ref(name: &Name, env: &[&Name], free: FreeVars<'_>, state: &mut Def
 /// unresolved types to one value is a safe fallback rather than a determinism
 /// hazard (the diff never runs mid-inference).
 ///
+/// `wenv` contains the enclosing Σ binders, innermost last. Bound witness references hash by
+/// De Bruijn index, so [`Type::alpha_convert_sum`] preserves the hash. Every recursive type
+/// and predicate-term traversal retains this scope, including types attached to predicate nodes.
+///
 /// [`FieldKey`]: crate::ccl::FieldKey
 fn hash_type<'a>(
-    ty: &'a Type,
-    env: &mut Vec<&'a Name>,
-    free: FreeVars<'_>,
-    state: &mut DefaultHasher,
-) {
-    hash_type_in(ty, env, &mut Vec::new(), free, state)
-}
-
-/// [`hash_type`] under a witness scope — `wenv` lists the Σ binders `ty` sits inside,
-/// innermost last.
-///
-/// A witness binder is α-renameable exactly as a term binder is: instantiating a scheme
-/// re-mints it ([`Type::alpha_convert_sum`](crate::ccl::Type::alpha_convert_sum)), so its
-/// `uid` says nothing about content and hashing it would make two α-equivalent sums differ.
-/// An occurrence therefore hashes by **how far out its binder sits**, which is the same rule
-/// this module already applies to a bound term variable.
-fn hash_type_in<'a>(
     ty: &'a Type,
     env: &mut Vec<&'a Name>,
     wenv: &mut Vec<crate::ccl::ty::WitnessId>,
@@ -352,7 +350,7 @@ fn hash_type_in<'a>(
         // A bounded annotation's ceiling is content, not an identity: `x <: Int`
         // and `x <: Str` state different obligations. The discriminant separates
         // it from a plain `Hole`.
-        T::BoundedHole(bound) => hash_type_in(bound, env, wenv, free, state),
+        T::BoundedHole(bound) => hash_type(bound, env, wenv, free, state),
         // The kind is content: a data function's domain *is* its data and its
         // joins have to be lossless, so `A ⇒ B` and `A ⤇ B` are not the same
         // computation. A `FunKind::Var`'s `uid` is a per-compilation identity
@@ -378,17 +376,16 @@ fn hash_type_in<'a>(
             for w in ws {
                 std::mem::discriminant(&w.type_kind()).hash(state);
                 for c in w.children() {
-                    hash_type_in(c, env, wenv, free, state);
+                    hash_type(c, env, wenv, free, state);
                 }
                 wenv.push(*w.id());
             }
-            hash_type_in(domain, env, wenv, free, state);
-            hash_type_in(codomain, env, wenv, free, state);
+            hash_type(domain, env, wenv, free, state);
+            hash_type(codomain, env, wenv, free, state);
             wenv.truncate(wenv.len() - ws.len());
         }
-        // Positional, innermost-first — the α rule stated at `hash_type_in`. A free
-        // occurrence (no binder in scope) contributes only its discriminant, matching how a
-        // free term variable is handled: its identity is not this subterm's content.
+        // Bound references retain their position through nested types and predicate terms.
+        // A free witness reference contributes only its discriminant.
         T::WitnessRef(w) => {
             if let Some(depth) = wenv.iter().rev().position(|b| b == w) {
                 depth.hash(state);
@@ -397,25 +394,25 @@ fn hash_type_in<'a>(
         T::Tuple(tys) => {
             tys.len().hash(state);
             for t in tys {
-                hash_type(t, env, free, state);
+                hash_type(t, env, wenv, free, state);
             }
         }
-        T::Record(fields) => hash_type_fields(fields, env, free, state),
+        T::Record(fields) => hash_type_fields(fields, env, wenv, free, state),
         // Openness is not decoration: an open arm set commits only to the arms it
         // lists, so a closed and an open type over the same arms make different
         // demands and are not the same computation.
         T::Variant(fields, openness) => {
             openness.hash(state);
-            hash_type_fields(fields, env, free, state);
+            hash_type_fields(fields, env, wenv, free, state);
         }
         // A refinement set is a set: its physical order carries nothing, so the
         // predicate hashes sort before they fold — the canonicalization
         // `hash_rel` applies to its AC nodes.
         T::Refinement(base, refinements) => {
-            hash_type_in(base, env, wenv, free, state);
+            hash_type(base, env, wenv, free, state);
             let mut predicates: Vec<u64> = refinements
                 .iter()
-                .map(|r| hash_rel(&r.predicate, env, free))
+                .map(|r| hash_rel(&r.predicate, env, wenv, free))
                 .collect();
             predicates.sort_unstable();
             predicates.hash(state);
@@ -426,8 +423,8 @@ fn hash_type_in<'a>(
             history_kind,
         } => {
             history_kind.hash(state);
-            hash_type_in(value, env, wenv, free, state);
-            hash_type_in(domain, env, wenv, free, state);
+            hash_type(value, env, wenv, free, state);
+            hash_type(domain, env, wenv, free, state);
         }
     }
 }
@@ -438,6 +435,7 @@ fn hash_type_in<'a>(
 fn hash_type_fields<'a, K: Hash>(
     fields: &'a [(K, Type)],
     env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
     free: FreeVars<'_>,
     state: &mut DefaultHasher,
 ) {
@@ -446,7 +444,7 @@ fn hash_type_fields<'a, K: Hash>(
         .map(|(key, t)| {
             let mut h = DefaultHasher::new();
             key.hash(&mut h);
-            hash_type(t, env, free, &mut h);
+            hash_type(t, env, wenv, free, &mut h);
             h.finish()
         })
         .collect();
@@ -458,13 +456,14 @@ fn hash_type_fields<'a, K: Hash>(
 fn hash_opt_type<'a>(
     ty: Option<&'a Type>,
     env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
     free: FreeVars<'_>,
     state: &mut DefaultHasher,
 ) {
     match ty {
         Some(t) => {
             1u8.hash(state);
-            hash_type(t, env, free, state);
+            hash_type(t, env, wenv, free, state);
         }
         None => 0u8.hash(state),
     }
@@ -480,14 +479,15 @@ fn hash_opt_type<'a>(
 fn hash_binding<'a>(
     b: &'a TypedBinding,
     env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
     free: FreeVars<'_>,
     fold: Fold,
     state: &mut DefaultHasher,
 ) {
     if fold == Fold::Whole {
-        hash_type(&b.ty, env, free, state);
+        hash_type(&b.ty, env, wenv, free, state);
     }
-    hash_opt_type(b.user_annotation.as_ref(), env, free, state);
+    hash_opt_type(b.user_annotation.as_ref(), env, wenv, free, state);
     // Authored at the binder and derived from nothing else in the tree, so it
     // rides both folds: `y = e` and `y ^= e` are different programs.
     std::mem::discriminant(&b.transparency).hash(state);
@@ -534,6 +534,7 @@ fn hash_key_ref(name: &Name, state: &mut DefaultHasher) {
 fn hash_payload<'a>(
     e: &'a TypedExpr,
     env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
     free: FreeVars<'_>,
     fold: Fold,
     h: &mut DefaultHasher,
@@ -542,7 +543,7 @@ fn hash_payload<'a>(
     match &e.node {
         // `Realize` wraps the value it realizes and adds no content of its own beyond the
         // discriminant hashed by the caller.
-        N::Realize(v) => hash_payload(v, env, free, fold, h),
+        N::Realize(v) => hash_payload(v, env, wenv, free, fold, h),
         N::Lit(Lit::Int(n)) => n.hash(h),
         N::Lit(Lit::String(s)) => s.hash(h),
         N::Lit(Lit::Bool(b)) => b.hash(h),
@@ -585,7 +586,7 @@ fn hash_payload<'a>(
         // at the cast, with nothing below it to explain it.
         N::Cast { target, .. } => {
             if fold == Fold::Whole {
-                hash_type(target, env, free, h);
+                hash_type(target, env, wenv, free, h);
             }
         }
         N::BinOp { op, .. } => op.hash(h),
@@ -607,17 +608,17 @@ fn hash_payload<'a>(
             }
         }
 
-        N::Lambda { param, .. } => hash_binding(param, env, free, fold, h),
-        N::Let { binding, .. } => hash_binding(binding, env, free, fold, h),
+        N::Lambda { param, .. } => hash_binding(param, env, wenv, free, fold, h),
+        N::Let { binding, .. } => hash_binding(binding, env, wenv, free, fold, h),
         // A mutable variable introduction binds exactly as a `let` does — the
         // history `Mut(V, D)` rides the binder's `ty`, so hashing the binding
         // covers the declaration's whole type-level content.
-        N::MutDecl { binding, .. } => hash_binding(binding, env, free, fold, h),
-        N::For { target, .. } => hash_binding(target, env, free, fold, h),
+        N::MutDecl { binding, .. } => hash_binding(binding, env, wenv, free, fold, h),
+        N::For { target, .. } => hash_binding(target, env, wenv, free, fold, h),
         N::LetRec { bindings, .. } => {
             bindings.len().hash(h);
             for (b, _) in bindings {
-                hash_binding(b, env, free, fold, h);
+                hash_binding(b, env, wenv, free, fold, h);
             }
         }
         N::Case {
@@ -631,7 +632,7 @@ fn hash_payload<'a>(
                     Some(p) => {
                         1u8.hash(h);
                         p.tag.hash(h);
-                        hash_binding(&p.binding, env, free, fold, h);
+                        hash_binding(&p.binding, env, wenv, free, fold, h);
                     }
                     None => 0u8.hash(h),
                 }
@@ -643,12 +644,12 @@ fn hash_payload<'a>(
             domain,
             parameter,
         } => {
-            hash_type(domain, env, free, h);
+            hash_type(domain, env, wenv, free, h);
             // A nested `Transact` is a different node from a top-level one with the same
             // writers, so the writer parameter contributes.
             parameter.is_some().hash(h);
             if let Some(t) = parameter {
-                hash_type(t, env, free, h);
+                hash_type(t, env, wenv, free, h);
             }
             keys.len().hash(h);
             writers.len().hash(h);
@@ -676,11 +677,16 @@ fn hash_payload<'a>(
 /// What *is* decided here is the associative–commutative folding of the
 /// set-shaped nodes (`Record`, `DisjointJoin`), which is a property of their
 /// algebra rather than of their scoping.
-fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -> u64 {
+fn hash_rel<'a>(
+    e: &'a TypedExpr,
+    env: &mut Vec<&'a Name>,
+    wenv: &mut Vec<crate::ccl::ty::WitnessId>,
+    free: FreeVars<'_>,
+) -> u64 {
     use TypedExprNode as N;
     let mut h = DefaultHasher::new();
     std::mem::discriminant(&e.node).hash(&mut h);
-    hash_payload(e, env, free, Fold::Whole, &mut h);
+    hash_payload(e, env, wenv, free, Fold::Whole, &mut h);
 
     // Name occurrences fold as they are met; child hashes are collected in walk
     // order so the AC nodes below can canonicalize theirs first.
@@ -694,7 +700,7 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -
         } => {
             let depth = env.len();
             env.extend(binders.iter().map(|b| &b.name));
-            let hashed = hash_rel(child, env, free);
+            let hashed = hash_rel(child, env, wenv, free);
             env.truncate(depth);
             children.push(hashed);
         }
@@ -728,8 +734,8 @@ fn hash_rel<'a>(e: &'a TypedExpr, env: &mut Vec<&'a Name>, free: FreeVars<'_>) -
     // so the hash is type-aware — refinements participate via `hash_rel` (see
     // `hash_type`). Pre-inference these `ty`s are `Hole` (a constant tag);
     // post-inference they carry the resolved type.
-    hash_type(&e.ty, env, free, &mut h);
-    hash_opt_type(e.user_annotation.as_ref(), env, free, &mut h);
+    hash_type(&e.ty, env, wenv, free, &mut h);
+    hash_opt_type(e.user_annotation.as_ref(), env, wenv, free, &mut h);
     h.finish()
 }
 
@@ -890,6 +896,178 @@ mod tests {
             h(&typed(Type::Base(BaseType::Int))),
             h(&typed(Type::Base(BaseType::Int))),
         );
+    }
+
+    fn witness_pair_type(swapped: bool, domain: impl FnOnce(Type, Type, Type) -> Type) -> Type {
+        use crate::ccl::ty::{TypeKind, Witness};
+
+        let first = Witness::mint(TypeKind::UIntRanges);
+        let second = Witness::mint(TypeKind::SubtypesOf(Box::new(Type::Base(BaseType::Int))));
+        let mut refs = [
+            Type::WitnessRef(*first.id()),
+            Type::WitnessRef(*second.id()),
+        ];
+        let fixed_pair = Type::Tuple(refs.to_vec());
+        if swapped {
+            refs.swap(0, 1);
+        }
+        let [a, b] = refs;
+        Type::sum_binding(
+            first,
+            Type::sum_binding(
+                second,
+                Type::data_fun(domain(a, b, fixed_pair), Type::Base(BaseType::Int)),
+            ),
+        )
+    }
+
+    fn assert_witness_positions(domain: impl Fn(Type, Type, Type) -> Type, label: &str) {
+        let original = witness_pair_type(false, &domain);
+        let renamed = witness_pair_type(false, &domain);
+        let swapped = witness_pair_type(true, &domain);
+        for authored in [false, true] {
+            let expr = |ty| {
+                if authored {
+                    var("x").with_user_annotation(ty)
+                } else {
+                    typed(ty)
+                }
+            };
+            let a = expr(original.clone());
+            let b = expr(renamed.clone());
+            let c = expr(swapped.clone());
+            assert_eq!(
+                content_hash(&a),
+                content_hash(&b),
+                "{label}: alpha-renaming"
+            );
+            assert_ne!(content_hash(&a), content_hash(&c), "{label}: positions");
+            assert_eq!(resolved_hash(&a, &[]), resolved_hash(&b, &[]), "{label}");
+            assert_ne!(resolved_hash(&a, &[]), resolved_hash(&c, &[]), "{label}");
+            if authored {
+                assert_eq!(own_hash(&a, &[]), own_hash(&b, &[]), "{label}");
+                assert_ne!(own_hash(&a, &[]), own_hash(&c, &[]), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn witness_scope_crosses_type_containers() {
+        use crate::ccl::{FieldKey, HistoryKind};
+
+        for container in [
+            "tuple", "record", "variant", "bounded", "function", "history",
+        ] {
+            assert_witness_positions(
+                |a, b, _| match container {
+                    "tuple" => Type::Tuple(vec![a, b]),
+                    "record" => Type::Record(vec![("a".into(), a), ("b".into(), b)]),
+                    "variant" => Type::variant(vec![
+                        (FieldKey::Name("a".into()), a),
+                        (FieldKey::Name("b".into()), b),
+                    ]),
+                    "bounded" => Type::BoundedHole(Box::new(Type::Tuple(vec![a, b]))),
+                    "function" => Type::fun(a, b),
+                    "history" => Type::History {
+                        value: Box::new(a),
+                        domain: Box::new(b),
+                        history_kind: HistoryKind::Overwrite,
+                    },
+                    _ => unreachable!(),
+                },
+                container,
+            );
+        }
+    }
+
+    #[test]
+    fn witness_scope_crosses_refinement_predicate_type_slots() {
+        for slot in [
+            "inferred",
+            "annotation",
+            "binding",
+            "binding_annotation",
+            "cast",
+            "child",
+        ] {
+            assert_witness_positions(
+                |a, b, fixed_pair| {
+                    let ty = Type::Tuple(vec![a, b]);
+                    let predicate = match slot {
+                        "inferred" => var("p").with_ty(ty),
+                        "annotation" => var("p").with_user_annotation(ty),
+                        "binding" => TypedExpr::lambda("p", ty, var("p")),
+                        "binding_annotation" => {
+                            let mut p = lam("p", var("p"));
+                            let TypedExprNode::Lambda { param, .. } = &mut p.node else {
+                                unreachable!()
+                            };
+                            param.user_annotation = Some(ty);
+                            p
+                        }
+                        "cast" => TypedExpr::new(TypedExprNode::Cast {
+                            value: Box::new(var("p")),
+                            target: ty,
+                        }),
+                        "child" => lam("p", var("p").with_ty(ty)),
+                        _ => unreachable!(),
+                    };
+                    Type::Refinement(
+                        Box::new(fixed_pair),
+                        RefinementSet::one(Refinement {
+                            predicate: Rc::new(predicate),
+                        }),
+                    )
+                },
+                slot,
+            );
+        }
+    }
+
+    #[test]
+    fn nested_witness_scope_preserves_outer_references_and_restores_siblings() {
+        use crate::ccl::ty::{TypeKind, Witness};
+
+        assert_witness_positions(
+            |a, b, fixed_pair| {
+                let inner = Witness::mint(TypeKind::SubtypesOf(Box::new(fixed_pair)));
+                let inner_ref = Type::WitnessRef(*inner.id());
+                Type::Tuple(vec![
+                    Type::sum_binding(
+                        inner,
+                        Type::data_fun(
+                            Type::Tuple(vec![a.clone(), inner_ref]),
+                            Type::Base(BaseType::Int),
+                        ),
+                    ),
+                    Type::Tuple(vec![a, b]),
+                ])
+            },
+            "nested sum",
+        );
+
+        let ty = witness_pair_type(false, |a, b, _| Type::Tuple(vec![a, b]));
+        let outer = Witness::mint(TypeKind::Type);
+        let mut wenv = vec![*outer.id()];
+        hash_type(
+            &ty,
+            &mut Vec::new(),
+            &mut wenv,
+            FreeVars::BySpelling,
+            &mut DefaultHasher::new(),
+        );
+        assert_eq!(wenv, vec![*outer.id()]);
+    }
+
+    #[test]
+    fn swapped_witness_positions_are_not_shared_by_the_differ() {
+        let domain = |a, b, _| Type::Tuple(vec![a, b]);
+        let a = typed(witness_pair_type(false, domain));
+        let b = typed(witness_pair_type(true, domain));
+        let diff = crate::ccl::diff::diff(&a, &b);
+        assert_eq!(diff.matched.len(), 1);
+        assert_ne!(diff.matched[0].content, crate::ccl::diff::Content::Same);
+        assert!(diff.shared_roots().is_empty());
     }
 
     #[test]
