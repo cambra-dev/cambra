@@ -442,6 +442,19 @@ pub struct Meta {
     /// a consumer rendering this as a header badge would show the reader a pane
     /// name where the kind belongs.
     pub payload_kind: String,
+    /// Which version of the `main` branch this payload describes: the branch
+    /// table's version number (`LiveProgram::version`), which starts at `1`.
+    ///
+    /// `0` for a payload no run produced — `--inspect-only`, `--dump-snapshot`
+    /// and a degraded payload — which is every committed fixture. Distinct from
+    /// [`schema`](Self::schema), which versions the wire format rather than the
+    /// program.
+    ///
+    /// A probe frame carries the same number. A client holding a payload of a
+    /// lower version than a frame's is holding the wrong node table: a reload
+    /// keeps a kept operator's `NodeId` and mints a fresh one for every rebuilt
+    /// operator.
+    pub version: u64,
     /// The wire-format version. A client reads this to detect an incompatible
     /// payload before parsing the rest.
     ///
@@ -655,7 +668,9 @@ impl InspectedProgram<'_> {
     ///   [`dense_edges`]).
     /// * `definitions` — [`InspectedProgram::definitions`](super::program::InspectedProgram).
     /// * `diagnostics` — empty.
-    /// * `meta` — `payloadKind: "program"`, `schema:` [`SCHEMA_VERSION`].
+    /// * `meta` — `payloadKind: "program"`, `version: 0`, `schema:` [`SCHEMA_VERSION`].
+    ///   A running program's driver sets `version` to the branch version it
+    ///   rendered from.
     pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
         let source = SourceInfo {
             name: name.into(),
@@ -730,6 +745,7 @@ impl InspectedProgram<'_> {
             diagnostics: Vec::new(),
             meta: Meta {
                 payload_kind: "program".to_string(),
+                version: 0,
                 schema: SCHEMA_VERSION,
             },
             panes,
@@ -770,6 +786,7 @@ impl InspectorPayload {
             diagnostics,
             meta: Meta {
                 payload_kind: "failed".to_string(),
+                version: 0,
                 schema: SCHEMA_VERSION,
             },
             panes: Vec::new(),

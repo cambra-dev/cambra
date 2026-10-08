@@ -97,7 +97,7 @@ describe("the Values pane menu", () => {
     const box = before.querySelector<HTMLInputElement>("input[type=checkbox]")!;
     box.focus();
 
-    live.apply({ published: 3, final: false, nodes: [], sources: [] });
+    live.apply({ version: 0, published: 3, final: false, nodes: [], sources: [] });
 
     expect(items(root)[0]).toBe(before);
     expect(document.activeElement).toBe(box);

@@ -77,6 +77,11 @@ pub(crate) struct Launched {
 /// The wait is not optional: the program binds its control port during
 /// compilation, so a request sent before then is refused rather than served.
 pub(crate) fn launch_under_control(program: &str) -> Launched {
+    launch_under_control_with(program, &[])
+}
+
+/// [`launch_under_control`], passing `extra` to the binary as well.
+pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Launched {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
@@ -89,6 +94,7 @@ pub(crate) fn launch_under_control(program: &str) -> Launched {
     let mut program = RunningProgram {
         child: Command::new(env!("CARGO_BIN_EXE_cambra"))
             .arg(format!("--control={control}"))
+            .args(extra)
             .arg(&v1)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

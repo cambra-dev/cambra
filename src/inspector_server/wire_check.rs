@@ -352,6 +352,7 @@ fn assert_common_shape(v: &Value, doc: &str) {
         crate::inspector_model::SCHEMA_VERSION,
         "{doc}meta.schema is the supported version"
     );
+    assert!(meta["version"].is_u64(), "{doc}meta.version is a number");
 }
 
 /// Assert one node's `rewritten` tag is either `null` (a lowering root, or a
@@ -670,7 +671,7 @@ fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
 /// the reason [`PANE_IDS`] is: a list read off the producer agrees with the
 /// producer by construction. A field added, renamed or removed is meant to fail
 /// here, and the failure is the notice that the wire changed.
-const PROBE_FRAME_KEYS: [&str; 4] = ["published", "final", "nodes", "sources"];
+const PROBE_FRAME_KEYS: [&str; 5] = ["version", "published", "final", "nodes", "sources"];
 const PROBED_NODE_KEYS: [&str; 2] = ["nodeId", "probes"];
 const PROBE_KEYS: [&str; 11] = [
     "producerId",
@@ -694,6 +695,7 @@ const SOURCE_WINDOW_KEYS: [&str; 5] = ["nodeIds", "name", "total", "dropped", "r
 /// otherwise.
 pub fn assert_probe_frame_shape(v: &Value) {
     assert_exact_keys(v, &PROBE_FRAME_KEYS, "frame");
+    assert!(v["version"].is_u64(), "frame.version is a number");
     assert!(v["published"].is_u64(), "frame.published is a number");
     assert!(v["final"].is_boolean(), "frame.final is a boolean");
 

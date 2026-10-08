@@ -144,5 +144,7 @@ mod cases;
 mod fanout_lag;
 #[path = "hot_reload/harness.rs"]
 mod harness;
+#[path = "hot_reload/inspector.rs"]
+mod inspector;
 #[path = "support/serving.rs"]
 mod serving;

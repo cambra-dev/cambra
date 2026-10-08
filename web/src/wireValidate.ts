@@ -547,6 +547,7 @@ export function validateSnapshot(json: unknown): Snapshot {
   if (num(meta.schema, "meta.schema") !== SCHEMA_VERSION) {
     throw new WireError("meta.schema", `exactly ${SCHEMA_VERSION}`, meta.schema);
   }
+  num(meta.version, "meta.version");
 
   const panes = arr(o.panes, "panes").map((s, i) => validatePane(s, `panes[${i}]`));
   // Always present, empty on a degraded payload: no payload omits the field.
