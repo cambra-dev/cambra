@@ -346,7 +346,7 @@ pub(crate) fn gate_leaks(leaks: &[Leak], pair: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, env::VarError, num::NonZeroUsize};
 
     use indoc::indoc;
 
@@ -1387,6 +1387,44 @@ mod tests {
         }
     }
 
+    fn perf_repetitions(value: Result<String, VarError>) -> NonZeroUsize {
+        match value {
+            Err(VarError::NotPresent) => NonZeroUsize::new(3).unwrap(),
+            Ok(value) => value.parse().unwrap_or_else(|_| {
+                panic!("{PERF_REPS_ENV} must be a positive integer, got {value:?}")
+            }),
+            Err(VarError::NotUnicode(value)) => {
+                panic!("{PERF_REPS_ENV} must be a positive integer, got {value:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn pane_perf_repetitions_default_only_when_absent() {
+        assert_eq!(perf_repetitions(Err(VarError::NotPresent)).get(), 3);
+        for reps in [1, 9, usize::MAX] {
+            assert_eq!(perf_repetitions(Ok(reps.to_string())).get(), reps);
+        }
+    }
+
+    #[test]
+    fn pane_perf_repetitions_reject_invalid_values() {
+        for value in ["0", "", "abc", "-1", "1.5", "184467440737095516160"] {
+            let err = std::panic::catch_unwind(|| perf_repetitions(Ok(value.to_string())))
+                .expect_err("invalid repetition count must fail");
+            let message = err.downcast_ref::<String>().expect("formatted panic");
+            assert!(message.contains("CAMBRA_PERF_REPS must be a positive integer"));
+        }
+        let err = std::panic::catch_unwind(|| {
+            perf_repetitions(Err(VarError::NotUnicode(std::ffi::OsString::from(
+                "invalid",
+            ))))
+        })
+        .expect_err("non-Unicode repetition count must fail");
+        let message = err.downcast_ref::<String>().expect("formatted panic");
+        assert!(message.contains("CAMBRA_PERF_REPS must be a positive integer"));
+    }
+
     /// Rough compile-time and retained-memory sanity for pane capture. Ignored
     /// by default — it is a measurement, not an assertion.
     ///
@@ -1406,10 +1444,7 @@ mod tests {
     #[ignore = "measurement, not an assertion; see the doc comment for the driver"]
     fn provenance_pane_perf() {
         let capture = provenance_capture_enabled();
-        let reps: usize = std::env::var(PERF_REPS_ENV)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3);
+        let reps = perf_repetitions(std::env::var(PERF_REPS_ENV));
         let mut total_compile = std::time::Duration::ZERO;
         let mut total_fold = std::time::Duration::ZERO;
         for (shape, n) in PERF_CORPUS {
@@ -1423,7 +1458,7 @@ mod tests {
             // is the pane design's real memory floor, against which the logs are
             // noise.
             let mut panes_nodes = 0usize;
-            for _ in 0..reps {
+            for _ in 0..reps.get() {
                 let t0 = std::time::Instant::now();
                 let program = compile_ok(&code);
                 best_compile = best_compile.min(t0.elapsed());

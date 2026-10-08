@@ -61,7 +61,9 @@
 //! ```
 
 use std::{
+    env::VarError,
     fs,
+    num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -175,6 +177,18 @@ fn gallery_post_infer_timing() {
     });
 }
 
+fn repetitions(value: Result<String, VarError>) -> NonZeroUsize {
+    match value {
+        Err(VarError::NotPresent) => NonZeroUsize::new(3).unwrap(),
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{REPS_ENV} must be a positive integer, got {value:?}")),
+        Err(VarError::NotUnicode(value)) => {
+            panic!("{REPS_ENV} must be a positive integer, got {value:?}")
+        }
+    }
+}
+
 /// Time `compile` over every selected gallery program and print the table.
 ///
 /// `what` labels the run and heads the timing column. `compile` receives a
@@ -188,10 +202,7 @@ fn time_gallery<T>(
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let reps: usize = std::env::var(REPS_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+    let reps = repetitions(std::env::var(REPS_ENV));
     let only = std::env::var(ONLY_ENV).unwrap_or_default();
     let programs: Vec<(String, PathBuf)> = gallery()
         .into_iter()
@@ -264,7 +275,7 @@ fn time_gallery<T>(
 fn best_compile<T>(
     label: &str,
     source: &str,
-    reps: usize,
+    reps: NonZeroUsize,
     compile: &mut impl FnMut(&dyn Fn() -> String) -> Result<Measured<T>, Vec<CompileError>>,
 ) -> Outcome {
     let mut best = Duration::MAX;
@@ -279,7 +290,7 @@ fn best_compile<T>(
         rendered.replace(text.clone());
         text
     };
-    for _ in 0..reps {
+    for _ in 0..reps.get() {
         match panic::catch_unwind(AssertUnwindSafe(|| compile(&fresh))) {
             Ok(Ok(Measured { span, product })) => {
                 best = best.min(span);
@@ -362,4 +373,41 @@ fn summary(message: &str) -> String {
         Some((locus, _)) => format!("{head} at {locus}"),
         None => head,
     }
+}
+
+#[test]
+fn timing_repetitions_default_only_when_absent() {
+    assert_eq!(repetitions(Err(VarError::NotPresent)).get(), 3);
+    for reps in [1, 9, usize::MAX] {
+        assert_eq!(repetitions(Ok(reps.to_string())).get(), reps);
+    }
+}
+
+#[test]
+fn timing_repetitions_reject_invalid_values() {
+    for value in ["0", "", "abc", "-1", "1.5", "184467440737095516160"] {
+        let err = panic::catch_unwind(|| repetitions(Ok(value.to_string())))
+            .expect_err("invalid repetition count must fail");
+        assert!(panic_message(&*err).contains("CAMBRA_PERF_REPS must be a positive integer"));
+    }
+    let err = panic::catch_unwind(|| {
+        repetitions(Err(VarError::NotUnicode(std::ffi::OsString::from(
+            "invalid",
+        ))))
+    })
+    .expect_err("non-Unicode repetition count must fail");
+    assert!(panic_message(&*err).contains("CAMBRA_PERF_REPS must be a positive integer"));
+}
+
+#[test]
+fn timing_best_compile_runs_every_repetition() {
+    let mut spans = [5, 2, 8].into_iter();
+    let outcome = best_compile("test", "1", NonZeroUsize::new(3).unwrap(), &mut |_| {
+        Ok(Measured {
+            span: Duration::from_millis(spans.next().expect("exactly three repetitions")),
+            product: (),
+        })
+    });
+    assert!(spans.next().is_none());
+    assert!(matches!(outcome, Outcome::Compiled(span) if span == Duration::from_millis(2)));
 }
