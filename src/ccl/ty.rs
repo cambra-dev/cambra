@@ -741,6 +741,20 @@ pub struct FunKindVar {
     /// Stable, globally-unique identity — and, with a position, each binder's.
     pub uid: FunKindVarId,
     bounds: RefCell<FunKindBounds>,
+    /// [`resolved`](Self::resolved)'s answer, with the [`KIND_FACTS`] count it was
+    /// computed at: still the answer while no kind variable has been written since.
+    resolved_at: RefCell<Option<(u64, KindPin)>>,
+}
+
+thread_local! {
+    /// How many facts have been written to kind variables on this thread: the bounds,
+    /// stamps and sources [`FunKindVar::resolved`] reads. Every write bumps it, so a
+    /// cached answer computed at the current count is still the answer.
+    static KIND_FACTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn kind_fact_written() {
+    KIND_FACTS.with(|n| n.set(n.get() + 1));
 }
 
 impl FunKindVar {
@@ -749,6 +763,7 @@ impl FunKindVar {
         let v = Rc::new(FunKindVar {
             uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             bounds: RefCell::new(FunKindBounds::default()),
+            resolved_at: RefCell::new(None),
         });
         #[cfg(debug_assertions)]
         KIND_VARS.with(|ks| ks.borrow_mut().push(Rc::clone(&v)));
@@ -767,6 +782,7 @@ impl FunKindVar {
         let side = if lower { &mut b.lower } else { &mut b.upper };
         if !side.iter().any(|x| same_fun_kind(x, &k)) {
             side.push(k);
+            kind_fact_written();
         }
     }
 
@@ -779,12 +795,30 @@ impl FunKindVar {
     ///
     /// `seen` guards the walk: a collection reaches itself through a recurrence, so the
     /// relation is not required to be acyclic.
+    ///
+    /// The answer is the join over every kind the walk reaches, and a kind it reaches
+    /// reaches only kinds this one does, so a reached kind's cached answer stands in for
+    /// walking it. An answer is cached once a whole walk computes it, and is current until
+    /// any kind variable is written ([`KIND_FACTS`]).
     pub fn resolved(&self) -> KindPin {
-        fn go(v: &FunKindVar, seen: &mut Vec<FunKindVarId>) -> KindPin {
-            if seen.contains(&v.uid) {
+        let now = KIND_FACTS.with(|n| n.get());
+        fn cached(v: &FunKindVar, now: u64) -> Option<KindPin> {
+            match &*v.resolved_at.borrow() {
+                Some((at, pin)) if *at == now => Some(pin.clone()),
+                _ => None,
+            }
+        }
+        fn go(
+            v: &FunKindVar,
+            now: u64,
+            seen: &mut std::collections::HashSet<FunKindVarId>,
+        ) -> KindPin {
+            if !seen.insert(v.uid) {
                 return KindPin::Unpinned;
             }
-            seen.push(v.uid);
+            if let Some(pin) = cached(v, now) {
+                return pin;
+            }
             let b = v.bounds.borrow();
             // **What a collection is built over says what it is.** It binds one position
             // per position of each source, so its width is their sum — a sum of that
@@ -801,13 +835,25 @@ impl FunKindVar {
                 .chain(b.upper.iter())
                 .fold(b.stamped.clone().join(over), |acc, k| {
                     let point = match k {
-                        FunKind::Var(x) => go(x, seen),
+                        FunKind::Var(x) => go(x, now, seen),
                         other => other.resolved(),
                     };
                     acc.join(point)
                 })
         }
-        go(self, &mut Vec::new())
+        if let Some(pin) = cached(self, now) {
+            return pin;
+        }
+        let pin = go(self, now, &mut std::collections::HashSet::new());
+        // The walk reads the sources' widths, which resolves other kinds, but resolving
+        // only reads and caches: the answer is computed at `now`.
+        debug_assert_eq!(
+            KIND_FACTS.with(|n| n.get()),
+            now,
+            "resolving a kind writes no kind facts"
+        );
+        *self.resolved_at.borrow_mut() = Some((now, pin.clone()));
+        pin
     }
 
     /// Record that this collection is **built over** `src`, ahead of what is already there.
@@ -819,6 +865,7 @@ impl FunKindVar {
     /// its applications. The order is the generator order, not the visit order.
     pub fn contributes_first(self: &Rc<Self>, src: FunKind) {
         self.bounds.borrow_mut().built_over.insert(0, src);
+        kind_fact_written();
     }
 
     /// The kinds this one is built over, in generator order.
@@ -857,6 +904,7 @@ impl FunKindVar {
     /// to have. The one fact that is not an edge, because no `FunKind` spells it.
     pub fn stamp_data(&self) {
         self.bounds.borrow_mut().stamped = KindPin::Data;
+        kind_fact_written();
     }
 
     /// A one-line rendering of everything recorded, for tracing.
@@ -5358,6 +5406,26 @@ mod tests {
 
     fn rng(n: usize) -> Type {
         Type::UIntRange(n)
+    }
+
+    /// A kind's cached [`resolved`](FunKindVar::resolved) answer follows a later write to a
+    /// kind it reaches. `record` is exercised throughout the suite; `stamp_data` and
+    /// `contributes_first` are written today only on variables nothing reaches yet, so
+    /// only this pins their invalidation.
+    #[test]
+    fn a_resolved_kind_follows_a_later_write_to_a_kind_it_reaches() {
+        let reaching = || {
+            let (k1, k2) = (FunKindVar::fresh(), FunKindVar::fresh());
+            k1.record(FunKind::Var(Rc::clone(&k2)), true);
+            assert_eq!(k1.resolved(), KindPin::Unpinned);
+            (k1, k2)
+        };
+        let (k1, k2) = reaching();
+        k2.stamp_data();
+        assert_eq!(k1.resolved(), KindPin::Data);
+        let (k1, k2) = reaching();
+        k2.contributes_first(FunKind::Data(None));
+        assert_eq!(k1.resolved(), KindPin::Plain);
     }
 
     /// Refusal is a predicate on **one** type against **one** kind — the whole of what a kind
