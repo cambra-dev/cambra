@@ -16,7 +16,7 @@ re-wrapped for reading — the compiler dumps its intermediate form after each s
 `RUST_LOG=debug`. Put either §7 program in a file and watch it go through:
 
 ```bash
-cargo build && RUST_LOG=debug ./target/debug/cambra prog.chl
+cargo build && RUST_LOG=debug ./target/debug/cambra prog.cambra
 ```
 
 Each stage prints under its own name (`Lowered`, `Inferred`, `Letrec phase CCL`,

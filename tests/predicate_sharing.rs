@@ -15,12 +15,13 @@ use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
 use cambra::ccl::comprehension;
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::infer::{TypeInferenceContext, infer};
+use cambra::ccl::load::LoadedProgram;
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
 use cambra::ccl::symbolic::symbolic;
 use cambra::ccl::uniquify;
 use cambra::ccl::{BaseType, Expr, Lit, Refinement, Type, TypedExprNode};
 use cambra::chl_parser;
-use cambra::chl_parser::{FileId, SourceMap};
+use cambra::chl_parser::FileId;
 use std::rc::Rc;
 
 /// Parse → lower → uniquify → infer `code` (the pipeline prefix through type
@@ -110,10 +111,7 @@ fn a_cast_target_does_not_carry_its_value_s_refinements() {
     let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
     let compiled = compile_program(
         &mut ctx,
-        &SourceMap::single(
-            "<test>",
-            "[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]",
-        ),
+        &LoadedProgram::test("[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]"),
         consumer,
     )
     .expect("the nested filter compiles");

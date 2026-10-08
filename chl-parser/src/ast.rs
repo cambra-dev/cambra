@@ -383,6 +383,17 @@ impl ModulePath {
         let last = self.segments.last().expect("a module path has a segment");
         first.span.join(last.span)
     }
+
+    /// The module this path names, or `None` when a segment breaks the rule
+    /// of [`crate::module_path::segment_error`], which the parser reported.
+    pub fn to_path(&self) -> Option<crate::module_path::ModulePath> {
+        self.segments
+            .iter()
+            .all(|s| crate::module_path::segment_error(&s.node).is_none())
+            .then(|| {
+                crate::module_path::ModulePath::new(self.segments.iter().map(|s| s.node.clone()))
+            })
+    }
 }
 
 /// One name a `use` clause binds: `f`, or `T as U` (`docs/chl-spec.md`, "9.2

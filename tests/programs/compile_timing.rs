@@ -21,7 +21,7 @@ use cambra::{
     ccl::context::{
         CompileError, GlobalContext, Phase, compile_program, compile_to, render_errors,
     },
-    chl_parser::SourceMap,
+    ccl::load::LoadedProgram,
     interpreter::Consumer,
 };
 
@@ -78,11 +78,11 @@ fn whole<T>(
 #[ignore = "measurement, not a gate; see docs/demo-programs.md, Timing a compile"]
 fn gallery_compile_timing() {
     time_gallery("compile", |source| {
-        let sources = SourceMap::single("<gallery>", source());
+        let loaded = LoadedProgram::from_text("<gallery>", source());
         whole(|| {
             let mut ctx = GlobalContext::default();
             let consumer: Box<dyn Consumer> = Box::new(|| {});
-            compile_program(&mut ctx, &sources, consumer)
+            compile_program(&mut ctx, &loaded, consumer)
         })
     });
 }
@@ -91,8 +91,8 @@ fn gallery_compile_timing() {
 #[ignore = "measurement, not a gate; see docs/demo-programs.md, Timing a compile"]
 fn gallery_infer_timing() {
     time_gallery("infer", |source| {
-        let sources = SourceMap::single("<gallery>", source());
-        whole(|| compile_to(&sources, Phase::Infer))
+        let loaded = LoadedProgram::from_text("<gallery>", source());
+        whole(|| compile_to(&loaded, Phase::Infer))
     });
 }
 
@@ -108,8 +108,8 @@ fn gallery_infer_timing() {
 fn gallery_post_infer_timing() {
     time_gallery("post-infer", |source| {
         let (to_infer, to_planning) = (
-            SourceMap::single("<gallery>", source()),
-            SourceMap::single("<gallery>", source()),
+            LoadedProgram::from_text("<gallery>", source()),
+            LoadedProgram::from_text("<gallery>", source()),
         );
         let inferred = whole(|| compile_to(&to_infer, Phase::Infer))?;
         let planned = whole(|| compile_to(&to_planning, Phase::Planning))?;
@@ -244,8 +244,8 @@ fn best_compile<T>(
                 std::hint::black_box(&product);
             }
             Ok(Err(errs)) => {
-                let sources = SourceMap::single(label, &*rendered.borrow());
-                return Outcome::Rejected(summary(&render_errors(&errs, &sources)));
+                let loaded = LoadedProgram::from_text(label, &*rendered.borrow());
+                return Outcome::Rejected(summary(&render_errors(&errs, loaded.sources())));
             }
             Err(payload) => return Outcome::Rejected(summary(&panic_message(&*payload))),
         }

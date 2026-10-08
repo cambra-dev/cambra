@@ -8,7 +8,6 @@
 //! (`expect_scalar` and its siblings) stay in `tests/programs/common/mod.rs`,
 //! which nothing else wants.
 
-use cambra::chl_parser::SourceMap;
 use std::{
     io::{Read, Write},
     net::TcpStream,
@@ -17,6 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cambra::ccl::load::LoadedProgram;
 use cambra::{
     ccl::context::{CompileResultExt, GlobalContext, compile_program},
     interpreter::Consumer,
@@ -40,8 +40,8 @@ use cambra::{
 pub fn compile_sink(source: &str) -> GlobalContext {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", source);
-    let _ = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(source);
+    let _ = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     ctx
 }
 
@@ -53,9 +53,9 @@ pub fn compile_sink(source: &str) -> GlobalContext {
 /// caller must keep alive alongside the context.
 pub fn start_sink(source: &str) -> (GlobalContext, LiveProgram) {
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single("<test>", source);
+    let loaded = LoadedProgram::test(source);
     let program =
-        LiveProgram::start(&mut ctx, &sources, &|| Box::new(|| {})).unwrap_or_render(&sources);
+        LiveProgram::start(&mut ctx, &loaded, &|| Box::new(|| {})).unwrap_or_render(&loaded);
     (ctx, program)
 }
 

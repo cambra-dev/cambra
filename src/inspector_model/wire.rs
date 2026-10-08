@@ -50,6 +50,7 @@
 
 use crate::ccl::Expr;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
+use crate::chl_parser::SourceMap;
 use crate::chl_parser::ast::Span;
 use crate::interpreter::operator_graph::{EdgeKind, EdgeRole, GraphNode, InputEdge, OperatorGraph};
 
@@ -397,10 +398,28 @@ impl Diagnostic {
 /// Convert a slice of [`CompileError`](crate::ccl::context::CompileError)s into
 /// wire [`Diagnostic`]s — the dual-use JSON consumer of the same errors the
 /// terminal renders.
+///
+/// The payload carries one file, the root of `sources`. A diagnostic located in
+/// another file names that file in its message and carries no span, since a
+/// span is a range of the text the payload carries.
 pub fn diagnostics_from_compile_errors(
     errors: &[crate::ccl::context::CompileError],
+    sources: &SourceMap,
 ) -> Vec<Diagnostic> {
-    errors.iter().map(Diagnostic::from_compile_error).collect()
+    errors
+        .iter()
+        .map(|error| {
+            let mut diagnostic = Diagnostic::from_compile_error(error);
+            if let Some(span) = diagnostic.span
+                && span.file != sources.root()
+            {
+                diagnostic.message =
+                    format!("in {}: {}", sources.path(span.file), diagnostic.message);
+                diagnostic.span = None;
+            }
+            diagnostic
+        })
+        .collect()
 }
 
 /// `meta` — snapshot metadata + the forward-compat live seams.
@@ -759,6 +778,7 @@ impl InspectorPayload {
 mod tests {
     use super::*;
     use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
+    use crate::ccl::load::LoadedProgram;
     use crate::ccl::panes::PANES;
     use crate::chl_parser::{FileId, SourceMap};
     use crate::interpreter::Consumer;
@@ -768,8 +788,7 @@ mod tests {
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
-            .expect("program compiles")
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect("program compiles")
     }
 
     /// The span of the `n`-th (0-based) byte occurrence of `needle` in the root
@@ -1454,7 +1473,7 @@ mod tests {
         let code = "x = (1 + \n";
         let compiled = compile_program(
             &mut GlobalContext::default(),
-            &SourceMap::single("<test>", code),
+            &LoadedProgram::test(code),
             Box::new(|| {}) as Box<dyn Consumer>,
         );
         let Err(errors) = compiled else {
@@ -1539,15 +1558,16 @@ mod tests {
     /// success path, so the two shapes cannot drift apart.
     #[test]
     fn a_degraded_payload_carries_diagnostics_and_no_panes() {
+        let program = LoadedProgram::test("z + 1\n");
         let compiled = compile_program(
             &mut GlobalContext::default(),
-            &SourceMap::single("<test>", "z + 1\n"),
+            &program,
             Box::new(|| {}) as Box<dyn Consumer>,
         );
         let Err(errors) = compiled else {
             panic!("an unbound name must fail to compile")
         };
-        let diagnostics = diagnostics_from_compile_errors(&errors);
+        let diagnostics = diagnostics_from_compile_errors(&errors, program.sources());
         assert!(!diagnostics.is_empty(), "the failure produces diagnostics");
 
         let payload = InspectorPayload::degraded("test", "z + 1\n", diagnostics);
@@ -1556,6 +1576,39 @@ mod tests {
         assert!(payload.panes.is_empty());
         assert!(payload.pane_links.is_empty());
         assert!(!payload.diagnostics.is_empty());
+    }
+
+    /// The payload carries the root file alone, so a diagnostic located in
+    /// another module names that module's file and carries no span.
+    #[test]
+    fn a_diagnostic_in_another_file_names_it_and_has_no_span() {
+        use crate::ccl::load::{InMemory, RootFile};
+        let root = RootFile {
+            path: "main.cambra".to_owned(),
+            module: None,
+            text: "import lib\n1\n".to_owned(),
+        };
+        let program = LoadedProgram::load(root, &mut InMemory::default().with("lib", "y = = 2\n"));
+        let Err(errors) = compile_program(
+            &mut GlobalContext::default(),
+            &program,
+            Box::new(|| {}) as Box<dyn Consumer>,
+        ) else {
+            panic!("an import is refused")
+        };
+        let diagnostics = diagnostics_from_compile_errors(&errors, program.sources());
+        let in_lib: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with("in lib.cambra: "))
+            .collect();
+        assert_eq!(in_lib.len(), 1, "{diagnostics:#?}");
+        assert!(in_lib[0].span.is_none());
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.span.is_some_and(|s| s.file == program.sources().root())),
+            "the root's refusal keeps its span: {diagnostics:#?}"
+        );
     }
 
     /// A let-polymorphic def used at two types fans out: the pre-inference →

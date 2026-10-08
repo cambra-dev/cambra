@@ -10,11 +10,11 @@
 //! the driver with **bounded** waits, so a lost-wakeup regression fails the test
 //! rather than hanging it.
 
-use cambra::chl_parser::SourceMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::context::{GlobalContext, compile_program};
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{
     ColumnValue, Consumer, Tile, TileGuard, Value, tile_operators::FunctionGuard,
 };
@@ -30,8 +30,7 @@ fn drive_main_output(code: &str) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(move || *nd.borrow_mut() = true);
 
     let mut ctx = GlobalContext::default();
-    let mut compiled = match compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
-    {
+    let mut compiled = match compile_program(&mut ctx, &LoadedProgram::test(code), consumer) {
         Ok(c) => c,
         Err(e) => panic!("compile failed: {e:?}"),
     };

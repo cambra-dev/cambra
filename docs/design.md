@@ -149,7 +149,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 
 | Stage | Transformation |
 | --- | --- |
-| Parse | CHL source to a recoverable CHL AST; see [parser design](../chl-parser/design-chl-parser.md#stage-2--parser-parserrs). |
+| Load | `LoadedProgram::load`, before `run_frontend`: read the root and every module it imports or runs, parse each file to a recoverable CHL AST, and refuse module-graph cycles; see [loading](modules.md#loading) and [parser design](../chl-parser/design-chl-parser.md#stage-2--parser-parserrs). Only the root is lowered. |
 | Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). |
 | Uniquify | Give term binders distinct identities so later passes substitute without capture; see [structured names](../src/ccl/design/ir.md#structured-names-and-α-uniquification-barendregt-convention). |
 | A-normalize | `anf::run` names compound operands before inference. |

@@ -12,7 +12,7 @@ use std::{
 
 use cambra::{
     ccl::context::{CompileError, GlobalContext, Phase},
-    chl_parser::SourceMap,
+    ccl::load::LoadedProgram,
     live_program::{DiffReport, LiveProgram, MainConsumerFactory, ReloadError, ReloadReport},
 };
 
@@ -811,7 +811,7 @@ impl OneFile for LiveProgram {
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Self, Vec<CompileError>> {
-        LiveProgram::start(ctx, &SourceMap::single("<test>", text), main_consumer)
+        LiveProgram::start(ctx, &LoadedProgram::test(text), main_consumer)
     }
 
     fn reload_text(
@@ -820,7 +820,7 @@ impl OneFile for LiveProgram {
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<ReloadReport, ReloadError> {
-        self.reload(ctx, &SourceMap::single("<test>", text), main_consumer)
+        self.reload(ctx, &LoadedProgram::test(text), main_consumer)
     }
 
     fn diff_text(
@@ -829,7 +829,7 @@ impl OneFile for LiveProgram {
         text: &str,
         phase: Phase,
     ) -> Result<DiffReport, ReloadError> {
-        self.diff_against(ctx, &SourceMap::single("<test>", text), phase)
+        self.diff_against(ctx, &LoadedProgram::test(text), phase)
     }
 }
 
@@ -894,8 +894,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     use std::{cell::RefCell, rc::Rc};
 
     use cambra::{
+        ccl::load::LoadedProgram,
         ccl::{Type, context::GlobalContext},
-        chl_parser::SourceMap,
         interpreter::{BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value},
         live_program::LiveProgram,
     };
@@ -924,8 +924,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
         producer.get(producer.tiling().universal_guard())
     };
 
-    let mut live = LiveProgram::start(&mut ctx, &SourceMap::single("<test>", v1), &no_main)
-        .expect("v1 compiles");
+    let mut live =
+        LiveProgram::start(&mut ctx, &LoadedProgram::test(v1), &no_main).expect("v1 compiles");
     source.borrow_mut().add_data(&rows(0, before));
     source
         .borrow_mut()
@@ -933,7 +933,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     for _ in 0..20 {
         pull(&mut ctx, &mut live);
     }
-    live.reload(&mut ctx, &SourceMap::single("<test>", v2), &no_main)
+    live.reload(&mut ctx, &LoadedProgram::test(v2), &no_main)
         .expect("v2 replaces v1");
     source.borrow_mut().add_data(&rows(before.len(), after));
     source.borrow_mut().set_yield_predicate(Predicate::True);

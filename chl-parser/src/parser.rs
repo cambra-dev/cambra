@@ -17,6 +17,7 @@ use crate::ast::{
     VariantPayload,
 };
 use crate::lexer::{self, Token};
+use crate::module_path::segment_error;
 
 mod error;
 #[cfg(test)]
@@ -1774,24 +1775,8 @@ where
         .collect::<Vec<_>>()
         .validate(|segments, _, emitter| {
             for segment in &segments {
-                if segment.node.starts_with("__") {
-                    emitter.emit(Rich::custom(
-                        segment.span,
-                        format!(
-                            "module name `{}` begins with `__`, a namespace user code \
-                             cannot bind",
-                            segment.node
-                        ),
-                    ));
-                } else if !segment.node.starts_with(|c: char| c.is_ascii_lowercase()) {
-                    emitter.emit(Rich::custom(
-                        segment.span,
-                        format!(
-                            "module name `{}` must begin with a lowercase letter; a \
-                             capitalized name is a type",
-                            segment.node
-                        ),
-                    ));
+                if let Some(message) = segment_error(&segment.node) {
+                    emitter.emit(Rich::custom(segment.span, message));
                 }
             }
             ModulePath { segments }
