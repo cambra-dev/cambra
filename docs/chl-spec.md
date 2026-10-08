@@ -169,8 +169,9 @@ clause, which ends a `def` signature or a polymorphic type
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
-> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `type` (nominal types,
-> **[Decided]**, [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `type` and `impl` (nominal
+> types and their associated functions, **[Decided]**,
+> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
 > and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
 > (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires` and the module keywords are
@@ -210,8 +211,8 @@ module](#912-field-labels-and-tags-belong-to-a-module)), and a nominal type from
 [Decided]](#68-nominal-types-and-methods-decided)). A qualified name parses wherever a name does,
 and lowering refuses it until modules are implemented.
 
-> **Direction [Decided].** Postfix `!` joins the set. It unwraps a proven `` `some ``
-> ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)).
+> **Direction [Decided].** Postfix `!` joins the set. It unwraps an `Option` proven not to be
+> `none` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
 a mutable variable. It is *not* Python's walrus operator: it is an
@@ -275,6 +276,10 @@ why the refinement separator moved off `|`.
 ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)) and `Discard`
 ([8.9 `@Discard` [Decided]](#89-discard-decided)), so `@` never appears in any other position.
 `@RenamedFrom` and `@Discard` parse, and lowering refuses them.
+
+**[Decided]** — `@RenamedFrom` also decorates a `type` declaration and a constructor line inside
+one ([Reloading a nominal type](#reloading-a-nominal-type)). Its argument there is a path:
+`@RenamedFrom(Price)`, `@RenamedFrom(old_mod::Price)`, `@RenamedFrom(circ)`.
 
 ### 1.10 Semicolons
 
@@ -419,7 +424,10 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 > (**[Decided]**, §3.7 — today an annotation *requires* a value), and
 > out-of-line collection definition through a subscript target,
 > `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
-> no-subscript-target rule above).
+> no-subscript-target rule above). A `type` declaration, a `def` whose name is
+> qualified by a type (`def Price::discounted(…)`), and `@RenamedFrom` on either a
+> `type` or one of its constructors are **[Decided]**, with their grammar in
+> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
 > (`mut_assign_stmt` and `with_stmt`
 > above are already implemented — §4.3, §8; they are in the grammar, not
 > this list.)
@@ -987,6 +995,20 @@ A *zero-argument* call is valid only against a name registered as a
 or as the context of `with begin():` (§8.2). A zero-argument call against
 any other name is a compile-time error.
 
+> **Direction [Decided] — a zero-argument call is an effect.** Terms are pure and immutable, so a
+> function of no argument is a constant and is written as a value. A zero-argument call remains
+> only where something other than a value is produced: a source read, a new channel (`defer()`),
+> or a transaction (`begin()`). `empty_map()` becomes the values `Map::empty` and `Set::empty`
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), and an
+> associated function that declares no parameters, `def Price::zero():`, is an error that says to
+> bind a value instead ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+>
+> A method call is not a zero-argument call: `o.is_none()` passes `o` as `self`, so the function
+> takes one argument. Two gaps remain, both **[Open]**. A value is bound by `=`, whose right side is
+> an expression, an `if` chain or a `match` ([4.3 Assignment forms](#43-assignment-forms)), so a
+> constant that needs an indented block of statements has no spelling. And an associated value of a
+> declared type, such as `Price::zero`, has none either.
+
 ### 3.9 Subscript and attribute access
 
 Subscript syntax distinguishes proven application from checked lookup:
@@ -1012,18 +1034,28 @@ requires the final domain. A live feed with no final domain may never answer an 
 
 #### Subscript and unwrap syntax [Decided]
 
-The replacement makes `c[k]` the optional lookup and retires `c[k]?`. A presence proof narrows
-its result from `Option(T)` to the single arm `some(T)`. Postfix `!` unwraps that single-arm value:
+The replacement makes `c[k]` the optional lookup and retires `c[k]?`. Its result is an `Option`
+refined by whether the key is present, and postfix `!` takes an `Option` refined to exclude
+`none`:
 
-```python
-def unwrap(o: {`some{T}}) => T:
-    `some(ret) = o
-    ret
+```
+_[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == not (k in m)}
+_!   : {Option(T) where not _.is_none()} => T
 ```
 
-Under this design, `c[k]!` is accepted only when the result type excludes `none`. Failure to
-establish presence is a type error at `!`, not a runtime unwrap failure. The destructuring rule
-is [Destructuring patterns](#431-destructuring-patterns). The proposed `!` has postfix precedence;
+`Option` is a nominal type ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+so presence is stated by a term predicate over it rather than by a subtype naming one constructor.
+`is_none` is a method of `Option` declared with it, and the predicate calls it because a nominal
+type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A lookup into an
+`Array(n, T)` states presence as `i < n`, and a `FullMap` lookup's result is
+`{Option(V) where not _.is_none()}` for every key. A `List(T)` lookup states presence through
+its length, `{Option(T) where _.is_none() == not (i < len(xs))}`
+([Trait requirements](#trait-requirements)); an index drawn from iterating `xs` lies in its index
+range, so it establishes `i < len(xs)`.
+
+`c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
+`in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
+is a type error at `!`, not a runtime unwrap failure. The proposed `!` has postfix precedence;
 `!=` remains one token, so `x! == y` requires a space before `==`.
 
 > **[Interim]** The compiler has no postfix `!`. Today's `c[k]?` corresponds to the decided
@@ -1129,7 +1161,7 @@ for example `m: Map(Int, Int) = box(map([1 -> 10, 2 -> 20]))`.
 `list(...)` is not a builtin; `box([1, 2])` can satisfy a `List(Int)` annotation.
 
 Repeated set elements produce one key. Duplicate keys in a constant map are a compile-time error;
-see [Type-directed literals](#type-directed-literals-decided).
+see [Re-keying is explicit](#re-keying-is-explicit-decided).
 
 #### Empty forms
 
@@ -1151,15 +1183,15 @@ The set annotation works because `Set(K)` currently lowers as `Map(K, unit)`. An
 Inference details and the distinction between empty positional and keyed domains belong to
 [The empty literal names no element type](../src/ccl/design/collections.md#the-empty-literal-names-no-element-type).
 
-#### Type-directed literals [Decided]
+#### Re-keying is explicit [Decided]
 
-Literal typing inserts constructors according to annotation or usage. A positional literal can
-supply an `Array`, `List` or `Set`; a pair literal can supply a list of pairs, a set keyed by whole
-pairs, or a map keyed by first components. The chosen collection type, not a distinct pair-literal
-AST node, determines re-keying.
-
-The explicit forms are `list([…])`, `set([…])` and `map([…])`. An annotation such
-as `m: Map(K, V) = [k -> v, …]` or a keyed lookup selects `map` implicitly.
+A literal is a positional collection, and a pair literal is a list of pairs. Only an explicit
+constructor re-keys one: `set([…])` by the element, and `map([…])` by each pair's first component.
+Neither an annotation nor a use inserts a constructor, so `m: Map(K, V) = [k -> v, …]` is a type
+error pointing at `map([…])`, and a keyed lookup on a list of pairs does not make it a `Map`.
+`Set`, `Map` and `FullMap` are nominal types
+([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so a literal
+reaches one of their types only as the argument of a function that answers it.
 
 The constant-map rule rejects duplicate keys at compile time, applying the immutable
 non-overlap rule described under [Collection types](#63-direction-collection-types-decided).
@@ -1168,7 +1200,8 @@ equality; general discharge through contextual parameters remains planned.
 
 The delimiter split retains `(…)` for products, `[…]` for collections and `{…}` for types.
 Whether a future empty constructor can cover all collection kinds remains open; `empty_map()`
-is the current keyed constructor, not a general empty-collection term.
+is the current keyed constructor, not a general empty-collection term. The values `Set::empty`
+and `Map::empty` replace it ([3.8 Function calls](#38-function-calls)).
 
 ### 3.12 Comprehensions
 
@@ -1216,20 +1249,24 @@ elements as inputs arrive.
 > These rewrites preserve the semantics described above; users should
 > not need to reason about which strategy the compiler picked.
 
-> **Direction — map/set comprehensions and entry iteration [Decided].**
-> A **map comprehension** is a comprehension whose element is a pair:
-> `[k -> v for …]` — the element `k -> v` is the 2-tuple `(k, v)`
-> ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)), which
-> parses today — read as a `Map` exactly as a map literal is. A **set
-> comprehension** has no brace form (`{ … }` is types-only,
-> [2.4 Atoms](#24-atoms)), so it is written
-> `set([e for …])`. Iterating a **keyed** collection yields its
-> *entries* as pairs, destructured with the 2-tuple pattern in the `for`
-> binder: `for k -> v in m` (≡ `for (k, v) in m`), and likewise
-> `for k -> g in groupby(c, key)` — so the group-by rollup composes as
-> `[k -> agg(g) for k -> g in groupby(c, key)]` (the north-star
-> `storefront` `/stats`). A single binder takes the whole entry rather than the
-> group (§4.6), so iterating the groups alone is `values(groupby(c, key))`.
+> **Direction — comprehensions and entry iteration [Decided].** A comprehension's result is a
+> structural collection over its sources' domains, whatever its element and whatever its sources.
+> It is never a `Set`, `Map` or `FullMap`. `[k -> v for …]` is a comprehension of pairs, the
+> element `k -> v` being the 2-tuple `(k, v)`
+> ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)), and reading it as a `Map`
+> is `map([k -> v for …])`. A set comprehension is `set([e for …])`.
+>
+> Iterating a **keyed** collection yields its *entries* as pairs, destructured with the 2-tuple
+> pattern in the `for` binder: `for k -> v in m` (≡ `for (k, v) in m`), and likewise
+> `for k -> g in groupby(c, key)`. A single binder takes the whole entry rather than the group
+> ([4.6 `for` — iteration](#46-for--iteration)), so iterating the groups alone is
+> `groupby(c, key).values()`.
+>
+> The `->` in a binder and the `->` in an element are both the 2-tuple, so
+> `[k -> v for k -> v in m]` and `[e for e in m]` denote one collection. With `m: Map(K, V)`,
+> both are a collection of `{K, V}` entries over `m`'s key domain: a lookup at a key of `m` answers
+> that key's entry, and iteration yields the entries. `map(…)` of either is a `Map(K, V)` again.
+> The group-by rollup composes as `map([k -> agg(g) for k -> g in groupby(c, key)])`.
 
 ### 3.13 `yield`
 
@@ -1305,8 +1342,9 @@ outright:
 > written unqualified means the current module's, and `m::ok` or
 > `r.m::f` names module `m`'s
 > ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
-> Within one file this changes nothing. Nominal variants, whose tags live
-> inside their type, are **[Tentative]**.
+> Within one file this changes nothing. A sum shared across modules is declared as a nominal type,
+> whose constructors belong to the type rather than to a module
+> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 
 This is the polymorphic-variant model, and the **backtick** plays the role
 capitalization plays in languages that capitalize constructors. Tags are
@@ -1334,12 +1372,14 @@ whatever term sits in the parens. A tag mismatch is therefore reported where the
 constructor meets a counterpart that lacks the tag — an annotation, a `match` arm's
 expected type, a join — rather than at the constructor.
 
-> **Direction [Tentative].** A **parameterised** type alias (§6.7 [Open]) —
-> `` Option(T) = {`some{T} | `none} ``, `` Result(T) = {`ok{T} | `err{String}} `` —
-> gives the arms a name to write, and would replace the built-in `Option(T)` above
-> with a prelude definition. An alias names a shape, so two aliases with the same
-> arms are the same type. The unparameterised alias §6.7 specifies already names
-> the arms at a fixed payload type.
+> **Direction [Decided] — `Option` is a nominal type.** `Option(T)` is a `type` declared in a std
+> module, with constructors `Option::some(T)` and `Option::none`
+> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), and the
+> method `Option::is_none` that a lookup's refinement tests
+> ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). It replaces the
+> built-in abbreviation above, so `` y: Option(Int) = `some(1) `` is a type error and
+> `y: Option(Int) = Option::some(1)` is the spelling. A structural variant with the same arms is a
+> different type.
 
 ---
 
@@ -1598,6 +1638,7 @@ pattern      ::= ident
               |  pattern ( "," pattern )+ [ "," ]               -- tuple, bare
               |  "(" field_pat ( "," field_pat )* [ "," ] ")"   -- record
               |  "`" tagname [ "(" pattern ( "," pattern )* [ "," ] ")" ]  -- variant (§6.5)
+              |  type_path "::" ident [ "(" pattern ( "," pattern )* [ "," ] ")" ]  -- constructor
               |  "_"                                            -- wildcard
 
 field_pat    ::= ident "=" pattern
@@ -1632,14 +1673,21 @@ A **record** pattern's `field=binder` mirrors the record value's
 the pattern it is matched against. `(x=x2)` therefore binds field `x` to
 the name `x2`; `(x=x)` is the same-name case and has no shorthand.
 
+A **constructor** pattern mirrors a call of a nominal type's constructor
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)): one pattern
+per declared parameter, in order, so `Shape::rect(w, h)` binds `rect`'s two parameters. `type_path`
+is the type's name, qualified as anywhere else (`shop::Shape`). A constructor that declares no
+parameters takes no parentheses, `Option::none`.
+
 Patterns are still **static** — which names a binding introduces is
-decidable from the syntax alone (§2.2). A variant pattern is the one form
-that can *fail* to match, which is why it only appears in a `case` arm or
-against a single-tag variant type, where the match is exhaustive.
+decidable from the syntax alone (§2.2). A variant pattern and a constructor pattern are the forms
+that can *fail* to match, which is why they appear only in a `case` arm or where the match is
+exhaustive: a variant pattern against a single-tag variant type, and a constructor pattern against
+a type that declares one constructor (`Price::new(r) = p`).
 
 Today's grammar accepts only the tuple forms, unannotated, with the
 annotation restricted to the whole target (`ann_assign_stmt`, §2.2);
-record, variant, wildcard, and per-component annotations are all
+record, variant, constructor, wildcard, and per-component annotations are all
 unimplemented.
 
 ### 4.4 Define statement `<<=`
@@ -1722,14 +1770,24 @@ element is chosen per type — it is *not* uniformly the value:
 |---|---|
 | `List(T)` / `Array(n, T)` / `Collection(T)` | the value `T` |
 | `Set(K)` | the key `K` |
-| `Map(K, V)` | the entry `(K, V)` |
+| `Map(K, V)` / `FullMap(K, V)` | the entry `(K, V)` |
 
 A **single** target binds the whole element; a **tuple / `->`** target
 destructures it, so a map iterates entries unpacked as `for k -> v in m:` (the
 north-star `storefront` rollup, §7.2). The keyed element carries its membership
-proof, so a key from `for k -> v in m` (or `for k in s`) narrows `m[k]` to
-`` `some ``, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
-collections is `keys(m)` / `values(m)` / `items(m)` (§6.3).
+proof, so for a key from `for k -> v in m` (or `for k in s`) the refinement on `m[k]` excludes
+`none`, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
+collections is `m.keys()` / `m.values()` / `m.items()` (§6.3).
+
+> **Direction [Decided] — the element is a trait requirement.** `for x in c` places the built-in
+> requirement `Iterable(C, Item=E)` on `c`'s type `C` and binds `x: E`
+> ([Trait requirements](#trait-requirements)). The table above lists its instances. A structural
+> collection, including every comprehension result
+> ([3.12 Comprehensions](#312-comprehensions)), yields its values. `Set`, `Map` and `FullMap` are
+> nominal builtins ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)),
+> and each yields what its row states. A polymorphic `def` that iterates a parameter carries the
+> requirement in its type: `def f(c): for x in c: …` requires `Iterable(C, Item=X)` of its
+> parameter's type `C`, so each call iterates its argument by the argument's own instance.
 
 > **[Interim].** Today `for`-in binds the **value** (codomain) for every
 > collection — so a map iterates its values (as `groupby` results do) and a set
@@ -2019,6 +2077,16 @@ type-checked as one.
 Patterns are **shallow**: an arm matches one tag and binds the whole
 payload, with no nesting, no literal patterns, and no per-arm guard.
 
+> **Direction [Decided] — matching a nominal type.** An arm may name a constructor of a nominal
+> type, `case Shape::rect(w, h):`, with one binder per declared parameter
+> ([4.3.1 Destructuring patterns](#431-destructuring-patterns),
+> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). The
+> constructors are the tags the arms partition, so every rule above holds with "constructor" for
+> "tag": each constructor is handled by one arm, and `case _:` covers the rest. The arms of one
+> `match` name constructors of one type, and that type is the scrutinee's type, so a constructor
+> pattern determines the scrutinee's type without an annotation. Tag arms and constructor arms do
+> not mix in one `match`.
+
 **Both statement contexts admit a `match`** — a `for`-loop body and a `with
 begin():` block. An arm may `yield` or `<<`, and the fed value may read the arm's
 payload, the loop's accumulators, or both.
@@ -2155,12 +2223,12 @@ marked one carries its status per "How to read this document".)
   type (§6.2, §8).
 - `Map(K, V)` — finite-map type. The map literal `[k -> v, …]`
   ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)) parses as the list of
-  entry pairs that a `Map` annotation or `map([…])` re-keys.
-- `FullMap(K, V)` — *total*-map type (**[Tentative]**, §6.3): every value
-  of `K` is a key, so lookup yields `V` rather than `Option(V)` and has
-  no missing case. The annotation and its total lookup are implemented;
-  what obligation totality places on whatever builds the map is **[Open]**,
-  so the annotation is a promise the checker propagates rather than checks.
+  entry pairs that `map([…])` re-keys.
+- `FullMap(K, V)` — *total*-map type (§6.3): every value of `K` is a key. `K` is the finite domain
+  of keys present in what built the map, and only `groupby` builds one, so a lookup always finds
+  its key. Today the lookup answers `V`. Under
+  [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) it answers
+  `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at the call.
 - `Time` — a position in the commit order, what a transaction handle's
   `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
   itself a `Txn` value, and the two spellings are not reconciled.
@@ -2235,11 +2303,10 @@ form `{T where p(_)}` (§6.4) is writable in annotation position.
 > Also **[Open]**: the precise placement and reference rules (what a
 > pre- or postcondition may mention, which local an assert on the result
 > names as its subject, how the lift renames it to `_`, where the lift
-> draws its cut points) need elaboration; and *nominal* domain types
-> carrying their own invariants (a `Price` whose `assert amount >= 0`
-> rides the type instead of being repeated per function) are the agreed
-> direction for factoring recurring contracts, with no invariant syntax
-> settled yet ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+> draws its cut points) need elaboration. A recurring contract is factored into a nominal type
+> whose constructor's parameter type carries the refinement, `type Price = {Int where _ >= 0}`,
+> so every construction discharges it and no function repeats it
+> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 > Pinned by `discount_contract` (the mechanism in
 > isolation), `nonneg_inventory` (data refinement plus guarded
 > discharge), and `storefront` (both combined, plus the codomain lift
@@ -2262,7 +2329,9 @@ exception (unlike ML and Rust, which capitalize constructors). Those
 constructors are **variant tags**, so they additionally carry the `` ` ``
 prefix in every position (§6.5); the capitalization rule is
 what fixes their case, and the backtick is what marks them as tags rather
-than ordinary names.
+than ordinary names. A nominal type's constructors are lowercase for the same reason, and take no
+backtick: they are declared names, reached through their type as `Option::some`
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 
 **Application is shared across levels.** `f(args)` is application
 whether `f` is a value or a type constructor: `split(line)` and `ok(v)`
@@ -2460,7 +2529,9 @@ The collection interface has six forms:
 | `Collection(T)` | Elements of type `T` with unspecified domain shape. | Generic collection operations. |
 
 `FullMap` totality is relative to its domain type. A group-by's domain is refined to keys
-present in its producer, not every value of the key's base type. A `List` hides its domain
+present in its producer, not every value of the key's base type. **[Decided]** — `groupby` is
+the only operation that builds a `FullMap`. No annotation converts another collection to one, so
+a `FullMap`'s key type is always such a finite present-key domain. A `List` hides its domain
 length in a sum witness; it does not store a separate length field in a product representation.
 The current representations are specified in
 [The six collection types](../src/ccl/design/collections.md#the-six-collection-types).
@@ -2480,21 +2551,51 @@ of a constructor into an unboxed term.
   [Iteration](#46-for--iteration); storage order does not establish a source-language ordering.
 - Membership `in` tests keys for sets/maps and values for arrays/lists/collections.
   A successful key-membership guard refines the key for proven access.
-- Maps iterate entries, sets keys, and arrays/lists/collections values. `keys(m)`, `values(m)` and
-  `items(m)` expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(values(m))`
-  requests value aggregation.
-- Type-directed literals share `[…]` across collection forms; explicit or inferred
-  constructors select positional storage or re-keying. The constructors and constant-element rule
-  are in [List, tuple, record literals](#311-list-tuple-record-literals).
+- `len(c)` answers the size of a collection's domain, through the built-in `HasLen` trait
+  ([Trait requirements](#trait-requirements)). A `List` lookup states presence as
+  `i < len(xs)` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
+- Maps iterate entries, sets keys, and arrays/lists/collections values. The methods
+  `m.keys()`, `m.values()` and `m.items()` of a `Map` or `FullMap`, and `s.keys()` of a `Set`,
+  expose lazy collection views. Numeric `sum(m)` rejects entries; `sum(m.values())` requests
+  value aggregation.
+- Arrays and lists share the `[…]` literal, chosen by annotation or usage. A set or a map is
+  always built by `set([…])` or `map([…])`, since nothing re-keys a literal implicitly. The
+  constructors and constant-element rule are in
+  [List, tuple, record literals](#311-list-tuple-record-literals).
 - Immutable collections support non-overlapping element-wise definitions `c[i] = v`.
   Feed uses `c << v`, and keyed mutation uses `c[i] := v`. Their current supported forms
   belong to [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
-Making `Set` and `Map` distinct nominal types remains tentative. It would also require a
-decision about widening: the current structural `Map(K, V) <: Collection(V)` relation need
-not be the rule for a nominal map whose iteration element is an entry. The alternatives are
-recorded in
-[Telling Set and Map apart](../src/ccl/design/collections.md#telling-set-and-map-apart-open).
+**`Set`, `Map` and `FullMap` are nominal builtins [Decided].** Each is a nominal type
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) that the
+compiler provides, so `Set(K)` and `Map(K, unit)` are distinct types. Nothing relates one of the
+three to a structural collection type: none widens to `Collection`, and the methods `keys`,
+`values` and `items` are the written route. `FullMap` has every operation `Map` has, and differs
+only in how it is built and in its lookup's refinement. The operations of all three are built in:
+lookup, membership `in`, iteration, `len`, the methods `keys`, `values` and `items` (`keys` alone
+for a `Set`), and the re-keying constructors `set([…])` and `map([…])`. The representation is
+[Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
+
+A builtin differs from a declared nominal type in five ways:
+
+- **No constructors or `extract`.** A program builds one through `set`, `map`, `groupby` or an
+  empty value, and takes it apart through its operations.
+- **Associated values.** `Set::empty` and `Map::empty` are values of the builtin, whose type
+  parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
+  has no spelling for an associated value
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+- **A type family as a parameter.** `FullMap(K, V)`'s `V` may depend on the key, as a group-by's
+  groups do. A declared type's parameter takes a type.
+- **Trait instances.** All three satisfy `Iterable` and `HasLen` through instances the compiler
+  provides ([Trait requirements](#trait-requirements)). Which traits a declared type satisfies is
+  **[Open]**.
+- **Stated variances.** A declared type's variance is read off its constructors' parameter types,
+  and a builtin has none to read, so each is stated. `Set(K)` is covariant in `K`, and `Map(K, V)`
+  in both `K` and `V`: a map over keys below `K` is a map over keys below any supertype of `K`.
+  `FullMap(K, V)` is invariant in `K`, since its key type is its domain and a collection's domain
+  is its data. Two `FullMap`s over one key type relate key by key: `FullMap(K, V₁)` is a subtype
+  of `FullMap(K, V₂)` when, at every key `k`, `V₁` at `k` is a subtype of `V₂` at `k`.
+
 General contextual parameters for equality and ordering belong to the planned operation
 interface, not the compiler's implemented arithmetic trait tables.
 
@@ -2632,6 +2733,12 @@ distinguished kind of type: nothing in the language privileges the spellings
 same shape with `` `ok ``/`` `err `` and has no built-in spelling — write its
 arms out, or name them with a type alias (§6.7) at a fixed payload type.
 
+> **Direction [Decided].** `Option` becomes a nominal type declared in a std module, and stops
+> being an abbreviation of a structural variant
+> ([3.15 Variant constructors](#315-variant-constructors)). A sum that several modules share, such
+> as a `Result`, is declared the same way
+> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+
 Variants are matched with `match`/`case` (§4.10). Destructuring one directly
 against a single-tag variant type, where the match cannot fail, is **[Decided]**
 and not implemented (§4.3.1).
@@ -2733,31 +2840,195 @@ The north-star `storefront` exercises four aliases, two of them refined.
 
 ### 6.8 Nominal types and methods [Decided]
 
-A `type` declaration binds a capitalized name to a new **nominal** type:
+A `type` declaration binds a capitalized name to a new **nominal** type by listing its
+**constructors**:
+
+```python
+type Option(T):
+    some(T)
+    none
+
+type Shape:
+    circle(radius: Int)
+    rect(w: Int, h: Int)
+```
+
+`Shape` is distinct from every other type, including a structural variant with the same arms, which
+is the difference from an alias ([6.7 Type-alias statements](#67-type-alias-statements)). When two
+spellings name the same nominal type is
+[Nominal type identity](#nominal-type-identity).
+
+#### Declaring a nominal type
+
+```ebnf
+type_stmt   ::= "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] ":"
+                NEWLINE INDENT ctor_line+ DEDENT
+             |  "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] "=" expression NEWLINE
+ctor_line   ::= [ "@" "RenamedFrom" "(" ident ")" NEWLINE ]
+                ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
+ctor_param  ::= [ ident ":" ] expression
+
+-- A type the version this source replaces held under another name or in another module.
+renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
+```
+
+`type_path` is in [Associated functions and methods](#associated-functions-and-methods), and
+`@RenamedFrom` on a type and on a constructor is
+[Reloading a nominal type](#reloading-a-nominal-type).
+
+- **A `type` is declared at a module's top level, once.** A `type` inside a `def`, a loop or any
+  other block is an error, and so is a second binding of its name in the module, public or private,
+  with both sites named.
+- **Each constructor line declares a function that builds the type's values.** `Shape::rect` has type
+  `{Int, Int} => Shape`, and `Option::some` has type `forall (T) T => Option(T)`. A constructor that
+  declares no parameters is a value: `Option::none` has type `forall (T) Option(T)`, its `T`
+  determined by the use ([Type parameters](#type-parameters)). The constructor set is closed.
+- **A constructor's parameter names are not record labels.** `radius` names the parameter for
+  documentation and diagnostics, and a call is positional: `Shape::circle(1)`. A call from another
+  module therefore writes no qualified label
+  ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+- **Constructors are lowercase and take no backtick.** They are declared names that belong to their
+  type, reached as `Shape::circle`, or `shop::Shape::circle` from a module that imports `shop`.
+- **A parameter type may name the type being declared and the module's other types**, so recursive
+  and mutually recursive types are written directly:
+
+  ```python
+  type Tree:
+      leaf
+      node(Tree, Tree)
+  ```
+
+- **A parameter type may carry a refinement** ([6.4 Refinement syntax](#64-refinement-syntax)), and
+  each construction discharges it. This is how a nominal type states a domain invariant once, for
+  the contracts direction of [6. Types (informal sketch)](#6-types-informal-sketch):
+  `type Price = {Int where _ >= 0}`.
+- **Each type parameter's variance is computed from the parameter types of the constructors.** A
+  parameter that appears only in covariant positions, such as `some(T)` or a field of a product, is
+  covariant. One that appears only in contravariant positions, such as the domain of
+  `on(T => Int)`, is contravariant. One that appears in both, or under an invariant constructor
+  such as `Mut(T)`, is invariant. `Option`'s `T` is covariant, so `Option({a: Int, b: Int})` is a
+  subtype of `Option({a: Int})`. A bound or a kind on a type parameter is **[Open]**.
+  - **A position inside a position composes their variances.** Covariant inside contravariant is
+    contravariant, contravariant inside contravariant is covariant, and invariant inside anything
+    is invariant. `T` is covariant in `on((T => Int) => Int)`. A collection's domain is its data,
+    so a parameter in one, as `K` in `FullMap(K, Int)`, is invariant.
+  - **A parameter inside another nominal type takes that type's parameter variance**, composed by
+    the same rule. `T` in `wrap(Option(T))` is covariant, and the builtins' variances are listed in
+    [6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided).
+  - **A recursive declaration's variance is the least fixpoint.** Every parameter starts with no
+    variance. Each round computes the variance of every occurrence, reading a recursive occurrence
+    at the previous round's answer, and the rounds repeat until no answer changes.
+    `type Stream(T): cons(T, Stream(T))` settles at covariant. In
+    `type Ping(T): p(T, Ping(T) => Int)`, the direct `T` gives covariant and the next round adds
+    contravariant through the domain, so `T` settles at invariant.
+  - **The variance is part of the type's interface.** Adding `on(T => Int)` to a covariant type
+    makes it invariant, which changes subtyping at every use, so the interface a module check
+    prints states each parameter's variance
+    ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+- **Every type parameter appears in some constructor's parameter type.** One that no constructor
+  uses is an error at the declaration. Its variance could not be read off the constructors, and
+  distinct nominal types already keep values such as `UserId` and `OrderId` apart.
+
+#### The single-constructor form
+
+`type N(P…) = R` declares `N` with the one constructor `new(R)`, and also declares the method
+`N::extract` of type `N(P…) => R`. `N::extract(n)` means `(match n: case N::new(r): r)`, and
+`n.extract()` is the same call ([Associated functions and methods](#associated-functions-and-methods)).
 
 ```python
 type Price = {amount: Int}
+
+p = Price::new(amount=3)    # the call's parentheses build the record argument
+p.extract().amount          # 3
 ```
 
-`Price` is distinct from `{amount: Int}` and from every other type of that shape, which is
-the difference from an alias ([6.7 Type-alias statements](#67-type-alias-statements)).
+Only this form declares `extract`. A type declared by a constructor list takes its values apart
+with patterns, even when it has one constructor.
 
-A nominal type is the home for domain invariants: a `Price` carrying `assert amount >= 0`
-in its declaration states the contract once, rather than as an assert at every function
-(the contracts direction in [6. Types (informal sketch)](#6-types-informal-sketch)). The
-syntax of that invariant is **[Open]**.
+**[Tentative]** — the name `extract`. The method shares the type's namespace with its own
+associated functions, so whatever name it takes is unavailable to every type declared with `= R`.
 
-**A method is a `def` whose first parameter is `self`, annotated with a nominal type.**
+#### A nominal type is opaque
+
+- **Subtyping relates a nominal type only to itself and its refinements.** Nothing relates `N` to
+  its constructors' parameter types, to `R` in the single-constructor form, or to another nominal or
+  structural type, in either direction. Within one nominal type:
+  - A type without parameters is related only by reflexivity: `Price <: Price`.
+  - A type with parameters relates two applications argument by argument. `N(a…) <: N(b…)` holds
+    when each pair of type arguments is related as its parameter's variance requires: `a <: b` for
+    a covariant parameter, `b <: a` for a contravariant one, and `a = b` for an invariant one.
+    `Option`'s `T` is covariant, so `Option(A) <: Option(B)` exactly when `A <: B`.
+  - The implicit arguments of [Nominal type identity](#nominal-type-identity) are compared for
+    identity, not by variance: `eu::Order` and `us::Order` are unrelated even where
+    `stripe::Receipt <: paypal::Receipt`.
+  - A refinement of a nominal type is related to it by the ordinary refinement rule
+    ([6.4 Refinement syntax](#64-refinement-syntax)): `{Option(V) where not _.is_none()}` is a
+    subtype of `Option(V)`, which is what a lookup's result relies on
+    ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
+
+  A join of two different nominal types, or of a nominal type and a type that is neither it nor a
+  refinement of it, is an error at the join.
+- **A nominal value is built only by its constructors and taken apart only by them.** A `match` over
+  its constructors ([4.10 `match` — tag dispatch](#410-match--tag-dispatch)), a constructor pattern
+  ([4.3.1 Destructuring patterns](#431-destructuring-patterns)), `extract`, and the type's own
+  functions are the only ways in. A nominal value has no fields: `p.amount` is an error, and
+  `p.extract().amount` is the projection.
+- **[Open] — which traits a declared nominal type satisfies.** None is inherited from the
+  constructors' parameter types: `type Price = {Int where _ >= 0}` is not `Addable` because `Int`
+  is. The direction is opt-in derivation, as with Rust's `#[derive]`, where the declaration names
+  each trait it takes from its constructors. Until then a declared nominal type satisfies no trait,
+  so `==`, ordering and arithmetic are errors on its values, and one is not a key of a `Set`, a
+  `Map` or a `groupby`. The nominal builtins `Set`, `Map` and `FullMap` satisfy the built-in
+  instances of `Iterable` and `HasLen`, which the compiler provides.
+- **The type of a nominal value is fixed by the expression that produced it.** Every producer of a
+  value names the same nominal type, so a method and a trait requirement resolve the same way
+  wherever the value flows.
+- **A value identifies its constructor by name.** A value is held as the name of its constructor
+  and that constructor's arguments. The name, and not the constructor's position in the
+  declaration, identifies the constructor, so reordering a declaration's lines changes nothing.
+- **[Open] — erasure after inference.** The first implementation keeps a declared nominal type
+  until operator conversion, which reads a value's shape off its constructors' parameter types, and
+  erases the nominal builtins once inference has resolved their operations. A nominal type kept
+  past inference could bound the data it holds, which is why erasure is not decided.
+
+#### Associated functions and methods
+
+```ebnf
+def_stmt    ::= "def" ( ident | Ident "::" ident ) "(" [ params ] ")"
+                [ "=>" expression ] [ requires_clause ] ":" block
+type_path   ::= [ module_path "::" ] Ident
+```
+
+`type_path` names a type where another production takes one, such as a constructor pattern
+([4.3.1 Destructuring patterns](#431-destructuring-patterns)); `module_path` is
+[9.2 Imports](#92-imports)'s.
+
+A `def` whose name is qualified by a type declares an **associated function** of that type. It binds
+no module-level name, and is reached through its type:
 
 ```python
-def discounted(self: Price, pct: Int) => Price:
-    …
+def Price::of_cents(c: Int) => Price:
+    Price::new(amount=c)
+
+Price::of_cents(250)
 ```
 
-Every `def` of that signature is a method of the type its `self` names. A method binds no
-module-level name: `discounted(p, 10)` does not call it, and two types in one module may each have
-a method `discounted`. Two methods of one type with one name are an error naming both sites.
-Whether a module other than the type's own may declare methods of it is **[Open]**.
+**A method is an associated function whose first value parameter is `self`.** For a type without
+parameters `self` is the type and takes no annotation. For a parameterised type, `self` is annotated
+with the type applied to the function's own type parameters
+([Type parameters](#type-parameters)):
+
+```python
+def Price::discounted(self, pct: Int) => Price:
+    …
+
+def Option::or_else(T, self: Option(T), d: T) => T:
+    match self:
+        case Option::some(v):
+            v
+        case Option::none:
+            d
+```
 
 A method is reached two ways:
 
@@ -2770,10 +3041,52 @@ A method is reached two ways:
 `Price::discounted` names the method without an instance. It is how a call states which type's
 method it means, and the method as an unapplied value has no other spelling.
 
+- **A type's constructors, its associated functions, and the `new` and `extract` of the
+  single-constructor form share one namespace.** Two entries of one type with one name are an error
+  naming both sites. Two types in one module may each have a `discounted`.
+- **An associated function declares at least one value parameter.** `def Price::zero():` is an
+  error: a function of no argument is a constant ([3.8 Function calls](#38-function-calls)). An
+  associated value has no spelling and is **[Open]**.
+- Whether a module other than the type's own may declare an associated function of it is **[Open]**.
+
+**An `impl` block declares a type's associated functions together.** It is shorthand for writing
+each `def` with the type's name:
+
+```ebnf
+impl_stmt   ::= "impl" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] ":"
+                NEWLINE INDENT ( [ "pub" ] def_stmt )+ DEDENT
+```
+
+```python
+impl Option(T):
+    def or_else(self, d: T) => T:
+        match self:
+            case Option::some(v):
+                v
+            case Option::none:
+                d
+
+    pub def is_none(self) => Bool:
+        …
+```
+
+- **Each `def` in the block is the `def` qualified by the type.** `def or_else(…)` inside `impl
+  Option(T):` declares `Option::or_else`, and every rule above applies to it unchanged. A `def` in
+  the block names no type of its own: `def Other::f` inside `impl Option(T):` is an error. The block
+  binds no value names: its functions reach each other as `Option::f` or `self.f()`, and `pub`
+  stands on each `def`.
+- **A parameterised type binds its parameters once.** `impl Option(T):` names the type's
+  parameters, and each `def` in the block takes them as type parameters
+  ([Type parameters](#type-parameters)), with `self` of type `Option(T)` unannotated. A `def` may
+  add type parameters of its own.
+- **The block names a type of its own module.** `impl shop::Price:` from another module is the
+  spelling an extension would take, and is **[Open]** with extensions. Whether an `impl` block also
+  declares trait instances, as `impl HasLen(Bag(T)):`, is **[Open]** with instance declarations.
+
 **Methods and fields are separate namespaces, and the parentheses decide which is meant.**
-`r.f(args)` is a method call, and `r.f` is a field and never a method. A value of `type Counter =
-{f: Int => Int}` holds both when `Counter` also has a method `f`: `r.f` is the function the field
-holds, and `Counter::f` is the method. Calling the function a field holds is written `(r.f)(args)`
+`r.f(args)` is a method call, and `r.f` is a field and never a method. A nominal value has no
+fields, and a structural record has no methods, so `r.f(args)` on a record whose field `f` holds a
+function is an error. Calling the function a field holds is written `(r.f)(args)`
 ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)).
 
 **A type in scope brings its methods into scope.** `x.m()` resolves `m` among the methods
@@ -2794,7 +3107,15 @@ belongs to a type and not to a module. Calling the function such a field holds i
 
 **A method call needs its receiver's type.** `x.m()` resolves `m` from the type of `x`. When
 nothing before the call in program text determines that type to be a nominal type, the call is a
-type error that asks for an annotation on `x`.
+type error that asks for an annotation on `x`. A polymorphic `def` therefore calls no method on a
+value whose type is one of its type parameters. An operation that works across types is a trait
+requirement instead, as iteration is ([4.6 `for` — iteration](#46-for--iteration)).
+
+> **Direction [Planned] — trait methods.** Method-call syntax extends to an operation a trait
+> requires: `xs.len()` resolves through `HasLen` ([Trait requirements](#trait-requirements)) as
+> `len(xs)` does. The receiver's type then need not be nominal, and a polymorphic `def` may call a
+> trait method on a value whose type is a type parameter, through the requirement the call places.
+> The rule above then covers only a type's own associated functions.
 
 ### 6.9 Effects in function types [Tentative]
 
@@ -2878,6 +3199,14 @@ first("a", "b")   # T = String
   annotation, or it is the associated type of a requirement whose other positions are determined
   ([Trait requirements](#trait-requirements)). Any other type parameter is an
   error at the definition.
+
+  > **Direction [Decided] — determined by the use.** A type parameter may instead appear only in
+  > the result, and each use determines it from the type the use requires. `Map::empty` has type
+  > `forall (K, V) Map(K, V)`, so `m: Map(String, Int) = Map::empty` determines `K` and `V`, and
+  > `Option::none` is the same case
+  > ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). A use that
+  > determines none is an unresolved-type error at the use, as an unannotated `empty_map()` is
+  > today ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)).
 - **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
   `requires` clause state, and nothing else. `def inc(T, x: T) => T: x + 1` is an error at `+`,
   because no requirement states that `T` and `Int` are `Addable`.
@@ -2969,6 +3298,26 @@ of one listed type, and a tuple or record satisfies `Equatable` only against the
   rejected at the call. A secondary label at the requirement is **[Decided]**.
 - Declaring a trait or an instance is **[Open]**.
 
+> **Direction [Decided] — collection traits.** Two more traits are built in, with instances the
+> compiler provides for the collection types
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
+>
+> | Trait | Required by | Operands | Associated type | Satisfied by |
+> | --- | --- | --- | --- | --- |
+> | `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Item` | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap`, and every comprehension result |
+> | `HasLen` | `len` | 1 | none | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap` |
+>
+> `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds. `len` is the
+> operation `HasLen` requires, as `+` is the operation `Addable` requires: the builtin
+> `len : forall (C) C => UInt requires HasLen(C)`, called as `len(c)`, places `HasLen(C)` on its
+> argument's type. Each instance answers the size of the collection's domain: `n` for an
+> `Array(n, T)`, the length of a `List`'s index range, the count of keys of a `Set`, `Map` or
+> `FullMap`, and the count of positions of a `Collection`. A `FullMap`'s key type is finite
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so
+> `len(g)` counts a group-by's groups. `len` is a function, not a method: `List` is structural, so
+> `xs.len()` has no type to resolve against until trait methods
+> ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+
 #### Polymorphic type annotations
 
 ```ebnf
@@ -3057,9 +3406,10 @@ The north-star programs additionally assume non-aggregate built-ins —
 > are written in **method** position, as are `catalog.keys()` and
 > `txn.current_time()`. A method call resolves among the methods of a
 > nominal type ([6.8 Nominal types and methods
-> [Decided]](#68-nominal-types-and-methods-decided)), and no collection
-> type is nominal today. Whether the collection types become nominal
-> types with these combinators as methods is open with them.
+> [Decided]](#68-nominal-types-and-methods-decided)). `Set`, `Map` and
+> `FullMap` are nominal, so `catalog.keys()` resolves; `List` and
+> `Collection` are structural, so `orders.filter(…)` on one waits on the
+> planned trait methods, open with the combinators themselves.
 
 ### 7.2 `groupby`
 
@@ -3081,19 +3431,19 @@ The standard pattern (above) — group, then aggregate per group — is
 what `groupby` is primarily designed to support.
 
 > **Direction [Decided].** Under the collections model, `groupby(c, key)`
-> returns a `Map(K, Collection)` — its refined-domain result type *is* a
-> map keyed by `K` (see
+> returns a `FullMap` keyed by the keys present in `c`
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided),
 > [src/ccl/design/collections.md](../src/ccl/design/collections.md)). Its
 > entries iterate as key–value pairs, so the rollup destructures the pair
-> in the `for` binder and can rebuild a map with a map comprehension
-> (§3.12):
+> in the `for` binder and rebuilds a map with `map` over a comprehension
+> ([3.12 Comprehensions](#312-comprehensions)):
 >
 > ```python
-> [key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)]
+> map([key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)])
 > ```
 >
 > (the north-star `storefront` `/stats` rollup). A single binder takes the whole
-> entry rather than the group (§4.6), so `for g in values(groupby(…))` is how to
+> entry rather than the group (§4.6), so `for g in groupby(…).values()` is how to
 > iterate the groups alone — which is what the unkeyed form above does today.
 
 ### 7.3 `defer`
@@ -3660,11 +4010,12 @@ with `T` as an upper bound.
 ```python
 @LoadFrom(qty)
 held <: Map(String, Int)
-qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+qty_units: Mut(Map(String, Int), Txn) := map([k -> q * 10000 for k -> q in held])
 ```
 
-A comprehension over a map binds each value and keeps the keys, so that scales
-every quantity the predecessor held.
+Iterating a map binds each entry, and `map` re-keys the scaled pairs by their keys
+([Re-keying is explicit](#re-keying-is-explicit-decided)), so that scales every quantity
+the predecessor held.
 
 **A running program is required today.** A source containing `@LoadFrom(x)` is an
 upgrade of a specific predecessor: compiled from nothing, it is an error naming
@@ -3753,8 +4104,8 @@ members ([9.8 Module types](#98-module-types)).
 - **Module type.** The structural type of a module's public members, `Module{…}`
   ([9.8 Module types](#98-module-types)).
 - **Module interface.** What checking records about a module for the modules that use it: its
-  public members' contracts, its parameters, and whether it performs IO
-  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+  public members' contracts, its parameters, whether it performs IO, and whether each public
+  function reaches state ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 
 ### 9.2 Imports
 
@@ -3787,7 +4138,7 @@ module_path ::= ident ("::" ident)*
 
 ```ebnf
 run_stmt ::= ["pub"] "run" module_path ["(" [arg ("," arg)* [","]] ")"] ["as" ident] [use_clause]
-arg      ::= ident "=" expr
+arg      ::= ( ident | Ident ) "=" expr
 ```
 
 ```python
@@ -3846,6 +4197,15 @@ param payments: Module{charge: {amount: Int} => Receipt}
   only through its bound: `Receipt` above has an `id` and nothing else checking can rely on. A run
   supplies it as an argument, `Receipt=stripe::Receipt`, or leaves it to be inferred from the other
   arguments.
+- **A structural bound is met by structural types only.** A nominal type relates to no structural
+  type ([A nominal type is opaque](#a-nominal-type-is-opaque)), and a record meets `{id: String}`
+  only through the labels the bound names, which belong to the bounding module
+  ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+  `Receipt=stripe::Receipt` therefore passes when `stripe::Receipt` is a record whose `id` is the
+  bounding module's label.
+- **[Open] — a bound a nominal type can meet.** The direction is a trait requirement on the
+  parameter, such as a method `id(self) => String`, which resolves on the argument's own type
+  rather than on labels. It waits on declared traits ([Trait requirements](#trait-requirements)).
 - A value parameter is an immutable value. Its type is its annotation, or inferred from the module's
   uses the way a function parameter's is.
 - A parameter of Module type is how a module takes another module. The argument is an import name
@@ -3873,8 +4233,8 @@ pub def quote(item, qty): …
 pub limit: Int = 10
 pub Qty = {Int where _ >= 0}
 pub type Price = {amount: Int}
-pub def discounted(self: Price, pct: Int) => Price: …
-pub stock: Mut(Map(String, Int), Txn) := []
+pub def Price::discounted(self, pct: Int) => Price: …
+pub stock: Mut(Map(String, Int), Txn) := Map::empty
 pub run inventory as inv
 ```
 
@@ -3899,10 +4259,11 @@ pub held: Int
   `pub` would change the module's interface.
 - Private names keep the ordinary top-level shadowing of
   [5. Scoping and binding](#5-scoping-and-binding).
-- `pub` on a `type` declaration exports the nominal type. `pub` on a method's `def` exports the
-  method, and a method without `pub` is reached only from its own module, in either spelling
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). A method binds
-  no module-level name, so the bound-once rule above does not apply to it.
+- `pub` on a `type` declaration exports the nominal type with its constructors, and with `new` and
+  `extract` in the single-constructor form. `pub` on an associated function's `def` exports it, and
+  one without `pub` is reached only from its own module, in either spelling
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). An associated
+  function binds no module-level name, so the bound-once rule above does not apply to it.
 - Types need not be annotated on public members. An unannotated member's contract is its inferred
   type ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 
@@ -3953,7 +4314,7 @@ it by that path ([9.18 Reloading a program of modules](#918-reloading-a-program-
 
 ```python
 # inventory.cambra: performs no IO, so it can be imported
-stock: Mut(Map(String, Int), Txn) := []
+stock: Mut(Map(String, Int), Txn) := Map::empty
 pub def reserve(sku, qty) requires Transaction:
     …
 pub InStock = {String where _ in stock.keys()}   # intended; not supported today
@@ -4117,10 +4478,13 @@ as `{app: String}`. Within one file this changes nothing.
 
 - **[Open]** — a syntax that aliases another module's label or tag, so the importer writes it
   unqualified.
-- **[Tentative]** — **nominal variants**, whose tags live inside the nominal type and follow its
-  scoping rather than the module's. Their syntax is **[Open]**. The built-in `Option(T)` waits on
-  them: its `` `some `` and `` `none `` belong to the std root, so a user module that writes
-  `` `some(1) `` builds its own tag, which no `Option` admits.
+- A sum or product that several modules share is declared as a nominal type. The constructors of a
+  constructor list belong to the type and their parameter names are not labels
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), so another
+  module writes `Shape::circle(1)` with no qualified tag or label. `Option` is such a type, in a
+  std module ([9.16 The std root](#916-the-std-root)). A record in the single-constructor form
+  `type N = R` keeps its labels, which belong to the declaring module like any other:
+  `shop::Price::new(shop::amount=3)` and `p.extract().shop::amount`.
 - **[Open]** — which module owns the labels of data from outside the program, such as the fields
   of an HTTP request body.
 
@@ -4129,6 +4493,78 @@ A module's type members are its type aliases and its nominal types
 alias exports a spelling for a structural type, and the user's type is the same type. Exporting a
 nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
 distinct from every other type of its shape.
+
+#### Nominal type identity
+
+A nominal type is identified by its module path, its name, its type arguments, and the arguments of
+the module parameters its declaration depends on ([9.4 Parameters](#94-parameters)). A run reaches
+a type through its run name, and two spellings name one type exactly when those parts agree.
+
+- **A declaration's identity includes the argument of every module parameter it reaches.** It
+  reaches one by naming it, by naming another type of the module that reaches it, or by naming a
+  top-level binding whose definition reaches it. A top-level binding is followed through its
+  definition, and a `def` through its body and every function that body calls. Terms appear in a
+  declaration inside refinement predicates and term arguments to type constructors, so those are
+  where it names bindings. Each such parameter is an implicit parameter of the type, and each run's
+  argument fills it.
+
+  ```python
+  param max_rate: Int
+  limit = max_rate * 2
+  def valid(r): r <= limit
+
+  type Rate = {Int where _ <= max_rate * 2}   # names the parameter
+  type Capped = {Int where _ <= limit}        # reaches it through `limit`
+  type Checked = {Int where valid(_)}         # through `valid`'s body, then `limit`
+  ```
+
+  All three reach `max_rate`. A binding that reaches no parameter, such as `ten = 10`, is the same
+  in every run, and a declaration names it freely.
+
+  Two runs given different arguments reach different types:
+
+  ```python
+  # shop.cambra
+  param Receipt
+  type Price = {Int where _ >= 0}
+  type Order:
+      placed(receipt: Receipt, total: Price)
+  ```
+
+  ```python
+  # deploy.cambra
+  run shop(Receipt=stripe::Receipt) as eu
+  run shop(Receipt=paypal::Receipt) as us
+  ```
+
+  `eu::Order` is `shop::Order` at `Receipt = stripe::Receipt`, and differs from `us::Order`. A
+  diagnostic prints the arguments that tell two such types apart.
+- **A declaration reaches no state and no source.** A declaration that reaches a mutable variable,
+  a feed or a source, of its own module or of an imported one, is an error naming the binding that
+  reaches it. Those change over time rather than per run, so a value that met the declaration when
+  built could fail it later. `InStock = {String where _ in stock.keys()}` therefore stays an alias.
+  Reaching state is an effect, as IO is. Within a module the check follows a `def` through its
+  body, and an imported function is read through its module's interface, which records whether
+  each public function reaches state
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). Once function types
+  state their effects
+  ([6.9 Effects in function types [Tentative]](#69-effects-in-function-types-tentative)), the check
+  reads them from the function's type.
+- **Type arguments compare by type equality, and Module arguments by the run passed.** A type
+  argument may be structural: two runs passing `{id: String, card: String}`, one through an alias
+  and one written out, reach one `Order`. A type argument compares the same whether written or
+  inferred at the `run`.
+- **[Open] — comparing value-parameter arguments.** Comparing them by term identity makes runs
+  given `30` and `10 + 20` reach two types, and comparing them by value would evaluate arguments
+  during type checking. The same question applies to an alias whose refinement names a top-level
+  binding ([6.4 Refinement syntax](#64-refinement-syntax)), and to type arguments that differ only
+  in a refinement: whether `{Int where _ >= 0}` and `{Int where 0 <= _}` are one type is
+  undecided, since [6. Types (informal sketch)](#6-types-informal-sketch) defines equality for
+  records and variants but not for refinements.
+- **A module is checked once against every argument.** Inside `shop`, `Receipt` is opaque, so the
+  functions of `Order` hold for each run's `Receipt`
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A shared run takes its
+  module's default arguments, and a `run` passing the same arguments reaches the same types.
 
 ### 9.13 Private-in-public
 
@@ -4152,8 +4588,9 @@ runs that check and prints the module's interface.
 
 - **Parameters are typed binders.** A value parameter has its annotated type or the type its uses
   infer. A type parameter is opaque apart from its bound.
-- **Imports are read through interfaces.** A module sees another module's public contracts and
-  whether it performs IO, never its bodies.
+- **Imports are read through interfaces.** A module sees another module's public contracts,
+  whether it performs IO, and whether each public function reaches state, never its bodies. A
+  library that adds a state read to a public function changes its interface.
 - **A public member's contract is its type.** An annotated member's contract is the annotation,
   checked against the body. An unannotated member's contract is its inferred type, refinements and
   all.
@@ -4218,6 +4655,14 @@ Until it does, two runs of a module that serves a route serve the same address a
 The prelude (`sum`, `max`, `groupby`, `stdin`, `defer`, `box`, `begin`, …) stays unqualified and in
 scope in every module.
 
+**[Decided]** — `Option` is a `type` declared in a std module, and is in the prelude
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Builtin
+operations that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), refer to that
+declaration. `Set`, `Map` and `FullMap` stay compiler builtins, as nominal types with no
+constructors
+([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
+
 ### 9.17 No trailing expressions
 
 A trailing value expression is an error in every module, since what a module does is its sinks. A
@@ -4263,6 +4708,52 @@ its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
   declare.
 - **Renaming a module file** renames every run that relies on the default run name, which moves its
   state. A run named with `as` is unaffected.
+
+#### Reloading a nominal type
+
+A stored value of a nominal type carries over a reload when the new version declares a compatible
+type. Comparing the constructors' parameter types alone is not enough: two versions of
+`type Price = {Int where _ >= 0}` that differ only in the refinement hold the same `Int`, and a
+stored `0` must not become a `Price` the new refinement excludes.
+
+- **The type continues by name.** The new version declares a type of the same name in the same
+  module, or one marked `@RenamedFrom` with the old name: `@RenamedFrom(Price)` for a rename, and
+  `@RenamedFrom(old_mod::Price)` for a move to another module.
+- **Every old constructor continues.** For each constructor of the old type, the new type has one
+  of the same name, or one marked `@RenamedFrom` with the old name on the line above it. Its
+  parameter types are supertypes of the old one's, compared under the arguments of each run that
+  holds such a value ([Nominal type identity](#nominal-type-identity)). Refinements are compared
+  with the rest, so a tightened refinement is refused. A recursive type is compared assuming the
+  pair under comparison compatible.
+- **Adding constructors is compatible.** Removing one, or renaming one without `@RenamedFrom`, is
+  refused as a change of the variable's type is ([8.8 `@LoadFrom`](#88-loadfrom)).
+- **The swap rewrites a renamed constructor in stored values.** A value names its constructor
+  ([A nominal type is opaque](#a-nominal-type-is-opaque)), and a constructor marked
+  `@RenamedFrom(circ)` takes over every stored `circ` at the swap, which writes the new name into
+  each value. A later version reads the value under the name its predecessor declares, and needs
+  no record of earlier renames.
+- **A run argument that a stored type mentions is part of that state's type.** Changing `eu`'s
+  `Receipt` argument while `eu` holds an `Order` is refused unless the old `Receipt` is a subtype of
+  the new one.
+- **A change to the type's parameters is compared at instantiation.** A variable holding a value
+  of the type has a concrete type in each version: the old declaration at its old arguments, and
+  the new declaration at its new ones. The rules above compare those two, constructor by
+  constructor, so adding, dropping or reordering a parameter needs no rule of its own.
+  `type Box: boxed(Int)` becoming `type Box(T): boxed(T)` carries over a variable now declared
+  `Box(Int)`. A change of variance changes no stored value; the new version's compile checks the
+  uses it affects.
+- **A change that no subtyping covers is a conversion.** The new version keeps the old declaration
+  unchanged and declares the new type under another name, loads the value at the old type with
+  `@LoadFrom`, and converts it. A later version deletes the old declaration once no state holds it,
+  and may give the new type the old name with `@RenamedFrom`.
+
+**[Open] — reload decorators that stay in the source.** A deployment applied twice should reach the
+same result, so a version that keeps `@RenamedFrom`, `@LoadFrom` or `@Discard` from an earlier
+reload could be accepted, as long as each decorator was valid against the version it was written
+for and the new version is valid. [8.8 `@LoadFrom`](#88-loadfrom) instead refuses a migrating
+source recompiled unchanged, because the name it loads is gone. How a later version tells a
+decorator already applied from one that names nothing, such as a mistyped `@LoadFrom`, is
+undecided.
 
 ### 9.19 Open questions
 
@@ -4420,7 +4911,7 @@ with parser-level support that lowering rejects:
   tag dispatch over a variant is implemented (§4.10), in both the indented and
   the one-line form, but patterns are shallow: no nesting, no literal patterns,
   and no per-arm guard.
-- **Destructuring patterns** beyond tuples — record, variant, and
+- **Destructuring patterns** beyond tuples — record, variant, constructor, and
   wildcard patterns in assignment targets and `for` binders (a `match`
   arm's tag pattern is §4.10), and per-component annotations with `:`
   binding tighter than `,` (**[Decided]**, §4.3.1).
@@ -4431,13 +4922,15 @@ with parser-level support that lowering rejects:
   runtime gap, not a surface one.
 - **The term-level delimiter migration** — record values are `(f=1, …)`, and `{…}` no longer
   denotes a term-level value (it is record-type / tuple-type / unit syntax,
-  [2.4 Atoms](#24-atoms)). The map literal `[k -> v, …]` parses; reading it as a `Map` without
-  `map([…])` remains **[Decided]**. Earlier plans to spell the entries `[k: v, …]`, `[k=v, …]`,
+  [2.4 Atoms](#24-atoms)). The map literal `[k -> v, …]` parses, and `map([…])` is the only reading
+  of it as a `Map` (**[Decided]**, [3.11 List, tuple, record literals](#311-list-tuple-record-literals)).
+  Earlier plans to spell the entries `[k: v, …]`, `[k=v, …]`,
   or Unicode `[k ↦ v, …]` are superseded by the map-literal decision.
-- **Map comprehensions** — `[k -> v for …]` parses as a comprehension of pairs
-  ([3.12 Comprehensions](#312-comprehensions)); reading the result as a `Map` follows the
-  map-literal decision above and is **[Decided]**, unimplemented. The north-star `storefront`
-  `/stats` rollup uses it.
+- **Map comprehensions** — `[k -> v for …]` is a comprehension of pairs, and reading one as a
+  `Map` is `map([k -> v for …])` ([3.12 Comprehensions](#312-comprehensions)).
+- **Nominal types** — `type` declarations, constructors, associated functions and methods, and
+  `@RenamedFrom` on a type are **[Decided]** and unimplemented
+  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 - **The target syntax at large** — the mutation and transaction **core is implemented** (`:=`,
   `with begin():`, `Mut(…, Txn)` mutable variables, feeds — §8), now spelled in the canonical target
   syntax: parenthesised type application (`Mut(V, Txn)`, `List(T)`) and capitalized primitive names

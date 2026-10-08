@@ -664,12 +664,12 @@ held for `x`, read once when the replacement takes over ([chl-spec, "8.8
 
 ```python
 # v1
-qty: Mut(Int, Txn) := 0
+qty: Mut(Map(String, Int), Txn) := Map::empty
 
 # v2
 @LoadFrom(qty)
 held <: Map(String, Int)
-qty_units: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+qty_units: Mut(Map(String, Int), Txn) := map([k -> q * 10000 for k -> q in held])
 ```
 
 `x` is a name the predecessor declared, so the version being compiled need not declare it. Renaming
@@ -792,6 +792,29 @@ silent in the same way, and it is reported instead of refused, off the same tree
 a loop that begins above the beginning of what it reads, per [A variable that begins above its
 loop's input](#a-variable-that-begins-above-its-loops-input). Everything else either works or fails
 visibly.
+
+### A nominal type is compared by declaration
+
+> **Status: [Prescribed].** Nominal types are not implemented.
+
+The second refusal compares types after inference, and a nominal type survives inference, so the
+comparison sees the nominal type and not only its constructors' parameter types. The rules a stored
+nominal value has to meet are
+[chl-spec, Reloading a nominal type](../../../docs/chl-spec.md#reloading-a-nominal-type). Comparing
+parameter types alone would admit two values the source tells apart: a renamed type, and a value
+that fails the new version's refinement while holding the same scalar.
+
+The check needs the predecessor's declarations as well as its types, because a constructor is paired
+by name, or by `@RenamedFrom`, and its parameter types compared under the arguments of the run that
+holds the value. A stored value names its constructor, so the pairing is by that name, and
+reordering a declaration's constructors changes no stored value. A constructor renamed with
+`@RenamedFrom` is rewritten to its new name in each stored value at the swap, so no later version
+needs the old name. The rewrite runs between steps 4 and 5 of [Order of a
+reload](#order-of-a-reload), once the predecessor's values are offered and before a store seeds from
+them. It visits every stored value of the type, those nested in collections included, so it adds to
+the pause the swap already takes (the **Open** note there). Whether a runtime `Value` also carries
+its nominal type is open with erasure in the spec ([A nominal type is
+opaque](../../../docs/chl-spec.md#a-nominal-type-is-opaque)).
 
 ## Where a rebuilt store picks up
 
