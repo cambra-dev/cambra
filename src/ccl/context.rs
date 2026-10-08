@@ -2233,7 +2233,7 @@ fn run_passes(
         let errors = errors
             .into_iter()
             .map(|mut located| {
-                located.error.map_types(&|ty| respelling.apply_type(ty));
+                located.error.respell(&respelling);
                 located
             })
             .collect();

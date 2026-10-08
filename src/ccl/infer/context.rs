@@ -227,6 +227,11 @@ pub(super) struct InferCtx {
     /// The [`DefGroup`](crate::ccl::TypedExprNode::DefGroup)s whose emission encloses the
     /// current position, innermost last.
     pub(super) groups: Vec<OpenGroup>,
+    /// How a contribution to a history declared outside each `let` or mutable variable's
+    /// binder entered leaves that binder's scope ([`Self::require_contribution`]). A binder
+    /// with no entry is a lambda's, a loop's or a pattern's. Like [`Self::opaque_binders`],
+    /// entries are never removed.
+    let_exits: HashMap<Name, LetExit>,
 }
 
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
@@ -258,6 +263,19 @@ pub(super) struct GroupMember {
     /// Whether its definition typed, once emitted ([`Typing::close_let_type`] closes only
     /// over one that did).
     pub(super) defined: bool,
+}
+
+/// How a contribution crossing a `let` binder leaves its scope, as `close_let_type` lifts a
+/// value past one.
+enum LetExit {
+    /// A transparent binding: discharge its definition.
+    Discharge(Box<Expr>),
+    /// An opaque binding keeps its name, as one value; under a lambda of the crossing it
+    /// takes a value per iteration or call and is joined over instead.
+    Opaque,
+    /// A mutable variable's binder (`Typing::scoped_mut`), a `:=` definiens, or a definition
+    /// that did not type, has no value to discharge; the name stays.
+    NoValue,
 }
 
 /// The environment a solver query runs in: the lexical scope at the query,
@@ -304,6 +322,7 @@ impl InferCtx {
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
             bound_at_annotation: HashSet::new(),
+            let_exits: HashMap::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
             groups: Vec::new(),
@@ -368,9 +387,10 @@ impl InferCtx {
         &mut self,
         g: usize,
         binding: &TypedBinding,
+        definition: Option<&Expr>,
         let_scheme: LetScheme,
     ) {
-        let entry = self.let_scope_binding(binding, let_scheme);
+        let entry = self.let_scope_binding(binding, definition, let_scheme);
         let depth = self.groups[g].depth;
         self.scopes.bind_at(depth, binding.name.clone(), entry);
     }
@@ -378,7 +398,12 @@ impl InferCtx {
     /// The scope entry a `let` binding is bound at under `let_scheme`, at the current level,
     /// recording what the binding states past its scope. Shared by [`Typing::scoped_let`]
     /// and [`bind_group_member`](Self::bind_group_member).
-    fn let_scope_binding(&mut self, binding: &TypedBinding, let_scheme: LetScheme) -> Binding {
+    fn let_scope_binding(
+        &mut self,
+        binding: &TypedBinding,
+        definition: Option<&Expr>,
+        let_scheme: LetScheme,
+    ) -> Binding {
         let (name, bound_ty) = (&binding.name, &binding.ty);
         // An opaque binder carries no definiens, so a type lifted past it keeps
         // the name (`close_let_type`) and what the name means there is the type
@@ -386,10 +411,24 @@ impl InferCtx {
         // entry rather than on exit because a bound naming it is recorded
         // *inside* the scope, on a variable that may have been minted outside
         // (see [`Telescope`]).
-        if binding.transparency == BindingTransparency::Opaque {
+        let exit = if binding.transparency == BindingTransparency::Opaque {
             self.telescope.enter_opaque(name);
             self.opaque_binders.insert(name.clone(), bound_ty.clone());
-        }
+            LetExit::Opaque
+        } else {
+            match definition {
+                Some(definition)
+                    if !matches!(
+                        definition.node,
+                        TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
+                    ) =>
+                {
+                    LetExit::Discharge(Box::new(definition.clone_preserving_ids()))
+                }
+                _ => LetExit::NoValue,
+            }
+        };
+        self.let_exits.insert(name.clone(), exit);
         // Generalize at the current (outer) level: any variable in `bound_ty`
         // whose level exceeds `self.level` was minted inside the RHS and is
         // universally quantified; `instantiate` freshens it per use site.
@@ -802,6 +841,63 @@ impl InferCtx {
         Ok(ann_simple)
     }
 
+    /// Record `contribution <: history`: a feed, define or write into the history `target`
+    /// binds, made at the current position.
+    ///
+    /// `history` stands where `target` is bound, and the write stands inside every binder
+    /// entered since, so `contribution` can name binders `history` cannot. The edge carries
+    /// each crossed binder's scope exit, innermost first ([`LetExit`]): a transparent `let`
+    /// is discharged, and a binder taking several values — a loop's, a lambda's, a
+    /// pattern's — is joined over, so the history's type is the join of the contribution
+    /// over every value it takes (`src/ccl/design/type-inference.md`, "A contribution
+    /// crosses the binders after its target").
+    pub(super) fn require_contribution(
+        &mut self,
+        target: &Name,
+        contribution: &Type,
+        history: &Type,
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError> {
+        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+            return self.require_sub(contribution, history, at);
+        };
+        use crate::ccl::subst::Subst;
+        // The crossing's lambdas: an opaque binder inside one takes a value per iteration
+        // or call. `crossed` is innermost first, so one is inside a lambda when a lambda
+        // comes later in it.
+        let outermost_lambda = crossed
+            .iter()
+            .rposition(|name| !self.let_exits.contains_key(name));
+        let exits = crossed
+            .iter()
+            .enumerate()
+            .fold(Subst::id(), |exits, (i, name)| {
+                let exit = match self.let_exits.get(name) {
+                    Some(LetExit::Discharge(definition)) => {
+                        Subst::discharge(name.clone(), definition.clone_preserving_ids())
+                    }
+                    Some(LetExit::NoValue) => return exits,
+                    Some(LetExit::Opaque) if outermost_lambda.is_none_or(|j| j < i) => {
+                        return exits;
+                    }
+                    Some(LetExit::Opaque) | None => Subst::join(name.clone()),
+                };
+                Subst::then(&exits, &exit)
+            });
+        if exits.is_id() {
+            return self.require_sub(contribution, history, at);
+        }
+        // The contribution reaches `history` through a variable standing where `target` is
+        // bound, whose lower edge carries the exits, as a `let`'s lifted type does
+        // (`close_let_type`): the contribution is usually a variable whose refinements
+        // arrive as bounds, so the exits apply when the solver forces the edge.
+        let crossing = InferVar::fresh_in(self.level, &target_scope);
+        let bound = crate::ccl::Bound::with_subst(contribution.clone(), exits);
+        crate::ccl::infer_var::enforce_bound_scope(&crossing, "lower", &bound);
+        crossing.bounds.borrow_mut().lower_mut().push(bound);
+        self.require_sub(&Type::Infer(crossing), history, at)
+    }
+
     /// `lit`'s singleton type, with its predicate shared across every occurrence
     /// of the same literal value in this pass (see [`Self::lit_singletons`]).
     pub(super) fn lit_singleton(&mut self, lit: &Lit) -> Type {
@@ -1054,6 +1150,11 @@ impl Typing for InferCtx {
         out
     }
 
+    fn scoped_mut<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.let_exits.insert(name.clone(), LetExit::NoValue);
+        self.scoped(name, ty, f)
+    }
+
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push_scope();
         // Monomorphic binder: lambda params and pattern/loop binders are not
@@ -1109,10 +1210,11 @@ impl Typing for InferCtx {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
+        definition: Option<&Expr>,
         let_scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let entry = self.let_scope_binding(binding, let_scheme);
+        let entry = self.let_scope_binding(binding, definition, let_scheme);
         self.scopes.push_scope();
         self.scopes.bind(binding.name.clone(), entry);
         let r = self.under_binder(&binding.name, f);
