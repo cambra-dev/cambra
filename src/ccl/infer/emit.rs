@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
-use crate::ccl::infer::{InferError, LocatedInferError};
+use crate::ccl::infer::{EscapeTarget, InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::ty::FunKind;
@@ -94,9 +94,23 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // coalesce walk reads the resolved use type back off the live graph
         // and rewrites the use to a per-type specialization
         // (`specialize_use`).
+        //
+        // A scheme quantifying type parameters also states their bounds, which each
+        // use checks at its own types (`src/ccl/design/type-parameters.md`,
+        // "Instantiation").
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-            Some(binding) => binding.scheme.instantiate(ctx.level),
+            Some(binding) => {
+                let (ty, bounded) = binding
+                    .scheme
+                    .instantiate_with_params(ctx.level, &ctx.telescope);
+                for (instantiation, bound) in bounded {
+                    ctx.require_sub(&instantiation, &bound, &|| {
+                        format!("the bound of a type parameter of `{name}`")
+                    })?;
+                }
+                ty
+            }
         },
 
         // Builtins with a polymorphic signature (shared type variables
@@ -236,7 +250,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(binding) => binding.scheme.instantiate(ctx.level),
             };
-            emit_feed(&target_ty, value, &label, ctx)?
+            emit_feed(&target_ty, value, &label, ctx).map_err(|e| {
+                e.with_escape_target(EscapeTarget::Feed {
+                    channel: name.to_string(),
+                })
+            })?
         }
 
         TypedExprNode::Define { name, value } => {
@@ -439,8 +457,10 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         Type::Refinement(inner, refinements) => {
             // The annotation's refinements are bare over REFINEMENT_BINDER, just
             // like a cast target's — bind the element over the refined base and
-            // check `Bool`.
-            refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, inner, ctx))?;
+            // check `Bool`. The base can name a declared type parameter, which the
+            // element sees as the opened one.
+            let domain = ctx.refinement_domain(inner);
+            refinements.try_rewrite_each(|_, r| emit_bare_predicate(r, &domain, ctx))?;
             emit_annotation_predicates(inner, ctx)
         }
         Type::Fun {
@@ -487,7 +507,12 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
+        | Type::Param(_)
         | Type::Infer(_) => Ok(()),
+        // Reached only after `emit_let` has opened the `Poly`, so its parameters
+        // are registered when a predicate in the body mentions one. The bounds were
+        // typed as they were opened (`Typing::open_poly`).
+        Type::Poly(poly) => emit_annotation_predicates(&mut std::rc::Rc::make_mut(poly).body, ctx),
     }
 }
 
@@ -1048,12 +1073,16 @@ pub(super) fn emit_apply<C: Typing>(
     });
     // A call that fails against a generalized definition the definition alone already
     // rejects is the definition's error, reported at the definition rather than at a
-    // call that only met it.
-    match (&applied, &function.node) {
-        (Err(_), TypedExprNode::Var(name)) => match ctx.definition_alone_error(name) {
-            Some(definition_error) => Err(definition_error),
-            None => applied,
-        },
+    // call that only met it. Any other failure names the function a type parameter
+    // escapes into.
+    match &function.node {
+        TypedExprNode::Var(name) => applied.map_err(|e| {
+            ctx.definition_alone_error(name).unwrap_or_else(|| {
+                e.with_escape_target(EscapeTarget::Argument {
+                    function: name.to_string(),
+                })
+            })
+        }),
         _ => applied,
     }
 }
@@ -1746,8 +1775,59 @@ pub(super) fn emit_let<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // Emit the RHS at a deeper level so its locally-minted variables can be
-    // generalized at the binding site (`scoped_let`).
-    let bound_ty = ctx.in_let_rhs(|ctx| ctx.subexpr(bound_expr))?;
+    // generalized at the binding site (`scoped_let`). A polymorphic annotation is
+    // opened at that level first, so its type parameters sit with the right-hand
+    // side's own variables and are quantified with them.
+    let poly = match &binding.user_annotation {
+        Some(Type::Poly(poly)) => Some(std::rc::Rc::clone(poly)),
+        _ => None,
+    };
+    // The `Poly` stays open through the annotation's reconcile, which normalizes
+    // the parameters the annotation names, and is closed on every path out.
+    let scheme_ty = emit_let_bound(binding, bound_expr, poly.as_deref(), ctx);
+    if let Some(poly) = &poly {
+        ctx.close_poly(poly);
+    }
+    let scheme_ty = scheme_ty?;
+    // The binder slot records the type the variable is *bound at*, not its
+    // initializer's type — an exact annotation binds at the annotation, not at
+    // what flowed in. Writing it here, for coalesce to resolve in place, is the same
+    // binder-slot discipline `emit_lambda` uses for `param.ty` and `emit_letrec`
+    // for its declared types; `let` was the one binder whose slot was
+    // reconstructed from its RHS afterwards instead, which is what forced the
+    // mutability checks to read `user_annotation` as a proxy for it.
+    binding.ty = scheme_ty.clone();
+    let generalize = ctx.is_generalizable(bound_expr);
+    // Lowering refuses a polymorphic annotation on a call or a collection; a name
+    // of a monomorphic binding is known only here.
+    if poly.is_some() && !generalize {
+        return Err(ctx.raise(InferError::MonomorphicPolyBinding {
+            name: binding.name.base().to_string(),
+        }));
+    }
+    let body_ty = ctx.scoped_let(binding, generalize, |ctx| ctx.subexpr(body))?;
+    // Lifting the body type out of the binder's scope must close it over the
+    // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
+    // story.
+    Ok(ctx.close_let_type(binding, bound_expr, body_ty))
+}
+
+/// [`emit_let`]'s right-hand side and annotation: emit the right-hand side one level
+/// deeper, opening `poly` there first, and reconcile it against the binding's
+/// annotation. Returns the type the binding is bound at. `poly` is left open for the
+/// caller to close.
+fn emit_let_bound<C: Typing>(
+    binding: &mut TypedBinding,
+    bound_expr: &mut Expr,
+    poly: Option<&crate::ccl::ty::PolyType>,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let bound_ty = ctx.in_let_rhs(|ctx| {
+        if let Some(poly) = poly {
+            ctx.open_poly(poly)?;
+        }
+        ctx.subexpr(bound_expr)
+    })?;
     // A `let d = Defer` binding names its channel's domain rigidly — replace
     // the handle's (fresh, otherwise-unconstrained) domain var with the
     // literal nominal `ChanDom(d)`, so every consumer of a read of `d` types
@@ -1771,7 +1851,7 @@ pub(super) fn emit_let<C: Typing>(
         && let Type::Infer(dv) = domain.as_ref()
     {
         let handle = Type::feed(
-            Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level)),
+            Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level())),
             (**value).clone(),
         );
         bound_expr.ty = handle.clone();
@@ -1820,6 +1900,15 @@ pub(super) fn emit_let<C: Typing>(
         // initializer was already deref'd above — so `y: Int = x` off a mutable variable
         // needs no special handling, and `y: _ = x` completes from the *value* rather
         // than the history, which is what makes it mean exactly `y = x`.
+        // A polymorphic annotation is exact, and binds at its body: the
+        // right-hand side is checked once against it with the parameters opaque. A
+        // `def`'s body is a `Hole`, completed from the lambda, whose annotations
+        // already name the parameters. The reconcile runs at the right-hand side's
+        // level, so a hole in the body is quantified with the definition.
+        Some(Type::Poly(poly)) => {
+            let declared = complete_annotation(&poly.body, &bound_ty);
+            ctx.in_let_rhs(|ctx| ctx.bind_annotation(&bound_ty, &declared))?
+        }
         Some(ann) => {
             let declared = match ann {
                 Type::BoundedHole(_) => ann.clone(),
@@ -1829,20 +1918,7 @@ pub(super) fn emit_let<C: Typing>(
         }
         None => bound_ty,
     };
-    // The binder slot records the type the variable is *bound at*, not its
-    // initializer's type — an exact annotation binds at the annotation, not at
-    // what flowed in. Writing it here, for coalesce to resolve in place, is the same
-    // binder-slot discipline `emit_lambda` uses for `param.ty` and `emit_letrec`
-    // for its declared types; `let` was the one binder whose slot was
-    // reconstructed from its RHS afterwards instead, which is what forced the
-    // mutability checks to read `user_annotation` as a proxy for it.
-    binding.ty = scheme_ty.clone();
-    let generalize = ctx.is_generalizable(bound_expr);
-    let body_ty = ctx.scoped_let(binding, generalize, |ctx| ctx.subexpr(body))?;
-    // Lifting the body type out of the binder's scope must close it over the
-    // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
-    // story.
-    Ok(ctx.close_let_type(binding, bound_expr, body_ty))
+    Ok(scheme_ty)
 }
 
 /// Run `f` with every `(name, ty)` pair bound monomorphically, innermost-last

@@ -357,7 +357,7 @@ with_stmt       ::= "with" [ ident "=" ] expression ":" block
 def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
 params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
 value_param     ::= ident [ ( ":" | "<:" ) expression ]
--- `type_param` and `requires_clause` are in §6.10 (**[Planned]**).
+-- `type_param` and `requires_clause` (**[Planned]**) are in §6.10.
 
 -- A declaration seeded from the version this source replaces, via `@LoadFrom`. The
 -- decorator and the declaration are one statement, which is why a declaration
@@ -1498,7 +1498,7 @@ leaves it inferred and bounded above by `T` (see [Two annotation
 forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
 The two forms may be mixed across a parameter list. A capitalized
 parameter is a type parameter, not a value
-(**[Planned]**, [Type parameters](#type-parameters)). A return-type
+([Type parameters](#type-parameters)). A return-type
 annotation, introduced by `=>`, specifies a fixed output type for the
 function. The inferred type of the function body must be a subtype of
 the annotated output type.
@@ -2280,8 +2280,7 @@ marked one carries its status per "How to read this document".)
   through which one module is passed to another (**[Decided]**,
   [9.8 Module types](#98-module-types)).
 - `forall (T) U` — polymorphic type: for every type `T`, a `U`
-  (**[Planned]**, [6.10 Polymorphic types](#610-polymorphic-types)), written only as a whole `let`
-  annotation.
+  ([6.10 Polymorphic types](#610-polymorphic-types)), written only as a whole `let` annotation.
 
 CHL also supports **refinement types**: a value of the refined type is
 a value of the base type for which a predicate holds. Refinements are
@@ -2830,7 +2829,7 @@ The rules, and what each one is doing:
   `:=`, `op=`, `<<=`, a `for` target, a comprehension generator — rejects a
   capitalized binder and names this one. A `def` name is not yet checked; a
   capitalized one binds a value the type language cannot see. A capitalized
-  parameter is a type parameter (**[Planned]**, [Type parameters](#type-parameters)).
+  parameter is a type parameter ([Type parameters](#type-parameters)).
 - **The type language's own names are reserved.** `Int`, `UInt`, `String`,
   `Bool`, `Unit` and `Txn`, and the constructors `Array`, `Collection`, `Feed`,
   `FullMap`, `List`, `Map`, `Mut`, `Option` and `Set`, are refused as alias
@@ -2981,8 +2980,6 @@ monomorphic, and making each field polymorphic on its own is **[Open]**.
 
 #### Type parameters
 
-**[Planned]**
-
 ```ebnf
 def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ] [ requires_clause ] ":" block
 params          ::= ( type_param "," )* value_param ( "," value_param )* [ "," ]
@@ -3008,7 +3005,7 @@ first("a", "b")   # T = String
   [3.8 Function calls](#38-function-calls) leaves open.
 - **Every type parameter is determined by the arguments.** It appears in a value parameter's
   annotation, or it is the associated type of a requirement whose other positions are determined
-  ([Trait requirements](#trait-requirements)). Any other type parameter is an
+  (**[Planned]**, [Trait requirements](#trait-requirements)). Any other type parameter is an
   error at the definition.
 - **A type parameter is opaque in the body.** A value of type `T` supports what `T`'s bound and the
   `requires` clause state, and nothing else. `def inc(T, x: T) => T: x + 1` is an error at `+`,
@@ -3025,8 +3022,6 @@ first("a", "b")   # T = String
   name. An alias of the same name declared in the body is an error naming both.
 
 #### Kinds and bounds
-
-**[Planned]**
 
 A type parameter ranges over a **kind**, a set of types. `T: K` states that `T` is one of the types
 in the kind `K`:
@@ -3107,8 +3102,6 @@ of one listed type, and a tuple or record satisfies `Equatable` only against the
 
 #### Polymorphic type annotations
 
-**[Planned]**
-
 ```ebnf
 poly_type       ::= "forall" "(" type_param ( "," type_param )* ")" expression [ requires_clause ]
 ```
@@ -3116,7 +3109,8 @@ poly_type       ::= "forall" "(" type_param ( "," type_param )* ")" expression [
 In a type position, `forall (T, U <: B) V requires …` is the type of a polymorphic value: for
 every `T` and `U` that meet the kinds and requirements, a value of type `V`. A polymorphic `def` has
 this type, with its type parameters moved into the `forall`. `first` above has type
-`forall (T) {T, T} => T`.
+`forall (T) {T, T} => T`. The `requires` clause is **[Planned]**
+([Trait requirements](#trait-requirements)).
 
 ```python
 pick: forall (T) {T, T} => T = first
@@ -3141,10 +3135,10 @@ pick: forall (T) {T, T} => T = first
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
   ([6.7 Type-alias statements](#67-type-alias-statements)).
-- **A diagnostic prints an inferred polymorphic type in this notation.** A mismatch against a
-  polymorphic annotation prints the right-hand side's type with each variable it quantifies as a
-  parameter, `A`, `B`, … in order of first appearance, and each trait it requires of them as a
-  requirement. `def inc(a): a + 1` prints as
+- **A diagnostic prints an inferred polymorphic type in this notation** (**[Decided]**). A
+  mismatch against a polymorphic annotation prints the right-hand side's type with each variable
+  it quantifies as a parameter, `A`, `B`, … in order of first appearance, and each trait it
+  requires of them as a requirement. `def inc(a): a + 1` prints as
   `forall (A) A => Int requires Addable(A, Int, Output=Int)`. A part of the type the notation cannot
   write, such as a parameter joined with another type, is marked in the printed type (`A ∨ Int`),
   not dropped.

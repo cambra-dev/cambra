@@ -697,3 +697,31 @@ fn alias_of_a_monomorphic_binding_is_monomorphic() {
         "Incompatible lower bounds",
     );
 }
+
+// A generalized definition beside a monomorphic binding shares the binding rather than
+// quantifying its variables: two uses of the definition at different types meet in the
+// one binding, as two direct uses do (`src/ccl/design/type-inference.md`, "A monomorphic
+// binding's variables sit at its level").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_feed(indoc! {r#"
+    out = defer()
+    def put(x):
+        out << x
+        x
+    put(1)
+    put("s")
+    out
+"#})]
+#[case::a_call_result(indoc! {r#"
+    def id(v):
+        v
+    g = id(\v -> v)
+    def h(y):
+        g(y)
+    h(1)
+    h("s")
+"#})]
+fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
+    check_compile_error(code, "Conflicting Types: Int | String");
+}

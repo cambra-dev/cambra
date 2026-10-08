@@ -1231,7 +1231,9 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 | Type::SharedHole(_)
                 | Type::DataSource(_)
                 | Type::ChanDom(_, _)
+                | Type::Param(_)
                 | Type::Txn => {}
+                Type::Poly(_) => unreachable!("a polymorphic type is never a recorded bound"),
                 // `peel_refinements` returns a non-refinement by construction.
                 Type::Refinement(_, _) => unreachable!("refinements are peeled above"),
                 // `BoundedHole` is a *pre-inference* annotation marker:
@@ -1490,6 +1492,10 @@ pub enum Offered<'a> {
     /// would split this variant into the shapes a row can key on — it would not
     /// change how narrowing works.
     NotABase,
+    /// A type parameter, inside the definition that declares it. It supports what
+    /// its bound supports, and nothing if it has none
+    /// (`src/ccl/design/type-parameters.md`, "Obligations under assumptions").
+    Param(&'a Rc<crate::ccl::ty::TypeParam>),
 }
 
 /// `product` with every component's refinements peeled, recursively through nested products.
@@ -1577,6 +1583,7 @@ pub fn offered(ty: &Type) -> Offered<'_> {
         // Sums and functions are fully determined and are not bases. A collection
         // compared or added is the same mistake as a variant.
         Type::Variant(_, _) | Type::Fun { .. } => Offered::NotABase,
+        Type::Param(param) => Offered::Param(param),
         // Everything else is either a variable, a placeholder, or a carrier whose
         // payload reaches the watch by another route.
         _ => Offered::Unknown,
@@ -1644,13 +1651,21 @@ pub(super) fn link_watches(
     }
 
     // Whatever `lower` already carries is information the obligation has not been
-    // offered — it arrived before the edge existed.
-    let (known, below) = {
+    // offered — it arrived before the edge existed. A type parameter is replayed
+    // with the bases: missing one would leave an operator on an unbounded parameter
+    // unchecked.
+    let (known, params, below) = {
         let bounds = lower.bounds.borrow();
         let known: Vec<BaseType> = bounds
             .lower()
             .iter()
             .filter_map(|b| offered_base(&b.ty).cloned())
+            .collect();
+        let params: Vec<Type> = bounds
+            .lower()
+            .iter()
+            .filter(|b| matches!(offered(&b.ty), Offered::Param(_)))
+            .map(|b| b.ty.clone())
             .collect();
         let below: Vec<Rc<InferVar>> = bounds
             .lower()
@@ -1660,11 +1675,14 @@ pub(super) fn link_watches(
                 _ => None,
             })
             .collect();
-        (known, below)
+        (known, params, below)
     };
     for (obligation, pos) in &added {
         for base in &known {
             obligation.narrow(*pos, base, cache)?;
+        }
+        for param in &params {
+            deliver(obligation, *pos, param, lower, cache)?;
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
@@ -1695,25 +1713,48 @@ pub(super) fn notify_lower(
         }
         watches.clone()
     };
-    match offered(contribution) {
-        Offered::Base(base) => {
-            for (obligation, pos) in watches {
-                obligation.narrow(pos, base, cache)?;
-            }
-        }
-        Offered::Product(product) => {
-            for (obligation, pos) in watches {
-                obligation.narrow_product(pos, product, var, cache)?;
-            }
-        }
-        Offered::NotABase => {
-            for (obligation, pos) in watches {
-                obligation.reject(pos, contribution)?;
-            }
-        }
-        Offered::Unknown => {}
+    for (obligation, pos) in watches {
+        deliver(&obligation, pos, contribution, var, cache)?;
     }
     Ok(())
+}
+
+/// Offer `contribution`, which landed on `var`, to `obligation` at position `pos`.
+///
+/// A type parameter offers its bound: a value of a bounded parameter's type is a
+/// value of its bound's type. An unbounded parameter supports no trait.
+fn deliver(
+    obligation: &Rc<TraitObligation>,
+    pos: u8,
+    contribution: &Type,
+    var: &Rc<InferVar>,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    match offered(contribution) {
+        Offered::Base(base) => obligation.narrow(pos, base, cache),
+        Offered::Product(product) => obligation.narrow_product(pos, product, var, cache),
+        Offered::NotABase => obligation.reject(pos, contribution),
+        Offered::Param(param) => match &param.bound {
+            // The operand is this parameter, so a requirement missing further up its bound
+            // chain is missing of it.
+            Some(bound) => deliver(obligation, pos, bound, var, cache).map_err(|e| match e {
+                ConstrainError::MissingRequirement {
+                    trait_, position, ..
+                } => ConstrainError::MissingRequirement {
+                    trait_,
+                    position,
+                    param: Rc::clone(param),
+                },
+                other => other,
+            }),
+            None => Err(ConstrainError::MissingRequirement {
+                trait_: obligation.trait_,
+                position: pos,
+                param: Rc::clone(param),
+            }),
+        },
+        Offered::Unknown => Ok(()),
+    }
 }
 
 #[cfg(test)]

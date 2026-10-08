@@ -125,6 +125,34 @@ pub(super) trait Typing {
     /// node-annotation predicate handling in [`emit_node`](super::emit::emit_node).
     fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError>;
 
+    /// The type a refinement's element is bound at while its predicate is typed:
+    /// `base` with each declared type parameter replaced by the one the open `Poly`
+    /// minted for it, since only an opened parameter may reach the solver
+    /// (`src/ccl/design/type-parameters.md`, "Representation").
+    fn refinement_domain(&self, base: &Type) -> Type;
+
+    /// Open a `let`'s polymorphic annotation before its right-hand side is
+    /// emitted: mint an opened [`Type::Param`] for each parameter the `Poly`
+    /// declares, at the current level and over its normalized bound, which
+    /// normalization then puts in place of the declared one until
+    /// [`close_poly`](Self::close_poly) (`src/ccl/design/type-parameters.md`,
+    /// "Checking a binding against a polymorphic type"). Called inside
+    /// [`in_let_rhs`](Self::in_let_rhs), so a parameter sits at the level of the
+    /// right-hand side's own variables. Check never meets a `Poly`: none survives
+    /// inference.
+    ///
+    /// Each bound's refinement predicates are typed here, before it is normalized
+    /// into its parameter, as [`type_annotation_predicates`](Self::type_annotation_predicates)
+    /// types any annotation's: a use instantiates the bound, and an untyped predicate
+    /// would reach the post-inference wall with its variables unresolved. Every
+    /// parameter is opened even when a predicate fails, so
+    /// [`close_poly`](Self::close_poly) closes what this opened.
+    fn open_poly(&mut self, poly: &crate::ccl::ty::PolyType) -> Result<(), LocatedInferError>;
+
+    /// Close the innermost `Poly` [`open_poly`](Self::open_poly) opened, once its
+    /// binding's right-hand side and annotation are checked.
+    fn close_poly(&mut self, poly: &crate::ccl::ty::PolyType);
+
     /// Require `sub <: sup`. `at` lazily produces an error-context label,
     /// invoked only on failure.
     fn require_sub(

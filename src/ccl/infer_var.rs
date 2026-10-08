@@ -529,19 +529,21 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
 /// A type inference variable: an unknown type the solver pins down by
 /// accumulating subtyping bounds.
 ///
-/// Carried by [`Type::Infer`]. The `uid` and `level` are immutable and live
+/// Carried by [`Type::Infer`]. The `uid` is immutable and, like the `level`, lives
 /// *outside* the `RefCell`, so identity (equality, hashing, display) is
 /// borrow-free and never inspects the bound graph — which is what lets
 /// [`Type`] keep deriving `PartialEq`/`Eq`/`Hash`/`Debug` even while a
 /// variable's bounds are cyclic (a recursive type, pre-rejection) or
-/// mutably borrowed mid-constraint. Only [`InferVar::bounds`] is mutable.
+/// mutably borrowed mid-constraint. Besides [`InferVar::bounds`], only the level
+/// changes, and only downward ([`InferVar::lower_level`]).
 pub struct InferVar {
     /// Stable, globally-unique identity.
     pub uid: InferVarId,
-    /// Scope level at which the variable was minted.
-    pub level: Level,
-    /// The binders in lexical scope at creation — immutable like `uid` and
-    /// `level`, and what a recorded bound must close against.
+    /// Scope level the variable belongs to: where it was minted, or lower once a
+    /// monomorphic binding claims it ([`InferVar::lower_level`]).
+    level: std::cell::Cell<Level>,
+    /// The binders in lexical scope at creation — immutable like `uid`, and what a
+    /// recorded bound must close against.
     pub telescope: Telescope,
     /// Mutable lower/upper bound lists.
     pub bounds: RefCell<InferBounds>,
@@ -676,7 +678,7 @@ impl InferVar {
         let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             fun_kind,
-            level,
+            level: std::cell::Cell::new(level),
             telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),
             watches: RefCell::new(Vec::new()),
@@ -693,6 +695,22 @@ impl InferVar {
 // Identity-based: two inference variables are equal iff they share a `uid`.
 // Borrow-free and cycle-free (never touches `bounds`), so it's safe to call
 // on a variable whose bound graph is cyclic or currently borrowed.
+impl InferVar {
+    /// The scope level the variable belongs to.
+    pub fn level(&self) -> Level {
+        self.level.get()
+    }
+
+    /// Move the variable down to `level` if it sits above it. A monomorphic binding
+    /// claims its right-hand side's variables this way
+    /// ([`lower_levels`](crate::ccl::infer::solver::constrain::lower_levels)).
+    pub(crate) fn lower_level(&self, level: Level) {
+        if self.level.get() > level {
+            self.level.set(level);
+        }
+    }
+}
+
 impl PartialEq for InferVar {
     fn eq(&self, other: &Self) -> bool {
         self.uid == other.uid

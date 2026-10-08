@@ -515,7 +515,7 @@ fn ask_oracle(oracle: &str, cases: &[String]) -> Vec<String> {
 
 /// Serialize an atom into the merge model's `Atom` schema. `None` for
 /// `ChanDom`, which the model excludes for the same reason `Ty` excludes the
-/// pipeline transients.
+/// pipeline transients, and for the other atoms the model has no form for.
 fn atom_json(a: &AtomKey) -> Option<String> {
     Some(match a {
         AtomKey::Prim(b) => format!(r#"{{"k":"prim","base":"{}"}}"#, base_json(b)),
@@ -523,8 +523,10 @@ fn atom_json(a: &AtomKey) -> Option<String> {
         AtomKey::Source(s) => format!(r#"{{"k":"source","s":"{s}"}}"#),
         AtomKey::Txn => r#"{"k":"txn"}"#.to_string(),
         // A witness reference is a name for whichever domain a Σ picked, and the model
-        // has no witness — outside the fragment for the same reason `ChanDom` is.
-        AtomKey::ChanDom(..) | AtomKey::Witness(..) => return None,
+        // has no witness — outside the fragment for the same reason `ChanDom` is. Nor
+        // does it have type parameters, which exist only inside a polymorphic
+        // definition's body.
+        AtomKey::ChanDom(..) | AtomKey::Witness(..) | AtomKey::Param(..) => return None,
     })
 }
 

@@ -380,6 +380,11 @@ impl Typing for CheckCtx {
         }
     }
 
+    fn refinement_domain(&self, base: &Type) -> Type {
+        // No `Poly` survives inference, so a checked tree holds no declared parameter.
+        base.clone()
+    }
+
     fn type_annotation_predicates(&mut self, _ty: &mut Type) -> Result<(), LocatedInferError> {
         // Check trusts already-resolved refinement predicates; re-emitting would
         // duplicate work and mistype planning's *function* predicates (`D ⇒ Bool`)
@@ -428,6 +433,14 @@ impl Typing for CheckCtx {
         // No generalization in Check (recorded types are trusted), so no level
         // bump is needed.
         f(self)
+    }
+
+    fn open_poly(&mut self, _poly: &crate::ccl::ty::PolyType) -> Result<(), LocatedInferError> {
+        unreachable!("a polymorphic annotation survived inference into Check");
+    }
+
+    fn close_poly(&mut self, _poly: &crate::ccl::ty::PolyType) {
+        unreachable!("a polymorphic annotation survived inference into Check");
     }
 
     fn is_generalizable(&self, _def: &Expr) -> bool {

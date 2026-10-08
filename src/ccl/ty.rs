@@ -996,6 +996,8 @@ pub fn reset_fun_kind_var_counter() {
 /// | `History` (`history_kind: Overwrite`) | Type checker only | "Mutable variable: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`history_kind: Append`) | Type checker only | "Feed channel `domain ⤇ value`: the defer binding's post-channelize collection type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its domain resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
+/// | `Poly(𝜋)` | Lowering | "A written polymorphic type `\𝑇 -> 𝑉`" — only as a `let` annotation | Inference, which opens it at the `let` and instantiates it at each use (flagged by `collect_type_errors` if it survives) |
+/// | `Param(𝑇)` | Lowering (declared), type checker (opened) | "A type parameter, opaque inside the binding that declares it" | Normalization, which replaces a declared one with the opened one, and specialization, which substitutes each use's types for an opened one (flagged by `collect_type_errors` if it survives) |
 ///
 /// A type is **concrete** when none of those variants occurs anywhere in it, nor
 /// a [`FunKind::Var`]: it is what a checked program exhibits, and what every pass
@@ -1273,8 +1275,198 @@ pub enum Type {
     /// Named for the *reference*: the witness itself is the [`Witness`] in the function's
     /// slot ([`FunKind::Data`]), classified by a [`TypeKind`].
     WitnessRef(WitnessId),
+    /// A **type parameter**, `T` in `def f(T, x: T)`: opaque inside the binding that
+    /// declares it, a subtype only of itself and of its bound, and instantiated as a
+    /// fresh inference variable at each use.
+    ///
+    /// Lowering writes the parameter a [`Type::Poly`] **declares**: a name, with no
+    /// level and no bound. Emission **opens** the `Poly` for each binding it annotates,
+    /// minting a parameter of its own that carries what the solver reads of it, as
+    /// [`Type::Infer`]'s variable does, and normalization replaces each declared
+    /// occurrence with it ([`TypeParam::level`]).
+    ///
+    /// See `src/ccl/design/type-parameters.md`.
+    Param(Rc<TypeParam>),
+    /// A **written polymorphic type**, `forall (T, U <: B) V`: type parameters with their
+    /// bounds over a body type. Lowering produces one only as a whole `let`
+    /// annotation; a `def` with type parameters is a `let` annotated with one whose
+    /// body is [`Type::Hole`], since the lambda's own annotations already state its
+    /// signature.
+    ///
+    /// See `src/ccl/design/type-parameters.md`.
+    Poly(Rc<PolyType>),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
+}
+
+/// A type parameter: [`Type::Param`]. Equality, ordering and hashing are by `id`.
+///
+/// One is either **declared** or **opened**. Lowering declares one per parameter a
+/// [`Type::Poly`] binds, and the `Poly`'s body and the annotations of the definition it
+/// annotates name it. Opening the `Poly` for a binding mints an opened parameter per
+/// declared one, at the right-hand side's level and under its normalized bound, and
+/// normalization maps each declared occurrence to it. A `Poly` an alias names is opened
+/// once per binding it annotates, so each binding has parameters of its own. Only an
+/// opened parameter reaches the solver ([`level`](Self::level)).
+#[derive(Debug)]
+pub struct TypeParam {
+    pub id: TypeParamId,
+    /// The name the user wrote, for display.
+    pub spelling: SmolStr,
+    /// For an opened parameter, the level of the right-hand side the `Poly` annotates,
+    /// which is where that right-hand side's own inference variables sit. `None` for a
+    /// declared one.
+    pub opened_at: Option<crate::ccl::Level>,
+    /// For an opened parameter, the upper bound its kind gives it
+    /// ([`PolyParam::bound`]), normalized at its level. A declared parameter's kind is
+    /// its [`PolyParam::kind`], where the passes before inference rewrite it.
+    pub bound: Option<Type>,
+}
+
+impl TypeParam {
+    /// A declared parameter: what lowering writes for `T` in `forall (T) V`.
+    pub fn declared(spelling: impl Into<SmolStr>) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            spelling: spelling.into(),
+            opened_at: None,
+            bound: None,
+        })
+    }
+
+    /// An opened parameter at `level`, no other equal to it.
+    pub fn opened(
+        spelling: impl Into<SmolStr>,
+        level: crate::ccl::Level,
+        bound: Option<Type>,
+    ) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            spelling: spelling.into(),
+            opened_at: Some(level),
+            bound,
+        })
+    }
+
+    /// The level an opened parameter sits at.
+    ///
+    /// # Panics
+    ///
+    /// On a declared parameter: normalization replaces every declared occurrence inside
+    /// the right-hand side that opens its `Poly`, so one reaching the solver was never
+    /// opened.
+    pub fn level(&self) -> crate::ccl::Level {
+        self.opened_at.unwrap_or_else(|| {
+            panic!(
+                "type parameter `{}` reached the solver as declared: no binding opened the \
+                 `Poly` that declares it",
+                self.spelling
+            )
+        })
+    }
+}
+
+impl PartialEq for TypeParam {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for TypeParam {}
+impl PartialOrd for TypeParam {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TypeParam {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.cmp(&other.id)
+    }
+}
+impl std::hash::Hash for TypeParam {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+/// Globally unique identity of a [`TypeParam`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeParamId(pub u32);
+
+static TYPE_PARAM_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// The content of a [`Type::Poly`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PolyType {
+    /// The type parameters, in declaration order, each with its kind.
+    pub params: Vec<PolyParam>,
+    /// The type the parameters are quantified over.
+    pub body: Type,
+}
+
+impl PolyType {
+    /// Every type this `Poly` holds: each kind's in declaration order, then the body.
+    pub fn types(&self) -> impl Iterator<Item = &Type> {
+        self.params
+            .iter()
+            .flat_map(|p| p.kind.children())
+            .chain(std::iter::once(&self.body))
+    }
+
+    /// [`types`](Self::types), mutably.
+    pub fn types_mut(&mut self) -> impl Iterator<Item = &mut Type> {
+        self.params
+            .iter_mut()
+            .flat_map(|p| p.kind.children_mut())
+            .chain(std::iter::once(&mut self.body))
+    }
+
+    /// This `Poly` with `f` applied to each kind's types and to the body; the
+    /// parameters keep their identities.
+    pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> PolyType {
+        PolyType {
+            params: self
+                .params
+                .iter()
+                .map(|p| PolyParam {
+                    param: Rc::clone(&p.param),
+                    kind: p.kind.map_children(&mut f),
+                })
+                .collect(),
+            body: f(&self.body),
+        }
+    }
+}
+
+/// One type parameter a [`PolyType`] declares, with the kind it ranges over. A kind
+/// names only the parameters before it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PolyParam {
+    /// The declared parameter, which the kinds after it, the body, and the
+    /// annotations of the definition the `Poly` annotates name.
+    pub param: Rc<TypeParam>,
+    /// [`TypeKind::Type`], or [`TypeKind::SubtypesOf`] for a bounded parameter;
+    /// lowering writes no other (`docs/chl-spec.md`, "Kinds and bounds").
+    pub kind: TypeKind,
+}
+
+impl PolyParam {
+    /// The upper bound the parameter's kind gives it: `𝐵` for `SubtypesOf(𝐵)`, and
+    /// none for `Type`.
+    ///
+    /// # Panics
+    ///
+    /// On any other kind, which lowering refuses.
+    pub fn bound(&self) -> Option<&Type> {
+        match &self.kind {
+            TypeKind::Type => None,
+            TypeKind::SubtypesOf(bound) => Some(bound),
+            other => panic!(
+                "type parameter `{}` has kind {other}, which lowering refuses: a type \
+                 parameter's kind is `Type` or `SubtypesOf`",
+                self.param.spelling
+            ),
+        }
+    }
 }
 
 /// **Which binder a witness is** — its name, and the whole of its identity.
@@ -2031,6 +2223,27 @@ fn fmt_type(
         Type::Infer(var) => write!(f, "?{}", var.uid),
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
+        Type::Param(param) => write!(f, "{}", param.spelling),
+        // The spec's notation, `forall (T, U <: B) V`.
+        Type::Poly(poly) => {
+            let params: Vec<String> = poly
+                .params
+                .iter()
+                .map(|p| match &p.kind {
+                    TypeKind::Type => p.param.spelling.to_string(),
+                    TypeKind::SubtypesOf(bound) => {
+                        format!("{} <: {}", p.param.spelling, at(bound, binders))
+                    }
+                    other => format!("{}: {other}", p.param.spelling),
+                })
+                .collect();
+            write!(
+                f,
+                "forall ({}) {}",
+                params.join(", "),
+                at(&poly.body, binders)
+            )
+        }
         Type::Txn => write!(f, "Txn"),
         Type::History {
             value,
@@ -2976,6 +3189,7 @@ impl Type {
                 value.without_pi_names(),
                 *history_kind,
             ),
+            Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(Type::without_pi_names))),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -2984,6 +3198,7 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::Param(_)
             | Type::Txn => self.clone(),
         }
     }
@@ -3075,7 +3290,11 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::Param(_)
             | Type::Txn => {}
+            // A `Poly`'s bounds are its children as its body is: a pass that rewrites
+            // types (uniquify's α-renaming, `subst`) must reach a refinement in a bound.
+            Type::Poly(poly) => poly.types().for_each(f),
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.
@@ -3132,7 +3351,9 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::Param(_)
             | Type::Txn => {}
+            Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.

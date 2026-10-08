@@ -103,8 +103,16 @@ the right-hand side's own inference variables sit.
 bounds; a type parameter must not ([chl-spec.md, "Type
 parameters"](../../../docs/chl-spec.md#type-parameters)). An edge that carries a parameter to a
 variable below its level reaches `constrain_go`'s level-mismatch arms, which check for one
-(`escaping_param`) before extruding and fail with `TypeParamEscapes`, naming the parameter.
-`extrude` never mints a proxy for a parameter.
+(`escaping_param`) before extruding and fail with `TypeParamEscapes`, naming the parameter. A
+call's argument edge and a feed's contribution edge also name what the value reaches, the function
+or the channel (`EscapeTarget`). `extrude` never mints a proxy for a parameter. A monomorphic
+binding beside the definition sits at the definition's own level
+([type-inference.md, "A monomorphic binding's variables sit at its level"](type-inference.md#a-monomorphic-bindings-variables-sit-at-its-level)),
+so a parameter reaching it is caught here too.
+
+A refinement in an annotation binds its element at the refined base with each declared parameter
+replaced by the opened one (`Typing::refinement_domain`), since only an opened parameter reaches
+the solver.
 
 `freshen_level` reports the level too, so `freshen_above` does not short-circuit past a type that
 mentions a parameter.
@@ -116,7 +124,8 @@ mentions a parameter.
 `emit_let` with an exact annotation `Poly(𝜋)`:
 
 1. Opens `𝜋` inside `in_let_rhs` (`Typing::open_poly`): mints an opened `Param` for each declared
-   one at the right-hand side's level, with its bound normalized at that level, which
+   one at the right-hand side's level, with its bound's refinement predicates typed and the bound
+   normalized at that level, which
    normalization puts in place of the declared one until `Typing::close_poly` closes `𝜋` after
    step 2, on every path out. It returns `𝜋` opened, its requirements normalized over the opened
    parameters, which are in scope as **assumptions** while the right-hand side is emitted
@@ -179,6 +188,12 @@ An unbounded parameter has nothing to widen to and still collides, which is the 
 with no common type. Widening at a meet never hides an error the program has: a position holding a
 parameter lies in a definition checked alone, whose types are dropped, and every value reaching a
 parameter's position was related to it through its bound when its edge was drawn.
+
+An unbounded parameter also collides with a variable of a lower level, which stands for a type
+chosen outside the parameter's definition: in `def outer(x)`, the join `y if c else x` inside
+`def inner(T, y: T)`. Checking `inner` alone sees `x`'s variable flexible, and simplification
+removes a variable that occurs at one polarity only, so the check reads the compacted term before
+simplifying it (`refuse_param_joined_with_outer_variable`).
 
 ---
 
@@ -250,7 +265,7 @@ states.
 ## Specialization
 
 A specialization clone is freshened with `FreshenLevel::Preserve`, and the level of a parameter says
-whose it is:
+whose it is, relative to the cutoff:
 
 | Parameter | Freshened to |
 | --- | --- |
@@ -270,6 +285,14 @@ two unrelated parameters meeting at one position, never shows in a clone.
 its parameters opaque
 ([type-inference.md, "Checking a definition alone"](type-inference.md#checking-a-definition-alone)),
 and that check is what reports such an error.
+
+A use inside a definition checked alone can carry that definition's opaque parameters into the
+specialization of a binding declared further out, whose own variables sit at a lower level. Related
+to one of those, a parameter would reach a variable below its level and fail as an escape.
+`CoalesceCtx::opaque_params_at` holds the level of the parameters of each `Poly`-annotated
+definition being checked alone, and `specialize_use` freshens such a clone with
+`FreshenLevel::Raise`, every level raised by the same amount, so the clone stands at the innermost
+of them. The relative levels inside the clone are kept, and it is coalesced at the raised cutoff.
 
 An obligation copy holding an assumption about one of the specialized binding's own parameters
 is reset to its trait's instances and the assumptions that name no such parameter

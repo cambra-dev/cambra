@@ -2569,8 +2569,11 @@ fn a_lookup_at_the_wrong_key_type_is_refused_for_membership() {
         msgs.iter().any(|m| m.contains("collection_contains")),
         "the rejection must name the present-key domain the key fails to carry, got {errs:?}"
     );
+    // The domain renders with its `String` base, so the hint is what says membership,
+    // not the key type, refused the key.
     assert!(
-        !msgs.iter().any(|m| m.contains("String")),
+        msgs.iter()
+            .any(|m| m.contains("is not known to lie in the collection's domain")),
         "the key type is not yet what refuses this; if it is, the doc comment above and \
          the membership assertion are both stale: {errs:?}"
     );
