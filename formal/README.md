@@ -33,7 +33,7 @@ The proof families have distinct scopes:
 A successful proof build validates those Lean declarations, not their correspondence to every
 Rust execution. Differential tests separately sample that correspondence.
 
-## One rule, end to end
+## Record-width subtyping in the model and implementation
 
 Record-width subtyping connects four definitions:
 
