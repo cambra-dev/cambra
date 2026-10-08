@@ -75,7 +75,7 @@ fn whole<T>(
 }
 
 #[test]
-#[ignore = "measurement, not a gate; see the module doc for the driver"]
+#[ignore = "measurement, not a gate; see docs/demo-programs.md, Timing a compile"]
 fn gallery_compile_timing() {
     time_gallery("compile", |source| {
         let sources = SourceMap::single("<gallery>", source());
@@ -88,7 +88,7 @@ fn gallery_compile_timing() {
 }
 
 #[test]
-#[ignore = "measurement, not a gate; see the module doc for the driver"]
+#[ignore = "measurement, not a gate; see docs/demo-programs.md, Timing a compile"]
 fn gallery_infer_timing() {
     time_gallery("infer", |source| {
         let sources = SourceMap::single("<gallery>", source());
@@ -104,7 +104,7 @@ fn gallery_infer_timing() {
 /// the difference between whole runs of the other two drivers does not, and
 /// carries their entry points' pane and provenance costs besides.
 #[test]
-#[ignore = "measurement, not a gate; see the module doc for the driver"]
+#[ignore = "measurement, not a gate; see docs/demo-programs.md, Timing a compile"]
 fn gallery_post_infer_timing() {
     time_gallery("post-infer", |source| {
         let (to_infer, to_planning) = (
