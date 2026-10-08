@@ -266,6 +266,10 @@ ci_shared_state() {
   python3 .github/scripts/shared-state/check_shared_state.py || return 1
 }
 
+# Unit tests for `.github/scripts/ci-verdict`, the reader that judges a PR's CI
+# at its head SHA through the cancelled duplicate runs a stack push leaves.
+ci_verdict_reader() { python3 .github/scripts/ci-verdict/test_ci_verdict.py; }
+
 # Fast inner-loop gate for local iteration: format, lint (debug, lib+bins only),
 # the frontend's typecheck and tests, and the Rust suite. Skips the phases whose
 # cost is compile-bound and rarely relevant mid-iteration — the release clippy
@@ -317,6 +321,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_shared_state || failed="${failed} shared_state"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_verdict_reader || failed="${failed} verdict_reader"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fmt || failed="${failed} fmt"

@@ -452,6 +452,21 @@ of the two is recoverable:
 So do not push branches by hand and then repair bases. Run a reorder through `init` and `submit`,
 which push and re-base in one step.
 
+#### Reading CI on a stack
+
+A push that force-pushes a PR's base and moves its head starts two `ci.yml` runs at the new head
+SHA, so after a restack most PRs carry a pair. The concurrency group cancels one, and the cancelled
+run's `check` job reports FAILURE. Either run of the pair can be the cancelled one, so the newest
+run, `gh pr checks` and `statusCheckRollup` all misread the PR. Read the verdict at each head SHA:
+
+```bash
+.github/scripts/ci-verdict/ci_verdict.py --wait 293 273 306   # exit 0 iff every PR passed
+```
+
+Do not re-run a cancelled run beside one that survived. The re-run joins the same concurrency
+group and cancels its in-flight sibling. Re-run only a SHA the script reports as `cancelled`, where
+every run was cancelled and nothing checked it.
+
 #### Operational notes
 
 - `gh stack` needs a checked-out branch. On a detached HEAD it fails with *failed to get current
