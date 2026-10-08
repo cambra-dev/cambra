@@ -747,28 +747,12 @@ fn pin_unobservable_arm_payload(p: &Pattern) -> bool {
     true
 }
 
-/// Pin an **empty** list literal's element type, so it resolves to *some* type
-/// rather than staying an inference variable.
+/// Pin the element variable of a syntactically empty list after constraints are recorded.
 ///
-/// The empty literal denotes the function with no positions, so nothing can read
-/// its codomain, and the type language has no uninhabited type to name that with
-/// (`docs/chl-spec.md`, "6.6 The empty product is unit"). A type is chosen here on
-/// the rule an unreachable arm's payload takes: whatever the position's uses
-/// require, and `Unit` when they require nothing
-/// (`src/ccl/design/type-inference.md`, "An unobservable arm payload is pinned to
-/// what its uses require").
-///
-/// Emptiness is the premise rather than a shortcut for it
-/// (`src/ccl/design/collections.md`, "The empty literal names no element type"), and what
-/// makes the choice free is that the domain is empty, which only this literal knows.
-///
-/// Recorded **on the variable**, like that pin and for the same reason: the element
-/// type also occurs in the binder slots the literal feeds — a `for` target, a `let`
-/// binding — and those resolve from the variable rather than from this node.
-///
-/// Chosen here rather than in `emit_list` because a type asserted before the
-/// constraints arrive is a bound the literal never had: `Unit` written at emission
-/// meets every annotation naming another element type as a mismatch.
+/// Pin the variable, not just the node slot: bindings and iteration targets share it.
+/// Emission must leave it open so later use sites can require a type other than `Unit`.
+/// Unlike an unreachable arm, a literal can have incompatible uses; report their conflict
+/// as a type error. See `src/ccl/design/collections.md`, "The empty literal names no element type".
 fn pin_empty_list_element(list_ty: &Type, ctx: &mut CoalesceCtx) {
     // `emit_list` builds a bare `Fun`, so this is an invariant and not a case: a list node
     // whose type grew a wrapper would stop being pinned, and every unannotated `[]` would
