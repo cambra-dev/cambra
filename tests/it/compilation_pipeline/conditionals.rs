@@ -1308,6 +1308,33 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     check_scalar(code, expected);
 }
 
+/// A boxed conditional chosen once and observed by its keys. Realization unions one gated leg
+/// per arm, and the value is the leg holding rows, keyed by its own keys
+/// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+#[rstest]
+#[case::fed_to_the_sink(indoc! {r#"
+    out = test_sink()
+    out << (box([1, 2]) if 2 > 1 else box([3, 4, 5]))
+"#}, "[() -> [1, 2]]")]
+#[case::the_second_arm_fed_to_the_sink(indoc! {r#"
+    c: Bool = False
+    out = test_sink()
+    out << (box([1, 2]) if c else box([3, 4, 5]))
+"#}, "[() -> [3, 4, 5]]")]
+#[case::a_loop_source(indoc! {r#"
+    out = test_sink()
+    for q in (box([1, 2]) if 2 > 1 else box([3, 4, 5])):
+        out << q
+"#}, "[1, 2]")]
+#[case::a_record_field(indoc! {r#"
+    out = test_sink()
+    r = (xs=(box([1, 2]) if 2 > 1 else box([3, 4, 5])), n=1)
+    out << sum(r.xs)
+"#}, "[() -> 3]")]
+fn a_boxed_conditional_keyed_by_its_arm(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
 /// **Two witnesses live at once, end to end.** A comprehension over two conditional
 /// collections opens both sums while typing one body, and one site carries both:
 /// `Σ (σ₄ : 𝐾₄). Σ (σ₇ : 𝐾₇). ((σ₄, σ₇) ⤇ Int)`. Typing is pinned by
