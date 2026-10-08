@@ -245,7 +245,8 @@ materialization; `Equatable` additionally handles tuple and record equality comp
 [A product is answered off the table](#a-product-is-answered-off-the-table)). This is separate from
 a general nominal-type system (`infer/schemes.rs`, `infer/solver/traits.rs`).
 
-`ccl::Type` has no first-class explicit `∀` type. The SMT fallback handles linear integer
+`ccl::Type` has no first-class explicit `∀` type; [type-parameters.md](type-parameters.md) sketches
+`Type::Poly`, the written form. The SMT fallback handles linear integer
 arithmetic over supported `Int`/`Bool` predicate forms. Both inference and `inline` use `smt_sub`;
 inlining uses it to check a refined parameter's precondition before beta-reduction. A predicate
 it cannot encode falls back to the structural mismatch, and point-free predicates after

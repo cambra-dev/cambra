@@ -27,6 +27,7 @@ CHL source
 | --- | --- |
 | [ir.md](ir.md) | The typed AST: `TypedExpr`/`Type`, the purity invariant, structured names & α-uniquification, the single statement of binding structure (`ccl/scope.rs`), the Lambda/Apply iteration encoding, the `Aggregate`/`Cast`/`Case`/`Transact`/`LetRec` nodes, `TypedBinding`, and the transient `Hole`/`Infer`/`Feed`/`Mut` variants. |
 | [type-inference.md](type-inference.md) | Cambra's inference algorithm: the two-pass emit → coalesce engine (`ccl/infer/`), the constraint solver (`ccl/infer/solver/`), let-polymorphism, dependent Pi types and refinements, and post-inference validation. |
+| [type-parameters.md](type-parameters.md) | **[Sketched]** Written polymorphic types: `Type::Poly` and `Type::Param`, checking a binding against a polymorphic type, trait requirements as assumptions, instantiation at a use, and specialization. |
 | [lowering.md](lowering.md) | CHL → CCL lowering: how comprehensions, lambdas, `def`s, and generators become CCL shapes, and the surface syntax of the deferred-collection operators. |
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
 | [mutability.md](mutability.md) | The unified history model: mutable variables, transactions, and feeds as functions over a sequencing domain, eliminated into a causal `LetRec`; the `Mut`/`Feed`/`Txn` types and the loop/commit engines. |
