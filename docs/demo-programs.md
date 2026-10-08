@@ -60,7 +60,8 @@ distinction from missing features. A source file is not necessarily a supported 
 
 [`tests/programs/compile_timing.rs`](../tests/programs/compile_timing.rs) provides three ignored
 measurement tests. They enumerate the gallery's `.cambra` files and report the fastest of
-`CAMBRA_PERF_REPS` repetitions (default 3). Use a positive repetition count.
+`CAMBRA_PERF_REPS` repetitions (default 3 when unset). A supplied value must be a positive integer;
+zero, malformed and non-Unicode values fail before measurement starts.
 `CAMBRA_TIMING_ONLY` selects labels containing its value; an unmatched filter fails the driver.
 
 | Driver | Timed operation |
