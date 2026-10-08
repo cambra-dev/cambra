@@ -412,13 +412,20 @@ type WitnessSet = std::collections::HashSet<crate::ccl::ty::WitnessId>;
 
 /// Walk `expr`'s children, handing each the type its position holds.
 ///
-/// [`child_demand`] gives the one demand an arm list or a list literal's elements share. **A
-/// record or a tuple names each field separately**, so each field is handed its own. The
-/// standing record case is `transact_phase`'s write set: `(m: 𝑣)` is typed by the mutable
-/// variable's declared value type, so a `Mut(List(𝑇), Txn)` write states the one candidate it
-/// is at a field bound over `UIntRanges`. The tuple case is a row of a list literal of pairs,
-/// `[("a", box([1])), ("b", box([2, 3]))]`, whose element type is a tuple with a sum in it, the
-/// shape `map` takes its entries in.
+/// [`child_demand`] gives the one demand an arm list or a list literal's elements share. The
+/// other rules hand a child a demand of its own:
+///
+/// - A record or a tuple hands each field the type the demand gives it. The standing record
+///   case is `transact_phase`'s write set: `(m: 𝑣)` is typed by the mutable variable's declared
+///   value type, so a `Mut(List(𝑇), Txn)` write states the one candidate it is at a field bound
+///   over `UIntRanges`. The tuple case is a row of a list literal of pairs,
+///   `[("a", box([1])), ("b", box([2, 3]))]`, whose element type is a tuple with a sum in it,
+///   the shape `map` takes its entries in.
+/// - The last step of a `≫` chain receives the chain's result type, since a chain's result is
+///   its last morphism's.
+/// - The argument of `𝑎 ▷ const` receives the result type, since `𝑎 ▷ const` returns `𝑎` at
+///   every input. With the chain rule, this carries a per-row fan-out's demand,
+///   `⊔ᵢ filter_values(π̂ᵢ) ≫ (armᵢ ▷ const)`, to each arm's `box`.
 ///
 /// **A position whose witness survives keeps every sum describing it**, so the witnesses
 /// `expr`'s element type names are recorded as materialized where the element position binds
@@ -453,6 +460,26 @@ fn walk_children_with_demand(
             for (child, ty) in elts.iter_mut().zip(elt_tys) {
                 visit(child, Some(ty.clone()), materialized);
             }
+        }
+        (Type::Fun { codomain, .. }, TypedExprNode::Compose(elts)) => {
+            let last = elts.len().saturating_sub(1);
+            for (i, child) in elts.iter_mut().enumerate() {
+                let demand = if i == last {
+                    child
+                        .ty
+                        .domain()
+                        .map(|d| Type::fun_like(&child.ty, d, (**codomain).clone()))
+                } else {
+                    None
+                };
+                visit(child, demand, materialized);
+            }
+        }
+        (Type::Fun { codomain, .. }, TypedExprNode::Apply { argument, function })
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)) =>
+        {
+            visit(argument, Some((**codomain).clone()), materialized);
+            visit(function, None, materialized);
         }
         _ => expr.walk_children_mut(|child| visit(child, below.clone(), materialized)),
     }
