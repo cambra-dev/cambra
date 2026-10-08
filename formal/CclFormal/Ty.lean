@@ -1,17 +1,10 @@
 /-!
 # The concrete `Type` grammar
 
-The Lean mirror of the **concrete fragment** of `src/ccl/ty.rs :: Type` — every variant a
-fully-inferred type can contain. Excluded, deliberately:
-
-- `Infer` and `SharedHole` — inference unknowns; the concrete relation has no
-  variable arms (they enter at the solver-model milestone).
-- `History` and `ChanDom` — transients erased before the strict wall; they are
-  pipeline artifacts, not types a checked program exhibits.
-- `App` and `Below` — type-function applications reduce during inference and
-  `Below` lives only in annotation position; both are transient in the same sense as `Infer`.
-- `FunKind::Var` — kind unknowns resolve at coalesce; a concrete kind is one of
-  the two points, related only to itself.
+`Ty` models a subset of concrete Rust `Type` forms, not every type a fully inferred program can
+contain. The supported forms and wire boundary are specified in `formal/design.md`, "The concrete
+type grammar". Inference unknowns, sum witnesses, open variants, kind variables, `History` and
+`ChanDom` are outside this grammar.
 -/
 
 namespace CclFormal
