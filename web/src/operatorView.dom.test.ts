@@ -15,7 +15,8 @@
 import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
-import { drawGraphOf, isBackEdge } from "./graph/model";
+import { type Detail, drawGraphOf, isBackEdge } from "./graph/model";
+import { MAX_MEMBERS } from "./graph/rules";
 import { Store } from "./store";
 import { TreeView } from "./treeView";
 import type { GraphLayout, LayoutRequest, Placed } from "./graph/layout";
@@ -111,12 +112,13 @@ function settled(): Promise<void> {
 async function mountGraph(
   snap: Snapshot,
   paneId: string,
+  detail: Detail = "operators",
 ): Promise<{ store: Store; body: HTMLElement; pane: OperatorPane; view: OperatorView }> {
   const body = document.createElement("div");
   document.body.appendChild(body);
   const store = new Store(snap);
   const pane = operatorPaneById(snap, paneId);
-  const view = new OperatorView(body, store, pane, new RowLayout());
+  const view = new OperatorView(body, store, pane, new RowLayout(), detail);
   await view.draw();
   return { store, body, pane, view };
 }
@@ -330,7 +332,7 @@ describe("a layout that fails", () => {
     const pane = operatorPaneById(polymorphic, "post-conversion");
     const reported = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    new OperatorView(body, store, pane, new FailingLayout());
+    new OperatorView(body, store, pane, new FailingLayout(), "operators");
     // Selected while the layout was still in flight, so this also pins that the
     // held selection is released by the fallback and not only by a drawing.
     const sink = pane.nodes.find((n) => n.role === "sink")!;
@@ -368,6 +370,54 @@ describe("a graph that reads a source", () => {
     for (const node of pane.nodes) {
       expect(graph.viewItem(node.nodeId)).toBeDefined();
     }
+  });
+});
+
+describe("the steps level", () => {
+  // Merging is a drawing decision, so it may not cost a reader anything the
+  // wire named. These are the three ways it could.
+  for (const [name, snap] of [
+    ["polymorphic", polymorphic],
+    ["list_min", listMin],
+    ["source_shared", sourceShared],
+  ] as const) {
+    it(`answers for every operator of ${name}`, () => {
+      const pane = operatorPaneById(snap, "post-conversion");
+      const graph = drawGraphOf(pane, "steps");
+      for (const node of pane.nodes) expect(graph.viewItem(node.nodeId)).toBeDefined();
+    });
+
+    it(`keeps every composite of ${name} within the size limit`, () => {
+      const pane = operatorPaneById(snap, "post-conversion");
+      for (const box of drawGraphOf(pane, "steps").nodes) {
+        expect(box.members.length).toBeLessThanOrEqual(MAX_MEMBERS);
+      }
+    });
+
+    it(`draws ${name} with no more boxes than the operators level`, () => {
+      const pane = operatorPaneById(snap, "post-conversion");
+      const steps = drawGraphOf(pane, "steps").nodes.length;
+      expect(steps).toBeLessThanOrEqual(drawGraphOf(pane, "operators").nodes.length);
+    });
+  }
+
+  it("attributes a chip to a member of the box that draws it", () => {
+    const pane = operatorPaneById(polymorphic, "post-conversion");
+    const graph = drawGraphOf(pane, "steps");
+    const withChips = graph.nodes.filter((n) => n.chips.length > 0);
+    expect(withChips.length).toBeGreaterThan(0);
+    for (const box of withChips) {
+      for (const chip of box.chips) expect(box.members).toContain(chip.owner);
+    }
+  });
+
+  it("draws the level the reader asked for, and redraws on the other", async () => {
+    const { body } = await mountGraph(sourceShared, "post-conversion", "steps");
+    const steps = body.querySelectorAll(".graph-node").length;
+    const button = body.querySelector<HTMLElement>('[data-detail="operators"]')!;
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await settled();
+    expect(body.querySelectorAll(".graph-node").length).toBeGreaterThan(steps);
   });
 });
 
@@ -409,12 +459,14 @@ describe("a back edge and a late one", () => {
     nodes,
   });
 
+  // These pin the `operators` drawing, where a suppressed branch is a glyph on
+  // its edge; `steps` moves that mark onto the producer.
   async function mountPane(pane: OperatorPane) {
     const body = document.createElement("div");
     document.body.appendChild(body);
     const snap = { ...listMin, panes: listMin.panes.map((p) => (p.id === pane.id ? pane : p)) };
     const layout = new RecordingLayout();
-    const view = new OperatorView(body, new Store(snap as Snapshot), pane, layout);
+    const view = new OperatorView(body, new Store(snap as Snapshot), pane, layout, "operators");
     await view.draw();
     const laidOut = layout.requests.flatMap((r) => r.edges.map((e) => `${e.source}>${e.target}`));
     return { body, laidOut };
@@ -430,6 +482,12 @@ describe("a back edge and a late one", () => {
     op(4, "FanOutBranch", [fan(1)]),
     op(5, "Sink", [value("out", 4)], null),
   ]);
+
+  it("keeps the back edge when the rules merge", () => {
+    const back = (detail: Detail) => drawGraphOf(store, detail).edges.filter(isBackEdge).length;
+    expect(back("steps")).toBe(back("operators"));
+    expect(back("steps")).toBe(1);
+  });
 
   it("draws the cycle as a back edge and never lays it out", async () => {
     const { body, laidOut } = await mountPane(store);

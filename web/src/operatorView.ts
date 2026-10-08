@@ -13,9 +13,21 @@
 // Two operator kinds are suppressed rather than drawn; see `./graph/model`. A
 // suppressed node keeps its id on whatever replaced it, because every id in the
 // pane is a cross-pane selection target.
+//
+// Two detail levels: `operators` draws one box per operator the suppressions
+// leave, and `steps` merges recurring plumbing into composites (`./graph/rules`).
+// Hovering a box expands what it could not fit; double-click pins that card.
 
 import type { GraphLayout, Placed, PlacedNode, Point } from "./graph/layout";
-import { type DrawEdge, type DrawGraph, type DrawNode, drawGraphOf, isBackEdge } from "./graph/model";
+import {
+  type Detail,
+  type DrawEdge,
+  type DrawGraph,
+  type DrawNode,
+  drawGraphOf,
+  isBackEdge,
+} from "./graph/model";
+import { browserStorage } from "./paneVisibility";
 import type { Resolved, Store } from "./store";
 import type { OperatorEdge, OperatorNode, OperatorPane } from "./types";
 import { isChildEdge, roleLabel, walkStarts } from "./types";
@@ -39,6 +51,66 @@ const MAX_TILING = 110;
 const BOW = 26;
 const MIN_WIDTH = 66;
 const MAX_WIDTH = 240;
+/**
+ * The box that carries a tiling on a line of its own, at `steps`.
+ *
+ * A tiling is 41 characters at the median against a box holding about 36, so it
+ * does not fit beside a label. On its own line the box is as wide as its wider
+ * line rather than as wide as their sum. 300px and 40 characters is the knee:
+ * past it the width grows faster than the prefix does.
+ */
+const TILED_MAX_WIDTH = 300;
+const TILED_HEIGHT = 34;
+const TILING_CHARS = 40;
+const DETAIL_KEY = "cambra-inspector:operator-detail:v1";
+
+const DETAIL_TEXT: Record<Detail, string> = {
+  steps: "Steps",
+  operators: "Operators",
+};
+
+/** A bounded prefix of the tiling; the card carries all of it. */
+function clipTiling(tiling: string): string {
+  return tiling.length <= TILING_CHARS ? tiling : `${tiling.slice(0, TILING_CHARS - 1)}…`;
+}
+
+/**
+ * What a tiling's outermost constructor means, after `Display for Tiling`.
+ *
+ * `Fn(…)` and `Store(…)` print in the same shape and mean opposite things —
+ * read one position, or fold a changelog — which is the misreading this names.
+ */
+function tilingGloss(tiling: string): string {
+  if (tiling.startsWith("Fn(")) return "a function: one value per position of each domain";
+  if (tiling.startsWith("Store(")) {
+    return "a changelog: fold the ticks to read a value, never index one";
+  }
+  if (tiling.startsWith("agg(")) return "an accumulator, not a stream";
+  if (tiling.startsWith("{")) return "a record: one tile per field";
+  return "a single cell";
+}
+
+/**
+ * The reader's detail level, remembered per browser.
+ *
+ * A reading preference rather than a property of the program, so it survives a
+ * recompile. A storage that cannot be used leaves the default.
+ */
+function readDetail(): Detail {
+  try {
+    return browserStorage()?.getItem(DETAIL_KEY) === "operators" ? "operators" : "steps";
+  } catch {
+    return "steps";
+  }
+}
+
+function writeDetail(detail: Detail): void {
+  try {
+    browserStorage()?.setItem(DETAIL_KEY, detail);
+  } catch {
+    // A preference that cannot be stored still holds for this pane.
+  }
+}
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -87,7 +159,9 @@ interface Handle {
 export class OperatorView {
   private readonly store: Store;
   private readonly paneId: string;
-  private readonly graph: DrawGraph;
+  private readonly pane: OperatorPane;
+  private graph: DrawGraph;
+  private detail: Detail;
   private readonly layout: GraphLayout;
   private readonly canvas: HTMLElement;
   private readonly handles = new Map<number, Handle>();
@@ -96,22 +170,37 @@ export class OperatorView {
   private drawn = false;
   /** Bumped per `draw`, so a layout that resolves after a later one is dropped. */
   private generation = 0;
+  private card: HTMLElement | null = null;
+  private cardPinned = false;
 
   /**
    * The engine is injected rather than chosen here, which is what confines it
-   * to the one module that names it — see `./graph/NOTICE`.
+   * to the one module that names it — see `./graph/NOTICE`. `detail` pins the
+   * level; without it the pane opens at the reader's remembered one.
    */
-  constructor(parent: HTMLElement, store: Store, pane: OperatorPane, layout: GraphLayout) {
+  constructor(
+    parent: HTMLElement,
+    store: Store,
+    pane: OperatorPane,
+    layout: GraphLayout,
+    detail?: Detail,
+  ) {
     this.store = store;
     this.paneId = pane.id;
-    this.graph = drawGraphOf(pane);
+    this.pane = pane;
+    this.detail = detail ?? readDetail();
+    this.graph = drawGraphOf(pane, this.detail);
     this.layout = layout;
 
+    parent.appendChild(this.detailControl());
     this.canvas = el("div", "graph-canvas");
     parent.appendChild(this.canvas);
     // On the canvas, which outlives every drawing: a listener bound per draw
     // accumulates one handler per paint.
     this.canvas.addEventListener("click", (event) => this.onClick(event));
+    this.canvas.addEventListener("pointerover", (event) => this.onHover(event));
+    this.canvas.addEventListener("pointerleave", () => this.hideCard());
+    this.canvas.addEventListener("dblclick", (event) => this.onPin(event));
 
     store.subscribe((resolved) => {
       // A selection can land before the first layout resolves. Hold the last
@@ -124,24 +213,62 @@ export class OperatorView {
     void this.draw().catch((error: unknown) => this.drawAsList(error));
   }
 
+  /** Whether this box draws its tiling on a second line rather than inline. */
+  private showsTilingBelow(node: DrawNode): boolean {
+    return this.detail === "steps" && node.tiling !== null;
+  }
+
+  /** The header control: how much of the graph to draw. */
+  private detailControl(): HTMLElement {
+    const bar = el("div", "graph-detail");
+    bar.appendChild(el("span", "graph-detail-label", "Detail"));
+    for (const level of ["steps", "operators"] as const) {
+      const button = el("button", "graph-detail-option", DETAIL_TEXT[level]);
+      button.dataset.detail = level;
+      button.setAttribute("aria-pressed", String(level === this.detail));
+      button.addEventListener("click", () => void this.setDetail(level, bar));
+      bar.appendChild(button);
+    }
+    return bar;
+  }
+
+  /** Redraw at another level. The relayout is full: ELK layered has no incremental mode. */
+  private async setDetail(detail: Detail, bar: HTMLElement): Promise<void> {
+    if (detail === this.detail) return;
+    this.detail = detail;
+    writeDetail(detail);
+    for (const b of bar.querySelectorAll<HTMLElement>("[data-detail]")) {
+      b.setAttribute("aria-pressed", String(b.dataset.detail === detail));
+    }
+    this.graph = drawGraphOf(this.pane, detail);
+    this.hideCard(true);
+    this.drawn = false;
+    // The held selection is the one the reader had, so the new drawing shows it.
+    this.pending = this.store.getResolved();
+    await this.draw().catch((error: unknown) => this.drawAsList(error));
+  }
+
   /** Lay the graph out and draw it. Resolves when the pane is on screen. */
   async draw(): Promise<void> {
     const generation = ++this.generation;
-    const sized = this.graph.nodes.map((n) => ({
-      id: String(n.id),
-      width: Math.min(
-        MAX_WIDTH,
-        Math.max(
-          MIN_WIDTH,
-          measure(n.label) +
-            (n.tiling === null ? 0 : Math.min(MAX_TILING, measure(n.tiling)) + 5) +
-            measure(`#${n.id}`) +
-            n.chips.reduce((a, c) => a + Math.min(64, measure(c.text)) + 9, 0) +
-            26,
-        ),
-      ),
-      height: NODE_HEIGHT,
-    }));
+    const sized = this.graph.nodes.map((n) => {
+      const head = measure(n.label) + measure(`#${n.id}`) + 26;
+      const chips = n.chips.reduce((a, c) => a + Math.min(64, measure(c.text)) + 9, 0);
+      if (!this.showsTilingBelow(n)) {
+        const inline = n.tiling === null ? 0 : Math.min(MAX_TILING, measure(n.tiling)) + 5;
+        return {
+          id: String(n.id),
+          width: Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, head + inline + chips)),
+          height: NODE_HEIGHT,
+        };
+      }
+      const below = measure(clipTiling(n.tiling!)) + 18;
+      return {
+        id: String(n.id),
+        width: Math.min(TILED_MAX_WIDTH, Math.max(MIN_WIDTH, head + chips, below)),
+        height: TILED_HEIGHT,
+      };
+    });
     const forward = this.graph.edges.filter((e) => !isBackEdge(e));
     const placed = await this.layout.run({
       nodes: sized,
@@ -176,11 +303,12 @@ export class OperatorView {
     this.graph.nodes.forEach((node, index) => {
       this.canvas.appendChild(this.nodeElement(node, index));
     });
-    // A suppressed operator is drawn on the edge that replaced it, and there
-    // are no edges here. Every id in the pane is a selection target, so it gets
-    // a row of its own instead.
+    // At `operators` a suppressed operator is drawn on the edge that replaced
+    // it, and there are no edges here. Every id in the pane is a selection
+    // target, so it gets a row of its own instead. At `steps` its producer's
+    // box already answers for it.
     const tail = this.graph.nodes.length;
-    for (const edge of this.graph.edges) {
+    for (const edge of this.detail === "steps" ? [] : this.graph.edges) {
       for (const id of edge.suppressed) {
         const row = el("div", "graph-node selectable");
         row.dataset.nodeId = String(id);
@@ -194,6 +322,96 @@ export class OperatorView {
       }
     }
     this.finish();
+  }
+
+  /**
+   * Expand a box: everything it could not fit.
+   *
+   * A box is 22 or 34 pixels tall and at most 300 wide, so it truncates a long
+   * tiling, a `Filter` carrying four constants, and the fan-out branches
+   * suppressed onto its outgoing edges. Hover shows all of it and double-click
+   * pins it, because reading a six-member list means moving the pointer.
+   */
+  private describe(node: DrawNode): HTMLElement {
+    const card = el("div", "graph-card");
+    const line = (text: string, cls?: string) => card.appendChild(el("div", cls, text));
+    if (node.members.length > 1) {
+      line(`${node.label} — stands for ${node.members.length} operators`, "graph-card-head");
+      node.members.forEach((id, i) => {
+        const kind = this.labelOf(id) ?? "?";
+        line(`  #${id} ${kind}${i === 0 ? "   (representative)" : ""}`, "graph-card-member");
+        // A constant is an operand of one operator, so it hangs off the member
+        // that reads it rather than sitting in one list nobody can attribute.
+        for (const chip of node.chips.filter((c) => c.owner === id)) {
+          line(`      #${chip.id} ${chip.text}`, "graph-card-chip");
+        }
+      });
+    } else {
+      line(`${node.label} #${node.id}`, "graph-card-head");
+      for (const chip of node.chips) line(`  #${chip.id} ${chip.text}`, "graph-card-chip");
+    }
+    if (node.tiling !== null) {
+      // The tiling is the shape of the tile every consumer receives, so it is
+      // also the payload type of every edge leaving this box.
+      line(`emits ${node.tiling}`, "graph-card-tiling");
+      line(`  ${tilingGloss(node.tiling)}`, "graph-card-note");
+    }
+    if (node.fanOuts.length) {
+      line(`fans out to ${node.fanOuts.map((f) => `#${f}`).join(", ")}`, "graph-card-note");
+    }
+    return card;
+  }
+
+  private labelOf(id: number): string | undefined {
+    return this.pane.nodes.find((n) => n.nodeId === id)?.label;
+  }
+
+  private showCard(node: DrawNode, x: number, y: number, pin: boolean): void {
+    this.hideCard(true);
+    const card = this.describe(node);
+    if (pin) card.classList.add("pinned");
+    document.body.appendChild(card);
+    const rect = card.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    card.style.left = `${Math.max(4, Math.min(x + 14, vw - rect.width - 8))}px`;
+    card.style.top = `${Math.max(4, Math.min(y + 14, vh - rect.height - 8))}px`;
+    this.card = card;
+    this.cardPinned = pin;
+  }
+
+  private hideCard(force = false): void {
+    if (this.cardPinned && !force) return;
+    this.card?.remove();
+    this.card = null;
+    this.cardPinned = false;
+  }
+
+  /** The drawn box answering for the element under `event`, if any. */
+  private nodeUnder(event: Event): DrawNode | undefined {
+    const owner = (event.target as HTMLElement | null)?.closest<HTMLElement>("[data-node-id]");
+    if (!owner) return undefined;
+    // A chip or a member is drawn inside a box; a glyph rides an edge and has
+    // no box to expand.
+    const own = Number(owner.dataset.nodeId);
+    const item = this.graph.viewItem(own);
+    const id = item && (item.kind === "chip" || item.kind === "member") ? item.host : own;
+    return this.graph.nodes.find((n) => n.id === id);
+  }
+
+  private onHover(event: PointerEvent): void {
+    if (this.cardPinned) return;
+    const node = this.nodeUnder(event);
+    if (!node) return this.hideCard();
+    this.showCard(node, event.clientX, event.clientY, false);
+  }
+
+  // Double-click also fires a `click`, so it moves the selection — the one that
+  // click would have made anyway, so the reader loses nothing.
+  private onPin(event: MouseEvent): void {
+    const node = this.nodeUnder(event);
+    if (!node) return this.hideCard(true);
+    this.showCard(node, event.clientX, event.clientY, true);
   }
 
   /** Accept the drawing and release the selection held while it was in flight. */
@@ -252,9 +470,10 @@ export class OperatorView {
       this.canvas.appendChild(div);
     }
 
-    // A suppressed node draws as a glyph on the edge that replaced it. The edge
-    // itself is a two-pixel target; the glyph is one a reader can hit.
-    for (const edge of this.graph.edges) {
+    // At `operators` a suppressed node draws as a glyph on the edge that
+    // replaced it: the edge itself is a two-pixel target, and the glyph is one a
+    // reader can hit. At `steps` its producer's box carries the mark instead.
+    for (const edge of this.detail === "steps" ? [] : this.graph.edges) {
       const points = route.get(edge.id);
       if (!points || !edge.suppressed.length) continue;
       const mid = midpoint(points);
@@ -282,18 +501,39 @@ export class OperatorView {
     const div = el("div", "graph-node selectable");
     div.dataset.nodeId = String(node.id);
     div.dataset.role = node.role;
+    if (node.members.length > 1) {
+      // "Stands for N operators", drawn as a stack of cards rather than a
+      // multiplier: "x2" beside a name reads as two of that name. It sits
+      // outside the flow, so it never takes width from the label.
+      div.classList.add("composite");
+      div.appendChild(el("span", "graph-count", String(node.members.length)));
+    }
     div.appendChild(el("span", "graph-strip"));
-    div.appendChild(el("span", "node-label", node.label));
-    if (node.tiling !== null) div.appendChild(el("span", "node-type", node.tiling));
+    const head = el("span", "graph-head");
+    head.appendChild(el("span", "node-label", node.label));
+    const below = this.showsTilingBelow(node);
+    if (node.tiling !== null && !below) head.appendChild(el("span", "node-type", node.tiling));
     for (const chip of node.chips) {
       const c = el("span", "graph-chip", chip.text);
       c.dataset.nodeId = String(chip.id);
-      div.appendChild(c);
+      head.appendChild(c);
       this.handles.set(chip.id, { element: c, order });
     }
-    div.appendChild(el("span", "node-id", `#${node.id}`));
-    div.title = node.tiling === null ? node.label : `${node.label}\n${node.tiling}`;
+    head.appendChild(el("span", "node-id", `#${node.id}`));
+    if (below) {
+      const body = el("span", "graph-body");
+      body.appendChild(head);
+      body.appendChild(el("span", "graph-tiling", clipTiling(node.tiling!)));
+      div.appendChild(body);
+    } else {
+      div.appendChild(head);
+    }
+    // A fan-out happens at the producer, so one mark on the producer names
+    // every branch reading it.
+    if (node.fanOuts.length) div.appendChild(el("span", "graph-fan"));
     this.handles.set(node.id, { element: div, order });
+    for (const member of node.members) this.handles.set(member, { element: div, order });
+    for (const fan of node.fanOuts) this.handles.set(fan, { element: div, order });
     return div;
   }
 
