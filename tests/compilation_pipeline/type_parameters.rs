@@ -193,6 +193,14 @@ use crate::helpers::{check_compile_error, check_scalar};
     "},
     Value::Int(1),
 )]
+// The lambda's own type, `𝑎 ⇒ 𝑎`, is below the annotation without being an instance of it.
+#[case::refinement_of_a_parameter_in_a_polymorphic_annotation(
+    indoc! {"
+        g: forall (T <: Int) {T where _ > 0} => Int = \\x -> x
+        g(3)
+    "},
+    Value::Int(3),
+)]
 fn type_parameters_check_and_run(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -565,14 +573,14 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
     "},
     "Annotation mismatch",
 )]
-// A false rejection: the refinement over the opened parameter is not discharged at the
-// use's instantiation, so a positive argument fails the specialization.
-#[case::refinement_of_a_parameter_in_a_polymorphic_annotation(
+// A use checks against the annotation, not the definition's own type, so a refinement
+// the annotation states is checked at the argument.
+#[case::refinement_of_a_parameter_in_a_polymorphic_annotation_violated(
     indoc! {"
         g: forall (T <: Int) {T where _ > 0} => Int = \\x -> x
-        g(3)
+        g(-1)
     "},
-    "expected {Int | __elem > 0}, found Int",
+    "expected {Int | __elem > 0}, found Int@-1",
 )]
 // The join of `T` with the enclosing definition's implicit parameter has no type: `x`'s
 // type is chosen outside `inner`. Rejected whether or not `outer` is called.

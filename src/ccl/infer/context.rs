@@ -215,6 +215,9 @@ pub(super) struct InferCtx {
     /// never removed: a uniquified name denotes one binding, so the fact it
     /// records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The generalized bindings bound at their exact annotation
+    /// ([`LetScheme::Generalized`]), which the coalesce walk pins one way.
+    pub(super) bound_at_annotation: HashSet<Name>,
     /// The errors emission recovered from ([`Typing::recover`]), in the order it
     /// raised them, which is source order.
     pub(super) errors: Vec<LocatedInferError>,
@@ -266,6 +269,7 @@ impl InferCtx {
             assumptions: Vec::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
+            bound_at_annotation: HashSet::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
         }
@@ -949,6 +953,13 @@ impl Typing for InferCtx {
         // they stay fixed. (Sound to generalize unconditionally because CCL is
         // a pure value language — no value-restriction hazard.)
         let generalize = let_scheme != LetScheme::Monomorphic;
+        if let_scheme
+            == (LetScheme::Generalized {
+                at_annotation: true,
+            })
+        {
+            self.bound_at_annotation.insert(name.clone());
+        }
         let scheme = if generalize {
             // Polymorphic: generalize at the outer level. Each `Var` use
             // instantiates a fresh copy; the coalesce walk then specializes

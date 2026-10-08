@@ -1065,3 +1065,114 @@ ys
         ),
     )
 }
+
+/// A lambda checks against an annotation its own type is below without being an
+/// instance of: `\x -> x` is `𝑎 ⇒ 𝑎`, and `{Int where _ > 0} => Int` widens the
+/// codomain. Each use is typed at the annotation.
+#[test]
+fn a_lambda_below_a_refined_function_annotation() {
+    check_scalar(
+        indoc! {r#"
+            g: {Int where _ > 0} => Int = \x -> x
+            g(3)
+        "#},
+        Value::Int(3),
+    );
+}
+
+/// Uses typed at an exact function annotation the definition's own type is below
+/// without being an instance of. The body's type need not mention the annotation's
+/// codomain at all, and a record codomain may be narrower than the body's.
+#[rstest]
+#[case::constant_body(
+    indoc! {r#"
+        g: Int => Int = \x -> 0
+        g(3)
+    "#},
+    Value::Int(0),
+)]
+#[case::record_codomain_the_body_widens(
+    indoc! {r#"
+        g: Int => {a: Int} = \x -> (a=x, b=x)
+        g(4).a
+    "#},
+    Value::Int(4),
+)]
+#[case::two_uses(
+    indoc! {r#"
+        g: Int => Int = \x -> 0
+        g(3) + g(4)
+    "#},
+    Value::Int(0),
+)]
+#[case::through_an_alias(
+    indoc! {r#"
+        g: Int => Int = \x -> 0
+        h = g
+        h(3)
+    "#},
+    Value::Int(0),
+)]
+fn a_use_is_typed_at_the_function_annotation(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[test]
+fn a_lambda_below_a_refined_function_annotation_is_checked_at_the_argument() {
+    check_compile_error(
+        indoc! {r#"
+            g: {Int where _ > 0} => Int = \x -> x
+            g(-1)
+        "#},
+        "expected {Int | __elem > 0}, found Int@-1",
+    );
+}
+
+/// A refinement the annotation states on the codomain is met by the clone through
+/// the solver: the pin decides `Int@5 <: {Int | __elem > 0}` semantically, as the
+/// annotation check did.
+#[rstest]
+#[case::exact(
+    indoc! {r#"
+        g: Int => {Int where _ > 0} = \x -> 5
+        g(3)
+    "#},
+)]
+#[case::polymorphic(
+    indoc! {r#"
+        g: forall (T <: Int) T => {Int where _ > 0} = \x -> 5
+        g(3)
+    "#},
+)]
+fn a_use_meets_the_annotations_codomain_refinement(#[case] code: &str) {
+    check_scalar(code, Value::Int(5));
+}
+
+/// TODO: false rejections. The specialization pin decides a refinement without the
+/// definition's scope, so a predicate naming an enclosing binder (`n`) cannot be
+/// discharged, though the annotation check proved it.
+#[test]
+fn a_use_meets_a_codomain_refinement_naming_an_enclosing_binder() {
+    check_compile_error(
+        indoc! {r#"
+            n = 2
+            g: Int => {Int where _ > n} = \x -> 5
+            g(3)
+        "#},
+        "Type mismatch for monomorphization specialization: expected {Int | __elem > n}, found Int@5",
+    );
+}
+
+/// TODO: false rejection. The pin now discharges `Int@1 <: {Int | __elem > 0}` at
+/// `f`'s domain, but the clone's `f(1)` reaches the post-inference check with its
+/// argument typed `Int`, which the refined domain does not admit structurally.
+#[test]
+fn a_use_meets_a_refined_domain_of_a_function_parameter() {
+    check_compile_error(
+        indoc! {r#"
+            g: ({Int where _ > 0} => Int) => Int = \f -> f(1)
+            g(\y -> y + 1)
+        "#},
+        "post-inference produced an invalid tree: [Type mismatch for Apply: expected {Int | __elem > 0}, found Int]",
+    );
+}

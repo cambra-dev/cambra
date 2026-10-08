@@ -11,8 +11,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::read_through;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
-    compact_type, compact_type_polarity_only, constrain_subtype, freshen_expr_type_slots,
-    seed_chan_dom_pairings, simplify_type, spec_key,
+    compact_type, compact_type_polarity_only, constrain_subtype, constrain_subtype_in,
+    freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type, spec_key,
 };
 use crate::ccl::infer_var::InferVarId;
 use crate::ccl::provenance::NodeId;
@@ -127,6 +127,10 @@ pub(super) struct CoalesceCtx {
     /// the same name (the same shadowing discipline emission's `ScopeStack`
     /// applies).
     scope: Vec<ScopeEntry>,
+    /// The generalized bindings emission bound at their exact annotation
+    /// ([`LetScheme::Generalized`](super::typing::LetScheme::Generalized)), whose
+    /// specializations [`specialize_use`] pins one way.
+    bound_at_annotation: std::collections::HashSet<Name>,
     /// Errors raised by the walk, each paired with the node whose rule raised it.
     /// Coalesce accumulates — it visits every node and collects what it finds —
     /// so the blame is per error, stamped at the raise site from
@@ -560,6 +564,10 @@ struct SpecializeFrame {
     /// The binding's polymorphism level — the freshen cutoff: variables
     /// deeper than this are the quantified ones.
     cutoff: Level,
+    /// Whether the binding is bound at its exact annotation rather than at the
+    /// definition's own type, so that each use is typed at an instance of the
+    /// annotation ([`specialize_use`] pins a clone to it one way).
+    bound_at_annotation: bool,
     /// The binding's own type parameters, those of the polymorphic type annotating
     /// it: what a specialization's obligation copies stop assuming
     /// ([`TraitObligation::reset_for_specialization`](crate::ccl::infer::solver::traits::TraitObligation::reset_for_specialization)).
@@ -897,9 +905,13 @@ fn payload_trait_default(v: &crate::ccl::infer_var::InferVar) -> crate::ccl::Bas
     candidates.first().cloned().unwrap_or(BaseType::Unit)
 }
 
-pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<LocatedInferError> {
+pub(super) fn coalesce_pass(
+    expr: &mut Expr,
+    bound_at_annotation: std::collections::HashSet<Name>,
+) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
+        bound_at_annotation,
         current_node: expr.node_id(),
         failed_type_vars: HashMap::new(),
         lambda_params: Vec::new(),
@@ -2051,19 +2063,52 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     };
     freshen_expr_type_slots(&mut clone, cutoff, target, &mut fresh);
 
-    // Pin the clone to the use's live instantiation type, two-way. Inward,
-    // this drives the use site's accumulated bounds into the clone's
-    // freshened variables (what makes the clone *this* use's specialization);
-    // outward, it connects the clone into the use's component of the live
+    // Pin the clone to the use's live instantiation type. Outward, clone below
+    // use, the pin connects the clone into the use's component of the live
     // graph, so a parent reading through emit-time edges reaches the clone's
-    // content. The pin gets a fresh constraint cache: the emit-pass σ-aware
-    // cache is long gone, and sharing one cache across pins could only
-    // conflate edges between independent specializations.
+    // content, and carries the use's arguments into the clone's domain. Inward,
+    // use below clone, it drives the use site's remaining accumulated bounds into
+    // the clone's freshened variables. Together the two make the clone equal to
+    // the use's type, which is an instance of the definition's own: what makes the
+    // clone *this* use's specialization. The pin gets a fresh constraint cache:
+    // the emit-pass σ-aware cache is long gone, and sharing one cache across pins
+    // could only conflate edges between independent specializations.
+    //
+    // A binding bound at its exact annotation is pinned outward only. The use's
+    // type is then an instance of the annotation, not of the definition's type,
+    // and the annotation check has already put the definition below the
+    // annotation, so being below the use is all the use can ask of the clone:
+    // `\x -> x` checks against `{Int where _ > 0} => Int`. The inward edge would
+    // equate the definition with the annotation instead, pushing the annotation's
+    // codomain into the definition's domain through their shared variable, a demand
+    // the annotation does not make.
+    //
+    // The outward edge decides a refinement deficit with the solver, as the
+    // annotation check does, so a refinement the annotation states and the clone
+    // meets is discharged (`Int@5 <: {Int | __elem > 0}`). It runs under
+    // [`NoScope`](crate::ccl::infer::solver::smt::NoScope): the walk holds no scope
+    // to resolve free names against, so a predicate naming an enclosing binder is
+    // decided with nothing assumed about it.
+    let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    let one_way = frame.bound_at_annotation;
     let mut cache = ConstrainCache::new();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
-    let pinned = constrain_subtype(&clone.ty, &use_expr.ty, &mut cache)
-        .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
+    let pinned = constrain_subtype_in(
+        &clone.ty,
+        &use_expr.ty,
+        &mut cache,
+        &crate::ccl::infer::solver::smt::NoScope,
+    )
+    .and_then(|()| {
+        if one_way {
+            Ok(())
+        } else {
+            constrain_subtype(&use_expr.ty, &clone.ty, &mut cache)
+        }
+    });
     // An obligation the copy reset, having assumed one of the binding's own type
     // parameters, resolves against its trait's instances at the use's types, which
     // the pin has just delivered to its operands' variables
@@ -2219,11 +2264,13 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
         _ => (Rc::from([]), Vec::new()),
     };
     let has_type_params = !own_params.is_empty();
+    let bound_at_annotation = ctx.bound_at_annotation.contains(&binding.name);
     ctx.scope
         .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
             name: binding.name,
             def: *bound_expr,
             cutoff: level,
+            bound_at_annotation,
             own_params,
             inside_discarded: ctx.discarding,
             held: Vec::new(),
