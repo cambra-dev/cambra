@@ -1206,6 +1206,9 @@ impl Interp {
         scrutinee: &Spanned<Expr>,
         arms: &'a [chl_parser::ast::MatchArm],
     ) -> Result<Chosen<'a>, Error> {
+        for pattern in arms.iter().filter_map(|arm| arm.pattern.as_ref()) {
+            unqualified(&pattern.tag_qualifier, "tag")?;
+        }
         let binder = |arm: &chl_parser::ast::MatchArm| match &arm.pattern {
             Some(pattern) => match &pattern.payload {
                 PayloadPattern::Named(n) => Some(n.to_string()),
@@ -1234,6 +1237,18 @@ impl Interp {
             return Ok(Chosen::Arm(bound, &arm.body));
         }
         err(format!("no `match` arm for tag `{tag}"))
+    }
+}
+
+/// Refuse a module qualifier on a label or a tag. A program is one module, and a
+/// qualified label is a different label from the unqualified one it spells
+/// (`docs/chl-spec.md`, "9.12 Field labels and tags belong to a module"), so
+/// reading past the qualifier would answer for a program the compiler refuses.
+fn unqualified<Segment>(qualifier: &[Segment], what: &str) -> Result<(), Error> {
+    if qualifier.is_empty() {
+        Ok(())
+    } else {
+        err(format!("a qualified {what} is not supported"))
     }
 }
 
@@ -1348,6 +1363,7 @@ impl Interp {
             Expr::Record(fields) => {
                 let mut out = Vec::with_capacity(fields.len());
                 for f in fields {
+                    unqualified(&f.qualifier, "record field label")?;
                     out.push((f.name.to_string(), self.eval(&f.value)?));
                 }
                 if any_pending(out.iter().map(|(_, v)| v)) {
@@ -1356,7 +1372,13 @@ impl Interp {
                 Ok(Value::Record(out))
             }
 
-            Expr::Attribute { target, attr, .. } => {
+            Expr::Attribute {
+                target,
+                attr,
+                attr_qualifier,
+                ..
+            } => {
+                unqualified(attr_qualifier, "field label")?;
                 let v = self.eval(target)?;
                 if matches!(v, Value::Pending) {
                     return Ok(Value::Pending);
@@ -1376,7 +1398,13 @@ impl Interp {
                     .ok_or_else(|| Error(format!("no field `{attr}`")))
             }
 
-            Expr::VariantCtor { tag, payload, .. } => {
+            Expr::VariantCtor {
+                tag,
+                tag_qualifier,
+                payload,
+                ..
+            } => {
+                unqualified(tag_qualifier, "tag")?;
                 let inner = match payload {
                     None => Value::Unit,
                     Some(VariantPayload::Term(inner)) => self.eval(inner)?,
@@ -1952,6 +1980,52 @@ mod tests {
         assert_eq!(floor_div(-7, -2), Some(3));
         assert_eq!(floor_div(6, -2), Some(-3));
         assert_eq!(floor_div(1, 0), None);
+    }
+
+    /// A qualified label or tag is a different one from the unqualified label or
+    /// tag it spells, so reading past the qualifier would answer for another program.
+    #[test]
+    fn a_qualified_label_or_tag_is_refused() {
+        let cases = [
+            (
+                indoc! {"
+                    out = test_sink()
+                    r = (mod2::f1=1, f1=2)
+                    out << r.f1
+                "},
+                "a qualified record field label is not supported",
+            ),
+            (
+                indoc! {"
+                    out = test_sink()
+                    r = (f1=2)
+                    out << r.mod2::f1
+                "},
+                "a qualified field label is not supported",
+            ),
+            (
+                indoc! {"
+                    out = test_sink()
+                    out << mod2::`some(1)
+                "},
+                "a qualified tag is not supported",
+            ),
+            (
+                indoc! {"
+                    out = test_sink()
+                    o = `some(1)
+                    match o:
+                        case mod2::`some(v):
+                            out << v
+                        case `none:
+                            out << 0
+                "},
+                "a qualified tag is not supported",
+            ),
+        ];
+        for (source, message) in cases {
+            assert_eq!(refused(source), message, "{source}");
+        }
     }
 
     #[test]

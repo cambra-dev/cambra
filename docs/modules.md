@@ -1,7 +1,7 @@
 # Modules
 
-> **Status: [Sketched].** A proposed implementation. Only the first item of the [Implementation
-> stack](#implementation-stack) is implemented.
+> **Status: [Sketched].** A proposed implementation. The first two items of the [Implementation
+> stack](#implementation-stack) are implemented.
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -322,7 +322,8 @@ An inference error's span resolves through the lowering projection, as it does t
 - **A reload carries every file.** `/diff` and `/reload` take a bundle mapping each module path to
   its source, including the root's. The single-source request form is removed. Reading files from
   disk at reload time is not offered: `/diff` answers about exactly the version it was sent.
-- **The run tree is diffed by run path**, and shared runs by module path.
+- **The run tree is diffed by run path**, and shared runs by module path. A run marked
+  `@RenamedFrom(eu)` pairs with the predecessor's run `eu` instead of its own path.
 - **`@Discard` on a run or an import** covers every address below its run path.
 - **Held addresses are recorded in the branch table** ([program-evolution.md, "The branch table"](../src/ccl/design/program-evolution.md#the-branch-table)). A tombstone resolves against every
   version in the branch's ancestry ([chl-spec.md, "8.9 `@Discard` [Decided]"](chl-spec.md#89-discard-decided)),
@@ -456,8 +457,9 @@ One PR per item, each updating the spec and design docs it touches:
 1. **Spans carry a `FileId`; `SourceMap`; multi-file diagnostic rendering.** Every compilation is
    still one file. The inspector wire gains `file` and the goldens are re-blessed.
 2. **Syntax.** The seven keywords, `import`, `run`, and `param` statements with `use` clauses,
-   `@Discard`, and a visibility flag on introducing statements. Lowering refuses the new statements
-   with an unsupported error.
+   `@RenamedFrom`, `@Discard`, `pub` on introducing statements, and `::` in qualified names, labels,
+   and tags. Lowering refuses each of them with an unsupported error
+   (`src/ccl/lower/module_syntax.rs`).
 3. **Loading and the module graph.** Path resolution, per-file parsing, module paths in the
    `SourceMap`, cycle refusal, link order.
 4. **Imports.** `Name::Member`, `Unique::home`, per-module lowering and uniquification, interfaces,
@@ -471,8 +473,8 @@ One PR per item, each updating the spec and design docs it touches:
    and the qualified references through them, type parameters.
 8. **The std root.** `http` as a std module, intrinsics recognized by identity, `http_serve`
    removed, route uniqueness across runs.
-9. **Hot reload.** Bundles on the control port, the run-tree diff, `@LoadFrom` on runs and qualified
-   loads, `@Discard`.
+9. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
+   qualified `@LoadFrom` loads, `@Discard`.
 10. **No trailing expressions.** The harness-only compile option, once an output sink exists.
 11. **The inspector's multi-file source pane.**
 

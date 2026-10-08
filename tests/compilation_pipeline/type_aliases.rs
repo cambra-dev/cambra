@@ -509,7 +509,7 @@ fn alias_is_the_value_type_of_a_transactional_variable() {
 fn alias_is_the_value_type_of_a_transactional_variable_in_a_nested_block() {
     check_scalar(
         indoc! {r#"
-            def run(xs) => Int:
+            def settle(xs) => Int:
                 Cents = Int
                 balance: Mut(Cents, Txn) := 0
                 for i in xs:
@@ -517,7 +517,7 @@ fn alias_is_the_value_type_of_a_transactional_variable_in_a_nested_block() {
                         balance := balance + i
                 await_final(balance)
 
-            run([1, 2, 3])
+            settle([1, 2, 3])
         "#},
         Value::Int(6),
     );

@@ -289,3 +289,18 @@ loop body's last statement before `pass` removal. In a final-position loop whose
 `bump(c)` followed by `pass`, that check misses the effect-call path and lowering rejects the
 loop. Removing the trailing `pass` selects the supported path. This is a lowering limitation,
 not intended `pass` semantics.
+
+## Module syntax — refused before lowering
+
+`import`, `run`, `param`, `@RenamedFrom`, `@Discard`, `pub`, qualified names, and qualified labels
+and tags parse ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules [Decided]") and do not lower
+yet.
+`refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module, every block and every
+expression, and reports one `LoweringError::Unsupported` per construct. `lower_stmts` lowers nothing
+when it reports, so no statement walker or expression arm has a rule for these forms. The arms that
+must name `Expr::Qualified` or `AssignTarget::Qualified` are `unreachable!`. A path with a
+capitalized qualifier segment, `Price::discounted`, is refused as a method reference rather than as
+module syntax ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]").
+
+A module that uses module syntax therefore reports only those refusals, and none of the lowering
+errors its other statements would raise.

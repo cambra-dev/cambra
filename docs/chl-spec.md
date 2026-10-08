@@ -136,6 +136,7 @@ match  case
 pass
 where
 forall requires
+import use    as     pub    run    param  this
 ```
 
 `where` is the refinement predicate separator (§6.4). It is lexed so the name is
@@ -147,9 +148,13 @@ syntax itself is parsed, in every annotation position that takes a type (§6.4).
 
 A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 (§1.8), not keywords, so `lambda` is an ordinary identifier — it, along with
-`while`, `class`, `import`, `try`, `except`, `as`, `global`, `nonlocal`,
+`while`, `class`, `try`, `except`, `global`, `nonlocal`,
 `del`, `assert`, `raise`, `is`, are **not** keywords in CHL today. Some are
 reserved for future use.
+
+`import`, `use`, `as`, `pub`, `run`, `param` and `this` are the module keywords
+([9. Modules [Decided]](#9-modules-decided)). The statements they introduce parse, and lowering
+refuses each of them until modules are implemented.
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
@@ -161,17 +166,15 @@ clause, which ends a `def` signature or a polymorphic type
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**), `given` and `summon` (the
-> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `import`, `use`, `as`,
-> `pub`, `run`, `param` and `this` (modules, **[Decided]**, [9. Modules
-> [Decided]](#9-modules-decided)), `type` (nominal types, **[Decided]**, [6.8 Nominal types and
-> methods [Decided]](#68-nominal-types-and-methods-decided)), and `assert` and its
-> `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands). Avoid taking these names
-> for other purposes. (`with`, `:=`, `match`, `case`, `where`, `forall` and `requires` are
-> **already** lexed — the first two carry today's transactions and mutation,
-> §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's predicate,
-> §6.4, and `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10 — so
-> they are not in this list.)
+> transactions-as-contextual-parameters layer — §8.7, **[Decided]**), `type` (nominal types,
+> **[Decided]**, [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
+> and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
+> surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
+> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires` and the module keywords are
+> **already** lexed — the first two carry today's transactions and mutation, §8, `match`/`case`
+> carry tag dispatch, §4.10, `where` separates a refinement's predicate, §6.4, and `forall` and
+> `requires` begin a polymorphic type and a `requires` clause, §6.10 — so they are not in this
+> list.)
 
 ### 1.7 Literals
 
@@ -191,18 +194,21 @@ surface level.
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
-:=  <:
+:=  <:  ::
 <<  <<=
 (  )  [  ]  {  }  ,  :  .  ;  \  `  ?  @
 ```
 
-> **Direction [Decided].** Two tokens join the set. `::` separates a qualifier from the name
-> it qualifies: a module or a run from its member (`cart::total`,
-> [9.6 Qualified references](#96-qualified-references)) and a nominal
-> type from its method (`Price::discounted`,
-> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Postfix
-> `!` unwraps a proven `` `some `` ([3.9 Subscript and attribute
-> access](#39-subscript-and-attribute-access)).
+`::` separates a qualifier from the name it qualifies: a module or a run from its member
+(`cart::total`, [9.6 Qualified references](#96-qualified-references)), a module from its label or
+tag (`r.mod2::f1`, `` mod2::`some ``, [9.12 Field labels and tags belong to a
+module](#912-field-labels-and-tags-belong-to-a-module)), and a nominal type from its method
+(`Price::discounted`, [6.8 Nominal types and methods
+[Decided]](#68-nominal-types-and-methods-decided)). A qualified name parses wherever a name does,
+and lowering refuses it until modules are implemented.
+
+> **Direction [Decided].** Postfix `!` joins the set. It unwraps a proven `` `some ``
+> ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)).
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
 a mutable variable. It is *not* Python's walrus operator: it is an
@@ -261,10 +267,11 @@ why the refinement separator moved off `|`.
 
 ### 1.9 Decorators
 
-`@` introduces a decorator on the line above a declaration. `LoadFrom` is the
-only one ([8.8 `@LoadFrom`](#88-loadfrom)), so `@` never appears in any other position.
-`Discard` is a second, **[Decided]** and unimplemented
-([8.9 `@Discard` [Decided]](#89-discard-decided)).
+`@` introduces a decorator on the line above a declaration. The decorators are `LoadFrom`
+([8.8 `@LoadFrom`](#88-loadfrom)), `RenamedFrom`
+([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)) and `Discard`
+([8.9 `@Discard` [Decided]](#89-discard-decided)), so `@` never appears in any other position.
+`@RenamedFrom` and `@Discard` parse, and lowering refuses them.
 
 ### 1.10 Semicolons
 
@@ -295,7 +302,7 @@ named `Module`, after Python's `ast.Module`.)
 > asserts that it performs no IO and reaches its one shared run; running one
 > creates a run of its own. The engine runs one root module. Modules are
 > specified in [9. Modules [Decided]](#9-modules-decided), whose statements (`import`, `run`, `param`,
-> and `pub` on a member) extend this grammar.
+> and `pub` on a member) extend this grammar ([2.2 Statements](#22-statements)).
 
 ### 2.2 Statements
 
@@ -306,6 +313,9 @@ statement       ::= simple_stmt NEWLINE
 
 simple_stmt     ::= return_stmt
                  |  pass_stmt
+                 |  import_stmt
+                 |  run_stmt
+                 |  param_stmt
                  |  assign_stmt
                  |  ann_assign_stmt
                  |  mut_assign_stmt
@@ -340,7 +350,7 @@ assign_target   ::= ident
                  |  assign_target ( "," assign_target )+ [ "," ]
 
 compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
-                 |  load_from_stmt
+                 |  load_from_stmt | renamed_from_stmt | discard_stmt | pub_stmt
 
 if_stmt         ::= "if" expression ":" block
                     ( "elif" expression ":" block )*
@@ -364,7 +374,18 @@ value_param     ::= ident [ ( ":" | "<:" ) expression ]
 -- decorator and the declaration are one statement, which is why a declaration
 -- may carry an annotation and no value here and nowhere else.
 load_from_stmt  ::= "@" "LoadFrom" "(" ident ")" NEWLINE
-                    ident ( ":" | "<:" ) expression NEWLINE
+                    [ "pub" ] ident ( ":" | "<:" ) expression NEWLINE
+
+-- A run that the version this source replaces held under another name, by `@RenamedFrom`.
+renamed_from_stmt ::= "@" "RenamedFrom" "(" ident ")" NEWLINE run_stmt NEWLINE
+
+-- A declaration head marked gone, by `@Discard`.
+discard_stmt    ::= "@" "Discard" NEWLINE discard_head NEWLINE
+discard_head    ::= ident | "run" module_path [ "as" ident ] | "import" module_path
+
+-- `pub` before the statement that introduces a member. Any statement parses
+-- after it; one that introduces no member is refused.
+pub_stmt        ::= "pub" statement
 
 block           ::= NEWLINE INDENT statement+ DEDENT
 ```
@@ -395,12 +416,14 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 > (**[Decided]**, §3.7 — today an annotation *requires* a value), and
 > out-of-line collection definition through a subscript target,
 > `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
-> no-subscript-target rule above). The module statements `import_stmt`,
-> `run_stmt` and `param_stmt`, and `pub` before a member's introducing
-> statement, are **[Decided]** ([9. Modules [Decided]](#9-modules-decided)).
+> no-subscript-target rule above).
 > (`mut_assign_stmt` and `with_stmt`
 > above are already implemented — §4.3, §8; they are in the grammar, not
 > this list.)
+
+The module statements `import_stmt`, `run_stmt`, `param_stmt`, `renamed_from_stmt`, `discard_stmt`
+and `pub_stmt` parse, with the productions of [9. Modules [Decided]](#9-modules-decided). Lowering
+refuses each of them until modules are implemented.
 
 ### 2.3 Expression precedence
 
@@ -3737,7 +3760,8 @@ qty_units: Int
 
 This is the one declaration that carries an annotation and no value — the
 decorator is where the value comes from. A bare `y: T` elsewhere is a parse error
-([4. Statement semantics](#4-statement-semantics)). `LoadFrom` is the only decorator CHL has today ([1.9 Decorators](#19-decorators)).
+([4. Statement semantics](#4-statement-semantics)). [1.9 Decorators](#19-decorators) lists every
+decorator.
 
 A load is a declaration, so it appears where declarations do: the top level, or a
 `def` body. A `for` body and a `with begin():` block take statements rather than
@@ -3844,8 +3868,9 @@ deletes no state.
 
 ## 9. Modules [Decided]
 
-A **module** is one `.cambra` file. Nothing in this section is implemented. A module is used in one
-of two ways:
+A **module** is one `.cambra` file. The statements of this section, qualified names, and qualified
+labels and tags parse. Lowering refuses each of them, so a program is still one file. A module is
+used in one of two ways:
 
 - **Importing** it brings its public members into scope. Importing asserts that the module performs
   no IO. Its members and its state exist once in the program, however many modules import it
@@ -3898,6 +3923,10 @@ module_path ::= ident ("::" ident)*
   Python, where `import a.b` binds `a`. The module name an import binds appears in the statement.
 - `import a::b use f, T as U` binds `b`, and also binds `f` and `U` to the public members `f` and
   `T` of `a::b`. A `use` item binds an unqualified name; the module name stays bound beside it.
+- An import name begins with a lowercase letter, as a module path segment does
+  ([9.15 Module files](#915-module-files)). A `use` alias keeps the case of the member it names,
+  `T as U` or `f as g`. Both rules follow from a capitalized name being a type
+  ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
 - An import reaches every public member of the module's shared run. Importing a module that
   performs IO is an error ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
@@ -3921,6 +3950,7 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
 ```
 
 - A run's name defaults to the module path's last segment, as an import's does. `as` overrides it.
+  A run name begins with a lowercase letter, as an import name does.
 - Every run has a name, because the name is the run's identity: its state, its routes, and what a
   reload pairs it with. Two runs in one module with the same name are an error, fixed by `as`.
   Renaming a module file renames every run that relies on the default, so a long-lived run names
@@ -3999,6 +4029,15 @@ pub type Price = {amount: Int}
 pub def discounted(self: Price, pct: Int) => Price: …
 pub stock: Mut(Map(String, Int), Txn) := []
 pub run inventory as inv
+```
+
+A declaration loaded with `@LoadFrom` is an ordinary declaration without an initializer
+([8.8 `@LoadFrom`](#88-loadfrom)), so its `pub` stands at the head of the declaration's line, below
+the decorator:
+
+```python
+@LoadFrom(qty)
+pub held: Int
 ```
 
 - A member without `pub` is private. Only its own module can name it.
@@ -4220,6 +4259,10 @@ r.f1           # Int; the same field as r.this::f1
 r.mod2::f1     # String
 ```
 
+A tag's qualifier precedes its backtick, so the backtick still opens the tag: `` mod2::`some(1) ``
+constructs `mod2`'s `` `some ``, `` {mod2::`some{Int} | `none} `` is a variant type over it, and
+`` case mod2::`some(v): `` matches it.
+
 The qualifier is `this`, an import name, or a run name. Record and variant types stay structural
 ([3.15 Variant constructors](#315-variant-constructors)), and two modules agree on a type by naming
 the same labels. `{audit_api::app: String}` written in `storefront` is the type `audit_api` writes
@@ -4356,11 +4399,12 @@ its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
   import inventory              # the shared run of `inventory` is intentionally gone
   ```
 
-- **Renaming a run is a load.** `@LoadFrom(eu)` on a `run` statement moves the whole run's state to
-  the new name:
+- **Renaming a run is marked with `@RenamedFrom`.** `@RenamedFrom(eu)` on a `run` statement moves
+  the whole run's state to the new name. `@LoadFrom` decorates only a declaration
+  ([8.8 `@LoadFrom`](#88-loadfrom)), so a run takes its own decorator:
 
   ```python
-  @LoadFrom(eu)
+  @RenamedFrom(eu)
   run storefront(port="8080", region="eu") as eu_west
   ```
 
