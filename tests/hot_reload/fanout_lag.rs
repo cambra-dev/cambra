@@ -1,7 +1,7 @@
 //! A reload replays output when a rebuilt reader subscribes to a kept fan-out
 //! whose readers disagree about what they have released.
 //!
-//! `FanOutBranch::subscribe` seeds every new subscriber with `FanOutShared::released`,
+//! `FanOutSlot::subscribe` seeds every new subscriber with `FanOutShared::released`,
 //! the intersection of all subscribers' releases, not with the release of the
 //! subscriber it replaces. A reader the reload rebuilds therefore starts at the
 //! slowest sibling's frontier and receives again every position between that
@@ -23,10 +23,10 @@ use indoc::indoc;
 use cambra::{
     ccl::context::GlobalContext,
     interpreter::{ColumnValue, FunctionGuard, Tile, TileGuard},
-    live_program::LiveProgram,
+    live_program::{LiveProgram, MAIN_BRANCH},
 };
 
-use crate::harness::{OneFile, stdin_across_reload};
+use crate::harness::stdin_across_reload;
 use crate::serving::no_main;
 
 const ITEMS: &str = r#"["a", "b", "c", "d", "e", "f", "g", "h"]"#;
@@ -72,7 +72,7 @@ fn feed(source: &str, reads_n: bool, mark: &str) -> String {
 fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) {
     ctx.scheduler().check_for_notifications();
     let producer = live
-        .main_producer_mut()
+        .main_producer_mut(MAIN_BRANCH)
         .expect("the program's value is `out`");
     let tile = producer.get(producer.tiling().universal_guard());
     let Tile::DataFunction {
@@ -103,13 +103,13 @@ fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) 
 /// edited, drive to the end, and return everything `main` emitted.
 fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start_text(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main)
-        .expect("v1 compiles");
+    let mut live =
+        LiveProgram::start(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main).expect("v1 compiles");
     let mut all = Vec::new();
     for _ in 0..pulls {
         all.extend(pull(&mut ctx, &mut live).0);
     }
-    live.reload_text(&mut ctx, &feed(ITEMS, reads_n, "!"), &no_main)
+    live.reload(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, "!"), &no_main)
         .expect("only the second writer changed");
     for _ in 0..100 {
         let (emitted, done) = pull(&mut ctx, &mut live);
@@ -208,7 +208,7 @@ fn a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut()
 /// In-process only: through the binary over `stdin` the recurrence has caught up at
 /// the quiet point where `--control` reloads, and nothing is replayed.
 ///
-/// No reader here is unpulled. The induction driver's recurrence branch reads each key
+/// No reader here is unpulled. The induction driver's recurrence slot reads each key
 /// at the store's frontier, the position before the one it feeds, so its release trails
 /// the tap reader's by one position, and the rebuilt tap reader is seeded at the driver's
 /// frontier.
@@ -317,15 +317,21 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
     let mut changed = Vec::new();
     for pulls in 0..=10 {
         let mut ctx = GlobalContext::default();
-        let mut live =
-            LiveProgram::start_text(&mut ctx, &fold("", "n"), &no_main).expect("compiles");
+        let mut live = LiveProgram::start(&mut ctx, &fold("", "n"), &no_main).expect("compiles");
         for _ in 0..pulls {
-            let producer = live.main_producer_mut().expect("the value is `n`");
+            let producer = live
+                .main_producer_mut(MAIN_BRANCH)
+                .expect("the value is `n`");
             let _ = producer.get(producer.tiling().universal_guard());
             ctx.scheduler().check_for_notifications();
         }
-        live.reload_text(&mut ctx, &fold(added, r#"n + "|" + p"#), &no_main)
-            .expect("a loop over a list literal is a collection this version can build again");
+        live.reload(
+            &mut ctx,
+            MAIN_BRANCH,
+            &fold(added, r#"n + "|" + p"#),
+            &no_main,
+        )
+        .expect("a loop over a list literal is a collection this version can build again");
         let value = drive_to_terminal(&mut ctx, &mut live);
         // The added loop folds `items` from the element the kept fold is on.
         let pinned = match pulls {
@@ -347,7 +353,9 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
 fn drive_to_terminal(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
     for _ in 0..500 {
         ctx.scheduler().check_for_notifications();
-        let producer = live.main_producer_mut().expect("the value is a string");
+        let producer = live
+            .main_producer_mut(MAIN_BRANCH)
+            .expect("the value is a string");
         let tile = producer.get(producer.tiling().universal_guard());
         if tile.is_terminal() {
             let Tile::Scalar(ColumnValue::Strings(v)) = tile else {

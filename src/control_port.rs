@@ -9,11 +9,13 @@
 //! | `/reload[/<branch>]` | `<source>` | Replace the branch's version with `<source>` |
 //! | `/branch/<name>[/from/<parent>]` | `<source>` | Create `<name>` from `<parent>` and reload it with `<source>` |
 //! | `/branch/<name>/delete` | nothing | Delete `<name>` |
-//! | `/branch/<name>/info` | nothing | Report `<name>`'s provenance, versions and source |
-//! | `/branches/list` | nothing | List every branch |
+//! | `/branch/<name>/info` | nothing | Report `<name>`'s origin, versions and source |
+//! | `/branches` | nothing | List every branch |
 //!
-//! An omitted `<branch>` or `<parent>` means `main`. A segment in a name
-//! position that is not a branch name is an unknown path, and answers 404.
+//! `/reload` and both `/branch` forms that change the table require `POST`,
+//! and any other method answers 405. An omitted `<branch>` or `<parent>`
+//! means `main`. A segment in a name position that is not a branch name is an
+//! unknown path, and answers 404.
 //!
 //! The source may be the whole query string, percent-decoded, or a `POST` body.
 //! The query form is percent-encoded rather than form-encoded: `+` stands for
@@ -39,7 +41,7 @@ use log::info;
 
 use crate::ccl::context::{GlobalContext, Phase, ReuseTally, render_errors};
 use crate::live_program::{
-    BranchError, DEFAULT_BRANCH, LiveProgram, MainConsumerFactory, ReloadReport, is_branch_name,
+    BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadReport, is_branch_name,
     render_unreadable,
 };
 
@@ -70,10 +72,38 @@ pub enum ControlRequest {
     },
     /// Delete `name`.
     Delete { name: String },
-    /// Report `name`'s branch provenance, versions and current source.
+    /// Report `name`'s branch origin, versions and current source.
     Info { name: String },
     /// List every branch.
     List,
+}
+
+impl ControlRequest {
+    /// Whether the request changes what a branch runs or what the table holds,
+    /// which is what makes it require `POST`.
+    pub fn mutates(&self) -> bool {
+        match self {
+            ControlRequest::Reload { .. }
+            | ControlRequest::Branch { .. }
+            | ControlRequest::Delete { .. } => true,
+            ControlRequest::Diff { .. }
+            | ControlRequest::DiffBranches { .. }
+            | ControlRequest::Info { .. }
+            | ControlRequest::List => false,
+        }
+    }
+}
+
+/// Refuse a mutating request sent with any method but `POST`, so a browser
+/// prefetch or a stray `GET` cannot reload, create or delete a branch.
+fn require_post(method: &str, request: &ControlRequest) -> Result<(), ControlReply> {
+    if request.mutates() && !method.eq_ignore_ascii_case("POST") {
+        return Err(ControlReply {
+            status: 405,
+            body: format!("{method} cannot change a branch; send POST\n"),
+        });
+    }
+    Ok(())
 }
 
 /// The answer to one [`ControlRequest`], as an HTTP status and a plain-text body.
@@ -153,7 +183,7 @@ pub fn service(
             branch,
             code,
             phase,
-        } => match live.diff_branch(ctx, branch, code, *phase) {
+        } => match live.diff_against(ctx, branch, code, *phase) {
             Ok(report) => ControlReply::ok(format!(
                 "{}{}",
                 report.diff,
@@ -173,7 +203,7 @@ pub fn service(
         // A rebuilt operator's producer takes the scheduler's probe slot when it
         // is built, as the first compile's did; a created branch's do too.
         ControlRequest::Reload { branch, code } => {
-            match live.reload_branch(ctx, branch, code, main_consumer) {
+            match live.reload(ctx, branch, code, main_consumer) {
                 Ok(report) => ControlReply::ok(render_reload(&report)),
                 Err(e) => branch_error(e, code),
             }
@@ -261,7 +291,10 @@ impl ControlPort {
             for mut request in server.incoming_requests() {
                 let mut body = String::new();
                 let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
-                let reply = match parse_request(request.url(), &body) {
+                let parsed = parse_request(request.url(), &body).and_then(|parsed| {
+                    require_post(request.method().as_str(), &parsed).map(|()| parsed)
+                });
+                let reply = match parsed {
                     Err(reply) => reply,
                     Ok(parsed) => {
                         let (reply_tx, reply_rx) = sync_channel::<ControlReply>(0);
@@ -344,6 +377,15 @@ pub fn phase_from_name(name: &str) -> Option<Phase> {
         .map(|(_, phase)| *phase)
 }
 
+/// The `phase=` spelling that names `phase`, or `None` for a phase `/diff`
+/// does not offer.
+pub fn phase_spelling(phase: Phase) -> Option<&'static str> {
+    OFFERED_PHASES
+        .iter()
+        .find(|(_, offered)| *offered == phase)
+        .map(|(spelling, _)| *spelling)
+}
+
 /// Every `phase=` spelling, for a diagnostic.
 fn phase_names() -> String {
     OFFERED_PHASES
@@ -364,7 +406,7 @@ fn split_url(url: &str) -> (&str, &str) {
 /// Every verb, for the reply to an unknown path.
 const ENDPOINTS: &str = "endpoints: /diff[/<branch>]?<source>, /diff/<branch>/<branch>, \
 /reload[/<branch>]?<source>, /branch/<name>[/from/<parent>]?<source>, /branch/<name>/delete, \
-/branch/<name>/info, /branches/list\n";
+/branch/<name>/info, /branches\n";
 
 /// The branch names a path's segments after its verb spell, or the `404` for a
 /// path that is no verb.
@@ -419,7 +461,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
             let phase = phase()?;
             require_code(&code)?;
             Ok(ControlRequest::Diff {
-                branch: rest.first().copied().unwrap_or(DEFAULT_BRANCH).to_string(),
+                branch: rest.first().copied().unwrap_or(MAIN_BRANCH).to_string(),
                 code,
                 phase,
             })
@@ -444,7 +486,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
         ("reload", [] | [_]) => {
             require_code(&code)?;
             Ok(ControlRequest::Reload {
-                branch: rest.first().copied().unwrap_or(DEFAULT_BRANCH).to_string(),
+                branch: rest.first().copied().unwrap_or(MAIN_BRANCH).to_string(),
                 code,
             })
         }
@@ -452,7 +494,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
             require_code(&code)?;
             Ok(ControlRequest::Branch {
                 name: name.to_string(),
-                parent: DEFAULT_BRANCH.to_string(),
+                parent: MAIN_BRANCH.to_string(),
                 code,
             })
         }
@@ -470,7 +512,7 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
         ("branch", [name, "info"]) => Ok(ControlRequest::Info {
             name: name.to_string(),
         }),
-        ("branches", ["list"]) => Ok(ControlRequest::List),
+        ("branches", []) => Ok(ControlRequest::List),
         _ => Err(ControlReply::not_found(ENDPOINTS)),
     }
 }
@@ -646,7 +688,7 @@ mod tests {
         let waiter = thread::spawn(move || rx.recv().expect("a reply").status);
         drop(ControlMessage {
             request: ControlRequest::Reload {
-                branch: DEFAULT_BRANCH.to_string(),
+                branch: MAIN_BRANCH.to_string(),
                 code: "x".to_string(),
             },
             reply: Some(tx),
@@ -711,7 +753,7 @@ mod tests {
             parsed("/branch/qa/info"),
             ControlRequest::Info { name: "qa".into() }
         );
-        assert_eq!(parsed("/branches/list"), ControlRequest::List);
+        assert_eq!(parsed("/branches"), ControlRequest::List);
         assert_eq!(
             parsed("/branch/delete/delete"),
             ControlRequest::Delete {
@@ -736,8 +778,34 @@ mod tests {
         assert_eq!(status_of("/reload/?x"), 404);
         assert_eq!(status_of("/diff/a/b/c?x"), 404);
         assert_eq!(status_of("/branch/a/rename"), 404);
-        assert_eq!(status_of("/branches"), 404);
+        assert_eq!(status_of("/branches/list"), 404);
         assert_eq!(status_of("/nonsense"), 404);
+    }
+
+    /// A verb that changes a branch or the table requires `POST`; one that only
+    /// reads accepts any method.
+    #[test]
+    fn only_post_may_change_a_branch() {
+        let delete = parse_request("/branch/qa/delete", "").expect("parses");
+        assert_eq!(
+            require_post("GET", &delete).expect_err("refused").status,
+            405
+        );
+        assert!(require_post("POST", &delete).is_ok());
+        let reload = parse_request("/reload", "x = 1; x").expect("parses");
+        assert_eq!(
+            require_post("GET", &reload).expect_err("refused").status,
+            405
+        );
+        let create = parse_request("/branch/qa", "x = 1; x").expect("parses");
+        assert_eq!(
+            require_post("PUT", &create).expect_err("refused").status,
+            405
+        );
+        for read in ["/branches", "/branch/qa/info", "/diff/a/b"] {
+            let request = parse_request(read, "").expect("parses");
+            assert!(require_post("GET", &request).is_ok(), "{read} only reads");
+        }
     }
 
     /// The sourceless verbs ignore the request body.
@@ -748,7 +816,7 @@ mod tests {
             ControlRequest::Delete { name: "qa".into() }
         );
         assert_eq!(
-            parse_request("/branches/list", "x = 1; x").expect("parses"),
+            parse_request("/branches", "x = 1; x").expect("parses"),
             ControlRequest::List
         );
     }

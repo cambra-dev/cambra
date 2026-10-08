@@ -192,8 +192,9 @@ impl UIntStreamBuffer {
         ColumnValue::from_uints(indices)
     }
 
-    /// Record the agreement as the starting point for producers registering from
-    /// now on — see
+    /// Record where producers registering from now on start: the intersection
+    /// of the releases of `predecessor`'s producers on this source, or the
+    /// agreement where `predecessor` has no producer on it. See
     /// [`ProducerReleases::carry_to_new_producers`](crate::interpreter::producer_releases::ProducerReleases::carry_to_new_producers).
     pub(crate) fn carry_release_to_new_producers(
         &mut self,

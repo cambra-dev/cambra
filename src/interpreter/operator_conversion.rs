@@ -144,7 +144,7 @@ fn compile_let_binding(
     // under the binding's name; the reads (`__hist.k`) project keys off it.
     // `__hist` is never a plain `Var` use, so it binds no scope entry. The check
     // precedes the fan because a store consumes no input, so fanning first would
-    // hand the body a branch where it expects the original operator.
+    // hand the body a slot where it expects the original operator.
     if let TypedExprNode::Transact {
         keys,
         writers,
@@ -154,7 +154,7 @@ fn compile_let_binding(
     {
         // A **nested** `Transact`'s components all take the enclosing body's parameter, so
         // it consumes that body's input rather than owning a source of its own: one
-        // branch feeds the `Transact`, the other carries on to the body that reads it.
+        // slot feeds the `Transact`, the other carries on to the body that reads it.
         if parameter.is_some() {
             let Some(input) = input else {
                 return Err(ConversionError::Unsupported(
@@ -163,12 +163,12 @@ fn compile_let_binding(
                         .to_string(),
                 ));
             };
-            // Memoized, as every shared computed input is: a `FanOut` passes each branch's
+            // Memoized, as every shared computed input is: a `FanOut` passes each slot's
             // pull to its input, and this input is the enclosing drive, which every reader
             // of the `Transact` pulls once per lap.
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(input))));
-            ctx.bind_nested_store(&binding.name, bound_expr, keys, writers, fan.branch())?;
-            return Ok(Some(fan.branch()));
+            ctx.bind_nested_store(&binding.name, bound_expr, keys, writers, fan.slot())?;
+            return Ok(Some(fan.slot()));
         }
         ctx.bind_store(&binding.name, bound_expr, keys, writers, domain)?;
         return Ok(input);
@@ -177,7 +177,7 @@ fn compile_let_binding(
     let (bound_input, body_input) = match input {
         Some(input) => {
             let fan_out = Rc::new(FanOut::new(input));
-            (Some(fan_out.branch()), Some(fan_out.branch()))
+            (Some(fan_out.slot()), Some(fan_out.slot()))
         }
         None => (None, None),
     };
@@ -276,7 +276,7 @@ pub enum ConversionError {
 pub(crate) enum BindingKind {
     /// The binding's op was compiled with an input stream — its tile-domain
     /// matches the surrounding iteration.  References inside that
-    /// iteration compile as passthrough (return the FanOut branch
+    /// iteration compile as passthrough (return the FanOut slot
     /// directly).
     Aligned,
     /// The binding's op was compiled without an input — it's a free
@@ -351,7 +351,7 @@ impl StoreReadInfo {
 }
 
 /// A built transactional store, registered under its `__hist` binder so each
-/// per-variable read (`__hist.k`) can branch the shared fan and project key
+/// per-variable read (`__hist.k`) can take a slot of the shared fan and project key
 /// `k`. The trailing read of a key (`final_read` → `StoreFinalRead`) is expressed in the
 /// CCL, not here.
 #[derive(Clone)]
@@ -361,7 +361,7 @@ struct StoreReadInfo {
     /// tell an edited site from one whose state has moved — see [`site_moved`].
     site: ContentHash,
     /// The cyclic store fan — a [`FanOut`] over the store body stream; every
-    /// read is a branch of this one fan.
+    /// read is a slot of this one fan.
     fan: Rc<FanOut>,
     /// Per-variable read info, keyed by the variable's [`Name::field_key`].
     keys: HashMap<String, KeyReadInfo>,
@@ -392,9 +392,10 @@ pub struct OpConversionContext {
     /// ([`bind_store`](Self::bind_store)) and every iteration input
     /// ([`iteration_input`](Self::iteration_input)); empty for a program's first
     /// compilation.
-    inherited: Inheritance,
-    /// What this compilation binds, for the version that replaces it.
-    minted: Inheritance,
+    offer: Offer,
+    /// What this compilation binds, for the branch that runs it and the version
+    /// that replaces it.
+    operator_map: OperatorMap,
     /// Where each node of the tree being converted stood in the version this one
     /// replaces. Empty for a program's first compilation, which keeps nothing.
     correspondence: Correspondence,
@@ -421,7 +422,7 @@ pub struct OpConversionContext {
     var_paths: HashMap<NodeId, Vec<VarPath>>,
     /// The value each `@LoadFrom(x)` site of that tree reads, by the node that
     /// reads it, resolved against what the retired version held
-    /// ([`Inheritance::mutable_state`]). Installed by the same call, and empty
+    /// ([`Offer::mutable_state`]). Installed by the same call, and empty
     /// for a first compilation — which is why a version containing one is
     /// refused there rather than converted.
     load_from_values: HashMap<NodeId, Value>,
@@ -469,36 +470,38 @@ pub(crate) struct OpenIteration {
     paired: CurryLevel,
 }
 
-/// What one compilation hands the version that replaces it: the operator behind
-/// every node it recorded one for, and the value each mutable variable was
-/// holding.
-///
-/// One type for both sides of the handover — what a compilation accumulates and
-/// what it inherits are the same thing.
+/// The operator behind every node a compilation recorded one for: what a
+/// branch's entry holds, and what [`handover`](Self::handover) offers the next
+/// compilation.
 ///
 /// It describes the running graph rather than the terms this compilation walked.
 /// The two differ wherever a binding is kept, since keeping one does not walk the
 /// bound term and so reaches no [`bind_store`](OpConversionContext::bind_store)
 /// below it; [`keep_region`](OpConversionContext::keep_region) is what puts such
-/// a store in the handover anyway.
+/// a store in the map anyway.
 ///
 /// Every consumer reads it as the running graph:
 /// [`live_state`](Self::live_state) takes a value off each store,
 /// [`state_conflicts`](OpConversionContext::state_conflicts) guards each
 /// variable, and the next compilation keeps from it.
 ///
-/// A branch's entry holds one of these as the operators it holds
-/// (`src/ccl/design/program-evolution.md`, "The branch table"). Every
-/// [`Recorded`] holds its operator by `Rc`, so a clone builds nothing and the two
-/// copies hold the same operators.
+/// A branch's entry holds one of these (`src/ccl/design/program-evolution.md`,
+/// "The branch table"). Every [`Recorded`] holds its operator by `Rc`, so a
+/// clone builds nothing and the two copies hold the same operators.
 #[derive(Default, Clone)]
-pub struct Inheritance {
+pub struct OperatorMap {
     /// What the graph holds, by the node it was built from.
     entries: HashMap<NodeId, Recorded>,
+}
+
+/// What a compilation is offered by the version it replaces: that version's
+/// operator map with every fan reopened, and the value each mutable variable
+/// held at handover. Built only by [`OperatorMap::handover`].
+#[derive(Default)]
+pub struct Offer {
+    operators: OperatorMap,
     /// The value each mutable variable hands to the variable that replaces it, by
-    /// identity. Read off `stores` at handover ([`Inheritance::handover`]), so
-    /// the record a compilation accumulates, and a branch's entry holds, carries
-    /// none — only the offer does.
+    /// identity, read off the stores at handover.
     ///
     /// A value and nothing else. Where the recurrence had reached is a property
     /// of the input it was reading rather than of the variable, and the reload
@@ -509,16 +512,16 @@ pub struct Inheritance {
     mutable_state: HashMap<VarPath, Value>,
 }
 
-impl Inheritance {
-    /// This record as an offer to the next compilation: the same operators, with
-    /// every fan reopened and the value each mutable variable holds read off its
-    /// store.
+impl OperatorMap {
+    /// Offer these operators to the next compilation: every fan reopened, and
+    /// the value each mutable variable holds read off its store.
     ///
     /// Reopens every fan first. A fan closes when its subscribers go, and the
     /// reloaded branch's are about to; a carried-forward one has to be open for
-    /// the replacement to subscribe to it. Reopening drops only dead slots
-    /// ([`FanOut::reopen`]), so a fan another branch still subscribes keeps that
-    /// subscription and its guard.
+    /// the replacement to subscribe to it. Reopening drops dead slots and resets
+    /// the fan's `inspect` bookkeeping ([`FanOut::reopen`]); a live slot, such as
+    /// one another branch still subscribes, keeps its subscription and its
+    /// guard. The map lists the same operators afterwards.
     ///
     /// Hands on every entry, including ones whose subscribers released them in
     /// full. Those can no longer produce, so a binding standing behind one is
@@ -527,23 +530,23 @@ impl Inheritance {
     /// variables hand on is still readable off its fan and the progress a
     /// recurrence continues from is still recorded on it.
     ///
-    /// By reference, because the record offered to branch-and-reload is the
-    /// parent's entry, which stays the parent's.
-    pub fn handover(&self) -> Inheritance {
+    /// By reference, because the map offered to branch-and-reload is the
+    /// parent's, which stays the parent's.
+    pub fn handover(&self) -> Offer {
         for entry in self.entries.values() {
             entry.fan().reopen();
         }
-        Inheritance {
-            entries: self.entries.clone(),
+        Offer {
+            operators: self.clone(),
             mutable_state: self.live_state(),
         }
     }
 
-    /// Every fan-out this record holds, one per operator however many nodes
+    /// Every fan-out this map holds, one per operator however many nodes
     /// record it.
     ///
-    /// What an entry holds: an operator is alive while some record lists it
-    /// here, which is what a branch's operator count and its sharing are counted
+    /// What an entry holds: an operator is alive while some operator map lists
+    /// it, which is what a branch's operator count and its sharing are counted
     /// over.
     pub fn operators(&self) -> Vec<Rc<FanOut>> {
         let mut out: Vec<Rc<FanOut>> = Vec::new();
@@ -556,13 +559,47 @@ impl Inheritance {
         out
     }
 
-    /// The name of every data-source producer the operators this record holds
-    /// registered ([`FanOut::source_readers`]).
-    pub fn source_readers(&self) -> HashSet<String> {
+    /// The name of every data-source producer the operators this map holds
+    /// registered ([`FanOut::source_producers`]).
+    pub fn source_producers(&self) -> HashSet<String> {
         self.operators()
             .iter()
-            .flat_map(|fan| fan.source_readers())
+            .flat_map(|fan| fan.source_producers())
             .collect()
+    }
+
+    /// The iteration input of each store in `planned` whose correspondent in
+    /// `previous` is a fan-out this map holds and whose live slots disagree
+    /// ([`FanOut::live_slots_agree`]), by the writer source's node.
+    ///
+    /// A store rebuilt over such an iteration resumes one past the
+    /// intersection of every slot's release, which a lagging slot holds below
+    /// where this map's own reader stopped, so the store would fold the
+    /// positions between a second time. The reload is refused instead, until a
+    /// rebuilt reader resumes from the slot of the reader it replaces
+    /// (`src/ccl/design/program-evolution.md`, "Routes across branches").
+    /// Refused whether or not the store is rebuilt, because whether it is is
+    /// decided at conversion, after the teardown.
+    pub fn disagreeing_kept_iterations(&self, previous: &Expr, planned: &Expr) -> Vec<NodeId> {
+        let sources = writer_sources(planned);
+        if sources.is_empty() {
+            return Vec::new();
+        }
+        let correspondence = Correspondence::of(&crate::ccl::diff::diff(previous, planned));
+        let mut out: Vec<NodeId> = sources
+            .values()
+            .flatten()
+            .map(|source| source.node_id())
+            .filter(|&node| {
+                correspondence
+                    .previous(node)
+                    .and_then(|prev| self.entries.get(&prev))
+                    .is_some_and(|entry| !entry.fan().live_slots_agree())
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The value each mutable variable currently holds, by the identity state is
@@ -816,8 +853,8 @@ impl OpConversionContext {
         let identities = state_identities(expr);
         self.var_paths = identities.variable_paths();
         self.load_from_values = identities.load_from_values(
-            &self.inherited.declared_paths(),
-            &self.inherited.mutable_state,
+            &self.offer.operators.declared_paths(),
+            &self.offer.mutable_state,
         );
         [self.unrecomputable, self.load_from_derived] =
             nodes_reaching(expr, [reads_a_source, is_a_load]);
@@ -969,7 +1006,7 @@ impl OpConversionContext {
         // A spent store answers its variable reads with nothing, so it is rebuilt
         // and reseeded from the value it is still holding — the handover carries
         // that value whatever the operator can produce
-        // ([`Inheritance::live_state`]). Rebuilding for that reason does not
+        // ([`OperatorMap::live_state`]). Rebuilding for that reason does not
         // change what the store computes, so it is not recorded as rebuilt.
         let spent = correspondent
             .as_ref()
@@ -1108,21 +1145,22 @@ records one and the only site a `Transact` reaches"
     /// records as much as a live one's, while a binding wants an operator its
     /// readers can pull — so each asks its own question of what this returns.
     fn correspondent(&self, term: &Expr) -> Option<Recorded> {
-        self.inherited
+        self.offer
+            .operators
             .entries
             .get(&self.correspondence.previous(term.node_id())?)
             .cloned()
     }
 
     /// The operator a recurrence iterates, and the first position it will offer:
-    /// `term` built behind a fan-out this compilation records, or a branch off
+    /// `term` built behind a fan-out this compilation records, or a slot of
     /// the fan-out the previous version recorded at the node `term` corresponds
     /// to.
     ///
     /// The seam a `Let` gets from being a sharing point, made available at a node
     /// that is not one. A fan-out is what carries a producer across a version: it
     /// owns the producer it subscribed and re-points the notification to the new
-    /// version's branch, which is why a producer cannot be moved between graphs
+    /// version's slot, which is why a producer cannot be moved between graphs
     /// any other way — a producer's consumer is fixed at
     /// [`subscribe`](TileOperator::subscribe) and a moved one would go on waking
     /// the retired version's. An iteration is where that matters most:
@@ -1156,7 +1194,7 @@ records one and the only site a `Transact` reaches"
     ///
     /// - A released-in-full operator is taken rather than rebuilt, for a
     ///   recurrence that continues over it. Released in full is what a finished
-    ///   iteration looks like, and a branch off it yields nothing further, which
+    ///   iteration looks like, and a slot of it yields nothing further, which
     ///   is the state the drive is in.
     /// - No [`Memo`] is interposed. One reader pulls this, so there is nothing to
     ///   share, and a memo would drop what a full release told it to drop.
@@ -1194,7 +1232,7 @@ records one and the only site a `Transact` reaches"
                 trace!("keeping iteration operator: resumed_after={resumed_after:?}");
                 self.record(node, kept);
                 return Ok(IterationInput {
-                    op: fan.branch(),
+                    op: fan.slot(),
                     resumed_after,
                 });
             }
@@ -1203,14 +1241,14 @@ records one and the only site a `Transact` reaches"
         let fan = Rc::new(FanOut::new(op));
         self.record(node, Recorded::Operator(fan.clone()));
         Ok(IterationInput {
-            op: fan.branch(),
+            op: fan.slot(),
             resumed_after: fresh_start,
         })
     }
 
     /// Record `entry` under `node` as this compilation's.
     fn record(&mut self, node: NodeId, entry: Recorded) {
-        self.minted.entries.insert(node, entry);
+        self.operator_map.entries.insert(node, entry);
     }
 
     /// Record everything the previous version holds inside `term` as this
@@ -1260,7 +1298,7 @@ in it has a correspondent",
                 );
                 continue;
             };
-            if let Some(entry) = self.inherited.entries.get(&previous).cloned() {
+            if let Some(entry) = self.offer.operators.entries.get(&previous).cloned() {
                 self.record(node, entry);
             }
         }
@@ -1280,15 +1318,11 @@ in it has a correspondent",
     /// because conversion runs after the teardown: a failure there is a panic
     /// with no running program left to keep serving.
     ///
-    /// `predecessor` is the record the reload would offer: the reloaded
-    /// branch's own entry, or the parent's for branch-and-reload.
-    pub fn state_conflicts(&self, predecessor: &Inheritance, planned: &Expr) -> Vec<StateConflict> {
+    /// `predecessor` is the operator map the reload would offer: the reloaded
+    /// branch's own, or the parent's for branch-and-reload.
+    pub fn state_conflicts(&self, predecessor: &OperatorMap, planned: &Expr) -> Vec<StateConflict> {
         let identities = state_identities(planned);
         let declared = identities.declared();
-        // Off the stores, not off `predecessor.mutable_state`: that field is
-        // filled at handover ([`Inheritance::handover`]), so a branch's own
-        // record carries none. The guard runs while the program it is guarding
-        // is the running one.
         let held = predecessor.live_state();
         let mut out = Vec::new();
 
@@ -1411,11 +1445,11 @@ in it has a correspondent",
     /// Read off the planned tree before anything is torn down, so `/diff` answers
     /// it as well as `/reload`.
     ///
-    /// `predecessor` is the record the reload would offer, and `previous` the
-    /// tree its graph was built from.
+    /// `predecessor` is the operator map the reload would offer, and `previous`
+    /// the tree its graph was built from.
     pub fn unreadable_inputs(
         &self,
-        predecessor: &Inheritance,
+        predecessor: &OperatorMap,
         previous: &Expr,
         planned: &Expr,
     ) -> Vec<UnreadablePrefix> {
@@ -1464,7 +1498,7 @@ in it has a correspondent",
                 }
                 // Where the loop will begin, by the same two answers
                 // `iteration_input` chooses between. The kept iteration's
-                // release is read from the record the reload will offer, which
+                // release is read from the operator map the reload will offer, which
                 // `previous` is the tree of.
                 let kept = correspondence
                     .get_or_init(|| Correspondence::of(&crate::ccl::diff::diff(previous, planned)))
@@ -1506,22 +1540,22 @@ in it has a correspondent",
         out
     }
 
-    /// Hand this compilation's record to the branch that runs it, leaving the
-    /// context holding none.
+    /// Hand this compilation's operator map to the branch that runs it, leaving
+    /// the context holding none.
     ///
-    /// Called once the compilation's outputs are subscribed. The record is what
-    /// a branch's entry holds ([`LiveProgram`](crate::live_program::LiveProgram)),
+    /// Called once the compilation's outputs are subscribed. The map is what a
+    /// branch's entry holds ([`LiveProgram`](crate::live_program::LiveProgram)),
     /// and an entry holding it is what keeps an operator alive, so the context
     /// keeps no second reference: the store table is keyed by this tree's
     /// binders and nothing reads it after conversion.
-    pub fn take_record(&mut self) -> Inheritance {
+    pub fn take_operator_map(&mut self) -> OperatorMap {
         debug_assert!(
-            self.inherited.entries.is_empty(),
-            "the offer is released before the record is taken, so no operator the \
-compilation declined outlives it here"
+            self.offer.operators.entries.is_empty(),
+            "the offer is released before the operator map is taken, so no operator \
+the compilation declined outlives it here"
         );
         self.transactional_stores.clear();
-        std::mem::take(&mut self.minted)
+        std::mem::take(&mut self.operator_map)
     }
 
     /// Drop what the previous version offered and this compilation did not take.
@@ -1535,13 +1569,13 @@ compilation declined outlives it here"
     /// ([`DataSourceDomainExtentImpl::retire_producer`](crate::interpreter::DataSourceDomainExtentImpl::retire_producer)),
     /// so this is what makes them run. What was kept is unaffected: the
     /// compilation that kept it holds its own reference.
-    pub fn release_inheritance(&mut self) {
-        self.inherited = Inheritance::default();
+    pub fn release_offer(&mut self) {
+        self.offer = Offer::default();
     }
 
-    /// Seed this context with what a previous version bound.
-    pub fn inherit(&mut self, inheritance: Inheritance) {
-        self.inherited = inheritance;
+    /// Seed this context with what a previous version offered.
+    pub fn inherit(&mut self, offer: Offer) {
+        self.offer = offer;
     }
 
     /// How much of the previous version's graph this compilation kept. `0` kept
@@ -1729,7 +1763,7 @@ compilation declined outlives it here"
 /// `None` means the expression is the start of the pipeline.
 ///
 /// Let-bound variables are stored in `ctx.scopes` as [`FanOut`]
-/// entries; each use produces a fresh [`FanOutBranch`] handle via [`FanOut::branch`].
+/// entries; each use produces a fresh [`FanOutSlot`] handle via [`FanOut::slot`].
 fn convert_impl(
     expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
@@ -1841,7 +1875,7 @@ fn convert_impl_inner(
 
         // `__hist.k` — a read of variable `k` off a transactional store. The
         // shared store fan was built at `let __hist = Transact{…}`; this
-        // branches it and projects key `k`'s carry-forward stream. A store read
+        // takes a slot of it and projects key `k`'s carry-forward stream. A store read
         // is a leaf source (no upstream input).
         TypedExprNode::Apply { argument, function }
             if matches!(&function.node, TypedExprNode::Proj(ProjKey::Field(_)))
@@ -1940,7 +1974,7 @@ fn convert_impl_inner(
                             level,
                         )));
                     }
-                    // Generic path: fan_out the input so every branch shares the
+                    // Generic path: fan_out the input so every slot shares the
                     // same upstream producer.  The arms' runtime tilings depend
                     // on the upstream `input` — scalar upstream produces scalar
                     // arms, function upstream produces function arms.  `zip_arms`
@@ -1960,7 +1994,7 @@ fn convert_impl_inner(
                         let arm_input = if is_leaf_zip_arm(elt, ctx) {
                             None
                         } else {
-                            Some(fan_out.branch())
+                            Some(fan_out.slot())
                         };
                         ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
@@ -1974,7 +2008,7 @@ fn convert_impl_inner(
                     let ops: Result<Vec<_>, _> = fields
                         .iter()
                         .map(|(name, elt)| {
-                            let arm_input = (!is_leaf_zip_arm(elt, ctx)).then(|| fan_out.branch());
+                            let arm_input = (!is_leaf_zip_arm(elt, ctx)).then(|| fan_out.slot());
                             Ok((name.clone(), convert_impl(elt, arm_input, ctx)?))
                         })
                         .collect();
@@ -2112,7 +2146,7 @@ fn convert_impl_inner(
                 let store_fan = ctx.lookup_store(store_name).unwrap().fan.clone();
                 Ok(Box::new(AsOf::new_snapshot(
                     trigger_op,
-                    store_fan.branch(),
+                    store_fan.slot(),
                     fields,
                 )))
             } else {
@@ -2221,11 +2255,11 @@ fn convert_impl_inner(
             // `Memo` the shared upstream: `Filter` pulls it as both the value stream
             // and (through the predicate) the boolean stream, and the transaction
             // writer re-pulls the body once per proposal — without the memo the two
-            // fan branches desync (one sees a position the other has already
+            // fan slots desync (one sees a position the other has already
             // consumed).
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(upstream))));
-            let pred_op = convert_impl(argument, Some(fan.branch()), ctx)?;
-            Ok(Box::new(Filter::new_at(fan.branch(), pred_op, masked)))
+            let pred_op = convert_impl(argument, Some(fan.slot()), ctx)?;
+            Ok(Box::new(Filter::new_at(fan.slot(), pred_op, masked)))
         }
 
         // cast(value): pure type-level assertion — re-views `value` under
@@ -2365,7 +2399,7 @@ fn convert_impl_inner(
         // value at the position its own writers finish, a commit key's `await_final` or an
         // induction accumulator's trailing read. Unlike `as_of_read` it needs no pairing —
         // the position comes from the store's closure, not from a reading loop — so it is
-        // compiled here, to a `StoreFinalRead` over the store branch.
+        // compiled here, to a `StoreFinalRead` over the store slot.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalRead) =>
         {
@@ -2561,16 +2595,16 @@ fn convert_impl_inner(
         TypedExprNode::Var(name) => {
             if let Some(binding) = ctx.lookup(name) {
                 let (kind, depth) = (binding.kind, binding.depth);
-                let op = binding.fan.branch();
+                let op = binding.fan.slot();
                 // Aligned bindings already vary in lockstep with the
-                // surrounding iteration — return the FanOut branch directly.
+                // surrounding iteration — return the FanOut slot directly.
                 // Free bindings are standalone functions; under an
                 // iteration we apply them pointwise via `MapResult`.
                 match (kind, input) {
-                    // An aligned use reads its binding directly, so the branch
+                    // An aligned use reads its binding directly, so the slot
                     // the enclosing `Let` fanned for this position is surplus.
                     // Dropping it here is all it takes: the graph is walked from
-                    // the sinks, and nothing holds this branch.
+                    // the sinks, and nothing holds this slot.
                     (BindingKind::Aligned, _) if depth == ctx.iterations.len() => Ok(op),
                     // Aligned to an iteration **outside** this one: the tile is keyed by
                     // that iteration's positions where the consumer here runs over these,
@@ -3332,7 +3366,7 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
 
 /// Build the operator graph for a `let __hist = Transact{…}` and return the
 /// [`StoreReadInfo`] registered under the `__hist` binder so each per-variable
-/// read `__hist.k` ([`convert_store_read`]) branches the fan and projects it.
+/// read `__hist.k` ([`convert_store_read`]) takes a slot of the fan and projects it.
 ///
 /// Op-conversion dispatches on the store's sequencing `domain`: a concrete
 /// iteration extent → the position-driven [`InductionStore`] changelog (an
@@ -3434,7 +3468,7 @@ fn store_key_extent(arms: Vec<(String, Extent)>) -> Extent {
 
 /// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
 /// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
-/// branch of the shared store output). Each fused writer reads the cyclic store,
+/// slot of the shared store output). Each fused writer reads the cyclic store,
 /// runs its body — the ``let k₀ = p.0 in … let item = p.r in {`commit{writes} | `abort}`` decision, whose input is the driver's tile — and either grants (appends
 /// a proposal) or denies. A single writer is the degenerate case (no conflicts →
 /// no retries); ≥2 writers serialize through the operator with conflict + retry.
@@ -3490,7 +3524,7 @@ fn build_commit_store(
     // drive is not a thing the store can do.
     let continues = paths
         .iter()
-        .any(|path| ctx.inherited.mutable_state.contains_key(path))
+        .any(|path| ctx.offer.mutable_state.contains_key(path))
         || keys
             .iter()
             .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
@@ -3516,7 +3550,7 @@ fn build_commit_store(
         // a transaction decides without discarding what it has committed — the
         // same rule the induction path follows, and the reason state is keyed by
         // variable rather than by store.
-        let carried = ctx.inherited.mutable_state.get(&paths[i]);
+        let carried = ctx.offer.mutable_state.get(&paths[i]);
         let seed_op: Box<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming transactional {field} from the retired version's value");
@@ -3629,22 +3663,22 @@ fn build_commit_store(
         let driver = TransactDriver::new(
             // The driver is placed inside this store by `set_writer` below, so
             // its read of the store is a recurrence rather than a reader.
-            store_fan.recurrence_branch(),
+            store_fan.recurrence_slot(),
             source_op,
             w.read_keys.iter().map(runtime_key).collect(),
             read_extents,
             item_extent,
             drive_resume,
         );
-        // Two branches of the driver: the body consumes rows, and the writer acks
+        // Two slots of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver advances its item cursor on the release
         // *intersection*, so a body's consume-release cannot advance it past an
         // attempt still in flight — and so this is the one fan whose input is **not**
         // memoized. A `Memo` releases its input as soon as it caches, which reaches the
-        // driver as an ack for an attempt no branch has finished.
+        // driver as an ack for an attempt no slot has finished.
         let driver_fan = Rc::new(FanOut::new(Box::new(driver)));
         // The body runs over the store's own domain, whatever the `Transact` sits in.
-        let body_op = convert_at(&w.body, Some(driver_fan.branch()), CurryLevel::new(1), ctx)?;
+        let body_op = convert_at(&w.body, Some(driver_fan.slot()), CurryLevel::new(1), ctx)?;
         // A reply (`out << e`) rides this writer body as `__to_<defer>` decision
         // taps. Each commits as a write-only key (appended after the mutable variable write
         // keys), so the reply rides this transaction's commit and is read back as a
@@ -3681,9 +3715,9 @@ fn build_commit_store(
         let writer = CommitWriter::new(
             // The writer *is* this store's input, so its read of the store is a
             // recurrence. `driver_fan` is a sibling, and held as a reader.
-            store_fan.recurrence_branch(),
+            store_fan.recurrence_slot(),
             body_op,
-            driver_fan.branch(),
+            driver_fan.slot(),
             w.read_keys.iter().map(runtime_key).collect(),
             write_keys,
             tap_fields,
@@ -4034,7 +4068,7 @@ impl LoadFromSite {
             // Indices are dense per chain and spelling, so the first is declared
             // wherever the chain declares the spelling at all, and the second
             // only where it declares it more than once. Asserted where the set
-            // is built (`Inheritance::declared_paths`).
+            // is built (`OperatorMap::declared_paths`).
             if !declared.contains(&at(0)) {
                 continue;
             }
@@ -4554,7 +4588,7 @@ fn convert_nested_seeds(
     ctx: &mut OpConversionContext,
 ) -> Result<Vec<Box<dyn TileOperator>>, ConversionError> {
     keys.iter()
-        .map(|k| convert_impl(&k.init, Some(enclosing_fan.branch()), ctx))
+        .map(|k| convert_impl(&k.init, Some(enclosing_fan.slot()), ctx))
         .collect()
 }
 
@@ -4583,7 +4617,7 @@ fn build_nested_induction_store(
     let runtime_key = |n: &Name| store_key(&n.field_key());
     let taps = body_tap_fields(&w.body.ty);
     // Each fan below shares a computed input between several readers, so each sits on a
-    // `Memo`: a `FanOut` passes every branch's pull to its input, and without the cache each
+    // `Memo`: a `FanOut` passes every slot's pull to its input, and without the cache each
     // reader recomputes the input once per lap. None of these fans' releases is read as a
     // drive's progress, which is what keeps a `Memo` off an iteration source.
     let enclosing_fan = Rc::new(FanOut::new(Box::new(Memo::new(enclosing_input))));
@@ -4592,7 +4626,7 @@ fn build_nested_induction_store(
     // source shapes planning emits converge here — a `curry_over` for an inner source the
     // enclosing position does not name, and a bare projection where the row *is* the
     // collection — so neither is matched for.
-    let source_nested = convert_impl(&w.source, Some(enclosing_fan.branch()), ctx)?;
+    let source_nested = convert_impl(&w.source, Some(enclosing_fan.slot()), ctx)?;
     // The two levels this `Transact` recurs over, and the levels above it that it leaves
     // standing, so a `Transact` inside a deeper nest pairs the loop it belongs to rather than
     // the outermost one. The standing levels are the ones the enclosing context already
@@ -4616,8 +4650,8 @@ fn build_nested_induction_store(
     let paired = CurryLevel::new(standing.len() + 1);
     let pairs = Box::new(Uncurry::new_at(
         Box::new(Product::per_row_at(
-            enclosing_fan.branch(),
-            source_fan.branch(),
+            enclosing_fan.slot(),
+            source_fan.slot(),
             paired,
         )),
         CurryLevel::new(standing.len()),
@@ -4631,7 +4665,7 @@ fn build_nested_induction_store(
     // `domain_predicate` names the rows that will gain no more items, and flattening to
     // pair keys is what loses it. Without it a row is only complete once the next one
     // starts, and the next one is waiting on this one's final.
-    let nested_source = source_fan.branch();
+    let nested_source = source_fan.slot();
     let pair_domain = Extent::Record(HashMap::from([
         (tuple_field(0), row_domain),
         (tuple_field(1), inner_domain),
@@ -4659,8 +4693,8 @@ fn build_nested_induction_store(
         // a position that writes nothing. One reader would leave the other disagreeing —
         // which is the shape of every "write between the loops" case.
         let seed_fan = Rc::new(FanOut::new(Box::new(Memo::new(seed))));
-        seed_ops.push(seed_fan.branch());
-        store_seed_ops.push((rk.clone(), seed_fan.branch()));
+        seed_ops.push(seed_fan.slot());
+        store_seed_ops.push((rk.clone(), seed_fan.slot()));
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
@@ -4717,14 +4751,14 @@ fn build_nested_induction_store(
     // where each accumulator restarts at an enclosing position boundary. The positions it
     // sequences are the inner half of the pair domain.
     let (nested, positions) = InductionDriver::nested_parts(
-        pairs_fan.branch(),
+        pairs_fan.slot(),
         seed_ops,
         standing,
         enclosing_extent,
         &pair_domain,
     );
     let driver = InductionDriver::new(
-        fan.recurrence_branch(),
+        fan.recurrence_slot(),
         nested_source,
         Some(nested),
         w.read_keys.iter().map(runtime_key).collect(),
@@ -4792,7 +4826,7 @@ fn build_induction_store_single(
     // drive is not a thing the store can do.
     let continues = paths
         .iter()
-        .any(|path| ctx.inherited.mutable_state.contains_key(path))
+        .any(|path| ctx.offer.mutable_state.contains_key(path))
         || keys
             .iter()
             .any(|k| ctx.load_from_derived.contains(&k.init.node_id()));
@@ -4811,7 +4845,7 @@ fn build_induction_store_single(
         // Rebuilding a store therefore changes what the loop does next without
         // discarding what it had accumulated, which is what distinguishes
         // swapping the logic from recomputing the program.
-        let carried = ctx.inherited.mutable_state.get(&paths[i]);
+        let carried = ctx.offer.mutable_state.get(&paths[i]);
         let seed_op: Box<dyn TileOperator> = match carried {
             Some(carried) => {
                 trace!("resuming {field} from the retired version's value");
@@ -4879,7 +4913,7 @@ resolves to the other's value",
     // fields and the per-key state come from the shared assembly.
     let parts = store_parts(w, taps, &mut keys_map, ctx)?;
 
-    // As in `build_commit_store`: the store, its fan branches and its driver are
+    // As in `build_commit_store`: the store, its fan slots and its driver are
     // all minted after the writer's own subexpressions have been converted, so
     // they attribute to the writer rather than to the enclosing binding.
     let _writer_scope = crate::ccl::provenance::converting(w.body.node_id());
@@ -4892,13 +4926,13 @@ resolves to the other's value",
     );
     let set_body = store.body_input_setter();
     // Cyclic: the driver reads this store's changelog back to recover each
-    // position's previous accumulator, so one fan branch feeds the cycle and the
+    // position's previous accumulator, so one fan slot feeds the cycle and the
     // rest serve the downstream `__hist.k` dense reads.
     let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
     let driver = InductionDriver::new(
         // The driver is placed inside this store by `set_body` below, so its
         // read of the store's changelog is a recurrence rather than a reader.
-        fan.recurrence_branch(),
+        fan.recurrence_slot(),
         source_op,
         // No rows above it: the body takes the position alone and the accumulator carries
         // from the store's own seed at the first one.
@@ -4926,7 +4960,7 @@ resolves to the other's value",
 }
 
 /// Resolve an `as_of` read's `source` — a bare mutable variable read `__hist.k`
-/// off a registered commit store — to the raw store fan branch, its runtime key,
+/// off a registered commit store — to the raw store fan slot, its runtime key,
 /// and the key's value extent. `AsOf` folds the [`Tile::Store`] fan directly (via
 /// `store_current`), so the as-of path takes the fan + key rather than
 /// compiling `source` to a per-key [`StoreValueStream`].
@@ -4963,7 +4997,7 @@ fn as_of_store_source(
     let runtime_key = key.runtime_key.clone();
     let value_extent = key.value_extent.clone();
     let fan = info.fan.clone();
-    Ok((fan.branch(), runtime_key, value_extent))
+    Ok((fan.slot(), runtime_key, value_extent))
 }
 
 /// The snapshot fields a whole-store `as_of` samples: the record fields of its
@@ -5039,7 +5073,7 @@ fn convert_store_settled_read(
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
     Ok(Box::new(StoreFinalRead::per_row_at(
-        fan.branch(),
+        fan.slot(),
         runtime_key,
         value_extent,
         levels_above,
@@ -5074,7 +5108,7 @@ fn convert_store_read(
         // variable holds its value across ticks that wrote other keys, and a reply tap
         // appears only at the tick that wrote it.
         (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => Ok(Box::new(
-            StoreValueStream::new(fan.branch(), runtime_key, value_extent, carry_forward),
+            StoreValueStream::new(fan.slot(), runtime_key, value_extent, carry_forward),
         )),
         // An `InductionChangelog` key read off the changelog by [`StoreDenseRead`],
         // folded at every position the store decided. An **accumulator**
@@ -5092,7 +5126,7 @@ fn convert_store_read(
             StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog,
             Some((runtime_key, value_extent, carry_forward)),
         ) => Ok(Box::new(StoreDenseRead::new(
-            fan.branch(),
+            fan.slot(),
             runtime_key,
             value_extent,
             carry_forward,
@@ -5160,8 +5194,8 @@ fn strength_at(
     level: CurryLevel,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let pair = Rc::new(FanOut::new(Box::new(Memo::new(input))));
-    let rows = proj_field(pair.branch(), 0, level)?;
-    let collections = proj_field(pair.branch(), 1, level)?;
+    let rows = proj_field(pair.slot(), 0, level)?;
+    let collections = proj_field(pair.slot(), 1, level)?;
     Ok(Box::new(Product::per_row_values_at(
         rows,
         collections,
@@ -5228,7 +5262,7 @@ fn lift_into_iteration(
     op: Box<dyn TileOperator>,
     open: &OpenIteration,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let paired = Box::new(Product::per_row_at(op, open.source.branch(), open.paired));
+    let paired = Box::new(Product::per_row_at(op, open.source.slot(), open.paired));
     // The pairing adds its level at `open.paired`, so the pairs stand one level further in.
     proj_named_field(
         paired,
@@ -5342,7 +5376,7 @@ fn union_operand_ops(
             })
         }
         // A **fed** union: fan the input to every operand (each restricts its own
-        // branch of the same element stream) and flat-merge, so the result stays on
+        // slot of the same element stream) and flat-merge, so the result stays on
         // that one extent and co-iterates with a sibling field — the writer-body
         // fan-out `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`, and the `match` fan-out.
         //
@@ -5367,7 +5401,7 @@ fn union_operand_ops(
                         .to_string(),
                 ));
             }
-            // `Memo` the shared fed input so the fan's branches (one per arm) stay
+            // `Memo` the shared fed input so the fan's slots (one per arm) stay
             // consistent under a re-entrant pull — the transaction writer pulls the
             // body once per proposal.
             // The arms partition the level the copairing is converted at, so they merge one
@@ -5379,7 +5413,7 @@ fn union_operand_ops(
             let fan = Rc::new(FanOut::new(Box::new(Memo::new(inp))));
             let ops = operands
                 .iter()
-                .map(|e| convert_impl(e, Some(fan.branch()), ctx))
+                .map(|e| convert_impl(e, Some(fan.slot()), ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Box::new(UnionOperator::new_flat_at(
                 ops,

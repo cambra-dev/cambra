@@ -11,8 +11,9 @@
 //! table across the induction, transactional and `stdin` domains. This entry is
 //! the demonstration.
 
+use cambra::live_program::MAIN_BRANCH;
+
 use super::serving::{exchange, http_post, no_main, reserve_test_port, start_sink};
-use cambra::chl_parser::SourceMap;
 
 fn source(text: &str, port: u16) -> String {
     text.replace("{PORT}", &port.to_string())
@@ -52,7 +53,8 @@ bob
 
     live.reload(
         &mut ctx,
-        &SourceMap::single("<test>", source(include_str!("reloaded.cambra"), port)),
+        MAIN_BRANCH,
+        &source(include_str!("reloaded.cambra"), port),
         &no_main,
     )
     .expect("editing a loop body is a change between existing endpoints");

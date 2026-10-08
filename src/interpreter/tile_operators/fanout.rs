@@ -20,12 +20,12 @@ use crate::{
 /// [`FanOut::new_cyclic`]; non-cyclic fan-outs leave it `None` and pay
 /// none of the cyclic-mode overhead.
 ///
-/// A fan-out is "cyclic" iff one of its branches feeds (transitively)
+/// A fan-out is "cyclic" iff one of its slots feeds (transitively)
 /// back into its own input.  In practice this is the commit store's
-/// recurrence: one branch feeds back into the store's own input and the
+/// recurrence: one slot feeds back into the store's own input and the
 /// body's prior-value reads (`get_prev_txn`) close the cycle.  In that setup,
-/// subscribing or pulling one branch can synchronously trigger the same
-/// operation on a sibling branch — the re-entrancy state below catches
+/// subscribing or pulling one slot can synchronously trigger the same
+/// operation on a sibling slot — the re-entrancy state below catches
 /// that and serves from the cache instead of recursively re-entering the
 /// inner producer.
 struct FanOutReentrancy {
@@ -36,31 +36,31 @@ struct FanOutReentrancy {
     /// particular) already return cumulative tiles, so each non-reentrant
     /// pull supplants the previous cache rather than appending to it.
     cached_tile: Tile,
-    /// Re-entrancy guard for the inner subscribe path.  `FanOutBranch::subscribe`
-    /// of one branch can transitively trigger `subscribe` on a sibling
-    /// (e.g. an induction loop's drive subscribes to its store branch while
+    /// Re-entrancy guard for the inner subscribe path.  `FanOutSlot::subscribe`
+    /// of one slot can transitively trigger `subscribe` on a sibling
+    /// (e.g. an induction loop's drive subscribes to its store slot while
     /// the store is subscribing the body that reads the drive).
     /// The re-entrant call sees this set, skips the inner subscribe (the
     /// outer call is doing it), and just returns a `FanOutProducer`.
     subscribing_inner: bool,
 }
 
-/// Mutable state shared across all branches from the same [`FanOut`] and all
+/// Mutable state shared across all slots from the same [`FanOut`] and all
 /// [`FanOutProducer`]s it creates.  Wrapping this in `Rc<RefCell<...>>` and
-/// creating it eagerly in [`FanOut::new`] ensures that every branch produced by
-/// [`FanOut::branch`] shares the same object from the start — even before any
+/// creating it eagerly in [`FanOut::new`] ensures that every slot produced by
+/// [`FanOut::slot`] shares the same object from the start — even before any
 /// [`TileOperator::subscribe`] call has initialised the inner producer.
 struct FanOutShared {
     /// Instance ID shared by all [`FanOutProducer`]s from the same fan-out group.
     id: usize,
-    /// Inner producer, set on the first [`FanOutBranch::subscribe`] call.
+    /// Inner producer, set on the first [`FanOutSlot::subscribe`] call.
     ///
     /// In cyclic mode (see [`FanOutReentrancy`]), this is also **taken out**
     /// during the inner pull in `FanOutProducer::get_impl` so that
     /// re-entrant calls from cyclic op graphs can detect re-entrance by
     /// finding `None` and fall back to the cached tile.
     producer: Option<Box<dyn TileProducer>>,
-    /// Every consumer registered via [`FanOutBranch::subscribe`], in order.
+    /// Every consumer registered via [`FanOutSlot::subscribe`], in order.
     ///
     /// Stored as `Rc<RefCell<...>>` so that the notification closure can clone the
     /// handles, release the `shared` borrow, and then call each consumer without
@@ -120,9 +120,9 @@ struct FanOutShared {
     /// registered with a data source when it was subscribed.
     ///
     /// The chain is subscribed once and owned here, so these producers live as
-    /// long as this fan-out does. What a branch that holds this fan-out holds of
-    /// each source is read off it ([`FanOut::source_readers`]).
-    source_readers: Vec<String>,
+    /// long as this fan-out does. What a program branch that holds this fan-out
+    /// holds of each source is read off it ([`FanOut::source_producers`]).
+    source_producers: Vec<String>,
 }
 
 impl FanOutShared {
@@ -220,20 +220,20 @@ impl<'a> Drop for TakenProducerGuard<'a> {
 }
 
 /// Allows for creating multiple TileOperators that all point to the same
-/// underlying operator.  Call [`FanOut::branch`] to get additional handles;
+/// underlying operator.  Call [`FanOut::slot`] to get additional handles;
 /// subscribing to any handle will reuse the same inner producer.
 pub struct FanOut {
-    // shared-state-ok: the fan-out's own input operator, shared with the branches
+    // shared-state-ok: the fan-out's own input operator, shared with the slots
     // that are views of this one operator. It holds an *operator*, not values
     // passed between operators — the same reason `CycleSlot` is legitimate.
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
-    /// All mutable shared state.  Created eagerly so that branches produced by
-    /// [`FanOut::branch`] always share the same object.
+    /// All mutable shared state.  Created eagerly so that slots produced by
+    /// [`FanOut::slot`] always share the same object.
     shared: Rc<RefCell<FanOutShared>>,
-    /// Whether any branches have been created yet.
+    /// Whether any slots have been created yet.
     // shared-state-ok: construction-time bookkeeping of the `FanOut` itself, not a
-    // channel between operators — it records that `branch` has been called, and no
+    // channel between operators — it records that `slot` has been called, and no
     // value ever passes through it.
     used: RefCell<bool>,
 }
@@ -241,7 +241,7 @@ pub struct FanOut {
 impl FanOut {
     /// Construct a new `FanOut` wrapping `input`.  Use this for ordinary
     /// (non-cyclic) op graphs; the resulting fan-out doesn't pay any
-    /// cyclic-mode overhead.  If a branch of this fan-out ends up
+    /// cyclic-mode overhead.  If a slot of this fan-out ends up
     /// feeding back into its own input (e.g. a store recurrence closing
     /// through the fan-out), use [`FanOut::new_cyclic`] instead.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
@@ -250,14 +250,14 @@ impl FanOut {
 
     /// Construct a cyclic [`FanOut`].  Sets up the re-entrancy bookkeeping
     /// (a cached tile snapshot + a subscribe-in-progress flag) needed when
-    /// a branch of this fan-out transitively feeds back into its own input.
+    /// a slot of this fan-out transitively feeds back into its own input.
     ///
     /// The cost relative to [`FanOut::new`] is one `Tile` clone per pull
     /// (to refresh the cache), so non-cyclic users should stick with `new`.
     /// Called for the stores a recurrence is built around — the commit store and
-    /// the induction store. The branch that closes the cycle is a
-    /// [`recurrence_branch`](Self::recurrence_branch), not a
-    /// [`branch`](Self::branch).
+    /// the induction store. The slot that closes the cycle is a
+    /// [`recurrence_slot`](Self::recurrence_slot), not a
+    /// [`slot`](Self::slot).
     pub fn new_cyclic(input: Box<dyn TileOperator>) -> Self {
         let cached_tile = input.tiling().empty_tile();
         Self::new_with_reentrancy(
@@ -283,7 +283,7 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
-            source_readers: Vec::new(),
+            source_producers: Vec::new(),
         }));
         Self {
             input: Rc::new(RefCell::new(input)),
@@ -293,27 +293,27 @@ impl FanOut {
         }
     }
 
-    /// Return a new branch handle on this fan-out.  All branches share the same
+    /// Return a new slot handle on this fan-out.  All slots share the same
     /// inner producer and consumer list; subscribing to any of them is
     /// equivalent.
     ///
     /// This is the handle for a reader downstream of the fan-out, and it owns
     /// the fan-out. An operator that this fan-out's own input chain contains
-    /// takes a [`recurrence_branch`](Self::recurrence_branch) instead — see
+    /// takes a [`recurrence_slot`](Self::recurrence_slot) instead — see
     /// [`FanHold`].
-    pub fn branch(&self) -> Box<dyn TileOperator> {
+    pub fn slot(&self) -> Box<dyn TileOperator> {
         self.branch_holding(FanHold::Reader {
             shared: self.shared.clone(), // shares the Rc — always connected
             input: self.input.clone(),
         })
     }
 
-    /// A branch for an operator that this fan-out's own input chain contains.
+    /// A slot for an operator that this fan-out's own input chain contains.
     ///
     /// A store's driver and its writer read the store they are part of, to
     /// recover each position's prior value. Such a reader must not own the
     /// fan-out — see [`FanHold`].
-    pub fn recurrence_branch(&self) -> Box<dyn TileOperator> {
+    pub fn recurrence_slot(&self) -> Box<dyn TileOperator> {
         self.branch_holding(FanHold::Recurrence {
             shared: Rc::downgrade(&self.shared),
             input: Rc::downgrade(&self.input),
@@ -321,7 +321,7 @@ impl FanOut {
     }
 
     fn branch_holding(&self, hold: FanHold) -> Box<dyn TileOperator> {
-        let result = FanOutBranch {
+        let result = FanOutSlot {
             hold,
             base: OperatorBase::new(self.tiling.clone()),
             primary: !*self.used.borrow(),
@@ -336,7 +336,7 @@ impl FanOut {
 
     /// The operator this fan-out reads.
     ///
-    /// For a caller that wants the subgraph rather than a place in it: a branch
+    /// For a caller that wants the subgraph rather than a place in it: a slot
     /// is minted fresh on every call, so reaching the input through one would
     /// answer about a node that did not exist a moment ago.
     pub fn with_input<R>(&self, f: impl FnOnce(&dyn TileOperator) -> R) -> R {
@@ -397,18 +397,34 @@ impl FanOut {
         self.shared.borrow().released_position.clone()
     }
 
+    /// Whether every live slot has released the same region.
+    ///
+    /// A subscriber added now starts at the intersection over the live slots,
+    /// and [`released_position`](Self::released_position) is read off the same
+    /// intersection, so when the slots disagree neither is where any one reader
+    /// stopped (`src/ccl/design/program-evolution.md`, "Routes across
+    /// branches").
+    pub fn live_slots_agree(&self) -> bool {
+        let shared = self.shared.borrow();
+        let mut guards = shared.live_indices().map(|i| &shared.release_guards[i]);
+        let Some(first) = guards.next() else {
+            return true;
+        };
+        guards.all(|g| g == first)
+    }
+
     /// The name of every producer registered with a data source from inside
     /// this fan-out's input chain, nested fan-outs included, when the chain was
     /// subscribed. Empty before the first subscription.
-    pub fn source_readers(&self) -> Vec<String> {
-        self.shared.borrow().source_readers.clone()
+    pub fn source_producers(&self) -> Vec<String> {
+        self.shared.borrow().source_producers.clone()
     }
 
-    /// Reopen this fan-out for a fresh set of branches, keeping the inner
+    /// Reopen this fan-out for a fresh set of slots, keeping the inner
     /// producer and everything it has accumulated.
     ///
     /// For carrying one operator across a program reload. Only the
-    /// [`inspect`](TileOperator::inspect) bookkeeping resets: which branch
+    /// [`inspect`](TileOperator::inspect) bookkeeping resets: which slot
     /// renders the input subtree and which renders a back-reference. The
     /// subscriptions need no attention, because each is tied to the life of the
     /// producer it handed out ([`FanOutShared::subscribers`]) — a subscriber the
@@ -440,7 +456,7 @@ enum FanHold {
     Reader {
         shared: Rc<RefCell<FanOutShared>>,
         // shared-state-ok: the fan-out's own input operator, the same handle as
-        // [`FanOut::input`] — a branch is a view of one fan-out, not a second
+        // [`FanOut::input`] — a slot is a view of one fan-out, not a second
         // one. It holds an *operator*, not values passed between operators.
         input: Rc<RefCell<Box<dyn TileOperator>>>,
     },
@@ -497,25 +513,25 @@ impl FanHold {
     }
 }
 
-struct FanOutBranch {
+struct FanOutSlot {
     // shared-state-ok: the same operator handle as [`FanOut::input`] and the same
-    // mutable state as [`FanOut::shared`] — a branch is a view of one fan-out,
+    // mutable state as [`FanOut::shared`] — a slot is a view of one fan-out,
     // not a second one. Operators and their bookkeeping, not values.
     hold: FanHold,
-    /// The tiling is the fan-out's, forwarded to every branch of it.
+    /// The tiling is the fan-out's, forwarded to every slot of it.
     base: OperatorBase,
-    /// True for the first handle returned by [`FanOut::branch`], false for subsequent ones.
+    /// True for the first handle returned by [`FanOut::slot`], false for subsequent ones.
     /// The primary renders its input subtree in inspect; copies emit a back-reference.
     primary: bool,
 }
 
-impl FanOutBranch {
+impl FanOutSlot {
     fn shared(&self) -> Rc<RefCell<FanOutShared>> {
         self.hold.shared()
     }
 }
 
-impl TileOperator for FanOutBranch {
+impl TileOperator for FanOutSlot {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
@@ -555,7 +571,7 @@ impl TileOperator for FanOutBranch {
         // Decide whether *this* call should drive the inner subscribe.
         // `producer.is_none()` is the standard "first subscription" check;
         // in cyclic mode, `!reentrancy.subscribing_inner` makes the path
-        // re-entrancy-safe: a sibling-branch subscribe triggered from
+        // re-entrancy-safe: a sibling-slot subscribe triggered from
         // inside the inner subscribe call sees the flag set and just
         // returns a producer (the outer call will populate `producer`
         // before anyone pulls).
@@ -587,7 +603,7 @@ impl TileOperator for FanOutBranch {
             // on this fan-out.
             let _guard = SubscribingInnerGuard { shared: &shared_rc };
             let shared_weak = Rc::downgrade(&shared_rc);
-            scheduler.begin_source_readers();
+            scheduler.begin_source_producers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
                 Box::new(move || {
@@ -612,25 +628,25 @@ impl TileOperator for FanOutBranch {
                 }),
                 scheduler,
             );
-            let readers = scheduler.end_source_readers();
+            let producers = scheduler.end_source_producers();
             let mut shared = shared_rc.borrow_mut();
             shared.producer = Some(inner);
-            shared.source_readers = readers;
+            shared.source_producers = producers;
             drop(shared);
             // `_guard` drops here, resetting `subscribing_inner`.
         }
 
         Box::new(FanOutProducer {
-            // The fan-out's own id rather than a fresh one, so every branch's
+            // The fan-out's own id rather than a fresh one, so every slot's
             // producer reads as the same `FanOut#n`. `ProbeTable` keys on
             // `(node_id, producer_id)`, and that stays unique here because each
-            // branch is its own operator with its own `NodeId` — the first
-            // component separates them, not the second. Subscribing one branch
+            // slot is its own operator with its own `NodeId` — the first
+            // component separates them, not the second. Subscribing one slot
             // twice would land both producers in one slot; nothing does, and
-            // `FanOut::branch` mints a fresh branch per call.
+            // `FanOut::slot` mints a fresh slot per call.
             base: ProducerBase::new(shared_rc.borrow().id, self.tiling(), &self.base, scheduler),
             // The producer a subscription hands out holds the fan-out the same
-            // way this branch does: a recurrence's producer must not own it
+            // way this slot does: a recurrence's producer must not own it
             // either.
             hold: self.hold.clone(),
             slot,
@@ -644,7 +660,7 @@ impl TileOperator for FanOutBranch {
 
 struct FanOutProducer {
     base: ProducerBase,
-    /// Shared state (consumers + release guards), held the same way the branch
+    /// Shared state (consumers + release guards), held the same way the slot
     /// this producer came from holds it — see [`FanHold`].
     hold: FanHold,
     /// This producer's index into `shared.consumers` and `shared.release_guards`,
@@ -673,7 +689,7 @@ impl FanOutProducer {
 impl TileProducer for FanOutProducer {
     impl_producer_base!();
 
-    /// A cyclic fan-out's cached snapshot, shared by every branch, so counted at the first.
+    /// A cyclic fan-out's cached snapshot, shared by every slot, so counted at the first.
     fn state_info(&self) -> ProducerStateInfo {
         if self.index() != 0 {
             return ProducerStateInfo::default();
@@ -711,7 +727,7 @@ impl TileProducer for FanOutProducer {
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // In cyclic mode, take the inner producer out during the pull so
-        // sibling-branch re-entrance can detect re-entrance by finding
+        // sibling-slot re-entrance can detect re-entrance by finding
         // `producer == None` and serve from the cached tile.  In
         // non-cyclic mode, the producer stays in `shared` and we pull
         // through a regular borrow.
@@ -744,7 +760,7 @@ impl TileProducer for FanOutProducer {
                 tile
                 // `guard` drops here, restoring `shared.producer`.
             } else {
-                // Re-entrant pull: another branch's outer `get_impl` is
+                // Re-entrant pull: another slot's outer `get_impl` is
                 // currently holding the producer.  Serve the latest known
                 // emission instead of re-entering the inner producer (which
                 // would alias `&mut`).
@@ -781,12 +797,12 @@ impl TileProducer for FanOutProducer {
         let mut shared = shared_rc.borrow_mut();
         // Union with the existing stored guard so that the accumulated set of
         // delivered data grows monotonically.  Replacing (instead of union-ing)
-        // would forget previously-released ranges, causing FanOutBranch to
+        // would forget previously-released ranges, causing FanOutSlot to
         // re-deliver data that a consumer has already released.
         let index = self.index();
         let accumulated = shared.release_guards[index].union(&obsolete_guard);
         trace!(
-            "{} branch {index} accumulate {:?} + {obsolete_guard:?} = {accumulated:?}",
+            "{} slot {index} accumulate {:?} + {obsolete_guard:?} = {accumulated:?}",
             self.name(),
             shared.release_guards[index]
         );
@@ -801,7 +817,7 @@ impl TileProducer for FanOutProducer {
                 acc.intersect(&shared.release_guards[i])
             });
         trace!(
-            "{} releasing: {intersection:?} from branches {:?} live {:?}",
+            "{} releasing: {intersection:?} from slots {:?} live {:?}",
             self.name(),
             shared.release_guards,
             shared.live_indices().collect::<Vec<_>>()
@@ -825,7 +841,7 @@ impl TileProducer for FanOutProducer {
         }
         shared.released = intersection.clone();
         // In cyclic mode the inner producer can be temporarily taken out
-        // by a sibling-branch `get_impl`; skip the inner release in that
+        // by a sibling-slot `get_impl`; skip the inner release in that
         // case (the next non-reentrant release will recompute and
         // forward).  Non-cyclic mode always has `producer = Some(_)`.
         if let Some(producer) = shared.producer.as_mut() {
@@ -1054,10 +1070,10 @@ mod tests {
         let tiling = Tiling::Scalar(extent);
 
         let first = fan
-            .branch()
+            .slot()
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
         let mut second = fan
-            .branch()
+            .slot()
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
         assert_eq!(fan.shared.borrow().subscribers.len(), 2);
 
@@ -1096,7 +1112,7 @@ mod tests {
         let tiling = Tiling::Scalar(extent);
 
         let mut first = fan
-            .branch()
+            .slot()
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
         assert!(
             !fan.released_in_full(),
@@ -1111,7 +1127,7 @@ mod tests {
             "the one subscriber released everything, so the fan-out can only answer empty"
         );
         let late = fan
-            .branch()
+            .slot()
             .subscribe(tiling.empty_guard(), Box::new(|| {}), &mut sched);
         assert_eq!(
             fan.shared.borrow().release_guards[0],

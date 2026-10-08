@@ -4,7 +4,7 @@
 //! Every case checks one of two things. A branch operation changes only the
 //! entry it names: every other branch keeps its outputs, the values its mutable
 //! variables hold, and the operators its entry holds. And the table's own
-//! bookkeeping — version numbers, branch provenance, tombstones — reads back
+//! bookkeeping — version numbers, branch origin, tombstones — reads back
 //! over the control port as the doc specifies.
 //!
 //! The HTTP cases run `running-log` as `main`. A branch that diverges from it
@@ -29,7 +29,7 @@ use cambra::{
     },
     control_port::{ControlReply, ControlRequest, service},
     interpreter::{BaseType, Extent, Predicate, TestDataSource, Value, pull_laps},
-    live_program::{BranchError, DEFAULT_BRANCH, LiveProgram},
+    live_program::{BranchError, LiveProgram, MAIN_BRANCH},
 };
 
 use crate::harness::{launch_under_control, source};
@@ -150,7 +150,7 @@ fn branch_and_reload_creates_a_branch_forked_from_its_parent() {
     let reply = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(
@@ -184,7 +184,7 @@ fn a_refused_branch_and_reload_leaves_no_entry() {
     let broken = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, "x = ".into()),
+        create("staging", MAIN_BRANCH, "x = ".into()),
     );
     assert_eq!(
         broken.status, 400,
@@ -196,7 +196,7 @@ fn a_refused_branch_and_reload_leaves_no_entry() {
     let dropping = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, with_port(LOG_DROPPED, port)),
+        create("staging", MAIN_BRANCH, with_port(LOG_DROPPED, port)),
     );
     assert_eq!(dropping.status, 400, "{}", dropping.body);
     assert!(
@@ -210,7 +210,7 @@ fn a_refused_branch_and_reload_leaves_no_entry() {
     let retried = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(retried.status, 200, "{}", retried.body);
     assert!(
@@ -229,7 +229,7 @@ fn a_duplicate_name_is_refused_and_an_unknown_parent_is_not_found() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -239,7 +239,7 @@ fn a_duplicate_name_is_refused_and_an_unknown_parent_is_not_found() {
     let duplicate = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, with_port(PLUSSED_LOG, port)),
+        create("staging", MAIN_BRANCH, with_port(PLUSSED_LOG, port)),
     );
     assert_eq!(duplicate.status, 400, "{}", duplicate.body);
     assert!(
@@ -272,7 +272,7 @@ fn a_parents_reload_leaves_its_child_untouched() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -283,7 +283,7 @@ fn a_parents_reload_leaves_its_child_untouched() {
     let reply = ask(
         &mut ctx,
         &mut live,
-        reload(DEFAULT_BRANCH, source("running-log-writer-edit", port)),
+        reload(MAIN_BRANCH, source("running-log-writer-edit", port)),
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
 
@@ -319,13 +319,13 @@ fn a_childs_reload_keeps_its_own_accumulated_value() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
     );
     let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "c")]);
-    assert_eq!(log_of(&live, DEFAULT_BRANCH), "abc");
+    assert_eq!(log_of(&live, MAIN_BRANCH), "abc");
     assert_eq!(log_of(&live, "staging"), "ab-c");
 
     let reply = ask(
@@ -361,7 +361,7 @@ fn a_one_branch_diff_compares_against_that_branchs_version() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -376,7 +376,7 @@ fn a_one_branch_diff_compares_against_that_branchs_version() {
         },
     );
     assert_eq!(own.status, 200);
-    assert_eq!(own.body, "no difference at phase AsOfRead\n");
+    assert_eq!(own.body, "no difference at phase as-of-read\n");
     let parents = ask(
         &mut ctx,
         &mut live,
@@ -399,7 +399,7 @@ fn a_two_branch_diff_compares_current_versions() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -411,13 +411,13 @@ fn a_two_branch_diff_compares_current_versions() {
         phase: Phase::AsOfRead,
     };
 
-    let across = ask(&mut ctx, &mut live, diff(DEFAULT_BRANCH, "staging"));
+    let across = ask(&mut ctx, &mut live, diff(MAIN_BRANCH, "staging"));
     assert_eq!(across.status, 200, "{}", across.body);
     assert!(across.body.contains("divergence"), "{}", across.body);
     let expected = live
-        .diff_branch(
+        .diff_against(
             &ctx,
-            DEFAULT_BRANCH,
+            MAIN_BRANCH,
             &with_port(DASHED_LOG, port),
             Phase::AsOfRead,
         )
@@ -429,27 +429,27 @@ fn a_two_branch_diff_compares_current_versions() {
     );
 
     let itself = ask(&mut ctx, &mut live, diff("staging", "staging"));
-    assert_eq!(itself.body, "no difference at phase AsOfRead\n");
+    assert_eq!(itself.body, "no difference at phase as-of-read\n");
 
     assert_eq!(
-        ask(&mut ctx, &mut live, diff(DEFAULT_BRANCH, "nowhere")).status,
+        ask(&mut ctx, &mut live, diff(MAIN_BRANCH, "nowhere")).status,
         404
     );
     assert_eq!(list(&mut ctx, &mut live), before, "asking changes nothing");
 }
 
-/// The version numbers and branch provenance read back over `/branches/list`
+/// The version numbers and branch origin read back over `/branches`
 /// and `/branch/<name>/info`: each reload raises only its own branch's number,
-/// and a branch provenance names the parent's version at creation even after
+/// and a branch origin names the parent's version at creation even after
 /// the parent has moved on.
 #[test]
-fn list_and_info_report_versions_and_provenance() {
+fn list_and_info_report_versions_and_origin() {
     let (port, mut ctx, mut live) = running_log_with_ab();
     assert_eq!(
         ask(
             &mut ctx,
             &mut live,
-            reload(DEFAULT_BRANCH, source("running-log-writer-edit", port))
+            reload(MAIN_BRANCH, source("running-log-writer-edit", port))
         )
         .status,
         200
@@ -458,7 +458,7 @@ fn list_and_info_report_versions_and_provenance() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -467,7 +467,7 @@ fn list_and_info_report_versions_and_provenance() {
         ask(
             &mut ctx,
             &mut live,
-            reload(DEFAULT_BRANCH, source("running-log", port))
+            reload(MAIN_BRANCH, source("running-log", port))
         )
         .status,
         200
@@ -527,7 +527,7 @@ fn list_and_info_report_versions_and_provenance() {
         &mut ctx,
         &mut live,
         ControlRequest::Info {
-            name: DEFAULT_BRANCH.into(),
+            name: MAIN_BRANCH.into(),
         },
     );
     assert!(
@@ -555,7 +555,7 @@ fn a_recreated_name_continues_its_tombstones_numbering() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -605,7 +605,7 @@ fn a_recreated_name_continues_its_tombstones_numbering() {
     let recreated = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(recreated.status, 200, "{}", recreated.body);
     assert!(
@@ -642,10 +642,10 @@ fn deleting_a_branch_frees_only_what_no_other_entry_holds() {
     let created = ask(
         &mut ctx,
         &mut live,
-        create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
     );
     assert_eq!(created.status, 200, "{}", created.body);
-    let held_by_main: Vec<_> = live.held_operators(DEFAULT_BRANCH).expect("exists");
+    let held_by_main: Vec<_> = live.held_operators(MAIN_BRANCH).expect("exists");
     let held_by_staging: Vec<_> = live.held_operators("staging").expect("exists");
     let summary = &live.branches()[1];
     assert!(
@@ -687,7 +687,7 @@ fn the_last_branch_cannot_be_deleted() {
         &mut ctx,
         &mut live,
         ControlRequest::Delete {
-            name: DEFAULT_BRANCH.into(),
+            name: MAIN_BRANCH.into(),
         },
     );
     assert_eq!(last.status, 400, "{}", last.body);
@@ -697,7 +697,7 @@ fn the_last_branch_cannot_be_deleted() {
         ask(
             &mut ctx,
             &mut live,
-            create("staging", DEFAULT_BRANCH, with_port(DASHED_LOG, port))
+            create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port))
         )
         .status,
         200
@@ -719,7 +719,7 @@ fn the_last_branch_cannot_be_deleted() {
             &mut ctx,
             &mut live,
             ControlRequest::Delete {
-                name: DEFAULT_BRANCH.into()
+                name: MAIN_BRANCH.into()
             }
         )
         .status,
@@ -739,20 +739,20 @@ fn the_last_branch_cannot_be_deleted() {
     // answers 404 rather than falling back to another branch.
     for request in [
         ControlRequest::Reload {
-            branch: DEFAULT_BRANCH.into(),
+            branch: MAIN_BRANCH.into(),
             code: with_port(DASHED_LOG, port),
         },
         ControlRequest::Diff {
-            branch: DEFAULT_BRANCH.into(),
+            branch: MAIN_BRANCH.into(),
             code: with_port(DASHED_LOG, port),
             phase: Phase::AsOfRead,
         },
-        create("scratch", DEFAULT_BRANCH, with_port(DASHED_LOG, port)),
+        create("scratch", MAIN_BRANCH, with_port(DASHED_LOG, port)),
     ] {
         let reply = ask(&mut ctx, &mut live, request);
         assert_eq!(reply.status, 404, "{}", reply.body);
     }
-    assert!(live.program().is_none() && live.main_producer().is_none());
+    assert!(live.program(MAIN_BRANCH).is_none());
 
     let replies = exchange(&mut ctx, move || {
         vec![http_post(port, "/set", "c"), http_get(port, "/get2")]
@@ -824,7 +824,7 @@ fn add(src: &Rc<RefCell<TestDataSource>>, from: usize, values: &[i64]) {
 /// Deliver and pull branch `name`'s `main` output until its fold settles.
 fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram, name: &str) {
     let producer = live
-        .branch_main_producer_mut(name)
+        .main_producer_mut(name)
         .expect("the program's value is `x`");
     pull_laps(ctx.scheduler(), &mut **producer, 8, |_| false);
 }
@@ -857,29 +857,29 @@ fn fold_after(with_lagging_branch: bool, install: Install) -> (i64, Predicate) {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
-    assert_eq!(x_of(&live, DEFAULT_BRANCH), 3);
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
+    assert_eq!(x_of(&live, MAIN_BRANCH), 3);
 
     if with_lagging_branch {
-        live.create_branch(&mut ctx, "lagging", DEFAULT_BRANCH, FOLD_VIA_VIEW, &no_main)
+        live.create_branch(&mut ctx, "lagging", MAIN_BRANCH, FOLD_VIA_VIEW, &no_main)
             .expect("rebuilding the iteration is accepted");
     }
     add(&src, 2, &[4, 8]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
-    assert_eq!(x_of(&live, DEFAULT_BRANCH), 15);
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
+    assert_eq!(x_of(&live, MAIN_BRANCH), 15);
     let agreed = src.borrow().get_released_predicate();
 
     let installed = match install {
         Install::Reload => {
-            live.reload(&mut ctx, FOLD_VIA_OTHER_VIEW, &no_main)
+            live.reload(&mut ctx, MAIN_BRANCH, FOLD_VIA_OTHER_VIEW, &no_main)
                 .expect("rebuilding the iteration is accepted");
-            DEFAULT_BRANCH
+            MAIN_BRANCH
         }
         Install::Branch => {
             live.create_branch(
                 &mut ctx,
                 "child",
-                DEFAULT_BRANCH,
+                MAIN_BRANCH,
                 FOLD_VIA_OTHER_VIEW,
                 &no_main,
             )
@@ -952,52 +952,42 @@ const FOLD_PLUS_ZERO: &str = indoc! {r#"
 /// `main` folds `1, 2`. With `with_lagging_branch`, a branch created from `main`
 /// with [`FOLD_TIMES_ONE`] subscribes to `main`'s kept iteration and is never
 /// pulled. `main` folds `4, 8`, reloads to [`FOLD_PLUS_ZERO`], which keeps the
-/// iteration and rebuilds the store, and folds `16`. Returns `main`'s `x`.
-fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> i64 {
+/// iteration and rebuilds the store, and folds `16`. Returns `main`'s `x`, or
+/// the reload's refusal.
+fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> Result<i64, String> {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
     if with_lagging_branch {
-        live.create_branch(
-            &mut ctx,
-            "lagging",
-            DEFAULT_BRANCH,
-            FOLD_TIMES_ONE,
-            &no_main,
-        )
-        .expect("a body edit is accepted");
+        live.create_branch(&mut ctx, "lagging", MAIN_BRANCH, FOLD_TIMES_ONE, &no_main)
+            .expect("a body edit is accepted");
     }
     add(&src, 2, &[4, 8]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
-    assert_eq!(x_of(&live, DEFAULT_BRANCH), 15);
-    live.reload(&mut ctx, FOLD_PLUS_ZERO, &no_main)
-        .expect("a body edit is accepted");
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
+    assert_eq!(x_of(&live, MAIN_BRANCH), 15);
+    live.reload(&mut ctx, MAIN_BRANCH, FOLD_PLUS_ZERO, &no_main)
+        .map_err(|e| format!("{e:?}"))?;
     add(&src, 4, &[16]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
-    x_of(&live, DEFAULT_BRANCH)
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
+    Ok(x_of(&live, MAIN_BRANCH))
 }
 
-/// A lagging branch subscribed to a kept iteration makes a reload of another
-/// branch that rebuilds its store fold elements twice.
+/// A reload that keeps an iteration another branch also reads, and has read
+/// less of, is refused.
 ///
-/// Pinned failure: the correct `x` is `31` (`1 + 2 + 4 + 8 + 16`), which the
-/// same run without the lagging branch folds, and today it is `43`, with `4`
-/// and `8` folded twice. The rebuilt store resumes one past the kept
-/// iteration's `FanOut::released_position`, which is read off the intersection
-/// of every live slot's release, so the lagging branch's slot holds it at the
-/// position the branch was created at. A fix replaces `43` with `31` and renames
-/// this test after the behaviour it then pins.
-///
-/// TODO: the fix is a per-reader release view applied at both layers. The
-/// source layer has it: `ProducerReleases::carry_to_new_producers` starts a new
-/// producer from its predecessor's own producers' release. A fan-out does not:
-/// the guard a new subscriber starts with and `released_position` are both the
-/// intersection over every slot, whichever branch holds it.
+/// Without the lagging branch the reload is accepted and `x` is `31`
+/// (`1 + 2 + 4 + 8 + 16`). With it, the rebuilt store would resume one past the
+/// kept iteration's `FanOut::released_position`, which is read off the
+/// intersection of every live slot's release, so the lagging branch's slot
+/// would hold it at the position the branch was created at and `4` and `8`
+/// would fold twice. `LiveProgram::check` refuses that reload instead
+/// (`OperatorMap::disagreeing_kept_iterations`).
 #[test]
-fn a_lagging_branch_makes_a_reload_over_a_kept_iteration_fold_twice() {
-    assert_eq!(reload_over_a_kept_iteration(false), 31);
-    assert_eq!(reload_over_a_kept_iteration(true), 43);
+fn a_reload_over_an_iteration_a_lagging_branch_reads_is_refused() {
+    assert_eq!(reload_over_a_kept_iteration(false), Ok(31));
+    let refusal = reload_over_a_kept_iteration(true).expect_err("refused");
+    assert!(refusal.contains("fold elements twice"), "{refusal}");
 }
 
 /// [`FOLD`] with an edited program value and the same loop, so a branch built
@@ -1027,28 +1017,22 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
     let (mut ctx, src) = with_src();
     let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
-    live.create_branch(
-        &mut ctx,
-        "child",
-        DEFAULT_BRANCH,
-        FOLD_VALUE_EDITED,
-        &no_main,
-    )
-    .expect("an edit outside the loop is accepted");
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
+    live.create_branch(&mut ctx, "child", MAIN_BRANCH, FOLD_VALUE_EDITED, &no_main)
+        .expect("an edit outside the loop is accepted");
 
     add(&src, 2, &[4]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
-    assert_eq!(x_of(&live, DEFAULT_BRANCH), 7);
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
+    assert_eq!(x_of(&live, MAIN_BRANCH), 7);
     assert_eq!(x_of(&live, "child"), 7, "one store, run once for both");
 
-    live.reload_branch(&mut ctx, "child", FOLD_VALUE_AND_BODY_EDITED, &no_main)
+    live.reload(&mut ctx, "child", FOLD_VALUE_AND_BODY_EDITED, &no_main)
         .expect("a body edit is accepted");
     add(&src, 3, &[8]);
-    pull(&mut ctx, &mut live, DEFAULT_BRANCH);
+    pull(&mut ctx, &mut live, MAIN_BRANCH);
     pull(&mut ctx, &mut live, "child");
     assert_eq!(
-        x_of(&live, DEFAULT_BRANCH),
+        x_of(&live, MAIN_BRANCH),
         7 + 8,
         "main keeps the original store"
     );
@@ -1065,7 +1049,7 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
 fn the_roots_first_version_keeps_nothing() {
     let (mut ctx, _src) = with_src();
     let live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
-    let info = live.render_info(DEFAULT_BRANCH).expect("main exists");
+    let info = live.render_info(MAIN_BRANCH).expect("main exists");
     let versions = info.split("\n\n").nth(1).expect("a versions block");
     assert!(versions.starts_with("1\tkept=0/"), "{versions}");
     assert_eq!(versions.lines().count(), 1, "{versions}");
@@ -1109,7 +1093,7 @@ fn the_driver_pulls_every_branch_and_exits_when_all_have_finished() {
 
     writeln!(input, "L1").expect("write");
     input.flush().expect("flush");
-    std::thread::sleep(Duration::from_millis(400));
+    launched.wait_for_output(&["AL1"], Duration::from_secs(10));
 
     let body = "[\"B\" + line for line in stdin()]\n";
     let reply = raw_http(
@@ -1124,7 +1108,7 @@ fn the_driver_pulls_every_branch_and_exits_when_all_have_finished() {
 
     writeln!(input, "L2").expect("write");
     input.flush().expect("flush");
-    std::thread::sleep(Duration::from_millis(400));
+    launched.wait_for_output(&["AL2", "BL2"], Duration::from_secs(10));
     drop(input);
 
     launched.program.wait_for_exit(Duration::from_secs(10));

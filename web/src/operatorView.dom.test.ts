@@ -151,7 +151,7 @@ describe("OperatorView", () => {
     const { body, pane } = await mountGraph(polymorphic, "post-conversion");
     const boxes = idsOf(body, ".graph-node");
     const suppressed = pane.nodes
-      .filter((n) => n.label === "FanOutBranch" || n.label === "Constant")
+      .filter((n) => n.label === "FanOutSlot" || n.label === "Constant")
       .map((n) => n.nodeId);
     // Something was suppressed, or this fixture would not exercise the rule.
     expect(suppressed.length).toBeGreaterThan(0);
@@ -199,7 +199,7 @@ describe("OperatorView", () => {
   it("selects a suppressed operator from the glyph that replaced it", async () => {
     const { store, body, pane } = await mountGraph(polymorphic, "post-conversion");
     const latest = watchSelection(store);
-    const branch = pane.nodes.find((n) => n.label === "FanOutBranch")!;
+    const branch = pane.nodes.find((n) => n.label === "FanOutSlot")!;
     const glyph = body.querySelector<HTMLElement>(`.graph-glyph[data-node-id="${branch.nodeId}"]`);
     expect(glyph).not.toBeNull();
     glyph!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -425,9 +425,9 @@ describe("a back edge and a late one", () => {
   // body's root.
   const store = paneOf([
     op(1, "InductionStore", [value("body", 3, true)], "Store(UInt)"),
-    op(2, "FanOutBranch", [fan(1)]),
+    op(2, "FanOutSlot", [fan(1)]),
     op(3, "UnionOperator", [value("input", 2)]),
-    op(4, "FanOutBranch", [fan(1)]),
+    op(4, "FanOutSlot", [fan(1)]),
     op(5, "Sink", [value("out", 4)], null),
   ]);
 
@@ -444,11 +444,11 @@ describe("a back edge and a late one", () => {
     const { body, laidOut } = await mountPane(
       paneOf([
         op(1, "InductionStore", [value("body", 6, true)], "Store(UInt)"),
-        op(2, "FanOutBranch", [fan(1)]),
+        op(2, "FanOutSlot", [fan(1)]),
         op(3, "MapResult", [value("input", 2)]),
-        op(6, "FanOutBranch", [fan(3)]),
-        op(7, "FanOutBranch", [fan(3)]),
-        op(4, "FanOutBranch", [fan(1)]),
+        op(6, "FanOutSlot", [fan(3)]),
+        op(7, "FanOutSlot", [fan(3)]),
+        op(4, "FanOutSlot", [fan(1)]),
         op(5, "Sink", [value("out", 4)], null),
         op(8, "Sink", [value("out", 7)], null),
       ]),
@@ -464,8 +464,8 @@ describe("a back edge and a late one", () => {
     const { body, laidOut } = await mountPane(
       paneOf([
         op(1, "InductionStore", [value("body", 2, true)], "Store(UInt)"),
-        op(2, "FanOutBranch", [fan(1)]),
-        op(4, "FanOutBranch", [fan(1)]),
+        op(2, "FanOutSlot", [fan(1)]),
+        op(4, "FanOutSlot", [fan(1)]),
         op(5, "Sink", [value("out", 4)], null),
       ]),
     );
@@ -503,7 +503,7 @@ describe("a constant behind a lone branch", () => {
       kind: "operators",
       nodes: [
         { label: "Constant", nodeId: 1, role: "operator", tiling: "Scalar(Int)", spans: [], rewritten: null, inputs: [] },
-        { label: "FanOutBranch", nodeId: 2, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
+        { label: "FanOutSlot", nodeId: 2, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
           inputs: [{ role: { kind: "named", name: "fan" }, kind: "share", deferred: false, subscribed: 1 }] },
         { label: "MapResult", nodeId: 3, role: "operator", tiling: "SF(Int)", spans: [], rewritten: null,
           inputs: [{ role: { kind: "named", name: "input" }, kind: "value", deferred: false, subscribed: 2 }] },

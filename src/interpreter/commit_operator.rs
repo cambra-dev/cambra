@@ -946,7 +946,7 @@ impl Engines {
     ///
     /// The render walks this tree, so a row the release names whole has to leave the tree in
     /// the same step: dropped from the render alone, the next render would rebuild it from
-    /// the engine still holding it. A row is named whole once every branch of the induction store's
+    /// the engine still holding it. A row is named whole once every slot of the induction store's
     /// `FanOut` names it — the drive for each row it has finished, a per-row reduction for
     /// each row its consumer has taken.
     pub fn remove_covered(&mut self, guard: &TileGuard) {
@@ -1708,7 +1708,7 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
 /// Each writer input — a proposal stream `step → {snap, reads, writes}` with
 /// map-valued read/write sets — is wired after construction via
 /// [`CommitOperator::writer_input_setter`]. That ordering is what allows the
-/// cycle: a writer is built around a branch of the operator's own (store)
+/// cycle: a writer is built around a slot of the operator's own (store)
 /// output, so it reads the store before proposing.
 ///
 /// On each `get` the operator drains every writer's new proposals in writer-index
@@ -1787,7 +1787,7 @@ impl CommitOperator {
     }
 
     /// Wire writer `k`'s input. Call after the operator is boxed, so the writer
-    /// can be built around a branch of the operator's store output (the cycle).
+    /// can be built around a slot of the operator's store output (the cycle).
     pub fn writer_input_setter(&self, k: usize) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
         self.writer_inputs[k].setter()
     }
@@ -2009,7 +2009,7 @@ impl TileProducer for CommitProducer {
         // versions, keeping the carry source a live position reads. A live `AsOf` reader
         // *does* release the prefix below its latched frontier (`AsOfProducer::
         // get_impl`), so a store with a writing endpoint still sheds its
-        // superseded history through this branch — the intersection just also
+        // superseded history through this slot — the intersection just also
         // waits on that reader's own released prefix.
         // Through the end of the prefix the meet covers, not its highest point: a tick the
         // meet skips is still read, and so is everything after it.
@@ -2644,7 +2644,7 @@ impl InductionStoreProducer {
     ///
     /// A nested store's seed streams are keyed by the enclosing positions, so the region is
     /// the rows through `decided`'s, each opened and reading its seed no more. The streams
-    /// are shared with the drive's reseeds, and a `FanOut` passes on only what every branch
+    /// are shared with the drive's reseeds, and a `FanOut` passes on only what every slot
     /// has released, so a store holding them would pin the seed stream for the whole run.
     /// An induction store with no rows above it reads one seed, whole, and releases it when the
     /// body goes terminal.
@@ -2976,7 +2976,7 @@ impl TileProducer for InductionStoreProducer {
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // Changelog GC (mirrors [`CommitProducer::release_impl`]). The store sits behind a
-        // `FanOut`, so this guard is the **meet** of what every branch has released — the
+        // `FanOut`, so this guard is the **meet** of what every slot has released — the
         // drive, the dense and tap reads, a settled read — and so the region safe to
         // reclaim. `gc_released_prefix` keeps the carry source a position can still fold
         // back to, including the one the drive folds at the frontier, so the GC never
@@ -3253,8 +3253,8 @@ impl TileProducer for StoreValueStreamProducer {
         // re-emit a merged prefix — a re-fold that unions this tap at a later
         // frontier would otherwise duplicate a position through the `Memo` merge)
         // AND forward that prefix upstream to the store: a consumer that merged
-        // commits `≤ max_tick` no longer needs them, so this read branch releases
-        // them. The store reclaims a version only once *every* branch (this reader,
+        // commits `≤ max_tick` no longer needs them, so this read slot releases
+        // them. The store reclaims a version only once *every* slot (this reader,
         // the writers) has released it — the cyclic `FanOut` intersects — so
         // forwarding here is safe and is what lets a long-lived collection log shed
         // its merged prefix. A terminal (`True`) release covers the whole
@@ -3294,7 +3294,7 @@ pub struct StoreFinalRead {
     /// terminal read is one value per row, not a stream, and a collection-valued key's value
     /// is handed out as a level, the way every other store read hands it out ([`read_tiling`]).
     base: OperatorBase,
-    /// The commit store (a [`Tile::Store`] fan branch).
+    /// The commit store (a [`Tile::Store`] fan slot).
     store_op: Box<dyn TileOperator>,
     /// The key whose settled value this reads.
     key: Value,
@@ -3403,7 +3403,7 @@ impl TileProducer for StoreFinalReadProducer {
         // Release through the frontier. This read wants the key's value as the store
         // stands, and `gc_released_prefix` keeps each key's carry source where nothing above
         // the boundary supersedes it, so the fold below is never stranded. Without this
-        // release the `FanOut`'s meet cannot advance past this branch until the read retires,
+        // release the `FanOut`'s meet cannot advance past this slot until the read retires,
         // which holds every version of every key for the length of the loop.
         if let Some(frontier) = store_frontier(&store) {
             let levels = path_levels(self.store_producer.tiling());
@@ -3447,7 +3447,7 @@ impl TileProducer for StoreFinalReadProducer {
             return;
         }
         // A universal release from the one consumer of a scalar retires this read, and
-        // releasing the store branch with it is safe: every other reader of the store
+        // releasing the store slot with it is safe: every other reader of the store
         // holds its own guard through the fan, which the fan intersects, so the store
         // reclaims a version only once all of them have released it too.
         if obsolete_guard.is_universal() {
@@ -3523,7 +3523,7 @@ impl StoreFinalReadProducer {
 pub struct StoreDenseRead {
     /// Output tiling [`read_tiling`] over `D`.
     base: OperatorBase,
-    /// The induction store (a [`Tile::Store`] fan branch).
+    /// The induction store (a [`Tile::Store`] fan slot).
     store_op: Box<dyn TileOperator>,
     /// The key to project.
     key: Value,
@@ -3917,7 +3917,7 @@ impl TileProducer for StoreDenseReadProducer {
 /// position is first observed.
 ///
 /// `trigger : Fun(B, _)` (e.g. an HTTP request stream), `source` the shared
-/// commit store (a [`Tile::Store`] fan branch), output `Fun(B, V)` — `key`'s
+/// commit store (a [`Tile::Store`] fan slot), output `Fun(B, V)` — `key`'s
 /// value as of each trigger position. This is **every fed-out mutable variable read**, not
 /// only the live one: each reading transaction sees the store as of where it lands
 /// in the commit order. The HTTP case ("a request arriving now sees the store as
@@ -3999,7 +3999,7 @@ pub struct AsOf {
     base: OperatorBase,
     /// The trigger stream `Fun(B, _)` — drives one output position each.
     trigger: Box<dyn TileOperator>,
-    /// The shared commit store (a [`Tile::Store`] fan branch) — the sampled
+    /// The shared commit store (a [`Tile::Store`] fan slot) — the sampled
     /// key(s)' current value(s) are latched per trigger position.
     source: Box<dyn TileOperator>,
     /// What to sample and emit — a single mutable variable or a whole snapshot record.
@@ -4263,7 +4263,7 @@ impl TileProducer for AsOfProducer {
         // Release the store *below* the decided frontier. AsOf needs only the
         // current snapshot — a future trigger latches the latest-as-of-its-time,
         // which is `>=` this — so the prefix is dead. Releasing it on this store
-        // fan branch is what lets a live store reclaim superseded history:
+        // fan slot is what lets a live store reclaim superseded history:
         // `CommitProducer` GCs the `FanOut`-intersected prefix. The
         // release names the last change strictly below the frontier, so the frontier's
         // own change survives and the fold still finds each key's value.
@@ -5177,7 +5177,7 @@ impl InductionDriverProducer {
         // carry source a live position reads inside a released prefix — so releasing
         // through the frontier never strands the fold, and without it the store's
         // `FanOut`-intersected release watermark could never advance past this cycle
-        // branch and the changelog would grow with the loop.
+        // slot and the changelog would grow with the loop.
         if let Some(frontier) = frontier {
             let levels = path_levels(self.store_producer.tiling());
             self.store_producer
@@ -5627,7 +5627,7 @@ impl TileProducer for InductionDriverProducer {
 /// advances on the **commit-ack**, delivered as a release — but a release from
 /// the body alone would be wrong, because a body releases a row the moment it
 /// consumes it, long before the attempt commits. The driver therefore sits behind
-/// a `FanOut` with two branches, the body and [`TransactWriter`], and reads the
+/// a `FanOut` with two slots, the body and [`TransactWriter`], and reads the
 /// **intersection**: the body has consumed the row *and* the writer has finished
 /// the attempt. Without that the driver would advance past an item still in
 /// flight, or re-propose one that already committed — an attempt is emitted once
@@ -5984,7 +5984,7 @@ impl TileProducer for TransactDriverProducer {
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // The commit-ack — but only because this producer sits behind a `FanOut`
-        // whose branches are the body and the writer, so what arrives here is
+        // whose slots are the body and the writer, so what arrives here is
         // their **intersection**. The body releases a row as soon as it has
         // *consumed* it, which is not an ack; the writer releases it when the
         // attempt has *finished* (committed, or denied without proposing). The
@@ -6380,7 +6380,7 @@ fn decision_at_index(
 /// **stable, append-only** proposal stream (positions never shift), exactly like
 /// the hand-written `TokenWriter`. Fusing is load-bearing: a writer split across
 /// fanned operators desyncs, because the `FanOut` compacts released positions
-/// per-branch and the proposal positions would re-index out from under the
+/// per-slot and the proposal positions would re-index out from under the
 /// `CommitProducer`'s cursor.
 ///
 /// Each pull: take the newest live position from the [`TransactDriver`] — which built
@@ -6392,7 +6392,7 @@ pub struct TransactWriter {
     base: OperatorBase,
     store_op: Box<dyn TileOperator>,
     body_op: Box<dyn TileOperator>,
-    /// A second branch of the [`TransactDriver`] the body reads. The writer pulls
+    /// A second slot of the [`TransactDriver`] the body reads. The writer pulls
     /// it to learn which attempt is in flight, and **releases** it to ack the
     /// attempt's finish — the half of the driver's release intersection that a
     /// body's consume-release cannot supply.
@@ -6458,7 +6458,7 @@ impl TileOperator for TransactWriter {
         // passed it). What the writer does need is for the driver's wakeups and
         // live arrivals to *reach* it, and through it the commit cycle and any
         // sink reading a store key or `__to_<defer>` tap — that is the forwarding
-        // consumer on its driver branch below. The store and body inputs need no
+        // consumer on its driver slot below. The store and body inputs need no
         // notification: the writer pulls them on demand, and forwarding the
         // cyclic store would loop.
         let consumer = shared_consumer(consumer);
@@ -6527,7 +6527,7 @@ struct TransactWriterProducer {
     base: ProducerBase,
     store_producer: Box<dyn TileProducer>,
     body_producer: Box<dyn TileProducer>,
-    /// The driver branch this writer acks on (see [`TransactWriter::driver_op`]).
+    /// The driver slot this writer acks on (see [`TransactWriter::driver_op`]).
     driver_producer: Box<dyn TileProducer>,
     read_keys: Vec<Value>,
     write_keys: Vec<Value>,
@@ -6609,7 +6609,7 @@ impl TransactWriterProducer {
     /// Ack every attempt at or below `pos` — issued when an attempt finishes: a
     /// deny (no proposal to commit) or a commit-ack on the proposal it produced.
     ///
-    /// It releases both driver branches this writer controls: its **own**, which
+    /// It releases both driver slots this writer controls: its **own**, which
     /// is the half of the driver's release intersection meaning "finished" (the
     /// body's half only means "consumed"), and the body's decision prefix, which
     /// bounds the body sub-operator's caches. Positions are absolute, so the
@@ -6708,7 +6708,7 @@ impl TileProducer for TransactWriterProducer {
         // `<<` commit (a collection store starts with no element).
         let snapshot = store_frontier(&store_tile);
         // Read each key's current value *and* the tick it was decided at — the
-        // tick bounds this writer's store-branch release below.
+        // tick bounds this writer's store-slot release below.
         let olds_at: Vec<Option<(Position, Value)>> = self
             .read_keys
             .iter()
@@ -6718,8 +6718,8 @@ impl TileProducer for TransactWriterProducer {
             .iter()
             .map(|o| o.as_ref().map(|(_, v)| v.clone()))
             .collect();
-        // Store-branch GC release. The store reclaims a committed version only
-        // once *every* consumer branch has released it (the cyclic `FanOut`
+        // Store-slot GC release. The store reclaims a committed version only
+        // once *every* consumer slot has released it (the cyclic `FanOut`
         // intersects the release guards; `gc_released_prefix` then drops the
         // released prefix, keeping the carry source a live position reads — the
         // carry-forward value a scalar read still needs). Two writer shapes
@@ -6739,7 +6739,7 @@ impl TileProducer for TransactWriterProducer {
         //    and pinned the commit log unbounded for its lifetime.
         //
         // A full-render `AsOf` reader (a live cross-endpoint read) still releases
-        // nothing on its own branch, so the intersection — hence GC — stays
+        // nothing on its own slot, so the intersection — hence GC — stays
         // pinned while it is live; that is correct, as it may answer an as-of
         // query at any past request position.
         let release_through: Option<Position> = if self.read_keys.is_empty() {
@@ -6767,7 +6767,7 @@ impl TileProducer for TransactWriterProducer {
             .body_producer
             .get(self.body_producer.tiling().universal_guard());
         // The attempt to decide is the newest live position on this writer's own
-        // driver branch — the row the driver emitted for `(current, frontier)` this
+        // driver slot — the row the driver emitted for `(current, frontier)` this
         // pull, or the one still in flight from an earlier one. Reading it here
         // rather than counting positions independently keeps the writer and the
         // driver from inventing two numberings that could drift.
@@ -6792,7 +6792,7 @@ impl TileProducer for TransactWriterProducer {
             "the driver's newest position {newest:?} went backwards past the decided watermark {:?}",
             self.last_decided_pos
         );
-        // Reclaim what supersession abandons, on this writer's driver branch. Every
+        // Reclaim what supersession abandons, on this writer's driver slot. Every
         // live position below `newest` is dead by the paragraph above, and saying so
         // *here* is what keeps a contended item's cost flat: without it the driver's
         // window grows one row per retry, and since the body re-renders its whole
@@ -7382,7 +7382,7 @@ mod tests {
         let source = FilteredLiveSource::new(&[10, 20]);
         let released = source.released.clone();
         let driver = InductionDriver::new(
-            fan.branch(),
+            fan.slot(),
             Box::new(source),
             None,
             vec![acc.clone()],
@@ -7392,7 +7392,7 @@ mod tests {
             None,
         );
         set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
-        let mut op = fan.branch();
+        let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -7573,7 +7573,7 @@ mod tests {
     }
 
     /// Wire a single-accumulator induction cycle: store → body → driver → cyclic
-    /// fan → store. Returns the fan (its branches are the store's readers) and
+    /// fan → store. Returns the fan (its slots are the store's readers) and
     /// the accumulator key.
     fn induction_cycle(items: &[i64], threshold: i64, init: i64) -> (Rc<FanOut>, Value) {
         let acc = acct("acc");
@@ -7591,7 +7591,7 @@ mod tests {
         let set_body = store.body_input_setter();
         let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
         let driver = InductionDriver::new(
-            fan.branch(),
+            fan.slot(),
             Box::new(ItemSource::new(items)),
             None,
             vec![acc.clone()],
@@ -7624,7 +7624,7 @@ mod tests {
     /// the tile protocol and return the converged store tile.
     fn drive_induction(items: &[i64], threshold: i64, init: i64) -> Tile {
         let (fan, _acc) = induction_cycle(items, threshold, init);
-        let mut op = fan.branch();
+        let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -7682,7 +7682,7 @@ mod tests {
     #[test]
     fn induction_store_release_bounds_changelog_keeping_latest() {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 10); // unconditional
-        let mut op = fan.branch();
+        let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -7718,7 +7718,7 @@ mod tests {
     /// extent via `StoreDenseRead`; return the dense `Fun(D, V)` values in order.
     fn dense_read(items: &[i64], threshold: i64, init: i64) -> Vec<i64> {
         let (fan, acc) = induction_cycle(items, threshold, init);
-        let mut reader = StoreDenseRead::new(fan.branch(), acc, value_extent(), true);
+        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -7806,7 +7806,7 @@ mod tests {
     fn carry_dense_reader_does_not_over_release_store() {
         // Writes iff `item > 3`: over [5, 1, 1, 9] that fires at positions 0 and 3.
         let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
-        let mut reader = StoreDenseRead::new(fan.branch(), acc, value_extent(), true);
+        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -7854,7 +7854,7 @@ mod tests {
 
     /// Records the domain-release watermarks a producer receives — lets a test
     /// observe what `StoreDenseRead` forwards to the store *without* a second
-    /// FanOut branch (which would perturb GC via the release intersection).
+    /// FanOut slot (which would perturb GC via the release intersection).
     /// A guard naming a row whole takes that row's store out of the tree, and leaves a
     /// row it names only part of alone. This is what keeps the render and the engines
     /// saying the same thing: the render walks the tree, so a row dropped here is a row
@@ -7891,7 +7891,7 @@ mod tests {
     #[test]
     fn a_released_prefix_does_not_strand_a_live_carry() {
         let (fan, acc) = induction_cycle(&[5, 1, 1, 9], 3, 0);
-        let mut reader = StoreDenseRead::new(fan.branch(), acc, value_extent(), true);
+        let mut reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -8551,7 +8551,7 @@ mod tests {
     /// `key`: each pull it folds the store to read `key`'s value and proposes
     /// `value + 1`, reporting the frontier it observed as its snapshot. Appends
     /// one proposal per pull, up to `n` steps. It reads the store through its
-    /// `store_op` input — which, in the cycle, is a branch of the commit
+    /// `store_op` input — which, in the cycle, is a slot of the commit
     /// operator's own output.
     struct CounterBody {
         tiling: Tiling,
@@ -8647,11 +8647,11 @@ mod tests {
         let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_writer = commit.writer_input_setter(0);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
-        // The body reads a branch of the store (the operator's own output).
-        let body = CounterBody::new(store_fan.branch(), acct("n"), 3);
+        // The body reads a slot of the store (the operator's own output).
+        let body = CounterBody::new(store_fan.slot(), acct("n"), 3);
         set_writer(Box::new(body));
 
-        let mut external = store_fan.branch();
+        let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -8758,7 +8758,7 @@ mod tests {
         for (items, set_writer) in draws.iter().zip(setters) {
             let observation = Rc::new(RefCell::new(DriverObservation::default()));
             let driver = TransactDriver::new(
-                store_fan.branch(),
+                store_fan.slot(),
                 Box::new(ItemSource::new(items)),
                 vec![pool.clone()],
                 vec![value_extent()],
@@ -8777,11 +8777,11 @@ mod tests {
             // release intersection. Without it the intersection would be the
             // writer's ack alone, and a superseded row could not be reclaimed
             // before its item finished.
-            let body = AddIfBody::new(Box::new(Memo::new(driver_fan.branch())), i64::MIN, "pool");
+            let body = AddIfBody::new(Box::new(Memo::new(driver_fan.slot())), i64::MIN, "pool");
             set_writer(Box::new(TransactWriter::new(
-                store_fan.branch(),
+                store_fan.slot(),
                 Box::new(body),
-                driver_fan.branch(),
+                driver_fan.slot(),
                 vec![pool.clone()],
                 vec![pool.clone()],
                 Vec::new(),
@@ -8818,7 +8818,7 @@ mod tests {
         let draws: Vec<&[i64]> = vec![&[-1]; WRITERS];
         let (store_fan, seen) = contending_writer_cycle(100, &draws);
 
-        let mut external = store_fan.branch();
+        let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -9059,17 +9059,17 @@ mod tests {
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(TokenWriter::new(
-            store_fan.branch(),
+            store_fan.slot(),
             acct("pool"),
             vec![70],
         )));
         set_b(Box::new(TokenWriter::new(
-            store_fan.branch(),
+            store_fan.slot(),
             acct("pool"),
             vec![50],
         )));
 
-        let mut external = store_fan.branch();
+        let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -9106,17 +9106,17 @@ mod tests {
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(TokenWriter::new(
-            store_fan.branch(),
+            store_fan.slot(),
             acct("pool"),
             vec![70, 40],
         )));
         set_b(Box::new(TokenWriter::new(
-            store_fan.branch(),
+            store_fan.slot(),
             acct("pool"),
             vec![50, 30],
         )));
 
-        let mut external = store_fan.branch();
+        let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -9139,7 +9139,7 @@ mod tests {
     /// covers `t`, and is empty (non-terminal) until then. Folding `state_as_of`
     /// at `t` walks past ticks that wrote *other* keys (decided-absent for this
     /// key) — the multi-key store is where that fold does real work. Reads the
-    /// store through a branch of the commit operator's output; pulling it also
+    /// store through a slot of the commit operator's output; pulling it also
     /// drives the cycle.
     struct StoreReadAsOf {
         tiling: Tiling,
@@ -9230,9 +9230,9 @@ mod tests {
         let commit = CommitOperator::new(init.clone(), keyed_like(&init), writes);
         let set_writer = commit.writer_input_setter(0);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
-        set_writer(Box::new(CounterBody::new(store_fan.branch(), acct("n"), 3)));
+        set_writer(Box::new(CounterBody::new(store_fan.slot(), acct("n"), 3)));
 
-        let mut reader = StoreReadAsOf::new(store_fan.branch(), acct("n"), 2);
+        let mut reader = StoreReadAsOf::new(store_fan.slot(), acct("n"), 2);
         let guard = reader.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -9347,7 +9347,7 @@ mod tests {
     }
 
     /// Drive a two-writer bank cycle to a fixpoint and return the final store
-    /// tile (the external store branch).
+    /// tile (the external store slot).
     fn run_bank_cycle(
         init: HashMap<Value, Value>,
         a: Vec<(Value, Value, i64)>,
@@ -9359,10 +9359,10 @@ mod tests {
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
         let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
-        set_a(Box::new(BankWriter::new(store_fan.branch(), a)));
-        set_b(Box::new(BankWriter::new(store_fan.branch(), b)));
+        set_a(Box::new(BankWriter::new(store_fan.slot(), a)));
+        set_b(Box::new(BankWriter::new(store_fan.slot(), b)));
 
-        let mut external = store_fan.branch();
+        let mut external = store_fan.slot();
         let guard = external.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = external.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -9633,7 +9633,7 @@ mod tests {
     ///
     /// It reads the key's value as the store *stands*, so it needs the latest write and
     /// nothing before it. The store's release watermark is the `FanOut` intersection over
-    /// its readers, so a reader that holds its branch until it retires keeps every version
+    /// its readers, so a reader that holds its slot until it retires keeps every version
     /// of every key for the length of the run — measured at 180 retained entries over a
     /// 90-position loop against 4 with this release.
     #[test]
@@ -10082,7 +10082,7 @@ mod tests {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 0); // unconditional
         let mut sched = Scheduler::new();
         let subscribe = |sched: &mut Scheduler| {
-            let reader = StoreDenseRead::new(fan.branch(), acc.clone(), value_extent(), true);
+            let reader = StoreDenseRead::new(fan.slot(), acc.clone(), value_extent(), true);
             let mut memo = Memo::new(Box::new(reader));
             let guard = memo.tiling().universal_guard();
             memo.subscribe(guard, Box::new(|| {}), sched)
@@ -10155,7 +10155,7 @@ mod tests {
     #[test]
     fn a_memo_over_a_live_dense_read_caches_only_decided_positions() {
         let (fan, acc) = induction_cycle(&[1, 2, 3], i64::MIN, 0); // unconditional
-        let reader = StoreDenseRead::new(fan.branch(), acc, value_extent(), true);
+        let reader = StoreDenseRead::new(fan.slot(), acc, value_extent(), true);
         let mut memo = Memo::new(Box::new(reader));
         let guard = memo.tiling().universal_guard();
         let mut sched = Scheduler::new();
@@ -10526,7 +10526,7 @@ mod tests {
         let set_body = store.body_input_setter();
         let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
         let driver = InductionDriver::new(
-            fan.branch(),
+            fan.slot(),
             Box::new(ItemSource::new(&items)),
             None,
             vec![acc.clone()],
@@ -10536,7 +10536,7 @@ mod tests {
             None,
         );
         set_body(Box::new(AddIfBody::new(Box::new(driver), i64::MIN, "acc")));
-        let mut op = fan.branch();
+        let mut op = fan.slot();
         let guard = op.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut sched);
@@ -10600,7 +10600,7 @@ mod tests {
     #[test]
     fn a_reclaim_stops_at_the_first_position_still_read() {
         let (fan, _acc) = induction_cycle(&[1, 2, 3, 4], i64::MIN, 0);
-        let mut reader = fan.branch();
+        let mut reader = fan.slot();
         let guard = reader.tiling().universal_guard();
         let mut sched = Scheduler::new();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut sched);

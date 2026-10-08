@@ -16,7 +16,7 @@ use cambra::{
             window_tail,
         },
     },
-    live_program::{DEFAULT_BRANCH, LiveProgram},
+    live_program::{LiveProgram, MAIN_BRANCH},
 };
 use log::debug;
 
@@ -53,7 +53,7 @@ fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {
     producer.release(release_guard);
     // Producers can return empty tiles, but still have more data.
     if !tile_is_empty(&tile) || done {
-        if branch == DEFAULT_BRANCH {
+        if branch == MAIN_BRANCH {
             println!("Got value: {tile:#?}");
         } else {
             println!("Got value from {branch}: {tile:#?}");
@@ -98,7 +98,9 @@ fn run_program(
     // `src/inspector_model/design.md`, "A reload is not followed".
     let mut inspection = match inspect_port {
         Some(port) => {
-            let program = live.program().expect("the process starts with `main`");
+            let program = live
+                .program(MAIN_BRANCH)
+                .expect("the process starts with `main`");
             match serve_compiled(program, src_name, port) {
                 Ok(channel) => Some(Inspection::new(
                     channel,
@@ -146,7 +148,7 @@ fn run_program(
         if let Some(inspection) = inspection.as_mut() {
             inspection.publish(&sources);
         }
-        if live.finished() {
+        if live.poll_finished() {
             break;
         }
         // A `main` output is pulled as soon as it is notified, so while one is

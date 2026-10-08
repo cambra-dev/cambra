@@ -34,7 +34,7 @@ use crate::{
         Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
         http_server::SharedHttpServer,
         operator_conversion::{
-            ConversionError, Inheritance, OpConversionContext, convert_outputs_to_operators,
+            ConversionError, OpConversionContext, OperatorMap, convert_outputs_to_operators,
             convert_to_operators,
         },
         operator_graph::{BoundarySession, OperatorGraph, assert_graph_invariants},
@@ -692,11 +692,13 @@ impl GlobalContext {
     /// conversion context.
     ///
     /// Call once the reloaded branch's graph has been torn down. Each operator
-    /// the record holds is offered by the node it was built from, and its fan is
-    /// reopened for the replacement to subscribe to ([`Inheritance::handover`]).
-    /// The record itself is read and left as it was: for branch-and-reload it is
-    /// the parent's entry, which stays the parent's, and for a reload it is the
-    /// branch's own, which the branch replaces once the compile is done.
+    /// the map holds is offered by the node it was built from
+    /// ([`OperatorMap::handover`]). Every fan the map holds is reopened, which
+    /// drops its dead slots and resets its `inspect` bookkeeping; its live slots
+    /// and their guards stay. The map lists the same operators afterwards: for
+    /// branch-and-reload it is the parent's, which stays the parent's, and for a
+    /// reload it is the branch's own, which the branch replaces once the compile
+    /// is done.
     ///
     /// The scheduler's *subscriptions* need no attention here: they are weak and
     /// owned by the producers that made them, so dropping the graph prunes
@@ -705,15 +707,15 @@ impl GlobalContext {
     /// strong and outlives every version, which is what a source outliving the
     /// program reading it means; that handle goes when the route behind it is
     /// retired ([`Scheduler::forget_source`]).
-    pub fn offer_predecessor(&mut self, predecessor: &Inheritance) {
+    pub fn offer_predecessor(&mut self, predecessor: &OperatorMap) {
         self.conversion = OpConversionContext::new();
         self.conversion.inherit(predecessor.handover());
     }
 
-    /// The record of what the last compilation built and kept, for the branch
-    /// that runs it to hold ([`OpConversionContext::take_record`]).
-    pub fn take_record(&mut self) -> Inheritance {
-        self.conversion.take_record()
+    /// The operator map of what the last compilation built and kept, for the
+    /// branch that runs it to hold ([`OpConversionContext::take_operator_map`]).
+    pub fn take_operator_map(&mut self) -> OperatorMap {
+        self.conversion.take_operator_map()
     }
 
     /// Stop serving every route `still_bound` does not name, and release the
@@ -759,7 +761,7 @@ impl GlobalContext {
     ///
     /// `predecessor` is the record the reload would offer: the branch's own
     /// entry, or the parent's for branch-and-reload.
-    pub fn state_conflicts(&self, predecessor: &Inheritance, planned: &Expr) -> Vec<StateConflict> {
+    pub fn state_conflicts(&self, predecessor: &OperatorMap, planned: &Expr) -> Vec<StateConflict> {
         self.conversion.state_conflicts(predecessor, planned)
     }
 
@@ -769,7 +771,7 @@ impl GlobalContext {
     /// ([`CompiledProgram::ast`]).
     pub fn unreadable_inputs(
         &self,
-        predecessor: &Inheritance,
+        predecessor: &OperatorMap,
         previous: &Expr,
         planned: &Expr,
     ) -> Vec<UnreadablePrefix> {
@@ -1043,8 +1045,8 @@ pub struct CompiledProgram {
     /// The name of every producer this compilation registered with a data
     /// source. Every one is new, since a kept operator's chain was subscribed by
     /// the compilation that built it; the producers under a kept operator are
-    /// read off its fan-out instead ([`Inheritance::source_readers`]).
-    pub source_readers: HashSet<String>,
+    /// read off its fan-out instead ([`OperatorMap::source_producers`]).
+    pub source_producers: HashSet<String>,
 }
 
 impl CompiledProgram {
@@ -2419,7 +2421,7 @@ fn compile_version(
     // running it can say which producers it holds. Opened before conversion in
     // case an operator subscribes while being built, and closed once every
     // output has subscribed.
-    ctx.scheduler().begin_source_readers();
+    ctx.scheduler().begin_source_producers();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
         if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
@@ -2430,13 +2432,13 @@ fn compile_version(
     })
     .errs()
     .inspect_err(|_| {
-        ctx.scheduler().end_source_readers();
+        ctx.scheduler().end_source_producers();
     })?;
     // Conversion is over, so what the retired version offered and this one did
     // not take is released here. Holding it any longer keeps the producers under
     // a rebuilt operator alive, and a source goes on retaining data for a
     // producer nobody reads.
-    ctx.conversion_ctx().release_inheritance();
+    ctx.conversion_ctx().release_offer();
     // Before the subscribe loop below: `subscribe` takes every `CycleSlot` and
     // every store's keyed inputs, so an operator asked for its inputs afterwards
     // would answer without them.
@@ -2515,8 +2517,8 @@ fn compile_version(
         }
     }
 
-    let source_readers: HashSet<String> =
-        ctx.scheduler().end_source_readers().into_iter().collect();
+    let source_producers: HashSet<String> =
+        ctx.scheduler().end_source_producers().into_iter().collect();
     let provenance_table = table_session.into_table();
 
     let program = CompiledProgram {
@@ -2533,7 +2535,7 @@ fn compile_version(
         operator_graph,
         source: code.to_string(),
         routes,
-        source_readers,
+        source_producers,
     };
 
     // Every compile its own gate — see `provenance_gate_every_compile` for why this

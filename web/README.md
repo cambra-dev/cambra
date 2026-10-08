@@ -164,7 +164,7 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
   are boxes, edges run producer to consumer, and the feedback edges are withheld
   from the layout and bowed out as back edges.
 - `graph/model.ts` — what that pane draws, derived from the wire. A
-  `FanOutBranch` and a single-consumer `Constant` are suppressed, the first onto
+  `FanOutSlot` and a single-consumer `Constant` are suppressed, the first onto
   the edge that replaced it and the second into the operator that reads it.
   Every suppressed id stays addressable: `viewItem` answers which element draws
   it, because a pane link may name any node on the wire.

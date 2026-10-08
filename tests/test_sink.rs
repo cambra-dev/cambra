@@ -9,11 +9,10 @@ use std::rc::Rc;
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{GlobalContext, compile_program, render_errors};
-use cambra::chl_parser::SourceMap;
 use cambra::interpreter::{
     BaseType, Consumer, Extent, Predicate, SinkReadError, TestDataSource, Value,
 };
-use cambra::live_program::LiveProgram;
+use cambra::live_program::{LiveProgram, MAIN_BRANCH};
 use indoc::{formatdoc, indoc};
 
 /// Run `source` to completion and answer what it wrote to each named sink.
@@ -26,7 +25,7 @@ fn observe(source: &str, names: &[&str]) -> Vec<Result<Value, SinkReadError>> {
     let mut ctx = GlobalContext::default();
     let sinks: Vec<_> = names.iter().map(|n| ctx.register_test_sink(*n)).collect();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let program = match compile_program(&mut ctx, &SourceMap::single("<test>", source), consumer) {
+    let program = match compile_program(&mut ctx, source, consumer) {
         Ok(p) => p,
         Err(e) => panic!("compile failed: {e:?}"),
     };
@@ -52,7 +51,7 @@ fn compile_error(source: &str, names: &[&str]) -> String {
         ctx.register_test_sink(*name);
     }
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    match compile_program(&mut ctx, &SourceMap::single("<test>", source), consumer) {
+    match compile_program(&mut ctx, source, consumer) {
         Ok(_) => String::new(),
         Err(errs) => format!("{errs:?}"),
     }
@@ -390,7 +389,7 @@ fn a_sink_name_bound_before_its_declaration_is_rejected_there() {
     let err = compile_error(source, &["out"]);
     assert!(
         err.contains("`out` is a sink, so it cannot be bound again")
-            && err.contains("span: Span { file: FileId(0), start: 0, end: 9 }"),
+            && err.contains("span: Span { start: 0, end: 9 }"),
         "expected the refusal at `out = [5]`, got: {err}"
     );
 }
@@ -481,7 +480,7 @@ fn a_sink_accumulates_across_two_deliveries() {
         for x in nums():
             out << x * 10
     "#};
-    let program = match compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer) {
+    let program = match compile_program(&mut ctx, code, consumer) {
         Ok(p) => p,
         Err(e) => panic!("compile failed: {e:?}"),
     };
@@ -541,12 +540,7 @@ fn a_sink_accumulates_across_a_reload() {
         }
     };
 
-    let mut live = LiveProgram::start(
-        &mut ctx,
-        &SourceMap::single("<test>", version(10)),
-        &consumer,
-    )
-    .expect("v1 compiles");
+    let mut live = LiveProgram::start(&mut ctx, &version(10), &consumer).expect("v1 compiles");
     src.borrow_mut().add_data(&[
         (Value::UInt(0), Value::Int(1)),
         (Value::UInt(1), Value::Int(2)),
@@ -555,12 +549,8 @@ fn a_sink_accumulates_across_a_reload() {
         .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
     pump(&mut ctx);
 
-    live.reload(
-        &mut ctx,
-        &SourceMap::single("<test>", version(100)),
-        &consumer,
-    )
-    .expect("v2 replaces v1");
+    live.reload(&mut ctx, MAIN_BRANCH, &version(100), &consumer)
+        .expect("v2 replaces v1");
     src.borrow_mut().add_data(&[
         (Value::UInt(2), Value::Int(3)),
         (Value::UInt(3), Value::Int(4)),
@@ -569,7 +559,7 @@ fn a_sink_accumulates_across_a_reload() {
     let mut completed = false;
     for _ in 0..200 {
         ctx.scheduler().check_for_notifications();
-        if live.finished() {
+        if live.poll_finished() {
             completed = true;
             break;
         }
@@ -607,13 +597,12 @@ fn a_collection_fed_from_inside_a_loop_does_not_compile() {
     let mut ctx = GlobalContext::default();
     ctx.register_test_sink("out");
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", source);
-    let Err(errs) = compile_program(&mut ctx, &sources, consumer) else {
+    let Err(errs) = compile_program(&mut ctx, source, consumer) else {
         panic!("expected a compile error");
     };
     // One refusal, pointing at the first element that reads the loop variable.
     assert_eq!(errs.len(), 1, "{errs:?}");
-    let rendered = render_errors(&errs, &sources);
+    let rendered = render_errors(&errs, "<test>", source);
     assert!(
         rendered.contains("a list element must be a constant, but this one varies with `x`"),
         "{rendered}"

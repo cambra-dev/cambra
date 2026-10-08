@@ -2,7 +2,7 @@
 //! several versions of it side by side as branches.
 //!
 //! A [`LiveProgram`] is the process's branch table: a named entry per branch,
-//! each holding its version number, its branch provenance, its compiled version
+//! each holding its version number, its branch origin, its compiled version
 //! and the operators that version runs
 //! (`src/ccl/design/program-evolution.md`, "The branch table"). A reload swaps
 //! one branch's version for its next; the new version inherits that branch's
@@ -56,9 +56,10 @@ use crate::ccl::{
     },
     diff::diff,
 };
+use crate::control_port::phase_spelling;
 use crate::interpreter::{
     Consumer, Value,
-    operator_conversion::{Inheritance, ReuseTally, StateConflict, UnreadablePrefix, VarPath},
+    operator_conversion::{OperatorMap, ReuseTally, StateConflict, UnreadablePrefix, VarPath},
     tile_operators::{FanOut, TileProducer},
 };
 
@@ -67,7 +68,7 @@ use crate::interpreter::{
 /// the binary's driver. The process starts with a branch of this name, and the
 /// name means whichever branch holds it, so once that branch is deleted a
 /// branch created under the name takes its place.
-pub const DEFAULT_BRANCH: &str = "main";
+pub const MAIN_BRANCH: &str = "main";
 
 /// Builds the consumer that wakes the driver for a program's `main` output.
 ///
@@ -89,23 +90,23 @@ pub fn is_branch_name(name: &str) -> bool {
 /// Recorded once, at creation, and read by no reload, so it can name a version
 /// its parent has since replaced or a branch since deleted.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Provenance {
+pub struct Origin {
     pub parent: String,
     pub version: u64,
 }
 
-impl fmt::Display for Provenance {
+impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}@{}", self.parent, self.version)
     }
 }
 
-/// One branch's entry: its branch provenance, its version number, its version,
+/// One branch's entry: its branch origin, its version number, its version,
 /// and the operators it holds.
 struct Branch {
     name: String,
     /// `None` for the root, which was not created by branch-and-reload.
-    provenance: Option<Provenance>,
+    origin: Option<Origin>,
     /// The current version's number.
     version: u64,
     /// Every version this entry has installed, from the one it was created at,
@@ -127,9 +128,9 @@ struct Branch {
     /// [`CompiledProgram::done`] fires once.
     sinks_done: bool,
     /// The operators this branch holds, by the node of its version's tree each
-    /// was built from. An operator lives as long as some entry's record holds
-    /// it.
-    record: Inheritance,
+    /// was built from. An operator lives as long as some entry's operator map
+    /// holds it.
+    operator_map: OperatorMap,
 }
 
 impl Branch {
@@ -138,10 +139,10 @@ impl Branch {
     /// the operators its record holds. What a source's start for a replacement's
     /// new producers is taken from (`src/ccl/design/program-evolution.md`,
     /// "Routes across branches").
-    fn source_readers(&self) -> HashSet<String> {
-        let mut readers = self.record.source_readers();
-        readers.extend(self.program.source_readers.iter().cloned());
-        readers
+    fn source_producers(&self) -> HashSet<String> {
+        let mut producers = self.operator_map.source_producers();
+        producers.extend(self.program.source_producers.iter().cloned());
+        producers
     }
 
     /// Drop this version's subscriptions, keeping the tree it was built from.
@@ -153,12 +154,12 @@ impl Branch {
     /// to sinks the next version now owns
     /// ([`SinkConsumer::detach`](crate::interpreter::SinkConsumer::detach)).
     ///
-    /// Every sink consumer is detached. The ownership rule is that a branch
-    /// detaches only the sink consumers no other entry holds, and a sink
-    /// consumer is built by the compilation of one version, which one entry
-    /// holds: branch-and-reload builds the new branch's own rather than sharing
-    /// its parent's (`src/ccl/design/program-evolution.md`, "A branch is created
-    /// by branch-and-reload").
+    /// Each sink consumer belongs to exactly one entry, because it is built by
+    /// the compilation of one version and branch-and-reload builds the new
+    /// branch's own rather than sharing its parent's
+    /// (`src/ccl/design/program-evolution.md`, "A branch is created by
+    /// branch-and-reload"). So a teardown detaches all of this entry's.
+    /// [`LiveProgram::debug_assert_sink_consumers_unshared`] checks that.
     ///
     /// The tree stays because the reload diffs against it and the compile of
     /// the replacement keys reuse on it.
@@ -173,11 +174,11 @@ impl Branch {
     }
 
     /// Install `program` as this entry's version `version`, holding `record`.
-    fn install(&mut self, program: CompiledProgram, record: Inheritance, reuse: ReuseTally) {
+    fn install(&mut self, program: CompiledProgram, operator_map: OperatorMap, reuse: ReuseTally) {
         let (program, main_producer) = driving(program);
         self.program = program;
         self.main_producer = main_producer;
-        self.record = record;
+        self.operator_map = operator_map;
         self.version += 1;
         self.history.push((self.version, reuse));
         self.main_finished = false;
@@ -208,14 +209,14 @@ fn branch_main_consumer(
     })
 }
 
-/// One row of [`LiveProgram::branches`], rendered as `/branches/list` prints it.
+/// One row of [`LiveProgram::branches`], rendered as `/branches` prints it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchSummary {
     pub name: String,
     /// The current version number.
     pub version: u64,
-    /// The branch provenance: `None` for the root.
-    pub provenance: Option<Provenance>,
+    /// The branch origin: `None` for the root.
+    pub origin: Option<Origin>,
     /// How many distinct fan-outs the entry's record holds, sink consumers not
     /// counted.
     pub operators: usize,
@@ -226,9 +227,9 @@ pub struct BranchSummary {
 impl fmt::Display for BranchSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let from = self
-            .provenance
+            .origin
             .as_ref()
-            .map_or_else(|| "-".to_string(), Provenance::to_string);
+            .map_or_else(|| "-".to_string(), Origin::to_string);
         write!(
             f,
             "{}\tversion={}\tfrom={from}\toperators={}\tshared={}",
@@ -297,8 +298,8 @@ pub struct Created {
     /// The new branch's name and first version number.
     pub name: String,
     pub version: u64,
-    /// The branch provenance it was created with.
-    pub from: Provenance,
+    /// The branch origin it was created with.
+    pub from: Origin,
     /// The creating reload's report.
     pub report: ReloadReport,
 }
@@ -318,7 +319,14 @@ pub struct DiffReport {
 
 /// What a difference reads as where there is none.
 fn no_difference(phase: Phase) -> String {
-    format!("no difference at phase {phase:?}\n")
+    format!("no difference at phase {}\n", phase_label(phase))
+}
+
+/// How a reply names `phase`: the `phase=` spelling a request names it by, and
+/// the enum's name for a phase the control port does not offer, which only a
+/// caller in this crate can ask at.
+fn phase_label(phase: Phase) -> String {
+    phase_spelling(phase).map_or_else(|| format!("{phase:?}"), str::to_string)
 }
 
 /// The loops that begin above the beginning of their input, one per line, and
@@ -357,7 +365,8 @@ fn difference(
         return Ok(None);
     }
     Ok(Some(format!(
-        "phase {phase:?}: {} divergence(s), {} shared root(s)\n\n{d}",
+        "phase {}: {} divergence(s), {} shared root(s)\n\n{d}",
+        phase_label(phase),
         d.divergences().len(),
         d.shared_roots().len(),
     )))
@@ -476,8 +485,8 @@ impl LiveProgram {
         )?;
         let (program, main_producer) = driving(program);
         let root = Branch {
-            name: DEFAULT_BRANCH.to_string(),
-            provenance: None,
+            name: MAIN_BRANCH.to_string(),
+            origin: None,
             version: 1,
             // A first compilation keeps nothing, so its tally is `0` kept of
             // everything it bound.
@@ -487,7 +496,7 @@ impl LiveProgram {
             main_notified,
             main_finished: false,
             sinks_done: false,
-            record: ctx.take_record(),
+            operator_map: ctx.take_operator_map(),
         };
         Ok(LiveProgram {
             branches: vec![root],
@@ -503,54 +512,25 @@ impl LiveProgram {
             .ok_or_else(|| BranchError::Unknown(name.to_string()))
     }
 
-    /// The branch the single-branch accessors answer for: the one named
-    /// [`DEFAULT_BRANCH`]. While no branch holds that name they answer `None`
-    /// rather than pick another branch, the way a control verb without a branch
-    /// segment answers 404 (`src/ccl/design/program-evolution.md`, "The control
-    /// port").
-    fn default_branch(&self) -> Option<&Branch> {
-        self.branches.iter().find(|b| b.name == DEFAULT_BRANCH)
-    }
-
-    /// The compiled program `main` runs, while the table holds `main`.
-    pub fn program(&self) -> Option<&CompiledProgram> {
-        self.default_branch().map(|b| &b.program)
-    }
-
     /// The compiled program branch `name` runs.
-    pub fn branch_program(&self, name: &str) -> Option<&CompiledProgram> {
+    pub fn program(&self, name: &str) -> Option<&CompiledProgram> {
         let at = self.index_of(name).ok()?;
         Some(&self.branches[at].program)
     }
 
-    /// `main`'s `main` output's producer, for inspection.
-    pub fn main_producer(&self) -> Option<&dyn TileProducer> {
-        self.default_branch()?.main_producer.as_deref()
-    }
-
-    /// `main`'s `main` output's producer, for a driver to pull.
-    pub fn main_producer_mut(&mut self) -> Option<&mut Box<dyn TileProducer>> {
-        self.branch_main_producer_mut(DEFAULT_BRANCH)
-    }
-
     /// Branch `name`'s `main` output's producer, for a driver to pull.
-    pub fn branch_main_producer_mut(&mut self, name: &str) -> Option<&mut Box<dyn TileProducer>> {
+    pub fn main_producer_mut(&mut self, name: &str) -> Option<&mut Box<dyn TileProducer>> {
         let at = self.index_of(name).ok()?;
         self.branches[at].main_producer.as_mut()
-    }
-
-    /// The source `main`'s current version was compiled from, while the table
-    /// holds `main`.
-    pub fn source(&self) -> Option<&str> {
-        self.default_branch().map(|b| b.program.source.as_str())
     }
 
     /// Pull every branch's `main` output that has something new, in creation
     /// order.
     ///
-    /// `pull` is handed the branch's name and the producer, and answers whether that output has now finished. A finished
-    /// output is not pulled again (`src/ccl/design/program-evolution.md`, "A
-    /// reload changes no other branch"). Returns whether anything was pulled.
+    /// `pull` is handed the branch's name and the producer, and answers whether
+    /// that output has now finished. A finished output is not pulled again
+    /// (`src/ccl/design/program-evolution.md`, "A reload changes no other
+    /// branch"). Returns whether anything was pulled.
     pub fn pull_mains(
         &mut self,
         mut pull: impl FnMut(&str, &mut dyn TileProducer) -> bool,
@@ -581,7 +561,10 @@ impl LiveProgram {
 
     /// Whether every branch has finished: its `main` output, where it has one,
     /// and every sink output, where it has any. The process exits then.
-    pub fn finished(&mut self) -> bool {
+    ///
+    /// Polls each branch's [`CompiledProgram::done`] and latches `sinks_done`
+    /// for the branches that have just finished, so it changes state as it reads.
+    pub fn poll_finished(&mut self) -> bool {
         let mut all = true;
         for branch in &mut self.branches {
             let has_sinks = branch.program.sinks().next().is_some();
@@ -594,10 +577,43 @@ impl LiveProgram {
         all
     }
 
+    /// Check that no other entry's outputs hold a sink consumer entry `at`'s
+    /// outputs hold, which is what lets [`Branch::tear_down`] detach all of its
+    /// own.
+    fn debug_assert_sink_consumers_unshared(&self, at: usize) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let consumers = |b: &Branch| {
+            b.program
+                .outputs
+                .iter()
+                .filter_map(|o| o.sink_consumer.clone())
+                .collect::<Vec<_>>()
+        };
+        let own = consumers(&self.branches[at]);
+        for (i, other) in self.branches.iter().enumerate() {
+            if i == at {
+                continue;
+            }
+            for theirs in consumers(other) {
+                debug_assert!(
+                    !own.iter().any(|mine| Rc::ptr_eq(mine, &theirs)),
+                    "each sink consumer belongs to exactly one entry, but `{}` and `{}` share one",
+                    self.branches[at].name,
+                    other.name,
+                );
+            }
+        }
+    }
+
     /// Every branch, in creation order.
     pub fn branches(&self) -> Vec<BranchSummary> {
-        let held: Vec<Vec<Rc<FanOut>>> =
-            self.branches.iter().map(|b| b.record.operators()).collect();
+        let held: Vec<Vec<Rc<FanOut>>> = self
+            .branches
+            .iter()
+            .map(|b| b.operator_map.operators())
+            .collect();
         self.branches
             .iter()
             .enumerate()
@@ -613,7 +629,7 @@ impl LiveProgram {
                 BranchSummary {
                     name: b.name.clone(),
                     version: b.version,
-                    provenance: b.provenance.clone(),
+                    origin: b.origin.clone(),
                     operators: held[at].len(),
                     shared,
                 }
@@ -621,12 +637,12 @@ impl LiveProgram {
             .collect()
     }
 
-    /// `/branches/list`'s reply: one line per branch, fields separated by a tab.
+    /// `/branches`'s reply: one line per branch, fields separated by a tab.
     pub fn render_branches(&self) -> String {
         self.branches().iter().map(|b| format!("{b}\n")).collect()
     }
 
-    /// `/branch/<name>/info`'s reply: the branch's `/branches/list` line, a
+    /// `/branch/<name>/info`'s reply: the branch's `/branches` line, a
     /// blank line, one line per version of the entry with the tally of the
     /// reload that installed it, a blank line, and the current version's source.
     pub fn render_info(&self, name: &str) -> Result<String, BranchError> {
@@ -652,7 +668,7 @@ impl LiveProgram {
         let at = self.index_of(name).ok()?;
         Some(
             self.branches[at]
-                .record
+                .operator_map
                 .operators()
                 .iter()
                 .map(Rc::downgrade)
@@ -664,27 +680,13 @@ impl LiveProgram {
     /// stores its entry holds.
     pub fn held_state(&self, name: &str) -> Option<HashMap<VarPath, Value>> {
         let at = self.index_of(name).ok()?;
-        Some(self.branches[at].record.live_state())
-    }
-
-    /// Answer what `/diff` asks of `main`.
-    pub fn diff_against(
-        &self,
-        ctx: &GlobalContext,
-        code: &str,
-        phase: Phase,
-    ) -> Result<DiffReport, Vec<CompileError>> {
-        self.diff_branch(ctx, DEFAULT_BRANCH, code, phase)
-            .map_err(|e| match e {
-                BranchError::Compile(errs) => errs,
-                other => vec![CompileError::Unsupported(other.to_string())],
-            })
+        Some(self.branches[at].operator_map.live_state())
     }
 
     /// Answer what `/diff/<branch>` asks: how `code` differs from branch
     /// `name`'s current version at `phase`, which is what its reload diffs
     /// against, and what reloading it would report. Changes nothing.
-    pub fn diff_branch(
+    pub fn diff_against(
         &self,
         ctx: &GlobalContext,
         name: &str,
@@ -707,7 +709,7 @@ impl LiveProgram {
         let planned = ctx.sources_and_sinks().compile_to(code, Phase::Planning)?;
         Ok(DiffReport {
             diff,
-            unreadable: ctx.unreadable_inputs(&branch.record, &branch.program.ast, &planned),
+            unreadable: ctx.unreadable_inputs(&branch.operator_map, &branch.program.ast, &planned),
         })
     }
 
@@ -729,21 +731,6 @@ impl LiveProgram {
         Ok(difference(ctx, from, to, phase)?.unwrap_or_else(|| no_difference(phase)))
     }
 
-    /// Replace `main`'s version with the one `code` describes. See
-    /// [`reload_branch`](Self::reload_branch).
-    pub fn reload(
-        &mut self,
-        ctx: &mut GlobalContext,
-        code: &str,
-        main_consumer: MainConsumerFactory<'_>,
-    ) -> Result<ReloadReport, Vec<CompileError>> {
-        self.reload_branch(ctx, DEFAULT_BRANCH, code, main_consumer)
-            .map_err(|e| match e {
-                BranchError::Compile(errs) => errs,
-                other => vec![CompileError::Unsupported(other.to_string())],
-            })
-    }
-
     /// Everything a reload does before it tears anything down: the difference,
     /// the compile to [`Phase::Planning`] that binds the ports the new version
     /// adds, the state-takeover guard against `predecessor`, and the report of
@@ -755,7 +742,7 @@ impl LiveProgram {
         ctx: &mut GlobalContext,
         previous_source: &str,
         previous_ast: &Expr,
-        predecessor: &Inheritance,
+        predecessor: &OperatorMap,
         code: &str,
     ) -> Result<Checked, Vec<CompileError>> {
         let diff = difference(ctx, previous_source, code, Phase::AsOfRead)?
@@ -776,6 +763,18 @@ impl LiveProgram {
         if !conflicts.is_empty() {
             ctx.sources_and_sinks_mut().release_unrouted_ports();
             return Err(vec![state_refusal(&conflicts)]);
+        }
+        if !predecessor
+            .disagreeing_kept_iterations(previous_ast, &planned)
+            .is_empty()
+        {
+            ctx.sources_and_sinks_mut().release_unrouted_ports();
+            return Err(vec![CompileError::Unsupported(
+                "this version keeps a loop's iteration that another branch also reads and \
+has read less of, so a store rebuilt over it would fold elements twice; reload or delete \
+the lagging branch first"
+                    .to_string(),
+            )]);
         }
         // Read before teardown, off the same planned tree the guard used, so this
         // and `/diff` answer alike and neither has to walk a graph that is gone.
@@ -832,7 +831,7 @@ impl LiveProgram {
     /// and the `Planning` one has already taken every port the version needs, so
     /// disagreement is a compiler bug, and one that has already torn the branch
     /// down, which is not a state to hand back to a caller as a rejection.
-    pub fn reload_branch(
+    pub fn reload(
         &mut self,
         ctx: &mut GlobalContext,
         name: &str,
@@ -846,7 +845,7 @@ impl LiveProgram {
                 ctx,
                 &branch.program.source,
                 &branch.program.ast,
-                &branch.record,
+                &branch.operator_map,
                 code,
             )?
         };
@@ -854,14 +853,15 @@ impl LiveProgram {
         // Where this branch's producers stopped, read while they all exist:
         // tearing the graph down drops its outputs' producers, and a record dies
         // with its producer.
-        ctx.carry_release_from(&self.branches[at].source_readers());
+        ctx.carry_release_from(&self.branches[at].source_producers());
         let bound_elsewhere = self.routes_bound_except(Some(at));
+        self.debug_assert_sink_consumers_unshared(at);
         let branch = &mut self.branches[at];
         branch.tear_down();
         // The offer holds the branch's operators until conversion is over, as a
         // single program's reload always has; the entry takes the new record
         // once the compile is done.
-        let previous_record = std::mem::take(&mut branch.record);
+        let previous_record = std::mem::take(&mut branch.operator_map);
         ctx.offer_predecessor(&previous_record);
         drop(previous_record);
         // The tree the torn-down graph was built from is still here — a teardown
@@ -876,7 +876,7 @@ impl LiveProgram {
         )
         .expect("a version that compiled to Planning must compile to operators");
         let reuse = ctx.reuse();
-        branch.install(program, ctx.take_record(), reuse);
+        branch.install(program, ctx.take_operator_map(), reuse);
         Ok(ReloadReport {
             diff: checked.diff,
             reuse,
@@ -907,7 +907,7 @@ impl LiveProgram {
     ///
     /// # Panics
     ///
-    /// As [`reload_branch`](Self::reload_branch).
+    /// As [`reload`](Self::reload).
     pub fn create_branch(
         &mut self,
         ctx: &mut GlobalContext,
@@ -929,13 +929,19 @@ impl LiveProgram {
         let from = self.index_of(parent)?;
         let checked = {
             let p = &self.branches[from];
-            Self::check(ctx, &p.program.source, &p.program.ast, &p.record, code)?
+            Self::check(
+                ctx,
+                &p.program.source,
+                &p.program.ast,
+                &p.operator_map,
+                code,
+            )?
         };
 
         let bound_elsewhere = self.routes_bound_except(None);
         let p = &self.branches[from];
-        ctx.carry_release_from(&p.source_readers());
-        ctx.offer_predecessor(&p.record);
+        ctx.carry_release_from(&p.source_producers());
+        ctx.offer_predecessor(&p.operator_map);
         let main_notified = Rc::new(Cell::new(false));
         let program = compile_replacement(
             ctx,
@@ -946,7 +952,7 @@ impl LiveProgram {
         )
         .expect("a version that compiled to Planning must compile to operators");
         let reuse = ctx.reuse();
-        let provenance = Provenance {
+        let origin = Origin {
             parent: p.name.clone(),
             version: p.version,
         };
@@ -955,7 +961,7 @@ impl LiveProgram {
         main_notified.set(true);
         self.branches.push(Branch {
             name: name.to_string(),
-            provenance: Some(provenance.clone()),
+            origin: Some(origin.clone()),
             version,
             history: vec![(version, reuse)],
             program,
@@ -963,12 +969,12 @@ impl LiveProgram {
             main_notified,
             main_finished: false,
             sinks_done: false,
-            record: ctx.take_record(),
+            operator_map: ctx.take_operator_map(),
         });
         Ok(Created {
             name: name.to_string(),
             version,
-            from: provenance,
+            from: origin,
             report: ReloadReport {
                 diff: checked.diff,
                 reuse,
@@ -984,7 +990,7 @@ impl LiveProgram {
     /// operators are freed where no other entry holds them; a freed producer's
     /// `Drop` returns its release record to the source it read. Every route no
     /// remaining branch binds is retired. The branches created from it keep
-    /// running what they hold, and their branch provenance still names it.
+    /// running what they hold, and their branch origin still names it.
     ///
     /// Refused for the last branch in the table; `Unknown` for a name the table
     /// does not hold. Returns the version number the tombstone keeps.
@@ -999,6 +1005,7 @@ impl LiveProgram {
                 "`{name}` is the last branch in the table and cannot be deleted\n"
             )));
         }
+        self.debug_assert_sink_consumers_unshared(at);
         let mut removed = self.branches.remove(at);
         removed.tear_down();
         let version = removed.version;
