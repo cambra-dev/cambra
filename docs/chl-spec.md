@@ -1252,8 +1252,8 @@ seen: Set(String) = empty_map()
 `Set(K)` is `Map(K, unit)`
 ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), so one term
 answers both annotations and the codomain is what tells the readings apart. The annotation is the
-only source for the two types — a keyed write constrains the value it writes, not the key type — so
-an `empty_map()` nothing annotates is an error.
+source of the empty constructor's key and value types. An unannotated `empty_map()` is an error;
+later keyed writes do not replace the annotation.
 
 > **Direction [Decided].** The literal forms migrate with the
 > delimiter split (§2.4) and the collections model (§6.3), form by

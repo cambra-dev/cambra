@@ -87,8 +87,8 @@ type language has no uninhabited type; see
 [The empty product is unit](../../../docs/chl-spec.md#66-the-empty-product-is-unit).
 
 `pin_empty_list_elements` runs before the coalescing traversal. For an empty literal whose
-element variable has no incoming value, `pin_empty_list_element` uses the selection rule from
-[payload rule](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require).
+element variable has no incoming value, `pin_empty_list_element` applies
+[An unobservable arm payload is pinned to what its uses require](type-inference.md#an-unobservable-arm-payload-is-pinned-to-what-its-uses-require).
 The choice is constrained in both directions against the element variable, so bindings and
 iteration targets that share it see the same choice. Choosing `unit` during emission would
 instead conflict with later requirements for another element type.
@@ -100,8 +100,9 @@ returned as a type error, not asserted as an internal invariant. The regression
 covers conflicting `List(Int)` and `List(String)` annotations.
 
 The pass selects syntactically empty `List` nodes, not every unresolved collection element type.
-A nonempty comprehension such as `\x -> [x for z in [1, 2]]` does not acquire a default element
-type through this rule. The pre-pass walks expression children, not copies stored in refinement
+Emptiness is what makes the choice unobservable. A nonempty comprehension such as
+`\x -> [x for z in [1, 2]]` leaves its element type ambiguous, and pinning it would accept a
+program that has no type. The pre-pass walks expression children, not copies stored in refinement
 predicate type slots.
 
 ### The empty collection has no key morphism [Interim]

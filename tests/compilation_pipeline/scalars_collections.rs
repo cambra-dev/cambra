@@ -224,9 +224,8 @@ fn a_checked_lookup_on_the_empty_map_is_none() {
     );
 }
 
-// Nothing else reaches the key and value types, so an unannotated `empty_map()` is
-// rejected. A keyed write does not supply them either: a write states its obligation on
-// the value it writes, not on the collection's key type.
+// An unannotated `empty_map()` leaves its key and value types unresolved. A keyed write
+// checks both, but requires the collection's type to be resolved before checking the write.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::bare("empty_map()")]
