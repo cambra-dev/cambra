@@ -85,8 +85,8 @@ debug.
 
 That guarantee holds only if an inferred type states every requirement its body imposes. Today one
 kind of requirement is enforced only when a concrete type is delivered: a trait requirement on a
-generic parameter ([type-inference.md, "Typechecking a never-called
-definition"](../src/ccl/design/type-inference.md#typechecking-a-never-called-definition)). Making it
+generic parameter ([type-inference.md, "Checking a definition
+alone"](../src/ccl/design/type-inference.md#checking-a-definition-alone)). Making it
 part of the generalized type is a dependency ([Dependencies](#dependencies)).
 
 The compiler's own test harness enables trailing expressions, which

@@ -570,6 +570,40 @@ pub enum InferError {
 }
 
 impl InferError {
+    /// Whether `self` and `other` report one defect: equal but for the inference
+    /// variables they name, which differ between a definition and a specialization's
+    /// copy of it.
+    pub fn same_defect(&self, other: &InferError) -> bool {
+        fn anonymous(e: &InferError) -> InferError {
+            let mut e = e.clone();
+            match &mut e {
+                InferError::IncompatibleBounds { vars, .. } => vars.clear(),
+                InferError::UnresolvedInfer { id, .. } => *id = InferVarId(0),
+                _ => {}
+            }
+            e
+        }
+        anonymous(self) == anonymous(other)
+    }
+
+    /// Whether `self` and `other` report one defect at possibly different sites:
+    /// [`same_defect`](Self::same_defect) once the expression each names as its site is
+    /// also dropped. Two nodes whose types carry one conflicting set of bounds raise
+    /// errors equal in all but that label.
+    pub fn same_defect_at_any_site(&self, other: &InferError) -> bool {
+        fn unsited(e: &InferError) -> InferError {
+            let mut e = e.clone();
+            match &mut e {
+                InferError::IncompatibleBounds { origin, .. }
+                | InferError::DomainJoinConflict { origin, .. } => origin.clear(),
+                InferError::UnresolvedPartial { at, .. } => at.clear(),
+                _ => {}
+            }
+            e
+        }
+        unsited(self).same_defect(&unsited(other))
+    }
+
     /// Rewrite every type this error renders through `f`.
     ///
     /// The one caller is the diagnostic boundary in
@@ -680,7 +714,7 @@ impl InferError {
 /// where they are raised. An inference error is raised holding types, not spans,
 /// so it carries a node id and resolves to a span at the `compile_program`
 /// boundary.)
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LocatedInferError {
     /// The underlying inference error.
     pub error: InferError,

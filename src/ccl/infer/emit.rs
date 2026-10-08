@@ -1043,9 +1043,19 @@ pub(super) fn emit_apply<C: Typing>(
         .as_ref()
         .and_then(Type::fun_kind)
         .cloned();
-    ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
+    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
         "Apply".to_string()
-    })
+    });
+    // A call that fails against a generalized definition the definition alone already
+    // rejects is the definition's error, reported at the definition rather than at a
+    // call that only met it.
+    match (&applied, &function.node) {
+        (Err(_), TypedExprNode::Var(name)) => match ctx.definition_alone_error(name) {
+            Some(definition_error) => Err(definition_error),
+            None => applied,
+        },
+        _ => applied,
+    }
 }
 
 /// The value type `𝑚[𝑘]` reads, with the key related to the collection's keys.

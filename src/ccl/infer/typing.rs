@@ -159,6 +159,13 @@ pub(super) trait Typing {
     /// (it never generalizes).
     fn is_generalizable(&self, def: &Expr) -> bool;
 
+    /// The error a generalized definition named `name` raises on its own, blamed on the
+    /// `let` that binds it: its type does not resolve, whatever any use supplies
+    /// (`src/ccl/design/type-inference.md`, "Checking a definition alone"). Asked where a
+    /// call of it fails, so the definition's error is reported rather than the call's.
+    /// Check has none to report.
+    fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError>;
+
     /// Run `f` with a `let` binding in scope over the body, at the type
     /// `binding.ty` records. When `generalize` is set, Emit generalizes that
     /// type at the current level into a polymorphic scheme (so each use site
