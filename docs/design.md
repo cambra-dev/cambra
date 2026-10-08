@@ -151,10 +151,10 @@ pipeline; individual pass contracts belong to the linked design documents.
 | --- | --- |
 | Parse | CHL source to a recoverable CHL AST; see [parser design](../chl-parser/design-chl-parser.md#stage-2--parser-parserrs). |
 | Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). |
-| Uniquify | Give term binders distinct identities; see [structured names](../src/ccl/design/ir.md#structured-names-and-α-uniquification-barendregt-convention). |
+| Uniquify | Give term binders distinct identities so later passes substitute without capture; see [structured names](../src/ccl/design/ir.md#structured-names-and-α-uniquification-barendregt-convention). |
 | A-normalize | `anf::run` names compound operands before inference. |
 | Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
-| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Read naming is undone before the post-inference snapshot. |
+| Infer | Infer types, specialize uses and validate the typed tree; see [type inference](../src/ccl/design/type-inference.md). Read naming is undone before the post-inference pane. |
 | Inline | Inline capability bindings and beta-reduce calls; see [inlining](../src/ccl/design/optimization.md#inlining-pass-cclinliners). |
 | Eliminate transactions | `transact_phase::run` constructs transaction histories after keyed-write desugaring and value-type views. |
 | Eliminate induction mutation | `mut_elim::run` constructs induction histories. |
