@@ -1953,6 +1953,60 @@ A demand on the codomain is met by what flows out of the body rather than narrow
 inside it. `def f(x) => 𝑇` with an unannotated `x` whose body introduces an opaque binder bounds `x`
 from its call sites alone; a conflict with `𝑇` surfaces when those bounds reach the codomain.
 
+#### A contribution crosses the binders after its target
+
+A feed (`<<`), a define (`<<=`) and a mutable write (`:=`, keyed or not) contribute to a history
+whose value type stands where the target is bound. The write stands inside every binder entered
+since, so the contribution can name binders the history's type cannot, and no scope exit of the
+value path lies between them. `InferCtx::require_contribution` records the contribution on a
+variable minted in the target's scope, through a lower edge carrying one exit per crossed binder,
+innermost first. The crossed binders are the telescope entries entered after the target's own
+(`Telescope::split_at`); a handle has no surface syntax as a parameter, so a target is always in
+lexical scope at the write.
+
+| Crossed binder | Exit |
+| --- | --- |
+| A transparent `let` | Discharge `[𝑥 ↦ definition]`, as `close_let_type` does |
+| A `:=` binder | None: the name stays, as in `close_let_type` |
+| An opaque binder outside every lambda of the crossing | None: it is one value |
+| A lambda's, loop's or pattern's binder, or an opaque binder under one | `Mapping::Join` |
+
+A history's type is the join of every value written to it (`docs/chl-spec.md`, "Joining the types
+of several values"). The contribution is joined over the values of each binder in the last row.
+A loop's or lambda's binder takes one per iteration or call; a pattern's binder takes one per
+evaluation of its `match`. A join mapping has no term. Where the solver forces the
+edge, compaction composes it into the accumulated substitution, and a refinement naming a joined
+binder is decided by its position:
+
+- On a value, it is dropped: the join keeps what every value establishes.
+- On a sum's candidate, the candidate widens to `SubtypesOf` what remains and the candidates' kinds
+  join. A row `box([v for v in xs if v > r])` fed from a loop over `r` contributes
+  `Σ (σ : SubtypesOf([0, 2])). σ ⤇ Int`.
+- In a data function's domain, or a function's whose kind is not known to be compute, there is no
+  join: each value has its own keys. Compaction records a `JoinViolation` and coalescing reports
+  `NoJoinOverBinder`.
+
+A discharge whose definition names a joined binder composes into a join (`Subst::then`), so `k = r`
+inside a loop over `r` is joined over as `r` is. The decision is syntactic: a domain naming a joined
+binder has no join even where its keys are the same for every value. Check mode trusts the types
+recorded at a feed or a write, so only emission records the edge.
+
+A `def`'s parameter is joined over however many calls reach the `def`. Inference types the body once,
+before any call site supplies an argument, so `def f(y): out << [v for v in xs if v > y]` is refused
+with `NoJoinOverBinder` when `f` is called once as well.
+
+**[Planned]** A binder that the target's key or a term in scope determines is discharged rather
+than joined over. A loop variable crossed by a feed is the loop's source read at the channel key's
+position, and a pattern binder is the scrutinee's payload. Until then both are joined over, and a
+collection whose keys read one is refused with `NoJoinOverBinder`.
+
+A `def` whose body writes to a handle declared outside it is generalized like any other `def`, so a
+variable its contribution carries must not be quantified. A `let` of a `Defer` binds
+monomorphically, and `emit_let` mints the channel's element variable at the binding's level rather
+than the right-hand side's. The edge from `def f(y): out << y` into `out` then lowers `y`'s variable
+to that level, `f` is monomorphic in `y`, and the channel receives what each call passes rather
+than the generic variable.
+
 #### Discharge is application
 
 A discharge-bearing bound represents applying a type family to a term argument. Its substitution

@@ -281,7 +281,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(ty) => ty,
             };
-            emit_feed(&target_ty, value, &label, ctx).map_err(|e| {
+            emit_feed(name, &target_ty, value, &label, ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
                 })
@@ -293,7 +293,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
                 Some(ty) => ty,
             };
-            emit_define(&target_ty, value, &label, ctx)?
+            emit_define(name, &target_ty, value, &label, ctx)?
         }
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
@@ -338,15 +338,14 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             };
             let value_ty = emit_value_read(value, ctx)?;
             let write_label = name.clone();
-            // The written value flows in **verbatim**, as one contribution to the
-            // mutable variable's value type. A refinement is a fact about *a value*, and a
-            // mutable variable is not one value — it is the sequence its seed and every write
-            // produce — so its value type is the join over all of them, and the
-            // lattice already *is* that join: every contribution is a lower bound of
-            // the mutable variable's value variable, and a positive-position read intersects
-            // refinement sets. A refinement therefore survives exactly when every
-            // contribution establishes it, which is the rule, and nothing here has to
-            // pre-emptively weaken a contribution to get it.
+            // The written value flows in as one contribution to the mutable variable's
+            // value type. A refinement is a fact about *a value*, and a mutable variable is
+            // not one value — it is the sequence its seed and every write produce — so its
+            // value type is the join over all of them. Across writes the lattice already
+            // *is* that join: every contribution is a lower bound of the mutable variable's
+            // value variable, and a positive-position read intersects refinement sets.
+            // Across the values one write takes — a write in a loop, once per iteration —
+            // the edge joins over the binders it crosses (`require_contribution`).
             //
             // The target is **not** relaxed. When `name` is not a mutable variable at all
             // (`x = 0; x += 1`) the constraint is skipped outright and
@@ -360,7 +359,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // the demand on an unrefined annotation and the skip on a non-mutable one.)
             if let Some(mut_val) = mut_value {
                 match key {
-                    None => ctx.require_sub(&value_ty, mut_val, &|| {
+                    None => ctx.require_contribution(name, &value_ty, mut_val, &|| {
                         format!("write to mutable variable `{write_label}`")
                     })?,
                     // The key *term* is not needed: a write states its obligation on the
@@ -1181,12 +1180,12 @@ fn emit_lookup_checked<C: Typing>(
 /// value type whether it is being read or written. Neither is an application: a read is
 /// reached when the key is not known to be present, and a write is what *makes* it
 /// present, so demanding a presence proof of the key being written would be backwards.
-fn emit_keyed_write<C: Typing>(
+fn emit_keyed_write(
     collection: &Type,
     key_ty: &Option<Type>,
     value_ty: &Type,
     label: &Name,
-    ctx: &mut C,
+    ctx: &mut InferCtx,
 ) -> Result<(), LocatedInferError> {
     let key_ty = key_ty
         .as_ref()
@@ -1225,7 +1224,7 @@ fn emit_keyed_write<C: Typing>(
         &|| format!("keyed write key of `{label}`"),
         ctx,
     )?;
-    ctx.require_sub(value_ty, &expected, &|| {
+    ctx.require_contribution(label, value_ty, &expected, &|| {
         format!("keyed write to mutable variable `{label}`")
     })
 }
@@ -1546,11 +1545,12 @@ fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, Located
 /// rather than a free `Infer`, and `channelize` erases `ChanDom(d)` to the
 /// concrete channel domain (a source domain, or a `Variant` union of feed
 /// sites) by substitution.
-pub(super) fn emit_feed<C: Typing>(
+pub(super) fn emit_feed(
+    target: &Name,
     target_ty: &Type,
     value: &mut Expr,
     label: &str,
-    ctx: &mut C,
+    ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
     // A feed payload is a *value* (`Mut` never appears in a feed payload — the
     // discipline forbids it), so a mutable variable mention here reads.
@@ -1565,20 +1565,21 @@ pub(super) fn emit_feed<C: Typing>(
     // A **data** function: the contribution is one row of the channel's collection,
     // and the channel it flows into is that collection (`constrain_into_feed`).
     let contribution = Type::data_fun(ctx.fresh(), value_ty);
-    constrain_into_feed(target_ty, &contribution, label, ctx)
+    constrain_into_feed(target, target_ty, &contribution, label, ctx)
 }
 
 /// Type a `Define { name, value }`: the defined value *is* the handle's
 /// eventual payload (`x <<= v` sets the whole channel); the define
 /// expression itself is `Unit`, like `Feed`.
-pub(super) fn emit_define<C: Typing>(
+pub(super) fn emit_define(
+    target: &Name,
     target_ty: &Type,
     value: &mut Expr,
     label: &str,
-    ctx: &mut C,
+    ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
     let value_ty = ctx.subexpr(value)?;
-    constrain_into_feed(target_ty, &value_ty, label, ctx)
+    constrain_into_feed(target, target_ty, &value_ty, label, ctx)
 }
 
 /// Land `payload_sub` inside the feed handle `target_ty`, returning `Unit`
@@ -1593,11 +1594,12 @@ pub(super) fn emit_define<C: Typing>(
 /// param` then meets the upper bound, and the invariant Feed/Feed rule
 /// carries the contribution back into the caller's channel; a non-feed
 /// argument fails the same meeting with `NotAFeed`.
-fn constrain_into_feed<C: Typing>(
+fn constrain_into_feed(
+    target: &Name,
     target_ty: &Type,
     payload_sub: &Type,
     label: &str,
-    ctx: &mut C,
+    ctx: &mut InferCtx,
 ) -> Result<Type, LocatedInferError> {
     match target_ty.as_feed() {
         Some((domain, value)) => {
@@ -1609,7 +1611,9 @@ fn constrain_into_feed<C: Typing>(
             // so a `Compute` channel here would reject every collection fed into
             // it.
             let rho = Type::data_fun(domain.clone(), value.clone());
-            ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
+            ctx.require_contribution(target, payload_sub, &rho, &|| {
+                format!("contribution to {label}")
+            })?;
         }
         None => {
             // Opaque target (a lambda parameter receiving the handle —
@@ -1624,7 +1628,9 @@ fn constrain_into_feed<C: Typing>(
                 format!("feed target of {label} must be a feed handle")
             })?;
             let rho = Type::data_fun(rho_domain, rho_value);
-            ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
+            ctx.require_contribution(target, payload_sub, &rho, &|| {
+                format!("contribution to {label}")
+            })?;
         }
     }
     Ok(prim(BaseType::Unit))
@@ -1837,7 +1843,10 @@ pub(super) fn emit_let<C: Typing>(
     } else {
         LetScheme::Monomorphic
     };
-    let body_ty = ctx.scoped_let(binding, scheme, |ctx| ctx.subexpr(body))?;
+    // A definition that did not type has no value a contribution crossing it could
+    // discharge.
+    let definition = (defined && !poisoned).then_some(&*bound_expr);
+    let body_ty = ctx.scoped_let(binding, definition, scheme, |ctx| ctx.subexpr(body))?;
     // A failed definition has no definiens to discharge: the program is already
     // rejected, and the RHS it would substitute did not type.
     if !defined {
@@ -1934,9 +1943,20 @@ fn emit_let_bound<C: Typing>(
         } = &bound_ty
         && let Type::Infer(dv) = domain.as_ref()
     {
+        // The value variable is minted again here, at the binding's level rather than the
+        // right-hand side's: a `let` of a `Defer` binds monomorphically, so the channel's
+        // element type stands where the handle is bound. A contribution from a generalized
+        // `def` then lowers the variables it carries to this level, so `def f(y): out << y`
+        // leaves `y` monomorphic; at the right-hand side's level `y` would be quantified,
+        // and the channel would receive the generic variable rather than what each call
+        // passes. The discarded variable, like the domain's, is referenced nowhere else.
+        debug_assert!(
+            matches!(value.as_ref(), Type::Infer(_)),
+            "a `Defer`'s element type is a fresh variable: {value}"
+        );
         let handle = Type::feed(
             Type::ChanDom(binding.name.clone(), crate::ccl::ChanLevel(dv.level())),
-            (**value).clone(),
+            ctx.fresh(),
         );
         bound_expr.ty = handle.clone();
         handle
