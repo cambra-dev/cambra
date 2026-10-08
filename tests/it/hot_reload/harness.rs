@@ -12,7 +12,7 @@ use std::{
 
 use cambra::{
     ccl::context::{CompileError, GlobalContext, Phase},
-    chl_parser::SourceMap,
+    ccl::load::LoadedProgram,
     live_program::{
         BranchError, Created, DiffReport, LiveProgram, MainConsumerFactory, ReloadReport,
     },
@@ -809,7 +809,7 @@ pub(crate) mod fixtures {
 /// file.
 ///
 /// Every case writes a version as one program text. These build its one-file
-/// [`SourceMap`], so a case passes the text as it reads.
+/// [`LoadedProgram`], so a case passes the text as it reads.
 pub(crate) trait OneFile: Sized {
     fn start_text(
         ctx: &mut GlobalContext,
@@ -849,7 +849,7 @@ impl OneFile for LiveProgram {
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Self, Vec<CompileError>> {
-        LiveProgram::start(ctx, &SourceMap::single("<test>", text), main_consumer)
+        LiveProgram::start(ctx, &LoadedProgram::test(text), main_consumer)
     }
 
     fn reload_text(
@@ -859,12 +859,7 @@ impl OneFile for LiveProgram {
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<ReloadReport, BranchError> {
-        self.reload(
-            ctx,
-            branch,
-            &SourceMap::single("<test>", text),
-            main_consumer,
-        )
+        self.reload(ctx, branch, &LoadedProgram::test(text), main_consumer)
     }
 
     fn diff_text(
@@ -874,7 +869,7 @@ impl OneFile for LiveProgram {
         text: &str,
         phase: Phase,
     ) -> Result<DiffReport, BranchError> {
-        self.diff_against(ctx, branch, &SourceMap::single("<test>", text), phase)
+        self.diff_against(ctx, branch, &LoadedProgram::test(text), phase)
     }
 
     fn create_branch_text(
@@ -885,13 +880,7 @@ impl OneFile for LiveProgram {
         text: &str,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Created, BranchError> {
-        self.create_branch(
-            ctx,
-            name,
-            parent,
-            &SourceMap::single("<test>", text),
-            main_consumer,
-        )
+        self.create_branch(ctx, name, parent, &LoadedProgram::test(text), main_consumer)
     }
 }
 
@@ -956,8 +945,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     use std::{cell::RefCell, rc::Rc};
 
     use cambra::{
+        ccl::load::LoadedProgram,
         ccl::{Type, context::GlobalContext},
-        chl_parser::SourceMap,
         interpreter::{BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value},
         live_program::{LiveProgram, MAIN_BRANCH},
     };
@@ -986,8 +975,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
         producer.get(producer.tiling().universal_guard())
     };
 
-    let mut live = LiveProgram::start(&mut ctx, &SourceMap::single("<test>", v1), &no_main)
-        .expect("v1 compiles");
+    let mut live =
+        LiveProgram::start(&mut ctx, &LoadedProgram::test(v1), &no_main).expect("v1 compiles");
     source.borrow_mut().add_data(&rows(0, before));
     source
         .borrow_mut()
@@ -997,13 +986,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     for _ in 0..20 {
         pull(&mut ctx, &mut live);
     }
-    live.reload(
-        &mut ctx,
-        MAIN_BRANCH,
-        &SourceMap::single("<test>", v2),
-        &no_main,
-    )
-    .expect("v2 replaces v1");
+    live.reload(&mut ctx, MAIN_BRANCH, &LoadedProgram::test(v2), &no_main)
+        .expect("v2 replaces v1");
     source.borrow_mut().add_data(&rows(before.len(), after));
     source.borrow_mut().set_yield_predicate(Predicate::True);
     for _ in 0..500 {

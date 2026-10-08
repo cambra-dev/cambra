@@ -41,7 +41,6 @@
 //! iterating a data source. Ratchet 5 validates all four like any other gallery
 //! program, naming the source it dumped when one fails.
 
-use cambra::chl_parser::SourceMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -739,10 +738,15 @@ fn dump_source(path: &Path) -> Option<Vec<u8>> {
     let mut spawn_path = path.to_path_buf();
     let substituted;
     if text.contains("{PORT}") {
-        substituted = std::env::temp_dir().join(format!(
-            "cambra-sweep-{}",
-            path.file_name().expect("a file name").to_string_lossy()
-        ));
+        // The file keeps its name, which is the root's module path, in a
+        // directory of its own.
+        let parent = path
+            .parent()
+            .and_then(Path::file_name)
+            .expect("a directory");
+        let dir = std::env::temp_dir().join(format!("cambra-sweep-{}", parent.to_string_lossy()));
+        std::fs::create_dir_all(&dir).expect("creating the directory");
+        substituted = dir.join(path.file_name().expect("a file name"));
         std::fs::write(&substituted, text.replace("{PORT}", "8080")).expect("writing the source");
         spawn_path = substituted;
     }
@@ -943,6 +947,7 @@ fn canonicalize_ids(v: &mut Value) {
 #[test]
 fn ids_are_the_only_difference_between_two_compiles() {
     use cambra::ccl::context::{GlobalContext, compile_program};
+    use cambra::ccl::load::LoadedProgram;
     use cambra::interpreter::Consumer;
 
     for example in [
@@ -956,8 +961,9 @@ fn ids_are_the_only_difference_between_two_compiles() {
         let payload = |name: &str| {
             let mut ctx = GlobalContext::default();
             let consumer: Box<dyn Consumer> = Box::new(|| {});
-            let compiled = compile_program(&mut ctx, &SourceMap::single(name, &source), consumer)
-                .expect("a corpus program compiles");
+            let compiled =
+                compile_program(&mut ctx, &LoadedProgram::from_text(name, &source), consumer)
+                    .expect("a corpus program compiles");
             let mut v: Value =
                 serde_json::from_str(&cambra::inspector_server::snapshot_json(&compiled, name))
                     .expect("the payload is valid JSON");

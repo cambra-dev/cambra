@@ -1,11 +1,11 @@
-use std::{collections::HashMap, thread, time::Duration};
+use std::{collections::HashMap, path::Path, thread, time::Duration};
 
 use cambra::{
     ccl::{
         context::{GlobalContext, eprint_errors},
+        load::LoadedProgram,
         provenance::NodeId,
     },
-    chl_parser::SourceMap,
     control_port::{ControlPort, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
@@ -63,15 +63,13 @@ fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {
     done
 }
 
-/// Runs a Cambra program from a source string.
+/// Runs a loaded Cambra program.
 ///
-/// `src_name` is the label shown in error reports (typically the input
-/// file name). Returns `Err(())` if compilation failed; the errors have
-/// already been rendered to stderr by [`eprint_errors`], so the caller's
-/// job is just to exit non-zero.
+/// Returns `Err(())` if compilation failed; the errors have already been
+/// rendered to stderr by [`eprint_errors`], so the caller's job is just to exit
+/// non-zero.
 fn run_program(
-    src_name: &str,
-    code: &str,
+    loaded: &LoadedProgram,
     inspect_port: Option<u16>,
     control_port: Option<u16>,
 ) -> Result<(), ()> {
@@ -85,11 +83,10 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single(src_name, code);
-    let mut live = match LiveProgram::start(&mut ctx, &sources, &main_consumer) {
+    let mut live = match LiveProgram::start(&mut ctx, loaded, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
-            eprint_errors(&errs, &sources);
+            eprint_errors(&errs, loaded.sources());
             return Err(());
         }
     };
@@ -103,6 +100,7 @@ fn run_program(
             let (version, program) = live
                 .program(MAIN_BRANCH)
                 .expect("the process starts with `main`");
+            let src_name = loaded.sources().path(loaded.sources().root());
             match serve_compiled(program, src_name, port, version) {
                 Ok((channel, snapshot)) => Some(Inspection::new(
                     channel,
@@ -480,17 +478,20 @@ fn main() {
         std::process::exit(1);
     });
 
-    let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
+    let loaded = LoadedProgram::read(Path::new(&input_file)).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
 
     match mode {
         Mode::DumpSnapshot => {
             println!(
                 "{}",
-                cambra::inspector_server::snapshot_body_pretty(&code, &input_file)
+                cambra::inspector_server::snapshot_body_pretty(&loaded)
             );
         }
         Mode::InspectOnly { port } => {
-            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port) {
+            if let Err(e) = cambra::inspector_server::serve(&loaded, port) {
                 eprintln!("error: serving the inspector: {e}");
                 std::process::exit(1);
             }
@@ -499,7 +500,7 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            if run_program(&input_file, &code, inspect_port, control_port).is_err() {
+            if run_program(&loaded, inspect_port, control_port).is_err() {
                 std::process::exit(1);
             }
 
@@ -518,10 +519,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use crate::run_program;
+    use cambra::ccl::load::LoadedProgram;
     use test_log::test;
 
     #[test]
     fn test_run_program() {
-        run_program("<test>", "x = 1; x", None, None).unwrap();
+        run_program(&LoadedProgram::test("x = 1; x"), None, None).unwrap();
     }
 }

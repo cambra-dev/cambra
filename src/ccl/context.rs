@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
-use crate::chl_parser;
+use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::chl_parser::ast::Span;
 use crate::chl_parser::parser::ParseError;
 use crate::chl_parser::source_map::{SourceMap, report_config};
@@ -77,6 +77,9 @@ use crate::{
 pub enum CompileError {
     /// The parser rejected one token / token sequence.
     Parse(ParseError),
+    /// Loading rejected the program: a statement names a module with no file,
+    /// or the module graph has a cycle.
+    Load(LoadError),
     /// The (parseable) AST uses a construct the lowering phase does not
     /// support yet.
     Lower(LoweringError),
@@ -135,6 +138,7 @@ impl CompileError {
     pub fn message(&self) -> String {
         match self {
             CompileError::Parse(e) => e.to_string(),
+            CompileError::Load(e) => e.to_string(),
             CompileError::Lower(e) => e.to_string(),
             CompileError::Infer { error, .. } => format!("{error:?}"),
             CompileError::ChannelizeDefers { error, .. } => error.to_string(),
@@ -149,6 +153,7 @@ impl CompileError {
     pub fn span(&self) -> Option<Span> {
         match self {
             CompileError::Parse(e) => Some(e.span()),
+            CompileError::Load(e) => Some(e.span()),
             CompileError::Lower(e) => Some(e.span()),
             CompileError::Infer { span, .. }
             | CompileError::ChannelizeDefers { span, .. }
@@ -203,6 +208,16 @@ impl CompileError {
             CompileError::Lower(e @ LoweringError::Internal { .. }) => {
                 ("internal compiler error in lowering", e.span())
             }
+            CompileError::Load(LoadError::Cycle { steps }) => {
+                let labels: Vec<_> = steps.iter().map(|s| (s.span, s.to_string())).collect();
+                return labels_rendering(
+                    "loading error",
+                    "the module graph has a cycle",
+                    &labels,
+                    color,
+                );
+            }
+            CompileError::Load(e) => ("loading error", e.span()),
             CompileError::Lower(e) => ("lowering error", e.span()),
             CompileError::Infer { span, .. } => ("type inference error", *span),
             CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),
@@ -267,6 +282,31 @@ fn span_rendering(
             )
             .finish(),
         detail,
+    }
+}
+
+/// A report titled `title: message` with one label per entry of `labels`, in
+/// whichever files they lie in. The first label is the report's location.
+fn labels_rendering(
+    title: &str,
+    message: &str,
+    labels: &[(Span, String)],
+    color: bool,
+) -> Rendering {
+    use ariadne::{Color, Label, Report, ReportKind};
+    let (first, _) = labels.first().expect("an error labels a span");
+    let report = Report::build(ReportKind::Error, first.file, first.start)
+        .with_config(report_config(color))
+        .with_message(format!("{title}: {message}"))
+        .with_labels(
+            labels
+                .iter()
+                .map(|(span, label)| Label::new(*span).with_message(label).with_color(Color::Red)),
+        )
+        .finish();
+    Rendering {
+        report,
+        detail: String::new(),
     }
 }
 
@@ -517,19 +557,19 @@ fn enclosing(tree: &Expr, node: NodeId) -> Option<Vec<NodeId>> {
 ///
 /// ```ignore
 /// use cambra::ccl::context::{compile_program, CompileResultExt};
-/// let sources = SourceMap::single("<test>", code);
-/// let compiled = compile_program(&mut ctx, &sources, consumer)
-///     .unwrap_or_render(&sources);
+/// let program = LoadedProgram::test(code);
+/// let compiled = compile_program(&mut ctx, &program, consumer)
+///     .unwrap_or_render(&program);
 /// ```
 pub trait CompileResultExt<T> {
     /// Return `Ok` payload, or render every error via [`render_errors`] and
     /// panic with the rendering bundled into the panic message (so the
     /// output is captured by cargo test alongside the failing test).
-    fn unwrap_or_render(self, sources: &SourceMap) -> T;
+    fn unwrap_or_render(self, program: &LoadedProgram) -> T;
 }
 
 impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
-    fn unwrap_or_render(self, sources: &SourceMap) -> T {
+    fn unwrap_or_render(self, program: &LoadedProgram) -> T {
         self.unwrap_or_else(|errs| {
             // Bundle the rendered output into the panic message rather than
             // writing to stderr directly: ariadne's `eprint` writes raw to
@@ -538,7 +578,10 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
             // test's output block. Putting them in the panic message means
             // cargo test groups them with the test's `---- TEST stdout ----`
             // section as expected.
-            panic!("compilation failed:\n{}", render_errors(&errs, sources))
+            panic!(
+                "compilation failed:\n{}",
+                render_errors(&errs, program.sources())
+            )
         })
     }
 }
@@ -709,18 +752,22 @@ impl SourceSinkRegistry {
         lowering
     }
 
-    /// Compile the root of `sources` through `phase` against these sources and
+    /// Compile `program` through `phase` against these sources and
     /// sinks, without touching the running program — see [`compile_to_in`] for
     /// why that is safe to do while it is serving.
-    pub fn compile_to(&self, sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
+    pub fn compile_to(
+        &self,
+        program: &LoadedProgram,
+        phase: Phase,
+    ) -> Result<Expr, Vec<CompileError>> {
         let mut lowering = self.seed_lowering_context();
         // Answering a question must not change what the program serves, so a route
         // this registry does not hold is named rather than opened.
         lowering.inherit_endpoints_only();
-        compile_to_in(lowering, sources, phase)
+        compile_to_in(lowering, program, phase)
     }
 
-    /// Compile the root of `sources` through `phase`, binding any port this
+    /// Compile `program` through `phase`, binding any port this
     /// registry does not hold and keeping the listener.
     ///
     /// The listener and nothing else: a route is registered by the compile that
@@ -742,11 +789,11 @@ impl SourceSinkRegistry {
     /// [`release_unrouted_ports`](Self::release_unrouted_ports).
     pub fn compile_to_opening(
         &mut self,
-        sources: &SourceMap,
+        program: &LoadedProgram,
         phase: Phase,
     ) -> Result<Expr, Vec<CompileError>> {
         let mut scratch = GlobalContext::scratch(self.seed_lowering_context());
-        let compiled = run_frontend(&mut scratch, sources, phase, &[], false);
+        let compiled = run_frontend(&mut scratch, program, phase, &[], false);
         // Taken from the scratch *registry*, because `run_frontend` has already
         // folded the pass's listeners into it. Taken whether or not the compile
         // succeeded, so a half-lowered pass leaves no listener owned by a context
@@ -1179,15 +1226,10 @@ pub struct CompiledProgram {
     /// switches off attribution, and the graph is the `post-conversion` pane's
     /// content, held like the trees beside it.
     pub operator_graph: OperatorGraph,
-    /// Every file the program was compiled from, retained verbatim.
-    ///
-    /// Inspector queries need the source text to produce snippets (`hover`'s
-    /// `snippet` = the text under a span) and to serve the snapshot wire's
-    /// `source.text`. Every span-keyed projection above (the
-    /// [`lowering_projection`](Self::lowering_projection), the surface AST's
-    /// spans) names a file of this map and a byte range of its text, so
-    /// retaining it is what makes those spans resolvable to text.
-    pub sources: SourceMap,
+    /// The files the program was compiled from, retained verbatim with their
+    /// trees ([`Self::sources`]). A version replacing this one compiles them
+    /// again to tell how the two differ.
+    pub loaded: LoadedProgram,
     /// Every `http_serve` route this version binds, by the route's source name.
     ///
     /// What a route is retired against once more than one branch runs: the
@@ -1203,6 +1245,18 @@ pub struct CompiledProgram {
 }
 
 impl CompiledProgram {
+    /// Every file the program was compiled from.
+    ///
+    /// Inspector queries need the source text to produce snippets (`hover`'s
+    /// `snippet` = the text under a span) and to serve the snapshot wire's
+    /// `source.text`. Every span-keyed projection above (the
+    /// [`lowering_projection`](Self::lowering_projection), the surface AST's
+    /// spans) names a file of this map and a byte range of its text, so
+    /// retaining it is what makes those spans resolvable to text.
+    pub fn sources(&self) -> &SourceMap {
+        self.loaded.sources()
+    }
+
     /// Returns a reference to the `main` output, if any.
     pub fn main(&self) -> Option<&CompiledOutput> {
         self.outputs.iter().find(|o| o.is_main())
@@ -1935,7 +1989,7 @@ fn at_phase_output(
 /// recorder scopes. Nothing else about the two callers differs.
 fn run_frontend(
     ctx: &mut GlobalContext,
-    sources: &SourceMap,
+    program: &LoadedProgram,
     stop: Phase,
     capture: &[Phase],
     record: bool,
@@ -1954,11 +2008,15 @@ fn run_frontend(
     // below; every early return drops it, clearing the slot.
     let table_session = record.then(TableSession::install);
 
+    // Loading's errors come first: every file's parse errors, then modules with
+    // no file and cycles. Only the root is lowered until imports exist
+    // (`docs/modules.md`, "Implementation stack"), and lowering refuses every
+    // `import` and `run`, so a program of several modules fails below.
+    let sources = program.sources();
     let root = sources.root();
     let code = sources.text(root);
-    let parse_result = chl_parser::parse_module(root, code);
-    errors.extend(parse_result.errors.into_iter().map(CompileError::Parse));
-    let Some(module) = parse_result.value else {
+    errors.extend(program.compile_errors());
+    let Some(module) = program.root() else {
         return Err(errors);
     };
 
@@ -1980,7 +2038,7 @@ fn run_frontend(
     // `LoweringLog`, folded once at the handoff below into the always-on lowering
     // projection. It must fully drain before the first phase (`Infer`) session opens.
     let lowering_session = LoweringSession::install();
-    let lower_result = lower_stmts(&module, ctx.lowering_ctx());
+    let lower_result = lower_stmts(module, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -2457,7 +2515,7 @@ fn run_passes(
     Ok(join_planned)
 }
 
-/// Compile the root of `sources` through `phase`, ready to pass to
+/// Compile `program` through `phase`, ready to pass to
 /// [`crate::ccl::diff::diff`].
 ///
 /// Runs [`run_frontend`] through the requested output, retaining no panes or provenance.
@@ -2465,11 +2523,11 @@ fn run_passes(
 /// rejects. Capture boundaries do not each run a consistency check. A stop beyond the
 /// frontend returns its final planned tree, not an operator graph. See
 /// `src/ccl/design/diffing.md`, "Which phase to diff" for the phase contracts.
-pub fn compile_to(sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
-    compile_to_in(GlobalContext::new().lowering, sources, phase)
+pub fn compile_to(program: &LoadedProgram, phase: Phase) -> Result<Expr, Vec<CompileError>> {
+    compile_to_in(GlobalContext::new().lowering, program, phase)
 }
 
-/// Compile the root of `sources` through `phase` against an already-open
+/// Compile `program` through `phase` against an already-open
 /// source/sink set, without touching the running program.
 ///
 /// Runs the same [`run_frontend`] every other entry point runs, over a
@@ -2481,14 +2539,14 @@ pub fn compile_to(sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<Compile
 /// running program already holds and fail.
 fn compile_to_in(
     lowering: LoweringContext,
-    sources: &SourceMap,
+    program: &LoadedProgram,
     phase: Phase,
 ) -> Result<Expr, Vec<CompileError>> {
     let mut ctx = GlobalContext::scratch(lowering);
-    Ok(run_frontend(&mut ctx, sources, phase, &[], false)?.expr)
+    Ok(run_frontend(&mut ctx, program, phase, &[], false)?.expr)
 }
 
-/// Compile the root of `sources` as a CHL program and return its operator graph
+/// Compile `program` as a CHL program and return its operator graph
 /// plus subscribed outputs.
 ///
 /// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
@@ -2504,13 +2562,13 @@ fn compile_to_in(
 ///   returning.
 pub fn compile_program(
     ctx: &mut GlobalContext,
-    sources: &SourceMap,
+    program: &LoadedProgram,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, sources, main_consumer, None, &HashSet::new())
+    compile_version(ctx, program, main_consumer, None, &HashSet::new())
 }
 
-/// Compile `sources` as the version replacing `previous`, keeping whichever of the
+/// Compile `program` as the version replacing `previous`, keeping whichever of the
 /// running graph's operators compute what this version's tree still asks for.
 ///
 /// `previous` is the tree the offered graph was built from
@@ -2525,17 +2583,17 @@ pub fn compile_program(
 /// either, because the endpoint registry is the process's.
 pub fn compile_replacement(
     ctx: &mut GlobalContext,
-    sources: &SourceMap,
+    program: &LoadedProgram,
     main_consumer: Box<dyn Consumer>,
     previous: &Expr,
     bound_elsewhere: &HashSet<String>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, sources, main_consumer, Some(previous), bound_elsewhere)
+    compile_version(ctx, program, main_consumer, Some(previous), bound_elsewhere)
 }
 
 fn compile_version(
     ctx: &mut GlobalContext,
-    sources: &SourceMap,
+    program: &LoadedProgram,
     main_consumer: Box<dyn Consumer>,
     previous: Option<&Expr>,
     bound_elsewhere: &HashSet<String>,
@@ -2560,7 +2618,7 @@ fn compile_version(
         sink_bindings: sink_bindings_registry,
         lowering_projection,
         table_session,
-    } = run_frontend(ctx, sources, Phase::Planning, &PANES, true)?;
+    } = run_frontend(ctx, program, Phase::Planning, &PANES, true)?;
     // A route the registry holds and this version did not bind is one the version
     // stopped serving. Retire it, or it keeps matching requests and buffering them
     // for a reader that no longer exists. A no-op for a first compilation, whose
@@ -2738,7 +2796,7 @@ fn compile_version(
         post_lambda_elim_ir,
         provenance_table,
         operator_graph,
-        sources: sources.clone(),
+        loaded: program.clone(),
         routes,
         source_producers,
     };
@@ -2782,10 +2840,10 @@ mod tests {
     /// Driver that runs `compile_program` for an error-only test, returning
     /// the collected error list. Discards the program — these tests only
     /// care about which errors surface.
-    fn compile_err(sources: &SourceMap) -> Vec<CompileError> {
+    fn compile_err(program: &LoadedProgram) -> Vec<CompileError> {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        match compile_program(&mut ctx, sources, consumer) {
+        match compile_program(&mut ctx, program, consumer) {
             Ok(_) => panic!("expected compile error, got success"),
             Err(errs) => errs,
         }
@@ -2795,7 +2853,7 @@ mod tests {
     fn compile_ok(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).expect("compiles")
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect("compiles")
     }
 
     /// Lowering's own recording overhead, measured rather than gated.
@@ -2835,9 +2893,9 @@ x = 1 +
 y = {a: 1}
 y
 ";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
-        let out = render_errors(&errs, &sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
+        let out = render_errors(&errs, loaded.sources());
         let expected = "\
 Error: parse error
    ╭─[<test>:1:8]
@@ -2885,8 +2943,8 @@ Error: lowering error
     #[test]
     fn infer_error_carries_resolved_span() {
         let code = "1 and 2\n";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -2916,8 +2974,8 @@ Error: lowering error
     #[test]
     fn coalesce_error_carries_resolved_span() {
         let code = "1 + \"a\"\n";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let span = errs
             .iter()
             .find_map(|e| match e {
@@ -2938,8 +2996,8 @@ Error: lowering error
     #[test]
     fn unbound_variable_carries_resolved_span() {
         let code = "y\n";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -2950,7 +3008,7 @@ Error: lowering error
         assert!(matches!(error, InferError::UnboundVariable(_)));
         assert_eq!(
             span,
-            Span::new(sources.root(), 0, 1),
+            Span::new(loaded.sources().root(), 0, 1),
             "the use of `y` spans byte offsets 0..1"
         );
     }
@@ -2980,8 +3038,8 @@ Error: lowering error
         "\\a, b -> (a + 1, a + \"s\")"
     )]
     fn unsatisfiable_operand_carries_resolved_span(#[case] code: &str, #[case] expected: &str) {
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
@@ -3016,18 +3074,18 @@ Error: lowering error
         #[case] start: usize,
         #[case] end: usize,
     ) {
-        let sources = SourceMap::single("<test>", code);
-        let expected = Span::new(sources.root(), start, end);
+        let program = LoadedProgram::test(code);
+        let expected = Span::new(program.sources().root(), start, end);
         let first_span = |errs: Vec<CompileError>| {
             errs.iter()
                 .find_map(CompileError::span)
                 .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"))
         };
-        let recorded = first_span(compile_err(&sources));
+        let recorded = first_span(compile_err(&program));
         let unrecorded = first_span(
             GlobalContext::default()
                 .sources_and_sinks()
-                .compile_to(&sources, Phase::Planning)
+                .compile_to(&program, Phase::Planning)
                 .expect_err("expected a compile error"),
         );
         assert_eq!(recorded, expected, "with recording");
@@ -3054,16 +3112,16 @@ Error: lowering error
     #[cfg_attr(debug_assertions, should_panic(expected = "traces to no source span"))]
     fn an_inference_minted_blame_node_has_no_span_without_recording() {
         let code = "xs = [1, 2]\n[x for x in xs if x > \"a\"]\n";
-        let sources = SourceMap::single("<test>", code);
+        let program = LoadedProgram::test(code);
         let errs = GlobalContext::default()
             .sources_and_sinks()
-            .compile_to(&sources, Phase::Planning)
+            .compile_to(&program, Phase::Planning)
             .expect_err("expected a compile error");
         let span = errs
             .iter()
             .find_map(CompileError::span)
             .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"));
-        assert_eq!(span, Span::new(sources.root(), 0, code.len()));
+        assert_eq!(span, Span::new(program.sources().root(), 0, code.len()));
     }
 
     /// Every rejection a pass after lowering raises points at the source of what
@@ -3132,8 +3190,8 @@ Error: lowering error
             .nth(nth)
             .unwrap_or_else(|| panic!("{expected:?} occurs fewer than {} times", nth + 1));
         let expected_span = Span::new(chl_parser::FileId::ROOT, start, start + expected.len());
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let spans: Vec<Span> = errs
             .iter()
             .map(|e| {
@@ -3145,7 +3203,7 @@ Error: lowering error
             spans.contains(&expected_span),
             "no error spans bytes {start}..{} ({expected:?}):\n{}",
             start + expected.len(),
-            render_errors(&errs, &sources)
+            render_errors(&errs, loaded.sources())
         );
     }
 
@@ -3229,8 +3287,8 @@ Error: lowering error
         &["nope", "1 + \"s\""]
     )]
     fn emission_reports_every_failing_statement(#[case] code: &str, #[case] expected: &[&str]) {
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let pointed: Vec<&str> = errs
             .iter()
             .map(|e| {
@@ -3238,7 +3296,12 @@ Error: lowering error
                 &code[span.start..span.end]
             })
             .collect();
-        assert_eq!(pointed, expected, "{}", render_errors(&errs, &sources));
+        assert_eq!(
+            pointed,
+            expected,
+            "{}",
+            render_errors(&errs, loaded.sources())
+        );
     }
 
     /// Lowering reports its errors in source order, though it lowers a block's
@@ -3246,8 +3309,8 @@ Error: lowering error
     #[test]
     fn lowering_errors_report_in_source_order() {
         let code = "a: Frob = 1\nb: Blarg = 2\na + b\n";
-        let sources = SourceMap::single("<test>", code);
-        let messages: Vec<String> = compile_err(&sources)
+        let loaded = LoadedProgram::test(code);
+        let messages: Vec<String> = compile_err(&loaded)
             .iter()
             .map(CompileError::message)
             .collect();
@@ -3264,8 +3327,8 @@ Error: lowering error
     /// joins the title rather than being dropped with the label.
     #[test]
     fn an_empty_program_renders_its_message() {
-        let sources = SourceMap::single("<test>", "");
-        let out = render_errors(&compile_err(&sources), &sources);
+        let loaded = LoadedProgram::test("");
+        let out = render_errors(&compile_err(&loaded), loaded.sources());
         assert_eq!(
             out.trim_end(),
             "Error: lowering error: empty program: file contains no top-level statements"
@@ -3277,12 +3340,12 @@ Error: lowering error
     #[test]
     fn a_multi_line_message_follows_its_report() {
         let code = "x = 1\n";
-        let sources = SourceMap::single("<test>", code);
+        let loaded = LoadedProgram::test(code);
         let error = CompileError::Unsupported {
             message: "first line\n  second line".to_string(),
-            span: Span::new(sources.root(), 0, 1),
+            span: Span::new(loaded.sources().root(), 0, 1),
         };
-        let out = error.render(&sources);
+        let out = error.render(loaded.sources());
         let (report, detail) = out.split_once("───╯\n").expect("a framed report");
         assert!(report.contains("first line"), "{out}");
         assert!(!report.contains("second line"), "{out}");
@@ -3293,14 +3356,14 @@ Error: lowering error
     /// source.
     #[test]
     fn an_internal_error_renders_without_a_label() {
-        let sources = SourceMap::single("<test>", "x = 1\n");
+        let loaded = LoadedProgram::test("x = 1\n");
         let error = CompileError::Internal {
             stage: "lambdaElim",
             message: "a `Case` with a guard".to_string(),
         };
         assert_eq!(error.span(), None);
         assert_eq!(
-            error.render(&sources).trim_end(),
+            error.render(loaded.sources()).trim_end(),
             "Error: internal compiler error in lambdaElim: a `Case` with a guard"
         );
     }
@@ -3311,8 +3374,8 @@ Error: lowering error
     #[test]
     fn a_diagnostic_after_a_multibyte_character_names_its_column() {
         let code = "s = (\"é\", 1 and 2)\ns\n";
-        let sources = SourceMap::single("<test>", code);
-        let out = render_errors(&compile_err(&sources), &sources);
+        let loaded = LoadedProgram::test(code);
+        let out = render_errors(&compile_err(&loaded), loaded.sources());
         assert!(out.contains("<test>:1:11"), "{out}");
     }
 
@@ -3321,9 +3384,9 @@ Error: lowering error
     #[test]
     fn infer_error_renders_with_source_context() {
         let code = "1 and 2\n";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
-        let out = render_errors(&errs, &sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
+        let out = render_errors(&errs, loaded.sources());
         // ariadne report markers: the source line, the file:line:col header,
         // and box-drawing for the underline/gutter.
         assert!(
@@ -3346,8 +3409,8 @@ x = (1 +)
 y = {a: 1}
 y
 ";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let has_parse = errs.iter().any(|e| matches!(e, CompileError::Parse(_)));
         let has_lower = errs.iter().any(|e| matches!(e, CompileError::Lower(_)));
         assert!(
@@ -3365,8 +3428,8 @@ x = 1 +
 y = 2 *
 1
 ";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let parse_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Parse(_)))
@@ -3387,8 +3450,7 @@ y = 2
 z = 3 +
 y
 ";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let errs = compile_err(&LoadedProgram::test(code));
         let lex = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Parse(ParseError::Lex(_))))
@@ -3410,8 +3472,8 @@ x = {a: 1}
 y = {b: 2}
 y
 ";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let lower_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Lower(_)))
@@ -3431,8 +3493,8 @@ y
 x = (1 +)
 1
 ";
-        let sources = SourceMap::single("<test>", code);
-        let errs = compile_err(&sources);
+        let loaded = LoadedProgram::test(code);
+        let errs = compile_err(&loaded);
         let lower_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Lower(_)))

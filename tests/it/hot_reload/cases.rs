@@ -2469,7 +2469,7 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
 
     use cambra::{
         ccl::Type,
-        chl_parser::SourceMap,
+        ccl::load::LoadedProgram,
         interpreter::{BaseType, Extent, TestDataSource},
         live_program::{BranchError, ReloadError},
     };
@@ -2488,12 +2488,12 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
     ))));
     let live = LiveProgram::start(
         &mut ctx,
-        &SourceMap::single("running.cambra", running),
+        &LoadedProgram::from_text("running.cambra", running),
         &no_main,
     )
     .expect("the running version compiles where its source is registered");
 
-    let new = SourceMap::single("new.cambra", "1\n");
+    let new = LoadedProgram::from_text("new.cambra", "1\n");
     let Err(BranchError::Reload(err)) = live.diff_against(
         &GlobalContext::default(),
         MAIN_BRANCH,
@@ -2514,7 +2514,7 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
         "the errors should not name the new version's file: {rendered}",
     );
     assert!(
-        err.render(&new)
+        err.render(new.sources())
             .starts_with("error: the running version no longer compiles:\n"),
     );
 }

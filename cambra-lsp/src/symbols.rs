@@ -3,7 +3,7 @@
 
 use crate::document::Document;
 use chl_parser::Stmt;
-use chl_parser::ast::{AssignTarget, ModulePath, Span, Spanned};
+use chl_parser::ast::{AssignTarget, Span, Spanned, WrittenPath};
 use lsp_types::{DocumentSymbol, SymbolKind};
 
 /// The entries for the document's top-level statements, in source order.
@@ -91,7 +91,7 @@ fn bound_names(
 /// has none.
 fn module(
     doc: &Document,
-    path: &ModulePath,
+    path: &WrittenPath,
     alias: Option<&Spanned<smol_str::SmolStr>>,
     range: Span,
 ) -> DocumentSymbol {

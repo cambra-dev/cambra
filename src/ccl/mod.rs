@@ -19,6 +19,7 @@ pub mod infer;
 pub mod inline;
 pub mod lambda_elim;
 pub mod letrec;
+pub mod load;
 pub mod lower;
 pub mod mut_elim;
 pub mod mut_read;
