@@ -120,6 +120,9 @@ There is no list or optional domain inside that slot.
 The domain merges at `!pol` and the codomain at `pol`. Kind accumulation uses `joinKind`:
 `unknown` is its identity, `data` and `compute` are incomparable, and `conflict` absorbs
 either. The model's domain merge does not select a rule from the intermediate kind.
+The kind's domain rule depends on the completed accumulation. Applying it pairwise would let
+bound arrival order decide acceptance, so Rust defers it to `coalesce_compact_go`.
+`undetermined_kinds_join_without_deciding_the_domain_rule` pins this behavior.
 
 The principal representation laws are:
 
@@ -169,8 +172,8 @@ An error is an outcome of the implemented model, not a theorem that a unique sem
 exists but lacks syntax.
 
 A full lattice semantics and a justification of `simplify_type`'s absorption/co-occurrence
-rewrites remain outside the proved model. The documentation makes no claim that disabling
-that Rust pass preserves all observable behavior.
+rewrites remain outside the proved model. A previous corpus check found the pass observationally
+inert: disabling it failed only its own unit tests in `simplify_type.rs`.
 
 ### Why the model carries `CompactTy` at all
 
@@ -280,6 +283,14 @@ A generated sample with no reported differences does not establish agreement on 
 cases. No domain-list fold, `widest` tie-break, or `Option CompactTy` domain encoding describes
 the current model.
 
+A one-off measurement recorded on 2026-08-28 instrumented negative-position data-domain merges
+in `CompactFun::merge`. It counted 473 merges over the integration corpus and 48 over four
+programs intended to force disagreement; all operand domains agreed apart from variable sets.
+The four programs read a parameter raw and filtered, used one parameter under two different
+filters, read a source raw and filtered, and filtered an already filtered binding.
+This is reachability evidence from that corpus, not a standing assertion or a proof that the
+`Enumerated`/`SubtypesOf` kind meet cannot reach disagreeing data domains.
+
 ### Checked samples and their limits
 
 `MaterializedMergeIsABound.lean` contains executable `#guard` assertions for:
@@ -353,8 +364,8 @@ fuel. The intended proof obligations are:
   and fresh variables introduced by extrusion.
 - Scope preservation, including levels, extrusion and escaping references.
 
-Termination is a proposed priority. A stalled build is not by itself evidence that the solver
-failed to terminate; attributing one requires a reproducer or diagnostic trace.
+Termination is the priority of the three: it is the property with live field bugs, and a hanging
+build in this repo is, as a working rule, solver non-termination.
 
 ### Σ types and `FunKind` inference
 

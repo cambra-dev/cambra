@@ -327,12 +327,12 @@ impl CompactTypeKind {
             // range, `UIntRange` subtyping is equality and the ranges below it look
             // spellable. The refinements are what rule it out.
             (SubtypesOf(_), UIntRanges) | (UIntRanges, SubtypesOf(_)) if pol => Universe,
-            // **A meet with a bound keeps the candidates below the parameter**
-            // (`glb_candidates_subtypesOf`). Membership is decided by the order this merge
-            // induces ([`CompactType::is_below`]), which is what the lattice at this
-            // representation *has*: sound as subtyping, incomplete, and its incompleteness
-            // drops a candidate rather than keeping one it should not — the safe direction for
-            // a lower bound.
+            // A meet with a bound filters candidates using `CompactType::is_below`.
+            // Absorption implies materialized subtyping only under additional hypotheses;
+            // see `formal/design.md`, "Bound and leastness hypotheses". This call does not
+            // establish domain agreement. Whether a moved data domain can reach this meet
+            // requires a reachability argument or a checked invariant; the corpus measurement
+            // in `formal/design.md`, "The fn slot holds one domain" is not that proof.
             (Enumerated(xs), SubtypesOf(k)) | (SubtypesOf(k), Enumerated(xs)) => {
                 debug_assert!(
                     k.shapes() > 0,
