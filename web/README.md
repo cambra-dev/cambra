@@ -45,8 +45,10 @@ See [Running it](../docs/inspector.md#running-it). No `cargo`? After `npm run bu
 | **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
 
 The header shows the program name, the snapshot kind (`post-inference`, or
-`failed` when the program has errors), and a **static (no values)** badge — M1
-inspects the program with no execution, so there are no runtime values yet.
+`failed` when the program has errors), and a values badge that follows the live
+run: `waiting for values`, `live · frame N`, `finished`, or `disconnected`. A
+payload no run produced (`meta.version` 0, as under `--inspect-only`) reads
+**static (no values)**.
 
 Cross-linking is bidirectional: **left-click** a source term to find its IR
 node, **click** an IR row to find its source span, and **Ctrl/Cmd-click** (or
@@ -257,8 +259,9 @@ expand/collapse in a tree, and come back blank (the views react to selection
   pre-inference pane (holes/untyped) carries a **"pre-inference (holes)"** badge
   in its header. On a degraded/`failed` snapshot a diagnostics list replaces the
   trees.
-- **Header**: program name, `payloadKind`, and a "static (no values)" badge
-  reflecting the `meta.tick: null` seam.
+- **Header**: program name, `payloadKind`, and a values badge driven by the
+  `LiveStore`'s status (`valuesBadge` in `main.ts`); `attachLive` sets that
+  status to `not-run` for a payload with `meta.version` 0.
 
 ### Cross-pane links are the dense `paneLinks` (bidirectional, transitive)
 
