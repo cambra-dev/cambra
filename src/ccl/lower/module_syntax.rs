@@ -10,16 +10,18 @@
 use super::LoweringError;
 use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
-    AssignTarget, CompClause, Comprehension, Expr as ChlExpr, IfBranch, KindAnnotation, MatchArm,
-    Module as ChlModule, Param, QualifiedName, RecordField, Requirement, Span, Spanned,
-    Stmt as ChlStmt, TypeAnnotation, TypeParam, VariantPayload,
+    AssignTarget, CompClause, Comprehension, DiscardHead, Expr as ChlExpr, IfBranch,
+    KindAnnotation, MatchArm, Module as ChlModule, Param, QualifiedName, RecordField, Requirement,
+    Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam, VariantPayload,
 };
 use smol_str::SmolStr;
 
 /// One error per module construct in `module`, in source order of traversal.
 pub(super) fn refuse_module_syntax(module: &ChlModule) -> Vec<LoweringError> {
     let mut refusals = Refusals::default();
-    refusals.stmts(&module.body);
+    for stmt in &module.body {
+        refusals.stmt(stmt);
+    }
     refusals.errors
 }
 
@@ -44,6 +46,9 @@ fn names_a_method(qualifier: &[Spanned<SmolStr>]) -> bool {
 #[derive(Default)]
 struct Refusals {
     errors: Vec<LoweringError>,
+    /// How many statement bodies enclose the statement being checked: 0 at the
+    /// module's top level.
+    depth: usize,
 }
 
 impl Refusals {
@@ -51,13 +56,42 @@ impl Refusals {
         self.errors.push(LoweringError::unsupported(span, message));
     }
 
+    /// The statements of a body nested in a statement or an expression.
     fn stmts(&mut self, stmts: &[Spanned<ChlStmt>]) {
+        self.depth += 1;
         for stmt in stmts {
             self.stmt(stmt);
         }
+        self.depth -= 1;
     }
 
     fn stmt(&mut self, stmt: &Spanned<ChlStmt>) {
+        // `import`, `run`, `param` and `pub` stand only at a module's top level
+        // (`docs/chl-spec.md`, "9.2 Imports"), and so does the tombstone of a
+        // `run` or an `import`, which stands where the statement stood
+        // (`docs/chl-spec.md`, "8.9 `@Discard` \[Decided\]"). Loading follows only
+        // top-level `import` and `run` statements, so a nested one names no module.
+        if self.depth > 0 {
+            let keyword = match &stmt.node {
+                ChlStmt::Import { .. } => Some("import"),
+                ChlStmt::Run { .. } => Some("run"),
+                ChlStmt::Param { .. } => Some("param"),
+                ChlStmt::Pub { .. } => Some("pub"),
+                ChlStmt::Discard(DiscardHead::Run { .. }) => Some("@Discard run"),
+                ChlStmt::Discard(DiscardHead::Import { .. }) => Some("@Discard import"),
+                _ => None,
+            };
+            if let Some(keyword) = keyword {
+                let span = match &stmt.node {
+                    ChlStmt::Pub { keyword, .. } => *keyword,
+                    _ => stmt.span,
+                };
+                return self.refuse(
+                    span,
+                    format!("`{keyword}` stands only at a module's top level"),
+                );
+            }
+        }
         match &stmt.node {
             ChlStmt::Import { .. } => self.refuse(
                 stmt.span,
@@ -631,6 +665,65 @@ mod tests {
             refused[0]
                 .1
                 .starts_with("`run` and `@RenamedFrom` are not supported yet")
+        );
+    }
+
+    /// A module statement in a nested body is refused as out of place, not as
+    /// unsupported, and the statement is not checked further.
+    #[test]
+    fn a_module_statement_stands_only_at_the_top_level() {
+        let refused = refusals(indoc! {"
+            def f():
+                import shop
+                run audit(log=x::y)
+                param port: String
+                pub limit = 10
+                limit
+            if ready:
+                import cart
+            for x in xs:
+                @Discard
+                run audit as old
+                @Discard
+                import ledger
+                @Discard
+                stock
+            1
+        "});
+        let refused: Vec<(&str, &str)> = refused
+            .iter()
+            .map(|(s, m)| (s.as_str(), m.as_str()))
+            .collect();
+        assert_eq!(
+            refused,
+            [
+                (
+                    "import shop",
+                    "`import` stands only at a module's top level"
+                ),
+                (
+                    "run audit(log=x::y)",
+                    "`run` stands only at a module's top level"
+                ),
+                (
+                    "param port: String",
+                    "`param` stands only at a module's top level"
+                ),
+                ("pub", "`pub` stands only at a module's top level"),
+                (
+                    "import cart",
+                    "`import` stands only at a module's top level"
+                ),
+                (
+                    "@Discard\n    run audit as old\n",
+                    "`@Discard run` stands only at a module's top level"
+                ),
+                (
+                    "@Discard\n    import ledger\n",
+                    "`@Discard import` stands only at a module's top level"
+                ),
+                ("@Discard\n    stock\n", "`@Discard` is not supported yet"),
+            ]
         );
     }
 

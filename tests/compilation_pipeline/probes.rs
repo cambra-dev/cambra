@@ -8,8 +8,8 @@ use std::rc::Rc;
 
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
+use cambra::ccl::load::LoadedProgram;
 use cambra::ccl::provenance::NodeId;
-use cambra::chl_parser::SourceMap;
 use cambra::interpreter::operator_graph::GraphNode;
 use cambra::interpreter::{BaseType, Extent, Predicate, TestDataSource, Value};
 use indoc::indoc;
@@ -40,9 +40,9 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
     lines.borrow_mut().set_yield_predicate(Predicate::True);
     ctx.register_source(lines.clone());
 
-    let sources = SourceMap::single("<test>", code);
+    let loaded = LoadedProgram::test(code);
     let mut compiled =
-        compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     // After the subscribe, as `/api/live` switches it: every producer already
     // holds the slot this fills.
     ctx.scheduler().probes().enable();

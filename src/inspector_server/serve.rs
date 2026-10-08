@@ -39,10 +39,10 @@
 //! type-checks — the frontend never has to branch its initial fetch on compile
 //! success.
 
+use crate::ccl::load::LoadedProgram;
 use std::{io, thread};
 
 use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
-use crate::chl_parser::SourceMap;
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
 use crate::interpreter::Consumer;
@@ -67,21 +67,22 @@ struct Bodies {
     diagnostics: String,
 }
 
-/// Compile `code` **once** and render both the `/api/snapshot` and
+/// Compile `program` **once** and render both the `/api/snapshot` and
 /// `/api/diagnostics` bodies from that single result, so the two can never
 /// disagree. On compile failure the snapshot body is the degraded form (see the
 /// module docs) and the diagnostics body carries the same structured array.
 /// The compile cost is paid once at startup, not per request.
-fn build_bodies(code: &str, name: &str) -> Bodies {
+fn build_bodies(program: &LoadedProgram) -> Bodies {
+    let (name, code) = root_file(program);
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    match compile_program(&mut ctx, &SourceMap::single(name, code), consumer) {
+    match compile_program(&mut ctx, program, consumer) {
         Ok(compiled) => Bodies {
             snapshot: snapshot_json(&compiled, name),
             diagnostics: diagnostics_body(&[]),
         },
         Err(errors) => {
-            let diagnostics = diagnostics_from_compile_errors(&errors);
+            let diagnostics = diagnostics_from_compile_errors(&errors, program.sources());
             Bodies {
                 snapshot: degraded_snapshot_json(name, code, diagnostics.clone()),
                 diagnostics: diagnostics_body(&diagnostics),
@@ -108,7 +109,13 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
         .expect("degraded snapshot payload serializes")
 }
 
-/// Compile `code` once and return the pretty-printed `/api/snapshot` body —
+/// The name and text of `program`'s root file, the one file the payload carries.
+fn root_file(program: &LoadedProgram) -> (&str, &str) {
+    let sources = program.sources();
+    (sources.path(sources.root()), sources.text(sources.root()))
+}
+
+/// Compile `program` once and return the pretty-printed `/api/snapshot` body —
 /// what `--dump-snapshot` prints, and therefore the exact bytes of the
 /// committed golden fixtures (see [`super::snapshot_json_pretty`] for why the
 /// binary owns this format). The degraded form (source + diagnostics, no panes)
@@ -117,15 +124,16 @@ fn degraded_snapshot_json(name: &str, code: &str, diagnostics: Vec<Diagnostic>) 
 /// One-shot and exits: this regenerates the frontend's golden test fixtures
 /// **without** standing up the never-exiting HTTP server (see
 /// `web/src/__fixtures__/`). The HTTP route keeps the compact form.
-pub fn snapshot_body_pretty(code: &str, name: &str) -> String {
+pub fn snapshot_body_pretty(program: &LoadedProgram) -> String {
+    let (name, code) = root_file(program);
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    match compile_program(&mut ctx, &SourceMap::single(name, code), consumer) {
+    match compile_program(&mut ctx, program, consumer) {
         Ok(compiled) => snapshot_json_pretty(&compiled, name),
         Err(errors) => serde_json::to_string_pretty(&InspectorPayload::degraded(
             name,
             code,
-            diagnostics_from_compile_errors(&errors),
+            diagnostics_from_compile_errors(&errors, program.sources()),
         ))
         .expect("degraded snapshot payload serializes"),
     }
@@ -152,19 +160,20 @@ fn text_header() -> tiny_http::Header {
         .expect("static header parses")
 }
 
-/// Compile `code` once and serve it over HTTP on `127.0.0.1:port` until the
+/// Compile `program` once and serve it over HTTP on `127.0.0.1:port` until the
 /// process is killed. Blocks the calling thread (this is the binary's main
 /// loop).
 ///
 /// Loopback, not `0.0.0.0`: the payload is the user's source text and the whole
 /// compiler IR for it, and this is a local development tool. Reaching it from
 /// another host is a port-forward.
-pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
+pub fn serve(program: &LoadedProgram, port: u16) -> io::Result<()> {
     // Started even without a program running: the route completes its handshake
     // and sends nothing, because nothing publishes until a run does.
     let live = LiveServer::start();
+    let (name, _) = root_file(program);
     let server = bind(name, port)?;
-    serve_bodies(&server, build_bodies(code, name), &live);
+    serve_bodies(&server, build_bodies(program), &live);
     Ok(())
 }
 
@@ -270,7 +279,7 @@ mod tests {
     /// [`assert_snapshot_shape`].
     #[test]
     fn snapshot_body_success_carries_a_node_table_per_pane() {
-        let bodies = build_bodies("1 + 2\n", "prog.chl");
+        let bodies = build_bodies(&LoadedProgram::from_text("prog.chl", "1 + 2\n"));
         let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
 
         assert_snapshot_shape(&v);
@@ -308,7 +317,7 @@ mod tests {
     #[test]
     fn snapshot_body_failure_degrades() {
         let code = "1 and 2\n";
-        let bodies = build_bodies(code, "bad.chl");
+        let bodies = build_bodies(&LoadedProgram::from_text("bad.chl", code));
         let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
 
         assert_degraded_snapshot_shape(&v);
@@ -337,14 +346,14 @@ mod tests {
     /// snapshot carries.
     #[test]
     fn diagnostics_body_matches_snapshot_diagnostics() {
-        let ok = build_bodies("1 + 2\n", "ok.chl");
+        let ok = build_bodies(&LoadedProgram::from_text("ok.chl", "1 + 2\n"));
         let ok_diag: Value = serde_json::from_str(&ok.diagnostics).expect("valid JSON");
         assert!(
             ok_diag["diagnostics"].as_array().expect("array").is_empty(),
             "clean compile -> empty diagnostics endpoint"
         );
 
-        let bad = build_bodies("1 and 2\n", "bad.chl");
+        let bad = build_bodies(&LoadedProgram::from_text("bad.chl", "1 and 2\n"));
         let bad_diag: Value = serde_json::from_str(&bad.diagnostics).expect("valid JSON");
         let bad_snap: Value = serde_json::from_str(&bad.snapshot).expect("valid JSON");
         assert_eq!(
@@ -370,7 +379,7 @@ mod tests {
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let Ok(compiled) = compile_program(
             &mut ctx,
-            &SourceMap::single("prog.chl", "1 + 2\n"),
+            &LoadedProgram::from_text("prog.chl", "1 + 2\n"),
             consumer,
         ) else {
             panic!("the program compiles");

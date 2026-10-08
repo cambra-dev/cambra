@@ -763,10 +763,10 @@ fn list_element_errors(body: &str) -> Option<String> {
     let code = format!("out = defer()\n{}\nout\n", body.trim_end());
     let mut ctx = cambra::ccl::context::GlobalContext::default();
     let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
-    let sources = cambra::chl_parser::SourceMap::single("<test>", &code);
-    match cambra::ccl::context::compile_program(&mut ctx, &sources, consumer) {
+    let loaded = cambra::ccl::load::LoadedProgram::test(&code);
+    match cambra::ccl::context::compile_program(&mut ctx, &loaded, consumer) {
         Ok(_) => None,
-        Err(errs) => Some(cambra::ccl::context::render_errors(&errs, &sources)),
+        Err(errs) => Some(cambra::ccl::context::render_errors(&errs, loaded.sources())),
     }
 }
 

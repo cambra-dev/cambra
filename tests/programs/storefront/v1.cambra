@@ -47,7 +47,7 @@ inventory: Mut(FullMap(SKU, Qty), Txn) := [
     "poster"    -> 1000,
 ]
 
-import http
+import std::http
 
 order_reqs,   order_resps   = http.serve("8080", "POST", "/order")
 restock_reqs, restock_resps = http.serve("8080", "POST", "/restock")
