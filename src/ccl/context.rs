@@ -1795,12 +1795,10 @@ fn at_phase_output(
 
 /// The compiler frontend: source in, a CCL tree at `stop`'s output out.
 ///
-/// **This is the only place the phase sequence and its checks are written.**
-/// [`compile_program`] runs it to [`Phase::Planning`] and continues into
-/// operator conversion; [`compile_to`] runs it to whichever phase a diff is
-/// being taken at and stops. A check added here therefore lands on both, which
-/// is what keeps a stopped tree from being one the real pipeline would have
-/// rejected.
+/// Owns the phase sequence and its checks. [`compile_program`] runs through
+/// [`Phase::Planning`] before operator conversion; [`compile_to`] stops at the requested
+/// output. A stopped tree has passed only the checks reached before that stop; a later
+/// phase can still reject it. See `src/ccl/design/diffing.md`, "Which phase to diff".
 ///
 /// `capture` names the phase outputs to retain as panes; `record` selects
 /// whether the run installs the provenance table and opens the per-phase
@@ -2311,14 +2309,11 @@ fn run_passes(
 /// Compile the root of `sources` through `phase`, ready to pass to
 /// [`crate::ccl::diff::diff`].
 ///
-/// Runs [`run_frontend`] — the same phases and the same checks
-/// [`compile_program`] runs — stopping at `phase`'s output rather than
-/// continuing into the operator graph, and retaining no panes and no provenance.
-/// A program `compile_program` refuses therefore yields no tree here.
-///
-/// Every phase output is a consistent tree (each has a wall after it), so any
-/// `Phase` is a legal stop. Which ones answer which question — and which ones a
-/// diff should be taken at — is `src/ccl/design/diffing.md`, "Which phase to diff".
+/// Runs [`run_frontend`] through the requested output, retaining no panes or provenance.
+/// Only checks reached before the stop have run: `Lower` can return a tree that inference
+/// rejects. Capture boundaries do not each run a consistency check. A stop beyond the
+/// frontend returns its final planned tree, not an operator graph. See
+/// `src/ccl/design/diffing.md`, "Which phase to diff" for the phase contracts.
 pub fn compile_to(sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
     compile_to_in(GlobalContext::new().lowering, sources, phase)
 }

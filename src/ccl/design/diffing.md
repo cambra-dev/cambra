@@ -541,9 +541,10 @@ can distinguish structurally similar terms that matched before inference.
 
 ## How much to normalize
 
-Choose a stop by the object being compared. Source-edit inspection needs a representation close
-to lowering. Comparing planned computations needs `Planning`, but even that CCL correspondence
-does not establish runtime state reuse.
+Diff at the earliest phase that can see the edit, unless the question is about the graph that
+runs; then diff at `Planning`. Each pass that rewrites the user's shape can spread one edit over
+more of the tree, so a later stop compares a different object rather than improving the source
+comparison. Even at `Planning`, a CCL correspondence does not establish runtime state reuse.
 
 Compiler transformations can both remove structural differences and duplicate changed content.
 For example, inlining can erase an extracted function boundary while copying an edited helper
@@ -568,8 +569,6 @@ predicate in several node types. Whole-subtree hashing includes those type slots
 edit can consequently yield several sites without representing several independent source edits.
 
 These effects depend on the program, its inferred types and the current transformations.
-Historical site-count tables are not API contracts. Tests of a particular contrast do not
-establish fixed counts for other programs or a monotonic increase at every phase.
 
 ### What is not normalized
 
@@ -635,8 +634,6 @@ and it is what makes a second version cost the diff rather than 2×. Not built.
 
 ## Open threads
 
-The following limitations concern the analysis. They do not authorize runtime-sharing decisions.
-
 ### Repeated predicates in types
 
 A predicate can affect the hashes of several nodes while being exposed as a child only at a cast.
@@ -645,9 +642,10 @@ require a cross-version predicate correspondence and a rule proving that the ret
 for every suppressed difference.
 
 A shared `Rc` can identify repeated mentions within one compilation, but not corresponding
-predicates across compilations. Some structurally equal predicates can also have distinct
-allocations. Pointer identity alone is not the proposed cross-version relation. No such reduction
-is implemented, and historical measurements of predicate counts are not invariants.
+predicates across compilations. An earlier `Planning` inspection found three distinct allocations
+of the same predicate across `sum` and `restrict` mentions, despite `Refinement::predicate`'s
+shared-allocation contract. Which pass rebuilds these copies, and whether that violates the
+contract, remains unexamined. Pointer identity alone cannot establish cross-version correspondence.
 
 ### Child enumeration and scope maintenance
 
@@ -677,8 +675,11 @@ Two alternatives remain separate proposals:
 - Introduce a binding-group representation whose independent members are unordered. That would
   affect lowering, inference and subsequent passes, not only the matcher.
 
-Revisit the representation if another compiler requirement also needs such a group. Earlier
-candidate-ranking experiments are not an impossibility proof for all matchers.
+Revisit the representation if another compiler requirement also needs such a group. Three
+previously measured matcher changes did not improve the reorder case: running bottom-up recovery
+before the root edit-distance step made three reordered bindings worse; ranking candidates by
+already-matched children gave byte-identical corpus results; keying a `Let` by its binding did not
+improve reordering and made the three-binding case worse.
 
 ### Standalone free names
 
