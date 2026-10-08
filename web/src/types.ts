@@ -162,6 +162,11 @@ export interface Meta {
   // Which payload this is: "program" for a successful compile, "failed" for the
   // degraded one. Never a pane id.
   payloadKind: string;
+  // Which version of the `main` branch this payload describes, counting from
+  // `1`; `0` for a payload no run produced. Not `schema`, which versions the
+  // wire format. A frame carrying a higher one names nodes this payload does
+  // not have, which is the client's cue to refetch.
+  version: number;
   schema: number;
 }
 
@@ -345,6 +350,9 @@ export interface LiveSource {
 }
 
 export interface LiveFrame {
+  // The `main` version whose payload this frame's node ids are meant against,
+  // as `meta.version` names it.
+  version: number;
   // Frames published so far, counting this one, so a client can tell it is
   // behind. Advances only over a pass that recorded something, so it counts
   // data rather than loop iterations.

@@ -2,10 +2,11 @@
 //! the static JSON bodies it fetches, and the websocket carrying a run's probe
 //! frames.
 //!
-//! One program is served, and its response bodies are rendered once and reused
-//! for every request. [`serve`] compiles `code` itself; [`serve_compiled`] takes
-//! the compile a driver is about to run. There is no per-request recompilation
-//! and no mutation endpoint.
+//! One program is served, and its response bodies are rendered ahead of the
+//! requests that read them. [`serve`] compiles `code` itself and renders once;
+//! [`serve_compiled`] takes the compile a driver is about to run, and hands back
+//! a [`ServedSnapshot`] the driver replaces when a reload installs another
+//! version. There is no per-request recompilation and no mutation endpoint.
 //!
 //! # Routes
 //!
@@ -39,6 +40,7 @@
 //! type-checks — the frontend never has to branch its initial fetch on compile
 //! success.
 
+use std::sync::{Arc, RwLock};
 use std::{io, thread};
 
 use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
@@ -46,7 +48,7 @@ use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_comp
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
 use crate::interpreter::Consumer;
 
-use super::{snapshot_json, snapshot_json_pretty};
+use super::{snapshot_json, snapshot_json_at_version, snapshot_json_pretty};
 
 /// The CodeMirror frontend, embedded at compile time. This is the built,
 /// self-contained single-file bundle (`web/dist/index.html`,
@@ -58,12 +60,41 @@ use super::{snapshot_json, snapshot_json_pretty};
 /// and this is the one place the Rust build reads from it.
 const INDEX_HTML: &str = include_str!("../../web/dist/index.html");
 
-/// The pre-rendered response bodies for the one static program.
+/// The pre-rendered response bodies for the one program served.
 ///
-/// Built once by [`build_bodies`] and served verbatim per request.
+/// Rendered ahead of the requests and served verbatim per request. Only the
+/// snapshot is ever replaced, by a [`ServedSnapshot`]: a version a reload
+/// installs has compiled, so its diagnostics body is the same empty one.
 struct Bodies {
-    snapshot: String,
+    snapshot: ServedSnapshot,
     diagnostics: String,
+}
+
+/// The `/api/snapshot` body being served, which the driver replaces when a
+/// reload installs a new version of `main`.
+///
+/// A request holds the read side for its whole response, so it finishes against
+/// the body it started on rather than seeing parts of two. The snapshot is
+/// megabytes on a large program, and holding the guard is what spares every
+/// request a copy of it.
+#[derive(Clone)]
+pub struct ServedSnapshot(Arc<RwLock<String>>);
+
+impl ServedSnapshot {
+    fn new(snapshot: String) -> Self {
+        Self(Arc::new(RwLock::new(snapshot)))
+    }
+
+    /// The body being served, held for as long as the guard lives.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, String> {
+        self.0.read().expect("served snapshot lock")
+    }
+
+    /// Serve `compiled`, running as `main`'s version `version`, from now on.
+    pub fn replace(&self, compiled: &CompiledProgram, name: &str, version: u64) {
+        let snapshot = snapshot_json_at_version(compiled, name, version);
+        *self.0.write().expect("served snapshot lock") = snapshot;
+    }
 }
 
 /// Compile `code` **once** and render both the `/api/snapshot` and
@@ -76,13 +107,17 @@ fn build_bodies(code: &str, name: &str) -> Bodies {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, code, consumer) {
         Ok(compiled) => Bodies {
-            snapshot: snapshot_json(&compiled, name),
+            snapshot: ServedSnapshot::new(snapshot_json(&compiled, name)),
             diagnostics: diagnostics_body(&[]),
         },
         Err(errors) => {
             let diagnostics = diagnostics_from_compile_errors(&errors);
             Bodies {
-                snapshot: degraded_snapshot_json(name, code, diagnostics.clone()),
+                snapshot: ServedSnapshot::new(degraded_snapshot_json(
+                    name,
+                    code,
+                    diagnostics.clone(),
+                )),
                 diagnostics: diagnostics_body(&diagnostics),
             }
         }
@@ -168,16 +203,17 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
 }
 
 /// Serve an already-compiled program on a background thread, and return the
-/// channel a driver publishes through.
+/// channel a driver publishes through and the snapshot it replaces.
 ///
 /// One compile feeds both the payload and the run: `NodeId`s come from a
 /// process-global counter, so compiling a second time for the payload would
 /// name different nodes than the graph being driven, and a click in a pane
 /// would resolve to a producer that does not exist.
 ///
-/// The payload is rendered once, so it describes `compiled` and not a version
-/// a later reload installs. See `src/inspector_model/design.md`,
-/// "A reload is not followed".
+/// `compiled` runs as `main`'s version `version`, which the payload and every
+/// frame are stamped with. A reload that installs another version is followed
+/// by the driver, through [`ServedSnapshot::replace`] and [`LiveChannel::follow`];
+/// see `src/inspector_model/design.md`, "A reload of main is followed".
 ///
 /// The port is bound before the server thread starts, so a port already in use
 /// is this call's `Err` rather than a run with no server behind it. The server
@@ -188,11 +224,14 @@ pub fn serve_compiled(
     compiled: &CompiledProgram,
     name: &str,
     port: u16,
-) -> io::Result<LiveChannel> {
+    version: u64,
+) -> io::Result<(LiveChannel, ServedSnapshot)> {
     let live = LiveServer::start();
     let channel = live.channel();
+    channel.follow(version);
+    let snapshot = ServedSnapshot::new(snapshot_json_at_version(compiled, name, version));
     let bodies = Bodies {
-        snapshot: snapshot_json(compiled, name),
+        snapshot: snapshot.clone(),
         diagnostics: diagnostics_body(&[]),
     };
     let server = bind(name, port)?;
@@ -200,7 +239,7 @@ pub fn serve_compiled(
         .name("cambra-inspector".to_string())
         .spawn(move || serve_bodies(&server, bodies, &live))
         .map_err(io::Error::other)?;
-    Ok(channel)
+    Ok((channel, snapshot))
 }
 
 /// The path a request URL routes on: the URL without its query string, so a
@@ -233,9 +272,11 @@ fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
         }
         // `bodies` and `INDEX_HTML` both outlive the loop, so a response
         // borrows: the snapshot is megabytes on a large program and the bundle
-        // is a quarter of one, and every request would otherwise copy it.
+        // is a quarter of one, and every request would otherwise copy it. The
+        // snapshot's read guard is held until the response is written.
+        let snapshot = bodies.snapshot.read();
         let (body, status, header) = match route(request.url()) {
-            "/api/snapshot" => (bodies.snapshot.as_bytes(), 200, json_header()),
+            "/api/snapshot" => (snapshot.as_bytes(), 200, json_header()),
             "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
             "/" | "/index.html" => (INDEX_HTML.as_bytes(), 200, html_header()),
             _ => (NOT_FOUND, 404, text_header()),
@@ -270,7 +311,7 @@ mod tests {
     #[test]
     fn snapshot_body_success_carries_a_node_table_per_pane() {
         let bodies = build_bodies("1 + 2\n", "prog.chl");
-        let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
+        let v: Value = serde_json::from_str(&bodies.snapshot.read()).expect("valid JSON");
 
         assert_snapshot_shape(&v);
         let anchor = v["panes"]
@@ -308,7 +349,7 @@ mod tests {
     fn snapshot_body_failure_degrades() {
         let code = "1 and 2\n";
         let bodies = build_bodies(code, "bad.chl");
-        let v: Value = serde_json::from_str(&bodies.snapshot).expect("valid JSON");
+        let v: Value = serde_json::from_str(&bodies.snapshot.read()).expect("valid JSON");
 
         assert_degraded_snapshot_shape(&v);
         assert!(v["panes"].as_array().expect("array").is_empty());
@@ -340,7 +381,7 @@ mod tests {
 
         let bad = build_bodies("1 and 2\n", "bad.chl");
         let bad_diag: Value = serde_json::from_str(&bad.diagnostics).expect("valid JSON");
-        let bad_snap: Value = serde_json::from_str(&bad.snapshot).expect("valid JSON");
+        let bad_snap: Value = serde_json::from_str(&bad.snapshot.read()).expect("valid JSON");
         assert_eq!(
             bad_diag["diagnostics"], bad_snap["diagnostics"],
             "the degraded snapshot's diagnostics equal the diagnostics endpoint's"
@@ -365,6 +406,6 @@ mod tests {
         let Ok(compiled) = compile_program(&mut ctx, "1 + 2\n", consumer) else {
             panic!("the program compiles");
         };
-        assert!(serve_compiled(&compiled, "prog.chl", port).is_err());
+        assert!(serve_compiled(&compiled, "prog.chl", port, 1).is_err());
     }
 }

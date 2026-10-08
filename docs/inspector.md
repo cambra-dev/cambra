@@ -107,10 +107,10 @@ A probe frame's shape is defined by `ProbeFrame` in
 `wire_check::assert_probe_frame_shape` and the fixture
 [`probe_frame.json`](../web/src/__fixtures__/probe_frame.json).
 
-With `--control` as well, the panes keep showing the version the run started
-with after a `/reload`. Probe frames for operators the reload rebuilt name nodes
-no pane contains. See
-[design.md](../src/inspector_model/design.md#a-reload-is-not-followed).
+With `--control` as well, the panes follow the version `main` runs: after a
+`/reload` of `main` the page fetches the new payload and redraws, keeping each
+pin whose construct the new version still has. Another branch is not shown. See
+[design.md](../src/inspector_model/design.md#a-reload-of-main-is-followed).
 
 ### One-shot snapshot dump
 

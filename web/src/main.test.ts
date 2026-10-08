@@ -16,9 +16,15 @@ import {
   diagnosticLines,
   formatSpan,
   lineCol,
+  followReloads,
   renderApp,
+  resolveTag,
   serializeDiagnostics,
+  tagLabel,
+  tagSpan,
 } from "./main";
+import { LiveStore } from "./liveStore";
+import type { Snapshot } from "./types";
 import { Store } from "./store";
 import { isIrPane } from "./types";
 import { fixture, stubLayout } from "./__fixtures__/helpers";
@@ -307,5 +313,71 @@ describe("renderApp: pane visibility", () => {
         "hidden",
       ),
     ).toBe(true);
+  });
+});
+
+describe("following a reload", () => {
+  beforeAll(stubLayout);
+
+  /** An anchor node that reaches some operator, pinned the way a gesture pins it. */
+  function pinned(store: Store, live: LiveStore): number {
+    const paneId = store.sourceAnchorPaneId!;
+    const ids = [...store.indicesFor(paneId)!.nodeById.keys()];
+    const nodeId = ids.find((id) => store.operatorsFor(id).length > 0 && tagSpan(store, id) !== null);
+    if (nodeId === undefined) throw new Error("the fixture pins nothing");
+    const lineStarts = byteLineStarts(store.snapshot.source.text);
+    live.inspect(tagLabel(store, nodeId, lineStarts), nodeId, store.operatorsFor(nodeId), tagSpan(store, nodeId));
+    return nodeId;
+  }
+
+  /** `snap` with one byte of its source replaced, at `at`. */
+  function edited(snap: Snapshot, at: number): Snapshot {
+    const text = snap.source.text;
+    const swapped = text[at] === "z" ? "y" : "z";
+    return { ...snap, source: { ...snap.source, text: text.slice(0, at) + swapped + text.slice(at + 1) } };
+  }
+
+  it("finds a tag's construct again by its span, text and label", () => {
+    const store = new Store(fixture(listMinJson));
+    const live = new LiveStore();
+    const nodeId = pinned(store, live);
+    const tag = live.get().tags[0]!;
+
+    const again = resolveTag(new Store(fixture(listMinJson)), tag);
+    expect(again?.anchorId).toBe(nodeId);
+    expect(again?.nodes).toEqual(store.operatorsFor(nodeId));
+  });
+
+  // An edit inside the construct changes the text under its span, and the tag
+  // is dropped rather than pointed at whatever now sits there.
+  it("drops a tag whose construct's text changed", () => {
+    const store = new Store(fixture(listMinJson));
+    const live = new LiveStore();
+    pinned(store, live);
+    const tag = live.get().tags[0]!;
+
+    const changed = new Store(edited(fixture(listMinJson), tag.span!.start));
+    expect(resolveTag(changed, tag)).toBeNull();
+  });
+
+  it("refetches once per later version, and redraws with the tags it could keep", async () => {
+    const root = document.createElement("div");
+    const live = new LiveStore();
+    const shown = fixture(listMinJson);
+    const next: Snapshot = { ...fixture(listMinJson), meta: { ...shown.meta, version: 2 } };
+    const fetchSnapshot = vi.fn(async () => next);
+    followReloads(root, live, shown, fetchSnapshot);
+    pinned(new Store(shown), live);
+
+    live.apply({ version: 0, published: 1, final: false, nodes: [], sources: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetchSnapshot).not.toHaveBeenCalled();
+
+    live.apply({ version: 2, published: 2, final: false, nodes: [], sources: [] });
+    live.apply({ version: 2, published: 3, final: false, nodes: [], sources: [] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetchSnapshot).toHaveBeenCalledTimes(1);
+    expect(live.get().tags).toHaveLength(1);
+    expect(root.querySelector(".panels")).not.toBeNull();
   });
 });

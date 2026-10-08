@@ -517,6 +517,16 @@ impl LiveProgram {
         self.default_branch().map(|b| &b.program)
     }
 
+    /// `main`'s version number, while the table holds `main`.
+    ///
+    /// Bumped by every accepted reload of `main` and by nothing else, and never
+    /// repeated under the name: a `main` deleted and created again continues
+    /// from its tombstone. So a change in this number is exactly a change in
+    /// what [`program`](Self::program) answers.
+    pub fn version(&self) -> Option<u64> {
+        self.default_branch().map(|b| b.version)
+    }
+
     /// The compiled program branch `name` runs.
     pub fn branch_program(&self, name: &str) -> Option<&CompiledProgram> {
         let at = self.index_of(name).ok()?;

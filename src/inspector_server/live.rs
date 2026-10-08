@@ -60,6 +60,9 @@ struct Latest {
     /// than the frame's text.
     frame: Mutex<Option<(Utf8Bytes, u64)>>,
     published: AtomicU64,
+    /// The `main` version every frame from now on is stamped with: the one
+    /// whose payload `/api/snapshot` serves. See [`LiveChannel::follow`].
+    version: AtomicU64,
 }
 
 /// The wake handle of every connection's writer thread.
@@ -113,6 +116,7 @@ impl LiveChannel {
         let frame = crate::inspector_model::frame::render_probe_frame(
             probes,
             sources,
+            self.latest.version.load(Ordering::Acquire),
             published,
             final_frame,
         );
@@ -128,6 +132,16 @@ impl LiveChannel {
     /// readings from before it connected as current state.
     pub fn forget_frame(&self) {
         *self.latest.frame.lock().expect("live frame lock") = None;
+    }
+
+    /// Stamp every later frame with `version`.
+    ///
+    /// Called with the version whose payload the server now answers
+    /// `/api/snapshot` with, after that payload is installed. A frame stamped
+    /// first would send a client to refetch a payload the server does not yet
+    /// have.
+    pub fn follow(&self, version: u64) {
+        self.latest.version.store(version, Ordering::Release);
     }
 
     /// Frames published so far, for tests and for a client asking whether it is
@@ -440,6 +454,30 @@ mod tests {
             frame["nodes"][0]["probes"][0]["producer"],
             "MapResultWithSource#1"
         );
+    }
+
+    /// A frame carries the `main` version the channel follows when it is
+    /// published, so the frames after a reload name the new version.
+    #[test]
+    fn a_frame_carries_the_version_followed_when_it_was_published() {
+        let live = Arc::new(LiveServer::start());
+        let channel = live.channel();
+        channel.follow(1);
+        let publishing = channel.clone();
+        thread::spawn(move || {
+            let probes = probes_with_one_row();
+            publishing.publish_probes(&probes, &[]);
+            publishing.follow(2);
+            publishing.publish_probes(&probes, &[]);
+        })
+        .join()
+        .expect("the publishing thread");
+
+        let port = serve_live(Arc::clone(&live));
+        let mut socket = connect(port);
+        let frame = read_frame(&mut socket);
+        assert_eq!(frame["published"], 2);
+        assert_eq!(frame["version"], 2);
     }
 
     /// A client that connects after the last publish still sees state. A converged

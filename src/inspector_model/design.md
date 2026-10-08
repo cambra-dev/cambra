@@ -84,29 +84,37 @@ nothing until the fresh table's first flow. A client that connects after the run
 receives the `final` frame. It carries readings when a client stayed connected through the end,
 and only the source windows otherwise: nothing pulls after the run.
 
-### A reload is not followed
+### A reload of main is followed
 
-Under `--inspect --control`, the panes and the source anchors describe the version the run started
-with, and a `/reload` does not replace them. `serve_compiled` renders `/api/snapshot` once, from the
-first compile, and the driver computes each source's anchors (`source_nodes`) once, before its first
-pull.
+Under `--inspect --control`, `/api/snapshot`, the source anchors and every probe frame describe the
+version `main` runs. The payload's `meta.version` and each frame's `version` carry that version's
+number from the branch table (`LiveProgram::version`), which starts at `1`. A payload no run
+produced has `meta.version` `0`: `--inspect-only`, `--dump-snapshot`, a degraded payload, and every
+committed fixture.
 
-A reload keeps some operators and rebuilds the rest. A kept operator keeps its `NodeId`, so its
-probe frame entries still resolve in the panes. A rebuilt operator mints a fresh `NodeId` that the
-served snapshot does not contain. Its entries arrive in every probe frame, but no pane node matches
-them. A source window's `nodeIds` keep naming the first version's `IterateExtent`s. For a rebuilt
-iteration, those ids name a node whose probe detached at teardown. A source first read by the new
-version ships with empty `nodeIds`.
+The driver compares `main`'s version with the one it follows after each control-port poll. On a
+change it renders the new version's payload into the served snapshot (`ServedSnapshot::replace`),
+re-derives each source's anchors (`source_nodes`), and stamps later frames with the new version
+(`LiveChannel::follow`), in that order. A frame stamped before the payload is installed would send a
+client to refetch the previous one.
 
-A branch is not followed either. The panes and anchors describe `main`'s first version, and every
-branch's producers hold the same `ProbeSlot`, because every branch subscribes under the one
-`Scheduler` ([program-evolution.md](../ccl/design/program-evolution.md#the-branch-table)). An
-operator another branch built and `main` does not hold mints a `NodeId` the snapshot does not
-contain, so its entries arrive in every probe frame and match no pane node, as a rebuilt
-operator's do.
+A reload keeps some operators and rebuilds the rest. A kept operator keeps its `NodeId`. A rebuilt
+operator mints a fresh one, and the producers it replaced detach their probes at teardown, so no
+frame after the reload names them.
 
-Following a reload means republishing the snapshot and the anchors with the version, and telling a
-reader which version a frame belongs to. Neither is implemented.
+A client holding a payload of a lower version than a frame's refetches `/api/snapshot` and redraws
+every pane (`followReloads`, `web/src/main.ts`). Its cached readings and source windows are dropped
+on the version change rather than merged, because an entry under an id the new version reused would
+read as that version's value. A tag is kept only if the new payload has an anchor node with the tag's
+span, the same source text under it and the same label (`resolveTag`). Any other tag is dropped: an
+edit above a construct shifts its bytes and an edit inside it changes its text.
+
+Only `main` is followed. Every branch's producers hold the same `ProbeSlot`, because every branch
+subscribes under the one `Scheduler`
+([program-evolution.md](../ccl/design/program-evolution.md#the-branch-table)). An operator another
+branch built and `main` does not hold mints a `NodeId` the payload does not contain, so its entries
+arrive in every probe frame and match no pane node. Reloading another branch changes nothing the
+inspector serves. Deleting `main` leaves the payload describing the last version `main` ran.
 
 ## The data model
 
