@@ -7,7 +7,6 @@
   "diagnostics": [
     {
       "severity": "error",
-      "stage": "infer",
       "message": "Type mismatch for BinOp: expected Bool, found Int",
       "span": {
         "file": 0,

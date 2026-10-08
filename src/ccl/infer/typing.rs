@@ -49,9 +49,9 @@ pub(super) trait Typing {
 
     /// Raise `error`, blamed on the node whose rule is running.
     ///
-    /// The **only** way to build a [`LocatedInferError`], which is why that type
-    /// has no unlocated state to represent: an inference error cannot be
-    /// constructed without the node it belongs to. Attribution happens at the
+    /// Inference's way to build a [`LocatedInferError`], which has no unlocated
+    /// state to represent: an inference error cannot be constructed without the
+    /// node it belongs to. Attribution happens at the
     /// raise site rather than on the unwind, so it does not depend on a pass
     /// being fail-fast — an accumulating pass gets the same per-error blame for
     /// free (this is how the coalesce walk and Check mode both get theirs).

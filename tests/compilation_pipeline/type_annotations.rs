@@ -211,7 +211,7 @@ def test(x: Int) => {Int where _ > y}:
 
 ()
 ",
-        "type inference: Unbound variable: 'y'",
+        "Unbound variable: 'y'",
     )
 }
 
@@ -324,7 +324,7 @@ def test(x: {Int where x >= 1}) => Int:
 
 ()
 ",
-        "type inference: Unbound variable: 'x'",
+        "Unbound variable: 'x'",
     )
 }
 
@@ -374,7 +374,7 @@ def test(a: String, b: Int):
 #[case::sibling_of_three("def f(a: Int, b: Int, c: {Int where _ >= b}):\n    c\n\nf\n", "b")]
 #[case::own_binder("def f(a: {Int where _ >= a}):\n    a\n\nf\n", "a")]
 fn type_annotation_naming_a_parameter_is_unbound(#[case] code: &str, #[case] name: &str) {
-    check_compile_error(code, &format!("type inference: Unbound variable: '{name}'"));
+    check_compile_error(code, &format!("Unbound variable: '{name}'"));
 }
 
 #[test]

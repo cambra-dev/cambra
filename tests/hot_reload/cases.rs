@@ -2308,9 +2308,10 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
     use std::{cell::RefCell, rc::Rc};
 
     use cambra::{
-        ccl::{Type, context::CompileError},
+        ccl::Type,
         chl_parser::SourceMap,
         interpreter::{BaseType, Extent, TestDataSource},
+        live_program::ReloadError,
     };
 
     let running = indoc! {"
@@ -2333,11 +2334,11 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
     .expect("the running version compiles where its source is registered");
 
     let new = SourceMap::single("new.cambra", "1\n");
-    let Err(errs) = live.diff_against(&GlobalContext::default(), &new, Phase::AsOfRead) else {
+    let Err(err) = live.diff_against(&GlobalContext::default(), &new, Phase::AsOfRead) else {
         panic!("a running version that does not compile has no difference to report");
     };
-    let [CompileError::RunningVersion(rendered)] = errs.as_slice() else {
-        panic!("expected one RunningVersion error, got {errs:?}");
+    let ReloadError::RunningVersion(rendered) = &err else {
+        panic!("expected a RunningVersion refusal, got {err:?}");
     };
     assert!(
         rendered.contains("running.cambra") && rendered.contains("source1()"),
@@ -2348,8 +2349,7 @@ fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
         "the errors should not name the new version's file: {rendered}",
     );
     assert!(
-        errs[0]
-            .render(&new)
+        err.render(&new)
             .starts_with("error: the running version no longer compiles:\n"),
     );
 }

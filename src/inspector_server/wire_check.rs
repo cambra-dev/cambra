@@ -338,7 +338,7 @@ fn assert_common_shape(v: &Value, doc: &str) {
         .unwrap_or_else(|| panic!("{doc}diagnostics is an array"));
     for (i, d) in diagnostics.iter().enumerate() {
         let at = format!("{doc}diagnostics[{i}]");
-        for key in ["severity", "stage", "message"] {
+        for key in ["severity", "message"] {
             assert!(d[key].is_string(), "{at}.{key} is a string");
         }
         // `null` when the error carries no range; present either way.
@@ -349,6 +349,7 @@ fn assert_common_shape(v: &Value, doc: &str) {
             assert_span(span, &format!("{at}.span"));
         }
         assert!(d.get("labels").is_none(), "{at} ships no labels");
+        assert!(d.get("stage").is_none(), "{at} ships no stage");
     }
     assert!(
         v.get("scopes").is_none(),

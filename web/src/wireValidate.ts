@@ -525,13 +525,16 @@ export function validateSnapshot(json: unknown): Snapshot {
   diagnostics.forEach((d, i) => {
     const dg = obj(d, `diagnostics[${i}]`);
     str(dg.severity, `diagnostics[${i}].severity`);
-    str(dg.stage, `diagnostics[${i}].stage`);
     str(dg.message, `diagnostics[${i}].message`);
     validateSpanOrNull(dg.span, `diagnostics[${i}].span`);
     // `labels` held one label repeating `span` and `message`: a diagnostic is
     // built from one `CompileError`, which carries at most one range.
     if (dg.labels !== undefined) {
       throw new WireError(`diagnostics[${i}].labels`, "absent", dg.labels);
+    }
+    // A diagnostic names no compiler phase; an internal error's message does.
+    if (dg.stage !== undefined) {
+      throw new WireError(`diagnostics[${i}].stage`, "absent", dg.stage);
     }
   });
 

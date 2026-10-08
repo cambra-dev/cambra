@@ -96,7 +96,7 @@ const NO_DIAGNOSTICS = "No diagnostics, but the IR is unavailable.";
  * pane displays.
  */
 export function diagnosticLines(d: Diagnostic, lineStarts: number[]): [string, string, string] {
-  return [`${d.severity} · ${d.stage}`, d.message, formatSpan(d.span, lineStarts)];
+  return [d.severity, d.message, formatSpan(d.span, lineStarts)];
 }
 
 /** The Diagnostics pane as plain text: each card's lines, blank line between. */
