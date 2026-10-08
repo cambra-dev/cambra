@@ -2,8 +2,8 @@
 //! "6.10 Polymorphic types"; `src/ccl/design/type-parameters.md`).
 //!
 //! A type parameter is opaque in the definition that declares it, and each use
-//! instantiates it at its own types. `requires` clauses are parsed and still refused at
-//! lowering, so every case here states its requirements through bounds or needs none.
+//! instantiates it at its own types. It supports what its bound and its definition's
+//! `requires` clause state, and each use satisfies both at its own types.
 
 use std::time::Duration;
 
@@ -195,6 +195,257 @@ use crate::helpers::{check_compile_error, check_scalar};
 )]
 fn type_parameters_check_and_run(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+/// A `requires` clause states what the body may do with a parameter, and each use
+/// satisfies it at its own types (`docs/chl-spec.md`, "Trait requirements").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::comparison(
+    indoc! {r#"
+        def larger(T, a: T, b: T) => T requires Orderable(T, T):
+            b if a < b else a
+        larger(3, 7) == 7 and larger("a", "b") == "b"
+    "#},
+    Value::Bool(true),
+)]
+// `max` places `Orderable(T, T)` on its element type, which the clause states.
+#[case::max_under_orderable(
+    indoc! {r#"
+        def top(T, a: T, b: T) => T requires Orderable(T, T):
+            max([a, b])
+        top(3, 7) == 7 and top("b", "a") == "b"
+    "#},
+    Value::Bool(true),
+)]
+#[case::associated_type(
+    indoc! {r#"
+        def add(T, a: T, b: T) => T requires Addable(T, T, Output=T):
+            a + b
+        add(1, 2) == 3 and add("a", "b") == "ab"
+    "#},
+    Value::Bool(true),
+)]
+// `O` is determined by the requirement, whose operands the arguments determine.
+#[case::associated_type_as_its_own_parameter(
+    indoc! {"
+        def add(A, B, O, a: A, b: B) => O requires Addable(A, B, Output=O):
+            a + b
+        add(1, 2)
+    "},
+    Value::Int(3),
+)]
+#[case::requirement_with_a_base_operand(
+    indoc! {"
+        def inc(T, x: T) => T requires Addable(T, Int, Output=T):
+            x + 1
+        inc(4)
+    "},
+    Value::Int(5),
+)]
+#[case::unary(
+    indoc! {"
+        def neg(T, a: T) => T requires Negatable(T, Output=T):
+            -a
+        neg(5)
+    "},
+    Value::Int(-5),
+)]
+// The clause answers the operator over a bounded parameter before the bound does, so
+// the sum is a `T`.
+#[case::requirement_and_bound(
+    indoc! {"
+        def add(T <: Int, a: T, b: T) => T requires Addable(T, T, Output=T):
+            a + b
+        add(1, 2)
+    "},
+    Value::Int(3),
+)]
+#[case::generic_calls_generic(
+    indoc! {r#"
+        def add(T, a: T, b: T) => T requires Addable(T, T, Output=T):
+            a + b
+        def twice(U, y: U) => U requires Addable(U, U, Output=U):
+            add(y, y)
+        twice(3) == 6 and twice("s") == "ss"
+    "#},
+    Value::Bool(true),
+)]
+// A product of the callee's variables matches the caller's one assumption of that shape
+// componentwise.
+#[case::generic_calls_generic_through_a_product_requirement(
+    indoc! {r#"
+        def same(T, U, V, a: {T, U}, b: V) => Bool requires Equatable({T, U}, V):
+            a == b
+        def wrap(A, B, W, a: A, c: B, b: W) => Bool requires Equatable({A, B}, W):
+            same((a, c), b)
+        wrap(1, "x", (1, "x"))
+    "#},
+    Value::Bool(true),
+)]
+#[case::generic_calls_generic_through_a_product_of_bases(
+    indoc! {r#"
+        def same(T, U, V, a: {T, U}, b: V) => Bool requires Equatable({T, U}, V):
+            a == b
+        def wrap(W, b: W) => Bool requires Equatable({Int, String}, W):
+            same((1, "x"), b)
+        wrap((1, "x"))
+    "#},
+    Value::Bool(true),
+)]
+// A nested definition's requirement naming the enclosing definition's parameter beside its
+// own still answers its own parameter in each specialization of the enclosing one.
+#[case::nested_requirement_naming_the_enclosing_parameter(
+    indoc! {r#"
+        def scale(V, v: V) => V requires Addable(V, Int, Output=V):
+            def add_to(T, b: V, a: T) => V requires Addable(V, T, Output=V):
+                b + a
+            add_to(v, 1)
+        scale(10)
+    "#},
+    Value::Int(11),
+)]
+// A nested definition's clause is its own in each clone of the enclosing one.
+#[case::nested_definitions_with_requirements(
+    indoc! {r#"
+        def outer(T, x: T) => T requires Addable(T, T, Output=T):
+            def inner(U, y: U) => U requires Addable(U, U, Output=U):
+                y + y
+            inner(x) + x
+        outer(1) == 3 and outer("a") == "aaa"
+    "#},
+    Value::Bool(true),
+)]
+// `Equatable` reads products componentwise, so the clause states it of `T` and `U`.
+#[case::equatable_over_products(
+    indoc! {r#"
+        def same(T, U, a: {T, U}, b: {T, U}) => Bool requires Equatable({T, U}, {T, U}):
+            a == b
+        same((1, "x"), (1, "x"))
+    "#},
+    Value::Bool(true),
+)]
+// A requirement states no refinement: an instance row matches a base whatever its
+// refinements.
+#[case::refined_operand(
+    indoc! {"
+        Qty = {Int where _ >= 0}
+        def restock(T, a: T, b: Qty) => T requires Addable(T, Qty, Output=T):
+            a + b
+        restock(1, 2)
+    "},
+    Value::Int(3),
+)]
+// The nested definition, checked alone in each clone of `outer`, specializes `add` at its
+// own opaque parameter, which its clause answers.
+#[case::nested_generic_calls_an_outer_generic(
+    indoc! {r#"
+        def add(V, a: V, b: V) => V requires Addable(V, V, Output=V):
+            a + b
+        def outer(T, x: T) => T requires Addable(T, T, Output=T):
+            def inner(U, y: U) => U requires Addable(U, U, Output=U):
+                add(y, y)
+            inner(x) + x
+        outer(1) == 3 and outer("a") == "aaa"
+    "#},
+    Value::Bool(true),
+)]
+#[case::nested_generic_in_an_implicit_definition(
+    indoc! {"
+        def add(V, a: V, b: V) => V requires Addable(V, V, Output=V):
+            a + b
+        def outer(x):
+            def inner(U, y: U) => U requires Addable(U, U, Output=U):
+                add(y, y)
+            inner(x) + x
+        outer(1)
+    "},
+    Value::Int(3),
+)]
+// Products of one shape over different parameters: each field's components are related
+// by the requirement on them, which need not be one type.
+#[case::equatable_over_products_of_different_parameters(
+    indoc! {r#"
+        def same(T, U, V, W, a: {T, U}, b: {V, W}) => Bool requires Equatable({T, U}, {V, W}):
+            a == b
+        same((1, "x"), (1, "x"))
+    "#},
+    Value::Bool(true),
+)]
+// A record's fields pair by name, whatever order each operand writes them in.
+#[case::equatable_over_records_written_in_different_orders(
+    indoc! {"
+        def same(T, U, a: {x: T, y: U}, b: {y: U, x: T}) => Bool requires Equatable({x: T, y: U}, {y: U, x: T}):
+            a == b
+        same((x=1, y=2), (y=2, x=1))
+    "},
+    Value::Bool(true),
+)]
+// A product against a type parameter: the clause answers the comparison as written, and
+// each use satisfies it at its own types.
+#[case::equatable_between_a_product_and_a_parameter(
+    indoc! {r#"
+        def same(T, U, V, a: {T, U}, b: V) => Bool requires Equatable({T, U}, V):
+            a == b
+        same((1, "x"), (1, "x")) and not same((1, "x"), (2, "x"))
+    "#},
+    Value::Bool(true),
+)]
+#[case::polymorphic_annotation(
+    indoc! {r#"
+        bigger: forall (T) {T, T} => T requires Orderable(T, T) = \a, b -> b if a < b else a
+        bigger("a", "b") == "b"
+    "#},
+    Value::Bool(true),
+)]
+fn requirements_check_and_run(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::operator_the_clause_does_not_state(
+    indoc! {"
+        def larger(T, a: T, b: T) => T requires Addable(T, T, Output=T):
+            b if a < b else a
+        larger(1, 2)
+    "},
+    "No requirement states that `T` is Orderable",
+)]
+#[case::operands_the_clause_does_not_state(
+    indoc! {"
+        def bad(T, x: T) => T requires Addable(T, T, Output=T):
+            x + 1
+        bad(4)
+    "},
+    "operand 2 is Int, but the only type accepted there is T",
+)]
+#[case::call_failing_a_requirement(
+    indoc! {"
+        def add(T, a: T, b: T) => T requires Addable(T, T, Output=T):
+            a + b
+        add(True, False)
+    "},
+    "No Addable instance",
+)]
+#[case::call_with_a_product(
+    indoc! {"
+        def larger(T, a: T, b: T) => T requires Orderable(T, T):
+            b if a < b else a
+        larger((1, 2), (3, 4))
+    "},
+    "No Orderable instance",
+)]
+#[case::call_failing_a_requirement_against_a_parameter(
+    indoc! {r#"
+        def same(T, U, V, a: {T, U}, b: V) => Bool requires Equatable({T, U}, V):
+            a == b
+        same((1, "x"), 1)
+    "#},
+    "No Equatable instance",
+)]
+fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
 }
 
 #[rstest]
@@ -480,21 +731,90 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
     "},
     "a binding annotated with a polymorphic type must be polymorphic",
 )]
-#[case::requires_clause(
-    indoc! {"
-        def add(a, b) requires Addable(Int, Int, Output=Int):
-            a + b
-        add(1, 2)
-    "},
-    "a `requires` clause is not supported yet",
-)]
 #[case::requires_transaction(
     indoc! {r#"
         def put(k: String) => String requires Transaction:
             k
         put("a")
     "#},
-    "a `requires` clause is not supported yet",
+    "`requires Transaction` is not supported yet",
+)]
+// The caller's assumption fixes the components' order.
+#[case::product_requirement_with_swapped_components(
+    indoc! {r#"
+        def same(T, U, V, a: {T, U}, b: V) => Bool requires Equatable({T, U}, V):
+            a == b
+        def wrap(A, B, W, a: A, c: B, b: W) => Bool requires Equatable({A, B}, W):
+            same((c, a), b)
+        wrap(1, "x", (1, "x"))
+    "#},
+    "expected A, found B",
+)]
+#[case::unknown_trait(
+    indoc! {"
+        def f(T, a: T) requires Frobnicable(T):
+            a
+        1
+    "},
+    "`Frobnicable` is not a trait",
+)]
+#[case::wrong_operand_count(
+    indoc! {"
+        def f(T, a: T) requires Addable(T):
+            a
+        1
+    "},
+    "`Addable` is over 2 type(s), and this requirement names 1",
+)]
+#[case::unknown_associated_type(
+    indoc! {"
+        def f(T, a: T) requires Orderable(T, T, Output=T):
+            a
+        1
+    "},
+    "`Orderable` associates no type named `Output`",
+)]
+#[case::unsatisfiable_requirement(
+    indoc! {"
+        def f(T, a: T) => T requires Negatable(String, Output=T):
+            a
+        1
+    "},
+    "no instance of `Negatable` accepts (String, Output=T)",
+)]
+// No `Addable` row with an `Int` second operand has a `String` output.
+#[case::unsatisfiable_associated_type(
+    indoc! {"
+        def f(T, a: T) => T requires Addable(T, Int, Output=String):
+            a
+        1
+    "},
+    "no instance of `Addable` accepts (T, Int, Output=String)",
+)]
+#[case::unsatisfiable_requirement_on_bases(
+    indoc! {"
+        def f(T, a: T) => T requires Addable(Int, Int, Output=String):
+            a
+        1
+    "},
+    "no instance of `Addable` accepts (Int, Int, Output=String)",
+)]
+// `T` would have to contain itself.
+#[case::product_containing_the_parameter_it_is_against(
+    indoc! {"
+        def f(T, U, a: {T, U}, b: T) => Bool requires Equatable({T, U}, T):
+            True
+        1
+    "},
+    "no instance of `Equatable` accepts",
+)]
+#[case::requirement_over_a_collection(
+    indoc! {"
+        def f(T, a: T) => T requires Orderable(List(T), List(T)):
+            a
+        1
+    "},
+    "no instance of `Orderable` accepts",
 )]
 #[case::capitalized_lambda_binder(
     indoc! {"

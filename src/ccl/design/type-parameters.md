@@ -199,29 +199,45 @@ simplifying it (`refuse_param_joined_with_outer_variable`).
 
 ## Obligations under assumptions
 
-An obligation's candidate set holds its trait's **instances** and its **assumptions**: the
-requirements of the `requires` clauses in scope where it is minted (`TraitObligation::assumptions`).
-`emit_let` puts a `Poly`'s requirements in scope over its right-hand side
-(`Typing::with_assumptions`), and `require_trait` gives each obligation those about its trait.
-Lowering leaves every assumption's operands a base or a type parameter
-([Lowering requirements](#lowering-requirements)), so an assumption is matched by equality.
+An obligation's candidates are its trait's **instances**, the trait's **product rule** if it has
+one ([type-inference.md, "A product is answered off the table"](type-inference.md#a-product-is-answered-off-the-table)),
+and its **assumptions**: the requirements of the `requires` clauses in scope where it is minted
+(`TraitObligation::assumptions`). `emit_let` puts a `Poly`'s requirements in scope over its
+right-hand side (`Typing::with_assumptions`), and `require_trait` gives each obligation those about
+its trait. An assumption is matched by equality: a contribution keeps the assumptions stating it at
+that position, a product compared with its record fields in a canonical order (`canonical_type`).
 
-A contribution arriving at a position narrows both kinds of row:
+A product of a generic use's variables, `{?𝑡, ?𝑢}` for a call of a definition requiring
+`Equatable({𝑇, 𝑈}, 𝑉)`, arrives when the use is instantiated, before its components have bounds,
+so it states no assumption by equality. Where exactly one assumption states a product of its
+shape whose components it can become, each variable component is related both ways to that
+assumption's component, and the product matches it
+(`TraitObligation::sole_assumption_it_can_become`). With more than one, nothing is committed.
 
-| Contribution | Instances | Assumptions |
-| --- | --- | --- |
-| a base | keep the rows with that base there | keep the rows stating that base there |
-| a type parameter an assumption names there (`narrow_param`) | all dropped | keep the rows naming it there |
-| any other type parameter | its bound is offered in its place; with no bound, `MissingRequirement` | as for the bound |
-| a product | answered by `narrow_product` | the conditions it mints start from the same assumptions |
+A contribution arriving at a position narrows every kind of candidate:
+
+| Contribution | Instances | Product rule | Assumptions |
+| --- | --- | --- | --- |
+| a base | keep the rows with that base there | ruled out | keep the rows stating that base there |
+| a type parameter an assumption names there (`narrow_param`) | all dropped | ruled out | keep the rows naming it there |
+| any other type parameter | its bound is offered in its place; with no bound, `MissingRequirement` | as for the bound | as for the bound |
+| a product | all dropped | applied, or pending while an assumption states the product | keep the rows stating that product there |
 
 So a requirement covering an operator on a bounded parameter answers it before the bound does. The
-obligation fails when both kinds are empty. A failure that leaves only assumptions reports what they
-accept: `operand 2 is Int, but the only type accepted there is T`.
+obligation fails when no candidate is left. A failure that leaves only assumptions reports what
+they accept: `operand 2 is Int, but the only type accepted there is T`.
 
-Deposit reads both kinds: once every surviving row agrees on an associated type, it is deposited,
-and it may be a parameter, so `a + b` under `requires Addable(T, T, Output=T)` gives the sum type
-`T`. An assumption that leaves `Output` unnamed leaves the position open in the body.
+The product rule waits while an assumption states the product (`ProductRule::Pending`), and
+applies once none does. Applied, it would bound every operand by a product, which an assumption
+relating the product to a type parameter does not state: under `requires Equatable({T, U}, V)`,
+`a == b` with `b: V` is answered by the assumption, and the rule's bound would demand that `V` be
+a pair. The conditions the rule mints start from the same assumptions as the obligation, so
+`Equatable({T, U}, {V, W})`, lowered to `Equatable(T, V)` and `Equatable(U, W)`, answers each
+field's condition.
+
+Deposit reads instances and assumptions: once every surviving row agrees on an associated type, it
+is deposited, and it may be a parameter, so `a + b` under `requires Addable(T, T, Output=T)` gives
+the sum type `T`. An assumption that leaves `Output` unnamed leaves the position open in the body.
 
 The sweep of [Requirements are read together, once](type-inference.md#requirements-are-read-together-once)
 skips an obligation that still holds assumptions: its operand is a parameter, which the sweep's base
@@ -231,11 +247,21 @@ intersection cannot read.
 
 `lower_requirements` resolves each requirement against the trait table: the name
 (`Trait::from_surface_name`), the operand count, and each associated type by name
-(`Assoc::from_surface_name`). It reads an `Equatable` over products componentwise, so
-`Equatable({T, U}, {T, U})` lowers to `Equatable(T, T)` and `Equatable(U, U)`. Every operand must
-then be a type parameter or a base type, and the requirement must fit some instance at its bases;
-any other is refused at the requirement, since no use could satisfy it. A requirement on bases only
-is checked and dropped. `Transaction` is refused until
+(`Assoc::from_surface_name`). Refinements are stripped from every operand, since an instance row
+matches a base whatever its refinements.
+
+- **Products of one shape** are read through the product rule, the one instance a product
+  satisfies the trait by: the requirement states the trait of each field's components, paired by
+  field name. `Equatable({T, U}, {V, W})` lowers to `Equatable(T, V)` and `Equatable(U, W)`.
+- **A product against a type parameter** is kept as written, since a use can instantiate the
+  parameter at a product of that shape. One where the parameter occurs inside the product is
+  refused: no finite type satisfies it.
+- **Otherwise** every operand must be a type parameter or a base type, and the requirement must fit
+  some instance: each base where the row has it, associated types included, and each parameter
+  standing for one base throughout. A requirement on bases only is checked and dropped.
+
+Any other requirement is refused at the requirement, since no use could satisfy it. `Transaction`
+is refused until
 [chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
 is implemented. For the check that every parameter is determined, a parameter that is the
 associated type of a requirement whose operands are determined counts as determined.
@@ -295,12 +321,23 @@ definition being checked alone, and `specialize_use` freshens such a clone with
 of them. The relative levels inside the clone are kept, and it is coalesced at the raised cutoff.
 
 An obligation copy holding an assumption about one of the specialized binding's own parameters
-is reset to its trait's instances and the assumptions that name no such parameter
+is reset to its trait's instances and the assumptions it still needs
 (`TraitObligation::reset_for_specialization`), and is redelivered its operands' lower bounds once
-the clone is pinned (`redeliver`). Freshening writes bounds directly and so does not deliver; the
+the clone is pinned (`redeliver`). An assumption naming only the binding's own parameters is
+dropped. One that also names a nested definition's parameter is the only row answering that
+parameter, so it is kept: its own parameters freshen to the clone's variables, which the pin ties
+to the use's types, and before redelivery each is replaced by the base it resolves to
+(`settle_assumptions`), since an assumption is matched by equality. Freshening writes bounds directly and so does not deliver; the
 redelivery, which reads the bounds transitively, replaces it. That a reset obligation resolves
 follows from the use having satisfied every requirement at the same types; one that did not would
 be an error the definition alone does not raise, which is reported at the use.
+
+The binding's own parameters are known by identity, the ids of its annotation's parameters
+(`SpecializeFrame::own_params`, carried to freshening as `FreshenCache::own_params`), not by level:
+a sibling definition's parameters can sit at the same level, and an obligation copied from its body
+must keep its rows. The rows a copy keeps can name a definition nested in the clone, whose
+parameters the clone re-mints, so they are freshened through the same cache
+(`TraitObligation::map_assumptions`).
 
 A use inside a generic definition checked alone carries that definition's still-opaque parameters
 into the specialization it reaches. The coalesce walk keeps the `requires` clauses of the

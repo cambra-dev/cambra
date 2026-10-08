@@ -1,5 +1,6 @@
 //! Aggregation kinds and their interpreter-facing fold semantics.
 
+use bit_vec::BitVec;
 use smol_str::SmolStr;
 
 use crate::ccl::BaseType;
@@ -112,6 +113,9 @@ impl AggregateKind {
             (AggregateKind::Max, Extent::Base(BaseType::String)) => {
                 ColumnValue::Strings(vec![SmolStr::default()])
             }
+            (AggregateKind::Max, Extent::Base(BaseType::Bool)) => {
+                ColumnValue::Bools(BitVec::from_elem(1, false))
+            }
             // The single `unit` a drained group collapses to; further elements
             // fold in as no-ops (see `accumulate`).
             (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),
@@ -160,6 +164,12 @@ impl AggregateKind {
             (AggregateKind::Max, ColumnValue::Strings(acc), ColumnValue::Strings(vs)) => {
                 accumulate_max(acc, &vs[start..end]);
             }
+            // `False < True`, so the maximum is whether any element is `True`.
+            (AggregateKind::Max, ColumnValue::Bools(acc), ColumnValue::Bools(vs)) => {
+                if (start..end).any(|i| vs[i]) {
+                    acc.set(0, true);
+                }
+            }
             // `Drain`: the accumulator already holds the single `unit` the group
             // collapses to; folding in more elements is a no-op (any positive
             // multiplicity yields one `unit`). The values column is ignored.
@@ -183,6 +193,7 @@ impl AggregateKind {
             | (AggregateKind::Max, ColumnValue::Ints(_))
             | (AggregateKind::Max, ColumnValue::UInts(_))
             | (AggregateKind::Max, ColumnValue::Strings(_))
+            | (AggregateKind::Max, ColumnValue::Bools(_))
             | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }

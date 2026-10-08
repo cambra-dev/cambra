@@ -369,20 +369,6 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
     expr
 }
 
-/// Refuse a `requires` clause, which the parser recognises and lowering does not
-/// implement yet (`docs/chl-spec.md`, "Trait requirements").
-pub(super) fn refuse_requires_clause(
-    requires: &[Spanned<Requirement>],
-) -> Result<(), LoweringError> {
-    if let Some(requirement) = requires.first() {
-        return Err(LoweringError::unsupported(
-            requirement.span,
-            "a `requires` clause is not supported yet",
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse a capitalized lambda binder: a capitalized name is a type, bound only by an
 /// alias, a `def`'s type parameter, or a polymorphic type (`docs/chl-spec.md`,
 /// "3.10 Lambda").
@@ -415,10 +401,11 @@ pub(super) fn lower_def(
     type_params: &[TypeParam],
     params: &[Param],
     output: Option<&Spanned<ChlExpr>>,
+    requires: &[Spanned<Requirement>],
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
-    if type_params.is_empty() {
+    if type_params.is_empty() && requires.is_empty() {
         return Ok((
             lower_function_body(fn_span, params, output, body, ctx)?,
             None,
@@ -427,12 +414,33 @@ pub(super) fn lower_def(
     let aliases = ctx.snapshot_type_aliases();
     let scoped = ctx.type_params_in_scope.len();
     let result = declare_type_params(type_params, ctx).and_then(|declared| {
-        ctx.type_params_in_scope
-            .extend(type_params.iter().map(|p| p.name.to_string()));
+        let requires = lower_requirements(requires, ctx)?;
         let func = lower_function_body(fn_span, params, output, body, ctx)?;
-        // Every type parameter is determined by a call's arguments, so each appears
-        // in a value parameter's annotation (`docs/chl-spec.md`, "Type parameters").
-        let mentioned = parameter_annotation_params(&func);
+        // Every type parameter is determined by a call's arguments: it appears in a
+        // value parameter's annotation, or it is the associated type of a requirement
+        // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
+        let mut mentioned = parameter_annotation_params(&func);
+        loop {
+            let before = mentioned.len();
+            for r in &requires {
+                // An operand can be a product; every parameter in it has to be known.
+                let mut in_operands = HashSet::new();
+                for a in &r.args {
+                    collect_params(a, &mut in_operands);
+                }
+                let operands_known = in_operands.is_subset(&mentioned);
+                if operands_known {
+                    for (_, t) in &r.assoc {
+                        if let Type::Param(param) = t {
+                            mentioned.insert(param.id);
+                        }
+                    }
+                }
+            }
+            if mentioned.len() == before {
+                break;
+            }
+        }
         if let Some((tp, _)) = type_params
             .iter()
             .zip(&declared)
@@ -449,6 +457,7 @@ pub(super) fn lower_def(
         }
         let poly = Type::Poly(Rc::new(crate::ccl::ty::PolyType {
             params: declared,
+            requires,
             body: Type::Hole,
         }));
         Ok((func, Some(poly)))
@@ -461,13 +470,16 @@ pub(super) fn lower_def(
 /// The type parameters the annotations on `func`'s parameters name: the binders of
 /// the lambda chain `uncurry_params` builds, one lambda for an uncurried definition
 /// and one per parameter for a `Mut`-parameter one.
-fn parameter_annotation_params(func: &Expr) -> HashSet<crate::ccl::ty::TypeParamId> {
-    fn collect(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
-        if let Type::Param(param) = ty {
-            out.insert(param.id);
-        }
-        ty.walk_children(|child| collect(child, out));
+/// Every type parameter `ty` names, into `out`.
+fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
+    if let Type::Param(param) = ty {
+        out.insert(param.id);
     }
+    ty.walk_children(|child| collect_params(child, out));
+}
+
+fn parameter_annotation_params(func: &Expr) -> HashSet<crate::ccl::ty::TypeParamId> {
+    let collect = collect_params;
     let mut out = HashSet::new();
     let mut node = func;
     while let TypedExprNode::Lambda { param, body } = &node.node {

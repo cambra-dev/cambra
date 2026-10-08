@@ -245,7 +245,7 @@ application discharges that binder; group-by lookup uses this mechanism (see
 [Dependent refinements via Pi types](#45-dependent-refinements-via-pi-types)).
 
 Trait obligations for operators are implemented. Operator signatures state requirements such as
-`Addable` and `Comparable`. The inference solver narrows base-type candidate instances before
+`Addable` and `Orderable`. The inference solver narrows base-type candidate instances before
 materialization; `Equatable` additionally handles tuple and record equality componentwise (see
 [A product is answered off the table](#a-product-is-answered-off-the-table)). This is separate from
 a general nominal-type system (`infer/schemes.rs`, `infer/solver/traits.rs`).
@@ -2622,7 +2622,7 @@ The constraint lattice can state that two positions are **equal** or **related b
 
 ### Vocabulary
 
-* A **trait** is a named requirement a list of types may satisfy — `Addable`, `Orderable`, `Comparable`. **A trait is not a type**: no `Type` variant, no lattice point, no subtyping edge, and the type grammar and `constrain_go`'s rules are untouched. Types *satisfy* traits.
+* A **trait** is a named requirement a list of types may satisfy — `Addable`, `Orderable`, `Equatable`. **A trait is not a type**: no `Type` variant, no lattice point, no subtyping edge, and the type grammar and `constrain_go`'s rules are untouched. Types *satisfy* traits.
 * An **instance** is one row of a trait's table: the types it accepts, and the types it associates with them. Written `Addable(Int, Int ⇝ Int)` — accepted types, then `⇝`, then the associated ones.
 * An **associated type** is a type a trait *names* — `Output`, the type an arithmetic operator's result takes. A trait is a requirement rather than a function, so it associates any number, **including none**. A type is associated only when it *depends* on the types satisfying the trait: a comparison's `Bool` is the same for every pair `Equatable` accepts, so it belongs to the operator's signature and `Equatable` associates nothing — recording it as an association would claim the trait determines something it does not.
 * An **obligation** is what one *use* of a trait records: the demand that some instance fit the type positions at that use — one **operand position** per argument the trait takes, and one **associated position** per type it names. It is a single claim with two halves, and neither alone is the obligation: *the operand positions are types some instance accepts*, **and** *each associated position is what that same instance associates*. Every position is an ordinary inference variable, unrelated to the others.
@@ -2726,7 +2726,7 @@ A contribution arriving at a position is one of four things, and each has its ow
 | **not determined yet** | a variable, a hole, a `Feed` handle whose payload arrives separately | nothing to say |
 | a **product** | a tuple, a record | answered componentwise by a structural trait, rejected by every other ([A product is answered off the table](#a-product-is-answered-off-the-table)) |
 | **determined, and neither** | a variant, a function | rejected — no instance accepts it ([What the tables hold](#what-the-tables-hold)) |
-| a **type parameter** | `T` in `def f(T, x: T)` | its bound is offered in its place; with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
+| a **type parameter** | `T` in `def f(T, x: T)` | answered by a `requires` assumption naming it; otherwise its bound is offered in its place, and with no bound, `MissingRequirement` ([type-parameters.md, "Obligations under assumptions"](type-parameters.md#obligations-under-assumptions)) |
 
 The last is a rejection and not silence, because "no base here" is true of both it and the second. A collection that merely failed to narrow would leave `[1, 2] == [3, 4]` well-typed: a comparison has no associated position to strand, so nothing downstream would object either.
 
