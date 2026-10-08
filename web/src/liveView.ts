@@ -143,9 +143,9 @@ function group(
   if (entry !== undefined) {
     return { kind: "operator", nodeId, probes: entry.probes, tags, label };
   }
-  // An operator with no recording has not been pulled. `get` is where a
-  // recording is taken — that is what makes it non-perturbing — so an operator
-  // whose demand path the run has not exercised has genuinely produced nothing.
+  // An operator with no entry has had no rows reach it. The frame ships a
+  // probe's last flow, its newest row-carrying reading, so a probe that was
+  // never pulled and one whose every pull answered empty both ship nothing.
   // Once the run is over that becomes permanent, and the two read differently.
   return { kind: "silent", nodeId, tags, label, ran: status.kind === "finished" };
 }
@@ -617,12 +617,12 @@ function headText(group: LiveGroup): string {
 function metaText(group: LiveGroup): string | null {
   switch (group.kind) {
     case "silent":
-      // Not "no values recorded", which reads as a defect. Nothing has pulled
-      // this operator: a recording is taken inside `get`, so an unexercised
-      // demand path has produced nothing. An `ExtractFinal` over a stream that
-      // never terminates is the permanent case, and after the run ends every
-      // silent operator is.
-      return group.ran ? "produced nothing during the run" : "not pulled yet";
+      // What the pane knows is that no row has reached this node, not why: the
+      // frame does not separate a node nothing pulled from one whose every
+      // pull answered empty. An `ExtractFinal` over a stream that never
+      // terminates is the permanent case, and after the run ends every silent
+      // node is.
+      return group.ran ? "nothing flowed here during the run" : "nothing has flowed here yet";
     case "source":
       return `retained ${countOf(group.source.rows.length, group.source.total)}`;
     case "operator":
