@@ -1,26 +1,11 @@
-//! CHL lexer: logos for raw tokens, plus a layout post-pass that emits
-//! `NEWLINE` / `INDENT` / `DEDENT` tokens following Python's off-side rule.
+//! CHL tokenization and indentation-sensitive layout.
 //!
-//! Public entry point is [`tokenize`], which returns a flat `Vec` of
-//! `(Token, Span)` ready to feed to the chumsky parser.
+//! [`tokenize`] returns span-bearing tokens for the parser. Raw tokenization and
+//! tag-adjacency checks precede layout processing.
 //!
-//! ## Off-side rule mechanics
-//!
-//! At the start of each logical line, the lexer compares the line's
-//! indentation (byte count of leading `' '` / `\t`) against an indent stack
-//! (initialised to `[0]`):
-//!
-//! - `indent > stack.top` → push the new indent, emit `INDENT`.
-//! - `indent < stack.top` → pop until `stack.top == indent`, emitting one
-//!   `DEDENT` per pop. If no equal indent exists on the stack, emit an
-//!   `InconsistentIndent` error.
-//! - `indent == stack.top` → no layout tokens; the line continues the current
-//!   block.
-//!
-//! Inside `(`/`[`/`{`, newlines are swallowed and indentation is ignored
-//! (Python's implicit line continuation). At EOF, a synthetic `NEWLINE` is
-//! emitted if the last token wasn't one, and the stack is fully unwound with
-//! `DEDENT`s so every `INDENT` has a partner.
+//! Source layout is specified in `docs/chl-spec.md`, "1.3 Indentation (off-side rule)".
+//! [`Level::Pending`] handles assignment-side blocks, whose closing `Dedent` has no
+//! corresponding `Indent`; see [`tokenize`] for the parser-facing token contract.
 
 use crate::ast::{FileId, Span};
 use logos::Logos;

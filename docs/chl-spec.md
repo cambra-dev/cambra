@@ -84,17 +84,20 @@ CHL source is UTF-8 text. A span is a byte range of one source file.
 
 ### 1.3 Indentation (off-side rule)
 
-CHL uses Python-style significant indentation. At the start of each
-logical line, the byte count of leading whitespace is compared to an
-indent stack initialised to `[0]`:
+Indentation determines block boundaries. Its width is the byte count of leading spaces and
+tabs; a tab counts as one byte, not expansion to a tab stop. Blank and comment-only lines
+do not establish or close a level. Indentation inside brackets is ignored.
 
-- *greater than top* → push, emit `INDENT`
-- *less than top* → pop until equal, emitting one `DEDENT` per pop;
-  failure to find an equal level is a **hard `InconsistentIndent` error**
-- *equal to top* → no layout token
+For ordinary statement blocks, indentation levels start at zero. A line farther indented
+than the current level opens a new level. A dedent must return to an enclosing level;
+otherwise lexing fails with `InconsistentIndent`. A line at the current level leaves the
+block structure unchanged.
 
-At EOF, the stack is unwound to `[0]` and a synthetic final `NEWLINE`
-plus the requisite `DEDENT`s are emitted, so every `INDENT` is paired.
+An `if` or `match` on the right-hand side of an assignment opens one further level; see
+[Assignment forms](#43-assignment-forms). When a header spans physical lines inside
+brackets, its indentation is that of the statement's first line.
+
+End of input closes every open level.
 
 ### 1.4 Implicit line continuation
 
