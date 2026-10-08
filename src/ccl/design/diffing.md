@@ -188,7 +188,7 @@ implementation does not cache per-subterm free-variable summaries.
 ### The hash is type-aware
 
 `content_hash` and `resolved_hash` include each node's inferred type, user annotation, binder
-types and cast target. `hash_type_in` hashes the type discriminant and the payload selected by
+types and cast target. `hash_type` hashes the type discriminant and the payload selected by
 its constructor. A changed refinement predicate can therefore change the fingerprint without
 changing the enclosing expression's term structure. The exclusions for `own_hash` are listed
 under [Three hashes, three questions](#three-hashes-three-questions).
@@ -204,12 +204,11 @@ resolved kind, but not its allocation identity. Sum binders contribute their cou
 kind children; their IDs extend a witness environment over the domain and codomain. A
 `WitnessRef` found in that environment contributes its innermost-first position.
 
-Witness scope is not propagated through every type constructor. Tuple elements and record or
-variant fields call `hash_type`, which starts a fresh witness environment; predicate terms
-also start fresh type hashes for their type slots. A witness absent from the current environment
-contributes only the `WitnessRef` discriminant. Thus the current hash does not distinguish all
-external witness identities or all references crossing these nested type boundaries. This is
-an implementation limitation, separate from accidental 64-bit collisions.
+Recursive type fields and refinement predicate terms retain the enclosing witness environment,
+including the types attached to predicate nodes. Nested sums extend that environment for their
+body and restore it on return. A witness absent from the environment contributes only the
+`WitnessRef` discriminant, so external witness identities remain indistinguishable. This limitation
+is separate from accidental 64-bit collisions.
 
 `Hole`, `SharedHole` and `Infer` contribute their respective discriminants, without IDs or
 inference bounds. A `BoundedHole` includes its bound. Before inference, annotations and
