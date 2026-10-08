@@ -513,6 +513,20 @@ fn ask_oracle(oracle: &str, cases: &[String]) -> Vec<String> {
     verdicts
 }
 
+fn dump_case(path: &std::path::Path, case: &str) {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|err| panic!("cannot open CAMBRA_DIFF_DUMP {}: {err}", path.display()));
+    write_dump_case(&mut file, path, case);
+}
+
+fn write_dump_case(writer: &mut impl Write, path: &std::path::Path, case: &str) {
+    writeln!(writer, "{case}")
+        .unwrap_or_else(|err| panic!("cannot write CAMBRA_DIFF_DUMP {}: {err}", path.display()));
+}
+
 /// Serialize an atom into the merge model's `Atom` schema. `None` for
 /// `ChanDom`, which the model excludes for the same reason `Ty` excludes the
 /// pipeline transients, and for the other atoms the model has no form for.
@@ -792,6 +806,36 @@ fn gen_type_kind(rng: &mut Rng) -> TypeKind {
     }
 }
 
+fn refuses_cases(seed: u64, n: usize) -> (Vec<String>, usize) {
+    let mut rng = Rng::new(seed);
+    let mut cases = Vec::with_capacity(n);
+    let mut refused = 0usize;
+    while cases.len() < n {
+        let kind = gen_type_kind(&mut rng);
+        let named = rng.chance(1, 2);
+        let ty = match &kind {
+            TypeKind::Enumerated(ds) if named && !ds.is_empty() => {
+                ds[rng.below(ds.len() as u64) as usize].clone()
+            }
+            TypeKind::SubtypesOf(p) if named => (**p).clone(),
+            _ => gen_ty(&mut rng, 2, Fragment::Modelled),
+        };
+        let (Some(k), Some(t)) = (tk_json(&kind), ty_json(&ty)) else {
+            panic!(
+                "generator produced a refusal case outside the wire schema \
+                 (seed {seed}, case {}): {kind:?} / {ty:?}",
+                cases.len()
+            );
+        };
+        let got = kind.refuses(&ty);
+        refused += usize::from(got);
+        cases.push(format!(
+            r#"{{"op":"refuses","kind":{k},"ty":{t},"got":{got}}}"#
+        ));
+    }
+    (cases, refused)
+}
+
 /// `TypeKind::refuses` against the model's, on the concrete fragment.
 ///
 /// `Ty` carries no `Infer` and no `Hole`, so what the wire can express of
@@ -809,28 +853,7 @@ fn differential_refuses_vs_lean_model() {
     let seed: u64 = env_or("CAMBRA_DIFF_SEED", 0x5EED);
     let n: usize = env_or("CAMBRA_DIFF_N", 4000);
 
-    let mut rng = Rng::new(seed);
-    let mut cases: Vec<String> = Vec::new();
-    let mut refused = 0usize;
-    while cases.len() < n {
-        let kind = gen_type_kind(&mut rng);
-        let named = rng.chance(1, 2);
-        let ty = match &kind {
-            TypeKind::Enumerated(ds) if named && !ds.is_empty() => {
-                ds[rng.below(ds.len() as u64) as usize].clone()
-            }
-            TypeKind::SubtypesOf(p) if named => (**p).clone(),
-            _ => gen_ty(&mut rng, 2, Fragment::Modelled),
-        };
-        let (Some(k), Some(t)) = (tk_json(&kind), ty_json(&ty)) else {
-            continue;
-        };
-        let got = kind.refuses(&ty);
-        refused += usize::from(got);
-        cases.push(format!(
-            r#"{{"op":"refuses","kind":{k},"ty":{t},"got":{got}}}"#
-        ));
-    }
+    let (cases, refused) = refuses_cases(seed, n);
 
     let verdicts = ask_oracle(oracle, &cases);
     let mismatches: Vec<String> = verdicts
@@ -894,6 +917,33 @@ fn gen_kind(rng: &mut Rng) -> CompactTypeKind {
     }
 }
 
+fn type_kind_merge_cases(seed: u64, n: usize) -> Vec<String> {
+    let mut rng = Rng::new(seed);
+    let mut cases = Vec::new();
+    while cases.len() < n {
+        let pol = rng.chance(1, 2);
+        let kinds: Vec<CompactTypeKind> =
+            (0..2 + rng.below(3)).map(|_| gen_kind(&mut rng)).collect();
+        let mut acc = kinds[0].clone();
+        for k in &kinds[1..] {
+            let merged = CompactTypeKind::merge_kinds(pol, acc.clone(), k.clone());
+            let (Some(l), Some(r), Some(g)) = (ctk_json(&acc), ctk_json(k), ctk_json(&merged))
+            else {
+                panic!(
+                    "generator produced a kind merge outside the wire schema \
+                     (seed {seed}, case {}): {acc:?} / {k:?} -> {merged:?}",
+                    cases.len()
+                );
+            };
+            cases.push(format!(
+                r#"{{"op":"mergeKind","pol":{pol},"lhs":{l},"rhs":{r},"got":{g}}}"#
+            ));
+            acc = merged;
+        }
+    }
+    cases
+}
+
 /// The kind merge, folded, against the model's `mergeTypeKind`.
 ///
 /// A **fold** rather than a pair, because the parameters worth testing are ones the merge itself
@@ -909,30 +959,7 @@ fn differential_type_kind_merge_vs_lean_model() {
     let seed: u64 = env_or("CAMBRA_DIFF_SEED", 0x5EED);
     let n: usize = env_or("CAMBRA_DIFF_N", 4000);
 
-    let mut rng = Rng::new(seed);
-    let mut cases: Vec<String> = Vec::new();
-    while cases.len() < n {
-        let pol = rng.chance(1, 2);
-        let kinds: Vec<CompactTypeKind> =
-            (0..2 + rng.below(3)).map(|_| gen_kind(&mut rng)).collect();
-        let mut acc = kinds[0].clone();
-        for k in &kinds[1..] {
-            let merged = CompactTypeKind::merge_kinds(pol, acc.clone(), k.clone());
-            let (Some(l), Some(r), Some(g)) = (ctk_json(&acc), ctk_json(k), ctk_json(&merged))
-            else {
-                // A kind carrying a position the wire cannot express: skip the *case*, not the
-                // fold, and keep folding — the merge's own answers are what this checks, and
-                // the same silent-skip reading a tally would give applies to a wire gap here
-                // as anywhere else, so the fold must not quietly shorten.
-                acc = merged;
-                continue;
-            };
-            cases.push(format!(
-                r#"{{"op":"mergeKind","pol":{pol},"lhs":{l},"rhs":{r},"got":{g}}}"#
-            ));
-            acc = merged;
-        }
-    }
+    let cases = type_kind_merge_cases(seed, n);
 
     let verdicts = ask_oracle(oracle, &cases);
     let mismatches: Vec<String> = verdicts
@@ -1050,14 +1077,10 @@ fn differential_concrete_subtype_vs_lean_model() {
             panic!("generator produced a type outside the concrete wire schema: {lhs:?} / {rhs:?}");
         };
         if let Some(path) = std::env::var_os("CAMBRA_DIFF_DUMP") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = writeln!(f, "{{\"op\":\"sub\",\"lhs\":{lj},\"rhs\":{rj}}}");
-            }
+            dump_case(
+                std::path::Path::new(&path),
+                &format!(r#"{{"op":"sub","lhs":{lj},"rhs":{rj}}}"#),
+            );
         }
         let mut cache = ConstrainCache::new();
         let rust = constrain_subtype(&lhs, &rhs, &mut cache).is_ok();
@@ -1118,4 +1141,76 @@ fn two_uniquified_binders_that_render_alike_encode_apart() {
         "the wire spelling must carry the uid, or the comparison loses the distinction"
     );
     assert_eq!(encode(&x1), encode(&x1), "and it is stable for one binder");
+}
+
+#[test]
+fn harness_refuses_generator_stays_in_wire_fragment() {
+    for seed in [0x5EED, 1, 0xC0A1] {
+        let (cases, refused) = refuses_cases(seed, 4000);
+        assert_eq!(cases.len(), 4000);
+        assert!(
+            refused > 200 && refused < 3800,
+            "one-sided sweep, seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn harness_kind_merge_generator_stays_in_wire_fragment() {
+    for seed in [0x5EED, 1, 0xC0A1] {
+        let cases = type_kind_merge_cases(seed, 4000);
+        // The final fold runs to completion and can add at most two extra steps.
+        assert!((4000..=4002).contains(&cases.len()));
+    }
+}
+
+#[test]
+fn harness_dump_writes_one_line_per_case() {
+    let mut bytes = Vec::new();
+    let path = std::path::Path::new("cases.jsonl");
+    write_dump_case(&mut bytes, path, r#"{"op":"sub"}"#);
+    write_dump_case(&mut bytes, path, r#"{"op":"refuses"}"#);
+    assert_eq!(bytes, b"{\"op\":\"sub\"}\n{\"op\":\"refuses\"}\n");
+}
+
+#[test]
+#[should_panic(expected = "cannot open CAMBRA_DIFF_DUMP")]
+fn harness_dump_open_failure_is_loud() {
+    dump_case(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), "{}");
+}
+
+#[test]
+#[should_panic(expected = "cannot write CAMBRA_DIFF_DUMP cases.jsonl: injected write failure")]
+fn harness_dump_write_failure_is_loud() {
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected write failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    write_dump_case(
+        &mut FailingWriter,
+        std::path::Path::new("cases.jsonl"),
+        "{}",
+    );
+}
+
+#[test]
+fn bug_plain_and_data_pins_have_the_same_wire_encoding() {
+    let mut plain = compact_type(&Type::data_fun(
+        Type::UIntRange(1),
+        Type::Base(BaseType::Int),
+    ))
+    .term;
+    plain.fun.as_mut().unwrap().kind = KindPin::Plain;
+    let mut data = plain.clone();
+    data.fun.as_mut().unwrap().kind = KindPin::Data;
+    // BUG: the wire and model lack the distinction between a plain collection and
+    // a data function whose plain-or-sum slot is unresolved. They must encode apart
+    // before the oracle can check the solver's behavior for both pins.
+    assert_eq!(cty_json(&plain).unwrap(), cty_json(&data).unwrap());
 }
