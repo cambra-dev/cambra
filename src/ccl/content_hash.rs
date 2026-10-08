@@ -337,7 +337,7 @@ fn hash_type<'a>(
                 p.param.spelling.hash(state);
             }
             for t in poly.types() {
-                hash_type_in(t, env, wenv, free, state);
+                hash_type(t, env, wenv, free, state);
             }
         }
         // `SharedHole`'s id joins `Infer`'s uid as an identity that is only
