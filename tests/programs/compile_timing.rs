@@ -86,18 +86,6 @@ use super::{panic_message::panic_message, serving::reserve_test_port};
 /// exist in the build an integration test links against.
 const REPS_ENV: &str = "CAMBRA_PERF_REPS";
 
-fn repetitions(value: Result<String, VarError>) -> NonZeroUsize {
-    match value {
-        Err(VarError::NotPresent) => NonZeroUsize::new(3).unwrap(),
-        Ok(value) => value
-            .parse()
-            .unwrap_or_else(|_| panic!("{REPS_ENV} must be a positive integer, got {value:?}")),
-        Err(VarError::NotUnicode(value)) => {
-            panic!("{REPS_ENV} must be a positive integer, got {value:?}")
-        }
-    }
-}
-
 /// Substring narrowing the run to the labels containing it.
 const ONLY_ENV: &str = "CAMBRA_TIMING_ONLY";
 
@@ -187,6 +175,18 @@ fn gallery_post_infer_timing() {
             product: (inferred.product, planned.product),
         })
     });
+}
+
+fn repetitions(value: Result<String, VarError>) -> NonZeroUsize {
+    match value {
+        Err(VarError::NotPresent) => NonZeroUsize::new(3).unwrap(),
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{REPS_ENV} must be a positive integer, got {value:?}")),
+        Err(VarError::NotUnicode(value)) => {
+            panic!("{REPS_ENV} must be a positive integer, got {value:?}")
+        }
+    }
 }
 
 /// Time `compile` over every selected gallery program and print the table.
