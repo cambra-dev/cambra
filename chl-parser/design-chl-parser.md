@@ -161,6 +161,19 @@ Key shape choices:
   entry `(k, v)`, and `k -> v if c else w` pairs `k` with the whole conditional.
   It does not chain, since nothing associates a third component, so
   `a -> b -> c` is a parse error.
+- **Type parameters are split out of the parameter list.** A capitalized `def` parameter is a
+  type parameter ([docs/chl-spec.md](../docs/chl-spec.md), "Type parameters"), so
+  `Stmt::FunctionDef` carries `type_params: Vec<TypeParam>` beside `params`, and `params` alone
+  is the arity. The split happens as the list is parsed (`split_params`), which rejects a type
+  parameter after a value parameter. A type parameter's annotation is a `KindAnnotation`: its kind
+  `T: K` or its bound `T <: U`.
+- **A polymorphic type has its own variant.** `forall (T, U <: B) V requires …` parses to
+  `Expr::Forall`, whose binder list holds only type parameters. The `)` closing the list ends the
+  last kind, so the body follows with no separator.
+- **A `requires` clause ends a signature.** `requires_clause` parses
+  `requires Addable(A, B, Output=O), Transaction` into `Vec<Spanned<Requirement>>`, operands
+  first and associated types by name after them. It follows a `def`'s `=>` result and a
+  `forall`'s body. A clause after a nested `forall`'s body belongs to the innermost one.
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.

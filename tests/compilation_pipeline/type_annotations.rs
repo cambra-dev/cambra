@@ -136,9 +136,9 @@ fn a_pair_arrow_in_type_position_names_both_spellings() {
 
 /// A `def`'s return annotation takes `=>`, and `->` there never reaches the message above.
 ///
-/// `def_stmt` wants the arrow before the `:`, so the commonest miswriting of a function
-/// type is a parse error in the statement grammar rather than a lowering report about the
-/// annotation.
+/// `def_stmt` wants the arrow, a `requires` clause, or the `:` after the parameter list, so
+/// the commonest miswriting of a function type is a parse error in the statement grammar
+/// rather than a lowering report about the annotation.
 #[test]
 fn a_pair_arrow_in_a_def_return_annotation_is_a_parse_error() {
     check_compile_error(
@@ -148,7 +148,7 @@ fn a_pair_arrow_in_a_def_return_annotation_is_a_parse_error() {
 
             f(4)
         "#},
-        "found '->', expected '=>'",
+        "found '->', expected 'requires', '=>', or ':'",
     )
 }
 

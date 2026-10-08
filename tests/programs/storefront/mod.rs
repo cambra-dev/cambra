@@ -96,9 +96,9 @@
 //! files pin the same blocker behind them: `SKU`'s predicate
 //! `_ in catalog.keys()` parses only as far as `in`, which is no expression
 //! operator.  The parser recovers past each statement, so the same run also
-//! reports the other unshipped surfaces listed above — `import`, `static assert`,
-//! `requires`, `with begin():` in value position, and the bare annotation
-//! `orders: Feed(…)`.
+//! reports the other unshipped surfaces listed above that do not parse — `import`,
+//! `static assert`, `with begin():` in value position, and the bare annotation
+//! `orders: Feed(…)`. `requires Transaction` parses, and lowering refuses it.
 //!
 //! `/stats`'s rollup shape is pinned by `entry_pair_rollup_from_the_storefront` in
 //! `tests/chl_parser_roundtrip.rs`; recovery here stops before those lines, so this run

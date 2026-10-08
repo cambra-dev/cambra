@@ -56,6 +56,8 @@ mod transactions;
 mod type_aliases;
 #[path = "compilation_pipeline/type_annotations.rs"]
 mod type_annotations;
+#[path = "compilation_pipeline/type_parameters.rs"]
+mod type_parameters;
 #[path = "compilation_pipeline/variants.rs"]
 mod variants;
 

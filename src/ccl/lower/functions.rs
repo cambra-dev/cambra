@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
-    chl_parser::ast::{AnnotationMode, Param, Span, Spanned},
+    chl_parser::ast::{AnnotationMode, Param, Requirement, Span, Spanned, TypeParam},
 };
 
 /// The binder a `=> T` output annotation introduces to check the body's result.
@@ -367,6 +367,53 @@ fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr
     let _frame = copy_frame("lower.uncurry_proj");
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
     expr
+}
+
+/// Refuse a `def` signature's type parameters and `requires` clause, which the
+/// parser recognises and lowering does not implement yet (`docs/chl-spec.md`,
+/// "6.10 Polymorphic types").
+pub(super) fn refuse_polymorphic_signature(
+    type_params: &[TypeParam],
+    requires: &[Spanned<Requirement>],
+) -> Result<(), LoweringError> {
+    if let Some(param) = type_params.first() {
+        return Err(LoweringError::unsupported(
+            param.name_span,
+            format!(
+                "`{}` is a type parameter, since it is capitalized, and type parameters are \
+                 not supported yet",
+                param.name
+            ),
+        ));
+    }
+    if let Some(requirement) = requires.first() {
+        return Err(LoweringError::unsupported(
+            requirement.span,
+            "a `requires` clause is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a capitalized lambda binder: a capitalized name is a type, bound only by an
+/// alias, a `def`'s type parameter, or a polymorphic type (`docs/chl-spec.md`,
+/// "3.10 Lambda").
+pub(super) fn refuse_capitalized_lambda_binder(params: &[Param]) -> Result<(), LoweringError> {
+    match params
+        .iter()
+        .find(|p| p.name.starts_with(char::is_uppercase))
+    {
+        Some(param) => Err(LoweringError::unsupported(
+            param.name_span,
+            format!(
+                "`{0}` is capitalized, so it names a type, which a lambda does not bind; \
+                 a type parameter is bound by a `def` or by a polymorphic type \
+                 `forall ({0}) …`",
+                param.name
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Lower a Python function definition body to a CCL expression.
