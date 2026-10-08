@@ -531,3 +531,50 @@ fn a_generic_definition_inside_a_loop_body() {
         Value::Int(6),
     );
 }
+
+/// A compared product's components pair by field in one condition per field, freshened with
+/// the definition, so each instantiation of a generic component has a condition of its own
+/// (`src/ccl/design/type-inference.md`, "A product is answered off the table").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::one_generic_component(
+    indoc! {r#"
+        def f(y):
+            (1, y) == (1, y)
+        f(1) and f("a")
+    "#},
+    Value::Bool(true),
+)]
+#[case::two_generic_components(
+    indoc! {r#"
+        def f(x, y):
+            (1, x) == (1, y)
+        f(1, 1) and f("a", "a")
+    "#},
+    Value::Bool(true),
+)]
+#[case::nested_generic_components(
+    indoc! {r#"
+        def f(x, y):
+            ((x, 1), "a") == ((y, 1), "a")
+        f(1, 1) and f("a", "a")
+    "#},
+    Value::Bool(true),
+)]
+fn a_compared_product_with_a_generic_component(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// Each instantiation is still held to the trait: components of different bases fail.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_compared_product_with_mismatched_generic_components() {
+    check_compile_error(
+        indoc! {r#"
+            def f(x, y):
+                (1, x) == (1, y)
+            f(1, "a")
+        "#},
+        "Equatable",
+    );
+}

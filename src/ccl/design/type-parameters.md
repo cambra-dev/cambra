@@ -213,7 +213,7 @@ A contribution arriving at a position narrows both kinds of row:
 | a base | keep the rows with that base there | keep the rows stating that base there |
 | a type parameter an assumption names there (`narrow_param`) | all dropped | keep the rows naming it there |
 | any other type parameter | its bound is offered in its place; with no bound, `MissingRequirement` | as for the bound |
-| a product | answered by `narrow_product` | the component obligations it mints start from the same assumptions |
+| a product | answered by `narrow_product` | the conditions it mints start from the same assumptions |
 
 So a requirement covering an operator on a bounded parameter answers it before the bound does. The
 obligation fails when both kinds are empty. A failure that leaves only assumptions reports what they

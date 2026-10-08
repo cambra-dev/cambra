@@ -405,16 +405,16 @@ pub struct TraitObligation {
     /// variable — at emission and again per instantiation, so a freshened copy records the
     /// instantiation's own variables as the walk reaches them. Narrowing needs none of this:
     /// a base contribution arrives at the watch and is consumed there. A **product** does,
-    /// because answering one means saying what the positions beside it hold
-    /// ([`narrow_product`](Self::narrow_product)).
+    /// because the product rule bounds every operand by the product's shape
+    /// ([`apply_product_rule`](Self::apply_product_rule)).
     operands: RefCell<Vec<Option<Type>>>,
-    /// The product shape this obligation settled at, once one has arrived.
+    /// Where the trait's **product rule** stands: the candidate beside the rows that
+    /// answers a tuple or record ([`ProductRule`]).
     ///
-    /// Set by [`narrow_product`](Self::narrow_product) and never unset, as a candidate set
-    /// only ever shrinks. Two things read it: a later base contribution, which contradicts
-    /// it, and the requirement sweep, which has no base intersection to take once an
-    /// obligation is answered off the table.
-    structural: RefCell<Option<Type>>,
+    /// Two things read it besides narrowing: a diagnostic, which names the product the
+    /// rule was applied at, and the requirement sweep, which has no base intersection to
+    /// take once an obligation is answered by the rule.
+    product_rule: RefCell<ProductRule>,
     /// The type positions this obligation associates, one per name the trait
     /// declares. Empty for a trait that is a pure requirement — the mechanism then
     /// still narrows and still rejects, it simply determines nothing.
@@ -429,6 +429,26 @@ pub struct TraitObligation {
     /// The ID of the operator node that spawned this obligation, to
     /// be used as provenance for any resulting refinement body.
     operator_node_id: provenance::NodeId,
+}
+
+/// The state of an obligation's product rule, the candidate that answers a product
+/// contribution (`src/ccl/design/type-inference.md`, "A product is answered off the
+/// table").
+///
+/// The rows accept bases only, so a contribution decides between them and the rule: a
+/// base rules the rule out, and a product leaves the rule the one candidate. Only a
+/// trait with a product reading has the rule ([`Trait::is_structural`]).
+#[derive(Clone, Debug)]
+enum ProductRule {
+    /// The trait has no product reading.
+    Absent,
+    /// No contribution has arrived to decide between the rows and the rule.
+    Open,
+    /// A base arrived, so only the rows can answer.
+    RuledOut,
+    /// A product arrived, recorded here with its components' refinements peeled, and the
+    /// rule's conditions are minted ([`TraitObligation::apply_product_rule`]).
+    Applied(Type),
 }
 
 /// One associated position of an obligation: the name, the type standing in for it,
@@ -458,7 +478,11 @@ impl TraitObligation {
             trait_,
             candidates: RefCell::new(trait_.instances().to_vec()),
             operands: RefCell::new(Vec::new()),
-            structural: RefCell::new(None),
+            product_rule: RefCell::new(if trait_.is_structural() {
+                ProductRule::Open
+            } else {
+                ProductRule::Absent
+            }),
             assoc: assoc
                 .into_iter()
                 .map(|(name, ty)| AssocPosition {
@@ -494,7 +518,7 @@ impl TraitObligation {
             trait_: original.trait_,
             candidates: RefCell::new(original.candidates()),
             operands: RefCell::new(Vec::new()),
-            structural: RefCell::new(original.structural.borrow().clone()),
+            product_rule: RefCell::new(original.product_rule.borrow().clone()),
             assoc: original
                 .assoc
                 .iter()
@@ -581,8 +605,8 @@ impl TraitObligation {
     /// outside the vocabulary the trait is defined over — or beside the product the trait
     /// has already been answered at, which is the one thing the position then accepts.
     fn reject(self: &Rc<Self>, pos: u8, found: &Type) -> Result<(), ConstrainError> {
-        let accepted = match self.structural.borrow().as_ref() {
-            Some(product) => vec![product.clone()],
+        let accepted = match self.answered_by_product() {
+            Some(product) => vec![product],
             None => self.accepted_at(pos).into_iter().map(Type::Base).collect(),
         };
         Err(ConstrainError::NoTraitInstance {
@@ -618,10 +642,19 @@ impl TraitObligation {
         base: &BaseType,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
-        // A product already answered this obligation, and the rows are homogeneous, so a
-        // base at any position is a second answer rather than a narrowing of the first.
-        if self.structural.borrow().is_some() {
-            return self.reject(pos, &Type::Base(base.clone()));
+        // The product rule answers this obligation, which leaves the rows no part in it, so
+        // a base at any position contradicts the product rather than narrowing anything.
+        // Before any product, a base rules the rule out.
+        {
+            let mut rule = self.product_rule.borrow_mut();
+            match &*rule {
+                ProductRule::Applied(_) => {
+                    drop(rule);
+                    return self.reject(pos, &Type::Base(base.clone()));
+                }
+                ProductRule::Open => *rule = ProductRule::RuledOut,
+                ProductRule::Absent | ProductRule::RuledOut => {}
+            }
         }
         // Read before the mutable borrow: "what this position could have accepted" is
         // only meaningful before the contribution rules rows out.
@@ -652,83 +685,111 @@ impl TraitObligation {
         self.try_deposit(cache)
     }
 
-    /// Answer a **product** contribution at `pos`, structurally.
+    /// Answer a **product** contribution at `pos` by the trait's product rule.
     ///
-    /// The trait's rows are homogeneous, so what a contribution says about a position is
-    /// also what it says about the positions beside it. A base says it through the candidate
-    /// set, which the sweep reads back and deposits; a product has no row to shrink, so it
-    /// says it directly — as an **upper** bound on each sibling, the same polarity and for
-    /// the same reason ([`resolve_operand_requirements`]): it states what may flow in, which
-    /// is exactly what the requirement says, and adds no lower bound.
+    /// The rule relates two products of the same shape when each field's components are
+    /// related in turn: for `Equatable`, `{𝑎₁ … 𝑎ₙ}` and `{𝑏₁ … 𝑏ₙ}` when every `𝑎ᵢ` and
+    /// `𝑏ᵢ` are `Equatable`. A product is no row's operand, so the first one to arrive
+    /// leaves the rule the one candidate and applies it ([`apply_product_rule`]); one
+    /// arriving after it has to have the same shape. A base already delivered has ruled the
+    /// rule out, and a trait with no product reading has none.
     ///
-    /// The components are then required to satisfy the trait in turn, each through an
-    /// obligation of its own over a fresh variable the component flows into. That is what
-    /// makes a component still unknown here — a record key whose field type has not arrived
-    /// — resolve later by the ordinary delivery path rather than being read now and missed.
-    /// A component that is itself a product re-enters here.
-    ///
-    /// `from` is the variable the contribution landed on, so a sibling position standing at
-    /// the same variable is skipped: a component obligation watches one variable at both
-    /// positions, and constraining it above its own lower bound states nothing.
+    /// [`apply_product_rule`]: Self::apply_product_rule
     fn narrow_product(
         self: &Rc<Self>,
         pos: u8,
         product: &Type,
-        from: &Rc<InferVar>,
         cache: &mut ConstrainCache,
     ) -> Result<(), ConstrainError> {
-        if !self.trait_.is_structural() {
-            return self.reject(pos, product);
+        let state = self.product_rule.borrow().clone();
+        match state {
+            ProductRule::Absent | ProductRule::RuledOut => self.reject(pos, product),
+            ProductRule::Applied(settled) => {
+                if product_shape(&settled) == product_shape(product) {
+                    Ok(())
+                } else {
+                    self.reject(pos, product)
+                }
+            }
+            ProductRule::Open => {
+                let product = peel_components(product);
+                *self.product_rule.borrow_mut() = ProductRule::Applied(product.clone());
+                self.apply_product_rule(&product, cache)
+            }
         }
-        // A base already delivered anywhere on this obligation has shrunk the candidate
-        // set; a product cannot then be the same type, and homogeneity is what makes that a
-        // contradiction rather than a second possibility.
-        if self.candidates.borrow().len() < self.trait_.instances().len() {
-            return self.reject(pos, product);
-        }
-        // A second product answers the same obligation, so the two have to be the same
-        // product: the rows are homogeneous, and a wider one is a subtype, so the
-        // upper-bound edge below admits `(𝐴, 𝐵, 𝐶)` against `(𝐴, 𝐵)` on its own.
-        if let Some(settled) = self.structural.borrow().as_ref() {
-            return if product_shape(settled) == product_shape(product) {
-                Ok(())
-            } else {
-                self.reject(pos, product)
-            };
-        }
-        let product = &peel_components(product);
-        *self.structural.borrow_mut() = Some(product.clone());
-        let siblings: Vec<Type> = self
-            .operands
-            .borrow()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != pos as usize)
-            .filter_map(|(_, ty)| ty.clone())
-            .filter(|ty| !matches!(ty, Type::Infer(v) if v.uid == from.uid))
-            .collect();
-        for sibling in siblings {
-            constrain_subtype(&sibling, product, cache)?;
-        }
+    }
+
+    /// Mint the product rule's conditions for `product`'s shape: one obligation of this
+    /// trait per field, over a variable per operand position that holds that operand's
+    /// component at the field.
+    ///
+    /// Each operand is then bounded **above** by a product of the shape with those
+    /// variables as its components. The bound states the shape every operand must have and
+    /// carries each operand's components, whenever they arrive, into its own position of
+    /// each field's condition. That is how the components pair: by field, one position per
+    /// operand, so `𝑎ᵢ` and `𝑏ᵢ` stand at different positions of one condition and need
+    /// not be one type. An upper bound states what may flow in and adds no lower bound
+    /// ([`resolve_operand_requirements`]), so it decides nothing an operand does not
+    /// supply. A component that is itself a product re-enters [`narrow_product`] on its
+    /// condition.
+    ///
+    /// A variable sits at its operand's level: a component flowing in from the operand must
+    /// not be carried below the level it was introduced at.
+    ///
+    /// [`narrow_product`]: Self::narrow_product
+    fn apply_product_rule(
+        self: &Rc<Self>,
+        product: &Type,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let operands = self.operands.borrow().clone();
         let _f = provenance::enter(
             self.operator_node_id,
-            "infer.narrow_product",
+            "infer.apply_product_rule",
             provenance::Nature::Machinery,
         );
-        for component in product_components(product) {
-            let obligation = TraitObligation::new(
+        // `slots[f][p]`: the component operand `p` holds at the product's `f`th field, in
+        // its own order ([`product_fields`]).
+        let slots: Vec<Vec<Type>> = product_fields(product)
+            .iter()
+            .map(|_| {
+                operands
+                    .iter()
+                    .map(|operand| {
+                        crate::ccl::infer::solver::fresh_var(
+                            operand.as_ref().map_or(0, super::type_level),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        for at_field in &slots {
+            let condition = TraitObligation::new(
                 self.trait_,
                 Vec::new(),
                 self.operator_node_id,
                 self.input_exprs(),
             );
-            let position = crate::ccl::infer::solver::fresh_var(0);
-            for pos in 0..self.trait_.arity() as u8 {
-                obligation.watch(&position, pos);
+            for (pos, slot) in at_field.iter().enumerate() {
+                condition.watch(slot, pos as u8);
             }
-            constrain_subtype(&component, &position, cache)?;
+        }
+        for (pos, operand) in operands.iter().enumerate() {
+            let Some(operand) = operand else {
+                continue;
+            };
+            let shape = with_components(product, slots.iter().map(|at| at[pos].clone()));
+            constrain_subtype(operand, &shape, cache)?;
         }
         Ok(())
+    }
+
+    /// The product the product rule was applied at, if a product has arrived.
+    pub(super) fn answered_by_product(&self) -> Option<Type> {
+        match &*self.product_rule.borrow() {
+            ProductRule::Applied(product) => Some(product.clone()),
+            _ => None,
+        }
     }
 
     /// Deposit the output type on `𝑂` if every surviving candidate agrees on it.
@@ -888,10 +949,10 @@ pub fn verify_narrowing_is_complete(resolve: impl Fn(&Type) -> Option<Type>) {
                 continue;
             };
             let Some(base) = offered_base(&resolved) else {
-                // Not a base leaf. A product owes `narrow_product`, which answers
-                // structurally — it constrains the sibling positions and mints a component
-                // obligation — rather than shrinking the candidate set this walk reads. So
-                // there is no narrowing here to check against.
+                // Not a base leaf. A product owes `narrow_product`, which answers it by
+                // the product rule — it bounds every operand by the shape and mints a
+                // condition per field — rather than shrinking the candidate set this walk
+                // reads. So there is no narrowing here to check against.
                 continue;
             };
             let candidates = obligation.candidates();
@@ -1166,7 +1227,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             // An obligation answered by a product is answered off the table, so its
             // `accepted_at` is the untouched row set and intersecting it would deposit a
             // base at a place holding a product ([`TraitObligation::narrow_product`]).
-            if obligation.structural.borrow().is_some() {
+            if obligation.answered_by_product().is_some() {
                 continue;
             }
             if !entry
@@ -1553,10 +1614,29 @@ pub(crate) fn product_shape(product: &Type) -> Vec<FieldKey> {
     fields
 }
 
-/// A product's component types.
-///
-/// Order is immaterial — every component carries the same obligation — so each shape's own
-/// field order serves.
+/// `product` with its components replaced by `components`, given in its own field order
+/// ([`product_fields`]).
+fn with_components(product: &Type, components: impl IntoIterator<Item = Type>) -> Type {
+    let mut components = components.into_iter();
+    let mut next = || {
+        components
+            .next()
+            .expect("one component per field of the product")
+    };
+    match product {
+        Type::Tuple(elems) => Type::Tuple(elems.iter().map(|_| next()).collect()),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(name, _)| (name.clone(), next()))
+                .collect(),
+        ),
+        other => unreachable!("`with_components` is reached only for a product, got {other:?}"),
+    }
+}
+
+/// A product's component types, in the product's own field order: the order
+/// [`product_fields`] lists the fields in.
 pub(crate) fn product_components(product: &Type) -> Vec<Type> {
     match product {
         Type::Tuple(elems) => elems.clone(),
@@ -1682,7 +1762,7 @@ pub(super) fn link_watches(
             obligation.narrow(*pos, base, cache)?;
         }
         for param in &params {
-            deliver(obligation, *pos, param, lower, cache)?;
+            deliver(obligation, *pos, param, cache)?;
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
@@ -1714,12 +1794,12 @@ pub(super) fn notify_lower(
         watches.clone()
     };
     for (obligation, pos) in watches {
-        deliver(&obligation, pos, contribution, var, cache)?;
+        deliver(&obligation, pos, contribution, cache)?;
     }
     Ok(())
 }
 
-/// Offer `contribution`, which landed on `var`, to `obligation` at position `pos`.
+/// Offer `contribution` to `obligation` at position `pos`.
 ///
 /// A type parameter offers its bound: a value of a bounded parameter's type is a
 /// value of its bound's type. An unbounded parameter supports no trait.
@@ -1727,17 +1807,16 @@ fn deliver(
     obligation: &Rc<TraitObligation>,
     pos: u8,
     contribution: &Type,
-    var: &Rc<InferVar>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     match offered(contribution) {
         Offered::Base(base) => obligation.narrow(pos, base, cache),
-        Offered::Product(product) => obligation.narrow_product(pos, product, var, cache),
+        Offered::Product(product) => obligation.narrow_product(pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
         Offered::Param(param) => match &param.bound {
             // The operand is this parameter, so a requirement missing further up its bound
             // chain is missing of it.
-            Some(bound) => deliver(obligation, pos, bound, var, cache).map_err(|e| match e {
+            Some(bound) => deliver(obligation, pos, bound, cache).map_err(|e| match e {
                 ConstrainError::MissingRequirement {
                     trait_, position, ..
                 } => ConstrainError::MissingRequirement {
@@ -1924,6 +2003,109 @@ mod tests {
         assert_eq!(position, 1);
         assert_eq!(found, Type::Base(BaseType::String));
         assert_eq!(accepted, vec![Type::Base(BaseType::Int)]);
+    }
+
+    /// The product rule pairs components by field, one condition position per operand:
+    /// each operand is bounded above by the shape over variables of its own, and the
+    /// variables at one field stand at different positions of the same condition.
+    #[test]
+    fn the_product_rule_pairs_components_by_field() {
+        use crate::ccl::infer::solver::constrain_subtype;
+        let node_id = provenance::NodeId::fresh();
+        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
+        let (a, b) = (fresh_var(1), fresh_var(1));
+        ob.watch(&a, 0);
+        ob.watch(&b, 1);
+        let mut cache = ConstrainCache::new();
+        let pair = |x: BaseType, y: BaseType| Type::Tuple(vec![Type::Base(x), Type::Base(y)]);
+        constrain_subtype(&pair(BaseType::Int, BaseType::String), &a, &mut cache)
+            .expect("a pair of equatable bases is a product the rule answers");
+        constrain_subtype(&pair(BaseType::Int, BaseType::String), &b, &mut cache)
+            .expect("the same shape over the same bases");
+
+        // The variables each operand's upper bound holds, by field.
+        let slots = |v: &Type| -> Vec<Rc<InferVar>> {
+            let Type::Infer(v) = v else { unreachable!() };
+            let upper = Rc::clone(v.bounds.borrow().upper());
+            let tuples: Vec<Vec<Rc<InferVar>>> = upper
+                .iter()
+                .filter_map(|bound| match &bound.ty {
+                    Type::Tuple(elems) => Some(
+                        elems
+                            .iter()
+                            .map(|e| match e {
+                                Type::Infer(s) => Rc::clone(s),
+                                other => panic!("a slot is a variable, got {other:?}"),
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect();
+            let [only] = tuples.as_slice() else {
+                panic!("one shape bound per operand, got {tuples:?}");
+            };
+            only.clone()
+        };
+        let (a_slots, b_slots) = (slots(&a), slots(&b));
+        for (field, (sa, sb)) in a_slots.iter().zip(&b_slots).enumerate() {
+            assert_ne!(
+                sa.uid, sb.uid,
+                "field {field}: each operand has its own slot"
+            );
+            let watched = |s: &Rc<InferVar>| -> Vec<(TraitObligationId, u8)> {
+                s.watches
+                    .borrow()
+                    .iter()
+                    .map(|(o, p)| (o.uid, *p))
+                    .collect()
+            };
+            let (wa, wb) = (watched(sa), watched(sb));
+            let [(ca, 0)] = wa.as_slice() else {
+                panic!(
+                    "field {field}: operand 0's slot is position 0 of one condition, got {wa:?}"
+                );
+            };
+            let [(cb, 1)] = wb.as_slice() else {
+                panic!(
+                    "field {field}: operand 1's slot is position 1 of one condition, got {wb:?}"
+                );
+            };
+            assert_eq!(ca, cb, "field {field}: both slots belong to one condition");
+        }
+        assert_ne!(
+            ob.answered_by_product(),
+            None,
+            "the rule was applied at the first product"
+        );
+    }
+
+    /// A base after a product, and a product after a base, each contradict the candidate
+    /// the first contribution left.
+    #[rstest::rstest]
+    #[case::base_then_product(true)]
+    #[case::product_then_base(false)]
+    fn a_base_and_a_product_exclude_each_other(#[case] base_first: bool) {
+        let node_id = provenance::NodeId::fresh();
+        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
+        let (a, b) = (fresh_var(1), fresh_var(1));
+        ob.watch(&a, 0);
+        ob.watch(&b, 1);
+        let mut cache = ConstrainCache::new();
+        let product = Type::Tuple(vec![Type::Base(BaseType::Int)]);
+        let result = if base_first {
+            ob.narrow(0, &BaseType::Int, &mut cache)
+                .expect("Int is equatable");
+            ob.narrow_product(1, &product, &mut cache)
+        } else {
+            ob.narrow_product(0, &product, &mut cache)
+                .expect("a tuple of Int is equatable");
+            ob.narrow(1, &BaseType::Int, &mut cache)
+        };
+        assert!(
+            matches!(result, Err(ConstrainError::NoTraitInstance { .. })),
+            "got {result:?}"
+        );
     }
 
     /// Every instance of a trait agrees on its **shape** — how many types it is
