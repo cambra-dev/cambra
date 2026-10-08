@@ -11,6 +11,41 @@ use rstest_log::rstest;
 
 use crate::helpers::*;
 
+// BUG: the right operand need not be defined once the left fixes the result.
+// These programs must return the given Bool without evaluating division by zero.
+// The current pipeline instead panics in the runtime arithmetic kernel. Remove
+// `should_panic` when selection is preserved through Boolean lowering and evaluation.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::and_literal("False and (1 // 0 > 0)", false)]
+#[case::or_literal("True or (1 // 0 > 0)", true)]
+#[case::and_computed(indoc! {"
+    n: Int = 0
+    n != 0 and (1 // n > 0)"}, false)]
+#[case::or_computed(indoc! {"
+    n: Int = 0
+    n == 0 or (1 // n > 0)"}, true)]
+#[case::and_chain("True and False and (1 // 0 > 0)", false)]
+#[case::or_chain("False or True or (1 // 0 > 0)", true)]
+#[should_panic(expected = "attempt to divide by zero")]
+fn bug_boolean_unselected_operand_definedness(#[case] code: &str, #[case] expected: bool) {
+    check_scalar(code, Value::Bool(expected));
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::and_literal("(1 // 0 > 0) if False else False", false)]
+#[case::or_literal("True if True else (1 // 0 > 0)", true)]
+#[case::and_computed(indoc! {"
+    n: Int = 0
+    (1 // n > 0) if n != 0 else False"}, false)]
+#[case::or_computed(indoc! {"
+    n: Int = 0
+    True if n == 0 else (1 // n > 0)"}, true)]
+fn boolean_definedness_ternary_control(#[case] code: &str, #[case] expected: bool) {
+    check_scalar(code, Value::Bool(expected));
+}
+
 /// Extract the codomain integers of a (possibly `Union`-domain) collection
 /// result tile, sorted. A conditional-collection result is a tagged union whose
 /// single non-empty variant carries the selected arm's elements.

@@ -767,10 +767,9 @@ This gap differs from unordered collections and unspecified evaluation order, wh
 parts of the language. The planned result of an aggregate over an empty collection is covered in
 [Aggregates](#71-aggregates).
 
-The intended selection rules allow an unselected operand to be undefined without making the
-selecting expression undefined. The current implementation does not satisfy every such rule:
-[Short-circuit `not`, `and`, `or`](#35-short-circuit-not-and-or) records the Boolean-operator
-limitation, and [Ternary](#36-ternary) gives a supported guarded expression.
+The selection rules of [Short-circuit `not`, `and`, `or`](#35-short-circuit-not-and-or),
+[Ternary](#36-ternary) and `if`/`elif` let an unselected operand be undefined without making the
+selecting expression undefined. These guarantees hold under any resolution of the question above.
 
 ### 3.1 Literals
 
@@ -790,9 +789,7 @@ it with the base type, whereas a bounded annotation retains it:
 [Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded) defines the
 annotation rules. Mutable bindings do not retain the singleton of an individual write.
 
-Computed results do not automatically inherit operand refinements: `2 + 3` has type `Int`.
-An operator can supply a result refinement of its own; `^+` records the sum of its operand terms
-in the result type.
+Computed results do not inherit operand refinements: `2 + 3` has type `Int`.
 
 > **Direction [Decided] — Boolean spelling.** The implemented literals are `True` and `False`.
 > The planned spellings are `true` and `false`, following the lowercase convention for terms.
@@ -812,24 +809,16 @@ not supported. Mutual recursion between top-level functions is **[Planned]**.
 | Operator | Meaning |
 |---|---|
 | `a + b`, `a - b`, `a * b` | Integer addition, subtraction, and multiplication. `+` also joins two strings. |
-| `a ^+ b` | Integer addition with a result refinement recording the sum. It computes the same value as `+`. |
 | `a // b` | Integer division rounded toward negative infinity: `-7 // 3` is `-3`, not `-2`. This matches [Python's floor division](https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations), so the shared syntax retains its meaning. Division by zero and overflow are not defined (see [Partiality](#3-expression-semantics)). |
 | `a ** b` | Integer exponentiation. The exponent must be provably non-negative. |
 | `-a` | Signed integer negation. |
 | `a & b`, `a \| b`, `a ^ b` | Boolean conjunction, disjunction, and exclusive-or. Both operands must be `Bool`; these are not integer bitwise operators. |
 | `not a` | Boolean negation. |
-| `a and b`, `a or b` | Boolean conjunction and disjunction; see [Short-circuit `not`, `and`, `or`](#35-short-circuit-not-and-or) for the intended selection rule and current limitation. |
+| `a and b`, `a or b` | Boolean conjunction and disjunction. The right operand need not be defined when the left settles the result; see [Short-circuit `not`, `and`, `or`](#35-short-circuit-not-and-or). |
 | `a ++ b` | Multiset union of collections with the same element type, not ordered concatenation. See [Collections are unordered](#collections-are-unordered). |
 
-**Implementation limitation — division and overflow.** Signed `//` currently truncates toward
-zero: `-7 // 2` evaluates to `-3`, not the floor `-4`. Both constant folding and runtime
-evaluation use the kernel in `src/scalar_ops.rs`. That kernel uses wrapping multiplication for
-`**`: `2 ** 64` evaluates to `0` in both debug and no-assertions builds. Other integer
-arithmetic still uses Rust's ordinary operators, with profile-dependent overflow checks. These
-behaviours do not settle CHL's [partiality semantics](#partiality-is-not-yet-defined-open).
-
-For every integer base `a`, `a ** 0` is `1`, including `0 ** 0`. Lowering requires the
-exponent to satisfy `{Int where _ >= 0}`. A non-negative literal or a parameter with that
+For every integer base `a`, `a ** 0` is `1`, including `0 ** 0`. The exponent must satisfy
+`{Int where _ >= 0}`. A non-negative literal or a parameter with that
 refinement is accepted:
 
 ```python
@@ -837,17 +826,9 @@ def scaled(e: {Int where _ >= 0}) => Int:
     2 ** e
 ```
 
-A negative exponent or an unrefined `Int` exponent is rejected during type inference.
-Exponentiation is right-associative, but `2 ** 3 ** 2` currently fails inference: the inner
-`3 ** 2` has unrefined type `Int`, which does not establish the outer exponent's bound.
-The parenthesized `(2 ** 3) ** 2` is accepted.
-
-**Implementation limitation — refined comprehension arguments.** The program
-`sum([2 ** x for x in [1, 2, 3]])` passes inference but fails the post-inference consistency
-check. The collection element type loses the bound needed by the mapped function. The regression
-`a_comprehension_exponent_reaches_the_wall` in
-`tests/compilation_pipeline/scalars_collections.rs` records this internal invariant failure,
-not a language restriction.
+A negative exponent or an exponent of unrefined type `Int` is rejected. Exponentiation is
+right-associative, so `2 ** 3 ** 2` is rejected: the inner `3 ** 2` has type `Int`, which does
+not establish the outer exponent's bound. `(2 ** 3) ** 2` is accepted.
 
 The expression operators `/`, `%`, `>>`, `~`, and `@` are not supported; see
 [Operators and punctuation](#18-operators-and-punctuation).
@@ -883,22 +864,15 @@ guard or an aggregate can express a membership query.
 at least one operand is true. All operands must have type `Bool`, and the result is `Bool`.
 There is no truthiness conversion or Python-style return of an operand.
 
-**Intended selection rule.** Once a prefix of the operands determines the result, subsequent
-operands need not be defined. This is a definedness rule, not a requirement to evaluate operands
-in source order.
-
-**Implementation limitation.** Lowering currently represents `and` and `or` as binary Boolean
-operations, not guarded branches. A right operand can still be evaluated when the left operand
-determines the answer. For example, this program panics on division by zero in both debug and
-no-assertions builds:
+Once a prefix of the operands determines the result, the remaining operands need not be defined.
+This is a definedness rule, not a requirement to evaluate operands in source order:
 
 ```python
 b: Int = 0
 False and (10 // b > 0)
 ```
 
-Replacing the last line with `True or (10 // b > 0)` has the same failure. A guarded ternary
-supports the corresponding selection; the example below returns `0`.
+is `False`, though `10 // b` is not defined.
 
 ### 3.6 Ternary
 
