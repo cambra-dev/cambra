@@ -28,6 +28,19 @@ pub(super) fn escaped_opaque_binders(
         .collect()
 }
 
+/// How a `let` binds its name over the body ([`Typing::scoped_let`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LetScheme {
+    /// At its type verbatim, shared by every use.
+    Monomorphic,
+    /// Generalized: each use instantiates its own copy.
+    Generalized,
+    /// Generalized, at a type its failed definition left unconstrained
+    /// ([`emit_let`](super::emit::emit_let)). A statement that reads it reports
+    /// nothing ([`Typing::recover`]).
+    Poisoned,
+}
+
 /// The operations a typing rule needs from its surrounding pass.
 ///
 /// Each per-node rule (`emit_apply`, `emit_let`, …) is written once against
@@ -61,6 +74,33 @@ pub(super) trait Typing {
             node_id: self.current_node(),
         }
     }
+
+    /// Record `error` and continue past the statement that raised it, or return
+    /// it to stop.
+    ///
+    /// A statement is a `let` definition, a `:=` initializer or an expression
+    /// statement, and the rule that types its continuation is the one that
+    /// recovers ([`emit_let`](super::emit::emit_let),
+    /// [`emit_mut_decl`](super::emit::emit_mut_decl),
+    /// [`emit_expr_stmt`](super::emit::emit_expr_stmt)). Emit records the error,
+    /// so a program's statements are typed and reported independently. Check
+    /// returns it: Check's own rules already record and continue (its
+    /// `require_sub`), and an error one of them returns ends the walk, as it did
+    /// before statements recovered.
+    ///
+    /// `reads_before` is [`Self::poisoned_reads`] taken as the statement began.
+    /// Emit drops the error of a statement that has read a
+    /// [poisoned](LetScheme::Poisoned) binding since: such a statement fails
+    /// because the binding's definition did, which has already been reported.
+    fn recover(
+        &mut self,
+        error: LocatedInferError,
+        reads_before: usize,
+    ) -> Result<(), LocatedInferError>;
+
+    /// How many uses of a [poisoned](LetScheme::Poisoned) binding emission has
+    /// resolved so far. Check resolves no names, so it answers `0`.
+    fn poisoned_reads(&self) -> usize;
 
     /// Obtain the type of a child sub-expression. In Emit mode this recurses
     /// via [`emit_node`](super::emit::emit_node), emitting the child's
@@ -210,11 +250,11 @@ pub(super) trait Typing {
     fn definition_alone_error(&self, name: &Name) -> Option<LocatedInferError>;
 
     /// Run `f` with a `let` binding in scope over the body, at the type
-    /// `binding.ty` records. When `generalize` is set, Emit generalizes that
-    /// type at the current level into a polymorphic scheme (so each use site
-    /// instantiates fresh quantified variables); otherwise it binds
-    /// monomorphically (shared). Check ignores `generalize` and binds the name
-    /// like any other binder.
+    /// `binding.ty` records. Unless `scheme` is [`LetScheme::Monomorphic`], Emit
+    /// generalizes that type at the current level into a polymorphic scheme (so
+    /// each use site instantiates fresh quantified variables); otherwise it binds
+    /// monomorphically (shared). Check ignores `scheme` and binds the name like
+    /// any other binder.
     ///
     /// Entering is also where an
     /// [opaque](crate::ccl::BindingTransparency::Opaque) binder's standing fact
@@ -225,7 +265,7 @@ pub(super) trait Typing {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
-        generalize: bool,
+        scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R
     where

@@ -20,7 +20,7 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
-use super::typing::Typing;
+use super::typing::{LetScheme, Typing};
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::Trait;
 
@@ -38,15 +38,14 @@ use crate::ccl::infer::solver::traits::Trait;
 /// own extent, so an error is stamped with the node that raised it, not with an
 /// ancestor that propagated it. Nothing is read after the walk unwinds.
 ///
-/// TODO(multi-error): emission is fail-fast — it returns at the first error,
-/// while the same rules in Check mode accumulate every one (`CheckCtx`). Making
-/// emission accumulate needs three decisions this wrapper does not prejudge: a
-/// poison value to carry on with when a constraint fails (a fresh unconstrained
-/// var, or a `Type::Error`), cascade suppression so one bad subtree does not
-/// report at every ancestor, and what to do with the run-wide `ConstrainCache`
-/// after a failed constraint has written into it. The blame mechanism is already
-/// accumulation-ready: each error is stamped where it is raised, so N errors
-/// carry N nodes with no further change here.
+/// An error propagates up to the nearest statement, whose rule records it and
+/// types the continuation ([`Typing::recover`]), so emission reports at most one
+/// error per statement. A binding whose definition failed is bound at a
+/// generalized fresh variable (`poison`), and a statement that reads it reports
+/// nothing ([`LetScheme::Poisoned`]).
+/// The run-wide `ConstrainCache` keeps whatever pairs a failed constraint wrote:
+/// a later constraint over one of them is skipped, which can hide a second error
+/// in an already rejected program and cannot accept a program.
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedInferError> {
     let prev = ctx.enter_node(expr.node_id());
     // One stack frame per node over the whole tree; grow on demand, as the other
@@ -98,39 +97,42 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // A scheme quantifying type parameters also states their bounds, which each
         // use checks at its own types (`src/ccl/design/type-parameters.md`,
         // "Instantiation").
-        TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
-            None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-            Some(binding) => {
-                let instance = binding
-                    .scheme
-                    .instantiate_with_params(ctx.level, &ctx.telescope);
-                for (instantiation, bound) in instance.bounds {
-                    ctx.require_sub(&instantiation, &bound, &|| {
-                        format!("the bound of a type parameter of `{name}`")
-                    })?;
-                }
-                // Each requirement becomes an obligation at this use's types, minted
-                // as an operator's is; the associated type it names receives what the
-                // obligation settles (`src/ccl/design/type-parameters.md`,
-                // "Instantiation").
-                for r in &instance.requires {
-                    let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
-                    let named = r.assoc.first();
-                    let settled = ctx.require_trait(
-                        r.trait_,
-                        node_id,
-                        &r.args.iter().collect::<Vec<_>>(),
-                        &[],
-                        named.map(|(n, _)| *n),
-                        &at,
-                    )?;
-                    if let (Some(settled), Some((_, named))) = (settled, named) {
-                        ctx.require_sub(&settled, named, &at)?;
+        TypedExprNode::Var(name) => {
+            ctx.note_use(name);
+            match ctx.scopes.lookup(name) {
+                None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
+                Some(binding) => {
+                    let instance = binding
+                        .scheme
+                        .instantiate_with_params(ctx.level, &ctx.telescope);
+                    for (instantiation, bound) in instance.bounds {
+                        ctx.require_sub(&instantiation, &bound, &|| {
+                            format!("the bound of a type parameter of `{name}`")
+                        })?;
                     }
+                    // Each requirement becomes an obligation at this use's types, minted
+                    // as an operator's is; the associated type it names receives what the
+                    // obligation settles (`src/ccl/design/type-parameters.md`,
+                    // "Instantiation").
+                    for r in &instance.requires {
+                        let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
+                        let named = r.assoc.first();
+                        let settled = ctx.require_trait(
+                            r.trait_,
+                            node_id,
+                            &r.args.iter().collect::<Vec<_>>(),
+                            &[],
+                            named.map(|(n, _)| *n),
+                            &at,
+                        )?;
+                        if let (Some(settled), Some((_, named))) = (settled, named) {
+                            ctx.require_sub(&settled, named, &at)?;
+                        }
+                    }
+                    instance.ty
                 }
-                instance.ty
             }
-        },
+        }
 
         // Builtins with a polymorphic signature (shared type variables
         // across positions) live in the `OperatorSchemes` registry — at
@@ -265,9 +267,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // monomorphic defer binding; for a feed-typed lambda param it
         // returns the param type verbatim.
         TypedExprNode::Feed { name, value } => {
-            let target_ty = match ctx.scopes.lookup(name) {
+            let target_ty = match ctx.instantiate_binding(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-                Some(binding) => binding.scheme.instantiate(ctx.level),
+                Some(ty) => ty,
             };
             emit_feed(&target_ty, value, &label, ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
@@ -277,9 +279,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         }
 
         TypedExprNode::Define { name, value } => {
-            let target_ty = match ctx.scopes.lookup(name) {
+            let target_ty = match ctx.instantiate_binding(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-                Some(binding) => binding.scheme.instantiate(ctx.level),
+                Some(ty) => ty,
             };
             emit_define(&target_ty, value, &label, ctx)?
         }
@@ -306,9 +308,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // lowering produces (a polymorphic init would under-constrain the
         // write and surface as `UnresolvedInfer`).
         TypedExprNode::MutWrite { name, key, value } => {
-            let var_ty = match ctx.scopes.lookup(name) {
+            let var_ty = match ctx.instantiate_binding(name) {
                 None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
-                Some(binding) => binding.scheme.instantiate(ctx.level),
+                Some(ty) => ty,
             };
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
@@ -1475,7 +1477,11 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    ctx.subexpr(e)?;
+    // A failed statement is recovered from: its value is discarded either way.
+    let reads_before = ctx.poisoned_reads();
+    if let Err(error) = ctx.subexpr(e) {
+        ctx.recover(error, reads_before)?;
+    }
     emit_value_read(body, ctx)
 }
 
@@ -1794,6 +1800,7 @@ pub(super) fn emit_let<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    let reads_before = ctx.poisoned_reads();
     // Emit the RHS at a deeper level so its locally-minted variables can be
     // generalized at the binding site (`scoped_let`). A polymorphic annotation is
     // opened at that level first, so its type parameters sit with the right-hand
@@ -1804,11 +1811,16 @@ pub(super) fn emit_let<C: Typing>(
     };
     // The `Poly` stays open through the annotation's reconcile, which normalizes
     // the parameters the annotation names, and is closed on every path out.
-    let bound = emit_let_bound(binding, bound_expr, poly.as_deref(), ctx);
+    let bound = emit_let_bound(binding, bound_expr, poly.as_deref(), reads_before, ctx);
     if let Some(poly) = &poly {
         ctx.close_poly(poly);
     }
-    let (scheme_ty, opened) = bound?;
+    let LetBound {
+        ty: scheme_ty,
+        opened,
+        defined,
+        mut poisoned,
+    } = bound?;
     // The annotation is the `Poly` opened from here on, over the completed body: its
     // parameters and `requires` clause are this binding's own, which its scheme
     // states to each use (`scoped_let`) and the coalesce walk assumes while it checks
@@ -1829,36 +1841,93 @@ pub(super) fn emit_let<C: Typing>(
     binding.ty = scheme_ty.clone();
     let generalize = ctx.is_generalizable(bound_expr);
     // Lowering refuses a polymorphic annotation on a call or a collection; a name
-    // of a monomorphic binding is known only here.
-    if poly.is_some() && !generalize {
-        return Err(ctx.raise(InferError::MonomorphicPolyBinding {
+    // of a monomorphic binding is known only here. A failed right-hand side names
+    // nothing, so it is not asked.
+    if defined && poly.is_some() && !generalize {
+        let error = ctx.raise(InferError::MonomorphicPolyBinding {
             name: binding.name.base().to_string(),
-        }));
+        });
+        ctx.recover(error, reads_before)?;
+        poisoned = true;
     }
-    let body_ty = ctx.scoped_let(binding, generalize, |ctx| ctx.subexpr(body))?;
+    let scheme = if poisoned {
+        LetScheme::Poisoned
+    } else if !defined || generalize {
+        LetScheme::Generalized
+    } else {
+        LetScheme::Monomorphic
+    };
+    let body_ty = ctx.scoped_let(binding, scheme, |ctx| ctx.subexpr(body))?;
+    // A failed definition has no definiens to discharge: the program is already
+    // rejected, and the RHS it would substitute did not type.
+    if !defined {
+        return Ok(body_ty);
+    }
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
     // story.
     Ok(ctx.close_let_type(binding, bound_expr, body_ty))
 }
 
+/// What [`emit_let_bound`] binds a `let` at.
+struct LetBound {
+    /// The type the binding is bound at.
+    ty: Type,
+    /// The `Poly` the annotation opened.
+    opened: Option<crate::ccl::ty::PolyType>,
+    /// Whether the right-hand side typed.
+    defined: bool,
+    /// Whether `ty` is a poison ([`LetScheme::Poisoned`]) rather than a type the
+    /// program states.
+    poisoned: bool,
+}
+
 /// [`emit_let`]'s right-hand side and annotation: emit the right-hand side one level
 /// deeper, opening `poly` there first with its `requires` clause in scope as
-/// assumptions, and reconcile it against the binding's annotation. Returns the type
-/// the binding is bound at, and the `Poly` opened. `poly` is left open for the caller
-/// to close.
+/// assumptions, and reconcile it against the binding's annotation. `poly` is left
+/// open for the caller to close.
+///
+/// A failed right-hand side is recovered from ([`Typing::recover`], against
+/// `reads_before`): the annotation is reconciled against a poison (see [`poison`]),
+/// and the binding is bound at the poison unless an exact annotation declares its
+/// type instead. A `poly` whose bounds do not type is recovered from too, and
+/// declares nothing usable: the binding is bound at a poison, and the right-hand
+/// side is not emitted, since it would be typed without the parameters' bounds and
+/// the assumptions the annotation states.
 fn emit_let_bound<C: Typing>(
     binding: &mut TypedBinding,
     bound_expr: &mut Expr,
     poly: Option<&crate::ccl::ty::PolyType>,
+    reads_before: usize,
     ctx: &mut C,
-) -> Result<(Type, Option<crate::ccl::ty::PolyType>), LocatedInferError> {
-    let (bound_ty, opened) = ctx.in_let_rhs(|ctx| {
+) -> Result<LetBound, LocatedInferError> {
+    let opening = ctx.in_let_rhs(|ctx| {
         let opened = poly.map(|poly| ctx.open_poly(poly)).transpose()?;
         let assumptions = opened.as_ref().map_or(&[][..], |o| o.requires.as_slice());
-        let ty = ctx.with_assumptions(assumptions, |ctx| ctx.subexpr(bound_expr))?;
-        Ok((ty, opened))
-    })?;
+        let rhs = ctx.with_assumptions(assumptions, |ctx| ctx.subexpr(bound_expr));
+        Ok((rhs, opened))
+    });
+    let (rhs, opened) = match opening {
+        Ok(emitted) => emitted,
+        Err(error) => {
+            ctx.recover(error, reads_before)?;
+            return Ok(LetBound {
+                ty: poison(ctx),
+                opened: None,
+                defined: false,
+                poisoned: true,
+            });
+        }
+    };
+    let mut defined = true;
+    let bound_ty = match rhs {
+        Ok(ty) => ty,
+        Err(error) => {
+            ctx.recover(error, reads_before)?;
+            defined = false;
+            poison(ctx)
+        }
+    };
     // A `let d = Defer` binding names its channel's domain rigidly — replace
     // the handle's (fresh, otherwise-unconstrained) domain var with the
     // literal nominal `ChanDom(d)`, so every consumer of a read of `d` types
@@ -1909,11 +1978,23 @@ fn emit_let_bound<C: Typing>(
     // predicates ride `binding.ty` to the post-inference wall. Type them here —
     // the predicates mention the enclosing scope's bindings, not the binder's own
     // name, so this is the scope they belong in.
-    if let Some(ann) = &mut binding.user_annotation {
-        emit_annotation_predicates(ann, ctx)?;
+    let mut annotation_typed = true;
+    if let Some(ann) = &mut binding.user_annotation
+        && let Err(error) = emit_annotation_predicates(ann, ctx)
+    {
+        ctx.recover(error, reads_before)?;
+        annotation_typed = false;
     }
+    // Whether the variable is bound at a poison rather than at a type the program
+    // states.
+    let mut poisoned = !defined;
     // The type the variable is bound at over the body.
     let scheme_ty = match &binding.user_annotation {
+        // An annotation whose predicates did not type declares nothing usable.
+        Some(_) if !annotation_typed => {
+            poisoned = true;
+            poison(ctx)
+        }
         // Every other annotation: the variable binds at what the annotation
         // *declares*, and the two forms differ only in what that is. An exact
         // `x: 𝑇` is completed from the initializer at its unspecified positions
@@ -1931,25 +2012,68 @@ fn emit_let_bound<C: Typing>(
         // initializer was already deref'd above — so `y: Int = x` off a mutable variable
         // needs no special handling, and `y: _ = x` completes from the *value* rather
         // than the history, which is what makes it mean exactly `y = x`.
+        //
+        // An exact annotation over a failed initializer still binds at what it
+        // declares, so its uses are typed against the program's own statement and
+        // the binding is not poisoned. A bounded one resolves to the initializer's
+        // type, which is the poison.
+        //
         // A polymorphic annotation is exact, and binds at its body: the
         // right-hand side is checked once against it with the parameters opaque. A
         // `def`'s body is a `Hole`, completed from the lambda, whose annotations
         // already name the parameters. The reconcile runs at the right-hand side's
         // level, so a hole in the body is quantified with the definition.
         Some(Type::Poly(poly)) => {
+            poisoned = false;
             let declared = complete_annotation(&poly.body, &bound_ty);
-            ctx.in_let_rhs(|ctx| ctx.bind_annotation(&bound_ty, &declared))?
+            match ctx.in_let_rhs(|ctx| ctx.bind_annotation(&bound_ty, &declared)) {
+                Ok(ty) => ty,
+                Err(error) => {
+                    ctx.recover(error, reads_before)?;
+                    poisoned = true;
+                    poison(ctx)
+                }
+            }
         }
         Some(ann) => {
             let declared = match ann {
                 Type::BoundedHole(_) => ann.clone(),
-                _ => complete_annotation(ann, &bound_ty),
+                _ => {
+                    poisoned = false;
+                    complete_annotation(ann, &bound_ty)
+                }
             };
-            ctx.bind_annotation(&bound_ty, &declared)?
+            match ctx.bind_annotation(&bound_ty, &declared) {
+                Ok(ty) => ty,
+                Err(error) => {
+                    ctx.recover(error, reads_before)?;
+                    poisoned = true;
+                    poison(ctx)
+                }
+            }
         }
         None => bound_ty,
     };
-    Ok((scheme_ty, opened))
+    Ok(LetBound {
+        ty: scheme_ty,
+        opened,
+        defined,
+        poisoned,
+    })
+}
+
+/// The type a binding whose definition failed is bound at: a fresh variable one
+/// level inside the binding, which the binding generalizes.
+///
+/// Generalized, every use of the name instantiates its own copy, so two uses
+/// that would demand different types of the definition never meet. A use can
+/// still fail where its rule needs the value's shape as it emits (`m[k]?` on the
+/// bare variable), so the binding is [`LetScheme::Poisoned`] and a statement that
+/// reads it reports nothing: a failed definition reports once, at the definition.
+/// The program is already rejected, so nothing downstream reads what the
+/// variable resolves to.
+fn poison<C: Typing>(ctx: &mut C) -> Type {
+    ctx.in_let_rhs(|ctx| ctx.fresh())
 }
 
 /// Run `f` with every `(name, ty)` pair bound monomorphically, innermost-last
@@ -2044,7 +2168,17 @@ pub(super) fn emit_mut_decl<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx))?;
+    // A failed initializer is recovered from: the variable is bound at its
+    // declared history all the same, so its writes still constrain one value type,
+    // and only the seed's contribution is missing.
+    let reads_before = ctx.poisoned_reads();
+    let init_ty = match ctx.in_let_rhs(|ctx| emit_value_read(init, ctx)) {
+        Ok(ty) => Some(ty),
+        Err(error) => {
+            ctx.recover(error, reads_before)?;
+            None
+        }
+    };
     let mut history = ctx.normalize(&binding.ty);
     // The declared value type's predicates are terms, and the binder's slot is what
     // carries them to the post-inference wall — an untyped one surfaces there as
@@ -2053,19 +2187,25 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // binder rather than in a `user_annotation`, so this is the only place that types it.
     // Routed through the mode for the reason `emit_lambda`'s call is: Check trusts a
     // resolved predicate.
-    ctx.type_annotation_predicates(&mut history)?;
+    if let Err(error) = ctx.type_annotation_predicates(&mut history) {
+        ctx.recover(error, reads_before)?;
+    }
     debug_assert!(
         history.mut_value_type().is_some(),
         "a MutDecl binder must be an Overwrite history, got {history}"
     );
-    if let Some(value) = history.mut_value_type()
+    if let Some(init_ty) = init_ty
+        && let Some(value) = history.mut_value_type()
         && !matches!(value, Type::Hole)
     {
         let value_ty = value.clone();
         let label = binding.name.clone();
-        ctx.require_sub(&init_ty, &value_ty, &|| {
+        let seeded = ctx.require_sub(&init_ty, &value_ty, &|| {
             format!("initializer of mutable `{label}`")
-        })?;
+        });
+        if let Err(error) = seeded {
+            ctx.recover(error, reads_before)?;
+        }
     }
     binding.ty = history.clone();
     // Monomorphic, like every other non-`let` binder: a mutable variable is a single

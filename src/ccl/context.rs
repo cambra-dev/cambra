@@ -63,9 +63,10 @@ use crate::{
 ///
 /// [`compile_program`] returns `Result<_, Vec<CompileError>>`: the parser and
 /// lowering each report every error they find, and lowering runs on the parser's
-/// partial tree, so one pass returns all of both. Each entry is single-phase; the
-/// parser's multi-error output is flattened into one [`CompileError::Parse`] per
-/// [`ParseError`].
+/// partial tree, so one pass returns all of both. Type inference runs only on a
+/// program both accept, and reports one error per failing statement. Each entry
+/// is single-phase; the parser's multi-error output is flattened into one
+/// [`CompileError::Parse`] per [`ParseError`].
 ///
 /// [`eprint_errors`] and [`render_errors`] render for a terminal; the web
 /// [`Diagnostic`](crate::inspector_model::Diagnostic) JSON path reads
@@ -2922,6 +2923,98 @@ Error: lowering error
             start + expected.len(),
             render_errors(&errs, &sources)
         );
+    }
+
+    /// Emission recovers at each statement: every failing statement reports, in
+    /// source order, and a binding whose definition failed reports nothing more at
+    /// its uses, even where a rule needs the value's shape as it emits (`m[1]?`). An
+    /// exact annotation binds its name at the declared type, so a use of it
+    /// still reports. `expected` is the text each error's span covers.
+    #[rstest]
+    #[case::two_definitions(
+        indoc::indoc! {"
+            x = foo + 1
+            y = bar + 2
+            x + y
+        "},
+        &["foo", "bar"]
+    )]
+    #[case::two_mismatches(
+        indoc::indoc! {r#"
+            x = 1 + "a"
+            y = 2 + "b"
+            x
+        "#},
+        &["1 + \"a\"", "2 + \"b\""]
+    )]
+    #[case::uses_of_a_failed_definition(
+        indoc::indoc! {"
+            x = foo
+            y = x + 1
+            z = not x
+            m = bar
+            v = m[1]?
+            y
+        "},
+        &["foo", "bar"]
+    )]
+    #[case::uses_of_an_annotated_failed_definition(
+        indoc::indoc! {r#"
+            x: Int = foo
+            y = x + "a"
+            y
+        "#},
+        &["foo", "x + \"a\""]
+    )]
+    #[case::a_polymorphic_annotation_whose_bound_fails(
+        indoc::indoc! {r#"
+            g: forall (T <: {Int where _ > zz}) T => T = \x -> x
+            y = g(1) + 1
+            z = 2 + "t"
+            y
+        "#},
+        &["zz", "2 + \"t\""]
+    )]
+    #[case::a_failed_annotation(
+        indoc::indoc! {r#"
+            x: Int = "s"
+            y = x + 1
+            z = 2 + "t"
+            y
+        "#},
+        &["x: Int = \"s\"", "2 + \"t\""]
+    )]
+    #[case::a_mutable_seed(
+        indoc::indoc! {r#"
+            a := foo
+            for i in [1, 2]:
+                a := a + i
+            b = 1 + "s"
+            a
+        "#},
+        &["foo", "1 + \"s\""]
+    )]
+    #[case::a_statement(
+        indoc::indoc! {r#"
+            acc := 0
+            for i in nope:
+                acc := acc + i
+            b = 1 + "s"
+            acc
+        "#},
+        &["nope", "1 + \"s\""]
+    )]
+    fn emission_reports_every_failing_statement(#[case] code: &str, #[case] expected: &[&str]) {
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let pointed: Vec<&str> = errs
+            .iter()
+            .map(|e| {
+                let span = e.span().expect("an inference error carries a span");
+                &code[span.start..span.end]
+            })
+            .collect();
+        assert_eq!(pointed, expected, "{}", render_errors(&errs, &sources));
     }
 
     /// Lowering reports its errors in source order, though it lowers a block's

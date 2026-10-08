@@ -24,7 +24,7 @@ use crate::util::ScopeStack;
 use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
 use super::solve::value_type;
-use super::typing::Typing;
+use super::typing::{LetScheme, Typing};
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{Assoc, Trait, TraitObligation};
 use crate::ccl::ty::TraitRequirement;
@@ -50,6 +50,10 @@ pub(super) struct Binding {
     /// The node that binds it: the `let` for a let binding, whose rule raises an error
     /// its definition causes ([`Typing::definition_alone_error`]).
     pub(super) defined_at: NodeId,
+    /// Whether the binder is a `let` bound at the type its failed definition left
+    /// unconstrained ([`LetScheme::Poisoned`]). Each use counts toward
+    /// [`InferCtx::poisoned_reads`].
+    pub(super) poisoned: bool,
 }
 
 /// Inference's lexical scope, read as the environment a solver query runs in.
@@ -205,6 +209,12 @@ pub(super) struct InferCtx {
     /// never removed: a uniquified name denotes one binding, so the fact it
     /// records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The errors emission recovered from ([`Typing::recover`]), in the order it
+    /// raised them, which is source order.
+    pub(super) errors: Vec<LocatedInferError>,
+    /// How many uses of a poisoned binding emission has resolved
+    /// ([`Self::note_use`]).
+    poisoned_reads: usize,
 }
 
 /// The environment a solver query runs in: the lexical scope at the query,
@@ -249,6 +259,25 @@ impl InferCtx {
             assumptions: Vec::new(),
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
+            errors: Vec::new(),
+            poisoned_reads: 0,
+        }
+    }
+
+    /// The type a use of `name` has: its binding's scheme instantiated at the
+    /// current level, or `None` for a name no scope binds. A use of a
+    /// [poisoned](LetScheme::Poisoned) binding counts toward
+    /// [`Typing::poisoned_reads`].
+    pub(super) fn instantiate_binding(&mut self, name: &Name) -> Option<Type> {
+        self.note_use(name);
+        Some(self.scopes.lookup(name)?.scheme.instantiate(self.level))
+    }
+
+    /// Count a use of `name` toward [`Typing::poisoned_reads`] when its binding is
+    /// [poisoned](LetScheme::Poisoned).
+    pub(super) fn note_use(&mut self, name: &Name) {
+        if self.scopes.lookup(name).is_some_and(|b| b.poisoned) {
+            self.poisoned_reads += 1;
         }
     }
 
@@ -474,6 +503,21 @@ impl Typing for InferCtx {
         self.current_node_id
     }
 
+    fn recover(
+        &mut self,
+        error: LocatedInferError,
+        reads_before: usize,
+    ) -> Result<(), LocatedInferError> {
+        if self.poisoned_reads == reads_before {
+            self.errors.push(error);
+        }
+        Ok(())
+    }
+
+    fn poisoned_reads(&self) -> usize {
+        self.poisoned_reads
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         emit_node(child, self)
     }
@@ -669,6 +713,7 @@ impl Typing for InferCtx {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
                 generalized: false,
                 defined_at: self.current_node(),
+                poisoned: false,
             },
         );
         let r = self.under_binder(name, f);
@@ -707,7 +752,7 @@ impl Typing for InferCtx {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
-        generalize: bool,
+        let_scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         let (name, bound_ty) = (&binding.name, &binding.ty);
@@ -728,6 +773,7 @@ impl Typing for InferCtx {
         // `self.level` (or below) by `extrude` during constraint solving, so
         // they stay fixed. (Sound to generalize unconditionally because CCL is
         // a pure value language — no value-restriction hazard.)
+        let generalize = let_scheme != LetScheme::Monomorphic;
         let scheme = if generalize {
             // Polymorphic: generalize at the outer level. Each `Var` use
             // instantiates a fresh copy; the coalesce walk then specializes
@@ -758,6 +804,7 @@ impl Typing for InferCtx {
                 scheme,
                 generalized: generalize,
                 defined_at: self.current_node(),
+                poisoned: let_scheme == LetScheme::Poisoned,
             },
         );
         let r = self.under_binder(name, f);

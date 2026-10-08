@@ -1832,8 +1832,7 @@ fn resolve_pass(
 pub enum OperandFailure {
     /// No type satisfies every requirement on it — ill-typed for every argument.
     ///
-    /// Raised for the first such place found, matching emission next door (also
-    /// fail-fast, also at most one error). *Whether* a program is rejected does not
+    /// Raised for the first such place found. *Whether* a program is rejected does not
     /// depend on order — the intersection is commutative — but *which* place is named,
     /// when a program has several, follows the order variables were minted in.
     Unsatisfiable {

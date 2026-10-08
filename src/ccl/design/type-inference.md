@@ -310,6 +310,31 @@ domain invariance and history invariance; a generic contravariant-function rule 
 every function kind. See [Bounds and constraint propagation](#bounds-and-constraint-propagation)
 and [Data domains are invariant](#data-domains-are-invariant).
 
+#### An error stops its statement, not the pass
+
+A failed rule returns its error to the nearest enclosing statement: a `let` definition, a `:=`
+initializer, or an expression statement. That statement's rule records the error and types its
+continuation (`Typing::recover`), so emission reports at most one error per statement, in source
+order.
+
+A `let` whose definition failed binds its name at the type an exact annotation declares, when it
+has one and `bind_annotation` accepts it, so its uses are typed against what the program states.
+Otherwise it binds the name at a poison: a fresh variable minted one level inside the binding and
+generalized. Each use of a poisoned binding instantiates its own copy, so uses that demand different
+types of the failed definition do not conflict. A rule that needs a value's shape as it emits, such
+as the checked lookup `m[k]?`, still fails on the bare variable, so `Typing::recover` drops the
+error of a statement that read a poisoned binding. The failure reports once, at the definition. A
+polymorphic annotation whose bounds do not type declares nothing usable: the `let` binds its name
+at a poison and does not type its definition, which would lack the bounds and the assumptions the
+annotation states. A `:=` whose initializer failed binds the variable at its declared history,
+which its writes still constrain.
+
+After any emission error, inference stops before the operand-requirement sweep and Pass 2. The graph
+lacks the constraints the failed statements would have contributed, so what those passes would
+report is the gap rather than the program. Check mode shares the rules and does not recover at
+statements: its rules record a failed constraint and continue, and an error a rule returns ends the
+walk.
+
 #### Apply is one-way
 
 The ordinary application rule emits a function-shape constraint and an argument constraint:
