@@ -1,39 +1,38 @@
 # Demo Programs
 
-A status table mapping each demo program in
-[`tests/programs/`](../tests/programs/) to whether it currently works.
-
-Each row maps a program to its current status and, when blocked, to the
-feature that must land for it to become `working`.  Each program is its own subdirectory
-containing a `program.cambra` source plus a `mod.rs` with one or more
-`#[test]` functions — when a blocked program starts succeeding (or a working
-one starts failing), the test goes red and prompts an update.
+[`tests/programs/`](../tests/programs/) contains CHL sources and integration tests. The
+[program table](#programs) records their intended coverage and status. A program's `mod.rs`
+asserts its result or current rejection; the table is not a substitute for running that test.
 
 ## Running a program manually
 
-Every program in the table below is a runnable `.cambra` file (named
-`program.cambra`, except `storefront`, which has `v0.cambra` and `v1.cambra`
-— the two sides of its version upgrade).  To run one by hand:
+Run a working gallery source from the repository root. Some directories contain several source
+versions rather than one `program.cambra`; select the file explicitly.
 
 ```bash
 cargo run -- tests/programs/<name>/program.cambra
 ```
 
-To open the live web inspector while it runs (shows the parsed CHL AST,
-the lowered CCL, the operator graph, and runtime producer state):
+To run the program and serve its compiler snapshot and live values:
 
 ```bash
 cargo run -- --inspect tests/programs/<name>/program.cambra
 ```
 
-To open the read-only program inspector *without* running the program — the
-source alongside one IR pane per compiler stage:
+To compile and serve the snapshot without driving program execution:
 
 ```bash
 cargo run -- --inspect-only tests/programs/<name>/program.cambra
 ```
 
-Two programs need a small substitution before they'll run as-is:
+Both server modes accept `=PORT` and default to port 8080. Open the printed URL in a browser;
+the command does not open a browser. `--inspect` keeps the inspector available after a finite
+program finishes. `--dump-snapshot` prints snapshot JSON and exits, including diagnostics for a
+failed compilation. It and `--inspect-only` are mutually exclusive and cannot be combined with
+execution flags. The CLI is implemented in [`src/main.rs`](../src/main.rs); pane and transport
+details belong to [the inspector reference](inspector.md#running-it).
+
+Some sources require input or test-time substitution:
 
 - **`http_greeter`** uses `{PORT}` as a placeholder so the integration test
   can pick a free TCP port.  Swap it for a literal (e.g. `8080`) before
@@ -53,58 +52,81 @@ Two programs need a small substitution before they'll run as-is:
   printf "hello\nworld\n" | cargo run -- tests/programs/source_accumulator/program.cambra
   ```
 
-The `🚧 blocked` programs in the table will panic or be rejected at
-lowering when run manually — that's the point.  Each row's Notes cell names its
-blocker; [Known issues](#known-issues-surfaced-by-these-programs) carries the
-ones that are bugs rather than missing features.
+Blocked entries can fail during parsing, lowering or a later stage. Use the program's test for
+its expected outcome and [Known issues](#known-issues-surfaced-by-these-programs) for the
+distinction from missing features. A source file is not necessarily a supported program.
 
 ## Timing a compile
 
-`gallery_compile_timing` (`tests/programs/compile_timing.rs`) compiles every `.cambra` file in the
-gallery and prints a row per program: its source lines and the fastest of N compiles. The timed
-region is `compile_program` alone — evaluation, where the rest of a gallery test's wall clock
-goes, sits outside it. The driver asserts nothing and is `#[ignore]`d, so an ordinary
-`cargo test` never pays for it.
+[`tests/programs/compile_timing.rs`](../tests/programs/compile_timing.rs) provides three ignored
+measurement tests. They enumerate the gallery's `.cambra` files and report the fastest of
+`CAMBRA_PERF_REPS` repetitions (default 3 when unset). A supplied value must be a positive integer;
+zero, malformed and non-Unicode values fail before measurement starts.
+`CAMBRA_TIMING_ONLY` selects labels containing its value; an unmatched filter fails the driver.
+
+| Driver | Timed operation |
+| --- | --- |
+| `gallery_compile_timing` | `compile_program`, including pane capture, operator conversion and output subscription; not scheduler-driven evaluation. |
+| `gallery_infer_timing` | `compile_to` through `Phase::Infer`, including preceding frontend stages. |
+| `gallery_post_infer_timing` | Duration through `Phase::Planning` minus duration through `Phase::Infer`, using two `compile_to` calls in each repetition. |
+
+The last driver clamps negative measured differences to zero. Subtracting the separately reported
+compile and infer rows does not measure the same interval: `compile_program` also captures panes
+and converts operators. Lowering can bind source/sink resources in either entry point; a source
+containing `{PORT}` receives a freshly reserved port for each compile.
+
+Run a selected driver in release mode to avoid measuring debug-only checks:
 
 ```bash
 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
 ```
 
-Release is the configuration whose numbers mean anything. `CAMBRA_PERF_REPS` sets the repetition
-count (default 3) and `CAMBRA_TIMING_ONLY` narrows the run to the labels containing a substring,
-which is how one program gets timed without the rest of the gallery's noise:
+To select one program and change the repetition count:
 
 ```bash
 CAMBRA_TIMING_ONLY=storefront CAMBRA_PERF_REPS=9 \
   cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
 ```
 
-Rows run slowest first. A `🚧 blocked` program has no compile time, so it sits at the bottom with
-the position where it stops. The module doc carries the rest: what a sink program's row includes,
-and the interleaved recipe for measuring provenance capture against the same corpus.
+Successful rows are sorted slowest first. A returned compiler error or caught panic stops that
+program's repetitions and produces a rejection row after successful rows. Rejection is a reported
+measurement outcome, not a failed correctness assertion. A bare `--ignored` selects all three
+drivers, which serialize access to the process-wide panic hook and output.
+
+To compare provenance recording costs, alternate configurations on the same machine:
+
+```bash
+for i in 1 2 3; do
+  CAMBRA_PROVENANCE=1 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+  CAMBRA_PROVENANCE=0 cargo test --release --test programs -- --ignored --nocapture gallery_compile_timing
+done
+```
+
+This changes provenance recording, not every snapshot or operator-graph cost.
 
 ## Adding to this table
 
-When you add a program under [`tests/programs/`](../tests/programs/), add a
-row here.  See [tests/programs/main.rs](../tests/programs/main.rs) for the
-list of registered programs and [tests/programs/common/mod.rs](../tests/programs/common/mod.rs)
-for the helpers each `mod.rs` uses (`expect_scalar`,
-`expect_compile_error`, `expect_scalar_currently_buggy`, and the subprocess
-utilities).  An entry that runs a program and talks to it takes
-[tests/support/serving.rs](../tests/support/serving.rs) instead, which the
-hot-reload suite shares.
+Add a source and `mod.rs` under `tests/programs/<name>/`, register its module in
+[tests/programs/main.rs](../tests/programs/main.rs), and add a row to [Programs](#programs).
+Registration makes its tests part of `cargo test --test programs`.
+
+[common/mod.rs](../tests/programs/common/mod.rs) owns pipeline and subprocess helpers,
+including `expect_scalar`, `expect_compile_error` and `expect_scalar_currently_buggy`.
+[tests/support/serving.rs](../tests/support/serving.rs) supplies HTTP-serving test support.
+Assert the current result or failure. Update that assertion and the status row when behavior
+changes.
 
 ## The inspector reads this gallery
 
-The program inspector has no example corpus of its own: `cambra --inspect-only
-<program>` takes any of these sources, and
-[`web/scripts/fixtures.manifest`](../web/scripts/fixtures.manifest)
-selects the few whose payload is committed as a golden fixture. A program added
-for pane coverage alone needs no fixture row — ratchet 5 of
-[tests/inspector_goldens.rs](../tests/inspector_goldens.rs) walks every source
-in this directory through the wire validator. So a program that pins an IR shape
-is also a program that runs and asserts its own value, and its `mod.rs` records
-both.
+The inspector uses the same sources rather than a separate example corpus.
+[`web/scripts/fixtures.manifest`](../web/scripts/fixtures.manifest) selects sources with committed
+snapshot fixtures. Its fixture names remain stable even when the source names differ.
+
+`every_gallery_program_produces_a_valid_payload` in
+[tests/inspector_goldens.rs](../tests/inspector_goldens.rs) enumerates gallery sources and checks
+their snapshot structure, including failed compilations. Pane-coverage tests need no manifest entry
+unless they also require a committed full-wire fixture. Runtime results and rejections remain the
+program tests' responsibility.
 
 ## North-star programs and corpus policy
 
