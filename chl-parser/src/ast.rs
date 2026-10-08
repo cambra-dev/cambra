@@ -1,29 +1,7 @@
-//! CHL surface AST.
+//! Span-bearing CHL syntax consumed by CCL lowering and `chl-interp`.
 //!
-//! Produced by [`super::parser`] and consumed by `cambra::ccl::lower` and by the
-//! differential interpreter, `chl-interp`.
-//!
-//! # Design choices vs. `rustpython_ast`
-//!
-//! - **Every node carries a span.** Nodes are wrapped in [`Spanned<T>`], so
-//!   diagnostics can point at any sub-expression without bolt-on span tables.
-//! - **Operators are enums, not strings.** [`BinOp`], [`CmpOp`], [`BoolOp`],
-//!   [`UnaryOp`], [`AugOp`] each enumerate exactly the operators CHL accepts;
-//!   variants Python supports but CHL does not (`/`, `%`, `>>`, `~`,
-//!   unary `+`, `is`, `in`) are simply absent. This makes lowering exhaustive
-//!   without an `unimplemented!()` branch per operator.
-//! - **`if`/`elif` flattens.** A chain of `if`/`elif`/`else` produces a single
-//!   [`Stmt::If`] with one `branches` entry per `if`/`elif` and one
-//!   optional `else_body`, rather than `rustpython_ast`'s nested
-//!   `else: [If(...)]` representation.
-//! - **Records are parens; braces are types.** A record *value* `(x=1, y=2)`
-//!   parses as [`Expr::Record`]. A brace literal is type syntax: `{x: T}`
-//!   (bare-identifier keys) is [`Expr::BraceRecord`] (a record type) and
-//!   `{T, U}` is [`Expr::BraceGroup`] (a tuple type). Lowering reads the brace
-//!   forms as types in annotation position and rejects them in value position.
-//! - **Feed / Define get their own variants.** `x << v` is [`Expr::Feed`] and
-//!   `x <<= v` is [`Stmt::Define`], rather than being a `BinOp(LShift)` and an
-//!   `AugAssign(LShift)` that lowering has to special-case.
+//! AST shape choices are specified in `chl-parser/design-chl-parser.md`,
+//! "Stage 3 — AST (`ast.rs`)". Type-expression nodes retain syntax for lowering to interpret.
 
 use smol_str::SmolStr;
 

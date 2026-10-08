@@ -1,57 +1,8 @@
-//! Chumsky parser for the CHL token stream produced by [`super::lexer`].
+//! Parse layout-resolved CHL tokens into expressions and statements.
 //!
-//! The grammar lives in one big [`recursive`] expression parser plus a
-//! recursive statement parser. The lexer-emitted `INDENT`/`DEDENT`/`NEWLINE`
-//! tokens stand in for block structure, so the parser itself is layout-free —
-//! it just matches `NEWLINE INDENT stmt+ DEDENT` for a multi-line block or
-//! `simple_stmt NEWLINE` for a one-liner.
-//!
-//! ## Why `.boxed()` is liberal
-//!
-//! Chumsky 1.0-alpha leans on rustc's type inference for parser types, and
-//! deeply-nested combinator chains create exponentially-sized types that
-//! compile slowly (or not at all). `.boxed()` heap-allocates the parser at
-//! that point and replaces the type with the uniform `Boxed<…>`, which both
-//! speeds up compilation and avoids the `'static`-lifetime footguns that
-//! deep dyn-trait inference produces (see [[reference-chumsky-gotchas]] in
-//! Claude memory for the gory details).
-//!
-//! ## Recovery
-//!
-//! Two complementary layers, both implemented with chumsky's
-//! `recover_with(via_parser(…))`:
-//!
-//! 1. **Bracket-level** (atom): a syntax error inside a balanced `(…)` /
-//!    `[…]` / `{…}` region is skipped to the matching close-delimiter and
-//!    produces an `Expr::Error` placeholder.
-//! 2. **Statement-level** (statement): a syntax error that doesn't fit
-//!    inside brackets makes the parser skip to the next `NEWLINE` (plus
-//!    any attached `INDENT…DEDENT` block), produce a `Stmt::Error`
-//!    placeholder, and resume with the next top-level statement.
-//!
-//! Both layers preserve the original chumsky error in the returned
-//! `ParseResult::errors` list, so a file with multiple syntax errors
-//! reports them all in one pass. See `chl-parser/design-chl-parser.md`,
-//! "Statement-level recovery" — the load-bearing `.at_least(1)` detail and
-//! the lexer-level `UnclosedBracket` interaction.
-//!
-//! ## Error message quality
-//!
-//! Errors are stored as structured [`ParseErrorInfo`] (preserving the
-//! found token, the categorised expected set, and `.as_context()` spans)
-//! rather than pre-rendered strings, so callers can render via:
-//!
-//! - `Display` for a one-line summary,
-//! - [`ParseResult::render_errors`] / [`ParseResult::eprint_errors`] for ariadne output
-//!   with source-code context and secondary spans,
-//! - or directly off [`ParseErrorInfo`] for a custom diagnostic UI.
-//!
-//! The error-handling types themselves ([`ParseError`], [`ParseErrorInfo`],
-//! [`Expected`], [`ParseResult`], and the chumsky-`Rich` conversion) live in
-//! the [`error`] submodule and are re-exported here; see the design doc's
-//! "Error message quality" section for the four layers (`Display` for
-//! tokens, targeted `.labelled(…)` annotations, and operator-category
-//! collapsing in [`collect_errors`]).
+//! Recovery can return a partial AST alongside diagnostics; callers must inspect both.
+//! Grammar and recovery contracts are in `chl-parser/design-chl-parser.md`,
+//! "Error recovery". Diagnostic conversion and rendering are implemented in [`error`].
 
 use chumsky::error::Rich;
 use chumsky::input::{Input, ValueInput};
@@ -136,12 +87,8 @@ pub fn parse_expression(file: FileId, source: &str) -> ParseResult<Spanned<Expr>
 // Parser plumbing
 // ---------------------------------------------------------------------------
 
-/// Shorthand for the parser-error type used by every parser in this module.
-///
-/// Public combinator signatures take a generic `I: ValueInput<'src, Token =
-/// Token, Span = Span>` rather than a concrete input alias, which lets
-/// chumsky's type inference resolve the deeply-nested combinator types
-/// without forcing us to name the mapper closure (see [[reference-chumsky-gotchas]]).
+/// Shared error type for token-stream parser combinators.
+/// See `chl-parser/design-chl-parser.md`, "Gotchas" for the generic input boundary.
 type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 
 // ---------------------------------------------------------------------------
@@ -774,13 +721,9 @@ where
                 )
             };
 
-        // `.boxed()` at every precedence layer is load-bearing for stack
-        // usage: without it, each `expr.clone()` re-entry monomorphizes
-        // through 15+ deeply-nested combinator types, and ~4 levels of
-        // nested function calls (`f(f(f(f(1))))`) is enough to overflow a
-        // 2 MiB test thread stack. Boxing collapses the type at each
-        // layer to a uniform `Boxed<…>`, so per-frame stack size stays
-        // bounded.
+        // Keep recursive re-entry from cloning the full concrete combinator chain.
+        // Without these boxes, `f(f(f(f(1))))` overflowed a 2 MiB test thread stack.
+        // See `chl-parser/design-chl-parser.md`, "Gotchas".
         let product = unary
             .clone()
             .foldl_with(
@@ -1138,19 +1081,8 @@ where
             })
             .boxed();
 
-        // Label the whole expression production so a failure here reports
-        // "expected expression" instead of unpacking the 20+ tokens that
-        // could legitimately start one. Lower-level productions
-        // (atoms, operators) deliberately stay unlabelled, so when a
-        // statement-level guide-post fails (e.g. `:` after `if cond`) the
-        // diagnostic still names the expected separator.
-        // `.as_context()` populates a context entry on every error that
-        // occurs *inside* this expression production, not just failures
-        // at its start. The renderer turns that into a yellow "while
-        // parsing expression" secondary span pointing at the partially-
-        // matched expression, which is what lets `if x` (no colon) show
-        // *where* the in-progress expression was when the missing `:`
-        // was hit.
+        // Start-position labels summarize expected input; contexts retain partial progress.
+        // See `chl-parser/design-chl-parser.md`, "Error message quality".
         choice((lambda, forall, yield_expr, fun_type))
             .labelled("expression")
             .as_context()
@@ -1796,36 +1728,10 @@ where
                 )
             });
 
-        // ---- Statement-level recovery -------------------------------
-        //
-        // If a whole statement fails to parse, fall back to:
-        //   1. consume tokens up to (and including) the next `Newline` at
-        //      the current bracket depth (the Newline ends the broken
-        //      statement);
-        //   2. if the next token after that is `Indent`, also swallow the
-        //      whole balanced `Indent…Dedent` block. This is what lets a
-        //      bad header line (`if x;`, `def f(:`) discard its attached
-        //      body instead of producing a cascade of orphan-block errors
-        //      from the outer module parser.
-        //
-        // The recovered statement is a `Stmt::Error` placeholder spanning
-        // the whole skipped region. The original chumsky error is preserved
-        // in the returned error list — recovery doesn't hide diagnostics,
-        // it just lets the parser keep going past them.
-        // `at_least(1)` is load-bearing for TWO reasons:
-        //   - **Termination.** Without it, recovery "succeeds" by matching
-        //     zero tokens at `Newline`/`Dedent`/EOF, which makes the
-        //     enclosing `statement().repeated()` loop forever (chumsky
-        //     panics with `Collect making no progress`).
-        //   - **No-cascade nested-block recovery.** A bad statement deep
-        //     inside nested blocks would otherwise emit one
-        //     "unexpected `Dedent`" parse error per block boundary on the
-        //     way out. With `at_least(1)`, recovery declines at each
-        //     intermediate `Dedent`, the enclosing `repeated()` exits
-        //     normally, and the surrounding `then_ignore(Dedent)`
-        //     consumes the `Dedent` without producing a spurious error.
-        //     `nested_block_recovery_reports_one_error_per_mistake` in the
-        //     integration tests guards this.
+        // Recovery must consume a non-boundary token before succeeding. Otherwise repeated
+        // statements can make no progress, or recovery can consume a surrounding block's
+        // Dedent and report cascading errors. See `chl-parser/design-chl-parser.md`,
+        // "Statement-level recovery".
         let skip_to_newline = any()
             .and_is(just(Token::Newline).not())
             .and_is(just(Token::Dedent).not())
