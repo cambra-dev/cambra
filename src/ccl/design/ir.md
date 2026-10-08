@@ -500,17 +500,19 @@ type. `BoundedHole` is also an annotation obligation, not a union of all subtype
 `Infer` may remain temporarily where a value has not been exercised; strict typecheck requires a
 fully resolved tree before operator conversion. Lowering does not mint solver variables.
 
-`History { domain, value, history_kind }` denotes a `domain ⤇ value` handle. `Overwrite` is a
-mutable variable, rendered `Mut(value, domain)`: ordinary reads yield its value, and its phase
-builds carry-forward histories. `Append` is a feed channel, rendered `feed(domain ⤇ value)`:
-reads yield the whole collection, with no off-path carry. Both children are invariant in the
-type relation. Lowering can construct histories for declarations and parameters, and inference
-propagates them. `Type::feed`, `Type::mutable`, and `Type::history` own construction;
-`Type::history` is the single constructor that fills the fields. Its argument order is
-`(domain, value, kind)`, even though `Mut` displays the value first.
+`History { function, history_kind }` denotes a handle over the data function
+`function : domain ⤇ value`. `Overwrite` is a mutable variable, rendered `Mut(value, domain)`:
+ordinary reads yield its value, and its phase builds carry-forward histories. `Append` is a feed
+channel, rendered `feed(domain ⤇ value)`: reads yield the whole collection, with no off-path
+carry. The domain and value are invariant in the type relation. Lowering can construct histories
+for declarations and parameters, and inference propagates them. `Type::feed`, `Type::mutable`,
+`Type::history` and `Type::history_keyed` own construction, all through `Type::history_over`. Their
+argument order is `(domain, value, kind)`, even though `Mut` displays the value first.
 
-`History` has no function binder slot. A feed's value therefore cannot currently depend on its
-own position, despite the arrow-shaped read view. `ChanDom` is minted when inference types a
+The function's binder names the position, and the value may read it: `Type::history_keyed` builds
+`(𝑘 : domain) ⤇ value`, the type of a feed in a loop whose row at each position reads that position
+([A history's value may depend on its position](type-inference.md#a-historys-value-may-depend-on-its-position)).
+`ChanDom` is minted when inference types a
 defer binding; its introduction level lets specialization freshen a channel introduced inside a
 generalized definition while retaining a captured outer channel. See
 [`Mut` as a type](mutability.md#mut-is-a-ccl-type) and

@@ -848,14 +848,12 @@ fn a_per_iteration_binding_read_by_the_inner_loop() {
 
 /// A refinement on the **inner** source that reads the outer binder — a correlated
 /// filter, so the inner domain differs per outer row and is narrower than the collection
-/// it filters. Answers 8 once it compiles: 2+3, then 3, then nothing. Pinned as it fails;
-/// the cause and its fix are the vault issue `refinements-dependent-projection-of-a-refined-pair`.
-///
-/// The inner history's type depends on the enclosing parameter, which lambda elimination
-/// refuses.
+/// it filters: 2+3, then 3, then nothing. The inner history's type depends on the enclosing
+/// parameter, so it is a dependent function of it, and the nested writer's parameter is a
+/// dependent pair.
 #[test]
 fn a_correlated_filter_on_the_inner_source() {
-    check_compile_error(
+    check_scalar(
         indoc! {r"
             total := 0
             for x in [1, 2, 3]:
@@ -863,7 +861,7 @@ fn a_correlated_filter_on_the_inner_source() {
                     total += y
             total
         "},
-        "history type does not depend on the enclosing parameter",
+        Value::Int(8),
     );
 }
 
@@ -1039,6 +1037,26 @@ fn an_empty_source_at_any_level_answers_from_the_seed(#[case] program: &str, #[c
 )]
 fn a_binding_is_lifted_into_the_iteration_that_reads_it(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
+}
+
+/// A binding made in a loop body and read inside a comprehension nested in it. The binding
+/// holds one value per row of the loop, and the comprehension runs a level further in, so the
+/// read lifts it over the keys beneath each row.
+#[rstest]
+#[case::as_a_filter_bound(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        m = r + 1
+        out << sum([v for v in [1, 2, 3] if v > m])
+"#}, "[3, 0]")]
+#[case::in_the_element(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        m = r + 1
+        out << [v + m for v in [1, 2, 3]]
+"#}, "[[3, 4, 5], [4, 5, 6]]")]
+fn a_loop_binding_read_by_a_nested_comprehension(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
 }
 
 /// A write between the loops with the inner loop always run — three rows of `total += 10`
@@ -1346,6 +1364,28 @@ fn an_inner_seed_combines_the_carried_value_with_an_enclosing_binding() {
 "}, 2063)]
 fn the_shapes_lowering_admits_run(#[case] program: &str, #[case] total: i64) {
     check_scalar(program, Value::Int(total));
+}
+
+/// A feed-only loop nested in a mutation loop may filter by a match arm's binder around it, as
+/// by a loop's variable: the arm binds it once per position of the mutation loop.
+#[test]
+fn a_feed_only_loop_filters_by_a_match_arm_binder_around_it() {
+    check_sink(
+        indoc! {r"
+            out = test_sink()
+            n := 0
+            for x in [1, 2]:
+                match `some(x):
+                    case `some(y):
+                        for v in [1, 2, 3]:
+                            if v > y:
+                                out << v
+                    case `none(_):
+                        n += 0
+                n += 1
+        "},
+        "[(_0: 0, _1: 1) -> 2, (_0: 0, _1: 2) -> 3, (_0: 1, _1: 2) -> 3]",
+    );
 }
 
 /// A long nest's stores hold the same state however many enclosing positions it runs: each

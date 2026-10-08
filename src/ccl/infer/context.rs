@@ -244,6 +244,8 @@ pub(super) struct InferCtx {
     /// and the function it calls, for the application that passes it its arguments
     /// ([`Typing::bind_instance_function_called`]).
     pub(super) trait_calls: HashMap<NodeId, (Rc<TraitObligation>, smol_str::SmolStr, Vec<Type>)>,
+    /// How many errors emission has recovered from ([`Typing::recoveries`]).
+    recoveries: usize,
     /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
     /// [`Self::require_contribution`] and [`Typing::close_let_type`]: one per binder of the
     /// name, innermost last, pushed where the binder is entered and popped where its scope
@@ -252,6 +254,31 @@ pub(super) struct InferCtx {
     /// The joined binders each `let` a contribution crossed varies with, for each such `let`
     /// whose definition reads one ([`Self::name_varying_binders`]).
     varies_with: HashMap<Name, Vec<Name>>,
+    /// Each loop variable entered, with the source it ranges over and its element type
+    /// ([`Typing::note_loop_source`]). A feed crossing one is keyed by the loop's position,
+    /// so the variable is the source read at that position ([`Self::require_feed`]).
+    loop_sources: HashMap<Name, LoopSource>,
+    /// The innermost lexical binder where each transaction block being emitted begins,
+    /// outermost block first ([`Typing::in_transaction`]).
+    open_transactions: Vec<Option<Name>>,
+    /// The places feeding each feed channel ([`Typing::note_feed_places`]).
+    feed_places: HashMap<Name, Vec<NodeId>>,
+    /// Each loop variable a feed was joined over only because its channel is fed from another
+    /// place as well, with that place ([`Self::require_feed`]). A coalesce error naming the
+    /// variable names the place ([`Self::name_other_feed_places`]).
+    fed_elsewhere: HashMap<Name, NodeId>,
+}
+
+/// A loop variable's source, as a feed crossing the variable reads it at the channel's key.
+struct LoopSource {
+    /// The binder of the source's type where it is dependent: the chain scopes it over the
+    /// loop's body, and it names the position ([`Typing::note_loop_source`]).
+    position_binder: Option<Name>,
+    source: Expr,
+    /// The type of the source's positions, its domain.
+    position: Type,
+    /// The type of the variable, one of the source's values.
+    item: Type,
 }
 
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
@@ -392,11 +419,16 @@ impl InferCtx {
             bound_at_annotation: HashSet::new(),
             scope_exits: HashMap::new(),
             varies_with: HashMap::new(),
+            loop_sources: HashMap::new(),
+            open_transactions: Vec::new(),
+            feed_places: HashMap::new(),
+            fed_elsewhere: HashMap::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
             instances: InstanceTable::builtin(),
             groups: Vec::new(),
             trait_calls: HashMap::new(),
+            recoveries: 0,
         }
     }
 
@@ -506,7 +538,8 @@ impl InferCtx {
                             TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
                         ) =>
                 {
-                    ScopeExit::Discharge(Rc::new(definition.clone_preserving_ids()))
+                    // In the spelling a predicate takes it in, once for every reader.
+                    ScopeExit::Discharge(Rc::new(crate::ccl::ccl_utils::predicate_term(definition)))
                 }
                 _ => ScopeExit::Keep,
             }
@@ -868,12 +901,10 @@ impl InferCtx {
             // nested `Hole` into a fresh var. (No `Mut`-specific `Hole` logic
             // here; that belongs to a later increment.)
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
-            } => Type::history(
-                self.normalize_annotation_in(domain, telescope),
-                self.normalize_annotation_in(value, telescope),
+            } => Type::history_over(
+                self.normalize_annotation_in(function, telescope),
                 *history_kind,
             ),
             // Leaves and existing inference vars pass through unchanged.
@@ -964,21 +995,37 @@ impl InferCtx {
         // `(Int ⤇ (Int ⤇ Int))`, with the key binders discharged — and the
         // recursion would need the annotation and the inferred type to agree on
         // depth, which nothing establishes at this edge.
+        //
+        // A history's function adopts the same way: it is a `Fun` whose binder is named where
+        // a position's value reads the position (`Type::History`), so a feed declared
+        // `x: Feed(_)` over a channel keyed by its position keeps the key.
+        fn function_layer(ty: &Type) -> &Type {
+            match ty.peel_refinements() {
+                Type::History { function, .. } => function,
+                other => other,
+            }
+        }
+        fn function_layer_mut(ty: &mut Type) -> &mut Type {
+            let mut cur = ty;
+            while let Type::Refinement(inner, _) = cur {
+                cur = inner;
+            }
+            match cur {
+                Type::History { function, .. } => function,
+                other => other,
+            }
+        }
         let adopted;
-        let ann_to_normalize = match (inferred.peel_refinements(), ann.peel_refinements()) {
+        let ann_to_normalize = match (function_layer(inferred), function_layer(ann)) {
             (Type::Fun { name: Some(b), .. }, Type::Fun { name: None, .. }) => {
                 let mut named = ann.clone();
-                // Name the unrefined function layer `peel_refinements` matched;
-                // refinement wrappers stay outside it. The walk peels exactly what
-                // that match peeled, so it lands on that same function.
-                let mut cur: &mut Type = &mut named;
-                while let Type::Refinement(inner, _) = cur {
-                    cur = inner;
-                }
-                let Type::Fun { name, .. } = cur else {
+                // Name the function layer `function_layer` matched; refinement wrappers
+                // and a history stay outside it. The walk peels exactly what that match
+                // peeled, so it lands on that same function.
+                let Type::Fun { name, .. } = function_layer_mut(&mut named) else {
                     unreachable!(
-                        "`peel_refinements` matched a `Fun` on this annotation, and \
-                         this walk peels the same `Refinement` layers, so it lands on it"
+                        "`function_layer` matched a `Fun` on this annotation, and \
+                         `function_layer_mut` peels the same layers, so it lands on it"
                     )
                 };
                 *name = Some(b.clone());
@@ -1097,54 +1144,8 @@ impl InferCtx {
         let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
             return self.require_sub(contribution, history, at);
         };
-        let exit_of = |name: &Name| {
-            self.scope_exits
-                .get(name)
-                .and_then(|exits| exits.last())
-                .unwrap_or_else(|| panic!("no scope exit recorded for the binder `{name}`"))
-        };
-        // `crossed` is innermost first, so a binder is inside the outermost joined one when
-        // that one comes later in it.
-        let outermost_join = crossed
-            .iter()
-            .rposition(|name| matches!(exit_of(name), ScopeExit::Join));
-        let exits = crossed
-            .iter()
-            .enumerate()
-            .fold(Subst::id(), |exits, (i, name)| {
-                let exit = match exit_of(name) {
-                    ScopeExit::Discharge(definition) => {
-                        Subst::discharge(name.clone(), definition.clone_preserving_ids())
-                    }
-                    ScopeExit::Keep if outermost_join.is_none_or(|j| j < i) => return exits,
-                    ScopeExit::Keep | ScopeExit::Join => Subst::join(name.clone()),
-                };
-                Subst::then(&exits, &exit)
-            });
-        // The joined binders each crossed binder varies with, outermost first: a joined
-        // binder varies with itself, and a discharged `let` with those of the binders its
-        // definition reads.
-        let mut varying: HashMap<&Name, Vec<Name>> = HashMap::new();
-        for (i, name) in crossed.iter().enumerate().rev() {
-            let with = match exit_of(name) {
-                ScopeExit::Discharge(definition) => crossed[i + 1..]
-                    .iter()
-                    .filter(|outer| crate::ccl::ccl_utils::is_free(outer, definition))
-                    .flat_map(|outer| varying[outer].iter().cloned())
-                    .collect(),
-                ScopeExit::Keep if outermost_join.is_none_or(|j| j < i) => Vec::new(),
-                ScopeExit::Keep | ScopeExit::Join => vec![name.clone()],
-            };
-            varying.insert(name, with);
-        }
-        let lets: Vec<(Name, Vec<Name>)> = varying
-            .into_iter()
-            .filter(|(name, with)| {
-                !with.is_empty() && matches!(exit_of(name), ScopeExit::Discharge(_))
-            })
-            .map(|(name, with)| (name.clone(), with))
-            .collect();
-        self.varies_with.extend(lets);
+        self.note_varying_binders(&crossed);
+        let exits = self.exits(&crossed, &[]);
         if exits.is_id() {
             return self.require_sub(contribution, history, at);
         }
@@ -1157,6 +1158,279 @@ impl InferCtx {
         enforce_bound_scope(&crossing, "lower", &bound);
         crossing.bounds.borrow_mut().lower_mut().push(bound);
         self.require_sub(&Type::Infer(crossing), history, at)
+    }
+
+    /// Record a feed of a value of type `value` into the channel `target`, whose read view
+    /// is `channel`: one row of the channel's collection.
+    ///
+    /// A channel fed from one place, under loops entered after it, is keyed by those loops'
+    /// positions, so the row at key `𝑘` was fed where each loop variable is its source read
+    /// at its position in `𝑘`: `𝑘 ▷ source` under one loop, `𝑘.𝑖 ▷ sourceᵢ` under several
+    /// (`src/ccl/design/type-inference.md`, "A history's value may depend on its
+    /// position"). Each loop variable is then joined over with that term at the key, which
+    /// answers a collection's domain that reads it. Anything else leaves the key unknown
+    /// here: a `def`'s parameter or a pattern's binder between the channel and the feed, a
+    /// transaction block, or a second place feeding the channel. The feed is then joined over as any contribution is
+    /// ([`Self::require_contribution`]).
+    pub(super) fn require_feed(
+        &mut self,
+        target: &Name,
+        value: &Type,
+        channel: &Type,
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError> {
+        let row = |ctx: &mut Self| Type::data_fun(ctx.fresh(), value.clone());
+        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+            let contribution = row(self);
+            return self.require_sub(&contribution, channel, at);
+        };
+        let keyed = match channel.peel_refinements() {
+            Type::Fun {
+                name: Some(key),
+                domain,
+                ..
+            } => Some((key.clone(), (**domain).clone())),
+            _ => None,
+        };
+        let loops: Vec<Name> = crossed
+            .iter()
+            .rev()
+            .filter(|n| self.loop_sources.contains_key(*n))
+            .cloned()
+            .collect();
+        let position_binders: Vec<&Name> = loops
+            .iter()
+            .filter_map(|x| self.loop_sources[x].position_binder.as_ref())
+            .collect();
+        let in_transaction = self
+            .open_transactions
+            .iter()
+            .flatten()
+            .any(|begin| begin == target || crossed.contains(begin));
+        let only_lets_and_loops = crossed.iter().all(|n| {
+            let joined = self
+                .scope_exits
+                .get(n)
+                .and_then(|exits| exits.last())
+                .is_none_or(|exit| matches!(exit, ScopeExit::Join));
+            !joined || self.loop_sources.contains_key(n) || position_binders.contains(&n)
+        });
+        let keyable =
+            keyed.is_some() && !loops.is_empty() && !in_transaction && only_lets_and_loops;
+        let places = self.feed_places.get(target).map_or(&[][..], Vec::as_slice);
+        if keyable && let Some(&other) = places.iter().find(|&&p| p != self.current_node_id) {
+            for x in &loops {
+                self.fed_elsewhere.insert(x.clone(), other);
+            }
+        }
+        let Some((key, key_domain)) = keyed.filter(|_| keyable && places == [self.current_node_id])
+        else {
+            let contribution = row(self);
+            return self.require_contribution(target, &contribution, channel, at);
+        };
+        // Each loop variable at its position in the key, outermost loop first, and a dependent
+        // source's binder as the position itself. The terms are the feed's reading of its
+        // position, built where the feed is.
+        let _g = crate::ccl::provenance::enter(
+            self.current_node_id,
+            "infer.feed_key",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        // Each projection out of the key binds a name of its own and reads its loop's position
+        // type there: an inner loop's positions can depend on an outer one's, so `.𝑖` has the
+        // type `(𝑝 : 𝐾) ⇒ 𝐷ᵢ(𝑝)`, the position type with the loops around it read at `𝑝`.
+        // Those reads are known once the terms that make them are, so each codomain is a
+        // variable bounded by the position type under them below.
+        let projections: Vec<Option<(Name, Rc<InferVar>)>> = loops
+            .iter()
+            .map(|_| {
+                (loops.len() > 1).then(|| {
+                    let at = Name::fresh("__key");
+                    let read_at = InferVar::fresh_in(
+                        self.level,
+                        &target_scope.extended(key.clone()).extended(at.clone()),
+                    );
+                    (at, read_at)
+                })
+            })
+            .collect();
+        // Each loop variable as its source read at its position in a key named `through`, and a
+        // dependent source's binder as that position.
+        self.note_varying_binders(&crossed);
+        let reads_at = |through: &Name| -> Vec<(Name, Expr)> {
+            let key_var = Expr::var(through).with_ty(key_domain.clone());
+            loops
+                .iter()
+                .zip(&projections)
+                .enumerate()
+                .flat_map(|(i, (x, projection))| {
+                    let LoopSource {
+                        position_binder,
+                        source,
+                        position: position_ty,
+                        item,
+                        ..
+                    } = &self.loop_sources[x];
+                    let position = match projection {
+                        None => key_var.clone_preserving_ids(),
+                        Some((at, read_at)) => Expr::apply(
+                            key_var.clone_preserving_ids(),
+                            Expr::proj_index(i).with_ty(Type::pi(
+                                at.clone(),
+                                key_domain.clone(),
+                                Type::Infer(Rc::clone(read_at)),
+                            )),
+                        )
+                        .with_ty(position_ty.clone()),
+                    };
+                    let read = Expr::apply(
+                        position.clone_preserving_ids(),
+                        source.clone_preserving_ids(),
+                    )
+                    .with_ty(item.clone());
+                    std::iter::once((x.clone(), read))
+                        .chain(
+                            position_binder
+                                .iter()
+                                .map(|b| (b.clone(), position.clone_preserving_ids())),
+                        )
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let exits_at = |through: &Name| self.exits(&crossed, &reads_at(through));
+        let exits = exits_at(&key);
+        // A position type names which keys exist, so a crossed binder in it is discharged to its
+        // term at the projection's binder ([`Subst::in_data_domain`]).
+        for ((at, read_at), x) in projections
+            .iter()
+            .zip(&loops)
+            .filter_map(|(p, x)| Some((p.as_ref()?, x)))
+        {
+            let position = self.loop_sources[x].position.clone();
+            let bound = Bound::with_subst(position, exits_at(at).in_data_domain().into_owned());
+            enforce_bound_scope(read_at, "lower", &bound);
+            enforce_bound_scope(read_at, "upper", &bound);
+            let mut bounds = read_at.bounds.borrow_mut();
+            bounds.lower_mut().push(bound.clone());
+            bounds.upper_mut().push(bound);
+        }
+        // The row's value stands under the key, where the terms the exits put in it read it.
+        let element = InferVar::fresh_in(self.level, &target_scope.extended(key.clone()));
+        let bound = Bound::with_subst(value.clone(), exits);
+        enforce_bound_scope(&element, "lower", &bound);
+        element.bounds.borrow_mut().lower_mut().push(bound);
+        let contribution = Type::Fun {
+            name: Some(key),
+            fun_kind: crate::ccl::ty::FunKind::Data(None),
+            domain: Box::new(self.fresh()),
+            codomain: Box::new(Type::Infer(element)),
+        };
+        self.require_sub(&contribution, channel, at)
+    }
+
+    /// Name, in each [`InferError::NoJoinOverBinder`] whose binders include a loop variable a
+    /// feed was joined over only because its channel is fed from another place
+    /// ([`Self::require_feed`]), that other place.
+    pub(super) fn name_other_feed_places(&self, errors: &mut [LocatedInferError]) {
+        for e in errors {
+            if let InferError::NoJoinOverBinder { binders, .. } = &e.error
+                && let Some(&other) = binders.iter().find_map(|b| self.fed_elsewhere.get(b))
+            {
+                e.fed_elsewhere(other);
+            }
+        }
+    }
+
+    /// The exit of each binder in `crossed`, innermost first, composed into one
+    /// substitution ([`ScopeExit`]): a transparent `let` is discharged, and a binder taking
+    /// several values is joined over, with its term at the key where `at_key` gives one
+    /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+    /// target"). A kept binder inside a joined one of the crossing is joined too: it holds one
+    /// value per value of the binder around it ([`Self::joined_in_crossing`]).
+    fn exits(&self, crossed: &[Name], at_key: &[(Name, Expr)]) -> Subst {
+        let joined = self.joined_in_crossing(crossed);
+        // Composed from the outermost exit inward: `𝑒₀ ; (𝑒₁ ; (… ; 𝑒ₙ))`, which is the same
+        // substitution as composing innermost first, since composition is associative. This
+        // order applies each exit's term only to the finished exits outside it. Composing
+        // innermost first applies every later exit to every term already composed, and a term
+        // whose type slots hold unresolved variables suspends on each of those partial
+        // composites ([`Subst::then`]), so the variables minted grew with the binders crossed
+        // times the terms crossing them.
+        crossed
+            .iter()
+            .enumerate()
+            .rev()
+            .fold(Subst::id(), |exits, (i, name)| {
+                let exit = match self.exit_of(name) {
+                    ScopeExit::Discharge(definition) => {
+                        Subst::discharge(name.clone(), definition.clone_preserving_ids())
+                    }
+                    _ if !joined[i] => return exits,
+                    _ => match at_key.iter().find(|(x, _)| x == name) {
+                        Some((_, read)) => {
+                            Subst::join_at_key(name.clone(), read.clone_preserving_ids())
+                        }
+                        None => Subst::join(name.clone()),
+                    },
+                };
+                Subst::then(&exit, &exits)
+            })
+    }
+
+    /// The exit recorded for the innermost binder `name` in scope.
+    fn exit_of(&self, name: &Name) -> &ScopeExit {
+        self.scope_exits
+            .get(name)
+            .and_then(|exits| exits.last())
+            .unwrap_or_else(|| panic!("no scope exit recorded for the binder `{name}`"))
+    }
+
+    /// Whether each binder of `crossed`, innermost first, is joined over in the crossing: a
+    /// joined binder, and a kept one inside a joined one.
+    fn joined_in_crossing(&self, crossed: &[Name]) -> Vec<bool> {
+        // `crossed` is innermost first, so a binder is inside the outermost joined one when
+        // that one comes later in it.
+        let outermost_join = crossed
+            .iter()
+            .rposition(|name| matches!(self.exit_of(name), ScopeExit::Join));
+        crossed
+            .iter()
+            .enumerate()
+            .map(|(i, name)| match self.exit_of(name) {
+                ScopeExit::Discharge(_) => false,
+                ScopeExit::Keep => outermost_join.is_some_and(|j| j > i),
+                ScopeExit::Join => true,
+            })
+            .collect()
+    }
+
+    /// Record the joined binders each `let` of `crossed`, innermost first, varies with
+    /// ([`Self::name_varying_binders`]): a joined binder varies with itself, and a discharged
+    /// `let` with those of the binders its definition reads.
+    fn note_varying_binders(&mut self, crossed: &[Name]) {
+        let joined = self.joined_in_crossing(crossed);
+        let mut varying: HashMap<&Name, Vec<Name>> = HashMap::new();
+        let mut lets = Vec::new();
+        for (i, name) in crossed.iter().enumerate().rev() {
+            let with: Vec<Name> = match self.exit_of(name) {
+                ScopeExit::Discharge(definition) => {
+                    let with: Vec<Name> = crossed[i + 1..]
+                        .iter()
+                        .filter(|outer| crate::ccl::ccl_utils::is_free(outer, definition))
+                        .flat_map(|outer| varying[outer].iter().cloned())
+                        .collect();
+                    if !with.is_empty() {
+                        lets.push((name.clone(), with.clone()));
+                    }
+                    with
+                }
+                _ if joined[i] => vec![name.clone()],
+                _ => Vec::new(),
+            };
+            varying.insert(name, with);
+        }
+        self.varies_with.extend(lets);
     }
 
     /// Name, in each [`InferError::NoJoinOverBinder`], the joined binders a crossed `let`
@@ -1222,6 +1496,7 @@ impl Typing for InferCtx {
         error: LocatedInferError,
         reads_before: usize,
     ) -> Result<(), LocatedInferError> {
+        self.recoveries += 1;
         if self.poisoned_reads == reads_before {
             self.errors.push(error);
         }
@@ -1234,6 +1509,10 @@ impl Typing for InferCtx {
 
     fn binds(&self, name: &Name) -> bool {
         self.scopes.lookup(name).is_some()
+    }
+
+    fn recoveries(&self) -> usize {
+        self.recoveries
     }
 
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
@@ -1484,6 +1763,37 @@ impl Typing for InferCtx {
         }
     }
 
+    fn note_loop_source(
+        &mut self,
+        binder: &Name,
+        position_binder: Option<&Name>,
+        source: &Expr,
+        position: &Type,
+        item: &Type,
+    ) {
+        self.loop_sources.insert(
+            binder.clone(),
+            LoopSource {
+                position_binder: position_binder.cloned(),
+                source: source.clone_preserving_ids(),
+                position: position.clone(),
+                item: item.clone(),
+            },
+        );
+    }
+
+    fn in_transaction<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.open_transactions
+            .push(self.telescope.iter().next().cloned());
+        let r = f(self);
+        self.open_transactions.pop();
+        r
+    }
+
+    fn note_feed_places(&mut self, defer: &Name, places: Vec<NodeId>) {
+        self.feed_places.insert(defer.clone(), places);
+    }
+
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
@@ -1611,7 +1921,14 @@ impl Typing for InferCtx {
         // `d`/`c` from `t`'s other bounds. Concretely `Compute`, unlike
         // `as_function`'s demand: the node *providing* a shape here is a `Proj`,
         // and a projection is a capability.
-        self.require_sub(&fun(d.clone(), c.clone()), t, at)?;
+        //
+        // A dependent node type's binder rides the shape: the codomain it supplies reads the
+        // binder, and an unnamed function would leave that reference with nothing to bind it.
+        let shape = match t.peel_refinements() {
+            Type::Fun { name: Some(b), .. } => Type::pi(b.clone(), d.clone(), c.clone()),
+            _ => fun(d.clone(), c.clone()),
+        };
+        self.require_sub(&shape, t, at)?;
         Ok((d, c))
     }
 
@@ -1703,9 +2020,11 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
+        // The argument goes into the result's predicates in the spelling predicates are
+        // compared in (`ccl_utils::predicate_term`).
         let bound = Bound::with_subst(
             result,
-            Subst::discharge(&x, argument.clone_preserving_ids()),
+            Subst::discharge(&x, crate::ccl::ccl_utils::predicate_term(argument)),
         );
         enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);

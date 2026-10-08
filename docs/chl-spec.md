@@ -991,6 +991,21 @@ element type is the type of `value`, or where several feeds target one
 feed, the join of their value types
 ([Joining the types of several values](#joining-the-types-of-several-values)).
 
+A feed inside a loop contributes once per position of the loops between the target's declaration
+and the `<<`, and the stream holds each contribution at its position. The element at a position is
+typed there, so its type may read the loop variables, and the contributions of one `<<` are not
+joined across positions:
+
+```python
+o: Feed(_)
+for r in [1, 2]:
+    o << [v for v in [1, 2, 3] if v > r]   # the row at r's position has the keys v > r
+```
+
+The two rows are collections over different keys, which have no join, and they need none: each is
+typed at its own position. `box` (§7.4) is needed where a value's type does not follow from its
+position, as between the values of two `<<` statements.
+
 The collection a feed accumulates is, like any CHL
 collection, **unordered** (§3): multiple `<<` statements — across
 different iterations of a `for` loop, or across multiple feed sites
@@ -2551,7 +2566,7 @@ nothing more.
 | `match` (§4.10) | every arm's result |
 | a collection literal or comprehension (§3.11, §3.12) | the elements |
 | a mutable variable (§8.1) | every value written to it |
-| a feed (§3.7) | every contribution |
+| a feed (§3.7) | every `<<` statement's contribution, each typed at its loop position |
 
 The join keeps what every value establishes and drops the rest, so a refinement
 survives only where all of them carry it: `1 if c else 2` is `Int`, `5 if c else 5` is

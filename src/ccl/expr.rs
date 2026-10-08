@@ -1191,14 +1191,6 @@ impl TypedExpr {
         }
     }
 
-    /// This subtree, its root taking `node_id` in place of its own, which it drops: for a
-    /// term just built and owned, so its interior is moved rather than copied again as
-    /// [`clone_at`](Self::clone_at) copies it. The caller supplies an existing root ID, as
-    /// for `clone_at`.
-    pub(crate) fn rooted_at(self, node_id: NodeId) -> Self {
-        TypedExpr { node_id, ..self }
-    }
-
     /// Set the inferred type on this expression, consuming and returning it.
     ///
     /// Used to pre-fill the type in tests or when the type is known at construction time.

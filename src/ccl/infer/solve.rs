@@ -585,11 +585,10 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
     {
         return false;
     }
-    let (value, domain, kind, other) = match (read, now) {
+    let (function, kind, other) = match (read, now) {
         (
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
             },
             other,
@@ -597,21 +596,21 @@ fn histories_agree(read: &Type, now: &Type, refinements: bool) -> bool {
         | (
             other,
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
             },
-        ) => (value, domain, history_kind, other),
+        ) => (function, history_kind, other),
         _ => unreachable!("called only when at least one side peels to a History"),
     };
     match kind {
-        // A feed's read view is a collection: a data function.
-        HistoryKind::Append => types_agree_modulo_unread(
-            &Type::data_fun((**domain).clone(), (**value).clone()),
-            other,
-            refinements,
-        ),
-        HistoryKind::Overwrite => types_agree_modulo_unread(value, other, refinements),
+        // A feed reads as its whole collection, the history's data function.
+        HistoryKind::Append => types_agree_modulo_unread(function, other, refinements),
+        HistoryKind::Overwrite => {
+            let Type::Fun { codomain, .. } = function.peel_refinements() else {
+                unreachable!("a history's function is a function")
+            };
+            types_agree_modulo_unread(codomain, other, refinements)
+        }
     }
 }
 
@@ -1092,7 +1091,8 @@ fn for_each_positioned_var(
                 step(t, PositionStep::Arm(key.clone()), path);
             }
         }
-        Type::History { value, domain, .. } => {
+        Type::History { .. } => {
+            let (domain, value, _) = ty.history_parts().expect("matched a history");
             step(value, PositionStep::HistoryValue, path);
             step(domain, PositionStep::HistoryDomain, path);
         }
@@ -1135,8 +1135,8 @@ fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
         (Type::DepTuple(cs), PositionStep::Component(i)) => &cs.get(*i)?.1,
         (Type::Record(fs), PositionStep::Field(name)) => &fs.iter().find(|(n, _)| n == name)?.1,
         (Type::Variant(arms, _), PositionStep::Arm(key)) => &arms.iter().find(|(k, _)| k == key)?.1,
-        (Type::History { value, .. }, PositionStep::HistoryValue) => value.as_ref(),
-        (Type::History { domain, .. }, PositionStep::HistoryDomain) => domain.as_ref(),
+        (Type::History { .. }, PositionStep::HistoryValue) => ty.history_parts()?.1,
+        (Type::History { .. }, PositionStep::HistoryDomain) => ty.history_parts()?.0,
         (Type::Nominal(decl, args), PositionStep::Argument(at, i)) if decl == at => args.get(*i)?,
         (Type::Split { input, .. }, PositionStep::Input) => input.as_ref(),
         (Type::Split { output, .. }, PositionStep::Output) => output.as_ref(),
@@ -1207,12 +1207,23 @@ impl OccurrenceIndex {
                 };
                 for b in lower.iter() {
                     let bound_ty = b.render_subst().apply_type(&b.ty);
-                    for_each_positioned_var(&bound_ty, &mut Vec::new(), &mut |u, position| {
-                        self.occurrences.entry(u.uid).or_default().push(Occurrence {
-                            holder: Rc::clone(&v),
-                            position: position.into(),
+                    // A substitution that reaches a variable suspends it, so the rendered
+                    // bound holds the suspension where the bound itself holds the variable.
+                    // Both stand at the same position of the holder, so both occur there:
+                    // read through the rendering alone, the variable a suspension waits on
+                    // occurs nowhere.
+                    let rendered_differs = bound_ty != b.ty;
+                    for ty in std::iter::once(&bound_ty).chain(rendered_differs.then_some(&b.ty)) {
+                        for_each_positioned_var(ty, &mut Vec::new(), &mut |u, position| {
+                            self.occurrences.entry(u.uid).or_default().push(Occurrence {
+                                holder: Rc::clone(&v),
+                                position: position.into(),
+                            });
                         });
-                    });
+                    }
+                    if rendered_differs {
+                        stack.push(b.ty.clone());
+                    }
                     stack.push(bound_ty);
                 }
                 stack.extend(upper.iter().map(|b| b.ty.clone()));
@@ -1349,6 +1360,14 @@ fn position_answer(
             return Some(answer);
         }
         if let Type::Infer(u) = &ty
+            && let Some(answer) = position_type_go(u, index, question, partial)
+        {
+            return Some(answer);
+        }
+        // A substitution reaching the bound's variable suspends it, and the position is the
+        // variable's as much as the suspension's, as in the occurrence index's sweep.
+        if ty != b.ty
+            && let Type::Infer(u) = &b.ty
             && let Some(answer) = position_type_go(u, index, question, partial)
         {
             return Some(answer);
@@ -1648,6 +1667,36 @@ fn check_scope_valid_go(
             also: Box::default(),
             related: RelatedPositions::default(),
         });
+    }
+    // **A loop over rows that read their position is not compiled yet.** The loop
+    // `𝑠 ≫ (λ 𝑥 → body)` types `𝑥` at `𝑠`'s row, which reads `𝑠`'s position, and nothing in the
+    // tree binds that position over the lambda: a feed keyed by the loops that fed it, read back
+    // by a `for` loop. A comprehension over the same rows binds the position and compiles.
+    if let TypedExprNode::Compose(elts) = &expr.node
+        && let [source, step] = elts.as_slice()
+        && matches!(step.node, TypedExprNode::Lambda { .. })
+        && let read = source.ty.read_view()
+        && let Type::Fun {
+            name: Some(position),
+            codomain,
+            ..
+        } = read.peel_refinements()
+        && crate::ccl::subst::codomain_depends_on(position, codomain)
+        && crate::ccl::subst::type_free_vars(&step.ty).contains(position)
+    {
+        errors.push(LocatedInferError {
+            error: InferError::Unsupported(
+                "a `for` loop over a collection whose rows depend on their position, such as a \
+                 feed keyed by the loops that fed it, is not compiled yet; a comprehension over \
+                 it is"
+                    .to_string(),
+            ),
+            node_id: expr.node_id(),
+            also: Box::default(),
+            related: RelatedPositions::default(),
+        });
+        check_scope_valid_go(source, scope, witnesses, errors);
+        return;
     }
     // The binders are the ones `for_each_scoped_item` states for every node, so a node that
     // introduces one is checked under it without this walk restating which nodes bind. A
@@ -2024,14 +2073,23 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // Reading resolved inputs remains applicable after specialization has
             // freshened the emit-time variables. Peel outer refinements to expose
             // the preceding function without removing codomain refinements.
+            //
+            // The preceding codomain is opened at its own binder, the name the morphisms
+            // after it read its position by (`src/ccl/design/type-inference.md`, "A chain
+            // names each position").
+            let position = match (expr.ty.peel_refinements(), elts.first()) {
+                (Type::Fun { name: Some(k), .. }, _) => Some(k.clone()),
+                (_, Some(head)) => match head.ty.peel_refinements() {
+                    Type::Fun { name, .. } => name.clone(),
+                    _ => None,
+                },
+                _ => None,
+            };
             for i in 1..elts.len() {
-                let Type::Fun {
-                    codomain: prev_cod, ..
-                } = elts[i - 1].ty.peel_refinements()
-                else {
+                let Some(prev_cod) = elts[i - 1].ty.peel_refinements().codomain() else {
                     continue;
                 };
-                let prev_cod = prev_cod.as_ref().clone();
+                let prev_cod = crate::ccl::subst::open_codomain(&elts[i - 1].ty, &prev_cod);
                 specialize_projection_domain(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
@@ -2042,26 +2100,34 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                         ..
                     },
                     Type::Fun {
-                        name: last_name,
+                        name: _last_name,
                         codomain: last_cod,
                         ..
                     },
                 ) = (first.ty.peel_refinements(), last.ty.peel_refinements())
             {
-                // Keep a dependent *final* morphism's Pi binder on the rebuilt
-                // chain type, mirroring `emit_compose`: the chain's codomain is
-                // the final codomain, which may reference that binder, and the
-                // dependent-application discharge dispatches on the name —
-                // rebuilding with a bare function type would silently drop the
-                // dependence.
-                expr.ty = Type::Fun {
-                    name: last_name.clone(),
-                    // FunKind is the first morphism's (mirrors `emit_compose`): a
-                    // chain over a data source is a data collection.
-                    fun_kind: first_kind.clone(),
-                    domain: Box::new((**first_dom).clone()),
-                    codomain: Box::new((**last_cod).clone()),
-                };
+                // The chain's type by the rule for chains, as `emit_compose` types it
+                // ([`crate::ccl::ccl_utils::chain_type_of`]): a last morphism whose codomain
+                // reads its own binder is read at each position, or keeps its binder where the
+                // prefix maps each position to itself. Rebuilt with a bare function type, the
+                // codomain's reference to that binder would be left with none.
+                expr.ty = crate::ccl::ccl_utils::chain_type_of(
+                    elts,
+                    Type::Fun {
+                        // The chain's own input binder where a morphism's type reads it,
+                        // which keeps the name those types were written with; otherwise
+                        // none, and the rule names the input
+                        // (`ccl_utils::chain_input_binder`).
+                        name: position
+                            .clone()
+                            .filter(|k| elts.iter().any(|e| crate::ccl::ccl_utils::is_free(k, e))),
+                        // FunKind is the first morphism's (mirrors `emit_compose`): a
+                        // chain over a data source is a data collection.
+                        fun_kind: first_kind.clone(),
+                        domain: Box::new((**first_dom).clone()),
+                        codomain: Box::new((**last_cod).clone()),
+                    },
+                );
             }
         }
         TypedExprNode::Record(fs) => {
@@ -2304,7 +2370,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             {
                 let sigma = crate::ccl::subst::Subst::discharge(
                     &binding.name,
-                    bound_expr.clone_preserving_ids(),
+                    crate::ccl::ccl_utils::predicate_term(bound_expr),
                 );
                 Some(sigma.apply_type(&body.ty))
             } else {
@@ -2812,10 +2878,7 @@ fn coalesce_type_predicates_go(
         Type::Variant(tags, _) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
-        Type::History { value, domain, .. } => {
-            coalesce_type_predicates_go(value, level, ctx, scope);
-            coalesce_type_predicates_go(domain, level, ctx, scope);
-        }
+        Type::History { function, .. } => coalesce_type_predicates_go(function, level, ctx, scope),
         // A barrier var survives coalescing only in a slot whose
         // resolution failed, as an `Infer` does, and
         // `resolve_binder_slot` has already reported that failure.
@@ -3729,10 +3792,17 @@ fn typecheck_discarded_definition(
 /// too.
 pub(super) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
-        && let Some(cod) = morphism.ty.codomain()
+        && let Type::Fun { name, codomain, .. } = morphism.ty.peel_refinements()
     {
-        // A projection is non-dependent, so the rebuilt function type keeps `name: None`.
-        morphism.ty = Type::fun(read_through(input), cod);
+        // Only the domain is recovered. A projection out of a dependent tuple binds the
+        // tuple, and its codomain reads it (`src/ccl/design/type-inference.md`,
+        // "Projection"), so the binder and the stored codomain stay as they are.
+        morphism.ty = Type::Fun {
+            name: name.clone(),
+            fun_kind: crate::ccl::FunKind::Compute,
+            domain: Box::new(read_through(input)),
+            codomain: codomain.clone(),
+        };
     }
 }
 

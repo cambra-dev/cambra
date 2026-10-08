@@ -883,7 +883,8 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
             occurrences(domain, at.compose(domain_variance), f);
             occurrences(codomain, at, f);
         }
-        Type::History { value, domain, .. } => {
+        Type::History { .. } => {
+            let (domain, value, _) = ty.history_parts().expect("matched a history");
             occurrences(value, Variance::Invariant, f);
             occurrences(domain, Variance::Invariant, f);
         }
@@ -988,12 +989,7 @@ mod tests {
                 BinOpKind::Compare(CompareKind::Greater),
                 Expr::lit(Lit::Int(0)),
             );
-            Type::refined_one(
-                int(),
-                Refinement {
-                    predicate: Rc::new(predicate),
-                },
-            )
+            Type::refined_one(int(), Refinement::born(Rc::new(predicate)))
         };
         let instance = |argument: Type| {
             decl.substituted(&mut |arg| {

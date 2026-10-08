@@ -2451,9 +2451,7 @@ mod tests {
                 fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Refinement(
                     Box::new(Type::Base(BaseType::Int)),
-                    RefinementSet::one(Refinement {
-                        predicate: Rc::new(pred()),
-                    }),
+                    RefinementSet::one(Refinement::born(Rc::new(pred()))),
                 )),
                 codomain: Box::new(Type::Base(BaseType::Int)),
             },
@@ -2512,9 +2510,7 @@ mod tests {
                     fun_kind: FunKind::Compute,
                     domain: Box::new(Type::Refinement(
                         Box::new(Type::Base(BaseType::Int)),
-                        RefinementSet::one(Refinement {
-                            predicate: Rc::new(pred),
-                        }),
+                        RefinementSet::one(Refinement::born(Rc::new(pred))),
                     )),
                     codomain: Box::new(Type::Base(BaseType::Int)),
                 },

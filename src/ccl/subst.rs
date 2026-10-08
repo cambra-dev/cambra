@@ -87,7 +87,7 @@
 //! ```
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
@@ -103,8 +103,7 @@ use crate::ccl::{Branch, Name, PredicateId, Type, TypedBinding, TypedExpr, Typed
 pub type Binder = Name;
 
 /// A single mapping target: a **rename** to another binder (invertible) or a
-/// **discharge** to a term (one-way), held built or **deferred**: a discharge whose later
-/// substitution is not yet applied.
+/// **discharge** to a term (one-way).
 ///
 /// The variant is the morphism's *species*, assigned at construction —
 /// provenance, not target shape reconstructed by inspecting terms. This is
@@ -131,19 +130,34 @@ pub enum Mapping {
     /// from, and `TypedExpr`'s `Clone` freshens, so a copy-on-write would freshen at every
     /// visit.
     Discharge(Rc<TypedExpr>),
-    /// `binder ↦ σ(term)`, with `σ` not yet applied: a discharge composed with a later
-    /// substitution ([`Subst::then`]). Applying `σ` into the term at composition copies
-    /// every definiens it reaches into it, and a chain of `let`s whose definientia read the
-    /// binders before them, each twice, doubles the term at every link. Deferred, the term
-    /// and `σ` are shared, and the composite is built only where an occurrence is filled.
-    Deferred(Rc<TypedExpr>, Rc<Subst>),
     /// `binder ↦` the join over every value the binder takes. A type leaving the
     /// binder's scope this way keeps what holds for every value: a refinement naming the
     /// binder is dropped where it states a value, and where it states a collection's
     /// domain there is no join (`src/ccl/design/type-inference.md`, "A contribution
-    /// crosses the binders after its target"). It has no term, so the term walks leave
-    /// an occurrence in place and the decision is made per refinement.
-    Join,
+    /// crosses the binders after its target"). Term walks leave an occurrence in place, and
+    /// the decision is made per refinement.
+    ///
+    /// The term, where there is one, is the binder's value at the target's key: a loop
+    /// variable a feed crosses is `𝑘 ▷ source` at the channel's key `𝑘`. A collection's
+    /// domain naming the binder then has an answer, the domain with the binder discharged to
+    /// that term ([`Subst::in_data_domain`]); a value's refinement is still dropped
+    /// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
+    Join(Option<Rc<TypedExpr>>),
+    /// The entry a substitution held, a discharge or a rename, whose term has no spelling at
+    /// this position: it reads an enclosing refinement's element, and the position is under a nested refinement, which
+    /// binds `__elem` to its own element ([`Subst::under_element`]). Acting on an occurrence
+    /// fails; an entry acting on nothing is no capture.
+    ///
+    /// The entry rides a suspension like any other ([`Subst::suspended`]), so a variable
+    /// whose resolution reads the binder fails when it is forced, and one whose resolution
+    /// does not is left alone.
+    ///
+    /// TODO: let a refinement name an enclosing refinement's element, with element
+    /// references indexed by the refinements crossed as `Name::PiBound` indexes function
+    /// binders. The term then reads the enclosing element one level out and this species
+    /// goes away. Every reader of `__elem` — substitution, the SMT encoding, predicate
+    /// compilation, and the closing and opening walks — would read the index.
+    Unspellable(Box<Mapping>),
 }
 
 /// What a substitution does to a **witness** binder — the witness-sort counterpart of
@@ -183,9 +197,18 @@ fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
 }
 
 impl Mapping {
+    /// Whether the term this mapping puts at its binder reads the enclosing refinement's
+    /// element.
+    fn reads_elem(&self) -> bool {
+        match self {
+            Mapping::Discharge(t) => is_free(&Name::elem(), t),
+            Mapping::Rename(to) => to.is_elem(),
+            Mapping::Join(_) | Mapping::Unspellable(_) => false,
+        }
+    }
+
     /// The variable this mapping sends its binder to, when it sends it to a bare variable:
-    /// a rename's target, or a discharge whose term is a variable. A deferred discharge is
-    /// read without building its term: a variable under `σ` is wherever `σ` sends it.
+    /// a rename's target, or a discharge whose term is a variable.
     fn var_target(&self) -> Option<Binder> {
         match self {
             Mapping::Rename(to) => Some(to.clone()),
@@ -193,46 +216,29 @@ impl Mapping {
                 TypedExprNode::Var(n) => Some(n.clone()),
                 _ => None,
             },
-            Mapping::Deferred(t, under) => match &t.node {
-                TypedExprNode::Var(n) => match under.binders.get(n) {
-                    None => Some(n.clone()),
-                    Some(m) => m.var_target(),
-                },
-                _ => None,
-            },
-            Mapping::Join => None,
-        }
-    }
-
-    /// The term a discharge replaces its binder with, built where it is deferred.
-    fn discharged_term(&self) -> Cow<'_, TypedExpr> {
-        match self {
-            Mapping::Discharge(t) => Cow::Borrowed(t),
-            Mapping::Deferred(t, under) => Cow::Owned(under.apply_expr(t)),
-            Mapping::Rename(_) => unreachable!("a rename discharges nothing"),
-            Mapping::Join => unreachable!("a joined binder has no term"),
+            Mapping::Join(_) | Mapping::Unspellable(_) => None,
         }
     }
 
     /// Materialize a replacement with ordinary fresh expression IDs.
     /// Rename retains the occurrence type; Discharge clones the template's type
-    /// and value, and Deferred the template's under its later substitution. The
-    /// typedness assertion applies to every result.
+    /// and value. The typedness assertion applies to every result.
     fn as_expr(&self, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // A renamed occurrence retains its type, including inside predicates.
             Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone(),
-            Mapping::Deferred(t, under) => under.apply_expr(t),
-            Mapping::Join => unreachable!("a joined binder has no term; its occurrence stays"),
+            Mapping::Join(_) => {
+                unreachable!("a joined binder has no term; its occurrence stays")
+            }
+            Mapping::Unspellable(m) => unspellable(m),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
     }
 
     /// Materialize at the replaced occurrence's root ID. Rename constructs directly
-    /// at that ID; Discharge uses clone_at and freshens the interior, and Deferred roots
-    /// the term it builds there.
+    /// at that ID; Discharge uses clone_at and freshens the interior.
     /// The root therefore retains use-site attribution without an unused root mint.
     fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
@@ -240,12 +246,30 @@ impl Mapping {
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => t.clone_at(node_id),
-            Mapping::Deferred(t, under) => under.apply_expr(t).rooted_at(node_id),
-            Mapping::Join => unreachable!("a joined binder has no term; its occurrence stays"),
+            Mapping::Join(_) => {
+                unreachable!("a joined binder has no term; its occurrence stays")
+            }
+            Mapping::Unspellable(m) => unspellable(m),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
     }
+}
+
+/// The failure of acting on an [`Mapping::Unspellable`] entry.
+fn unspellable(entry: &Mapping) -> ! {
+    let term = match entry {
+        Mapping::Rename(to) => to.to_string(),
+        Mapping::Discharge(t) => crate::ccl::symbolic::symbolic(t),
+        Mapping::Join(_) | Mapping::Unspellable(_) => {
+            unreachable!("only a discharge or a rename is made unspellable")
+        }
+    };
+    panic!(
+        "a substitution reaches a binder under a nested refinement, and the term it puts there, \
+         `{term}`, reads the enclosing refinement's element, which has no spelling under a \
+         refinement that binds `__elem` to its own element (see `Mapping::Unspellable`)"
+    )
 }
 
 /// `domain`, taken from a `Compose`'s head, spelled in the **composition's own**
@@ -450,7 +474,17 @@ impl Subst {
         let binder = binder.into();
         debug_assert_no_pi_bound(&binder);
         let mut m = BTreeMap::new();
-        m.insert(binder, Mapping::Join);
+        m.insert(binder, Mapping::Join(None));
+        Subst::of_binders(m)
+    }
+
+    /// `[binder ↦ join]` where the target's key determines the binder as `at_key`
+    /// ([`Mapping::Join`]).
+    pub fn join_at_key(binder: impl Into<Name>, at_key: TypedExpr) -> Self {
+        let binder = binder.into();
+        debug_assert_no_pi_bound(&binder);
+        let mut m = BTreeMap::new();
+        m.insert(binder, Mapping::Join(Some(Rc::new(at_key))));
         Subst::of_binders(m)
     }
 
@@ -458,14 +492,33 @@ impl Subst {
     pub fn joins_in(&self, e: &TypedExpr) -> bool {
         self.binders
             .iter()
-            .any(|(k, m)| matches!(m, Mapping::Join) && is_free(k, e))
+            .any(|(k, m)| matches!(m, Mapping::Join(_)) && is_free(k, e))
     }
 
-    /// The binders this substitution joins over that occur free in `e`.
+    /// Whether a binder this substitution joins over with no term at the key occurs free
+    /// in `e`.
+    pub fn joins_unkeyed_in(&self, e: &TypedExpr) -> bool {
+        self.binders
+            .iter()
+            .any(|(k, m)| matches!(m, Mapping::Join(None)) && is_free(k, e))
+    }
+
+    /// The binders this substitution joins over that occur free in `e`, with or without a term
+    /// at the key: the ones a position other than a collection's domain has no answer for.
+    pub fn joined_over_in(&self, e: &TypedExpr) -> Vec<Name> {
+        self.binders
+            .iter()
+            .filter(|(k, m)| matches!(m, Mapping::Join(_)) && is_free(k, e))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// The binders this substitution joins over with no term at the key that occur free in
+    /// `e`: the ones a collection's domain naming them has no answer for.
     pub fn joined_in(&self, e: &TypedExpr) -> Vec<Name> {
         self.binders
             .iter()
-            .filter(|(k, m)| matches!(m, Mapping::Join) && is_free(k, e))
+            .filter(|(k, m)| matches!(m, Mapping::Join(None)) && is_free(k, e))
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -476,18 +529,24 @@ impl Subst {
         self.shadow(&Name::elem()).joins_in(&r.predicate)
     }
 
+    /// Whether `r`'s predicate names a binder this substitution joins over with no term at
+    /// the key, other than the refinement's own element.
+    pub fn joins_unkeyed_refinement(&self, r: &crate::ccl::Refinement) -> bool {
+        self.shadow(&Name::elem()).joins_unkeyed_in(&r.predicate)
+    }
+
     /// This substitution without its [`Mapping::Join`] entries: what applies inside a
     /// position where a joined binder's refinement is kept for the caller to report
     /// rather than dropped.
     pub fn without_joins(&self) -> Cow<'_, Subst> {
-        if !self.binders.values().any(|m| matches!(m, Mapping::Join)) {
+        if !self.binders.values().any(|m| matches!(m, Mapping::Join(_))) {
             return Cow::Borrowed(self);
         }
         Cow::Owned(Subst {
             binders: self
                 .binders
                 .iter()
-                .filter(|(_, m)| !matches!(m, Mapping::Join))
+                .filter(|(_, m)| !matches!(m, Mapping::Join(_)))
                 .map(|(k, m)| (k.clone(), m.clone()))
                 .collect(),
             witnesses: self.witnesses.clone(),
@@ -498,8 +557,97 @@ impl Subst {
     pub fn renamed(&self, binder: &Name) -> Option<&Binder> {
         match self.binders.get(binder)? {
             Mapping::Rename(to) => Some(to),
-            Mapping::Discharge(_) | Mapping::Deferred(..) | Mapping::Join => None,
+            Mapping::Discharge(_) | Mapping::Join(_) | Mapping::Unspellable(_) => None,
         }
+    }
+
+    /// This substitution as it acts on a collection's domain, where a join has no answer: a
+    /// joined binder with a term at the key is discharged to it, and one without is left in
+    /// place for compaction to report ([`Mapping::Join`]).
+    pub fn in_data_domain(&self) -> Cow<'_, Subst> {
+        if !self.binders.values().any(|m| matches!(m, Mapping::Join(_))) {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter_map(|(k, m)| match m {
+                    Mapping::Join(None) => None,
+                    Mapping::Join(Some(t)) => Some((k.clone(), Mapping::Discharge(Rc::clone(t)))),
+                    other => Some((k.clone(), other.clone())),
+                })
+                .collect(),
+            witnesses: self.witnesses.clone(),
+        })
+    }
+
+    /// How a term `t` naming a binder this substitution joins over leaves its scope: joined
+    /// with no term where `t` names one with none, and otherwise joined with `t` read at the
+    /// key.
+    fn join_through(&self, t: &TypedExpr) -> Mapping {
+        if self.joins_unkeyed_in(t) {
+            Mapping::Join(None)
+        } else {
+            Mapping::Join(Some(Rc::new(self.in_data_domain().apply_expr(t))))
+        }
+    }
+
+    /// `𝛼[σ]` for this substitution `σ` and the variable `𝛼`, which `σ` cannot compute while
+    /// `𝛼` is unresolved: a variable carrying `𝛼` under `σ` as its lower and upper bound, so
+    /// compaction applies `σ` to whatever `𝛼` resolves to (`src/ccl/design/type-inference.md`,
+    /// "A substitution reaching a variable suspends on it"). `𝛼` itself where `σ`'s domain
+    /// names no binder in `𝛼`'s telescope: `𝛼` resolves to types naming its telescope's
+    /// binders and nothing else. A witness mapping always suspends, since a telescope does not
+    /// list the witnesses a variable's content may name.
+    fn suspended(&self, v: &Rc<crate::ccl::infer_var::InferVar>) -> Type {
+        let acts =
+            !self.witnesses.is_empty() || self.binders.keys().any(|b| v.telescope.contains(b));
+        if !acts {
+            return Type::Infer(Rc::clone(v));
+        }
+        if let Some((_, held)) = v.suspensions.borrow().iter().find(|(s, _)| s == self) {
+            return Type::Infer(Rc::clone(held));
+        }
+        let reads: Vec<Name> = self
+            .binders
+            .values()
+            .flat_map(|m| match m {
+                Mapping::Rename(to) => vec![to.clone()],
+                Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
+                    crate::ccl::ccl_utils::free_names(t).into_iter().collect()
+                }
+                Mapping::Unspellable(m) => match &**m {
+                    Mapping::Rename(to) => vec![to.clone()],
+                    Mapping::Discharge(t) => {
+                        crate::ccl::ccl_utils::free_names(t).into_iter().collect()
+                    }
+                    Mapping::Join(_) | Mapping::Unspellable(_) => Vec::new(),
+                },
+                Mapping::Join(None) => Vec::new(),
+            })
+            .filter(|n| n.pi_bound_index().is_none() && !n.is_elem())
+            .collect();
+        let telescope = v
+            .telescope
+            .rescoped(|n| self.binders.contains_key(n), reads);
+        let held = crate::ccl::infer_var::InferVar::fresh_over(
+            v.level(),
+            &telescope,
+            Rc::clone(&v.fun_kind),
+        );
+        v.suspensions
+            .borrow_mut()
+            .push((self.clone(), Rc::clone(&held)));
+        let bound = crate::ccl::Bound::suspended_on(v, self.clone());
+        crate::ccl::infer_var::enforce_bound_scope(&held, "lower", &bound);
+        crate::ccl::infer_var::enforce_bound_scope(&held, "upper", &bound);
+        {
+            let mut bounds = held.bounds.borrow_mut();
+            bounds.lower_mut().push(bound.clone());
+            bounds.upper_mut().push(bound);
+        }
+        Type::Infer(held)
     }
 
     /// The binders this substitution acts on (its source domain).
@@ -531,7 +679,8 @@ impl Subst {
     }
 
     /// The names `names` become under this substitution: a renamed binder its target, a
-    /// discharged one the free names of its term, and any other itself. What a
+    /// discharged one the free names of its term, a joined one itself and the free names of
+    /// its term at the key, and any other itself. What a
     /// substitution applied *after* this one can act on, of a term whose free names are
     /// `names`.
     pub fn image_of(&self, names: &BTreeSet<Binder>) -> BTreeSet<Binder> {
@@ -542,9 +691,14 @@ impl Subst {
                     out.insert(to.clone());
                 }
                 Some(Mapping::Discharge(t)) => out.extend(expr_free_vars(t)),
-                Some(Mapping::Deferred(t, under)) => out.extend(under.image_of(&expr_free_vars(t))),
-                // A joined binder's occurrence stays.
-                Some(Mapping::Join) | None => {
+                // A joined binder's occurrence stays, and in a collection's domain a keyed
+                // join reads its term at the key instead ([`Self::in_data_domain`]).
+                Some(Mapping::Join(Some(t))) => {
+                    out.insert(n.clone());
+                    out.extend(expr_free_vars(t));
+                }
+                // An unspellable binder fails where it is reached.
+                Some(Mapping::Join(None) | Mapping::Unspellable(_)) | None => {
                     out.insert(n.clone());
                 }
             }
@@ -552,29 +706,22 @@ impl Subst {
         out
     }
 
-    /// Visit each discharge mapping's captured term mutably (renames have no
-    /// term). For specialization freshening: a suspended discharge's term was
-    /// captured at emit with the definition's inference variables in its type
-    /// slots, and a freshened clone must rename those alongside every other
-    /// slot it copies — see `solver::scheme::freshen_subst_payloads`, called from
-    /// `freshen_above`'s bound-copying arm. Each payload visited gets a new `Rc`
-    /// ([`Mapping::Discharge`] says why).
+    /// Visit each captured term mutably: a discharge's, and a keyed join's (renames and an
+    /// unkeyed join have none). For specialization freshening: a suspended discharge's term
+    /// was captured at emit with the definition's inference variables and channel domains in
+    /// its type slots, and a freshened clone must rename those alongside every other slot it
+    /// copies — see `solver::scheme::freshen_subst_payloads`, called from `freshen_above`'s
+    /// bound-copying arm. Each payload visited gets a new `Rc` ([`Mapping::Discharge`] says
+    /// why).
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.binders.values_mut() {
             match m {
-                Mapping::Discharge(t) => {
+                Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
                     let mut term = t.clone_preserving_ids();
                     f(&mut term);
                     *t = Rc::new(term);
                 }
-                Mapping::Deferred(t, under) => {
-                    let mut term = t.clone_preserving_ids();
-                    f(&mut term);
-                    let mut composed = (**under).clone();
-                    composed.for_each_discharge_term_mut(f);
-                    *m = Mapping::Deferred(Rc::new(term), Rc::new(composed));
-                }
-                Mapping::Rename(_) | Mapping::Join => {}
+                Mapping::Rename(_) | Mapping::Join(None) | Mapping::Unspellable(_) => {}
             }
         }
     }
@@ -627,23 +774,51 @@ impl Subst {
                                 crate::ccl::eq_term_modulo_ty_slots(a, b)
                             }
                             (Mapping::Rename(_), _) | (_, Mapping::Rename(_)) => false,
-                            (Mapping::Join, Mapping::Join) => true,
-                            (Mapping::Join, _) | (_, Mapping::Join) => false,
-                            (Mapping::Deferred(a, ua), Mapping::Deferred(b, ub))
-                                if crate::ccl::eq_term_modulo_ty_slots(a, b)
-                                    && (Rc::ptr_eq(ua, ub) || ua.eq_modulo_ty_slots(ub)) =>
-                            {
-                                true
-                            }
-                            // A deferred discharge denotes the term it builds, and one
-                            // built eagerly, or deferred at another split, is the same
-                            // mapping where the terms agree.
-                            _ => crate::ccl::eq_term_modulo_ty_slots(
-                                &va.discharged_term(),
-                                &vb.discharged_term(),
-                            ),
+                            (Mapping::Join(a), Mapping::Join(b)) => match (a, b) {
+                                (None, None) => true,
+                                (Some(a), Some(b)) => crate::ccl::eq_term_modulo_ty_slots(a, b),
+                                _ => false,
+                            },
+                            (Mapping::Join(_), _) | (_, Mapping::Join(_)) => false,
+                            (Mapping::Unspellable(_), _) | (_, Mapping::Unspellable(_)) => false,
                         }
                 })
+    }
+
+    /// Whether `t` reads, free, a binder this substitution has no spelling for: one whose entry
+    /// is unspellable, or, inside a refinement `t` carries, one whose term reads the enclosing
+    /// refinement's element, which has no spelling there ([`Self::under_element`]). A variable
+    /// in `t` that may read one is not a read: the entry suspends on it.
+    fn unspellable_in(&self, t: &TypedExpr) -> bool {
+        if self
+            .binders
+            .iter()
+            .any(|(k, m)| matches!(m, Mapping::Unspellable(_)) && is_free(k, t))
+        {
+            return true;
+        }
+        let reading: Vec<&Binder> = self
+            .binders
+            .iter()
+            .filter(|(_, m)| m.reads_elem())
+            .map(|(k, _)| k)
+            .collect();
+        !reading.is_empty() && refinement_reads_any(t, &reading, &mut HashSet::new())
+    }
+
+    /// This substitution inside a refinement's predicate, where `__elem` is that
+    /// refinement's own element: the element is shadowed, and an entry whose term reads the
+    /// enclosing element has no spelling there ([`Mapping::Unspellable`]). A join puts no
+    /// term at an occurrence, so it stays.
+    fn under_element(&self) -> Subst {
+        let mut out = self.shadow(&Name::elem());
+        for m in out.binders.values_mut() {
+            if m.reads_elem() {
+                let entry = std::mem::replace(m, Mapping::Join(None));
+                *m = Mapping::Unspellable(Box::new(entry));
+            }
+        }
+        out
     }
 
     /// True if any binder of `self`'s *range* (the replacement terms) contains a
@@ -652,8 +827,11 @@ impl Subst {
         self.binders.values().any(|m| match m {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
-            Mapping::Deferred(t, under) => under.image_of(&expr_free_vars(t)).contains(name),
-            Mapping::Join => false,
+            Mapping::Join(at_key) => at_key.as_ref().is_some_and(|t| is_free(name, t)),
+            Mapping::Unspellable(m) => {
+                Subst::of_binders(BTreeMap::from([(name.clone(), (**m).clone())]))
+                    .range_mentions(name)
+            }
         })
     }
 
@@ -673,25 +851,6 @@ impl Subst {
                 .collect(),
             witnesses: BTreeMap::new(),
         }
-    }
-
-    /// The part of this substitution that acts on a term whose free names are `names`: its
-    /// entries for those names, and its witness mappings. `None` when that part is the
-    /// identity, so the term is its own image.
-    fn acting_on(&self, names: &BTreeSet<Binder>) -> Option<Subst> {
-        let binders: BTreeMap<Binder, Mapping> = self
-            .binders
-            .iter()
-            .filter(|(k, _)| names.contains(*k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if binders.is_empty() && self.witnesses.is_empty() {
-            return None;
-        }
-        Some(Subst {
-            binders,
-            witnesses: self.witnesses.clone(),
-        })
     }
 
     /// Compose two morphisms: `then(a, b)` is "apply `a`, then `b`" — the
@@ -735,24 +894,20 @@ impl Subst {
                     None => Mapping::Rename(to.clone()),
                 },
                 // A definition naming a binder `b` joins over is itself joined over: it
-                // takes a value per value of that binder.
-                Some(Mapping::Discharge(t)) if b.joins_in(t) => Mapping::Join,
-                Some(Mapping::Discharge(t)) => match b.acting_on(&expr_free_vars(t)) {
-                    None => Mapping::Discharge(Rc::clone(t)),
-                    Some(under) => Mapping::Deferred(Rc::clone(t), Rc::new(under)),
-                },
-                Some(Mapping::Deferred(t, under)) => {
-                    let composed = Subst::then(under, b);
-                    if composed.joins_in(t) {
-                        Mapping::Join
-                    } else {
-                        match composed.acting_on(&expr_free_vars(t)) {
-                            None => Mapping::Discharge(Rc::clone(t)),
-                            Some(composed) => Mapping::Deferred(Rc::clone(t), Rc::new(composed)),
-                        }
-                    }
+                // takes a value per value of that binder. Where the key determines every
+                // binder it names, so does the key determine it, at its definition read at
+                // the key.
+                Some(Mapping::Discharge(t)) if b.joins_in(t) => b.join_through(t),
+                // A definition reading a binder `b` has no spelling for has none either, and
+                // fails where an occurrence of `k` is reached rather than here, where
+                // nothing has read it yet.
+                Some(Mapping::Discharge(t)) if b.unspellable_in(t) => {
+                    Mapping::Unspellable(Box::new(Mapping::Discharge(Rc::clone(t))))
                 }
-                Some(Mapping::Join) => Mapping::Join,
+                Some(Mapping::Discharge(t)) => Mapping::Discharge(Rc::new(b.apply_expr(t))),
+                Some(Mapping::Unspellable(m)) => Mapping::Unspellable(m.clone()),
+                Some(Mapping::Join(None)) => Mapping::Join(None),
+                Some(Mapping::Join(Some(t))) => b.join_through(t),
                 None => match b.binders.get(&k) {
                     Some(mb) => mb.clone(),
                     None => continue,
@@ -763,8 +918,7 @@ impl Subst {
             let is_identity = match &composed {
                 Mapping::Rename(to) => *to == k,
                 Mapping::Discharge(t) => is_var_named(t, &k),
-                Mapping::Deferred(..) => composed.var_target().is_some_and(|n| n == k),
-                Mapping::Join => false,
+                Mapping::Join(_) | Mapping::Unspellable(_) => false,
             };
             if !is_identity {
                 m.insert(k, composed);
@@ -838,11 +992,11 @@ impl Subst {
             .iter()
             .map(|(k, v)| {
                 let v = match v {
-                    Mapping::Discharge(_) | Mapping::Deferred(..) => match v.var_target() {
+                    Mapping::Discharge(_) => match v.var_target() {
                         Some(n) => Mapping::Rename(n),
                         None => v.clone(),
                     },
-                    Mapping::Rename(_) | Mapping::Join => v.clone(),
+                    Mapping::Rename(_) | Mapping::Join(_) | Mapping::Unspellable(_) => v.clone(),
                 };
                 (k.clone(), v)
             })
@@ -921,7 +1075,7 @@ impl Subst {
             );
             return e.clone();
         }
-        self.apply_expr_inner(e)
+        with_transport_memo(|| self.apply_expr_inner(e))
     }
 
     /// Whether this substitution acts on `e` — the guard both vacuity short-circuits ask.
@@ -931,14 +1085,80 @@ impl Subst {
     /// witness rename has no term half at all. Asking only the binders answers "vacuous"
     /// for a pure α-conversion, which is how a predicate keeps a spelling of an index its
     /// own base has since renamed.
+    ///
+    /// An unresolved variable in one of `e`'s type slots is a place it acts too, where it would
+    /// suspend on the variable ([`Self::suspended`]): what the variable resolves to may name a
+    /// binder no free-name walk can see yet.
     fn acts_on(&self, e: &TypedExpr) -> bool {
         if self.binders.keys().any(|k| is_free(k, e)) {
             return true;
         }
-        !self.witnesses.is_empty() && {
+        if !self.witnesses.is_empty() && {
             let named = crate::ccl::ccl_utils::free_witnesses(e);
             self.witnesses.keys().any(|w| named.contains(w))
+        } {
+            return true;
         }
+        self.suspends_in_expr(e)
+    }
+
+    /// Whether a type slot at or below `e`, a predicate's own slots included, holds a variable
+    /// this substitution suspends on ([`Self::suspended`]).
+    fn suspends_in_expr(&self, e: &TypedExpr) -> bool {
+        self.suspends_in_expr_visiting(e, &mut HashSet::new())
+    }
+
+    /// Whether `ty` holds a variable this substitution suspends on, at any depth, the
+    /// predicates its refinements carry included.
+    fn suspends_in_type(&self, ty: &Type) -> bool {
+        self.suspends_in_type_visiting(ty, &mut HashSet::new())
+    }
+
+    // Each predicate is visited once per scan: a predicate shared across type slots, as
+    // nested dependent types share their inner levels' predicates, is one term, and a walk
+    // that re-entered it at every occurrence would be exponential in the nesting.
+    fn suspends_in_expr_visiting(&self, e: &TypedExpr, visited: &mut HashSet<PredicateId>) -> bool {
+        let mut found = false;
+        e.walk_type_slots(|t| found |= !found && self.suspends_in_type_visiting(t, visited));
+        e.walk_children(|c| found |= !found && self.suspends_in_expr_visiting(c, visited));
+        found
+    }
+
+    fn suspends_in_type_visiting(&self, ty: &Type, visited: &mut HashSet<PredicateId>) -> bool {
+        match ty {
+            Type::Infer(v) => self.suspends_on(v),
+            _ => {
+                ty.refinements().iter().any(|r| {
+                    visited.insert(r.predicate_id())
+                        && self.suspends_in_expr_visiting(&r.predicate, visited)
+                }) || {
+                    let mut found = false;
+                    ty.walk_children(|c| {
+                        found |= !found && self.suspends_in_type_visiting(c, visited);
+                    });
+                    found
+                }
+            }
+        }
+    }
+
+    /// This substitution with only the binder entries that act on `ty`: a binder free there, or
+    /// one an unresolved variable there may resolve to read. The witness half is kept whole.
+    /// An entry acting on nothing in `ty` puts nothing there, so it captures nothing there,
+    /// as [`Self::under_binder`] states for a term.
+    fn acting_on_type(&self, ty: &Type) -> Subst {
+        let free = type_free_vars(ty);
+        let mut out = self.clone();
+        out.binders.retain(|k, m| {
+            free.contains(k)
+                || Subst::of_binders(BTreeMap::from([(k.clone(), m.clone())])).suspends_in_type(ty)
+        });
+        out
+    }
+
+    /// Whether this substitution acts on what `v` may resolve to ([`Self::suspended`]).
+    fn suspends_on(&self, v: &crate::ccl::infer_var::InferVar) -> bool {
+        !self.witnesses.is_empty() || self.binders.keys().any(|b| v.telescope.contains(b))
     }
 
     fn apply_expr_inner(&self, e: &TypedExpr) -> TypedExpr {
@@ -958,7 +1178,7 @@ impl Subst {
             Var(n) => match self.binders.get(n) {
                 // The replacement carries its own type/annotation, so return it
                 // wholesale rather than rebuilding `e`.
-                Some(repl) if !matches!(repl, Mapping::Join) => return repl.as_expr(&e.ty),
+                Some(repl) if !matches!(repl, Mapping::Join(_)) => return repl.as_expr(&e.ty),
                 _ => Var(n.clone()),
             },
 
@@ -1136,7 +1356,10 @@ impl Subst {
     /// the in-place mode visit every name occurrence in the tree without a
     /// [`Name`] clone per node.
     fn retarget(&self, name: &Name) -> Option<Name> {
-        self.binders.get(name)?.var_target()
+        match self.binders.get(name)? {
+            Mapping::Unspellable(m) => unspellable(m),
+            m => m.var_target(),
+        }
     }
 
     /// The handle-rename half of [`Self::apply_handle_use`], shared with the
@@ -1234,7 +1457,7 @@ impl Subst {
         // carry the substituted binder in a refinement predicate.
         if let TypedExprNode::Var(n) = &e.node
             && let Some(repl) = self.binders.get(n)
-            && !matches!(repl, Mapping::Join)
+            && !matches!(repl, Mapping::Join(_))
         {
             // Root-carry: the replacement ROOT is built at the occurrence's own
             // id — a *preserve*, so the root inherits the occurrence's
@@ -1307,11 +1530,15 @@ impl Subst {
         // compute function `⇒` and drops a dependent binder, on every `Compose` a
         // live substitution happens to reach
         // (`src/ccl/design/type-inference.md`, "4.6 Data vs compute functions").
+        //
+        // A last morphism whose codomain reads its own binder is read at each position, by
+        // the rule for chains ([`crate::ccl::ccl_utils::chain_type_of`]).
         if let TypedExprNode::Compose(elts) = &e.node
             && let (Some(first), Some(last)) = (elts.first(), elts.last())
             && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
         {
-            e.ty = Type::fun_like(&e.ty, at_own_witnesses(d, &e.ty, &first.ty), c);
+            let stated = Type::fun_like(&e.ty, at_own_witnesses(d, &e.ty, &first.ty), c);
+            e.ty = crate::ccl::ccl_utils::chain_type_of(elts, stated);
         }
     }
 
@@ -1328,11 +1555,6 @@ impl Subst {
     }
 
     fn rewrite_type_go(&self, ty: &mut Type, memo: &PredMemo<Subst>) {
-        if let Type::Refinement(_, refinements) = ty {
-            refinements
-                .iter()
-                .for_each(|r| self.assert_no_element_capture(r));
-        }
         match ty {
             Type::BoundedHole(t) => self.rewrite_type_go(t, memo),
             Type::Base(_)
@@ -1347,8 +1569,8 @@ impl Subst {
             // A type parameter names no term binder; its bound is a child of the
             // `Poly` that declares it, reached by the arm below.
             | Type::Param(_)
-            | Type::BarrierVar(_)
-            | Type::Infer(_) => {}
+            | Type::BarrierVar(_) => {}
+            Type::Infer(v) => *ty = self.suspended(v),
             Type::Poly(poly) => Rc::make_mut(poly)
                 .types_mut()
                 .for_each(|t| self.rewrite_type_go(t, memo)),
@@ -1362,10 +1584,7 @@ impl Subst {
             // A transient history handle (an `Overwrite` erased by the unified phase,
             // a `Feed` by `channelize`): rewrite both children in place. Renaming
             // does not cross the kind — the value and domain are ordinary types.
-            Type::History { value, domain, .. } => {
-                self.rewrite_type_go(value, memo);
-                self.rewrite_type_go(domain, memo);
-            }
+            Type::History { function, .. } => self.rewrite_type_go(function, memo),
 
             Type::Fun {
                 name: None,
@@ -1403,8 +1622,9 @@ impl Subst {
 
             Type::Refinement(base, refinements) => {
                 // The refinement implicitly binds REFINEMENT_BINDER in its bare
-                // predicate, so the substitution acts *under* that binder.
-                let restricted = self.shadow(&Name::elem());
+                // predicate, so the substitution acts *under* that binder
+                // ([`Self::under_element`]).
+                let restricted = self.under_element();
                 // `restricted` is the memo's context: an entry is reused only for
                 // an occurrence under the *same* active substitution, so a rebuild
                 // made outside a scope that shadows a substituted binder is never
@@ -1413,8 +1633,8 @@ impl Subst {
                 // memo across binder crossings correct — see `PredMemo`.
                 refinements.rewrite_each(|_, r| {
                     memo.rebuild(r, &restricted, |pred| {
-                        if !restricted.binders.keys().any(|k| is_free(k, pred)) {
-                            // Vacuous: no substituted binder occurs free here, so report
+                        if !restricted.acts_on(pred) {
+                            // Vacuous: the substitution acts on nothing here, so report
                             // no change and keep the origin `Rc` — a predicate this
                             // substitution merely walks past stays shared with its other
                             // occurrences (mirroring `force_refinement`'s transport
@@ -1486,35 +1706,6 @@ impl Subst {
         restricted
     }
 
-    /// Refuse a rewrite of `r` that would capture: the substitution acts on `r`'s predicate
-    /// and a term it puts there reads [`Name::elem`], which inside `r` is `r`'s own element.
-    ///
-    /// Lifting a filter onto a pair is the substitution whose terms read the element —
-    /// `𝑥 ↦ __elem.0`, the pair's element being the outer `__elem` — and a refinement nested
-    /// in that predicate's subterm types binds `__elem` again. A nested refinement cannot
-    /// name an enclosing refinement's element, so the rewrite has no spelling, and both
-    /// silent answers are wrong: the captured term reads the nested element, and dropping
-    /// the refinement deletes a filter where it sits on a collection's domain. A lift that
-    /// can remove what would be captured does so before it substitutes
-    /// (`lambda_elim`'s nested-lambda rule removes a dependent tuple's restated component
-    /// facts).
-    ///
-    /// TODO: the general fix is to let a refinement name an enclosing refinement's element,
-    /// with element references indexed by the refinements crossed as `Name::PiBound`
-    /// indexes function binders, so the lift writes the enclosing element and nothing is
-    /// removed. Every reader of `__elem` — substitution, the SMT encoding, predicate
-    /// compilation, and the closing and opening walks — would read the index.
-    fn assert_no_element_capture(&self, r: &crate::ccl::Refinement) {
-        let restricted = self.shadow(&Name::elem());
-        assert!(
-            !(restricted.range_mentions(&Name::elem()) && restricted.acts_on(&r.predicate)),
-            "a substitution whose terms read `__elem` reaches a nested refinement it acts on, \
-             `{}`: the rewrite would capture the nested element, and no spelling names the \
-             enclosing one",
-            crate::ccl::symbolic::symbolic(&r.predicate),
-        );
-    }
-
     /// Rewrite a refinement's predicate by this substitution. A no-op clone
     /// under the identity.
     ///
@@ -1529,25 +1720,65 @@ impl Subst {
         if self.is_id() {
             return r.clone();
         }
+        with_transport_memo(|| self.force_refinement_scoped(r))
+    }
+
+    fn force_refinement_scoped(&self, r: &crate::ccl::Refinement) -> crate::ccl::Refinement {
         // The refinement is a binding form for the implicit REFINEMENT_BINDER,
         // so the substitution acts *under* that binder: shadow it (drop it from
         // the domain) before rewriting the predicate. Unlike an ordinary binder
         // it is never α-renamed — every refinement shares the one global name,
-        // and a predicate only ever references its *own* element through it. A
-        // substitution whose terms read the element would capture here, which the
-        // type walks refuse before reaching this ([`Self::assert_no_element_capture`]).
+        // and a predicate only ever references its *own* element through it. An
+        // entry whose term reads the element has no spelling here
+        // ([`Self::under_element`]).
         // A joined binder has no term to put in the predicate: a caller that reaches here
         // with a refinement naming one is keeping it ([`Mapping::Join`]).
-        let restricted = self.without_joins().shadow(&Name::elem());
+        let restricted = self.without_joins().under_element();
         // Vacuous (no substituted binder occurs free anywhere in the
         // predicate — value or nested type slots): keep the original
         // refinement, *sharing its predicate `Rc`*. The shared `Rc` is what
         // keeps a vacuously-transported refinement pointer-equal to its
         // source, so the `PartialEq` fast path and any downstream identity
         // dedup still see one predicate.
-        if !restricted.acts_on(&r.predicate) {
-            return r.clone();
+        //
+        // One application shares one answer per predicate, as the in-place mode's `PredMemo`
+        // does: every occurrence of a shared predicate reached under the same substitution is
+        // the same term once rewritten, and the same one kept where the substitution is
+        // vacuous, so neither the rewrite nor the scan deciding vacuity repeats per occurrence
+        // ([`with_transport_memo`]).
+        if let Some(answer) = transport_memo_get(&r.predicate, &restricted) {
+            return answer;
         }
+        let answer = if restricted.acts_on(&r.predicate) {
+            let rewritten = restricted.force_acting_refinement(r);
+            // Scope-validity (design §6.2): a discharged binder must not survive
+            // in the rewritten predicate — once `[x ↦ arg]` fires, no free `x`
+            // may remain, or a downstream pass would observe a dangling
+            // reference. (Only `Discharge` entries are checked: a rename
+            // legitimately *introduces* its target.) In a correct implementation
+            // this never fires; it is the per-rewrite regression guard for
+            // substitution-descent bugs, backing the end-of-inference
+            // `check_scope_valid` debug walk.
+            #[cfg(debug_assertions)]
+            for (b, m) in &self.binders {
+                if matches!(m, Mapping::Discharge(_)) {
+                    debug_assert!(
+                        !is_free(b, &rewritten.predicate),
+                        "discharged binder `{b}` still free after substitution into predicate",
+                    );
+                }
+            }
+            rewritten
+        } else {
+            r.clone()
+        };
+        transport_memo_put(&r.predicate, restricted, &answer);
+        answer
+    }
+
+    /// [`Self::force_refinement`]'s rewrite of a refinement this substitution, already under
+    /// the element binder, acts on.
+    fn force_acting_refinement(&self, r: &crate::ccl::Refinement) -> crate::ccl::Refinement {
         // A refinement predicate is a *denotational* term, so a substituted
         // value must not drag a term-tree `iterate` planning marker into it
         // (the §6.2 move-site discharge of a `let`-bound, iterate-marked
@@ -1569,25 +1800,9 @@ impl Subst {
                 "subst.force_refinement",
                 crate::ccl::provenance::Nature::Machinery,
             );
-            strip_iterate_markers(&restricted.apply_expr(&r.predicate))
+            strip_iterate_markers(&self.apply_expr(&r.predicate))
         };
-        // Scope-validity (design §6.2): a discharged binder must not survive
-        // in the rewritten predicate — once `[x ↦ arg]` fires, no free `x`
-        // may remain, or a downstream pass would observe a dangling
-        // reference. (Only `Discharge` entries are checked: a rename
-        // legitimately *introduces* its target.) In a correct implementation
-        // this never fires; it is the per-rewrite regression guard for
-        // substitution-descent bugs, backing the end-of-inference
-        // `check_scope_valid` debug walk.
-        #[cfg(debug_assertions)]
-        for (b, m) in &self.binders {
-            if matches!(m, Mapping::Discharge(_) | Mapping::Deferred(..)) {
-                debug_assert!(
-                    !is_free(b, &new_pred),
-                    "discharged binder `{b}` still free after substitution into predicate",
-                );
-            }
-        }
+
         // A substituted predicate is a genuinely new term (the transport mode
         // builds rather than rewrites), so `born` is the right spelling; the
         // vacuous case returned above kept the source's `Rc` instead.
@@ -1658,7 +1873,7 @@ impl Subst {
         if self.is_id() {
             return ty.clone();
         }
-        self.apply_type_inner(ty)
+        with_transport_memo(|| self.apply_type_inner(ty))
     }
 
     fn apply_type_inner(&self, ty: &Type) -> Type {
@@ -1671,8 +1886,8 @@ impl Subst {
             | Type::Hole
             | Type::SharedHole(_)
             | Type::Param(_)
-            | Type::BarrierVar(_)
-            | Type::Infer(_) => ty.clone(),
+            | Type::BarrierVar(_) => ty.clone(),
+            Type::Infer(v) => self.suspended(v),
             Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(|t| self.apply_type_inner(t)))),
 
             // **A witness reference crosses a scope change here.** The reference names the
@@ -1727,16 +1942,13 @@ impl Subst {
                     refinements
                         .iter()
                         // A refinement naming a joined binder is dropped, which is the join at
-                        // positive polarity: a data domain or a kind's candidate applies
-                        // `without_joins` and never reaches this. This walk has no polarity, so
-                        // it drops one in a compute function's domain as well; compaction,
-                        // the one reader that materializes a joined edge, reports that one
-                        // instead (`JoinedPosition::Parameter`).
+                        // positive polarity: a data domain applies `in_data_domain` and a
+                        // kind's candidate `without_joins`, and neither reaches this. This walk
+                        // has no polarity, so it drops one in a compute function's domain as
+                        // well; compaction, the one reader that materializes a joined edge,
+                        // reports that one instead (`JoinedPosition::Parameter`).
                         .filter(|r| !self.joins_refinement(r))
-                        .map(|r| {
-                            self.assert_no_element_capture(r);
-                            self.force_refinement(r)
-                        })
+                        .map(|r| self.force_refinement(r))
                         .collect(),
                 )
             }
@@ -1773,14 +1985,9 @@ impl Subst {
                 *openness,
             ),
             Type::History {
-                value,
-                domain,
+                function,
                 history_kind,
-            } => Type::history(
-                self.apply_type(domain),
-                self.apply_type(value),
-                *history_kind,
-            ),
+            } => Type::history_over(self.apply_type(function), *history_kind),
         }
     }
 
@@ -1814,7 +2021,8 @@ impl Subst {
                             _ => w.clone(),
                         };
                         // A candidate is a domain the sum may take, so a joined binder's
-                        // refinement on it is kept, as in a data domain.
+                        // refinement on it is kept naming the binder, for compaction to widen
+                        // the candidate.
                         w.map_types(|t| self.without_joins().apply_type(t))
                     })
                     .collect();
@@ -1825,11 +2033,12 @@ impl Subst {
     }
 
     /// Apply this substitution to a function's `domain`. A data function's domain is its
-    /// data, so a refinement there naming a joined binder has no join: it is kept, naming
-    /// the binder, for compaction to report ([`Mapping::Join`]).
+    /// data, so a refinement there naming a joined binder has no join: it names the binder's
+    /// term at the key where there is one, and is kept naming the binder, for compaction to
+    /// report, where there is none ([`Subst::in_data_domain`]).
     pub fn apply_domain(&self, fun_kind: &crate::ccl::ty::FunKind, domain: &Type) -> Type {
         if fun_kind.has_data_domain() {
-            self.without_joins().apply_type(domain)
+            self.in_data_domain().apply_type(domain)
         } else {
             self.apply_type(domain)
         }
@@ -1839,7 +2048,7 @@ impl Subst {
     /// shadow the Pi binder in `codomain`. Capture is asserted unreachable
     /// for the same reason (see `under_binder`).
     fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> Type {
-        let restricted = self.shadow(binder);
+        let restricted = self.shadow(binder).acting_on_type(codomain);
         restricted.assert_no_capture(binder);
         restricted.apply_type(codomain)
     }
@@ -1877,6 +2086,55 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
 ///
 /// The refinement binds [`Name::elem`] over its base, so `__elem` is bound, not
 /// free, inside the predicate.
+/// Whether an inference variable occurs in one of `e`'s type slots, at any depth, the
+/// predicates their refinements carry included.
+pub(crate) fn holds_infer_var(e: &TypedExpr) -> bool {
+    fn in_expr(e: &TypedExpr, visited: &mut HashSet<PredicateId>) -> bool {
+        let mut found = false;
+        e.walk_type_slots(|t| found |= !found && in_type(t, visited));
+        e.walk_children(|c| found |= !found && in_expr(c, visited));
+        found
+    }
+    fn in_type(ty: &Type, visited: &mut HashSet<PredicateId>) -> bool {
+        match ty {
+            Type::Infer(_) => true,
+            _ => {
+                ty.refinements()
+                    .iter()
+                    .any(|r| visited.insert(r.predicate_id()) && in_expr(&r.predicate, visited))
+                    || {
+                        let mut found = false;
+                        ty.walk_children(|c| found |= !found && in_type(c, visited));
+                        found
+                    }
+            }
+        }
+    }
+    in_expr(e, &mut HashSet::new())
+}
+
+/// Whether a refinement predicate in one of `e`'s type slots, at any depth, names one of
+/// `names` free. Each predicate is read once.
+fn refinement_reads_any(
+    e: &TypedExpr,
+    names: &[&Binder],
+    visited: &mut HashSet<PredicateId>,
+) -> bool {
+    fn in_type(ty: &Type, names: &[&Binder], visited: &mut HashSet<PredicateId>) -> bool {
+        ty.refinements().iter().any(|r| {
+            visited.insert(r.predicate_id()) && names.iter().any(|n| is_free(n, &r.predicate))
+        }) || {
+            let mut found = false;
+            ty.walk_children(|c| found |= !found && in_type(c, names, visited));
+            found
+        }
+    }
+    let mut found = false;
+    e.walk_type_slots(|t| found |= !found && in_type(t, names, visited));
+    e.walk_children(|c| found |= !found && refinement_reads_any(c, names, visited));
+    found
+}
+
 pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
     let mut out = BTreeSet::new();
     let mut bound = BTreeSet::new();
@@ -2026,10 +2284,7 @@ fn collect_type_fv(
         Type::Variant(tags, _) => tags
             .iter()
             .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
-        Type::History { value, domain, .. } => {
-            collect_type_fv(value, bound, visited, out);
-            collect_type_fv(domain, bound, visited, out);
-        }
+        Type::History { function, .. } => collect_type_fv(function, bound, visited, out),
     }
 }
 
@@ -2331,25 +2586,38 @@ pub fn open_tuple_components(
 /// for its input `𝑎`. A bare reference to `binder` stays. The rewrite a pass performs where
 /// it removes the binder of a pairing's value, so nothing reads that binder after it.
 pub fn rewrite_pairing_projections(binder: &Name, components: &[TypedExpr], ty: &mut Type) {
-    fn in_type(ty: &mut Type, binder: &Name, components: &[TypedExpr]) {
-        if let Type::Refinement(_, refinements) = ty {
-            refinements.rewrite_each(|_, r| {
-                let _g = crate::ccl::provenance::enter(
-                    r.predicate.node_id(),
-                    "predicate.pairing",
-                    crate::ccl::provenance::Nature::Machinery,
-                );
-                let mut pred = (*r.predicate).clone();
-                if in_expr(&mut pred, binder, components) {
-                    *r = crate::ccl::Refinement::born(Rc::new(pred));
-                }
-            });
-        }
-        ty.walk_children_mut(|c| in_type(c, binder, components));
+    rewrite_pairing_projections_memo(binder, components, ty, &PredMemo::new());
+}
+
+/// [`rewrite_pairing_projections`] through `memo`, so a predicate shared across the types a
+/// caller rewrites for one `binder` and `components` is rebuilt once and stays shared. The
+/// memo is good for that one rewrite only: its entries are keyed by predicate alone.
+pub fn rewrite_pairing_projections_memo(
+    binder: &Name,
+    components: &[TypedExpr],
+    ty: &mut Type,
+    memo: &PredMemo<()>,
+) {
+    fn in_type(
+        ty: &mut Type,
+        binder: &Name,
+        components: &[TypedExpr],
+        memo: &PredMemo<()>,
+    ) -> bool {
+        crate::ccl::ccl_utils::walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+            in_expr(pred, binder, components, memo)
+        })
     }
     // Top-down, so a component standing where `binder.𝑘` stood is not read again as
-    // a projection out of the binder.
-    fn in_expr(e: &mut TypedExpr, binder: &Name, components: &[TypedExpr]) -> bool {
+    // a projection out of the binder. Changes are reported as they are made, not found by
+    // comparing a type with its old self: type equality reads predicates in normal form,
+    // which does not see a rewrite inside a cast's target.
+    fn in_expr(
+        e: &mut TypedExpr,
+        binder: &Name,
+        components: &[TypedExpr],
+        memo: &PredMemo<()>,
+    ) -> bool {
         if let TypedExprNode::Apply { argument, function } = &e.node
             && is_var_named(argument, binder)
             && let TypedExprNode::Proj(crate::ccl::ProjKey::Index(k)) = function.node
@@ -2359,15 +2627,11 @@ pub fn rewrite_pairing_projections(binder: &Name, components: &[TypedExpr], ty: 
             return true;
         }
         let mut changed = false;
-        e.walk_type_slots_mut(|t| {
-            let before = t.clone();
-            in_type(t, binder, components);
-            changed |= *t != before;
-        });
-        e.walk_children_mut(|c| changed |= in_expr(c, binder, components));
+        e.walk_type_slots_mut(|t| changed |= in_type(t, binder, components, memo));
+        e.walk_children_mut(|c| changed |= in_expr(c, binder, components, memo));
         changed
     }
-    in_type(ty, binder, components);
+    in_type(ty, binder, components, memo);
 }
 
 /// `codomain` opened at `binder`, the function it was read off binding that name.
@@ -2406,6 +2670,113 @@ pub fn open_codomain(morphism: &Type, codomain: &Type) -> Type {
     }
 }
 
+/// A conversion [`PiWalk`] performs, as a pass-scoped memo keys it: the enclosing functions a
+/// close converts, or the name an opening renames to. An opening that discharges a term has
+/// no key, since its target is a term rather than a name.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ConversionKey {
+    Close(Vec<Option<Name>>),
+    Rename(Name),
+}
+
+/// The conversions of every [`PiWalk`] a pass runs, keyed by the predicate's allocation, the
+/// conversion, the depth and the relevant shadow ([`PiWalk::shadow_key`]). A conversion is a
+/// function of those, so occurrences that shared one predicate leave sharing one conversion
+/// however many walks reach them (`src/ccl/design/type-inference.md`, "Sharing is an
+/// invariant, not an optimization detail"). Each entry keeps its origin alive, so the
+/// allocation it is keyed by is not reused while the memo stands.
+#[derive(Default)]
+struct ConversionMemo {
+    entries: HashMap<ConversionEntryKey, (Rc<TypedExpr>, Rc<TypedExpr>)>,
+}
+
+/// A [`ConversionMemo`] entry's key: the predicate's allocation, the conversion, the depth,
+/// and the relevant shadow. The entry holds the origin, kept alive, and its conversion.
+type ConversionEntryKey = (PredicateId, ConversionKey, u32, Vec<Name>);
+
+thread_local! {
+    static CONVERSION_MEMO: std::cell::RefCell<Option<ConversionMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The predicates one transport application has rewritten, so every occurrence of a shared
+/// predicate reached under the same substitution takes one rewritten term
+/// ([`with_transport_memo`]). Keyed by the predicate's allocation; each entry keeps its origin
+/// alive, so the allocation is not reused while the memo stands.
+#[derive(Default)]
+struct TransportMemo {
+    entries: HashMap<PredicateId, Vec<(Rc<TypedExpr>, Subst, crate::ccl::Refinement)>>,
+}
+
+thread_local! {
+    static TRANSPORT_MEMO: std::cell::RefCell<Option<TransportMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, a transport application ([`Subst::apply_type`], [`Subst::apply_expr`],
+/// [`Subst::force_refinement`]), with one memo for the predicates it rewrites, or under the
+/// memo an enclosing application already opened. The in-place mode threads a [`PredMemo`]
+/// through its walk for the same reason: a predicate shared across the type slots of the term
+/// being substituted stays shared in the result (`src/ccl/design/type-inference.md`, "Sharing
+/// is an invariant, not an optimization detail").
+fn with_transport_memo<R>(f: impl FnOnce() -> R) -> R {
+    if TRANSPORT_MEMO.with(|m| m.borrow().is_some()) {
+        return f();
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            TRANSPORT_MEMO.with(|m| m.borrow_mut().take());
+        }
+    }
+    TRANSPORT_MEMO.with(|m| *m.borrow_mut() = Some(TransportMemo::default()));
+    let _clear = Clear;
+    f()
+}
+
+/// The rewrite of `predicate` under `subst` an earlier occurrence in this application made.
+fn transport_memo_get(predicate: &Rc<TypedExpr>, subst: &Subst) -> Option<crate::ccl::Refinement> {
+    TRANSPORT_MEMO.with(|m| {
+        let memo = m.borrow();
+        memo.as_ref()?
+            .entries
+            .get(&Rc::as_ptr(predicate))?
+            .iter()
+            .find(|(_, s, _)| s == subst)
+            .map(|(_, _, r)| r.clone())
+    })
+}
+
+/// Record `rewritten` as `predicate`'s rewrite under `subst` for this application.
+fn transport_memo_put(predicate: &Rc<TypedExpr>, subst: Subst, rewritten: &crate::ccl::Refinement) {
+    TRANSPORT_MEMO.with(|m| {
+        if let Some(memo) = m.borrow_mut().as_mut() {
+            memo.entries
+                .entry(Rc::as_ptr(predicate))
+                .or_default()
+                .push((Rc::clone(predicate), subst, rewritten.clone()));
+        }
+    });
+}
+
+/// Run `f` with one memo for the binder conversions it performs ([`ConversionMemo`]), or
+/// under the memo already standing. A pass that builds many types over the same predicates,
+/// lambda elimination say, wraps its run in this.
+pub(crate) fn with_conversion_memo<R>(f: impl FnOnce() -> R) -> R {
+    if CONVERSION_MEMO.with(|m| m.borrow().is_some()) {
+        return f();
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            CONVERSION_MEMO.with(|m| m.borrow_mut().take());
+        }
+    }
+    CONVERSION_MEMO.with(|m| *m.borrow_mut() = Some(ConversionMemo::default()));
+    let _clear = Clear;
+    f()
+}
+
 /// Which conversion a [`PiWalk`] performs.
 enum PiMode<'a> {
     /// `Var(n)` where `n` names an enclosing function becomes `Var(PiBound(k))`,
@@ -2433,10 +2804,10 @@ struct PiWalk<'a> {
     changed: usize,
     /// Predicate terms already rewritten at a given depth, so occurrences
     /// that entered sharing one `Rc` leave sharing one `Rc`. Keyed by depth
-    /// too: one term reachable at two depths is two different rewrites.
-    /// Consulted only while [`shadowed`](Self::shadowed) is empty, since a
-    /// shadow changes what the same term at the same depth converts to.
-    memo: HashMap<(PredicateId, u32), Rc<TypedExpr>>,
+    /// too: one term reachable at two depths is two different rewrites. Keyed
+    /// by the shadow that can change the result as well ([`Self::shadow_key`]),
+    /// so that a predicate shared under many binders converts once.
+    memo: HashMap<(PredicateId, u32, Vec<Name>), Rc<TypedExpr>>,
     /// Term binders a predicate's interior introduces, innermost last. A
     /// reference to one of these is bound by the predicate's own lambda, not
     /// by an enclosing function, so closing leaves it alone
@@ -2476,14 +2847,20 @@ impl<'a> PiWalk<'a> {
             Type::BoundedHole(t) => self.ty(t, depth),
             Type::Fun {
                 name,
+                fun_kind,
                 domain,
                 codomain,
-                ..
             } => {
                 // A binder scopes over its codomain only: the domain stays at
                 // the enclosing depth, the codomain is one crossing deeper. A name
                 // reference beneath it to its own spelling is its own, so closing
-                // leaves it to that binder.
+                // leaves it to that binder. A sum's candidates are alternatives for the
+                // domain, so they stand where it does.
+                for w in fun_kind.witnesses_mut() {
+                    for t in w.types_mut() {
+                        self.ty(t, depth);
+                    }
+                }
                 self.ty(domain, depth);
                 let base = self.shadowed.len();
                 if let Some(b) = name {
@@ -2515,23 +2892,55 @@ impl<'a> PiWalk<'a> {
             }
             Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::Variant(tags, _) => tags.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
-            Type::History { value, domain, .. } => {
-                self.ty(value, depth);
-                self.ty(domain, depth);
-            }
+            Type::History { function, .. } => self.ty(function, depth),
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => {}
         }
     }
 
+    /// The part of [`Self::shadowed`] that can change what a term converts to. Opening and
+    /// lowering rewrite indices, which no name shadows, so no shadow does. Closing leaves a
+    /// reference to a shadowed name alone, which matters only where that name is one of
+    /// the enclosing functions being closed.
+    fn shadow_key(&self) -> Vec<Name> {
+        match &self.mode {
+            PiMode::Open(_) | PiMode::Lower(_) => Vec::new(),
+            PiMode::Close(enclosing) => self
+                .shadowed
+                .iter()
+                .filter(|n| enclosing.iter().any(|f| f.as_ref() == Some(*n)))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// This walk's conversion as a [`ConversionMemo`] keys it.
+    fn conversion_key(&self) -> Option<ConversionKey> {
+        match &self.mode {
+            PiMode::Close(enclosing) => Some(ConversionKey::Close(enclosing.to_vec())),
+            PiMode::Open(Mapping::Rename(n)) => Some(ConversionKey::Rename(n.clone())),
+            PiMode::Open(_) | PiMode::Lower(_) => None,
+        }
+    }
+
     fn refinement(&mut self, r: &mut crate::ccl::Refinement, depth: u32) {
-        // A shadow makes the conversion depend on more than the term and the
-        // depth, so the memo is bypassed under one. It costs a re-walk of a
-        // predicate a shadowing lambda encloses and keeps the key two fields.
-        let key = (r.predicate_id(), depth);
-        let memoizable = self.shadowed.is_empty();
-        if memoizable && let Some(done) = self.memo.get(&key) {
+        let shadow = self.shadow_key();
+        let pass_key = self
+            .conversion_key()
+            .map(|c| (r.predicate_id(), c, depth, shadow.clone()));
+        let key = (r.predicate_id(), depth, shadow);
+        let from_pass = pass_key.as_ref().and_then(|k| {
+            CONVERSION_MEMO.with(|m| {
+                m.borrow()
+                    .as_ref()
+                    .and_then(|memo| memo.entries.get(k).map(|(_, done)| Rc::clone(done)))
+            })
+        });
+        if let Some(done) = from_pass {
+            self.memo.insert(key.clone(), Rc::clone(&done));
+        }
+        if let Some(done) = self.memo.get(&key) {
             if !Rc::ptr_eq(done, &r.predicate) {
                 *r = crate::ccl::Refinement::sharing(done);
                 // A memo hit is a rewrite, and an enclosing predicate's walk reads
@@ -2555,6 +2964,7 @@ impl<'a> PiWalk<'a> {
         // `PredMemo::rebuild` uses for its deriving branch. Without the guard the
         // fresh ids are minted with nothing recording, and surface as dangling
         // parents once a later recorded rewrite names the converted root.
+        let r_origin = Rc::clone(&r.predicate);
         let (pred, before) = {
             let _g = crate::ccl::provenance::enter(
                 r.predicate.node_id(),
@@ -2575,9 +2985,15 @@ impl<'a> PiWalk<'a> {
         } else {
             Rc::clone(&r.predicate)
         };
-        if memoizable {
-            self.memo.insert(key, done);
+        if let Some(k) = pass_key {
+            let origin = Rc::clone(&r_origin);
+            CONVERSION_MEMO.with(|m| {
+                if let Some(memo) = m.borrow_mut().as_mut() {
+                    memo.entries.insert(k, (origin, Rc::clone(&done)));
+                }
+            });
         }
+        self.memo.insert(key, done);
     }
 
     fn expr(&mut self, e: &mut TypedExpr, depth: u32) {
@@ -2691,9 +3107,17 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             Type::Poly(poly) => poly.types().any(|t| ty_scan(t, depth, within, visited)),
             Type::BoundedHole(t) => ty_scan(t, depth, within, visited),
             Type::Fun {
-                domain, codomain, ..
+                fun_kind,
+                domain,
+                codomain,
+                ..
             } => {
-                ty_scan(domain, depth, within, visited)
+                // A sum's candidates stand where its domain does ([`PiWalk`]).
+                fun_kind
+                    .witnesses()
+                    .iter()
+                    .any(|w| w.types().iter().any(|t| ty_scan(t, depth, within, visited)))
+                    || ty_scan(domain, depth, within, visited)
                     || ty_scan(codomain, depth + 1, within, visited)
             }
             // Keyed by depth as well as by predicate: the answer depends on
@@ -2718,9 +3142,7 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             }
             Type::Record(fs) => fs.iter().any(|(_, t)| ty_scan(t, depth, within, visited)),
             Type::Variant(tags, _) => tags.iter().any(|(_, t)| ty_scan(t, depth, within, visited)),
-            Type::History { value, domain, .. } => {
-                ty_scan(value, depth, within, visited) || ty_scan(domain, depth, within, visited)
-            }
+            Type::History { function, .. } => ty_scan(function, depth, within, visited),
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => false,
@@ -2933,44 +3355,6 @@ mod tests {
         assert_eq!(abc.apply_expr(&var("k")), int(5));
     }
 
-    /// Composing a discharge with a later one that acts on its term keeps the term and the
-    /// later substitution side by side, and builds their composite where it is read.
-    #[test]
-    fn a_composed_discharge_is_built_where_it_is_read() {
-        let pair = |n: &str| TypedExpr::tuple(vec![var(n), var(n)]);
-        let composed = Subst::then(
-            &Subst::discharge("c2", pair("c1")),
-            &Subst::discharge("c1", pair("c0")),
-        );
-        assert!(matches!(
-            composed.binders.get(&Name::from("c2")),
-            Some(Mapping::Deferred(..))
-        ));
-        assert_eq!(
-            composed.apply_expr(&var("c2")),
-            TypedExpr::tuple(vec![pair("c0"), pair("c0")])
-        );
-        // It is the mapping a discharge of the built term is.
-        let built = Subst::then(
-            &Subst::discharge("c2", TypedExpr::tuple(vec![pair("c0"), pair("c0")])),
-            &Subst::discharge("c1", pair("c0")),
-        );
-        assert!(composed.eq_modulo_ty_slots(&built));
-        assert!(built.eq_modulo_ty_slots(&composed));
-        // A later substitution that does not act on the term leaves it a plain discharge.
-        let untouched = Subst::then(
-            &Subst::discharge("c2", pair("c1")),
-            &Subst::discharge("other", int(1)),
-        );
-        assert!(matches!(
-            untouched.binders.get(&Name::from("c2")),
-            Some(Mapping::Discharge(_))
-        ));
-    }
-
-    /// A copy of a substitution shares its discharge payloads: the solver copies
-    /// substitutions at every bound it reads, and a payload grows with the `let`s nested
-    /// around it.
     #[test]
     fn a_copied_substitution_shares_its_payloads() {
         let sigma = Subst::discharge("x", TypedExpr::tuple(vec![int(1), int(2)]));
@@ -2982,6 +3366,74 @@ mod tests {
             panic!("a discharge stays a discharge when copied");
         };
         assert!(Rc::ptr_eq(a, b));
+    }
+
+    /// Composition is associative across the mappings a contribution's exits mix: a `let`
+    /// discharged, a loop joined at the key, a `let` whose definition reads the loop, and a
+    /// binder joined with no term. Inference composes the exits outermost first
+    /// (`InferCtx::exits`) and relies on this to mean the same substitution as innermost
+    /// first.
+    #[test]
+    fn exits_compose_the_same_from_either_end() {
+        let plus = |l, r| {
+            TypedExpr::binop(
+                l,
+                BinOpKind::Arithmetic(crate::ccl::ops::ArithmeticKind::Add),
+                r,
+            )
+        };
+        // Innermost first, as a contribution crosses them.
+        let exits = [
+            Subst::discharge("a", plus(var("b"), int(1))),
+            Subst::join_at_key("x", TypedExpr::apply(var("key"), var("src"))),
+            Subst::discharge("b", plus(var("x"), int(2))),
+            Subst::join("y"),
+        ];
+        let inner_first = exits
+            .iter()
+            .fold(Subst::id(), |acc, e| Subst::then(&acc, e));
+        let outer_first = exits
+            .iter()
+            .rev()
+            .fold(Subst::id(), |acc, e| Subst::then(e, &acc));
+        assert_eq!(inner_first, outer_first);
+        let pred = gt(var("a"), plus(var("x"), var("y")));
+        assert_eq!(inner_first.apply_expr(&pred), outer_first.apply_expr(&pred));
+    }
+
+    /// A projection out of a pairing's binder read only in a cast nested inside another cast's
+    /// type is rewritten too. Type equality reads a predicate in normal form, which reads
+    /// through a cast, so a rewrite judged by comparing the outer cast's type with its old self
+    /// finds it unchanged and keeps the read of the binder.
+    #[test]
+    fn a_pairing_projection_in_a_nested_cast_type_is_rewritten() {
+        let key = Name::from("key");
+        let int_ty = || Type::Base(crate::ccl::BaseType::Int);
+        let elem_is = |rhs: TypedExpr| {
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(Name::elem()),
+                BinOpKind::Compare(CompareKind::Equals),
+                rhs,
+            )))
+        };
+        // `cast(xs)` over a domain refined by `refinement`, typed as inference leaves a cast:
+        // its own type is the target.
+        let cast_over = |refinement: Refinement| {
+            let target =
+                Type::data_fun(Type::refined_one(Type::UIntRange(3), refinement), int_ty());
+            crate::ccl::ccl_utils::make_cast(var("xs"), target.clone()).with_ty(target)
+        };
+        let inner = cast_over(elem_is(TypedExpr::apply(
+            var("key"),
+            TypedExpr::proj_index(1),
+        )));
+        let outer = cast_over(elem_is(TypedExpr::apply(int(0), inner)));
+        let mut ty = Type::refined_one(int_ty(), elem_is(TypedExpr::apply(int(0), outer)));
+        assert!(type_free_vars(&ty).contains(&key));
+        rewrite_pairing_projections(&key, &[var("a"), var("b")], &mut ty);
+        let free = type_free_vars(&ty);
+        assert!(!free.contains(&key), "{ty}");
+        assert!(free.contains(&Name::from("b")), "{ty}");
     }
 
     // The identity substitution is a perfect structural no-op.
@@ -3264,19 +3716,30 @@ mod tests {
     /// substitution recomputes them — but its `FunKind` and Pi binder are not,
     /// and rebuilding with `Type::fun` would answer `Compute`/`None` for both.
     /// A data collection `⤇` must survive a discharge that reaches it, or
-    /// op-conversion dispatches on a downgraded domain.
+    /// op-conversion dispatches on a downgraded domain. The binder here is one the
+    /// composition's morphisms read, the input they are typed under
+    /// (`src/ccl/design/type-inference.md`, "A chain names each position").
     #[test]
     fn a_compose_keeps_its_fun_kind_and_binder_across_a_discharge() {
         let int_ty = Type::Base(crate::ccl::BaseType::Int);
         let fun_ty = Type::data_fun(int_ty.clone(), int_ty.clone());
+        let n = Name::raw("n");
+        let at_n = Type::refined_one(
+            int_ty.clone(),
+            Refinement::born(Rc::new(TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(int_ty.clone()),
+                BinOpKind::Compare(CompareKind::Equals),
+                TypedExpr::var(n.clone()).with_ty(int_ty.clone()),
+            ))),
+        );
 
-        // (f ≫ g) : Int ⤇ Int, with `f` the substituted occurrence.
+        // (f ≫ g) : (n: Int) ⇒ {Int | __elem == n}, with `f` the substituted occurrence and
+        // `g`'s type reading the composition's input `n`.
         let mut compose = TypedExpr::compose(vec![
             var("f").with_ty(fun_ty.clone()),
-            var("g").with_ty(fun_ty.clone()),
+            var("g").with_ty(Type::data_fun(int_ty.clone(), at_n.clone())),
         ]);
-        compose.ty = Type::pi("n", int_ty.clone(), int_ty.clone());
-        // A Pi function type whose ends the elements will recompute; the binder must stay.
+        compose.ty = Type::pi(n, int_ty.clone(), at_n);
         let replacement = var("h").with_ty(fun_ty);
         let env: HashMap<Name, TypedExpr> = HashMap::from([(Name::raw("f"), replacement)]);
 
@@ -3953,14 +4416,26 @@ mod locally_nameless_tests {
         );
     }
 
-    /// A substitution whose terms read `__elem`, reaching a nested refinement it acts on,
-    /// fails rather than capture the nested element.
+    /// A substitution whose terms read `__elem`, reaching an occurrence of its binder inside
+    /// a nested refinement, fails rather than capture the nested element
+    /// ([`Mapping::Unspellable`]).
     #[test]
-    #[should_panic(expected = "would capture the nested element")]
+    #[should_panic(expected = "reads the enclosing refinement's element")]
     fn a_substitution_reading_the_element_does_not_capture() {
         let x = Name::fresh("x");
         let lifted = TypedExpr::apply(TypedExpr::var(Name::elem()), TypedExpr::proj_index(0));
         Subst::discharge(x.clone(), lifted).apply_type(&refined(TypedExpr::var(x)));
+    }
+
+    /// The same substitution passes a nested refinement that does not read its binder: an
+    /// entry with no spelling there acts on nothing there.
+    #[test]
+    fn a_substitution_reading_the_element_passes_a_refinement_it_does_not_act_on() {
+        let x = Name::fresh("x");
+        let y = Name::fresh("y");
+        let lifted = TypedExpr::apply(TypedExpr::var(Name::elem()), TypedExpr::proj_index(0));
+        let ty = refined(TypedExpr::var(y));
+        assert_eq!(Subst::discharge(x, lifted).apply_type(&ty), ty);
     }
 
     /// Two α-variant codomains close to structurally identical types — the

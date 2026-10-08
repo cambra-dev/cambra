@@ -1044,7 +1044,7 @@ for p in [1,2,3]:
     o << x
 x
         "#},
-        "open bound recorded",
+        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
     )
 }
 
@@ -1061,7 +1061,7 @@ for p in [1, 2, 3]:
     x += 1
 o
         "#},
-        "Barendregt violation: substitution range mentions binder",
+        "a feed whose rows depend on a mutable variable its loop writes is not supported yet",
     )
 }
 
@@ -1572,39 +1572,29 @@ fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str, #[case] expe
     check_sink(source, expected);
 }
 
-/// A feed's element type is the join of every contribution, and a feed inside a loop or a
-/// `def` contributes once per value of the binders between the target and the feed
-/// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
-/// target"). Rows whose keys depend on such a binder have no join, so the program is refused
-/// naming it.
+/// A feed's element type is the join of every contribution, and a feed contributes once per
+/// value of the binders between the target and the feed (`src/ccl/design/type-inference.md`,
+/// "A contribution crosses the binders after its target"). Where the target's key determines
+/// a binder, a row reads it at the key (`rows_keyed_by_the_loops_around_the_feed`). Where it does not, rows whose keys depend on the
+/// binder have no join, so the program is refused naming it: a `def` parameter, and a target
+/// fed from two places, whose key does not say which place a row came from.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::filtered_by_the_loop_variable(indoc! {r#"
-    o: Feed(_)
-    for r in [1, 2]:
-        o << [v for v in [1, 2, 3] if v > r]
-    o
-"#}, "`r`")]
-#[case::grouped_by_the_loop_variable(indoc! {r#"
-    o: Feed(_)
-    for i in [1, 2]:
-        o << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
-    o
-"#}, "`i`")]
-// The `let` is joined over because its definition reads `r`, and the message names `r`.
-#[case::through_a_let_of_the_loop_variable(indoc! {r#"
-    o: Feed(_)
-    for r in [1, 2]:
-        k = r
-        o << [v for v in [1, 2, 3] if v > k]
-    o
-"#}, "`r`")]
 #[case::filtered_by_a_parameter(indoc! {r#"
     o: Feed(_)
     def f(y):
         o << [v for v in [1, 2, 3] if v > y]
     for r in [1, 2]:
         f(r)
+    o
+"#}, "`y`")]
+// The `let` is joined over because its definition reads `y`, and the message names `y`.
+#[case::through_a_let_of_a_parameter(indoc! {r#"
+    o: Feed(_)
+    def f(y):
+        k = y
+        o << [v for v in [1, 2, 3] if v > k]
+    f(1)
     o
 "#}, "`y`")]
 // One call is refused as well: the `def` is inferred once, for every call.
@@ -1626,6 +1616,14 @@ fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str, #[case] expe
             o << [z for z in [1, 2, 3]]
     o
 "#}, "`x`")]
+#[case::fed_from_two_loops(indoc! {r#"
+    o: Feed(_)
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    for q in [1]:
+        o << [v for v in [1, 2, 3] if v > q]
+    o
+"#}, "`r`")]
 // The loop writes `t`, so the filter reads it once per iteration, and the message spells the
 // read's binder as the variable it reads.
 #[case::filtered_by_a_mutable_variable_the_loop_writes(indoc! {r#"
@@ -1682,19 +1680,274 @@ fn a_contribution_with_no_join_is_reported_once() {
     );
 }
 
-/// Boxed rows whose keys vary with the loop variable do join, as a sum over every subtype
-/// of the row's domain, and inference accepts them. Lambda elimination does not: the row's
-/// filter stays on its domain on one side of the channel and not on the other. Pinned on that
-/// failure.
+/// A loop's position keys the rows of a target fed from one place. Fed from two, the target
+/// is refused as any join over the loop variable is, and the message names the other place.
 #[test]
-fn boxed_rows_whose_keys_vary_with_the_loop_reach_a_lowering_gap() {
+fn a_target_fed_from_two_places_names_the_other() {
+    let code = indoc! {r#"
+        o: Feed(_)
+        for r in [1, 2]:
+            o << [v for v in [1, 2, 3] if v > r]
+        for q in [1]:
+            o << [v for v in [1, 2, 3] if v > q]
+        o
+    "#};
+    let sources = LoadedProgram::from_text("<two-places-test>", code);
+    let errs = match compile_program(&mut GlobalContext::default(), &sources, Box::new(|| {})) {
+        Ok(_) => panic!("rows keyed by a loop's position need a target fed from one place"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, sources.sources());
+    assert!(
+        rendered.contains("this target is fed from more than one")
+            && rendered.contains("the target is also fed here"),
+        "{rendered}"
+    );
+}
+
+/// Rows whose keys vary with a loop around the feed. The channel is keyed by the loops'
+/// positions and each row is typed at its own position, the loop variable read as the
+/// source's value there (`src/ccl/design/type-inference.md`, "A history's value may depend on
+/// its position").
+#[rstest]
+#[case::filtered_by_the_loop_variable(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        out << [v for v in [1, 2, 3] if v > r]
+"#}, "[[1 -> 2, 2 -> 3], [2 -> 3]]")]
+#[case::grouped_by_the_loop_variable(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
+"#}, "[[1 -> 1, 2 -> 2, 3 -> 3, 4 -> 4], [1, 5, 4]]")]
+#[case::through_a_let_of_the_loop_variable(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        k = r
+        out << [v for v in [1, 2, 3] if v > k]
+"#}, "[[1 -> 2, 2 -> 3], [2 -> 3]]")]
+#[case::through_a_let_computed_from_it(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        m = r + 1
+        out << [v for v in [1, 2, 3] if v > m]
+"#}, "[[2 -> 3], []]")]
+#[case::under_a_filtered_loop(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2, 3]:
+        if r > 1:
+            out << [v for v in [1, 2, 3] if v > r]
+"#}, "[1 -> [2 -> 3], 2 -> []]")]
+#[case::over_a_named_source(indoc! {r#"
+    xs = [1, 2]
+    out = test_sink()
+    for r in xs:
+        out << [v for v in [1, 2, 3] if v > r]
+"#}, "[[1 -> 2, 2 -> 3], [2 -> 3]]")]
+// The source's filter is read at each key through the binding, and planned in one copy of
+// the row's type only: the two compare as one predicate.
+#[case::over_a_named_filtered_source(indoc! {r#"
+    xs = [x for x in [1, 2, 3] if x > 1]
+    out = test_sink()
+    for r in xs:
+        out << [v for v in [1, 2, 3, 4] if v > r]
+"#}, "[1 -> [2 -> 3, 3 -> 4], 2 -> [3 -> 4]]")]
+#[case::read_back_through_a_defer(indoc! {r#"
+    o: Feed(_)
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    out = test_sink()
+    out << sum([sum(row) for row in o])
+"#}, "[() -> 8]")]
+#[case::yielded_by_a_generator(indoc! {r#"
+    def rows(xs):
+        for x in xs:
+            yield [v for v in [1, 2, 3] if v > x]
+    out = test_sink()
+    out << sum([sum(r) for r in rows([1, 2])])
+"#}, "[() -> 8]")]
+#[case::under_two_loops_reading_the_outer(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            out << [v for v in [1, 2, 3] if v > i]
+"#}, "[(_0: 0, _1: 0) -> [1 -> 2, 2 -> 3], (_0: 0, _1: 1) -> [1 -> 2, 2 -> 3], (_0: 1, _1: 0) -> [2 -> 3], (_0: 1, _1: 1) -> [2 -> 3]]")]
+#[case::under_two_loops_reading_both(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            out << [v for v in [1, 2, 3] if v > i + j]
+"#}, "[(_0: 0, _1: 0) -> [2 -> 3], (_0: 0, _1: 1) -> [], (_0: 1, _1: 0) -> [], (_0: 1, _1: 1) -> []]")]
+#[case::under_three_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            for k in [1, 2]:
+                out << [v for v in [1, 2, 3, 4] if v > i + j - k]
+"#}, "[(_0: 0, _1: 0, _2: 0) -> [1 -> 2, 2 -> 3, 3 -> 4], (_0: 0, _1: 0, _2: 1) -> [1, 2, 3, 4], (_0: 0, _1: 1, _2: 0) -> [2 -> 3, 3 -> 4], (_0: 0, _1: 1, _2: 1) -> [1 -> 2, 2 -> 3, 3 -> 4], (_0: 1, _1: 0, _2: 0) -> [2 -> 3, 3 -> 4], (_0: 1, _1: 0, _2: 1) -> [1 -> 2, 2 -> 3, 3 -> 4], (_0: 1, _1: 1, _2: 0) -> [3 -> 4], (_0: 1, _1: 1, _2: 1) -> [2 -> 3, 3 -> 4]]")]
+fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// Rows keyed by the loops that fed them, read back by a `for` loop, are refused: the loop
+/// types its element at a row that reads the position, which nothing binds over the loop's
+/// body. A comprehension over the same rows compiles (`read_back_through_a_defer`).
+#[test]
+fn keyed_rows_read_back_by_a_loop_are_refused() {
     check_compile_error(
         indoc! {r#"
             o: Feed(_)
             for r in [1, 2]:
-                o << box([v for v in [1, 2, 3] if v > r])
-            o
+                o << [v for v in [1, 2, 3] if v > r]
+            out: Feed(_)
+            for row in o:
+                out << sum(row)
+            sum(out)
         "#},
-        "post-lambda-elim produced an invalid tree",
+        "a `for` loop over a collection whose rows depend on their position",
     );
+}
+
+/// A nest whose inner loop ranges over keys chosen by the outer loop's value. The feed is
+/// keyed by the dependent tuple of the two positions (`src/ccl/design/type-inference.md`,
+/// "4.8 Dependent tuples").
+#[rstest]
+#[case::a_value_fed(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z + i for z in [1, 2, 3] if z > i]:
+            out << j
+"#}, "[(_0: 0, _1: 1) -> 3, (_0: 0, _1: 2) -> 4, (_0: 1, _1: 2) -> 5]")]
+#[case::rows_reading_the_inner_variable(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            out << [v for v in [1, 2, 3] if v > j]
+"#}, "[(_0: 0, _1: 1) -> [2 -> 3], (_0: 0, _1: 2) -> [], (_0: 1, _1: 2) -> []]")]
+#[case::rows_over_an_inner_source_reading_the_outer(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z + i for z in [1, 2, 3] if z > i]:
+            out << [v for v in [1, 2, 3, 4, 5] if v > j]
+"#}, "[(_0: 0, _1: 1) -> [3 -> 4, 4 -> 5], (_0: 0, _1: 2) -> [4 -> 5], (_0: 1, _1: 2) -> []]")]
+#[case::an_aggregate_per_row(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            out << sum([v for v in [1, 2, 3] if v > j])
+"#}, "[(_0: 0, _1: 1) -> 3, (_0: 0, _1: 2) -> 0, (_0: 1, _1: 2) -> 0]")]
+#[case::a_third_loop_over_independent_keys(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [1, 2]:
+                out << j + k
+"#}, "[(_0: 0, _1: 1, _2: 0) -> 3, (_0: 0, _1: 1, _2: 1) -> 4, (_0: 0, _1: 2, _2: 0) -> 4, (_0: 0, _1: 2, _2: 1) -> 5, (_0: 1, _1: 2, _2: 0) -> 4, (_0: 1, _1: 2, _2: 1) -> 5]")]
+#[case::a_chain_of_three_dependent_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [w for w in [1, 2, 3, 4] if w > j]:
+                out << k
+"#}, "[(_0: 0, _1: 1, _2: 2) -> 3, (_0: 0, _1: 1, _2: 3) -> 4, (_0: 0, _1: 2, _2: 3) -> 4, (_0: 1, _1: 2, _2: 3) -> 4]")]
+#[case::rows_under_three_dependent_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [w for w in [1, 2, 3, 4] if w > j]:
+                out << [v for v in [1, 2, 3, 4, 5] if v > k]
+"#}, "[(_0: 0, _1: 1, _2: 2) -> [3 -> 4, 4 -> 5], (_0: 0, _1: 1, _2: 3) -> [4 -> 5], (_0: 0, _1: 2, _2: 3) -> [4 -> 5], (_0: 1, _1: 2, _2: 3) -> [4 -> 5]]")]
+#[case::a_chain_of_four_dependent_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [w for w in [1, 2, 3, 4] if w > j]:
+                for m in [u for u in [1, 2, 3, 4, 5] if u > k]:
+                    out << m
+"#}, "[(_0: 0, _1: 1, _2: 2, _3: 3) -> 4, (_0: 0, _1: 1, _2: 2, _3: 4) -> 5, (_0: 0, _1: 1, _2: 3, _3: 4) -> 5, (_0: 0, _1: 2, _2: 3, _3: 4) -> 5, (_0: 1, _1: 2, _2: 3, _3: 4) -> 5]")]
+#[case::only_the_third_loop_dependent(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            for k in [w for w in [1, 2, 3, 4] if w > i + j]:
+                out << k
+"#}, "[(_0: 0, _1: 0, _2: 2) -> 3, (_0: 0, _1: 0, _2: 3) -> 4, (_0: 0, _1: 1, _2: 3) -> 4, (_0: 1, _1: 0, _2: 3) -> 4]")]
+fn a_feed_under_a_dependent_nest(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// Boxed rows fed from a loop, each row's keys depending on the loop variable. The row's
+/// filter is a domain the loop's writer builds from the variable, so elimination pairs the
+/// variable with the row (`src/ccl/design/type-inference.md`, "A refinement on a collection's
+/// domain is data"). Read downstream, each row is a sum whose candidate leaves the loop under
+/// the feed's exits, which the kind edge carrying it records.
+#[rstest]
+#[case::to_a_sink(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        out << box([v for v in [1, 2, 3] if v > r])
+"#}, "[[1 -> 2, 2 -> 3], [2 -> 3]]")]
+#[case::read_by_a_comprehension(indoc! {r#"
+    o: Feed(_)
+    for r in [1, 2]:
+        o << box([v for v in [1, 2, 3] if v > r])
+    out = test_sink()
+    out << sum([sum(b) for b in o])
+"#}, "[() -> 8]")]
+#[case::read_by_a_loop(indoc! {r#"
+    o: Feed(_)
+    for r in [1, 2]:
+        o << box([v for v in [1, 2, 3] if v > r])
+    out = test_sink()
+    for b in o:
+        out << sum(b)
+"#}, "[5, 3]")]
+#[case::filtered_through_a_binding_in_the_loop(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        n = r + 1
+        out << box([v for v in [1, 2, 3, 4] if v > n])
+"#}, "[[2 -> 3, 3 -> 4], [3 -> 4]]")]
+#[case::filtered_through_a_binding_and_read(indoc! {r#"
+    o: Feed(_)
+    for r in [1, 2]:
+        n = r + 1
+        o << box([v for v in [1, 2, 3, 4] if v > n])
+    out = test_sink()
+    out << sum([sum(b) for b in o])
+"#}, "[() -> 11]")]
+fn boxed_rows_fed_from_a_loop(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
+}
+
+/// A feed under a loop that also writes a mutable variable. The loop is a recurrence, one
+/// decision per position, and a fed row whose keys depend on the loop variable makes the
+/// decision depend on the position, so the history of decisions is keyed by it
+/// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
+#[rstest]
+#[case::rows_reading_the_loop_variable(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for r in [1, 2]:
+        t += r
+        out << [v for v in [1, 2, 3] if v > r]
+"#}, "[[1 -> 2, 2 -> 3], [2 -> 3]]")]
+#[case::fed_under_a_condition(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for r in [1, 2, 3]:
+        t += r
+        if r > 1:
+            out << [v for v in [1, 2, 3] if v > r]
+"#}, "[1 -> [2 -> 3], 2 -> []]")]
+#[case::rows_reading_both_loops_of_a_nest(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            t += j
+            out << [v for v in [1, 2, 3, 4] if v > i + j]
+"#}, "[(_0: 0, _1: 0) -> [2 -> 3, 3 -> 4], (_0: 0, _1: 1) -> [3 -> 4], (_0: 1, _1: 0) -> [3 -> 4], (_0: 1, _1: 1) -> []]")]
+fn a_feed_under_a_loop_writing_a_mutable_variable(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
 }
