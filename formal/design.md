@@ -53,7 +53,7 @@ Function kinds are the two fixed values `compute` and `data`.
 The grammar is a subset of concrete Rust types, not every type a fully inferred program can
 contain. It has no Σ or witness-reference constructor and no open variant form. It also excludes
 inference unknowns (`Hole`, `SharedHole`, `BoundedHole` and `Infer`), kind variables, and the
-`History`, `ChanDom`, `App` and `Below` forms. The `ty_json` encoder in
+`History` and `ChanDom` forms. The `ty_json` encoder in
 [the differential harness](../tests/differential_oracle.rs) defines the supported wire boundary:
 it rejects sum-bearing function kinds and function binders other than a raw name or no name.
 
