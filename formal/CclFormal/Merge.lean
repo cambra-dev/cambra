@@ -7,6 +7,9 @@ This module defines `CompactTy`, fixed-polarity merge, representation equivalenc
 Its correspondence with Rust and the hypotheses of its algebraic laws are specified in
 `formal/design.md`, "The polar merge". The model omits solver state and several function-slot
 fields; its equivalence is not equality of complete Rust compact types.
+Rust retains a Pi binder name with `a.name.or(b.name)`, which depends on operand order.
+Refinement references use `Name::PiBound` indices, so the surviving spelling is unobservable
+to that binding representation and is omitted from this model.
 
 `merge_comm` and `merge_assoc` apply at either polarity. Idempotence requires `wellFormed`.
 `foldMerge_perm` fixes the seed and permutes the remaining contributions; `foldMerge_dup`
