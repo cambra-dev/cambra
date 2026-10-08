@@ -821,6 +821,12 @@ point of use. Mutual recursion between top-level functions is
 
 ### 3.3 Arithmetic and logical operators
 
+`//` rounds toward negative infinity rather than toward zero: `-7 // 3` is `-3`, not `-2`.
+The rule matches
+[Python's floor division](https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations)
+so the shared syntax retains its meaning. For a positive divisor, floor division gives a
+non-negative remainder smaller than the divisor, including for negative dividends.
+
 | Operator | Semantics |
 |---|---|
 | `a + b`, `a - b`, `a * b` | Integer arithmetic. Overflow is not defined (see *Partiality*, §3). |
