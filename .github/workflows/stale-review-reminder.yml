@@ -10,11 +10,16 @@ jobs:
   remind:
     runs-on: ubuntu-latest
     permissions:
+      # checks and statuses: read let the GraphQL statusCheckRollup return the
+      # head commit's check runs and commit statuses, which decide whether a
+      # PR's CI has passed.
+      checks: read
       contents: read
       # issues: read is required for the /issues/{pr}/timeline API endpoint used
       # to find when review was requested; pull requests are issues in GitHub's API.
       issues: read
       pull-requests: read
+      statuses: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

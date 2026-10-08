@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Find open PRs with review requests pending for over 10 hours.
+"""Find PRs waiting on general review (open 24h, no approval or changes
+requested, passing CI, no individual reviewer requested) and review requests pending over 10 hours.
 
-Outputs JSONL to stdout: one JSON object per stale review, sorted by (reviewer, pr_number).
+Outputs one JSON object to stdout:
+  "now":       the reference time, ISO 8601
+  "general_review": groups of GeneralReviewPr (see prreminder.find_general_review_prs), each a list
+  "reviews":   StaleReview objects, sorted by (reviewer, pr_number)
 
 Required env: GH_TOKEN, GH_REPOSITORY
 Optional env: STALE_NOW (epoch seconds or ISO timestamp, for testing)
@@ -13,8 +17,10 @@ import sys
 from datetime import datetime, timezone
 
 from prreminder import (
+    find_general_review_prs,
     find_stale_reviews,
     get_review_request_dates,
+    list_open_prs,
     list_open_prs_with_reviewers,
     parse_iso,
 )
@@ -34,17 +40,19 @@ def main() -> None:
     else:
         now = datetime.now(timezone.utc)
 
-    prs = list_open_prs_with_reviewers(repo)
-    if not prs:
-        sys.exit(0)
+    general_review = find_general_review_prs(list_open_prs(repo), now=now)
 
     def get_dates(pr_number: int) -> dict[str, str]:
         return get_review_request_dates(repo, pr_number)
 
-    stale = find_stale_reviews(prs, get_dates, now=now)
+    reviews = find_stale_reviews(list_open_prs_with_reviewers(repo), get_dates, now=now)
 
-    for review in stale:
-        print(json.dumps(review.to_dict()))
+    json.dump({
+        "now": now.isoformat(),
+        "general_review": [[p.to_dict() for p in group] for group in general_review],
+        "reviews": [r.to_dict() for r in reviews],
+    }, sys.stdout)
+    print()
 
 
 if __name__ == "__main__":

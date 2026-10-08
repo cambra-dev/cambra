@@ -64,7 +64,7 @@ usermap)
   ;;
 
 find)
-  echo "==> Finding stale PRs (pending review >24h)..."
+  echo "==> Finding PRs waiting on general review (open >24h, passing CI, no reviewer) and review requests (pending >10h)..."
   python3 "${SCRIPT_DIR}/find_stale_prs.py"
   ;;
 
