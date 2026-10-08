@@ -53,13 +53,11 @@ use panic_message::panic_message;
 /// to agreement and every cell here to disagreement, so a fix that makes one agree removes it.
 const BROKEN: &[(&str, &str)] = &[
     ("comp_source_in_loop", "binder_cond_coll[i]"),
-    ("feed_collection", "cond_boxed"),
     ("function_body", "rows_sum"),
     ("generator_yield", "rows_sum"),
     ("groupby_tuple_key", "rec_comp"),
     ("groupby_tuple_key", "rec_filtered"),
     ("groupby_tuple_key", "rec_list"),
-    ("loop_source", "cond_boxed"),
     ("loop_source_in_loop", "binder_cond_boxed[i]"),
     ("loop_source_in_loop", "binder_cond_coll[i]"),
     ("loop_source_in_loop", "binder_filtered_comp[i]"),
@@ -79,7 +77,6 @@ const BROKEN: &[(&str, &str)] = &[
     ("nested_mut_source", "map_arrow"),
     ("nested_mut_source", "map_lit"),
     ("nested_mut_source", "union"),
-    ("record_collection_field", "cond_boxed"),
     ("record_in_list", "comp_sum"),
     ("record_in_list", "filtered_sum"),
     ("record_in_list", "generator_max"),
