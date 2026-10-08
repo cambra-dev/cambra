@@ -565,6 +565,17 @@ impl LiveProgram {
         Some(&self.branches[at].program)
     }
 
+    /// Branch `name`'s version number.
+    ///
+    /// Bumped by every accepted reload of the branch and by nothing else, and
+    /// never repeated under the name: a branch deleted and created again
+    /// continues from its tombstone. So a change in this number is exactly a
+    /// change in what [`program`](Self::program) answers for `name`.
+    pub fn version(&self, name: &str) -> Option<u64> {
+        let at = self.index_of(name).ok()?;
+        Some(self.branches[at].version)
+    }
+
     /// Branch `name`'s `main` output's producer, for a driver to pull.
     pub fn main_producer_mut(&mut self, name: &str) -> Option<&mut Box<dyn TileProducer>> {
         let at = self.index_of(name).ok()?;

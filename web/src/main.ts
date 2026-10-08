@@ -33,7 +33,7 @@ import { SourceView } from "./sourceView";
 import { ElkLayout } from "./graph/elk";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
-import { LiveStore, connectLive } from "./liveStore";
+import { type LiveTag, LiveStore, connectLive } from "./liveStore";
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
@@ -62,6 +62,49 @@ export function tagLabel(store: Store, nodeId: number, lineStarts: number[]): st
   let line = 0;
   for (let i = 0; i < lineStarts.length && (lineStarts[i] ?? 0) <= start; i++) line = i;
   return `${label}: L${line + 1}`;
+}
+
+/** The source bytes `[start, end)`, as text. Spans are byte offsets. */
+function spanText(source: string, start: number, end: number): string {
+  return new TextDecoder().decode(new TextEncoder().encode(source).slice(start, end));
+}
+
+/** A tag's construct in `store`'s payload: its span, and the text under it. */
+export function tagSpan(store: Store, nodeId: number): LiveTag["span"] {
+  const paneId = store.sourceAnchorPaneId;
+  const span = paneId ? store.spanOf(paneId, nodeId) : null;
+  if (span === null) return null;
+  return {
+    start: span.start,
+    end: span.end,
+    text: spanText(store.snapshot.source.text, span.start, span.end),
+  };
+}
+
+/**
+ * `tag`'s construct in a later version's payload, or `null` where it has none.
+ *
+ * Found by its span and the text under it, and confirmed by its label: the
+ * anchor node with the same span, the same text and the same `label: Lline`
+ * is the construct the reader pinned. An edit above it shifts its bytes and an
+ * edit inside it changes its text, and either drops the tag rather than guess.
+ */
+export function resolveTag(store: Store, tag: LiveTag): Omit<LiveTag, "shown"> | null {
+  const span = tag.span;
+  const paneId = store.sourceAnchorPaneId;
+  const index = paneId ? store.indicesFor(paneId) : undefined;
+  if (span === null || index === undefined) return null;
+  if (spanText(store.snapshot.source.text, span.start, span.end) !== span.text) return null;
+  const lineStarts = byteLineStarts(store.snapshot.source.text);
+  for (const nodeId of index.nodesInRange(span.start, span.end)) {
+    const at = store.spanOf(paneId!, nodeId);
+    if (at === null || at.start !== span.start || at.end !== span.end) continue;
+    if (tagLabel(store, nodeId, lineStarts) !== tag.label) continue;
+    const nodes = store.operatorsFor(nodeId);
+    if (nodes.length === 0) continue;
+    return { id: tag.id, label: tag.label, anchorId: nodeId, nodes, span };
+  }
+  return null;
 }
 
 export function byteLineStarts(text: string): number[] {
@@ -184,6 +227,9 @@ export function describePanes(
   // Pin the operators a position reaches, and reveal the values pane so the
   // reader sees the result of the gesture they just made.
   onInspect?: (nodeId: number, operators: readonly number[]) => void,
+  // Where a pane that subscribes to `live` leaves the function that stops it,
+  // so a redraw after a reload does not leave the previous panes listening.
+  disposers: (() => void)[] = [],
 ): PaneDescriptor[] {
   const snap = store.snapshot;
   const panes: PaneDescriptor[] = [
@@ -270,12 +316,12 @@ export function describePanes(
         serializeLivePanel(livePanelState(live.get(), (id) => store.operatorLabel(id))),
       mount: (body) => {
         // The menu first, so it reads as this pane's toolbar above its rows.
-        renderLiveMenu(body, live);
+        disposers.push(renderLiveMenu(body, live));
         // No origin on either selection: the gesture happened in this pane,
         // which is not one the link graph knows, so every pane should scroll to
         // what it resolved — the same reason goto-def and the operator pane's
         // reference rows pass none.
-        new LiveView(body, live, (id) => store.operatorLabel(id), {
+        const view = new LiveView(body, live, (id) => store.operatorLabel(id), {
           construct: (anchorId) => {
             const paneId = store.sourceAnchorPaneId;
             if (paneId) store.setSelection({ kind: "node", paneId, nodeId: anchorId });
@@ -290,6 +336,7 @@ export function describePanes(
             if (paneId) store.setSelection({ kind: "locate", paneId, nodeId });
           },
         });
+        disposers.push(() => view.dispose());
       },
     });
   }
@@ -355,7 +402,12 @@ function renderPane(panels: HTMLElement, pane: PaneDescriptor): MountedPane {
   return { panel, reveal: pane.mount(body) };
 }
 
-export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): void {
+/**
+ * Draw every pane for `store`'s payload, and answer the function that stops the
+ * ones subscribed to `live`. A redraw calls it first.
+ */
+export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): () => void {
+  const disposers: (() => void)[] = [];
   // Set once the visibility controller exists, because pinning has to reveal
   // the pane and the controller is built from the pane list this produces.
   let reveal: ((paneId: string) => void) | null = null;
@@ -364,11 +416,16 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): vo
   const lineStarts = byteLineStarts(store.snapshot.source.text);
   const onInspect = live
     ? (nodeId: number, operators: readonly number[]) => {
-        live.inspect(tagLabel(store, nodeId, lineStarts), nodeId, operators);
+        live.inspect(
+          tagLabel(store, nodeId, lineStarts),
+          nodeId,
+          operators,
+          tagSpan(store, nodeId),
+        );
         reveal?.("values");
       }
     : undefined;
-  const panes = describePanes(store, live, onInspect);
+  const panes = describePanes(store, live, onInspect, disposers);
 
   // A storage that throws on access degrades the filter to one session.
   const storage = browserStorage();
@@ -419,6 +476,49 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): vo
     visibility.subscribe(() => saveHiddenPanes(storage, visibility.hiddenIds()));
   }
   applyVisibility();
+  return () => {
+    for (const dispose of disposers) dispose();
+  };
+}
+
+/**
+ * Redraw the app whenever a frame names a later `main` version than the payload
+ * on screen, which a reload under `--control` does.
+ *
+ * The payload is fetched again rather than patched: a reload rebuilds operators
+ * under fresh ids, so the node tables are the new version's or wrong. At most one
+ * fetch is in flight, and a version that advanced while it was is fetched next.
+ */
+export function followReloads(
+  root: HTMLElement,
+  live: LiveStore,
+  shown: Snapshot,
+  fetchSnapshot: () => Promise<Snapshot>,
+): void {
+  let drawn = shown.meta.version;
+  let dispose = renderApp(root, new Store(shown), live);
+  let fetching = false;
+  const follow = async (): Promise<void> => {
+    if (fetching || live.get().version <= drawn) return;
+    fetching = true;
+    try {
+      const snap = await fetchSnapshot();
+      dispose();
+      const store = new Store(snap);
+      live.retag((tag) => resolveTag(store, tag));
+      dispose = renderApp(root, store, live);
+      drawn = snap.meta.version;
+    } catch (e) {
+      // The panes keep describing the previous version, which is stale but
+      // legible; a fatal screen would end a working session over one fetch.
+      console.error("live: could not follow the reload", e);
+      drawn = live.get().version;
+    } finally {
+      fetching = false;
+    }
+    void follow();
+  };
+  live.subscribe(() => void follow());
 }
 
 async function main(): Promise<void> {
@@ -436,7 +536,11 @@ async function main(): Promise<void> {
     // all.
     const live = new LiveStore();
     connectLive(live);
-    renderApp(root, new Store(snap), live);
+    followReloads(root, live, snap, async () => {
+      const again = await fetch("/api/snapshot");
+      if (!again.ok) throw new Error(`HTTP ${again.status}`);
+      return validateSnapshot(await again.json());
+    });
   } catch (e) {
     root.replaceChildren(el("div", "fatal", `Failed to load /api/snapshot: ${String(e)}`));
   }

@@ -22,6 +22,11 @@ use crate::interpreter::value_probe::{Flow, ProbeTable, ReadingRow, SourceWindow
 /// the table first would buy nothing.
 #[derive(Debug, serde::Serialize)]
 pub struct ProbeFrame<'a> {
+    /// The `main` branch version whose payload this frame's node ids are meant
+    /// against, as `meta.version` names it. A client holding a payload of a
+    /// lower version refetches it rather than matching these ids against the
+    /// wrong node table.
+    pub version: u64,
     /// Frames published before and including this one, so a client that
     /// reconnects or misses a wake can tell it is behind. A reading's own `seq`
     /// is the finer signal, for a gap within one probe's readings.
@@ -112,6 +117,7 @@ pub struct SourceWindowWire<'a> {
 pub fn probe_frame<'a>(
     probes: &'a ProbeTable,
     sources: &'a [SourceWindow],
+    version: u64,
     published: u64,
     final_frame: bool,
 ) -> ProbeFrame<'a> {
@@ -149,6 +155,7 @@ pub fn probe_frame<'a>(
         })
         .collect();
     ProbeFrame {
+        version,
         published,
         final_frame,
         nodes,
@@ -160,11 +167,18 @@ pub fn probe_frame<'a>(
 pub fn render_probe_frame(
     probes: &ProbeTable,
     sources: &[SourceWindow],
+    version: u64,
     published: u64,
     final_frame: bool,
 ) -> String {
-    serde_json::to_string(&probe_frame(probes, sources, published, final_frame))
-        .expect("a probe frame holds only strings, numbers and booleans")
+    serde_json::to_string(&probe_frame(
+        probes,
+        sources,
+        version,
+        published,
+        final_frame,
+    ))
+    .expect("a probe frame holds only strings, numbers and booleans")
 }
 
 fn row_wire(row: &ReadingRow) -> RowWire<'_> {
@@ -282,7 +296,7 @@ mod tests {
             &released(Some(1)),
         );
 
-        let frame = probe_frame(&probes, &[], 1, true);
+        let frame = probe_frame(&probes, &[], 0, 1, true);
         let probe = &frame.nodes[0].probes[0];
         assert_eq!(probe.rows.len(), 2, "the rows are the last flow's");
         assert!(probe.stale);
@@ -375,7 +389,7 @@ mod tests {
             &strings(&["b"]),
         );
 
-        let mut frame = serde_json::to_value(probe_frame(&table, &[window], 2, false))
+        let mut frame = serde_json::to_value(probe_frame(&table, &[window], 1, 2, false))
             .expect("a probe frame serializes");
         assert_probe_frame_shape(&frame);
         let minted: HashMap<u64, u64> = ids

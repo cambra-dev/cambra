@@ -75,6 +75,11 @@ export interface LiveTag {
   anchorId: number;
   /** The operators this gesture pinned. */
   nodes: readonly number[];
+  /**
+   * The pinned construct's source span and text, which is how the tag is found
+   * again in a later version: every id above is minted per compile.
+   */
+  span: { start: number; end: number; text: string } | null;
   /** Whether its operators are currently drawn. The menu's checkbox. */
   shown: boolean;
 }
@@ -82,6 +87,12 @@ export interface LiveTag {
 /** The cache and the tags, as one value a view can render from. */
 export interface LiveState {
   status: LiveStatus;
+  /**
+   * The `main` version the cached entries came from. A frame of another
+   * version clears them rather than merging two versions' operators: an entry
+   * left under an id the new version reused would read as its value.
+   */
+  version: number;
   /** Latest rows per operator node. Bounded by the operator count, and does not grow over time. */
   nodes: Map<number, LiveEntry>;
   /** Latest retained window per source, by its graph node id. */
@@ -120,9 +131,11 @@ type Listener = (state: LiveState) => void;
  * keeps the frame it arrived in; any other probe arrived in this frame.
  */
 export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
-  const nodes = new Map(state.nodes);
+  const swapped = frame.version !== state.version;
+  const heldNodes = swapped ? new Map<number, LiveEntry>() : state.nodes;
+  const nodes = new Map(heldNodes);
   for (const node of frame.nodes) {
-    const held = state.nodes.get(node.nodeId)?.probes ?? [];
+    const held = heldNodes.get(node.nodeId)?.probes ?? [];
     const probes = node.probes.map((probe): TrackedProbe => {
       const previous = held.find((p) => p.producerId === probe.producerId);
       const changedAt =
@@ -133,12 +146,13 @@ export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
     });
     nodes.set(node.nodeId, { probes });
   }
-  const sources = new Map(state.sources);
+  const sources = swapped ? new Map<number, LiveSource>() : new Map(state.sources);
   for (const source of frame.sources) {
     for (const nodeId of source.nodeIds) sources.set(nodeId, source);
   }
   return {
     ...state,
+    version: frame.version,
     nodes,
     sources,
     status: frame.final
@@ -157,6 +171,7 @@ export function applyFrame(state: LiveState, frame: LiveFrame): LiveState {
 export class LiveStore {
   private state: LiveState = {
     status: { kind: "connecting" },
+    version: 0,
     nodes: new Map(),
     sources: new Map(),
     tags: [],
@@ -194,10 +209,36 @@ export class LiveStore {
    * next compile, so a remembered tag would point at nodes that no longer
    * exist. Pane visibility carries no ids, which is why that *is* persisted.
    */
-  inspect(label: string, anchorId: number, nodes: readonly number[]): void {
+  inspect(
+    label: string,
+    anchorId: number,
+    nodes: readonly number[],
+    span: LiveTag["span"] = null,
+  ): void {
     const id = label;
     const rest = this.state.tags.filter((tag) => tag.id !== id);
-    this.state = { ...this.state, tags: [{ id, label, anchorId, nodes, shown: true }, ...rest] };
+    this.state = {
+      ...this.state,
+      tags: [{ id, label, anchorId, nodes, span, shown: true }, ...rest],
+    };
+    this.notify();
+  }
+
+  /**
+   * Re-point every tag at a new payload, after a reload.
+   *
+   * `resolve` answers a tag's construct in the new payload, or `null` where
+   * that version has no construct with the same span and text. Such a tag is
+   * dropped: pointing it at whatever now sits at its position would show
+   * another construct's values under its name.
+   */
+  retag(resolve: (tag: LiveTag) => Omit<LiveTag, "shown"> | null): void {
+    const tags: LiveTag[] = [];
+    for (const tag of this.state.tags) {
+      const next = resolve(tag);
+      if (next !== null) tags.push({ ...next, shown: tag.shown });
+    }
+    this.state = { ...this.state, tags };
     this.notify();
   }
 

@@ -76,7 +76,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     source: { name: "x.chl", text: "1" },
     definitions: [],
     diagnostics: [],
-    meta: { payloadKind: "failed", schema: SCHEMA_VERSION },
+    meta: { payloadKind: "failed", version: 0, schema: SCHEMA_VERSION },
     panes: [],
     paneLinks: [],
   });
@@ -113,7 +113,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     source: { name: "x.chl", text: "1" },
     definitions: [],
     diagnostics: [],
-    meta: { payloadKind: "program", schema: SCHEMA_VERSION },
+    meta: { payloadKind: "program", version: 0, schema: SCHEMA_VERSION },
     panes: PANE_IDS.map((id) => ({
       id,
       label: `IR (${id.toUpperCase()})`,
