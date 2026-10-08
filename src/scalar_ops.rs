@@ -80,7 +80,8 @@ pub(crate) trait IntPow: Copy {
     /// Wrapping, so both profiles answer the same. The release profile sets no
     /// `overflow-checks`, and a plain `*` therefore panics on `2 ** 64` in debug and
     /// answers `0` in release. `zip_arithmetic`'s `+`, `-`, and `*` still use plain
-    /// operators and retain that profile-dependent overflow behavior. Integer division
+    /// operators and retain that profile-dependent overflow behavior, tracked in the vault
+    /// issue `interpreter-integer-arithmetic-divergences`. Integer division
     /// panics on zero divisors and on `i64::MIN // -1` in both profiles.
     fn raised(mut self, mut exponent: u64) -> Self {
         let mut acc = Self::ONE;

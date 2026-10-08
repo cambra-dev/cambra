@@ -529,7 +529,8 @@ fn a_negative_comprehension_element_is_rejected_as_an_exponent() {
 }
 
 /// Exponentiation wraps on overflow in every profile. Addition, subtraction, and
-/// multiplication retain profile-dependent overflow behavior.
+/// multiplication retain profile-dependent overflow behavior, tracked in the vault issue
+/// `interpreter-integer-arithmetic-divergences`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::past_the_width("2 ** 64", Value::Int(0))]
