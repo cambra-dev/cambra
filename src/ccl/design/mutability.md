@@ -237,9 +237,9 @@ substituting it would put `x` in that type. A diagnostic raised past inference �
 or op-conversion's — spells such a read `__anf`, the rename below reaching inference errors alone.
 
 A diagnostic spells the binder as the variable it reads. `mut_read::read_respelling` builds that
-rename and `compile_program` applies it to an inference error's types, so a message reports
-`{Int | __elem == x ^+ 1}` where the type carries the binder. The rename is display alone:
-substituting the variable into a type inference still holds is
+rename and `compile_program` applies it to an inference error's types and the binders it names, so
+a message reports `{Int | __elem == x ^+ 1}` where the type carries the binder. The rename is
+display alone: substituting the variable into a type inference still holds is
 [what no type may do](#a-mutable-variable-read-is-an-explicit-operation). A binder the user wrote
 keeps its spelling — `x0 ^= x` names the read itself.
 

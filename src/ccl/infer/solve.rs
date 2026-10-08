@@ -57,14 +57,17 @@ fn is_significant_context(label: &str) -> bool {
     label.contains("let ") || label.contains("λ ") || label.contains('\n')
 }
 
-/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`] and
-/// [`InferError::OpaqueEscape`].
+/// Push `new_err` onto `errors`, deduplicating [`InferError::IncompatibleBounds`],
+/// [`InferError::OpaqueEscape`] and [`InferError::NoJoinOverBinder`].
 ///
 /// If an existing error has the same `(polarity, conflicting)` key, `label` is
 /// appended to its context vec (when it passes [`is_significant_context`])
 /// instead of pushing a duplicate. An `OpaqueEscape` naming the same binders as an
 /// existing one is dropped: each specialization of a function copies its barrier
-/// variable, and every copy reports it. All other error kinds are pushed as-is.
+/// variable, and every copy reports it. A `NoJoinOverBinder` is one fact about one
+/// contribution, which every node whose type reaches the target's variable meets
+/// again, so a second report of the same binders and keys is dropped. All other
+/// error kinds are pushed as-is.
 ///
 /// `blame` is the node whose rule raised `new_err`. A merged
 /// `IncompatibleBounds` keeps the *first* contributing node: a bounds conflict
@@ -85,6 +88,11 @@ fn push_coalesce_err(
         && errors.iter().any(
             |e| matches!(&e.error, InferError::OpaqueEscape { names: seen, .. } if seen == names),
         )
+    {
+        return;
+    }
+    if let InferError::NoJoinOverBinder { .. } = &new_err
+        && errors.iter().any(|e| e.error == new_err)
     {
         return;
     }

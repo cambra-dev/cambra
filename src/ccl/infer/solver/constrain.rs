@@ -691,6 +691,10 @@ fn constrain_fun_kind(
 ///   `τ_U = lo ∘ hi⁻¹` (e.g. a discharge-bearing lower meeting an ordinary
 ///   upper — a discharge lands on a holder side at every contravariant edge
 ///   swap — where `V <: U` and `L <: V‹[x↦0]›` derive `L <: U‹[x↦0]›`);
+/// - two non-invertible morphisms that commute ([`Subst::commutes_with`]) meet in
+///   the frame of their composite: each side takes the other's morphism, so
+///   `τ_L = hi` and `τ_U = lo` (a feed parameter's call-site rename meeting the
+///   join of a binder the feed crosses);
 /// - two *distinct non-invertible* morphisms meeting at one variable is the
 ///   unhandled domain-join corner (O1/O4) — `invert_rename` is its loud
 ///   tripwire.
@@ -711,6 +715,9 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     }
     if let Some(hi_inv) = hi.invert() {
         return (Subst::id(), Subst::then(&hi_inv, lo));
+    }
+    if lo.commutes_with(hi) {
+        return (hi.clone(), lo.clone());
     }
     // Both composites are non-invertible. Factor each into its rename part
     // and its term (discharge) part: when the term parts agree — the common
@@ -828,7 +835,7 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
     let mut seen: Vec<Type> = Vec::new();
     for low in lows {
         let Type::Fun {
-            fun_kind: FunKind::Data(..),
+            fun_kind: fun_kind @ FunKind::Data(..),
             domain,
             ..
         } = &low.ty
@@ -843,7 +850,9 @@ fn distinct_data_domains(lows: &[Bound]) -> Option<(Type, Type)> {
         if low.ty.sum().is_some() {
             continue;
         }
-        let d = low.ty_subst.apply_type(domain);
+        // A joined binder's refinement stays on the domain, as on any data domain, so two
+        // rows over keys that differ by the binder conflict here.
+        let d = low.ty_subst.apply_domain(fun_kind, domain);
         if matches!(d, Type::WitnessRef(_) | Type::Infer(_)) {
             continue;
         }

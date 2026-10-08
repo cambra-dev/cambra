@@ -879,9 +879,10 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     }
 }
 
-/// Whether a walk enters a `def` or lambda body. Its statements run where it is called
-/// rather than where it stands, so a question about what runs here skips them and a
-/// question about the program text enters them.
+/// Whether a walk enters a lambda body. Its statements run where it is called rather than
+/// where it stands, so a question about what runs here skips them and a question about the
+/// program text enters them. No walk enters a `def`'s body: a question about the text asks it
+/// of each function's text on its own ([`collect_feed_sites`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Bodies {
     Enter,
@@ -890,7 +891,7 @@ enum Bodies {
 
 /// Call `f` on every statement in `body` and every statement nested in it, outermost first:
 /// the bodies of `if`, `match`, `for` and `with`, every block in expression position, and a
-/// `def` or lambda body when `bodies` enters them.
+/// lambda body when `bodies` enters them. A `def`'s body is not entered ([`Bodies`]).
 ///
 /// The one walk every question about the program text asks, so that no question enters a
 /// construct another one skips.
@@ -925,11 +926,6 @@ fn for_each_stmt<'a>(
                 for_each_stmt(body, bodies, f);
             }
             Stmt::With { body, .. } => for_each_stmt(body, bodies, f),
-            Stmt::FunctionDef { body, .. } => {
-                if bodies == Bodies::Enter {
-                    for_each_stmt(body, bodies, f);
-                }
-            }
             Stmt::Expr(e)
             | Stmt::Return(Some(e))
             | Stmt::Assign { value: e, .. }
@@ -1142,17 +1138,47 @@ fn unwrap_pub(stmt: &Spanned<Stmt>) -> &Spanned<Stmt> {
 }
 
 /// Every `<<` site in `body` into `feeds`, by the channel name each names, in source order.
+///
+/// A `def`'s body contributes the sites feeding a name the body binds itself. A site feeding a
+/// name bound outside the `def` runs once per call, as the compiler's inlined copies of it do,
+/// so it is a site of each call ([`Site`]) and joins its channel when it first fires.
 fn collect_feed_sites(body: &[Spanned<Stmt>], feeds: &mut BTreeMap<String, Vec<usize>>) {
-    for_each_stmt(body, Bodies::Enter, &mut |s| {
-        if let Stmt::Expr(e) = &s.node
-            && let Expr::Feed { target, value } = &e.node
-            && let Expr::Name(n) = &target.node
-        {
-            feeds
-                .entry(n.to_string())
-                .or_default()
-                .push(value.span.start);
+    collect_function_feed_sites(body, None, feeds);
+}
+
+/// [`collect_feed_sites`] over one function's text: the top level's (`local` absent), or a
+/// `def`'s body, which records only the sites feeding a name in `local`.
+fn collect_function_feed_sites(
+    body: &[Spanned<Stmt>],
+    local: Option<&BTreeSet<String>>,
+    feeds: &mut BTreeMap<String, Vec<usize>>,
+) {
+    for_each_stmt(body, Bodies::Enter, &mut |s| match &s.node {
+        Stmt::Expr(e) => {
+            if let Expr::Feed { target, value } = &e.node
+                && let Expr::Name(n) = &target.node
+                && local.is_none_or(|names| names.contains(n.as_str()))
+            {
+                feeds
+                    .entry(n.to_string())
+                    .or_default()
+                    .push(value.span.start);
+            }
         }
+        Stmt::FunctionDef { body, .. } => {
+            let mut bound = BTreeSet::new();
+            for_each_stmt(body, Bodies::Enter, &mut |s| {
+                if let Stmt::Declare { target, .. }
+                | Stmt::Assign { target, .. }
+                | Stmt::AnnAssign { target, .. } = &s.node
+                    && let AssignTarget::Name(n) = &target.node
+                {
+                    bound.insert(n.to_string());
+                }
+            });
+            collect_function_feed_sites(body, Some(&bound), feeds);
+        }
+        _ => {}
     });
 }
 

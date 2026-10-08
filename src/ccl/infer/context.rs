@@ -13,13 +13,14 @@ use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
 };
 use crate::ccl::infer_var::Origin;
-use crate::ccl::infer_var::{Telescope, TelescopeWalk};
+use crate::ccl::infer_var::{Telescope, TelescopeWalk, enforce_bound_scope};
+use crate::ccl::subst::Subst;
 use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{
-    BarrierVar, BindingTransparency, Expr, InferVar, Level, Lit, Name, Refinement, Type,
+    BarrierVar, BindingTransparency, Bound, Expr, InferVar, Level, Lit, Name, Refinement, Type,
     TypedBinding, TypedExpr, TypedExprNode,
 };
 use crate::util::ScopeStack;
@@ -243,6 +244,14 @@ pub(super) struct InferCtx {
     /// and the function it calls, for the application that passes it its arguments
     /// ([`Typing::bind_instance_function_called`]).
     pub(super) trait_calls: HashMap<NodeId, (Rc<TraitObligation>, smol_str::SmolStr, Vec<Type>)>,
+    /// How a type leaves the scope of each binder in scope ([`ScopeExit`]), read by
+    /// [`Self::require_contribution`] and [`Typing::close_let_type`]: one per binder of the
+    /// name, innermost last, pushed where the binder is entered and popped where its scope
+    /// closes, a `let`'s at `close_let_type`.
+    scope_exits: HashMap<Name, Vec<ScopeExit>>,
+    /// The joined binders each `let` a contribution crossed varies with, for each such `let`
+    /// whose definition reads one ([`Self::name_varying_binders`]).
+    varies_with: HashMap<Name, Vec<Name>>,
 }
 
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
@@ -271,9 +280,28 @@ pub(super) struct GroupMember {
     pub(super) binding: TypedBinding,
     /// The definition, `None` while it is under emission.
     pub(super) def: Option<Expr>,
-    /// Whether its definition typed, once emitted ([`Typing::close_let_type`] closes only
-    /// over one that did).
-    pub(super) defined: bool,
+}
+
+/// How a type leaves a binder's scope: a contribution crossing the binder after its target
+/// ([`InferCtx::require_contribution`]), and a `let` body's type lifted past its binding
+/// ([`Typing::close_let_type`]). Recorded for every binder emission enters.
+enum ScopeExit {
+    /// A transparent `let` whose definition typed: the definition is discharged.
+    Discharge(Rc<Expr>),
+    /// One value over the scope, so the type keeps the name:
+    ///
+    /// - an opaque `let`, which carries no definiens, and whose meaning, the type it is bound
+    ///   at, outlives the scope ([`InferCtx::opaque_binders`]);
+    /// - a mutable variable's binder, and a `let` of a `:=` definiens: a mutable variable is
+    ///   a history, the join over its seed and every write, so the definiens denotes no value
+    ///   to substitute into a type, and both are erased before any consumer of the type runs;
+    /// - a `let` whose definition did not type, or is poisoned ([`LetScheme::Poisoned`]):
+    ///   the program is already rejected.
+    Keep,
+    /// A binder taking a value per iteration or call: a lambda's parameter, a loop's or a
+    /// pattern's binder, a `letrec` group member, or a chain's intermediate. The type is
+    /// joined over every value.
+    Join,
 }
 
 /// The environment a solver query runs in: the lexical scope at the query,
@@ -362,6 +390,8 @@ impl InferCtx {
             telescope: Telescope::empty(),
             opaque_binders: HashMap::new(),
             bound_at_annotation: HashSet::new(),
+            scope_exits: HashMap::new(),
+            varies_with: HashMap::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
             instances: InstanceTable::builtin(),
@@ -377,6 +407,12 @@ impl InferCtx {
         let entry = self.telescope.clone();
         for m in &members {
             self.telescope = self.telescope.extended(m.binding.name.clone());
+            // Until it is bound ([`Self::bind_group_member`]), a member's definition is
+            // unknown, so a contribution crossing it joins over it.
+            self.scope_exits
+                .entry(m.binding.name.clone())
+                .or_default()
+                .push(ScopeExit::Join);
         }
         self.scopes.push_scope();
         self.groups.push(OpenGroup {
@@ -428,17 +464,28 @@ impl InferCtx {
         &mut self,
         g: usize,
         binding: &TypedBinding,
+        definition: Option<&Expr>,
         let_scheme: LetScheme,
     ) {
-        let entry = self.let_scope_binding(binding, let_scheme);
+        let (entry, exit) = self.let_scope_binding(binding, definition, let_scheme);
+        *self
+            .scope_exits
+            .get_mut(&binding.name)
+            .and_then(|exits| exits.last_mut())
+            .expect("`open_group` records a member's exit") = exit;
         let depth = self.groups[g].depth;
         self.scopes.bind_at(depth, binding.name.clone(), entry);
     }
 
     /// The scope entry a `let` binding is bound at under `let_scheme`, at the current level,
-    /// recording what the binding states past its scope. Shared by [`Typing::scoped_let`]
-    /// and [`bind_group_member`](Self::bind_group_member).
-    fn let_scope_binding(&mut self, binding: &TypedBinding, let_scheme: LetScheme) -> Binding {
+    /// and how a type leaves its scope. Shared by [`Typing::scoped_let`] and
+    /// [`bind_group_member`](Self::bind_group_member).
+    fn let_scope_binding(
+        &mut self,
+        binding: &TypedBinding,
+        definition: Option<&Expr>,
+        let_scheme: LetScheme,
+    ) -> (Binding, ScopeExit) {
         let (name, bound_ty) = (&binding.name, &binding.ty);
         // An opaque binder carries no definiens, so a type lifted past it keeps
         // the name (`close_let_type`) and what the name means there is the type
@@ -446,10 +493,24 @@ impl InferCtx {
         // entry rather than on exit because a bound naming it is recorded
         // *inside* the scope, on a variable that may have been minted outside
         // (see [`Telescope`]).
-        if binding.transparency == BindingTransparency::Opaque {
+        let exit = if binding.transparency == BindingTransparency::Opaque {
             self.telescope.enter_opaque(name);
             self.opaque_binders.insert(name.clone(), bound_ty.clone());
-        }
+            ScopeExit::Keep
+        } else {
+            match definition {
+                Some(definition)
+                    if let_scheme != LetScheme::Poisoned
+                        && !matches!(
+                            definition.node,
+                            TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
+                        ) =>
+                {
+                    ScopeExit::Discharge(Rc::new(definition.clone_preserving_ids()))
+                }
+                _ => ScopeExit::Keep,
+            }
+        };
         // Generalize at the current (outer) level: any variable in `bound_ty`
         // whose level exceeds `self.level` was minted inside the RHS and is
         // universally quantified; `instantiate` freshens it per use site.
@@ -488,12 +549,13 @@ impl InferCtx {
                 crate::ccl::infer::solver::constrain::lower_levels(bound_ty, self.level),
             )
         };
-        Binding {
+        let entry = Binding {
             scheme,
             generalized: generalize,
             defined_at: self.current_node(),
             poisoned: let_scheme == LetScheme::Poisoned,
-        }
+        };
+        (entry, exit)
     }
 
     /// The type a use of `name` has: its binding's scheme instantiated at the
@@ -982,6 +1044,141 @@ impl InferCtx {
         Ok(ann_simple)
     }
 
+    /// [`Typing::scoped`], recording how a type leaves the binder's scope.
+    fn scoped_exiting<R>(
+        &mut self,
+        name: &Name,
+        ty: &Type,
+        exit: ScopeExit,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.scope_exits.entry(name.clone()).or_default().push(exit);
+        self.scopes.push_scope();
+        // Monomorphic binder: lambda params and pattern/loop binders are not
+        // generalized. The scheme's cutoff is the *current* level, not 0:
+        // these binders' variables are minted at `self.level` (a `let` RHS may
+        // have bumped it), and a cutoff below that would wrongly quantify them,
+        // freshening the binder on every use and severing it from its body
+        // constraints. `poly(self.level, ty)` quantifies nothing at this level,
+        // so `instantiate` returns the binder's variables verbatim.
+        self.scopes.bind(
+            name,
+            Binding {
+                scheme: PolyScheme::poly(self.level, ty.clone()),
+                generalized: false,
+                defined_at: self.current_node(),
+                poisoned: false,
+            },
+        );
+        let r = self.under_binder(name, f);
+        self.scopes.pop_scope();
+        self.scope_exits.get_mut(name).and_then(Vec::pop);
+        r
+    }
+
+    /// Record `contribution <: history`: a feed, define or write into the history `target`
+    /// binds, made at the current position.
+    ///
+    /// `history` stands where `target` is bound, and the write stands inside every binder
+    /// entered since, so `contribution` can name binders `history` cannot. The edge carries
+    /// each crossed binder's scope exit, innermost first ([`ScopeExit`]): a transparent `let`
+    /// is discharged, and a binder taking several values is joined over, so the history's
+    /// type is the join of the contribution over every value it takes
+    /// (`src/ccl/design/type-inference.md`, "A contribution crosses the binders after its
+    /// target"). A kept binder inside a joined one of the crossing is joined too: it holds one
+    /// value per value of the binder around it.
+    pub(super) fn require_contribution(
+        &mut self,
+        target: &Name,
+        contribution: &Type,
+        history: &Type,
+        at: &dyn Fn() -> String,
+    ) -> Result<(), LocatedInferError> {
+        let Some((target_scope, crossed)) = self.telescope.split_at(target) else {
+            return self.require_sub(contribution, history, at);
+        };
+        let exit_of = |name: &Name| {
+            self.scope_exits
+                .get(name)
+                .and_then(|exits| exits.last())
+                .unwrap_or_else(|| panic!("no scope exit recorded for the binder `{name}`"))
+        };
+        // `crossed` is innermost first, so a binder is inside the outermost joined one when
+        // that one comes later in it.
+        let outermost_join = crossed
+            .iter()
+            .rposition(|name| matches!(exit_of(name), ScopeExit::Join));
+        let exits = crossed
+            .iter()
+            .enumerate()
+            .fold(Subst::id(), |exits, (i, name)| {
+                let exit = match exit_of(name) {
+                    ScopeExit::Discharge(definition) => {
+                        Subst::discharge(name.clone(), definition.clone_preserving_ids())
+                    }
+                    ScopeExit::Keep if outermost_join.is_none_or(|j| j < i) => return exits,
+                    ScopeExit::Keep | ScopeExit::Join => Subst::join(name.clone()),
+                };
+                Subst::then(&exits, &exit)
+            });
+        // The joined binders each crossed binder varies with, outermost first: a joined
+        // binder varies with itself, and a discharged `let` with those of the binders its
+        // definition reads.
+        let mut varying: HashMap<&Name, Vec<Name>> = HashMap::new();
+        for (i, name) in crossed.iter().enumerate().rev() {
+            let with = match exit_of(name) {
+                ScopeExit::Discharge(definition) => crossed[i + 1..]
+                    .iter()
+                    .filter(|outer| crate::ccl::ccl_utils::is_free(outer, definition))
+                    .flat_map(|outer| varying[outer].iter().cloned())
+                    .collect(),
+                ScopeExit::Keep if outermost_join.is_none_or(|j| j < i) => Vec::new(),
+                ScopeExit::Keep | ScopeExit::Join => vec![name.clone()],
+            };
+            varying.insert(name, with);
+        }
+        let lets: Vec<(Name, Vec<Name>)> = varying
+            .into_iter()
+            .filter(|(name, with)| {
+                !with.is_empty() && matches!(exit_of(name), ScopeExit::Discharge(_))
+            })
+            .map(|(name, with)| (name.clone(), with))
+            .collect();
+        self.varies_with.extend(lets);
+        if exits.is_id() {
+            return self.require_sub(contribution, history, at);
+        }
+        // The contribution reaches `history` through a variable standing where `target` is
+        // bound, whose lower edge carries the exits, as a `let`'s lifted type does
+        // (`close_let_type`): the contribution is usually a variable whose refinements
+        // arrive as bounds, so the exits apply when the solver forces the edge.
+        let crossing = InferVar::fresh_in(self.level, &target_scope);
+        let bound = Bound::with_subst(contribution.clone(), exits);
+        enforce_bound_scope(&crossing, "lower", &bound);
+        crossing.bounds.borrow_mut().lower_mut().push(bound);
+        self.require_sub(&Type::Infer(crossing), history, at)
+    }
+
+    /// Name, in each [`InferError::NoJoinOverBinder`], the joined binders a crossed `let`
+    /// varies with in place of the `let`. The exit composed over a `let` whose definition
+    /// reads a joined binder joins over the `let` as well ([`Subst::then`]), so compaction
+    /// reports the `let`, and the binders taking several values are the ones it reads.
+    pub(super) fn name_varying_binders(&self, errors: &mut [LocatedInferError]) {
+        for e in errors {
+            if let InferError::NoJoinOverBinder { binders, .. } = &mut e.error {
+                let mut named: Vec<Name> = Vec::new();
+                for b in binders.drain(..) {
+                    for v in self.varies_with.get(&b).cloned().unwrap_or_else(|| vec![b]) {
+                        if !named.contains(&v) {
+                            named.push(v);
+                        }
+                    }
+                }
+                *binders = named;
+            }
+        }
+    }
+
     /// `lit`'s singleton type, with its predicate shared across every occurrence
     /// of the same literal value in this pass (see [`Self::lit_singletons`]).
     pub(super) fn lit_singleton(&mut self, lit: &Lit) -> Type {
@@ -1224,27 +1421,12 @@ impl Typing for InferCtx {
         out
     }
 
+    fn scoped_mut<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.scoped_exiting(name, ty, ScopeExit::Keep, f)
+    }
+
     fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.scopes.push_scope();
-        // Monomorphic binder: lambda params and pattern/loop binders are not
-        // generalized. The scheme's cutoff is the *current* level, not 0:
-        // these binders' variables are minted at `self.level` (a `let` RHS may
-        // have bumped it), and a cutoff below that would wrongly quantify them,
-        // freshening the binder on every use and severing it from its body
-        // constraints. `poly(self.level, ty)` quantifies nothing at this level,
-        // so `instantiate` returns the binder's variables verbatim.
-        self.scopes.bind(
-            name,
-            Binding {
-                scheme: PolyScheme::poly(self.level, ty.clone()),
-                generalized: false,
-                defined_at: self.current_node(),
-                poisoned: false,
-            },
-        );
-        let r = self.under_binder(name, f);
-        self.scopes.pop_scope();
-        r
+        self.scoped_exiting(name, ty, ScopeExit::Join, f)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -1305,10 +1487,15 @@ impl Typing for InferCtx {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
+        definition: Option<&Expr>,
         let_scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let entry = self.let_scope_binding(binding, let_scheme);
+        let (entry, exit) = self.let_scope_binding(binding, definition, let_scheme);
+        self.scope_exits
+            .entry(binding.name.clone())
+            .or_default()
+            .push(exit);
         self.scopes.push_scope();
         self.scopes.bind(binding.name.clone(), entry);
         let r = self.under_binder(&binding.name, f);
@@ -1316,11 +1503,16 @@ impl Typing for InferCtx {
         r
     }
 
-    fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(
+        &mut self,
+        binding: &TypedBinding,
+        _bound_expr: &Expr,
+        body_ty: Type,
+    ) -> Type {
         let name = &binding.name;
         // Lifting the body's type past the binder is an application: a `let`
         // telescope entry carries its definiens, so the lift discharges
-        // `[name ↦ bound_expr]` (`src/ccl/design/type-inference.md`, "`let`
+        // `[name ↦ definition]` (`src/ccl/design/type-inference.md`, "`let`
         // binders and scope exit"). The body type is an inference variable here,
         // whose refinements accumulate as bounds rather than sitting in the
         // type, so the substitution cannot be applied to it directly. It rides
@@ -1334,38 +1526,23 @@ impl Typing for InferCtx {
         // refinement over `name` flow into the enclosing lambda's codomain,
         // which is minted outside the binder and holds no discharge for it.
         //
-        // A `:=` definiens is the exception, and for the reason `emit_mut_decl`
-        // gives for holding a mutable variable's own body back from this
-        // method: the discharge substitutes the definiens *into a type*, which
-        // needs the definiens to denote a value. A mutable variable is a
-        // history — its value is the join over the seed and every write — so a
-        // `MutDecl` denotes no value to substitute, and a `MutWrite` denotes a
-        // write rather than the written value. Both are erased before any
-        // consumer of the discharged type runs. Lift `body_ty` unchanged.
-        if matches!(
-            bound_expr.node,
-            TypedExprNode::MutDecl { .. } | TypedExprNode::MutWrite { .. }
-        ) {
-            return body_ty;
-        }
-        // An opaque binder is the second exception, and for the reverse reason:
-        // it carries no definiens to discharge, so the name stays in the lifted
-        // type. What it means there is the type it was bound at, which outlives
-        // the scope as a standing fact ([`Self::opaque_binders`], recorded by
-        // `scoped_let` on the way in) — that is how a refinement over the binder
-        // is still decided once the binder's scope has closed.
-        if binding.transparency == BindingTransparency::Opaque {
-            return body_ty;
-        }
+        // The binding's scope has closed, so no contribution crosses it again and its exit is
+        // popped. A kept binder lifts `body_ty` unchanged ([`ScopeExit::Keep`]).
+        let definition = match self.scope_exits.get_mut(name).and_then(Vec::pop) {
+            Some(ScopeExit::Discharge(definition)) => definition,
+            Some(ScopeExit::Keep) => return body_ty,
+            other => unreachable!(
+                "a `let` binder `{name}` records a discharge or keeps its name, got {}",
+                if other.is_some() { "a join" } else { "nothing" }
+            ),
+        };
         let lifted = self.fresh();
         let Type::Infer(v) = &lifted else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        let bound = crate::ccl::Bound::with_subst(
-            body_ty,
-            crate::ccl::subst::Subst::discharge(name.clone(), bound_expr.clone_preserving_ids()),
-        );
-        crate::ccl::infer_var::enforce_bound_scope(v, "lower", &bound);
+        let definition = Rc::try_unwrap(definition).unwrap_or_else(|d| d.clone_preserving_ids());
+        let bound = Bound::with_subst(body_ty, Subst::discharge(name.clone(), definition));
+        enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         lifted
     }
@@ -1526,11 +1703,11 @@ impl Typing for InferCtx {
         let Type::Infer(v) = &applied else {
             unreachable!("fresh() yields a Type::Infer var");
         };
-        let bound = crate::ccl::Bound::with_subst(
+        let bound = Bound::with_subst(
             result,
-            crate::ccl::subst::Subst::discharge(&x, argument.clone_preserving_ids()),
+            Subst::discharge(&x, argument.clone_preserving_ids()),
         );
-        crate::ccl::infer_var::enforce_bound_scope(v, "lower", &bound);
+        enforce_bound_scope(v, "lower", &bound);
         v.bounds.borrow_mut().lower_mut().push(bound);
         Ok(applied)
     }
