@@ -446,8 +446,7 @@ describe("the values pane", () => {
     live.apply(frame());
     live.inspect("Var(gone): L1", 999, [999]);
     await nextFrame();
-    // Not "no values recorded", which reads as a defect. Nothing pulled it.
-    expect(body.textContent).toContain("not pulled yet");
+    expect(body.textContent).toContain("nothing has flowed here yet");
   });
 
   // The operator's kind comes from the static payload, so a group is named even
@@ -461,10 +460,10 @@ describe("the values pane", () => {
     await nextFrame();
 
     expect(body.textContent).toContain("#999 ExtractFinal");
-    expect(body.textContent).toContain("not pulled yet");
+    expect(body.textContent).toContain("nothing has flowed here yet");
   });
 
-  // Once the run is over, "not pulled" is permanent and reads differently.
+  // Once the run is over, silence is permanent and reads differently.
   it("says a silent operator produced nothing once the run has finished", async () => {
     const live = new LiveStore();
     const body = document.createElement("div");
@@ -473,8 +472,8 @@ describe("the values pane", () => {
     live.inspect("Var(gone): L1", 999, [999]);
     await nextFrame();
 
-    expect(body.textContent).toContain("produced nothing during the run");
-    expect(body.textContent).not.toContain("not pulled yet");
+    expect(body.textContent).toContain("nothing flowed here during the run");
+    expect(body.textContent).not.toContain("nothing has flowed here yet");
   });
 
   // A recorded operator shows both: what it is, and which producer ran.
