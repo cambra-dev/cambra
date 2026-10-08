@@ -22,6 +22,7 @@ function probe(seq: number, value: string): LiveProbe {
 /** A frame whose every probe carries a new answer: its `seq` is the frame's count. */
 function frame(published: number, nodes: [number, string][], final = false): LiveFrame {
   return {
+    version: 0,
     published,
     final,
     nodes: nodes.map(([nodeId, value]) => ({ nodeId, probes: [probe(published, value)] })),
@@ -31,6 +32,7 @@ function frame(published: number, nodes: [number, string][], final = false): Liv
 
 const empty: LiveState = {
   status: { kind: "connecting" },
+  version: 0,
   nodes: new Map(),
   sources: new Map(),
   tags: [],
@@ -67,6 +69,23 @@ describe("applyFrame", () => {
     const repeat: LiveFrame = { ...frame(4, []), nodes: [{ nodeId: 10, probes: [probe(1, '"a"')] }] };
     const state = applyFrame(first, repeat);
     expect(state.nodes.get(10)?.probes[0]?.changedAt).toBe(1);
+  });
+
+  // A reload rebuilds operators under fresh ids and may hand an old id's
+  // number to nothing, so entries from the version before it are dropped
+  // rather than left to read as the new version's.
+  it("drops every cached entry when a frame names another version", () => {
+    const sourced: LiveFrame = {
+      ...frame(1, [[10, '"a"']]),
+      sources: [{ nodeIds: [20], name: "stdin", total: 1, dropped: 0, rows: [] }],
+    };
+    const before = applyFrame(empty, sourced);
+    const after = applyFrame(before, { ...frame(2, [[11, '"b"']]), version: 2 });
+
+    expect(after.version).toBe(2);
+    expect(after.nodes.has(10)).toBe(false);
+    expect(after.nodes.get(11)?.probes[0]?.rows[0]?.value).toBe('"b"');
+    expect(after.sources.size).toBe(0);
   });
 
   it("reads a final frame as a finished run", () => {
@@ -185,5 +204,25 @@ describe("LiveStore tags", () => {
     store.subscribe(() => seen.push("second"));
     store.inspect("a", 1, [1]);
     expect(seen).toEqual(["second"]);
+  });
+});
+
+describe("LiveStore.retag", () => {
+  // A tag names ids minted per compile, so after a reload each is either found
+  // again in the new payload or dropped; it is never left naming old ids.
+  it("re-points the tags it can resolve and drops the rest, keeping their shown state", () => {
+    const live = new LiveStore();
+    const span = { start: 0, end: 1, text: "x" };
+    live.inspect("Var(x): L1", 1, [10], span);
+    live.inspect("Var(y): L2", 2, [20], span);
+    live.toggleTag("Var(x): L1");
+
+    live.retag((tag) =>
+      tag.label === "Var(x): L1" ? { id: tag.id, label: tag.label, anchorId: 5, nodes: [50], span } : null,
+    );
+
+    expect(live.get().tags).toEqual([
+      { id: "Var(x): L1", label: "Var(x): L1", anchorId: 5, nodes: [50], span, shown: false },
+    ]);
   });
 });
