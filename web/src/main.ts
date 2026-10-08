@@ -33,7 +33,7 @@ import { SourceView } from "./sourceView";
 import { ElkLayout } from "./graph/elk";
 import { OperatorView, serializeOperatorGraph } from "./operatorView";
 import { TreeView, serializeTree } from "./treeView";
-import { LiveStore, connectLive } from "./liveStore";
+import { LiveStore, connectLive, type LiveStatus } from "./liveStore";
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
@@ -129,11 +129,28 @@ export function renderDiagnostics(
   parent.appendChild(box);
 }
 
+/** The header badge's text for a live run's status. */
+function valuesBadge(status: LiveStatus): string {
+  switch (status.kind) {
+    case "connecting":
+      return "waiting for values";
+    case "not-run":
+      return "static (no values)";
+    case "live":
+      return `live · frame ${status.published}`;
+    case "finished":
+      return "finished";
+    case "lost":
+      return "disconnected";
+  }
+}
+
 function renderHeader(
   parent: HTMLElement,
   snap: Snapshot,
   panes: readonly PaneDescriptor[],
   visibility: PaneVisibility,
+  live?: LiveStore,
 ): void {
   const header = el("div", "header");
   header.appendChild(el("span", "title", "Cambra Inspector"));
@@ -142,8 +159,19 @@ function renderHeader(
   const failed = snap.meta.payloadKind === "failed";
   header.appendChild(el("span", `badge${failed ? " failed" : ""}`, snap.meta.payloadKind));
 
-  // The payload describes the program, with no execution and no values.
-  header.appendChild(el("span", "badge", "static (no values)"));
+  // Whether values are flowing, which is a different question from whether the
+  // payload compiled. With no live store nothing drives the program
+  // (`--inspect-only`, a dump), so the badge is static; with one, it follows the
+  // store's status.
+  const values = el("span", "badge", "static (no values)");
+  header.appendChild(values);
+  if (live) {
+    const describe = () => {
+      values.textContent = valuesBadge(live.get().status);
+    };
+    describe();
+    live.subscribe(describe);
+  }
 
   header.appendChild(el("span", "spacer"));
   renderPaneMenu(header, panes, visibility);
@@ -378,7 +406,7 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): vo
   );
 
   root.replaceChildren();
-  renderHeader(root, store.snapshot, panes, visibility);
+  renderHeader(root, store.snapshot, panes, visibility, live);
 
   const panels = el("div", "panels");
   root.appendChild(panels);
