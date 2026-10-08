@@ -1,8 +1,8 @@
 # CHL Parser Design
 
-`chl-parser` converts source text into a span-bearing AST. It also returns diagnostics and,
-when recovery succeeds, a partial AST. Recovery can preserve later statements after a local
-error; it does not guarantee a diagnostic for every invalid construct in the file.
+`chl-parser` converts source text into a span-bearing AST. Its recovery aims to report every
+problem in a file in one pass: it returns diagnostics and, when recovery succeeds, a partial AST.
+The limits on that are under [Error recovery](#error-recovery).
 
 ## Stack: logos + chumsky
 
@@ -385,7 +385,8 @@ type. Re-entering a recursive expression parser then does not clone a concrete t
 every intervening combinator layer. This limits representation-related stack costs; it does
 not establish a fixed nesting limit or prove that arbitrary nesting cannot exhaust the stack.
 
-Keep boxes at the established recursive/precedence boundaries unless stack behavior is measured.
+Keep boxes at the established recursive/precedence boundaries. Without them, four levels of
+nested calls (`f(f(f(f(1))))`) overflowed a 2 MiB test thread stack.
 The grammar does not specify a portable maximum nesting depth.
 
 ## Testing

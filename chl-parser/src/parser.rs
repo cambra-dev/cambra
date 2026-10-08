@@ -722,6 +722,7 @@ where
             };
 
         // Keep recursive re-entry from cloning the full concrete combinator chain.
+        // Without these boxes, `f(f(f(f(1))))` overflowed a 2 MiB test thread stack.
         // See `chl-parser/design-chl-parser.md`, "Gotchas".
         let product = unary
             .clone()
