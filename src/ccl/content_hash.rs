@@ -146,21 +146,12 @@ fn hash_free_var(name: &Name, free: FreeVars<'_>, state: &mut DefaultHasher) {
     }
 }
 
-/// The domain-refinement predicate **terms** carried by a cast `target` type —
-/// the borrowing companion to
-/// [`crate::ccl::ccl_utils::cast_target_refinement`] (which clones the set).
+/// Borrow predicates from an immediately refined function domain in a cast target.
 ///
-/// A refinement predicate is a *term* (`Rc<TypedExpr>` — the filter/join logic
-/// a comprehension lowers to), embedded in a type position. `hash_type` already
-/// folds them into a cast's hash; this borrowing accessor is what lets the
-/// *differ* descend into each predicate as a tree child (so an edit localizes to
-/// it), rather than only flagging the enclosing cast as changed.
-///
-/// A refined domain carries a [`RefinementSet`], whose physical order is
-/// meaningless by contract, so the predicates are returned in ascending
-/// [`content_hash`] order. A differ pairs a node's children by position, and
-/// one built off the set's own order would report two compilations of one
-/// program as disagreeing on which predicate is which.
+/// Other target forms return no predicates. Standalone hash order gives the differ
+/// a canonical child order under the fingerprint assumptions; equal hashes have no
+/// structural tie-break. The accessor does not enumerate arbitrary nested type predicates.
+/// See `src/ccl/design/diffing.md`, "Order-insensitivity where the language is".
 pub(crate) fn cast_target_predicates(target: &Type) -> Vec<&TypedExpr> {
     let Type::Fun { domain, .. } = target else {
         return Vec::new();
@@ -546,22 +537,12 @@ fn hash_payload<'a>(
     }
 }
 
-/// Hash `e` relative to the binder environment `env` (in-scope binders,
-/// innermost last) and return a finalized 64-bit hash. Child contributions are
-/// finalized recursively and folded into this node's hasher; ordered children
-/// are folded in position order, unordered children (records, collection
-/// unions) are sorted first so the hash is permutation-invariant.
+/// Hash one subtree under its positional binder environment and free-name policy.
 ///
-/// The scoping — which binders `env` is extended by over which child — is not
-/// decided here. It comes from [`for_each_scoped_item`], the crate's single
-/// statement of CCL's binding structure, which the free-variable walkers fold
-/// over too. That shared source is what makes a divergence impossible; a
-/// divergence would be a correctness bug rather than a style difference,
-/// because it would make the hash disagree with α-equivalence.
-///
-/// What *is* decided here is the associative–commutative folding of the
-/// set-shaped nodes (`Record`, `DisjointJoin`), which is a property of their
-/// algebra rather than of their scoping.
+/// `for_each_scoped_item` supplies term references, key references and scoped children.
+/// Each child restores the environment depth after recursion. Record fields and
+/// disjoint-join operands are sorted locally; other children retain traversal order.
+/// See `src/ccl/design/diffing.md`, "Scoping comes from one place".
 fn hash_rel<'a>(
     e: &'a TypedExpr,
     env: &mut Vec<&'a Name>,
@@ -615,10 +596,8 @@ fn hash_rel<'a>(
         _ => children.hash(&mut h),
     }
 
-    // The node's own inferred type and user annotation. Types are meaningful,
-    // so the hash is type-aware — refinements participate via `hash_rel` (see
-    // `hash_type`). Pre-inference these `ty`s are `Hole` (a constant tag);
-    // post-inference they carry the resolved type.
+    // Inferred types and explicit annotations participate even before inference:
+    // lowering can already construct non-Hole types and refinement predicates.
     hash_type(&e.ty, env, wenv, free, &mut h);
     hash_opt_type(e.user_annotation.as_ref(), env, wenv, free, &mut h);
     h.finish()
