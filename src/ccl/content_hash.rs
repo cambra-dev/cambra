@@ -316,13 +316,11 @@ fn hash_type<'a>(
             predicates.hash(state);
         }
         T::History {
-            value,
-            domain,
+            function,
             history_kind,
         } => {
             history_kind.hash(state);
-            hash_type(value, env, wenv, free, state);
-            hash_type(domain, env, wenv, free, state);
+            hash_type(function, env, wenv, free, state);
         }
     }
 }
@@ -863,11 +861,7 @@ mod tests {
                     ]),
                     "bounded" => Type::BoundedHole(Box::new(Type::Tuple(vec![a, b]))),
                     "function" => Type::fun(a, b),
-                    "history" => Type::History {
-                        value: Box::new(a),
-                        domain: Box::new(b),
-                        history_kind: HistoryKind::Overwrite,
-                    },
+                    "history" => Type::history(b, a, HistoryKind::Overwrite),
                     _ => unreachable!(),
                 },
                 container,
@@ -911,6 +905,7 @@ mod tests {
                         Box::new(fixed_pair),
                         RefinementSet::one(Refinement {
                             predicate: Rc::new(predicate),
+                            normal: Default::default(),
                         }),
                     )
                 },
@@ -1027,6 +1022,7 @@ mod tests {
                 Box::new(Type::Base(BaseType::Int)),
                 RefinementSet::one(Refinement {
                     predicate: Rc::new(pred),
+                    normal: Default::default(),
                 }),
             ))
         };

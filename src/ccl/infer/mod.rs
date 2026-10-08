@@ -137,7 +137,7 @@ fn blame_node_for_place(
             Type::Fun {
                 domain, codomain, ..
             } => mentions(domain, uid) || mentions(codomain, uid),
-            Type::History { value, domain, .. } => mentions(value, uid) || mentions(domain, uid),
+            Type::History { function, .. } => mentions(function, uid),
             Type::Tuple(elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),

@@ -442,6 +442,17 @@ pub struct CompactWitness {
     pub type_kind: CompactTypeKind,
 }
 
+/// A history in a compacted position: its function's binder, domain and value, the two
+/// children compacted at the history's own polarity (`CompactType::history_slot`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactHistory {
+    /// The function's binder, `na.or(nb)` on merge, as [`CompactFun::name`].
+    pub name: Option<Name>,
+    pub value: Box<CompactType>,
+    pub domain: Box<CompactType>,
+    pub kind: HistoryKind,
+}
+
 /// A merged function shape — the **single** carrier for every function-shaped type,
 /// plain function and dependent sum alike. What distinguishes them is the
 /// [`CompactTypeKind`], so both reach one position through one slot and
@@ -832,7 +843,7 @@ pub struct CompactType {
     /// compaction runs both directions' information has already been propagated
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
-    pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
+    pub history_slot: Option<CompactHistory>,
     /// **Kinding** constraints gathered from the variables contributing here —
     /// `α :: 𝐾` for each, conjunctively. Folded in by the variable walk exactly as
     /// its bounds are, and discharged by
@@ -990,7 +1001,7 @@ impl CompactType {
             || self
                 .history_slot
                 .as_ref()
-                .is_some_and(|(v, d, _)| v.conflicted() || d.conflicted())
+                .is_some_and(|h| h.value.conflicted() || h.domain.conflicted())
     }
 
     /// Does this position name a type? Exactly one shape here, and no conflict below.
@@ -1084,7 +1095,12 @@ impl CompactType {
             }
             && match (history_slot, &other.history_slot) {
                 (None, None) => true,
-                (Some((v, d, k)), Some((v2, d2, k2))) => k == k2 && v.equiv(v2) && d.equiv(d2),
+                (Some(a), Some(b)) => {
+                    a.name == b.name
+                        && a.kind == b.kind
+                        && a.value.equiv(&b.value)
+                        && a.domain.equiv(&b.domain)
+                }
                 _ => false,
             }
             && match (fun, &other.fun) {
@@ -1169,13 +1185,18 @@ impl CompactType {
         // history/history rule rejects that), so keep either side's kind.
         let history_slot = match (lhs.history_slot, rhs.history_slot) {
             (None, m) | (m, None) => m,
-            (Some((va, da, ka)), Some((vb, db, kb))) => {
-                debug_assert_eq!(ka, kb, "compaction merged histories of different kinds");
-                Some((
-                    Box::new(Self::merge(pol, *va, *vb)),
-                    Box::new(Self::merge(pol, *da, *db)),
-                    ka,
-                ))
+            (Some(a), Some(b)) => {
+                debug_assert_eq!(
+                    a.kind, b.kind,
+                    "compaction merged histories of different kinds"
+                );
+                Some(CompactHistory {
+                    // Either side's binder, as a function's merge takes `na.or(nb)`.
+                    name: a.name.or(b.name),
+                    value: Box::new(Self::merge(pol, *a.value, *b.value)),
+                    domain: Box::new(Self::merge(pol, *a.domain, *b.domain)),
+                    kind: a.kind,
+                })
             }
         };
         CompactType {
@@ -1455,9 +1476,10 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
             .fun
             .iter()
             .all(|f| refinement_slot_present(&f.domain) && refinement_slot_present(&f.codomain))
-        && ct.history_slot.iter().all(|(value, domain, _)| {
-            refinement_slot_present(value) && refinement_slot_present(domain)
-        })
+        && ct
+            .history_slot
+            .iter()
+            .all(|h| refinement_slot_present(&h.value) && refinement_slot_present(&h.domain))
 }
 
 /// The variables whose bounds the current path is walking, as a chain of stack
@@ -1494,7 +1516,8 @@ impl ParentPath<'_> {
 /// The two fields say which position the walk is reading and how, and every step moves
 /// them together. Bundling them makes that hold by construction: a structural child takes
 /// `Position::default()`, a step along a variable's bound chain takes
-/// [`Position::under`], and a function's domain takes [`Position::domain_of`]. Nothing
+/// [`Position::under`], a function's domain takes [`Position::domain_of`], and a sum's
+/// candidate takes [`Position::candidate`]. Nothing
 /// else constructs one, so no call site can reset half of a position.
 #[derive(Clone, Copy, Default)]
 struct Position<'a> {
@@ -1515,6 +1538,17 @@ impl<'a> Position<'a> {
         Position {
             parents: None,
             invariant: fun_kind.resolved().is_data(),
+        }
+    }
+
+    /// A sum's candidate: a domain its witness ranges over, so a data domain like any other,
+    /// and invariant (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). `box`
+    /// shares one variable between its argument's domain and its candidate, and the two
+    /// readings must agree.
+    fn candidate() -> Self {
+        Position {
+            parents: None,
+            invariant: true,
         }
     }
 
@@ -1668,16 +1702,23 @@ fn var_binder_kind(
     // negative position — two collections below one kind are a conditional over both, so
     // their candidate sets union, and a negative occurrence of that kind does not turn the
     // union into the empty kind, which admits no type at all.
-    let merged = |ks: Vec<crate::ccl::ty::FunKind>,
+    // Each kind is read across its edge under the substitution the edge was recorded under,
+    // composed before the walk's own, as a bound's content is
+    // ([`crate::ccl::ty::FunKindVar::record_under`]).
+    let merged = |ks: Vec<(crate::ccl::ty::FunKind, Subst)>,
                   joining: bool,
                   through: bool,
                   st: &mut CompactState,
                   seen: &mut _| {
         ks.iter()
-            .filter_map(|f| kind_at(f, position, pol, through, subst_acc, st, seen))
+            .filter_map(|(f, edge)| {
+                let acc = Subst::then(edge, subst_acc);
+                kind_at(f, position, pol, through, &acc, st, seen)
+            })
             .reduce(|a, b| CompactTypeKind::merge(joining, a, b))
     };
-    merged(k.lower(), true, true, st, seen).or_else(|| merged(k.upper(), false, false, st, seen))
+    merged(k.lower_edges(), true, true, st, seen)
+        .or_else(|| merged(k.upper_edges(), false, false, st, seen))
 }
 
 /// The same question of one kind, concrete or variable — a concrete kind states its binders,
@@ -1733,7 +1774,7 @@ fn compact_type_kind(
             .map(|d| {
                 let depth = std::mem::take(&mut st.data_domain_depth);
                 let outer = st.candidate_widened.replace(false);
-                let candidate = compact_go(d, pol, subst_acc, Position::default(), st);
+                let candidate = compact_go(d, pol, subst_acc, Position::candidate(), st);
                 let widened = std::mem::replace(&mut st.candidate_widened, outer);
                 st.data_domain_depth = depth;
                 if widened == Some(true) {
@@ -1941,22 +1982,29 @@ fn compact_go(
             for r in refinements {
                 // **A refinement naming a joined binder** states something per value of the
                 // binder. In a sum's candidate the candidate widens; in a data domain there
-                // is no join, since each value has its own keys; anywhere else the join of
-                // the values drops it.
-                if subst_acc.joins_refinement(r) {
+                // is no join, since each value has its own keys, unless the target's key
+                // determines every joined binder it names, which then reads at the key;
+                // anywhere else the join of the values drops it.
+                let in_data_domain = st.candidate_widened.is_none() && st.data_domain_depth > 0;
+                let at_key = in_data_domain
+                    && subst_acc.joins_refinement(r)
+                    && !subst_acc.joins_unkeyed_refinement(r);
+                if !at_key && subst_acc.joins_refinement(r) {
                     match &mut st.candidate_widened {
                         Some(widened) => *widened = true,
-                        None if st.data_domain_depth > 0 => {
-                            st.join_violations.push(JoinViolation {
-                                binders: subst_acc.joined_in(&r.predicate),
-                                refinement: r.clone(),
-                            })
-                        }
+                        None if in_data_domain => st.join_violations.push(JoinViolation {
+                            binders: subst_acc.joined_in(&r.predicate),
+                            refinement: r.clone(),
+                        }),
                         None => {}
                     }
                     continue;
                 }
-                let r = subst_acc.force_refinement(r);
+                let r = if at_key {
+                    subst_acc.in_data_domain().force_refinement(r)
+                } else {
+                    subst_acc.force_refinement(r)
+                };
                 // References to the walk's enclosing binders become indices
                 // before the refinement is compared or stored.
                 let r = st.scope.close(&r);
@@ -2135,16 +2183,36 @@ fn compact_go(
         // invariant in both (enforced at constraint time, so this is
         // materialization only; see the `CompactType::history_slot` docs).
         // A new position per child. The `kind` (overwrite vs
-        // feed) rides along so coalesce rebuilds the same flavour.
+        // feed) rides along so coalesce rebuilds the same flavour. The value is under the
+        // function's binder, which it crosses as a function's codomain does, named or not.
         Type::History {
-            value,
-            domain,
+            function,
             history_kind,
         } => {
-            let value = compact_go(value, pol, subst_acc, Position::default(), st);
+            let Type::Fun {
+                name,
+                domain,
+                codomain: value,
+                ..
+            } = function.as_ref()
+            else {
+                unreachable!("a history's function is an unrefined function, got {function}")
+            };
             let domain = compact_go(domain, pol, subst_acc, Position::default(), st);
+            let value_acc = match name {
+                Some(b) => subst_acc.shadow(b),
+                None => subst_acc.clone(),
+            };
+            st.scope.enter(name.clone());
+            let value = compact_go(value, pol, &value_acc, Position::default(), st);
+            st.scope.exit();
             CompactType {
-                history_slot: Some((Box::new(value), Box::new(domain), *history_kind)),
+                history_slot: Some(CompactHistory {
+                    name: name.clone(),
+                    value: Box::new(value),
+                    domain: Box::new(domain),
+                    kind: *history_kind,
+                }),
                 ..CompactType::value()
             }
         }

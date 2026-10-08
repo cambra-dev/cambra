@@ -951,7 +951,7 @@ in __read ^+ i
 to
 let __read : (Int ⇒ Int@3) = x ▷ const
 in (((id, __read ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
-with (Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})",
+with (Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == i ▷ (x ▷ const) ^+ i})",
     )
 }
 
@@ -998,7 +998,7 @@ x := 3
 ys = [x ^+ i for i in [1,2,3] if i > 1]
 ys
     "#},
-    "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})"
+    "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == i ▷ (x ▷ const) ^+ i})"
 )]
 #[case::nested(
     indoc! {r#"
@@ -1006,7 +1006,7 @@ x := 3
 ys = [[x ^+ j for j in [1,2]] for i in [1,2] if i > 1]
 ys
     "#},
-    "(Int ⇒ Int) vs ((j: Int) ⇒ {Int | __elem == x ▷ const ^+ j})"
+    "(Int ⇒ Int) vs ((j: Int) ⇒ {Int | __elem == j ▷ (x ▷ const) ^+ j})"
 )]
 fn a_comprehension_that_reads_a_mut_fails_lambda_elims_reconstruction(
     #[case] code: &str,

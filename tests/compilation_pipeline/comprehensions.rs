@@ -887,41 +887,6 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
     );
 }
 
-/// A correlated filter with **no aggregate over it** does not compile, where the same filter
-/// under a `sum` does (`a_correlated_inner_comprehension_runs_per_outer_row`,
-/// `correlated_filter`). The one predicate ends up spelled two ways — the term reads the outer
-/// list through the iteration record, while the copy in the type reads it through a `let` —
-/// and lambda elimination's check that a node keeps its type rejects the pair:
-///
-/// ```text
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > (let __anf = [1, 2] in __iter_record ▷ __anf)} ⤇ Int)
-/// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
-/// ```
-///
-/// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim
-/// wall, which reports the same disagreement as a collection-domain mismatch.
-///
-/// The fault is below the re-basing rewrite rather than in it: the rewrite that reaches one
-/// occurrence does not reach the other (`refinements-dependent-projection-of-a-refined-pair`
-/// in the issue tracker).
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "lambda elimination changed a node's type")
-)]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "Type mismatch for collection domain")
-)]
-fn a_correlated_filter_without_an_aggregate_does_not_compile() {
-    check_tile(
-        "[[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]",
-        // `[[2, 3], [6]]` if it compiled.
-        make_int_list(&[]),
-    );
-}
-
 /// A correlated filter whose **body** reads nothing outer. The outer binder is free only in
 /// the filter, which `lambda_elim` rewrites to the refined lambda it denotes, so the site is
 /// the same pair a correlated body makes and the filter rides it.

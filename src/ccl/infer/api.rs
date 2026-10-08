@@ -89,6 +89,7 @@ impl Drop for InferArena {
             // which watches the obligation — a cycle of exactly the kind the bound
             // lists make, and severed the same way.
             var.watches.borrow_mut().clear();
+            var.suspensions.borrow_mut().clear();
         }
     }
 }
@@ -919,11 +920,30 @@ impl LocatedInferError {
 /// place it diverges. Only ever computed on this path: `Debug` of a type carrying a compiled
 /// predicate runs to a hundred kilobytes, which is exactly why the excerpt is a window and
 /// not the whole thing.
+/// `debug` with every `node_id: NodeId(…)` field removed.
+fn without_node_ids(debug: &str) -> String {
+    const FIELD: &str = "node_id: NodeId(";
+    let mut out = String::with_capacity(debug.len());
+    let mut rest = debug;
+    while let Some(start) = rest.find(FIELD) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + FIELD.len()..];
+        rest = after.find(')').map_or("", |end| &after[end + 1..]);
+    }
+    out.push_str(rest);
+    out
+}
+
 fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     if type_a.to_string() != type_b.to_string() {
         return None;
     }
-    let (a, b) = (format!("{type_a:?}"), format!("{type_b:?}"));
+    // A predicate's node ids name where its nodes came from, not what the type says, so the
+    // comparison skips them.
+    let (a, b) = (
+        without_node_ids(&format!("{type_a:?}")),
+        without_node_ids(&format!("{type_b:?}")),
+    );
     let Some(at) = a
         .char_indices()
         .zip(b.chars())
@@ -1859,8 +1879,7 @@ fn collect_type_errors(
             }
         }
         Type::History {
-            value,
-            domain,
+            function,
             history_kind,
         } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
@@ -1875,8 +1894,7 @@ fn collect_type_errors(
                     "{what} at `{context_sym}`"
                 )));
             }
-            collect_type_errors(value, context_sym, strictness, errors, seen_refinements);
-            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(function, context_sym, strictness, errors, seen_refinements);
         }
         Type::Refinement(inner, refinements) => {
             // Walk each predicate term only once: a predicate term shared by
@@ -2113,10 +2131,10 @@ fn check_no_nested_mut(
         // below, whose children are still walked with `allow_mut = false` (a
         // `Overwrite` buried in a feed's value/domain is a nested violation).
         Type::History {
-            value,
-            domain,
             history_kind: HistoryKind::Overwrite,
+            ..
         } => {
+            let (domain, value, _) = ty.history_parts().expect("matched a history");
             if !allow_mut {
                 errors.push(InferError::MutInCompositeType {
                     at: at(),

@@ -110,6 +110,11 @@ pub(super) trait Typing {
     /// resolved so far. Check resolves no names, so it answers `0`.
     fn poisoned_reads(&self) -> usize;
 
+    /// How many errors emission has recovered from so far ([`Self::recover`]), reported
+    /// or not. A statement recovered from leaves its nodes untyped. Check returns the
+    /// error rather than recovering, so it answers `0`.
+    fn recoveries(&self) -> usize;
+
     /// Obtain the type of a child sub-expression. In Emit mode this recurses
     /// via [`emit_node`](super::emit::emit_node), emitting the child's
     /// constraints and writing its inferred type onto the child node.
@@ -295,6 +300,39 @@ pub(super) trait Typing {
     ) -> R
     where
         Self: Sized;
+
+    /// Record that `binder` is a loop's variable, ranging over `source`'s values at type
+    /// `item`, one per position of type `position`. Emit keeps it for a feed that crosses the
+    /// binder, whose channel is keyed by the loop's position, so the binder is `𝑘 ▷ source`
+    /// at the key `𝑘` ([`InferCtx::require_feed`](super::context::InferCtx::require_feed)).
+    /// `position_binder` is the binder of a dependent source's type, which the chain scopes
+    /// over the loop's body as the position itself, so it is `𝑘`. Check trusts the recorded
+    /// types and keeps nothing.
+    fn note_loop_source(
+        &mut self,
+        _binder: &Name,
+        _position_binder: Option<&Name>,
+        _source: &Expr,
+        _position: &Type,
+        _item: &Type,
+    ) {
+    }
+
+    /// Run `f` inside a transaction block. A feed inside the block is keyed by commit time
+    /// rather than by the positions of the loops around it, so Emit marks where the block
+    /// begins. Check keeps nothing.
+    fn in_transaction<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        f(self)
+    }
+
+    /// Record whether the feed channel `defer` is fed from one place: one `<<` naming it, no
+    /// `<<=` defining it, and no call it is passed to, which could feed it from another. A
+    /// channel fed from one place is keyed by the positions of the loops around that place.
+    /// Check keeps nothing.
+    fn note_feed_place(&mut self, _defer: &Name, _one_place: bool) {}
 
     /// Close a `let` body's type over its binder when lifting it to the `let`
     /// node: discharge `[name ↦ bound_expr]` into refinement predicates

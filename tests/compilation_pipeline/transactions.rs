@@ -548,9 +548,8 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 /// a record field or a tuple component, of a seed written as a literal or bound first, or of a
 /// write (`mut_elim::view_values_at_value_type`).
 ///
-/// Every map here holds two keys. A one-key map gives its key domain a second refinement and does
-/// not compile; that shape is pinned in
-/// [`a_one_key_map_inside_a_product_does_not_compile`].
+/// Every map here holds two keys. A one-key map, whose key domain carries a second refinement, is
+/// [`a_one_key_map_inside_a_product`].
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::record_seed(
@@ -601,33 +600,14 @@ fn a_sum_inside_a_product_enters_its_declared_sum(#[case] code: &str, #[case] ex
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
-/// The same shape over a **one-key** map does not compile: the map's key domain acquires a second
-/// refinement, and the two places that spell that domain disagree about it.
-///
-/// A one-element list literal's element type keeps the literal's singleton refinement, so the key
-/// morphism `λ __map_kv → __map_kv.0` has codomain `String@"x"` and `present_key_domain` bases the
-/// key domain on it: `{String | __elem == "x", __elem ▷ (([("x", 1)] ≫ .0) ▷ collection_contains)}`.
-/// `box_intro` shares one variable between its parameter's domain and its sum's sole candidate
-/// (`src/ccl/infer/schemes.rs`), so the two are one type. The inferred node has them differing —
-/// the candidate carries the `collection_contains` conjunct alone — which is the defect this pins.
-/// A map of two or more keys joins its key types to the bare `String`, leaving the two spellings
-/// equal and the disagreement unobservable.
-///
-/// The `box` between them reads neither: entering a sum makes the argument's domain the witness.
-/// A-normalization binds the seed's boxed field first, so `view_at_value_type` meets a `Let` rather
-/// than a record literal and takes the `spell_out_product` path, which writes the candidate
-/// spelling onto a `__seed` binder. Realization then erases the single-candidate box and leaves
-/// that binder at the concrete collection type, while `plan_loops` stamps the `converse` chain it
-/// rebuilds at the group-by head's domain, the two-conjunct one. A collection's domain is
-/// invariant, so the post-planning `typecheck` rejects the pair.
-///
-/// Either consumer could strip the singleton, and either would leave `box`'s shared variable
-/// holding two types. The fix belongs on the instantiation.
-// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether the
-// gap closed, regressed, or went away, and nothing runs ignored tests here.
+/// The same shape over a **one-key** map. Its key domain keeps the literal's singleton
+/// refinement beside the membership one: `{String | __elem == "x", __elem ▷ (([("x", 1)] ≫ .0) ▷
+/// collection_contains)}`. `box_intro` shares one variable between its parameter's domain and its
+/// sum's sole candidate (`src/ccl/infer/schemes.rs`), and compaction reads both as invariant
+/// positions, so the two spell the one domain. A map of two or more keys joins its key types to
+/// the bare `String`, which would leave a disagreement between the two unobservable.
 #[test]
-#[should_panic(expected = "post-planning produced an invalid tree: [Type mismatch")]
-fn a_one_key_map_inside_a_product_does_not_compile() {
+fn a_one_key_map_inside_a_product() {
     check_tile(
         indoc! {r#"
             s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1)])))

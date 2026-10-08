@@ -200,6 +200,251 @@ fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str) {
     agree(source);
 }
 
+/// Rows whose keys vary with a loop around the feed. The channel is keyed by the loops'
+/// positions and each row is typed at its own position, the loop variable read as the
+/// source's value there (`src/ccl/design/type-inference.md`, "A history's value may depend on
+/// its position").
+#[rstest]
+#[case::filtered_by_the_loop_variable(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        out << [v for v in [1, 2, 3] if v > r]
+"#})]
+#[case::grouped_by_the_loop_variable(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << [sum(g) for g in groupby([1, 2, 3, 4], \e -> e // i)]
+"#})]
+#[case::through_a_let_of_the_loop_variable(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        k = r
+        out << [v for v in [1, 2, 3] if v > k]
+"#})]
+#[case::through_a_let_computed_from_it(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        m = r + 1
+        out << [v for v in [1, 2, 3] if v > m]
+"#})]
+#[case::under_a_filtered_loop(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2, 3]:
+        if r > 1:
+            out << [v for v in [1, 2, 3] if v > r]
+"#})]
+#[case::over_a_named_source(indoc! {r#"
+    xs = [1, 2]
+    out = test_sink()
+    for r in xs:
+        out << [v for v in [1, 2, 3] if v > r]
+"#})]
+#[case::read_back_through_a_defer(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    out = test_sink()
+    out << sum([sum(row) for row in o])
+"#})]
+#[case::yielded_by_a_generator(indoc! {r#"
+    def rows(xs):
+        for x in xs:
+            yield [v for v in [1, 2, 3] if v > x]
+    out = test_sink()
+    out << sum([sum(r) for r in rows([1, 2])])
+"#})]
+#[case::under_two_loops_reading_the_outer(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [10, 20]:
+            out << [v for v in [1, 2, 3] if v > i]
+"#})]
+#[case::under_two_loops_reading_both(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            out << [v for v in [1, 2, 3] if v > i + j]
+"#})]
+#[case::under_three_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            for k in [1, 2]:
+                out << [v for v in [1, 2, 3, 4] if v > i + j - k]
+"#})]
+fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str) {
+    agree(source);
+}
+
+/// A nest whose inner loop ranges over keys chosen by the outer loop's value. The feed is
+/// keyed by the dependent tuple of the two positions (`src/ccl/design/type-inference.md`,
+/// "4.8 Dependent tuples").
+#[rstest]
+#[case::a_value_fed(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z + i for z in [1, 2, 3] if z > i]:
+            out << j
+"#})]
+#[case::rows_reading_the_inner_variable(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            out << [v for v in [1, 2, 3] if v > j]
+"#})]
+#[case::rows_over_an_inner_source_reading_the_outer(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z + i for z in [1, 2, 3] if z > i]:
+            out << [v for v in [1, 2, 3, 4, 5] if v > j]
+"#})]
+#[case::an_aggregate_per_row(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            out << sum([v for v in [1, 2, 3] if v > j])
+"#})]
+#[case::a_third_loop_over_independent_keys(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [1, 2]:
+                out << j + k
+"#})]
+#[case::a_chain_of_three_dependent_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [w for w in [1, 2, 3, 4] if w > j]:
+                out << k
+"#})]
+#[case::rows_under_three_dependent_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [w for w in [1, 2, 3, 4] if w > j]:
+                out << [v for v in [1, 2, 3, 4, 5] if v > k]
+"#})]
+#[case::a_chain_of_four_dependent_loops(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [z for z in [1, 2, 3] if z > i]:
+            for k in [w for w in [1, 2, 3, 4] if w > j]:
+                for m in [u for u in [1, 2, 3, 4, 5] if u > k]:
+                    out << m
+"#})]
+#[case::only_the_third_loop_dependent(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            for k in [w for w in [1, 2, 3, 4] if w > i + j]:
+                out << k
+"#})]
+fn a_feed_under_a_dependent_nest(#[case] source: &str) {
+    agree(source);
+}
+
+/// Boxed rows fed from a loop, each row's keys depending on the loop variable. The row's
+/// filter is a domain the loop's writer builds from the variable, so elimination pairs the
+/// variable with the row (`src/ccl/design/type-inference.md`, "A refinement on a collection's
+/// domain is data"). Read downstream, each row is a sum whose candidate leaves the loop under
+/// the feed's exits, which the kind edge carrying it records.
+#[rstest]
+#[case::to_a_sink(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        out << box([v for v in [1, 2, 3] if v > r])
+"#})]
+#[case::read_by_a_comprehension(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        o << box([v for v in [1, 2, 3] if v > r])
+    out = test_sink()
+    out << sum([sum(b) for b in o])
+"#})]
+#[case::read_by_a_loop(indoc! {r#"
+    o = defer()
+    for r in [1, 2]:
+        o << box([v for v in [1, 2, 3] if v > r])
+    out = test_sink()
+    for b in o:
+        out << sum(b)
+"#})]
+fn boxed_rows_fed_from_a_loop(#[case] source: &str) {
+    agree(source);
+}
+
+/// A feed under a loop that also writes a mutable variable. The loop is a recurrence, one
+/// decision per position, and a fed row whose keys depend on the loop variable makes the
+/// decision depend on the position, so the history of decisions is keyed by it
+/// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
+#[rstest]
+#[case::rows_reading_the_loop_variable(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for r in [1, 2]:
+        t += r
+        out << [v for v in [1, 2, 3] if v > r]
+"#})]
+#[case::fed_under_a_condition(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for r in [1, 2, 3]:
+        t += r
+        if r > 1:
+            out << [v for v in [1, 2, 3] if v > r]
+"#})]
+#[case::rows_reading_both_loops_of_a_nest(indoc! {r#"
+    t := 0
+    out = test_sink()
+    for i in [1, 2]:
+        for j in [1, 2]:
+            t += j
+            out << [v for v in [1, 2, 3, 4] if v > i + j]
+"#})]
+fn a_feed_under_a_loop_writing_a_mutable_variable(#[case] source: &str) {
+    agree(source);
+}
+
+/// A binding made in a loop body and read inside a comprehension nested in it. The binding
+/// holds one value per row of the loop, and the comprehension runs a level further in, so the
+/// read lifts it over the keys beneath each row.
+#[rstest]
+#[case::as_a_filter_bound(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        m = r + 1
+        out << sum([v for v in [1, 2, 3] if v > m])
+"#})]
+#[case::in_the_element(indoc! {r#"
+    out = test_sink()
+    for r in [1, 2]:
+        m = r + 1
+        out << [v + m for v in [1, 2, 3]]
+"#})]
+fn a_loop_binding_read_by_a_nested_comprehension(#[case] source: &str) {
+    agree(source);
+}
+
+/// Rows filtered by the outer binder of a comprehension, with no aggregate over them: each
+/// row keeps its own keys.
+#[rstest]
+#[case::filtered_by_the_outer_binder(indoc! {r#"
+    out = test_sink()
+    out << [[v for v in [1, 2, 3] if v > r] for r in [1, 2]]
+"#})]
+#[case::reading_it_in_the_element(indoc! {r#"
+    out = test_sink()
+    out << [[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]
+"#})]
+#[case::filtered_by_a_computation_on_it(indoc! {r#"
+    out = test_sink()
+    out << [[v for v in [1, 2, 3] if v > r + 1] for r in [1, 2]]
+"#})]
+fn correlated_rows_without_an_aggregate(#[case] source: &str) {
+    agree(source);
+}
+
 #[test]
 fn a_scalar_feed() {
     agree(indoc! {r#"

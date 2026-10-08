@@ -177,6 +177,18 @@ impl Bound {
         }
     }
 
+    /// The bound a substitution suspended on the unresolved variable `v` takes: `v` under the
+    /// whole of `s`, witness half included. Forcing that half applies `s` to `v`, which is the
+    /// substitution being suspended, so it waits with the binder half until `v` resolves.
+    pub fn suspended_on(v: &Rc<InferVar>, s: subst::Subst) -> Self {
+        Bound {
+            origin: None,
+            self_subst: subst::Subst::id(),
+            ty: Type::Infer(Rc::clone(v)),
+            ty_subst: s,
+        }
+    }
+
     /// A fully general two-sided edge.
     pub fn edge(self_subst: subst::Subst, ty: Type, ty_subst: subst::Subst) -> Self {
         let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
@@ -465,6 +477,26 @@ impl Telescope {
         }
     }
 
+    /// This scope without the lexical entries `dropped` names, with `added` entered innermost
+    /// (each that is not already an entry). The opaque set is shared, as [`Self::extended`]
+    /// shares it.
+    pub fn rescoped(
+        &self,
+        dropped: impl Fn(&Name) -> bool,
+        added: impl IntoIterator<Item = Name>,
+    ) -> Telescope {
+        let mut kept: Vec<Name> = self.iter().filter(|n| !dropped(n)).cloned().collect();
+        kept.reverse();
+        let root = Telescope {
+            lexical: None,
+            opaque: Rc::clone(&self.opaque),
+        };
+        let scope = kept.into_iter().fold(root, |t, n| t.extended(n));
+        added
+            .into_iter()
+            .fold(scope, |t, n| if t.contains(&n) { t } else { t.extended(n) })
+    }
+
     /// The lexical binders, innermost first.
     pub fn iter(&self) -> impl Iterator<Item = &Name> {
         let mut cur = &self.lexical;
@@ -613,6 +645,12 @@ pub struct InferVar {
     /// obligation holds its output `Type`, which holds a variable, which holds the
     /// obligation.
     pub watches: RefCell<Vec<(Rc<crate::ccl::infer::solver::traits::TraitObligation>, u8)>>,
+    /// The variables standing for this one under a substitution, one per substitution
+    /// (`Subst::suspended`): `𝛼[σ]` is one type, so every occurrence of `𝛼` under `σ` is
+    /// the one variable. Two variables for it would each take their own bounds and could
+    /// resolve apart. Severed at arena teardown with [`bounds`](Self::bounds): a held
+    /// variable's bound holds this one.
+    pub suspensions: RefCell<Vec<(subst::Subst, Rc<InferVar>)>>,
 }
 
 thread_local! {
@@ -723,6 +761,7 @@ impl InferVar {
             telescope: telescope.clone(),
             bounds: RefCell::new(InferBounds::default()),
             watches: RefCell::new(Vec::new()),
+            suspensions: RefCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
             if let Some(vars) = slot.borrow_mut().as_mut() {

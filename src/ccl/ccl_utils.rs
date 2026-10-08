@@ -645,6 +645,345 @@ pub(crate) fn discharge_transparent_lets(r: &Refinement) -> Refinement {
     Refinement::born(Rc::new(discharge_transparent_lets_in_term(&r.predicate)))
 }
 
+/// `term` in the spelling a predicate states it in, its transparent `let`s discharged
+/// ([`discharge_transparent_lets`]): the form for a term a substitution puts into a type, a
+/// `let`'s definition or an application's argument, so the predicate that results needs no
+/// normalizing before it is compared.
+pub(crate) fn predicate_term(term: &Expr) -> Expr {
+    if !binds_a_transparent_let(term) {
+        return term.clone_preserving_ids();
+    }
+    let _g = crate::ccl::provenance::enter(
+        term.node_id(),
+        "predicate.discharge_transparent_lets",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    discharge_transparent_lets_in_term(term)
+}
+
+/// The normal form of a predicate term, the form refinements are compared and hashed in
+/// (`src/ccl/design/type-inference.md`, "Predicates are compared by normal form").
+///
+/// Passes rewrite the terms a predicate quotes: A-normalization names operands, and lambda
+/// elimination spells a definition point-free while a type's copy of it keeps the lambdas. Each
+/// spelling denotes one value, and the normal form is the spelling they share:
+///
+/// - a transparent `let` is discharged, and `𝑎 ▷ (λ 𝑥 → 𝑏)` reduces to `𝑏[𝑥 ↦ 𝑎]`;
+/// - an applied `cast` reads its value: `𝑎 ▷ cast(𝑣)` is `𝑎 ▷ 𝑣`, since a cast re-views a
+///   collection's domain and leaves what it holds at a key;
+/// - every eliminated combinator applied to an argument reads back to the term it stands for:
+///   `id`, `const`, a `zip` pairing, `apply`, an operator, a chain, `curry`
+///   (`𝑥 ▷ (𝑓 ▷ curry)` is `λ 𝑦 → (𝑥, 𝑦) ▷ 𝑓`) and `uncurry`;
+/// - a staged form reads as what it stages, since an application only reaches keys in its
+///   function's domain: `curry_over` as `curry` of its morphism; `𝑥 ▷ (𝑚 ▷ filter_values)`,
+///   `𝑥 ▷ (𝑝 ▷ iterate)` and `𝑥 ▷ (𝑐 ▷ map_domain)` as `𝑥`; `𝑥 ▷ ((𝑣, 𝑐) ▷ strength)` as
+///   `(𝑣, 𝑥 ▷ 𝑐)`; and `𝑥 ▷ (𝑐 ▷ map(𝑔))` as `(𝑥 ▷ 𝑐) ▷ 𝑔`;
+/// - a projection out of a tuple or record former reads the component.
+///
+/// Type-blind, as predicate equality is: type slots ride along, and the nodes the rewrite
+/// builds carry none it needs. It mints no node identity, so an equality can run it.
+pub(crate) fn normal_form(term: &Expr) -> Expr {
+    let mut fuel: usize = 100_000;
+    normalize(term.clone_preserving_ids(), &mut fuel)
+}
+
+fn normalize(mut e: Expr, fuel: &mut usize) -> Expr {
+    *fuel = fuel
+        .checked_sub(1)
+        .expect("a predicate term normalizes: its terms are typed, so reduction terminates");
+    e.map_children(|c| normalize(c, fuel));
+    reduce_head(e, fuel)
+}
+
+/// A node whose children are normal, reduced at its head.
+fn reduce_head(e: Expr, fuel: &mut usize) -> Expr {
+    match &e.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } if binding.transparency == BindingTransparency::Transparent => normalize(
+            substitute_term(body.clone_preserving_ids(), &binding.name, bound_expr),
+            fuel,
+        ),
+        TypedExprNode::Apply { argument, function } => {
+            reduce_application(argument, function, &e.ty, fuel).unwrap_or(e)
+        }
+        _ => e,
+    }
+}
+
+/// `argument ▷ function` built without an identity, then reduced.
+fn applied(argument: Expr, function: Expr, ty: Type, fuel: &mut usize) -> Expr {
+    let node = TypedExprNode::Apply {
+        argument: Box::new(argument),
+        function: Box::new(function),
+    };
+    reduce_head(Expr::throwaway(node).with_ty(ty), fuel)
+}
+
+/// `argument ▷ function` reduced at its head, for normal `argument` and `function`; `None`
+/// where it is already normal.
+fn reduce_application(
+    argument: &Expr,
+    function: &Expr,
+    ty: &Type,
+    fuel: &mut usize,
+) -> Option<Expr> {
+    let a = || argument.clone_preserving_ids();
+    let codomain = |f: &Expr| f.ty.codomain().unwrap_or(Type::Hole);
+    let pair = |e: &Expr| match &e.node {
+        TypedExprNode::Tuple(parts) if parts.len() == 2 => Some((
+            parts[0].clone_preserving_ids(),
+            parts[1].clone_preserving_ids(),
+        )),
+        _ => None,
+    };
+    match &function.node {
+        TypedExprNode::Lambda { param, body } => Some(normalize(
+            substitute_term(body.clone_preserving_ids(), &param.name, argument),
+            fuel,
+        )),
+        TypedExprNode::Cast { value, .. } => {
+            Some(applied(a(), value.clone_preserving_ids(), ty.clone(), fuel))
+        }
+        TypedExprNode::Builtin(Builtin::Id) => Some(a()),
+        TypedExprNode::Compose(steps) => Some(steps.iter().fold(a(), |acc, step| {
+            applied(acc, step.clone_preserving_ids(), codomain(step), fuel)
+        })),
+        TypedExprNode::Apply {
+            argument: inner,
+            function: combinator,
+        } => match &combinator.node {
+            TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
+            TypedExprNode::Builtin(Builtin::Zip) => {
+                let (g, h) = pair(inner)?;
+                let (g_ty, h_ty) = (codomain(&g), codomain(&h));
+                let g = applied(a(), g, g_ty, fuel);
+                let h = applied(a(), h, h_ty, fuel);
+                Some(Expr::throwaway(TypedExprNode::Tuple(vec![g, h])).with_ty(ty.clone()))
+            }
+            // A staged form reads as what it stages. `curry_over` is `curry(𝑔)` with each
+            // row's keys beside it, and `𝑚 ▷ filter_values` is the identity restricted to the
+            // elements `𝑚` keeps. An application reaches only keys in its function's domain,
+            // which the type guarantees, so neither restriction changes the value read.
+            TypedExprNode::Builtin(Builtin::FilterValues) => Some(a()),
+            // Planning's other staging reads the same way. `iterate` and `map_domain` map
+            // each key to itself, and `strength` pairs a value with each value of a
+            // collection under that value's key.
+            TypedExprNode::Builtin(Builtin::Iterate | Builtin::MapDomain) => Some(a()),
+            TypedExprNode::Builtin(Builtin::Strength) => {
+                let project = |k: usize| {
+                    Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k))).with_ty(Type::Hole)
+                };
+                let value = applied(inner.clone_preserving_ids(), project(0), Type::Hole, fuel);
+                let collection =
+                    applied(inner.clone_preserving_ids(), project(1), Type::Hole, fuel);
+                let element = applied(a(), collection, Type::Hole, fuel);
+                Some(
+                    Expr::throwaway(TypedExprNode::Tuple(vec![value, element])).with_ty(ty.clone()),
+                )
+            }
+            // `map(𝑔)` keeps a collection's keys and maps its values by `𝑔`.
+            TypedExprNode::Apply {
+                argument: g,
+                function: map,
+            } if matches!(map.node, TypedExprNode::Builtin(Builtin::Map)) => {
+                let at = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+                Some(applied(at, g.clone_preserving_ids(), ty.clone(), fuel))
+            }
+            TypedExprNode::Builtin(Builtin::Curry | Builtin::CurryOver) => {
+                let inner = match &combinator.node {
+                    TypedExprNode::Builtin(Builtin::CurryOver) => pair(inner)?.1,
+                    _ => inner.clone_preserving_ids(),
+                };
+                let y = Name::fresh("__curried");
+                let y_var = Expr::throwaway(TypedExprNode::Var(y.clone())).with_ty(Type::Hole);
+                let both =
+                    Expr::throwaway(TypedExprNode::Tuple(vec![a(), y_var])).with_ty(Type::Hole);
+                let body = applied(both, inner, Type::Hole, fuel);
+                let param = crate::ccl::TypedBinding {
+                    name: y,
+                    ty: Type::Hole,
+                    user_annotation: None,
+                    transparency: BindingTransparency::Transparent,
+                };
+                Some(
+                    Expr::throwaway(TypedExprNode::Lambda {
+                        param,
+                        body: Box::new(body),
+                    })
+                    .with_ty(ty.clone()),
+                )
+            }
+            TypedExprNode::Builtin(Builtin::Uncurry) => {
+                let project = |k: usize| {
+                    Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k))).with_ty(Type::Hole)
+                };
+                let first = applied(a(), project(0), Type::Hole, fuel);
+                let second = applied(a(), project(1), Type::Hole, fuel);
+                let curried = applied(first, inner.clone_preserving_ids(), Type::Hole, fuel);
+                Some(applied(second, curried, ty.clone(), fuel))
+            }
+            _ => None,
+        },
+        TypedExprNode::Builtin(Builtin::Apply) => {
+            let (x, f) = pair(argument)?;
+            Some(applied(x, f, ty.clone(), fuel))
+        }
+        TypedExprNode::Builtin(Builtin::BinOp(op)) => {
+            // A binary operation's argument is a pair, so one that is not a pair former
+            // reads as its two components (tuple η).
+            let (left, right) = pair(argument).unwrap_or_else(|| {
+                let component = |k: usize| {
+                    Expr::throwaway(TypedExprNode::Apply {
+                        argument: Box::new(a()),
+                        function: Box::new(
+                            Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k)))
+                                .with_ty(Type::Hole),
+                        ),
+                    })
+                    .with_ty(Type::Hole)
+                };
+                (component(0), component(1))
+            });
+            Some(
+                Expr::throwaway(TypedExprNode::BinOp {
+                    left: Box::new(left),
+                    op: *op,
+                    right: Box::new(right),
+                })
+                .with_ty(ty.clone()),
+            )
+        }
+        TypedExprNode::Proj(ProjKey::Index(k)) => match &argument.node {
+            TypedExprNode::Tuple(parts) => parts.get(*k).map(Expr::clone_preserving_ids),
+            _ => None,
+        },
+        TypedExprNode::Proj(ProjKey::Field(field)) => match &argument.node {
+            TypedExprNode::Record(fields) => fields
+                .iter()
+                .find(|(n, _)| n == field)
+                .map(|(_, v)| v.clone_preserving_ids()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `body` with `replacement` for each free `x`, on terms alone: type slots are left as they
+/// are, which a type-blind comparison does not read.
+fn substitute_term(mut body: Expr, x: &Name, replacement: &Expr) -> Expr {
+    match &mut body.node {
+        TypedExprNode::Var(n) if n == x => return replacement.clone_preserving_ids(),
+        TypedExprNode::Lambda { param, .. } if &param.name == x => return body,
+        // A `let` binding `x` shadows it in its body only.
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if &binding.name == x => {
+            let bound = std::mem::replace(
+                bound_expr.as_mut(),
+                Expr::throwaway(TypedExprNode::Lit(Lit::Unit)),
+            );
+            **bound_expr = substitute_term(bound, x, replacement);
+            return body;
+        }
+        _ => {}
+    }
+    body.map_children(|c| substitute_term(c, x, replacement));
+    body
+}
+
+/// `r` over its normal form ([`normal_form`]), for a consumer that reads the predicate as a term
+/// rather than comparing it: the SMT encoder's fragment has no `let`, eliminated combinator,
+/// or unreduced application.
+pub(crate) fn normal_refinement(r: &Refinement) -> Refinement {
+    Refinement::born(r.normal())
+}
+
+/// `input ▷ f` as a term, the combinator shapes elimination writes read back to the term they
+/// came from:
+///
+/// - `input ▷ id` reads `input`, and `input ▷ (𝑐 ▷ const)` reads `𝑐`;
+/// - `input ▷ (⟨𝑔, ℎ⟩ ▷ zip)` reads the pair `(input ▷ 𝑔, input ▷ ℎ)`;
+/// - `(𝑥, 𝑦) ▷ apply` reads `𝑥 ▷ 𝑦`, and `(𝑥, 𝑦) ▷ op`, for a binary operator, `𝑥 op 𝑦`;
+/// - `input ▷ (𝑓₁ ≫ … ≫ 𝑓ₙ)` reads each step in turn.
+///
+/// A type stating `input ▷ f` then spells the value as the program did before elimination,
+/// which is the spelling its other copies keep: types compare predicates structurally.
+pub(crate) fn read_at(input: &Expr, f: &Expr) -> Expr {
+    let cod = match f.ty.peel_refinements() {
+        Type::Fun {
+            name: Some(b),
+            codomain,
+            ..
+        } => crate::ccl::subst::discharge_codomain(b, input, codomain),
+        _ => f.ty.codomain().unwrap_or(Type::Hole),
+    };
+    read_back_application(input, f, &cod)
+        .unwrap_or_else(|| Expr::apply(input.clone(), f.clone()).with_ty(cod))
+}
+
+/// [`read_at`]'s reading of `input ▷ f`, typed `ty`, or `None` where `f` is no shape it reads.
+fn read_back_application(input: &Expr, f: &Expr, ty: &Type) -> Option<Expr> {
+    let zipped = |e: &Expr| match &e.node {
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) =>
+        {
+            match &argument.node {
+                TypedExprNode::Tuple(parts) if parts.len() == 2 => {
+                    Some((parts[0].clone(), parts[1].clone()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match &f.node {
+        TypedExprNode::Builtin(Builtin::Id) => Some(input.clone()),
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)) =>
+        {
+            Some(argument.as_ref().clone())
+        }
+        TypedExprNode::Builtin(Builtin::BinOp(op)) => match &input.node {
+            TypedExprNode::Tuple(parts) if parts.len() == 2 => Some(
+                Expr::new(TypedExprNode::BinOp {
+                    left: Box::new(parts[0].clone()),
+                    op: *op,
+                    right: Box::new(parts[1].clone()),
+                })
+                .with_ty(ty.clone()),
+            ),
+            _ => None,
+        },
+        TypedExprNode::Builtin(Builtin::Apply) => match &input.node {
+            TypedExprNode::Tuple(parts) if parts.len() == 2 => Some(
+                read_back_application(&parts[0], &parts[1], ty).unwrap_or_else(|| {
+                    Expr::apply(parts[0].clone(), parts[1].clone()).with_ty(ty.clone())
+                }),
+            ),
+            _ => None,
+        },
+        // A chain reads one step at a time, each step's reading the next one's input.
+        TypedExprNode::Compose(elts) => {
+            let mut read = input.clone();
+            for step in elts {
+                read = read_at(&read, step);
+            }
+            (read.ty != Type::Hole).then_some(read)
+        }
+        _ => {
+            let (g, h) = zipped(f)?;
+            let (g, h) = (read_at(input, &g), read_at(input, &h));
+            let pair_ty = Type::Tuple(vec![g.ty.clone(), h.ty.clone()]);
+            Some(Expr::new(TypedExprNode::Tuple(vec![g, h])).with_ty(pair_ty))
+        }
+    }
+}
+
 /// [`discharge_transparent_lets`] on a bare term, bottom-up so a chain of
 /// bindings collapses in one pass.
 fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
@@ -784,29 +1123,233 @@ pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
     branches
 }
 
-/// Builds a composition of expressions, setting the types based on the input
-/// expressions' types. The first expression's domain type is used as the domain type of the
-/// composition, and the last expression's codomain type is used as the codomain type of the composition.
+/// Builds a composition of expressions typed by [`chain_type`].
 ///
 /// The chain's **kind** is the head morphism's, matching the inference rule
 /// (`emit_compose`): a chain's domain is the head's domain, so the chain denotes
 /// a collection exactly when the head does. Mapping a function over a collection
 /// (`xs ≫ f`) leaves a collection; a chain of capabilities stays a capability.
 pub fn typed_compose(elts: Vec<Expr>) -> Expr {
-    let d_ty = elts[0].ty.domain().unwrap().clone();
-    let c_ty = elts[elts.len() - 1].ty.codomain().unwrap().clone();
-    // Not `fun_like`: only the *kind* comes from the head. A Pi binder belongs to
-    // the morphism that binds it, and the chain's codomain is the last morphism's.
     let fun_kind = match &elts[0].ty {
         Type::Fun { fun_kind, .. } => fun_kind.clone(),
         _ => crate::ccl::ty::FunKind::Compute,
     };
-    Expr::compose(elts).with_ty(Type::Fun {
-        name: None,
+    let ty = chain_type(&elts, fun_kind);
+    Expr::compose(elts).with_ty(ty)
+}
+
+/// The type of the chain `elts` at `fun_kind`, after inference, where every element's type is
+/// resolved: the head's domain, and the last morphism's codomain read at each position
+/// ([`chain_type_of`]).
+pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Type {
+    let head_domain = elts[0].ty.domain().expect("a chain's head is a function");
+    let last_codomain = elts[elts.len() - 1]
+        .ty
+        .codomain()
+        .expect("a chain's last element is a function");
+    chain_type_of(
+        elts,
+        Type::Fun {
+            name: None,
+            fun_kind,
+            domain: Box::new(head_domain),
+            codomain: Box::new(last_codomain),
+        },
+    )
+}
+
+/// The chain `elts` typed `ty`, where `ty` is the type a site states for it
+/// ([`chain_type_of`]).
+pub(crate) fn chain_typed(elts: Vec<Expr>, ty: Type) -> Expr {
+    let ty = chain_type_of(&elts, ty);
+    Expr::compose(elts).with_ty(ty)
+}
+
+/// `stated`, the type a site gives the chain `elts` from its ends, unless the last morphism is
+/// dependent, which ends alone cannot type.
+///
+/// A last morphism `𝑓 : (𝑥 : 𝑋) ⇒ 𝐶` whose codomain reads `𝑥` after a prefix `𝑠` gives, at
+/// position `𝑘`, `𝐶[𝑥 ↦ 𝑘 ▷ 𝑠]`, so the chain is `(𝑘 : 𝐷) ⇒ 𝐶[𝑥 ↦ 𝑘 ▷ 𝑠]` over `stated`'s domain
+/// and kind: the rule inference's `emit_compose` types a chain by
+/// (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
+/// Leading steps that map each position to itself drop out of the read; where every step of
+/// the prefix does, the chain keeps `𝑓`'s binder and codomain. Every other chain is typed by
+/// its ends, so `stated` stands.
+pub(crate) fn chain_type_of(elts: &[Expr], stated: Type) -> Type {
+    let Some(last) = elts.last() else {
+        return stated;
+    };
+    let (
+        Type::Fun {
+            name: stated_name,
+            fun_kind,
+            domain,
+            ..
+        },
+        Some(last_cod),
+    ) = (
+        stated.peel_refinements(),
+        last.ty.peel_refinements().codomain(),
+    )
+    else {
+        return stated;
+    };
+    let named: Vec<Option<(Name, Type)>> = elts
+        .iter()
+        .map(|e| match e.ty.peel_refinements() {
+            Type::Fun {
+                name: Some(b),
+                domain,
+                ..
+            } => Some((b.clone(), (**domain).clone())),
+            _ => None,
+        })
+        .collect();
+    let opened = crate::ccl::subst::open_codomain(&last.ty, &last_cod);
+    let reads_a_position = named
+        .iter()
+        .flatten()
+        .any(|(b, _)| crate::ccl::subst::type_free_vars(&opened).contains(b));
+    if !reads_a_position {
+        return without_unread_binder(stated, elts);
+    }
+    let position = chain_input_binder(elts, stated_name.as_ref(), &named);
+    // The reads are minted for the last morphism, whose codomain they restate.
+    let _g = crate::ccl::provenance::enter(
+        last.node_id(),
+        "ccl_utils.chain_type",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let cod = over_input(elts, &named, &position, domain, opened);
+    without_unread_binder(
+        Type::pi_kinded(position, (**domain).clone(), cod, fun_kind.clone()),
+        elts,
+    )
+}
+
+/// The name a chain's type binds its input under: the chain's own binder, so the types
+/// written over it stay bound; else its head's, which names the same position; else, where
+/// every morphism before the last maps each position to itself, the last's, the spelling the
+/// group-by shape and an iteration site are recorded in; else a fresh one
+/// (`src/ccl/design/type-inference.md`, "A chain names each position").
+pub(crate) fn chain_input_binder(
+    elts: &[Expr],
+    chain_binder: Option<&Name>,
+    binders: &[Option<(Name, Type)>],
+) -> Name {
+    if let Some(k) = chain_binder {
+        return k.clone();
+    }
+    if let Some((head, _)) = &binders[0] {
+        return head.clone();
+    }
+    let maps_through = elts[..elts.len() - 1]
+        .iter()
+        .all(maps_each_position_to_itself);
+    match binders.last() {
+        Some(Some((last, _))) if maps_through => last.clone(),
+        _ => Name::fresh("__iter_record"),
+    }
+}
+
+/// `stated` without its binder where nothing reads it: not its codomain, which reads it by
+/// index, and not the chain's morphisms, typed under it by name where the head does not bind
+/// that name itself. A binder no type reads is no part of the chain's type.
+fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
+    let Type::Fun {
+        name: Some(k),
         fun_kind,
-        domain: Box::new(d_ty),
-        codomain: Box::new(c_ty),
-    })
+        domain,
+        codomain,
+    } = &stated
+    else {
+        return stated;
+    };
+    let head_binds = elts.first().is_some_and(
+        |head| matches!(head.ty.peel_refinements(), Type::Fun { name: Some(h), .. } if h == k),
+    );
+    if crate::ccl::subst::references_enclosing_function(codomain)
+        || (!head_binds && elts.iter().any(|e| is_free(k, e)))
+    {
+        return stated;
+    }
+    Type::Fun {
+        name: None,
+        fun_kind: fun_kind.clone(),
+        domain: domain.clone(),
+        codomain: codomain.clone(),
+    }
+}
+
+/// `cod`, opened at the positions a chain names (`binders`, one per morphism), written over
+/// the chain's input `position : first_dom`: each position `𝑥ᵢ` discharged to
+/// `position ▷ elts[..i]` ([`read_at_position`]), the head's renamed to `position`
+/// (`src/ccl/design/type-inference.md`, "A chain names each position"). A codomain not
+/// resolved yet reads them inside a variable, and the discharge suspends on it.
+pub(crate) fn over_input(
+    elts: &[Expr],
+    binders: &[Option<(Name, Type)>],
+    position: &Name,
+    first_dom: &Type,
+    cod: Type,
+) -> Type {
+    let mut cod = cod;
+    for (i, binder) in binders.iter().enumerate().rev() {
+        let Some((b, dom)) = binder else {
+            continue;
+        };
+        if b == position {
+            continue;
+        }
+        // In the spelling a term a substitution puts into a type takes ([`predicate_term`]).
+        let at = predicate_term(&read_at_position(&elts[..i], position, first_dom, dom));
+        cod = Subst::discharge(b.clone(), at).apply_type(&cod);
+    }
+    cod
+}
+
+/// The input of the morphism after `prefix` in a chain over `position : first_dom`:
+/// `position ▷ prefix`, typed `item` (`src/ccl/design/type-inference.md`, "A chain names
+/// each position"). Leading steps that map each position to itself drop out
+/// ([`maps_each_position_to_itself`]); where every step does, the input is `position`.
+pub(crate) fn read_at_position(
+    prefix: &[Expr],
+    position: &Name,
+    first_dom: &Type,
+    item: &Type,
+) -> Expr {
+    let reading = prefix
+        .iter()
+        .position(|e| !maps_each_position_to_itself(e))
+        .unwrap_or(prefix.len());
+    let at = Expr::var(position).with_ty(first_dom.clone());
+    let source = match &prefix[reading..] {
+        [] => return at,
+        [one] => one.clone_preserving_ids(),
+        many => {
+            let head_domain = many[0].ty.domain().unwrap_or_else(|| first_dom.clone());
+            Expr::compose(many.iter().map(Expr::clone_preserving_ids).collect())
+                .with_ty(Type::fun_like(&many[0].ty, head_domain, item.clone()))
+        }
+    };
+    Expr::apply(at, source).with_ty(item.clone())
+}
+
+/// Whether `e` maps each position to itself: `id`, an iteration source (`iterate`, a
+/// `restrict` applied to one), whose codomain is the keys it ranges over, or a
+/// `filter_values` gate, which passes each value it keeps unchanged.
+pub(crate) fn maps_each_position_to_itself(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Builtin(Builtin::Id | Builtin::Iterate) => true,
+        TypedExprNode::Apply { function, .. } => match &function.node {
+            TypedExprNode::Builtin(Builtin::Iterate | Builtin::FilterValues) => true,
+            TypedExprNode::Apply { function, .. } => {
+                matches!(function.node, TypedExprNode::Builtin(Builtin::Restrict))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Construct the trivially-true predicate `λ _ → true` over the given domain,
@@ -1212,14 +1755,9 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             *openness,
         ),
         Type::History {
-            value,
-            domain,
+            function,
             history_kind,
-        } => Type::history(
-            strip_refinements(domain),
-            strip_refinements(value),
-            *history_kind,
-        ),
+        } => Type::history_over(strip_refinements(function), *history_kind),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
@@ -2436,10 +2974,9 @@ mod tests {
         );
     }
 
-    /// Two spellings of one predicate — an A-normalization binding and the
-    /// collapsed form inlining leaves behind — compare equal once the binding is
-    /// discharged, which is what keeps the deficit rule from reporting a
-    /// refinement the subtype already carries.
+    /// Two spellings of one predicate, an A-normalization binding and the collapsed form
+    /// inlining leaves behind, are one refinement, and discharging the binding gives the
+    /// collapsed term.
     #[test]
     fn a_transparent_binding_is_discharged_into_the_predicate() {
         let elem = || Expr::var(Name::elem()).with_ty(Type::Base(BaseType::Int));
@@ -2464,8 +3001,13 @@ mod tests {
         ))));
         let collapsed = Refinement::born(Rc::new(eq(sum())));
 
-        assert_ne!(named, collapsed, "the two spellings differ structurally");
-        assert_eq!(discharge_transparent_lets(&named), collapsed);
+        // A `let` names a sub-term, so the two spellings are one refinement: equality compares
+        // normal forms ([`normal_form`]).
+        assert_eq!(named, collapsed);
+        assert_eq!(
+            discharge_transparent_lets(&named).predicate,
+            collapsed.predicate
+        );
     }
 
     /// An opaque binding stays: it withholds its definiens because the definiens

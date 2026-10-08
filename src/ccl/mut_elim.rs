@@ -217,12 +217,17 @@ fn contains_mut_type(expr: &Expr) -> bool {
 /// expected, is erased for totality).
 fn erase_mut_in_type(ty: &mut Type) {
     if let Type::History {
-        value,
+        function,
         history_kind: HistoryKind::Overwrite,
-        ..
     } = ty
     {
-        *ty = std::mem::replace(value.as_mut(), Type::Hole);
+        let Type::Fun {
+            codomain: value, ..
+        } = std::mem::replace(function.as_mut(), Type::Hole)
+        else {
+            unreachable!("a history's function is an unrefined function")
+        };
+        *ty = *value;
         // The unwrapped value may itself be `Mut` (nested handles are not
         // expected, but erasure is total either way) — re-check this slot.
         return erase_mut_in_type(ty);
@@ -1128,7 +1133,9 @@ fn collect_mut_value_types(expr: &Expr, out: &mut HashMap<Name, Type>) {
 /// The value a `Mut(𝑉, 𝐷)` binder holds, peeling refinements on either side.
 fn value_type_of(ty: &Type) -> Type {
     match ty {
-        Type::History { value, .. } => value_type_of(value),
+        history @ Type::History { .. } => {
+            value_type_of(history.history_parts().expect("matched a history").1)
+        }
         Type::Refinement(inner, _) => value_type_of(inner),
         other => other.clone(),
     }
@@ -1225,10 +1232,9 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
             // a feed reads as its whole collection and never reaches this phase's
             // loop-source destructuring.
             Type::History {
-                value,
                 history_kind: HistoryKind::Overwrite,
                 ..
-            } => t = value,
+            } => t = t.history_parts().expect("matched a history").1,
             _ => break,
         }
     }
@@ -1280,6 +1286,47 @@ fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 /// flat compose so recognition (and the causal-slot grammar) match it
 /// structurally. The write set is keyed by accumulator name, so the slice is
 /// named too. The ``variant_project(`commit)`` step eliminates the ``{`commit{𝑃} | `abort}`` decision to its dense payload before the `.writes` read.
+/// The type of a view of the history `hist_ty` reading `field_ty` at each position. A history
+/// keyed by its position names it, and a field that reads it is keyed the same way.
+fn view_ty(hist_ty: &Type, domain_ty: &Type, field_ty: &Type) -> Type {
+    match hist_ty.peel_refinements() {
+        Type::Fun {
+            name: Some(r),
+            fun_kind,
+            ..
+        } if crate::ccl::subst::type_free_vars(field_ty).contains(r) => Type::pi_kinded(
+            r.clone(),
+            domain_ty.clone(),
+            field_ty.clone(),
+            fun_kind.clone(),
+        ),
+        _ => Type::fun_like(hist_ty, domain_ty.clone(), field_ty.clone()),
+    }
+}
+
+/// `ty`, a type a loop's writer states over its parameter `p`, read at one position: each
+/// projection `p.𝑖` becomes `components[𝑖]`, and a read of the whole parameter becomes
+/// `whole`. The item's component reads the position, so a fed row whose keys depend on the
+/// loop variable depends on it. An accumulator's component is its previous value, read out of
+/// `prev`, the write set the history holds before the position, so a type reading it would be
+/// the type of the history it reads; that is refused.
+fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev: &Name) -> Type {
+    if !crate::ccl::subst::type_free_vars(ty).contains(p) {
+        return ty.clone();
+    }
+    let mut ty = ty.clone();
+    crate::ccl::subst::rewrite_pairing_projections(p, components, &mut ty);
+    if crate::ccl::subst::type_free_vars(&ty).contains(p) {
+        ty = Subst::discharge(p.clone(), whole.clone()).apply_type(&ty);
+    }
+    assert!(
+        !crate::ccl::subst::type_free_vars(&ty).contains(prev),
+        "a feed whose rows depend on a mutable variable its loop writes is not supported yet: \
+         the rows' type would read the history that holds them, got {ty}"
+    );
+    ty
+}
+
 fn writes_key_view(
     h: &Name,
     hist_ty: &Type,
@@ -1295,9 +1342,10 @@ fn writes_key_view(
     wproj.ty = Type::fun(payload_ty, writes_ty.clone());
     let mut iproj = Expr::proj_field(acc);
     iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
-    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, wproj, iproj]);
-    comp.ty = Type::fun_like(hist_ty, domain_ty.clone(), vty.clone());
-    comp
+    crate::ccl::ccl_utils::chain_typed(
+        vec![tvar(h, hist_ty.clone()), vp, wproj, iproj],
+        view_ty(hist_ty, domain_ty, vty),
+    )
 }
 
 /// A `Var(name) : ty`.
@@ -1326,9 +1374,10 @@ fn hist_field_view(
     let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
     let mut proj = Expr::proj_field(field);
     proj.ty = Type::fun(payload_ty, field_ty.clone());
-    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, proj]);
-    comp.ty = Type::fun_like(hist_ty, domain_ty.clone(), field_ty.clone());
-    comp
+    crate::ccl::ccl_utils::chain_typed(
+        vec![tvar(h, hist_ty.clone()), vp, proj],
+        view_ty(hist_ty, domain_ty, field_ty),
+    )
 }
 
 /// Close a recurrence group: wrap `cont` in `letrec { bindings } in <feed hoists>
@@ -1421,16 +1470,20 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
 /// `for x in collection: defer << x` — the loop `collection ≫ (λ x → Feed(defer, x))`.
 fn feed_each(defer: Name, collection: Expr) -> Expr {
     let (domain_ty, item_ty) = fun_parts(&collection.ty);
+    // A collection keyed by its position names it, and the item read there is its codomain
+    // opened at that name, which the lambda after it reads.
+    let item_ty = crate::ccl::subst::open_codomain(&collection.ty, &item_ty);
     let x = Name::fresh("__fed");
     let mut feed = Expr::feed(defer, tvar(&x, item_ty.clone()));
     feed.ty = Type::Base(BaseType::Unit);
     let mut lambda = Expr::lambda(x, item_ty.clone(), feed);
     lambda.ty = Type::fun(item_ty, Type::Base(BaseType::Unit));
     let collection_ty = collection.ty.clone();
-    let mut each = Expr::compose(vec![collection, lambda]);
     // A loop over the collection is a read of it, so it is whatever the collection is.
-    each.ty = Type::fun_like(&collection_ty, domain_ty, Type::Base(BaseType::Unit));
-    each
+    crate::ccl::ccl_utils::chain_typed(
+        vec![collection, lambda],
+        Type::fun_like(&collection_ty, domain_ty, Type::Base(BaseType::Unit)),
+    )
 }
 
 /// Rewrite one loop. `cont` is the raw continuation after the loop
@@ -1737,19 +1790,66 @@ pub(crate) fn fold_induction_loop(
     // commit/abort level exactly as the old `commit: true`/`false` gate.
     let chain = crate::ccl::ccl_utils::wrap_decision_variant(chain);
 
-    // The decision codomain is exactly the record `attach_feed_fields` built (its
-    // type propagates through the RYW `let`s), so `hist_ty`/the body lambda match
-    // it by construction — no separate reconstruction of the `__to_<feed>` field set
-    // (which would have to re-derive the same fire conditions).
-    let decision_ty = chain.ty.clone();
+    // The decision as the writer states it, over its parameter `__p`. The record is exactly
+    // what `attach_feed_fields` built (its type propagates through the RYW `let`s), so
+    // `hist_ty` and the body lambda match it by construction — no separate reconstruction
+    // of the `__to_<feed>` field set (which would have to re-derive the same fire
+    // conditions).
+    let writer_decision_ty = chain.ty.clone();
+
+    // The writer's argument at position `r`: each accumulator's previous value, read by
+    // name out of the write set, then the loop's item `r ▷ iter`. The body's parameter stays
+    // a positional tuple, which is what `transact_phase::build_writer` and the drive both
+    // build.
+    let mut snap_elts: Vec<Expr> = accs
+        .iter()
+        .map(|a| {
+            let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
+            let mut proj = Expr::proj_field(a.name.field_key());
+            proj.ty = Type::fun(writes_ty.clone(), a.ty.clone());
+            let mut app = Expr::apply(tvar(&prev, writes_ty.clone()), proj);
+            app.ty = a.ty.clone();
+            app
+        })
+        .collect();
+    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
+    item_read.ty = item_ty.clone();
+    snap_elts.push(item_read);
+    // The type rewrites read the argument without placing it, so they take copies that keep
+    // its identity; the term places the argument itself.
+    let components: Vec<Expr> = snap_elts.iter().map(Expr::clone_preserving_ids).collect();
+    let mut snap = Expr::tuple(snap_elts);
+    snap.ty = p_ty.clone();
+    let whole = snap.clone_preserving_ids();
+
+    // The decision at position `r` is the writer's codomain at that argument. A feed keyed
+    // by the loop's position reads the item there, so the decision, and the history of
+    // decisions, depend on the position
+    // (`src/ccl/design/type-inference.md`, "A history's value may depend on its position").
+    let at_position = |ty: &Type| read_at_position(ty, &p, &components, &whole, &prev);
+    let decision_ty = at_position(&writer_decision_ty);
     // The recurrence binds the loop's history, so it is a collection — and a `Type::fun`
     // here rode down into everything lambda elimination mints out of the position binder,
     // the loop's own iteration source among them.
-    let hist_ty = crate::ccl::ccl_utils::history_ty(&domain_ty, &decision_ty);
+    let hist_ty = if crate::ccl::subst::type_free_vars(&decision_ty).contains(&r) {
+        Type::pi_kinded(
+            r.clone(),
+            domain_ty.clone(),
+            decision_ty.clone(),
+            crate::ccl::ty::FunKind::Data(None),
+        )
+    } else {
+        crate::ccl::ccl_utils::history_ty(&domain_ty, &decision_ty)
+    };
 
     // The opaque writer body: `λ __p → ⟨chain⟩ ending in the decision`.
-    let mut body_lam = Expr::lambda(p, p_ty.clone(), chain);
-    body_lam.ty = Type::fun(p_ty.clone(), decision_ty.clone());
+    let body_lam_ty = if crate::ccl::subst::type_free_vars(&writer_decision_ty).contains(&p) {
+        Type::pi(p.clone(), p_ty.clone(), writer_decision_ty.clone())
+    } else {
+        Type::fun(p_ty.clone(), writer_decision_ty.clone())
+    };
+    let mut body_lam = Expr::lambda(p.clone(), p_ty.clone(), chain);
+    body_lam.ty = body_lam_ty;
 
     // The recurrence guard reads the *writes projection* of the history:
     // `get_prev_seq((__hist ≫ .writes, r, (acc₀: init₀, …)))` — a projection of
@@ -1781,28 +1881,9 @@ pub(crate) fn fold_induction_loop(
     };
 
     // λ r → let __prev = ⟨guard⟩ in (__prev.acc₀, …, r ▷ iter) ▷ __body.
-    // The previous values are the write set, so they are read by accumulator
-    // name; the body's parameter stays a positional tuple, which is what
-    // `transact_phase::build_writer` and the drive both build.
-    let mut snap_elts: Vec<Expr> = accs
-        .iter()
-        .map(|a| {
-            let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
-            let mut proj = Expr::proj_field(a.name.field_key());
-            proj.ty = Type::fun(writes_ty.clone(), a.ty.clone());
-            let mut app = Expr::apply(tvar(&prev, writes_ty.clone()), proj);
-            app.ty = a.ty.clone();
-            app
-        })
-        .collect();
-    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
-    item_read.ty = item_ty.clone();
-    snap_elts.push(item_read);
-    let mut snap = Expr::tuple(snap_elts);
-    snap.ty = p_ty.clone();
     let mut decision = Expr::apply(snap, body_lam);
     decision.ty = decision_ty.clone();
-    let lambda_body = Expr::let_in(binding(prev, writes_ty.clone()), guard, decision);
+    let lambda_body = Expr::let_in(binding(prev.clone(), writes_ty.clone()), guard, decision);
     let mut lambda = Expr::lambda(r.clone(), domain_ty.clone(), lambda_body);
     lambda.ty = hist_ty.clone();
 
@@ -1847,14 +1928,17 @@ pub(crate) fn fold_induction_loop(
             // view reads the field at that type and eliminates `` `fired ``:
             // the channel is the fired positions with their values
             // ([`fired_project`](crate::ccl::ccl_utils::fired_project)).
-            let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value.ty.clone());
+            let value_ty = at_position(&f.value.ty);
+            let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(value_ty.clone());
             let field_view =
                 hist_field_view(&h, &hist_ty, &domain_ty, &f.field, &tap_ty, &decision_ty);
-            let mut view = Expr::compose(vec![
-                field_view,
-                crate::ccl::ccl_utils::fired_project(f.value.ty.clone()),
-            ]);
-            view.ty = Type::fun_like(&hist_ty, domain_ty.clone(), f.value.ty.clone());
+            let view = crate::ccl::ccl_utils::chain_typed(
+                vec![
+                    field_view,
+                    crate::ccl::ccl_utils::fired_project(value_ty.clone()),
+                ],
+                view_ty(&hist_ty, &domain_ty, &value_ty),
+            );
             // This loop's positions are one more level over what the feed held.
             LoopFeed {
                 defer: f.defer.clone(),
@@ -1927,9 +2011,11 @@ fn transform_feed_only_loop(
         feed.ty = unit.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), feed);
         lambda.ty = Type::fun(target.ty.clone(), unit.clone());
-        let mut each = Expr::compose(vec![iter.clone(), lambda]);
         // A loop over the source is a read of `iter`, so it is whatever `iter` is.
-        each.ty = Type::fun_like(&iter.ty, domain_ty.clone(), unit);
+        let each = crate::ccl::ccl_utils::chain_typed(
+            vec![iter.clone(), lambda],
+            Type::fun_like(&iter.ty, domain_ty.clone(), unit),
+        );
         // As above: `expr_stmt` carries the continuation's type itself.
         body_out = Expr::expr_stmt(each, body_out);
     }
@@ -2605,6 +2691,10 @@ fn transform_chain(
                     } in fold.feed_views
                     {
                         let field = defer.defer_tap_field(feeds.len());
+                        // The view reads the inner history, whose binding the environment
+                        // was discharged into above, and its type can read this level's
+                        // binders as well, a fed row filtered by this loop's variable say.
+                        let view = Subst::discharge_env_in_place(view, env);
                         feeds.push(FeedSite {
                             defer,
                             field,

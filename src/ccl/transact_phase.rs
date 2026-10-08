@@ -387,7 +387,7 @@ fn build_zip_read(
     }
     let body = Subst::discharge_env_in_place(lam_body.clone(), &reads);
     let reply = Expr::lambda(p, pair_ty, body);
-    Some(Expr::compose(vec![zip, reply]).with_ty(out_ty))
+    Some(crate::ccl::ccl_utils::chain_typed(vec![zip, reply], out_ty))
 }
 
 /// `p ▷ .i : elt_ty` — project index `i` off a tuple-typed variable.
@@ -448,7 +448,10 @@ fn build_single(trigger: &Expr, read: &BoundRead, lam_body: &Expr, out_ty: Type)
         return Some(as_of);
     }
     let reply = Expr::lambda(read.name.clone(), read.value_ty.clone(), lam_body.clone());
-    Some(Expr::compose(vec![as_of, reply]).with_ty(out_ty))
+    Some(crate::ccl::ccl_utils::chain_typed(
+        vec![as_of, reply],
+        out_ty,
+    ))
 }
 
 /// A multi-variable as-of read: `as_of((trigger, (f_a: ⟨a-hist⟩, f_b:
@@ -485,7 +488,10 @@ fn build_snapshot(
     let mut body = lam_body.clone();
     project_reads(&mut body, used, &snap, &record_ty);
     let reply = Expr::lambda(snap, record_ty, body);
-    Some(Expr::compose(vec![as_of, reply]).with_ty(out_ty))
+    Some(crate::ccl::ccl_utils::chain_typed(
+        vec![as_of, reply],
+        out_ty,
+    ))
 }
 
 /// Replace each `Var(read.name)` in `e` with `snap.read.field` — the projection
@@ -520,7 +526,7 @@ pub fn collect_txn_mut_vars(expr: &Expr) -> HashSet<Name> {
     /// Whether `ty` is (a refinement of) `Mut(_, Txn)`.
     fn is_txn_mut_var(ty: &Type) -> bool {
         match ty {
-            Type::History { domain, .. } => is_txn_domain(domain),
+            Type::History { .. } => is_txn_domain(ty.history_parts().expect("a history").0),
             Type::Refinement(inner, _) => is_txn_mut_var(inner),
             _ => false,
         }
@@ -568,10 +574,9 @@ fn mut_var_value_ty(ty: &Type) -> Type {
             // Only a mutable variable peels to its value; a feed history reads as
             // its whole stream and is never a transactional mutable variable target.
             Type::History {
-                value,
                 history_kind: HistoryKind::Overwrite,
                 ..
-            } => Some(value),
+            } => Some(ty.history_parts().expect("a history").1),
             Type::Refinement(inner, _) => under_mut(inner),
             _ => None,
         }
@@ -2863,23 +2868,27 @@ fn per_key_view(
     // time leg: commits_j ≫ .time : dom ⇒ Txn.
     // Each leg is the commit log read through a projection, so it is a collection too,
     // and carries the log's kind.
-    let mut time_view = Expr::compose(vec![
-        tvar(commits_j, commits_ty.clone()),
-        fproj(F_TIME, rec_ty, &Type::Txn),
-    ]);
-    time_view.ty = Type::fun_like(&commits_ty, dom.clone(), Type::Txn);
+    let time_view = crate::ccl::ccl_utils::chain_typed(
+        vec![
+            tvar(commits_j, commits_ty.clone()),
+            fproj(F_TIME, rec_ty, &Type::Txn),
+        ],
+        Type::fun_like(&commits_ty, dom.clone(), Type::Txn),
+    );
 
     // write leg: commits_j ≫ .decision ≫ variant_project(`commit) ≫ .writes ≫ .k.
     let mut iproj = Expr::proj_field(key);
     iproj.ty = Type::fun(writes_ty.clone(), value_ty.clone());
-    let mut write_view = Expr::compose(vec![
-        tvar(commits_j, commits_ty.clone()),
-        fproj(F_DECISION, rec_ty, decision_ty),
-        crate::ccl::ccl_utils::commit_project(decision_ty),
-        fproj(F_WRITES, &payload_ty, &writes_ty),
-        iproj,
-    ]);
-    write_view.ty = Type::fun_like(&commits_ty, dom.clone(), value_ty.clone());
+    let write_view = crate::ccl::ccl_utils::chain_typed(
+        vec![
+            tvar(commits_j, commits_ty.clone()),
+            fproj(F_DECISION, rec_ty, decision_ty),
+            crate::ccl::ccl_utils::commit_project(decision_ty),
+            fproj(F_WRITES, &payload_ty, &writes_ty),
+            iproj,
+        ],
+        Type::fun_like(&commits_ty, dom.clone(), value_ty.clone()),
+    );
 
     // ⟨time, write⟩ ▷ zip : dom ⇒ {time, write} — the zip inner-joins, so the
     // total `time` leg is narrowed to the committing positions of the `write` leg.
@@ -3124,8 +3133,10 @@ fn plan_store(
             // hoist below, where the channel wants the fed value.
             let mut field_proj = Expr::proj_field(f.field.clone());
             field_proj.ty = Type::fun(payload_ty.clone(), tap_value_ty.clone());
-            let mut tap_expr = Expr::compose(vec![by_time, dec_proj, vp, field_proj]);
-            tap_expr.ty = tap_ty.clone();
+            let tap_expr = crate::ccl::ccl_utils::chain_typed(
+                vec![by_time, dec_proj, vp, field_proj],
+                tap_ty.clone(),
+            );
             tap_bindings.push((binding(tap_name.clone(), tap_ty.clone()), tap_expr));
             hoisted.push(HoistedFeed {
                 defer: f.defer,
@@ -3351,14 +3362,16 @@ impl StorePlan {
             .map(|f| {
                 // The channel carries the fed value at the positions the tap
                 // fired, so the hoist eliminates `` `fired `` off the raw tap.
-                let mut view = Expr::compose(vec![
-                    tvar(&f.tap, f.tap_ty.clone()),
-                    crate::ccl::ccl_utils::fired_project(f.value_ty.clone()),
-                ]);
-                view.ty = Type::fun_like(
-                    &f.tap_ty,
-                    f.tap_ty.domain().unwrap_or(Type::Hole),
-                    f.value_ty.clone(),
+                let view = crate::ccl::ccl_utils::chain_typed(
+                    vec![
+                        tvar(&f.tap, f.tap_ty.clone()),
+                        crate::ccl::ccl_utils::fired_project(f.value_ty.clone()),
+                    ],
+                    Type::fun_like(
+                        &f.tap_ty,
+                        f.tap_ty.domain().unwrap_or(Type::Hole),
+                        f.value_ty.clone(),
+                    ),
                 );
                 // One value per commit: the tap is keyed by commit time alone.
                 LoopFeed {

@@ -1694,7 +1694,8 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 // The value a mutable variable or channel carries is a component of it in the
                 // same sense a field is; the domain beside it is an index, not a value
                 // this place holds.
-                Type::History { value, .. } => {
+                history @ Type::History { .. } => {
+                    let (_, value, _) = history.history_parts().expect("matched a history");
                     descend(value, &path, Step::HistoryValue, &mut frontier)
                 }
                 // Leaves: nothing inside to constrain. `Base`/`UIntRange` are concrete,

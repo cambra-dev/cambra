@@ -434,11 +434,14 @@ fn inner_source<'a>(g: &'a Expr, inner_domain: &Type) -> Option<&'a Expr> {
 /// gate that varies with the row is the same thing. The domain loses the refinement in every
 /// slot the chain is written at, because the term now carries it.
 fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, String> {
+    if emit_component_filter(g, witnesses)? {
+        return Ok(true);
+    }
     let Type::Fun {
+        name,
         fun_kind,
         domain,
         codomain,
-        ..
     } = &g.ty
     else {
         return Ok(false);
@@ -456,11 +459,14 @@ fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, Str
         .map(|r| Rc::clone(&r.predicate))
         .collect();
     let old_domain = (**domain).clone();
+    // The binder stays: a row whose keys depend on the pair reads it in the codomain, which
+    // is stored closed against it.
+    let name = name.clone();
     let fun_kind = fun_kind.clone();
     let codomain = (**codomain).clone();
     retype_subtree(g, &old_domain, &pair_ty);
     g.ty = Type::Fun {
-        name: None,
+        name: name.clone(),
         fun_kind,
         domain: Box::new(pair_ty.clone()),
         codomain: codomain.clone().into(),
@@ -473,7 +479,112 @@ fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, Str
             Builtin::FilterValues,
             Type::fun(pair_ty.clone(), pair_ty.clone()),
         );
-        chain = compose(filter, chain).with_ty(Type::fun(pair_ty.clone(), codomain.clone()));
+        chain = compose(filter, chain).with_ty(Type::Fun {
+            name: name.clone(),
+            fun_kind: crate::ccl::FunKind::Compute,
+            domain: Box::new(pair_ty.clone()),
+            codomain: Box::new(codomain.clone()),
+        });
+    }
+    *g = chain;
+    Ok(true)
+}
+
+/// Emit the filter a dependent pair's second component carries, where that filter is what
+/// makes it dependent: `(𝑎 : 𝐴) × {𝐾 | 𝑝(𝑎, ·)}`, a correlated filter that `lambda_elim` keeps
+/// on the component. Each row ranges over `𝐾`'s keys, so the site runs over the product
+/// `(𝐴, 𝐾)`, and `filter_values` keeps the pairs `𝑝` holds for, `λ 𝑞 → 𝑝(𝑞.0, 𝑞.1)`. The
+/// pairs it keeps are the dependent tuple's elements, so it is typed from the product to the
+/// dependent tuple, and `𝑔` keeps the domain it was written at.
+fn emit_component_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, String> {
+    let Some(Type::DepTuple(components)) = g.ty.domain().map(|d| d.peel_refinements().clone())
+    else {
+        return Ok(false);
+    };
+    let [(first_name, first), (_, second)] = components.as_slice() else {
+        return Ok(false);
+    };
+    let a = first_name.clone().unwrap_or_else(|| Name::fresh("__x"));
+    let second =
+        crate::ccl::subst::open_pi_binder(&crate::ccl::subst::Mapping::Rename(a.clone()), second);
+    let filters: Vec<Rc<TypedExpr>> = second
+        .refinements()
+        .iter()
+        .filter(|r| !r.is_collection_membership())
+        .map(|r| Rc::clone(&r.predicate))
+        .collect();
+    if filters.is_empty()
+        || second
+            .refinements()
+            .iter()
+            .any(|r| r.is_collection_membership() && ccl_utils::is_free(&a, &r.predicate))
+    {
+        return Ok(false);
+    }
+    // The filters move onto the chain as `filter_values`; a membership refinement says which
+    // keys exist, which the collection the row is read from demands on its domain, so it stays.
+    let keys = Type::refined(
+        second.peel_refinements().clone(),
+        second
+            .refinements()
+            .iter()
+            .filter(|r| r.is_collection_membership())
+            .cloned()
+            .collect(),
+    );
+    debug_assert!(
+        !crate::ccl::subst::type_free_vars(&keys).contains(&a),
+        "a filtered component's keys are the same for every row: {keys}"
+    );
+    let dependent = g.ty.domain().expect("matched a function's domain");
+    let product = Type::Tuple(vec![first.clone(), keys.clone()]);
+    let at = |index: usize, ty: &Type| {
+        Expr::apply(
+            Expr::var(Name::elem()).with_ty(product.clone()),
+            Expr::proj_index(index).with_ty(Type::fun(product.clone(), ty.clone())),
+        )
+        .with_ty(ty.clone())
+    };
+    let mut chain = std::mem::replace(g, Expr::builtin(Builtin::Id));
+    // The chain keeps `𝑔`'s binder: a row whose keys depend on the pair reads it in the
+    // codomain, which is stored closed against it.
+    let Type::Fun {
+        name: binder,
+        codomain,
+        ..
+    } = chain.ty.peel_refinements().clone()
+    else {
+        unreachable!("matched a function")
+    };
+    let mut kept = Type::fun(product.clone(), dependent.clone());
+    for predicate in filters {
+        // The element read first, then `𝑎`. A nested refinement reading `𝑎` binds `__elem`
+        // to its own element, so there `𝑎` is bound by a lambda applied to `.0` rather than
+        // written as `__elem.0` (`src/ccl/design/type-inference.md`, "Lifting a filter onto
+        // the pair").
+        let on_element =
+            crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &keys)).apply_expr(&predicate);
+        let over_pair = if ccl_utils::count_free(&a, &on_element)
+            > ccl_utils::count_free_in_value(&a, &on_element)
+        {
+            let ty = on_element.ty.clone();
+            Expr::apply(
+                at(0, first),
+                Expr::lambda(a.clone(), first.clone(), on_element),
+            )
+            .with_ty(ty)
+        } else {
+            crate::ccl::subst::Subst::discharge(a.clone(), at(0, first)).apply_expr(&on_element)
+        };
+        let p = plan_before_iteration(fn_of_bare_predicate(&product, &over_pair, &[]), witnesses)?;
+        let filter = apply_primitive(p, Builtin::FilterValues, kept.clone());
+        chain = compose(filter, chain).with_ty(Type::Fun {
+            name: binder.clone(),
+            fun_kind: crate::ccl::FunKind::Compute,
+            domain: Box::new(product.clone()),
+            codomain: codomain.clone(),
+        });
+        kept = Type::fun(product.clone(), product.clone());
     }
     *g = chain;
     Ok(true)
@@ -481,19 +592,55 @@ fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, Str
 
 /// Rewrite the refined pair domain to its bare product in every type slot at or below `e`:
 /// the domain is the type every morphism in the chain is written at, so one slot is never
-/// the only one.
+/// the only one. A refinement predicate's own slots count: a row whose keys depend on the
+/// pair reads it in its domain's predicate, through projections written at the pair.
 fn retype_subtree(e: &mut Expr, old: &Type, bare: &Type) {
-    e.walk_type_slots_mut(|ty| replace_domain(ty, old, bare));
-    e.walk_children_mut(|child| retype_subtree(child, old, bare));
+    retype_subtree_in(e, old, bare, &PredMemo::default());
+}
+
+fn retype_subtree_in(e: &mut Expr, old: &Type, bare: &Type, memo: &PredMemo<()>) {
+    e.walk_type_slots_mut(|ty| replace_domain(ty, old, bare, memo));
+    e.walk_children_mut(|child| retype_subtree_in(child, old, bare, memo));
 }
 
 /// Replace the refined pair with its bare product wherever it occurs inside `ty`, not only
 /// where `ty` is it: a morphism in the chain is written at `pair ⇒ 𝑉`, so the occurrence
 /// is the domain of a function type rather than the slot itself.
-fn replace_domain(ty: &mut Type, old: &Type, bare: &Type) {
+fn replace_domain(ty: &mut Type, old: &Type, bare: &Type, memo: &PredMemo<()>) {
     if ty == old {
         *ty = bare.clone();
         return;
     }
-    ty.walk_children_mut(|child| replace_domain(child, old, bare));
+    if let Type::Refinement(_, refinements) = ty {
+        refinements.rewrite_each(|_, refinement| {
+            memo.rebuild(refinement, &(), |pred| {
+                if !mentions_type(pred, old) {
+                    return false;
+                }
+                retype_subtree_in(pred, old, bare, memo);
+                true
+            });
+        });
+    }
+    ty.walk_children_mut(|child| replace_domain(child, old, bare, memo));
+}
+
+/// Whether `old` occurs in a type slot at or below `e`, its predicates' slots included.
+fn mentions_type(e: &Expr, old: &Type) -> bool {
+    fn in_type(ty: &Type, old: &Type) -> bool {
+        ty == old
+            || ty
+                .refinements()
+                .iter()
+                .any(|r| mentions_type(&r.predicate, old))
+            || {
+                let mut found = false;
+                ty.walk_children(|c| found |= in_type(c, old));
+                found
+            }
+    }
+    let mut found = false;
+    e.walk_type_slots(|ty| found |= in_type(ty, old));
+    e.walk_children(|c| found |= mentions_type(c, old));
+    found
 }

@@ -541,7 +541,7 @@ impl<'a> Encode<'a> {
             Type::UIntRange(n) => Some(Sort::UIntRange(*n)),
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
             Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
-            Type::History { value, .. } => self.sort(value),
+            Type::History { .. } => self.sort(ty.history_parts()?.1),
             _ => None,
         }
     }
