@@ -41,6 +41,11 @@ pub(super) struct Binding {
     /// code) happens during the coalesce walk
     /// ([`specialize_use`](super::solve::specialize_use)).
     pub(super) scheme: PolyScheme,
+    /// Whether the binder is a generalized `let`, which is what makes a `let`
+    /// naming it polymorphic too ([`should_generalize`]). Not readable off
+    /// `scheme`: a monomorphic `let`'s variables sit above the enclosing level as
+    /// well, since its right-hand side is emitted one level up.
+    pub(super) generalized: bool,
 }
 
 /// Inference's lexical scope, read as the environment a solver query runs in.
@@ -65,14 +70,17 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
     }
 }
 
-/// Whether `def` is a generalizable function definition at `level`.
+/// Whether `def` is a generalizable definition at `level`: a polymorphic form whose
+/// type contains a variable above `level` to quantify.
 ///
-/// All three conditions are required:
+/// The polymorphic forms are:
 ///
-/// - The definition is a syntactic lambda.
-/// - Its function kind is not `Data`. A grouping can lower to a lambda but is
-///   still a collection value whose uses must share it.
-/// - Its type contains a variable above `level` to quantify.
+/// - A syntactic lambda whose function kind is not `Data`. A grouping can lower to
+///   a lambda but is still a collection value whose uses must share it.
+/// - A `Var` naming a generalized binding, which `generalized` answers from the
+///   caller's scope. An alias of a generalized binding duplicates nothing: a use of
+///   it specializes a copy of the `Var`, which specializes the binding it names
+///   (`docs/chl-spec.md`, "6.10 Polymorphic types").
 ///
 /// Emission and coalescing use the same predicate. There is no use-count or
 /// collection-producing-UDF exception. Specializations are keyed by the use's
@@ -82,16 +90,23 @@ impl ScopeEnv for ScopeStack<Name, Binding> {
 /// Generalizing a grouping would specialize its dependent domain filter per use.
 /// That sharing decision is separate from function generalization; see
 /// `src/ccl/design/type-inference.md`, "Generalizing a collection is filter pushdown".
-pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
-    matches!(def.node, TypedExprNode::Lambda { .. })
-        && !matches!(
+pub(super) fn should_generalize(
+    def: &Expr,
+    level: Level,
+    generalized: impl FnOnce(&Name) -> bool,
+) -> bool {
+    let polymorphic_form = match &def.node {
+        TypedExprNode::Lambda { .. } => !matches!(
             def.ty,
             Type::Fun {
                 fun_kind: crate::ccl::ty::FunKind::Data(..),
                 ..
             }
-        )
-        && type_level(&def.ty) > level
+        ),
+        TypedExprNode::Var(name) => generalized(name),
+        _ => false,
+    };
+    polymorphic_form && type_level(&def.ty) > level
 }
 
 /// Emission context for Cambra's inference algorithm (Pass 1).
@@ -522,6 +537,7 @@ impl Typing for InferCtx {
             name,
             Binding {
                 scheme: PolyScheme::poly(self.level, ty.clone()),
+                generalized: false,
             },
         );
         let r = self.under_binder(name, f);
@@ -540,7 +556,9 @@ impl Typing for InferCtx {
     }
 
     fn is_generalizable(&self, def: &Expr) -> bool {
-        should_generalize(def, self.level)
+        should_generalize(def, self.level, |name| {
+            self.scopes.lookup(name).is_some_and(|b| b.generalized)
+        })
     }
 
     fn scoped_let<R>(
@@ -581,7 +599,13 @@ impl Typing for InferCtx {
             PolyScheme::poly(self.level + 1, bound_ty.clone())
         };
         self.scopes.push_scope();
-        self.scopes.bind(name, Binding { scheme });
+        self.scopes.bind(
+            name,
+            Binding {
+                scheme,
+                generalized: generalize,
+            },
+        );
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r

@@ -471,3 +471,125 @@ fn destructuring_a_collection_does_not_demand_a_capability() {
         ),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Polymorphic aliases — `g = f` (`docs/chl-spec.md`, "6.10 Polymorphic types")
+// ---------------------------------------------------------------------------
+
+// A name of a generalized binding is generalized too, so each use of the alias
+// specializes the binding it names at its own types. Each case was rejected while
+// an alias was monomorphic: two uses at different types conflicted, and an alias
+// nothing used was left with an unresolved type.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::used_at_two_types(
+    indoc! {r#"
+        def add(a, b):
+            a + b
+        plus = add
+        plus(1, 2) == 3 and plus("a", "b") == "ab"
+    "#},
+    Value::Bool(true),
+)]
+#[case::alias_of_an_alias(
+    indoc! {r#"
+        def add(a, b):
+            a + b
+        plus = add
+        sum2 = plus
+        sum2(1, 2) == 3 and plus("a", "b") == "ab" and add(3, 4) == 7
+    "#},
+    Value::Bool(true),
+)]
+#[case::inside_a_definition(
+    indoc! {r#"
+        def add(a, b):
+            a + b
+        def check(x):
+            plus = add
+            plus(x, 1) == x + 1 and plus("a", "b") == "ab"
+        check(5)
+    "#},
+    Value::Bool(true),
+)]
+#[case::unused(
+    indoc! {"
+        def add(a, b):
+            a + b
+        plus = add
+        1
+    "},
+    Value::Int(1),
+)]
+#[case::of_a_lambda_binding(
+    indoc! {r#"
+        same = \x -> x == x
+        also = same
+        also(1) and also("s")
+    "#},
+    Value::Bool(true),
+)]
+// `g: _ = f` is the alias `g = f`: a `_` annotation states nothing.
+#[case::with_a_hole_annotation(
+    indoc! {r#"
+        def id(x):
+            x
+        g: _ = id
+        g(1) == 1 and g("s") == "s"
+    "#},
+    Value::Bool(true),
+)]
+fn alias_of_a_polymorphic_binding_is_polymorphic(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// An alias of a generator specializes the generator per element type, as a direct
+// call does.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn alias_of_a_generator() {
+    check_scalar(
+        indoc! {"
+            def doubled(xs):
+                for x in xs:
+                    yield x * 2
+            twice = doubled
+            sum(twice([1, 2, 3]))
+        "},
+        Value::Int(12),
+    );
+}
+
+// The alias carries the requirements of the binding it names, so a call through
+// it is checked against them at the call.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn alias_carries_the_requirements_of_its_binding() {
+    check_compile_error(
+        indoc! {r#"
+            def add(a, b):
+                a + b
+            plus = add
+            plus(1, "s")
+        "#},
+        "No Addable instance",
+    );
+}
+
+// An alias of a monomorphic binding stays monomorphic. `m`'s variables sit one
+// level above its binding, as a generalized binding's do, so this pins that
+// generalization asks whether the name is a generalized binding rather than
+// reading its type's level: the alias is rejected exactly as `m` itself is.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn alias_of_a_monomorphic_binding_is_monomorphic() {
+    check_compile_error(
+        indoc! {r#"
+            pair = (\x -> x, 1)
+            m = pair.0
+            g = m
+            (g(1), g("s"))
+        "#},
+        "Incompatible lower bounds",
+    );
+}

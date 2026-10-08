@@ -216,7 +216,9 @@ first-class quantified type (`infer/solver/scheme.rs`).
 ### Roadmap and Current Prototype Status
 
 A `let` whose RHS is a `Lambda` generalizes when its type contains variables above the binding
-level and its function kind is not `Data` (`should_generalize` in `infer/context.rs`). Each use
+level and its function kind is not `Data` (`should_generalize` in `infer/context.rs`), and so does
+one whose RHS names a generalized binding
+([A name of a generalized binding](#a-name-of-a-generalized-binding)). Each use
 instantiates the scheme. During coalescing, `specialize_use` freshens a copy of the definition,
 pins it against the use's live type, and coalesces the copy. A `SpecKey` identifies uses that can
 share one specialization; the resolved type alone is not the key (see
@@ -621,7 +623,8 @@ permits it. These operations have separate scopes and lifetimes.
 ### 3.1 Let-Polymorphism is Freshening (Instantiation)
 
 `should_generalize` in `infer/context.rs` selects a syntactic lambda whose function kind is
-not `Data` and whose type contains a variable above the enclosing level. A non-function value
+not `Data` and whose type contains a variable above the enclosing level, and a name of a
+generalized binding ([A name of a generalized binding](#a-name-of-a-generalized-binding)). A non-function value
 or a function with no quantifiable variable remains monomorphic. There is no use-count exception
 or separate eligibility rule for collection-producing UDFs.
 
@@ -710,6 +713,22 @@ The comparison is bounded:
   specialization key. The base structure is still checked.
 
 The check is debug-only. The compilation strategy relies on the ordering invariant in all builds.
+
+#### A name of a generalized binding
+
+`should_generalize` also admits a `let` whose right-hand side is a `Var` naming a generalized
+binding, `g = f` ([chl-spec.md, "6.10 Polymorphic types"](../../../docs/chl-spec.md#610-polymorphic-types)).
+Emission instantiates `f`'s scheme inside `g`'s right-hand side, one level up, so `g`'s type holds
+variables above the binding level and `f`'s obligations ride them, and `scoped_let` generalizes it
+as it does a function definition. A use of `g` specializes a clone of `Var f`, and the clone's walk
+specializes `f`: the path a generalized function used only inside another generalized definition
+takes. `g`'s `let` rebuilds as `let g₁ = f₁ in …`, an ordinary monomorphic binding.
+
+Whether the `Var` names a generalized binding is asked of the scope, not read off levels. A
+monomorphic `let`'s variables also sit one level above its binding, because its right-hand side is
+emitted one level up, so a level test would generalize `g = m` over `m`'s own shared variables.
+Emission reads `Binding::generalized`; the coalesce walk asks whether the name resolves to a
+specialization frame (`lookup_generalized`).
 
 #### Typechecking a never-called definition
 
