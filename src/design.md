@@ -40,7 +40,6 @@ The runtime's formal model lives under
 
 ## Pass pipeline
 
-The pass order (parse → lower → uniquify → infer → inline → mut_elim →
-channelize → lambda_elim → planning → operator_conversion) and the file
-implementing each pass are listed in
-[docs/design.md](/docs/design.md#program-execution-pipeline).
+[Program Execution Pipeline](../docs/design.md#program-execution-pipeline) owns the phase order
+and implementation map. [The CCL document index](ccl/design/README.md#the-documents) locates
+the representation, pass and cross-cutting contracts.
