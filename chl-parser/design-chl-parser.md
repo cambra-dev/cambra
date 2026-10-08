@@ -53,9 +53,10 @@ level forms:
   `Indent`; closing the level emits `Dedent`. A dedent that reaches no compatible level
   produces `InconsistentIndent`.
 - `Pending { min }` records the assignment column when a block starts within a logical line.
-  Entering this level emits no `Indent`. The first continuation line above `min` fixes its
-  column; a line at or below `min` closes it. The parser's `block_value` consumes the extra
-  closing `Dedent` after parsing the `if` or `match` statement.
+  Entering this level emits no `Indent`. A branch body opens a `Fixed` level above it; the first
+  line that dedents back into it, the `elif` or `else`, fixes its column. A line at or below
+  `min` closes it. The parser's `block_value` consumes the extra closing `Dedent` after parsing
+  the `if` or `match` statement.
 
 The stack starts with `Fixed(0)`. `block_value_open` requests a pending level when a logical
 line ends in `:` but did not start with a block-opening keyword. The floor comes from the

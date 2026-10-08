@@ -93,31 +93,11 @@ than the current level opens a new level. A dedent must return to an enclosing l
 otherwise lexing fails with `InconsistentIndent`. A line at the current level leaves the
 block structure unchanged.
 
-An `if` or `match` used on the right-hand side of an assignment opens an additional level
-above the assignment's indentation. For an `if` expression, the first `elif` or `else`
-continuation fixes the chain's column. Subsequent continuations must use that column, which
-must be to the right of the assignment's column:
+An `if` or `match` on the right-hand side of an assignment opens one further level; see
+[Assignment forms](#43-assignment-forms). When a header spans physical lines inside
+brackets, its indentation is that of the statement's first line.
 
-```python
-x = if c:
-        1
-    elif d:
-        2
-    else:
-        3
-y = x
-```
-
-This continuation column need not align with the initial `if` token. When a header spans
-physical lines inside brackets, its indentation is measured from the logical statement's
-first line. A `match` expression has no `elif`/`else` continuation to fix this extra level;
-its case arms are nested within it.
-
-At EOF, the lexer inserts a final `NEWLINE` if needed and closes the remaining levels with
-`DEDENT`s. The extra assignment-side level closes without a corresponding `INDENT`; the
-parser consumes that `DEDENT` at the end of the block-valued assignment. The token-level
-contract is documented in
-[the lexer design](../chl-parser/design-chl-parser.md#stage-1--lexer-lexerrs).
+End of input closes every open level.
 
 ### 1.4 Implicit line continuation
 
