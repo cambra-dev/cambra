@@ -355,9 +355,9 @@ fn for_each_child(
         f(&mut cf.domain, !pol)?;
         f(&mut cf.codomain, pol)?;
     }
-    if let Some((value, domain, _)) = &mut ct.history_slot {
-        f(value, pol)?;
-        f(domain, pol)?;
+    if let Some(history) = &mut ct.history_slot {
+        f(&mut history.value, pol)?;
+        f(&mut history.domain, pol)?;
     }
     for (decl, args) in ct.nominal.iter_mut() {
         for (arg, v) in args.iter_mut().zip(decl.sided_variances()) {

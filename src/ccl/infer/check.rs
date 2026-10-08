@@ -220,6 +220,10 @@ impl Typing for CheckCtx {
         0
     }
 
+    fn recoveries(&self) -> usize {
+        0
+    }
+
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, LocatedInferError> {
         // Recurse to collect the child's own errors, then hand back its
         // *recorded* type (not the rule-derived, throwaway-laden one) so the
@@ -906,7 +910,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             payload,
         } => emit_nominal_ctor(decl, ctor, payload, ctx)?,
 
-        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
+        TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, node_id, ctx)?,
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
@@ -918,7 +922,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             writers,
             domain,
             parameter,
-        } => emit_transact(keys, writers, domain, parameter.as_ref(), ctx)?,
+        } => emit_transact(keys, writers, domain, parameter.as_ref(), node_id, ctx)?,
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 
@@ -1138,6 +1142,16 @@ pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
 /// [`check_located`] against the types of the registered data sources, which verifies each
 /// projected source's recorded type and raises `MissingField` where a path has no field.
 pub(crate) fn check_located_against(
+    expr: &Expr,
+    sources: Option<&HashMap<String, Type>>,
+) -> Result<(), Vec<LocatedInferError>> {
+    // The walk opens a type's binders to reach the predicates beneath them, once per node
+    // that carries the type, so one memo keeps each opened predicate one allocation and
+    // `checked_predicates` checks it once.
+    crate::ccl::subst::with_conversion_memo(|| check_located_memoized(expr, sources))
+}
+
+fn check_located_memoized(
     expr: &Expr,
     sources: Option<&HashMap<String, Type>>,
 ) -> Result<(), Vec<LocatedInferError>> {

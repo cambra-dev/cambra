@@ -90,6 +90,7 @@ impl Drop for InferArena {
             // which watches the obligation — a cycle of exactly the kind the bound
             // lists make, and severed the same way.
             var.watches.borrow_mut().clear();
+            var.suspensions.borrow_mut().clear();
         }
     }
 }
@@ -394,6 +395,10 @@ pub enum InferError {
         reads: Vec<Name>,
         /// The predicate stating the keys.
         keys: std::rc::Rc<Expr>,
+        /// Whether a loop variable among `binders` would key the target's rows, but the target
+        /// is fed from more than one place, so a key does not say which place fed a row
+        /// ([`LocatedInferError::fed_elsewhere`]).
+        fed_elsewhere: bool,
     },
     /// The expression kind is not yet handled by this inference pass.
     Unsupported(String),
@@ -673,6 +678,7 @@ impl InferError {
             binders,
             reads,
             keys,
+            ..
         } = self
         {
             binders.retain(|binder| match rename.renamed(binder) {
@@ -792,10 +798,10 @@ pub struct LocatedInferError {
 /// [`LocatedInferError`], so it stays under `clippy::result_large_err`'s threshold, and
 /// an error rarely has any.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct RelatedPositions(Option<Box<[Option<Related>; 2]>>);
+pub struct RelatedPositions(Option<Box<[Option<Related>; 3]>>);
 
 impl RelatedPositions {
-    /// Each position: the value's, then the demand's.
+    /// Each position: the value's, the demand's, then another place feeding the target.
     pub fn iter(&self) -> impl Iterator<Item = &Related> {
         self.0.iter().flat_map(|slots| slots.iter().flatten())
     }
@@ -805,6 +811,7 @@ impl RelatedPositions {
         let slot = match related.role {
             RelatedRole::Value => 0,
             RelatedRole::Demand => 1,
+            RelatedRole::OtherFeed => 2,
         };
         self.0.get_or_insert_with(Box::default)[slot] = Some(related);
     }
@@ -826,6 +833,8 @@ pub enum RelatedRole {
     Value,
     /// The demand on the failing edge's right was stated here.
     Demand,
+    /// The target of a feed the error is about is fed here as well.
+    OtherFeed,
 }
 
 impl RelatedRole {
@@ -834,6 +843,7 @@ impl RelatedRole {
         match self {
             RelatedRole::Value => "the value comes from here",
             RelatedRole::Demand => "required here",
+            RelatedRole::OtherFeed => "the target is also fed here",
         }
     }
 }
@@ -872,6 +882,20 @@ impl LocatedInferError {
 }
 
 impl LocatedInferError {
+    /// Say that a [`InferError::NoJoinOverBinder`]'s target is fed from more than one place,
+    /// one of them at `other`: a loop variable it names would key the rows of a target fed
+    /// from one place (`src/ccl/design/type-inference.md`, "A history's value may depend on
+    /// its position"). Any other error is unchanged.
+    pub(crate) fn fed_elsewhere(&mut self, other: NodeId) {
+        if let InferError::NoJoinOverBinder { fed_elsewhere, .. } = &mut self.error {
+            *fed_elsewhere = true;
+            self.related.set(Related {
+                origin: crate::ccl::infer_var::Origin::Node(other),
+                role: RelatedRole::OtherFeed,
+            });
+        }
+    }
+
     /// Name what a [`InferError::TypeParamEscapes`] reaches, for the typing rule that
     /// knows it; any other error, or one already naming its target, is unchanged.
     pub(crate) fn with_escape_target(mut self, named: EscapeTarget) -> Self {
@@ -932,11 +956,30 @@ impl LocatedInferError {
 /// place it diverges. Only ever computed on this path: `Debug` of a type carrying a compiled
 /// predicate runs to a hundred kilobytes, which is exactly why the excerpt is a window and
 /// not the whole thing.
+/// `debug` with every `node_id: NodeId(…)` field removed.
+fn without_node_ids(debug: &str) -> String {
+    const FIELD: &str = "node_id: NodeId(";
+    let mut out = String::with_capacity(debug.len());
+    let mut rest = debug;
+    while let Some(start) = rest.find(FIELD) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + FIELD.len()..];
+        rest = after.find(')').map_or("", |end| &after[end + 1..]);
+    }
+    out.push_str(rest);
+    out
+}
+
 fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     if type_a.to_string() != type_b.to_string() {
         return None;
     }
-    let (a, b) = (format!("{type_a:?}"), format!("{type_b:?}"));
+    // A predicate's node ids name where its nodes came from, not what the type says, so the
+    // comparison skips them.
+    let (a, b) = (
+        without_node_ids(&format!("{type_a:?}")),
+        without_node_ids(&format!("{type_b:?}")),
+    );
     let Some(at) = a
         .char_indices()
         .zip(b.chars())
@@ -1358,6 +1401,7 @@ impl std::fmt::Debug for InferError {
                 binders,
                 reads,
                 keys,
+                fed_elsewhere,
             } => {
                 let spelled =
                     |names: &[Name]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>();
@@ -1384,7 +1428,16 @@ impl std::fmt::Debug for InferError {
                      The target's type is the join of every value written to it, and collections \
                      over different keys have no join.",
                     depends.join("; and on ")
-                )
+                )?;
+                if *fed_elsewhere {
+                    write!(
+                        f,
+                        " A loop's position keys the rows of a target fed from one place, but \
+                         this target is fed from more than one, so a key does not say which \
+                         place fed a row."
+                    )?;
+                }
+                Ok(())
             }
             InferError::MutNotBareVariable { at } => {
                 write!(
@@ -2225,10 +2278,10 @@ fn check_no_nested_mut(
         // below, whose children are still walked with `allow_mut = false` (a
         // `Overwrite` buried in a feed's value/domain is a nested violation).
         Type::History {
-            value,
-            domain,
             history_kind: HistoryKind::Overwrite,
+            ..
         } => {
+            let (domain, value, _) = ty.history_parts().expect("matched a history");
             if !allow_mut {
                 errors.push(InferError::MutInCompositeType {
                     at: at(),

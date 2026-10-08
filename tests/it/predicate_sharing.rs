@@ -91,7 +91,9 @@ fn assert_no_split(code: &str) {
 /// recomputes as value-refinements ∪ target-refinements — so a `target` that also
 /// carried the value's would double-book each one.
 ///
-/// The minimal exhibit is a nested filter. `coalesce_node` used to overwrite a
+/// The minimal exhibit is a nested filter, the two filters different predicates: refinements
+/// compare by normal form, so the same condition twice would be one refinement on both sides.
+/// `coalesce_node` used to overwrite a
 /// `Cast`'s `target` with the occurrence's coalesced view, which carries the
 /// value's filter alongside the cast's own, and three rebuild passes then did the
 /// same from route-dependent types; the inner cast came out with two refinements
@@ -111,7 +113,7 @@ fn a_cast_target_does_not_carry_its_value_s_refinements() {
     let consumer: Box<dyn cambra::interpreter::Consumer> = Box::new(|| {});
     let compiled = compile_program(
         &mut ctx,
-        &LoadedProgram::test("[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 3]"),
+        &LoadedProgram::test("[a for a in [b for b in [1, 2, 3, 4] if b < 3] if a < 2]"),
         consumer,
     )
     .expect("the nested filter compiles");

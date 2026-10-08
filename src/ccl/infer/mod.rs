@@ -137,7 +137,7 @@ fn blame_node_for_place(
             Type::Fun {
                 domain, codomain, ..
             } => mentions(domain, uid) || mentions(codomain, uid),
-            Type::History { value, domain, .. } => mentions(value, uid) || mentions(domain, uid),
+            Type::History { function, .. } => mentions(function, uid),
             Type::Tuple(elems) | Type::Nominal(_, elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::Split { input, output } => mentions(input, uid) || mentions(output, uid),
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
@@ -415,6 +415,7 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             binders,
             reads: Vec::new(),
             keys: refinement.predicate,
+            fed_elsewhere: false,
         },
         // The same violation `check_scope_valid` reports post-inference, caught where it is
         // made: a materialized type carrying a witness reference no binder covers. A
@@ -638,7 +639,8 @@ pub(crate) fn run(
     // state, so nothing needs to be kept in sync across them.
     // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
-    let errors = coalesce_pass(expr, std::mem::take(&mut sub_ctx.bound_at_annotation));
+    let mut errors = coalesce_pass(expr, std::mem::take(&mut sub_ctx.bound_at_annotation));
+    sub_ctx.name_other_feed_places(&mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }

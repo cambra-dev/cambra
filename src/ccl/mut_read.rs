@@ -711,7 +711,7 @@ fn unbind_go(mut expr: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, HistoryKind, Lit, Type};
+    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type};
 
     const ADD: BinOpKind = BinOpKind::Arithmetic(ArithmeticKind::Add);
 
@@ -719,11 +719,7 @@ mod tests {
     fn accumulator(name: &Name, body: Expr) -> Expr {
         Expr::mut_decl(
             name.clone(),
-            Type::History {
-                value: Box::new(Type::Base(BaseType::Int)),
-                domain: Box::new(Type::Hole),
-                history_kind: HistoryKind::Overwrite,
-            },
+            Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
             Expr::lit(Lit::Int(0)),
             body,
         )

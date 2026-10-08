@@ -793,7 +793,10 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    enclosing position in the form a nested comprehension lowers to. A tap holds a collection
    level per loop around its feed, which `mut_elim` counts as it builds the tap; the hoist
    uncurries those levels into the tuple key and feeds each value through a loop over the
-   result, `for x in tap: defer << x`, so a `Feed` appends one element wherever it stands.
+   result, `for x in tap: defer << x`, so a `Feed` appends one element wherever it stands. A
+   recurrence's tap whose rows read its loop's variable is keyed by the loop's position: the tap's
+   history is a data function whose value reads the position, with the variable read as its
+   source there (`type-inference.md`, "A history's value may depend on its position").
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator

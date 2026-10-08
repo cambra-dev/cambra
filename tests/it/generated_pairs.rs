@@ -52,11 +52,6 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
-    (
-        "comp_source_in_loop",
-        "binder_cond_coll[i]",
-        "CompilerRejects",
-    ),
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
     ("groupby_tuple_key", "rec_comp", "CompilerPanics"),
@@ -66,16 +61,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
         "loop_source_in_loop",
         "binder_cond_boxed[i]",
         "CompilerRejects",
-    ),
-    (
-        "loop_source_in_loop",
-        "binder_cond_coll[i]",
-        "CompilerRejects",
-    ),
-    (
-        "loop_source_in_loop",
-        "binder_filtered_comp[i]",
-        "CompilerPanics",
     ),
     ("loop_source_in_loop", "cond_boxed", "CompilerRejects"),
     ("loop_source_in_loop", "cond_coll", "CompilerPanics"),
@@ -87,16 +72,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
         "nested_mut_source",
         "binder_cond_boxed[i]",
         "CompilerRejects",
-    ),
-    (
-        "nested_mut_source",
-        "binder_cond_coll[i]",
-        "CompilerRejects",
-    ),
-    (
-        "nested_mut_source",
-        "binder_filtered_comp[i]",
-        "CompilerPanics",
     ),
     ("nested_mut_source", "cond_boxed", "CompilerRejects"),
     ("nested_mut_source", "cond_coll", "CompilerPanics"),
@@ -117,8 +92,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("record_in_list", "sum_of_empty", "CompilerRejects"),
     ("record_in_list", "ternary", "CompilerRejects"),
     ("record_in_list", "union_sum", "CompilerRejects"),
-    ("rows_comp_source", "rows_filtered", "CompilerPanics"),
-    ("rows_inner_filter", "rows_filtered", "CompilerPanics"),
     ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
     ("rows_nested_mut", "rows_cond", "CompilerRejects"),
     ("rows_nested_mut", "rows_filtered", "CompilerRejects"),

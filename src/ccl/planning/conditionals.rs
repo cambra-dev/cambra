@@ -504,7 +504,23 @@ fn instantiate_erased_in_type(
     ty: &mut Type,
     erased: &std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
 ) {
-    ty.walk_children_mut(|child| instantiate_erased_in_type(child, erased));
+    // **Top-down: a sum instantiates its own references before anything below it is
+    // visited.** The candidate is spelled where the sum stands, and one witness is named in
+    // several frames — a channel keyed by a loop's position and a row inside that loop name the
+    // same binder, each sum spelling the candidate in its own binders. Visiting the body first
+    // would hand a reference the sum binds the candidate recorded for another frame, whose
+    // closed indices then bind whatever function encloses this one.
+    if let Some([first, ..]) = ty.sum()
+        && erased.contains_key(first.id())
+        && let crate::ccl::ty::TypeKind::Enumerated(ds) = first.type_kind()
+        && let [sole] = ds.as_slice()
+    {
+        let sole = sole.clone();
+        let mut instantiated = ty.instantiate_sum(&sole);
+        instantiate_erased_in_type(&mut instantiated, erased);
+        *ty = instantiated;
+        return;
+    }
     // **A free reference to an erased witness is instantiated too.** Consumption names the
     // witness rather than presenting it (the sum-against-plain constrain arm), so a
     // consumer's recorded
@@ -517,16 +533,7 @@ fn instantiate_erased_in_type(
         *ty = sole.clone();
         return;
     }
-    if let Some([first, ..]) = ty.sum()
-        && erased.contains_key(first.id())
-        && let crate::ccl::ty::TypeKind::Enumerated(ds) = first.type_kind()
-        && let [sole] = ds.as_slice()
-    {
-        let sole = sole.clone();
-        let mut instantiated = ty.instantiate_sum(&sole);
-        instantiate_erased_in_type(&mut instantiated, erased);
-        *ty = instantiated;
-    }
+    ty.walk_children_mut(|child| instantiate_erased_in_type(child, erased));
 }
 
 /// The witness a collection type names, in **either spelling**.

@@ -474,7 +474,8 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
             occurrences(domain, at.compose(domain_variance), f);
             occurrences(codomain, at, f);
         }
-        Type::History { value, domain, .. } => {
+        Type::History { .. } => {
+            let (domain, value, _) = ty.history_parts().expect("matched a history");
             occurrences(value, Variance::Invariant, f);
             occurrences(domain, Variance::Invariant, f);
         }
