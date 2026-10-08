@@ -174,7 +174,11 @@ impl UnionOperator {
     /// concatenation — so this is a check, not a reconciliation. Arms that
     /// genuinely differ are a copairing, and [`new`](Self::new) is the
     /// constructor for those.
-    fn flatten_domain(tiling: Tiling) -> Tiling {
+    ///
+    /// A `declared_domain` is the bound the arms' keys range over where their domains
+    /// differ, the legs of a realized sum ([`new_flat_over`](Self::new_flat_over)). The
+    /// check is then that the bound includes every arm's domain.
+    fn flatten_domain(tiling: Tiling, declared_domain: Option<Extent>) -> Tiling {
         let (domain, codomain) = match tiling {
             Tiling::DataFunction { domain, codomain } => (domain, codomain),
             other => return other,
@@ -184,6 +188,16 @@ impl UnionOperator {
             other => vec![other],
         }
         .into_iter();
+        if let Some(domain) = declared_domain {
+            for arm in arms {
+                assert!(
+                    domain.includes(&arm),
+                    "a flat merge over a declared domain keys every arm's rows in it, but the \
+                     declared {domain:?} does not include an arm's {arm:?}"
+                );
+            }
+            return Tiling::DataFunction { domain, codomain };
+        }
         let domain = arms.next().expect("at least one arm");
         for other in arms {
             assert_eq!(
@@ -218,11 +232,30 @@ impl UnionOperator {
         declared_codomain: Extent,
         level: CurryLevel,
     ) -> Self {
+        Self::new_flat_over(inputs, None, declared_codomain, level)
+    }
+
+    /// [`new_flat_at`](Self::new_flat_at) whose merged keys range over `declared_domain`
+    /// where one is given, rather than over the one domain the arms share.
+    ///
+    /// The legs of a realized sum are the case: each is over its own arm's domain, at most
+    /// one holds rows (their first-match gates are disjoint), and the merged collection is
+    /// keyed as that leg is, under the bound the sum's type declares
+    /// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+    pub fn new_flat_over(
+        inputs: Vec<Box<dyn TileOperator>>,
+        declared_domain: Option<Extent>,
+        declared_codomain: Extent,
+        level: CurryLevel,
+    ) -> Self {
         // Narrow before minting, so the identity an operator is born with carries
         // the tiling it keeps. Reaching into `base.tiling` afterwards would leave
         // the shape recorded at construction stale.
         let arms = Self::inner_tilings(&inputs, level);
-        let merged = Self::flatten_domain(Self::coproduct_of(&arms, declared_codomain));
+        let merged = Self::flatten_domain(
+            Self::coproduct_of(&arms, declared_codomain),
+            declared_domain,
+        );
         let tiling = with_values_at(inputs[0].tiling(), level, merged);
         Self {
             base: OperatorBase::new(tiling),
