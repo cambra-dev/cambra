@@ -71,7 +71,7 @@ pinning it).
 
 ### 1.1 Source encoding
 
-CHL source is UTF-8 text. Spans are byte offsets into that source.
+CHL source is UTF-8 text. A span is a byte range of one source file.
 
 ### 1.2 Whitespace, comments, line structure
 

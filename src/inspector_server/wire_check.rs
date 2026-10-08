@@ -324,8 +324,32 @@ fn assert_common_shape(v: &Value, doc: &str) {
         v["source"]["text"].is_string(),
         "{doc}source.text is a string"
     );
-    assert!(v["definitions"].is_array(), "{doc}definitions is an array");
-    assert!(v["diagnostics"].is_array(), "{doc}diagnostics is an array");
+    let definitions = v["definitions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc}definitions is an array"));
+    for (i, d) in definitions.iter().enumerate() {
+        let at = format!("{doc}definitions[{i}]");
+        assert_span(&d["useSpan"], &format!("{at}.useSpan"));
+        assert_span(&d["defSpan"], &format!("{at}.defSpan"));
+        assert!(d["name"].is_string(), "{at}.name is a string");
+    }
+    let diagnostics = v["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{doc}diagnostics is an array"));
+    for (i, d) in diagnostics.iter().enumerate() {
+        let at = format!("{doc}diagnostics[{i}]");
+        for key in ["severity", "stage", "message"] {
+            assert!(d[key].is_string(), "{at}.{key} is a string");
+        }
+        // `null` when the error carries no range; present either way.
+        let span = d
+            .get("span")
+            .unwrap_or_else(|| panic!("{at}.span is present"));
+        if !span.is_null() {
+            assert_span(span, &format!("{at}.span"));
+        }
+        assert!(d.get("labels").is_none(), "{at} ships no labels");
+    }
     assert!(
         v.get("scopes").is_none(),
         "{doc}the payload ships no scopes"
@@ -584,8 +608,20 @@ fn assert_operator_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64
     }
 }
 
-/// Assert a node's `spans`: every entry a `{start, end}` pair, each one once,
-/// narrowest first. Same channel and same meaning on both node shapes.
+/// Assert one wire span, a `{file, start, end}` object of numbers, and return
+/// its three fields. Every span on the wire has this shape: a node's `spans`, a
+/// definition's `useSpan` and `defSpan`, and a diagnostic's `span`.
+fn assert_span(sp: &Value, at: &str) -> (u64, u64, u64) {
+    let field = |key: &str| {
+        sp[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{at}.{key} is a number"))
+    };
+    (field("file"), field("start"), field("end"))
+}
+
+/// Assert a node's `spans`: every entry a `{file, start, end}` triple, each one
+/// once, narrowest first. Same channel and same meaning on both node shapes.
 fn assert_spans(v: &Value, at: &str) {
     let spans = v["spans"]
         .as_array()
@@ -593,15 +629,10 @@ fn assert_spans(v: &Value, at: &str) {
     let mut widths = Vec::with_capacity(spans.len());
     let mut seen_spans = std::collections::HashSet::new();
     for (i, sp) in spans.iter().enumerate() {
-        let start = sp["start"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("{at}.spans[{i}].start is a number"));
-        let end = sp["end"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("{at}.spans[{i}].end is a number"));
+        let (file, start, end) = assert_span(sp, &format!("{at}.spans[{i}]"));
         assert!(
-            seen_spans.insert((start, end)),
-            "{at}.spans[{i}] repeats span {start}..{end}"
+            seen_spans.insert((file, start, end)),
+            "{at}.spans[{i}] repeats span {start}..{end} of file {file}"
         );
         widths.push(end.saturating_sub(start));
     }

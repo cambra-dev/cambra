@@ -410,6 +410,7 @@ impl Diagnostic {
             CompileError::LambdaElim { error, span } => ("lambdaElim", error.to_string(), *span),
             CompileError::Conversion(e) => ("conversion", format!("{e:?}"), None),
             CompileError::Unsupported(msg) => ("unsupported", msg.clone(), None),
+            CompileError::RunningVersion(rendered) => ("runningVersion", rendered.clone(), None),
         };
         Diagnostic {
             severity: "error".to_string(),
@@ -540,11 +541,14 @@ fn build_operator_table(graph: &OperatorGraph, projection: &SourceProjection) ->
 /// the ordering is this function's to establish rather than something the
 /// projection already holds.
 ///
-/// The key is `(width, start, end)` rather than width alone, so two spans of
-/// equal width order by position and the payload stays byte-reproducible.
+/// The key is `(width, start, end, file)` rather than width alone, so two spans
+/// of equal width order by position and the payload stays byte-reproducible.
+/// `file` is in it because `dedup` drops only adjacent repeats: two spans of one
+/// extent in different files would otherwise tie, keep the union's order, and
+/// let a repeat of one land on the far side of the other.
 fn wire_spans(spans: &[Span]) -> Vec<Span> {
     let mut spans = spans.to_vec();
-    spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end));
+    spans.sort_by_key(|s| (s.end.saturating_sub(s.start), s.start, s.end, s.file));
     spans.dedup();
     spans
 }
@@ -783,6 +787,7 @@ mod tests {
     use super::*;
     use crate::ccl::context::{CompiledProgram, GlobalContext, collect_tree_ids, compile_program};
     use crate::ccl::panes::PANES;
+    use crate::chl_parser::{FileId, SourceMap};
     use crate::interpreter::Consumer;
     use indoc::indoc;
     use std::collections::{HashMap, HashSet};
@@ -790,17 +795,21 @@ mod tests {
     fn compile(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, code, consumer).expect("program compiles")
+        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+            .expect("program compiles")
     }
 
-    /// The span of the `n`-th (0-based) byte occurrence of `needle` in `code`.
-    fn nth_span(code: &str, needle: &str, n: usize) -> Span {
-        let start = code
+    /// The span of the `n`-th (0-based) byte occurrence of `needle` in the root
+    /// file of `sources`, the map a program was compiled from.
+    fn nth_span(sources: &SourceMap, needle: &str, n: usize) -> Span {
+        let file = sources.root();
+        let start = sources
+            .text(file)
             .match_indices(needle)
             .nth(n)
             .unwrap_or_else(|| panic!("occurrence {n} of {needle:?} not found"))
             .0;
-        Span::new(start, start + needle.len())
+        Span::new(file, start, start + needle.len())
     }
 
     /// Programs whose shapes reach the payload's moving parts: a comprehension
@@ -1001,7 +1010,8 @@ mod tests {
     /// this is what says what that join is checked against.
     #[test]
     fn wire_spans_orders_narrowest_first_and_dedups() {
-        let span = |start: usize, end: usize| Span { start, end };
+        let file = FileId::ROOT;
+        let span = |start: usize, end: usize| Span::new(file, start, end);
 
         // The observed regression: `inner_join`'s operator nodes carried the
         // 99-byte comprehension ahead of the 32-byte record it contains, so
@@ -1039,6 +1049,15 @@ mod tests {
         );
 
         assert_eq!(wire_spans(&[]), vec![]);
+
+        // Spans of one extent in two files: each ships once, in an order that
+        // does not depend on the union's.
+        let mut sources = SourceMap::default();
+        let a = sources.add("a.cambra", "x\n");
+        let b = sources.add("b.cambra", "x\n");
+        let (in_a, in_b) = (Span::new(a, 0, 1), Span::new(b, 0, 1));
+        assert_eq!(wire_spans(&[in_a, in_b, in_a]), vec![in_a, in_b]);
+        assert_eq!(wire_spans(&[in_b, in_a]), vec![in_a, in_b]);
     }
 
     /// A node's `spans` are exactly the spans its pane's projection records for
@@ -1146,7 +1165,11 @@ mod tests {
         // `x * 2` is the root of a lowered source expression, so its rewrite tag
         // null-compresses; it carries its own span and its inferred type.
         let mul = node_named(pane, "BinOp(Arithmetic(Mul))");
-        assert_eq!(mul.spans, [Span::new(24, 29)], "the span of `x * 2`");
+        assert_eq!(
+            mul.spans,
+            [Span::new(prog.sources.root(), 24, 29)],
+            "the span of `x * 2`"
+        );
         assert_eq!(mul.ty, "Int");
         assert!(
             mul.rewritten.is_none(),
@@ -1458,7 +1481,7 @@ mod tests {
         let code = "x = (1 + \n";
         let compiled = compile_program(
             &mut GlobalContext::default(),
-            code,
+            &SourceMap::single("<test>", code),
             Box::new(|| {}) as Box<dyn Consumer>,
         );
         let Err(errors) = compiled else {
@@ -1498,14 +1521,15 @@ mod tests {
         use crate::ccl::lower::LoweringError;
         use crate::chl_parser::ast::Span;
 
+        let file = FileId::ROOT;
         let error = crate::ccl::context::CompileError::Lower(LoweringError::unsupported(
-            Span::new(3, 7),
+            Span::new(file, 3, 7),
             "generators are not supported here",
         ));
         let diagnostic = Diagnostic::from_compile_error(&error);
         assert_eq!(diagnostic.stage, "lower");
         assert_eq!(diagnostic.message, "generators are not supported here");
-        assert_eq!(diagnostic.span, Some(Span::new(3, 7)));
+        assert_eq!(diagnostic.span, Some(Span::new(file, 3, 7)));
     }
 
     /// Every node of every pane carries an attribution, so `spans` and
@@ -1545,7 +1569,7 @@ mod tests {
     fn a_degraded_payload_carries_diagnostics_and_no_panes() {
         let compiled = compile_program(
             &mut GlobalContext::default(),
-            "z + 1\n",
+            &SourceMap::single("<test>", "z + 1\n"),
             Box::new(|| {}) as Box<dyn Consumer>,
         );
         let Err(errors) = compiled else {
@@ -1769,7 +1793,7 @@ max(totals)
             .filter(|(_, _, spans)| {
                 spans
                     .iter()
-                    .any(|s| s.start <= span.start && span.end <= s.end)
+                    .any(|s| s.file == span.file && s.start <= span.start && span.end <= s.end)
             })
             .map(|(_, label, _)| (*label).to_string())
             .collect()
@@ -1786,26 +1810,26 @@ max(totals)
 
         // The `x * x` body → the arithmetic-mul BinOp (a mono clone of the
         // generator body, which *does* carry the body span).
-        let mul = at(nth_span(GENERATOR_SRC, "x * x", 0));
+        let mul = at(nth_span(&prog.sources, "x * x", 0));
         assert!(
             mul.iter().any(|l| l.contains("BinOp(Arithmetic(Mul))")),
             "`x * x` → Mul BinOp; got {mul:?}"
         );
 
         // `max(squared(...))` → the Max aggregate.
-        let max = at(nth_span(GENERATOR_SRC, "max", 0));
+        let max = at(nth_span(&prog.sources, "max", 0));
         assert!(
             max.iter().any(|l| l.contains("Aggregate(Max)")),
             "`max` → Max; got {max:?}"
         );
 
         // The list literals `1` and `2` map to their Lit nodes.
-        let lit1 = at(nth_span(GENERATOR_SRC, "1", 0));
+        let lit1 = at(nth_span(&prog.sources, "1", 0));
         assert!(
             lit1.iter().any(|l| l.contains("Lit(Int(1))")),
             "`1` → Lit; got {lit1:?}"
         );
-        let lit2 = at(nth_span(GENERATOR_SRC, "2", 0));
+        let lit2 = at(nth_span(&prog.sources, "2", 0));
         assert!(
             lit2.iter().any(|l| l.contains("Lit(Int(2))")),
             "`2` → Lit; got {lit2:?}"
@@ -1815,7 +1839,7 @@ max(totals)
         // monomorphized `squared(...)` call) maps to the `List` node. Span the
         // elements, not the whole `[...]`: the `[` sits outside the lowered list
         // span, so the elements' extent is what a row covers.
-        let list = at(nth_span(GENERATOR_SRC, "1, 2, 3, 4", 0));
+        let list = at(nth_span(&prog.sources, "1, 2, 3, 4", 0));
         assert!(
             list.iter().any(|l| l.contains("List")),
             "`[1, 2, 3, 4]` → List; got {list:?}"
@@ -1832,13 +1856,13 @@ max(totals)
         let payload = InspectedProgram::new(&prog).build_payload("test");
         let at = |span| labels_at(&payload, "post-inference", span);
 
-        let sum = at(nth_span(DEFER_SRC, "sum", 0));
+        let sum = at(nth_span(&prog.sources, "sum", 0));
         assert!(
             sum.iter().any(|l| l.contains("Aggregate(Sum)")),
             "`sum` → Sum; got {sum:?}"
         );
 
-        let max = at(nth_span(DEFER_SRC, "max", 0));
+        let max = at(nth_span(&prog.sources, "max", 0));
         assert!(
             max.iter().any(|l| l.contains("Aggregate(Max)")),
             "`max` → Max; got {max:?}"
@@ -1846,14 +1870,14 @@ max(totals)
 
         // `totals` occurs 4×: the def (0), the two `<<` feeds (1, 2), and the
         // `max(totals)` use (3). The last is the read whose span maps to Var.
-        let totals_use = at(nth_span(DEFER_SRC, "totals", 3));
+        let totals_use = at(nth_span(&prog.sources, "totals", 3));
         assert!(
             totals_use.iter().any(|l| l.contains("Var(totals)")),
             "`totals` in `max(totals)` → Var(totals); got {totals_use:?}"
         );
 
         // The readings list literals map to Lit nodes.
-        let lit1 = at(nth_span(DEFER_SRC, "1", 0));
+        let lit1 = at(nth_span(&prog.sources, "1", 0));
         assert!(
             lit1.iter().any(|l| l.contains("Lit(Int(1))")),
             "`1` → Lit; got {lit1:?}"
@@ -1878,7 +1902,7 @@ max(totals)
         let panes = prog.materialize_panes();
         let payload = InspectedProgram::from_parts(
             "post-channelize",
-            &prog.source,
+            &prog.sources,
             &prog.post_channelize_ir,
             panes.projection("post-channelize").clone(),
         )
@@ -1887,7 +1911,7 @@ max(totals)
 
         // Copairing, not a disjoint join: the arms land on their coproduct, and
         // nothing asserts the two feeds cover disjoint parts of one domain.
-        let defer_site = at(nth_span(DEFER_SRC, "defer()", 0));
+        let defer_site = at(nth_span(&prog.sources, "defer()", 0));
         assert!(
             defer_site.iter().any(|l| l.contains("Copair")),
             "the `defer()` declaration reaches the copaired fan-in; got {defer_site:?}"
@@ -1895,23 +1919,23 @@ max(totals)
 
         // The fed value the user wrote still maps to its own aggregate, and the
         // rest of the Part-A set maps at this pane too.
-        let feed = at(nth_span(DEFER_SRC, "sum", 0));
+        let feed = at(nth_span(&prog.sources, "sum", 0));
         assert!(
             feed.iter().any(|l| l.contains("Aggregate(Sum)")),
             "`sum` → Sum; got {feed:?}"
         );
-        let max = at(nth_span(DEFER_SRC, "max", 0));
+        let max = at(nth_span(&prog.sources, "max", 0));
         assert!(
             max.iter().any(|l| l.contains("Aggregate(Max)")),
             "`max` → Max; got {max:?}"
         );
-        let totals_use = at(nth_span(DEFER_SRC, "totals", 3));
+        let totals_use = at(nth_span(&prog.sources, "totals", 3));
         assert!(
             totals_use.iter().any(|l| l.contains("Var(totals)")),
             "`totals` in `max(totals)` → Var(totals); got {totals_use:?}"
         );
         for digit in ["1", "2", "3", "4"] {
-            let lit = at(nth_span(DEFER_SRC, digit, 0));
+            let lit = at(nth_span(&prog.sources, digit, 0));
             assert!(
                 lit.iter()
                     .any(|l| l.contains(&format!("Lit(Int({digit}))"))),

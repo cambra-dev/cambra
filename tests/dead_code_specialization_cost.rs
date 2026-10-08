@@ -22,6 +22,7 @@ use cambra::ccl::{
     uniquify,
 };
 use cambra::chl_parser;
+use cambra::chl_parser::FileId;
 
 /// `a1 … a{depth}`, each calling its predecessor twice, then `f` calling the last.
 /// With `live`, `f` is applied; without, `f` is dead code.
@@ -42,11 +43,12 @@ fn chain(depth: usize, live: bool) -> String {
 /// outside the window, so only inference is measured.
 fn inference_allocations(code: &str) -> usize {
     let mut lctx = LoweringContext::default();
-    let stmts = chl_parser::parse_module(code)
+    let module = chl_parser::parse_module(FileId::ROOT, code)
         .into_result()
-        .expect("parse")
-        .body;
-    let expr = lower_stmts(&stmts, &mut lctx).into_result().expect("lower");
+        .expect("parse");
+    let expr = lower_stmts(&module, &mut lctx)
+        .into_result()
+        .expect("lower");
     // Uniquify outside the measurement window, as the pipeline does before
     // `infer`: inference allocates against α-unique binders in the product, so
     // measuring it on source spellings measures a tree it never sees.

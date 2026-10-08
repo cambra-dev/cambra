@@ -8,11 +8,22 @@
 //! "is the surface syntax we already use still parseable?"
 
 use cambra::chl_parser::ast::{Expr, Spanned, Stmt};
-use cambra::chl_parser::{parse_expression, parse_module};
+use cambra::chl_parser::parser::ParseResult;
+use cambra::chl_parser::{FileId, SourceMap, parse_expression, parse_module};
 use indoc::indoc;
 
+/// Parse `src` as a module, the root of its own one-file map.
+fn parse_mod(src: &str) -> ParseResult<cambra::chl_parser::Module> {
+    parse_module(FileId::ROOT, src)
+}
+
+/// Parse `src` as an expression, the root of its own one-file map.
+fn parse_expr(src: &str) -> ParseResult<Spanned<Expr>> {
+    parse_expression(FileId::ROOT, src)
+}
+
 fn must_parse_module(src: &str) {
-    let result = parse_module(src);
+    let result = parse_mod(src);
     if !result.errors.is_empty() {
         panic!("parse failed:\n{src}\n----\n{:#?}", result.errors);
     }
@@ -24,7 +35,7 @@ fn must_parse_module(src: &str) {
 }
 
 fn must_parse_expr(src: &str) -> Spanned<Expr> {
-    parse_expression(src)
+    parse_expr(src)
         .into_result()
         .unwrap_or_else(|errs| panic!("parse failed:\n{src}\n----\n{errs:#?}"))
 }
@@ -60,7 +71,7 @@ fn comparison_and_boolean() {
         "a < b < c",
     ] {
         // single-quote string literals aren't in the spec; skip if they fail to parse.
-        let _ = parse_expression(src);
+        let _ = parse_expr(src);
     }
 }
 
@@ -128,7 +139,7 @@ fn records_and_brace_types() {
     assert!(matches!(rt.node, Expr::BraceRecord(_)));
     // Expression-key braces are not a valid type — a map is `[k -> v]`.
     assert!(
-        !parse_module(r#"{"name": "alice"}"#).errors.is_empty(),
+        !parse_mod(r#"{"name": "alice"}"#).errors.is_empty(),
         "expression-key braces should be a parse error"
     );
     // A one-element product carries the comma; `{}` is the zero-element one.
@@ -152,7 +163,7 @@ fn custom_grammar_errors_keep_their_message() {
         ("x: {a: Int, Bool} = (1,)", "is type syntax"),
     ];
     for (src, needle) in cases {
-        let result = parse_module(src);
+        let result = parse_mod(src);
         assert!(!result.errors.is_empty(), "expected {src:?} to be rejected");
         let rendered = result.errors[0].to_string();
         assert!(
@@ -170,8 +181,9 @@ fn custom_grammar_errors_keep_their_message() {
 /// exercises the full ariadne path rather than just `Display`.
 #[test]
 fn custom_grammar_errors_render_with_source_context() {
-    let result = parse_module("x: {Int} = (1,)");
-    let rendered = result.render_errors("<test>", "x: {Int} = (1,)");
+    let sources = SourceMap::single("<test>", "x: {Int} = (1,)");
+    let result = parse_module(sources.root(), "x: {Int} = (1,)");
+    let rendered = result.render_errors(&sources);
     assert!(
         rendered.contains("{T,}"),
         "ariadne rendering should carry the custom message, got: {rendered}"
@@ -201,7 +213,7 @@ fn positional_attribute_access() {
         }
     }
     // A key that is neither spelling is rejected, and the label names both.
-    let r = parse_module("t.-1\n");
+    let r = parse_mod("t.-1\n");
     let msg = format!("{}", r.errors.first().expect("`.-1` must not parse"));
     assert!(
         msg.contains("field name or index"),
@@ -352,7 +364,7 @@ fn annotated_assignment_with_type() {
 fn empty_module_is_well_formed() {
     // No statements, no panic, no spurious errors.
     for src in &["", "\n\n\n", "# just a comment\n"] {
-        let result = parse_module(src);
+        let result = parse_mod(src);
         assert!(
             result.errors.is_empty(),
             "got errors for {src:?}: {:#?}",
@@ -368,7 +380,7 @@ fn empty_module_is_well_formed() {
 #[test]
 fn parse_error_is_reported_not_panicked() {
     // Syntax that the parser must reject — without panicking.
-    let result = parse_module("def\n");
+    let result = parse_mod("def\n");
     assert!(!result.errors.is_empty(), "expected at least one error");
 }
 
@@ -393,7 +405,7 @@ fn newlines_within_brackets_are_continuations() {
 #[test]
 fn statement_with_function_then_call() {
     // Two top-level statements: a def and an expr-stmt call.
-    let m = parse_module(indoc! {"
+    let m = parse_mod(indoc! {"
         def doubles(xs):
             for x in xs:
                 yield x * 2
@@ -425,7 +437,7 @@ fn statement_recovery_collects_multiple_errors_in_one_pass() {
         def 3(z):
             z
     "};
-    let result = parse_module(src);
+    let result = parse_mod(src);
     assert!(
         result.errors.len() >= 2,
         "expected at least 2 errors, got {}: {:#?}",
@@ -449,7 +461,7 @@ fn bracket_recovery_inside_expression() {
     // A balanced (...) with a syntax error inside should produce an
     // Expr::Error at the right span, NOT abort the statement.
     let src = "x = (1 +) + 2\n";
-    let result = parse_module(src);
+    let result = parse_mod(src);
     // We get at least one error (the bad sub-expression), but the parser
     // still produced a statement for `x = …`.
     assert!(
@@ -473,7 +485,7 @@ fn bad_def_header_does_not_swallow_following_top_level_stmts() {
 
         y = 2
     "};
-    let result = parse_module(src);
+    let result = parse_mod(src);
     assert!(!result.errors.is_empty(), "expected at least one error");
     let m = result.value.expect("recovery should still produce an AST");
     assert_eq!(m.body.len(), 2);
@@ -489,7 +501,7 @@ fn unclosed_bracket_is_reported_at_eof() {
     // get a clean `UnclosedBracket` from the lexer.
     use cambra::chl_parser::lexer::{LexError, tokenize};
     assert!(matches!(
-        tokenize("(1 + 2\n"),
+        tokenize(FileId::ROOT, "(1 + 2\n"),
         Err(LexError::UnclosedBracket { .. })
     ));
 }
@@ -563,7 +575,7 @@ fn nested_block_recovery_reports_one_error_per_mistake() {
         ),
     ];
     for (name, src) in cases {
-        let r = parse_module(src);
+        let r = parse_mod(src);
         assert_eq!(
             r.errors.len(),
             1,
@@ -597,7 +609,7 @@ fn error_messages_use_readable_symbols_not_debug_names() {
         ("if 1 + 2:\n    pass\n=\n", &["'='"], &["Eq(", "Token::"]),
     ];
     for (src, must_contain, must_not_contain) in cases {
-        let r = parse_module(src);
+        let r = parse_mod(src);
         assert!(
             !r.errors.is_empty(),
             "expected at least one error for {src:?}"
@@ -633,7 +645,7 @@ fn expected_lists_are_collapsed_to_categories() {
     // ("binary operator", "comparison operator", "boolean operator",
     // "postfix operation") and the genuinely-distinct alternatives
     // (`<<`, `if`, `:`) — about 7 items total, not 22.
-    let r = parse_module("if x\n    y\n");
+    let r = parse_mod("if x\n    y\n");
     assert_eq!(r.errors.len(), 1, "{:#?}", r.errors);
     let msg = format!("{}", r.errors[0]);
     for needle in &[
@@ -668,8 +680,9 @@ fn ariadne_render_includes_source_context_and_secondary_labels() {
     //       parsing statement" pointing back at the in-progress
     //       production.
     let src = "if x\n    y\n";
-    let r = parse_module(src);
-    let rendered = r.render_errors("if-test", src);
+    let sources = SourceMap::single("if-test", src);
+    let r = parse_module(sources.root(), src);
+    let rendered = r.render_errors(&sources);
     // Source content shows up in the report.
     assert!(rendered.contains("if x"), "rendered: {rendered}");
     assert!(rendered.contains("if-test"), "rendered: {rendered}");
@@ -695,7 +708,7 @@ fn with_begin_transaction_block_parses() {
 #[test]
 fn with_begin_binds_handle() {
     // `with t = begin():` records the optional handle binding.
-    let m = parse_module("with t = begin():\n    x = 1\nx\n")
+    let m = parse_mod("with t = begin():\n    x = 1\nx\n")
         .value
         .expect("parses");
     let Stmt::With { binding, .. } = &m.body[0].node else {
@@ -708,7 +721,7 @@ fn with_begin_binds_handle() {
 fn mut_txn_annotation_parses_as_type_application() {
     // `Mut(V, Txn)` — the two-argument (value, domain) annotation form —
     // parses as type application: a call with a `Mut` head and two arguments.
-    let m = parse_module("store: Mut(Int, Txn) = 0\nstore\n")
+    let m = parse_mod("store: Mut(Int, Txn) = 0\nstore\n")
         .value
         .expect("parses");
     let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {

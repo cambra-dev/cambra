@@ -163,7 +163,7 @@ describe("view integration: cross-pane source<->tree linking", () => {
     const twin = (widened as { nodes: { nodeId: number; spans: unknown[] }[] }).nodes.find(
       (n) => n.nodeId === 1,
     )!;
-    twin.spans = [{ start: 1, end: 5 }];
+    twin.spans = [{ file: 0, start: 1, end: 5 }];
 
     const root = document.createElement("div");
     document.body.appendChild(root);

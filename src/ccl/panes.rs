@@ -351,6 +351,7 @@ mod tests {
     use indoc::indoc;
 
     use super::*;
+
     use crate::ccl::TypedExprNode;
     use crate::ccl::context::{
         GlobalContext, PERF_REPS_ENV, compile_program, predicate_id_collisions,
@@ -358,13 +359,14 @@ mod tests {
     };
     use crate::ccl::provenance::Link;
     use crate::ccl::test_corpus::pipeline_corpus as corpus;
+    use crate::chl_parser::SourceMap;
     use crate::interpreter::Consumer;
 
     /// Compile `code` through the full pipeline, panicking on error.
     fn compile_ok(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        match compile_program(&mut ctx, code, consumer) {
+        match compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer) {
             Ok(p) => p,
             Err(errs) => panic!("expected a successful compile, got {errs:?}"),
         }

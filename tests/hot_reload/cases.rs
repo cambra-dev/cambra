@@ -47,14 +47,15 @@ fn a_loop_added_over_a_folded_collection_reads_it_whole() {
         )
     };
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &fold("", "n"), &no_main).expect("v1 compiles");
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &fold("", "n"), &no_main).expect("v1 compiles");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
         "abc",
         "the fold runs to the end, so `items` is spent"
     );
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &fold(
             "p := \"\"
@@ -98,7 +99,7 @@ fn a_loop_that_cannot_read_its_collection_from_the_start_is_reported() {
         source("view-fold-revariabled", port),
     );
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &v1, &no_main).expect("v1 compiles");
     let before: Vec<String> = exchange(&mut ctx, move || {
         (1..=3)
             .map(|i| http_post(port, "/bump", &i.to_string()))
@@ -107,7 +108,7 @@ fn a_loop_that_cannot_read_its_collection_from_the_start_is_reported() {
     assert_eq!(before, vec!["1!", "1!2!", "1!2!3!"]);
 
     let report = live
-        .reload(&mut ctx, &v2, &no_main)
+        .reload_text(&mut ctx, &v2, &no_main)
         .expect("the elements are gone, so this is a fact about the reload rather than a refusal");
     let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
     assert_eq!(
@@ -161,10 +162,10 @@ fn a_loop_added_over_a_buildable_collection_reports_nothing() {
             p := p + y
         n + p
     "#};
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "abc");
 
-    let report = live.reload(&mut ctx, v2, &no_main).expect("accepted");
+    let report = live.reload_text(&mut ctx, v2, &no_main).expect("accepted");
     assert!(
         report.unreadable.is_empty(),
         "`items` is a list literal, so `p`'s loop reads it whole: {:?}",
@@ -197,7 +198,7 @@ fn a_stateless_loop_gaining_an_accumulator_over_an_advanced_source_is_reported()
     assert_eq!(before, vec!["a\n", "q\n"]);
 
     let report = live
-        .reload(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
+        .reload_text(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
         .expect("`n` is unchanged and `m` is new");
     let rendered: Vec<String> = report.unreadable.iter().map(ToString::to_string).collect();
     assert_eq!(
@@ -221,8 +222,8 @@ fn a_stateless_loop_gaining_an_accumulator_over_an_advanced_source_is_reported()
 fn a_loop_added_over_an_unread_source_reports_nothing() {
     let port = reserve_test_port();
     let mut ctx = GlobalContext::default();
-    let mut live =
-        LiveProgram::start(&mut ctx, &source("view-fold", port), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &source("view-fold", port), &no_main)
+        .expect("v1 compiles");
     let before: Vec<String> = exchange(&mut ctx, move || {
         (1..=3)
             .map(|i| http_post(port, "/bump", &i.to_string()))
@@ -231,7 +232,7 @@ fn a_loop_added_over_an_unread_source_reports_nothing() {
     assert_eq!(before, vec!["1!", "1!2!", "1!2!3!"]);
 
     let report = live
-        .reload(&mut ctx, &source("view-fold-second-route", port), &no_main)
+        .reload_text(&mut ctx, &source("view-fold-second-route", port), &no_main)
         .expect("a loop over a second route reads a source of its own");
     assert!(
         report.unreadable.is_empty(),
@@ -279,7 +280,7 @@ fn a_reload_keeps_the_state_of_logic_it_did_not_change() {
     );
 
     let report: ReloadReport = live
-        .reload(
+        .reload_text(
             &mut ctx,
             &source("guestbook-stateless-edit", port),
             &no_main,
@@ -337,7 +338,7 @@ fn a_store_resumes_however_far_its_source_has_advanced() {
     assert_eq!(before.len(), 6);
     assert_eq!(before[5], "e1\ne2\ne3\ne4\ne5\ne6\n");
 
-    live.reload(&mut ctx, &source("guestbook-stateful-edit", port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook-stateful-edit", port), &no_main)
         .expect("editing a loop body is a change between existing endpoints");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/sign", "e7")]);
@@ -367,7 +368,7 @@ fn reordering_two_accumulators_does_not_cross_their_state() {
     });
     assert_eq!(before[2], "aaa|BBB\n");
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("two-accumulators-reordered", port),
         &no_main,
@@ -398,7 +399,7 @@ fn a_loop_may_gain_an_accumulator() {
     assert_eq!(before[1], "aa|BB\n");
 
     let report = live
-        .reload(&mut ctx, &source("two-accumulators-added", port), &no_main)
+        .reload_text(&mut ctx, &source("two-accumulators-added", port), &no_main)
         .expect("adding an accumulator loses nothing");
 
     // One loop drives one position sequence, so the added variable begins where
@@ -440,7 +441,7 @@ fn a_variable_that_moves_to_another_loop_takes_its_value_and_restarts() {
     });
     assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    live.reload(&mut ctx, &source("one-stateful-loop-moved", port), &no_main)
+    live.reload_text(&mut ctx, &source("one-stateful-loop-moved", port), &no_main)
         .expect("`n` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || {
@@ -474,7 +475,7 @@ fn moving_a_program_to_another_port_keeps_its_state() {
     });
     assert_eq!(before, vec!["alice\n", "alice\nbob\n"]);
 
-    live.reload(&mut ctx, &source("guestbook", new_port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook", new_port), &no_main)
         .expect("`entries` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || {
@@ -511,7 +512,7 @@ fn a_transactional_variable_survives_an_edit_to_its_writer() {
     });
     assert_eq!(before, vec!["ok\n", "bob"]);
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("latest-write-writer-edit", port),
         &no_main,
@@ -543,7 +544,7 @@ fn an_edit_to_one_accumulator_leaves_the_other_running() {
     assert_eq!(before, vec!["p\n", "q\n"]);
 
     let report = live
-        .reload(&mut ctx, &source("two-loops-one-edited", port), &no_main)
+        .reload_text(&mut ctx, &source("two-loops-one-edited", port), &no_main)
         .expect("editing one loop is a change between existing endpoints");
     // Reuse is not observable in the values below: a rebuilt store resumes
     // from the value it carried, so it answers what a kept one answers. The
@@ -585,16 +586,16 @@ fn reuse_does_not_depend_on_how_many_reloads_came_before() {
     let first = {
         let port = reserve_test_port();
         let (mut ctx, mut live) = start_sink(&source("two-loops", port));
-        live.reload(&mut ctx, &source("two-loops-one-edited", port), &no_main)
+        live.reload_text(&mut ctx, &source("two-loops-one-edited", port), &no_main)
             .expect("accepted")
             .reuse
     };
     let after_a_no_op = {
         let port = reserve_test_port();
         let (mut ctx, mut live) = start_sink(&source("two-loops", port));
-        live.reload(&mut ctx, &source("two-loops", port), &no_main)
+        live.reload_text(&mut ctx, &source("two-loops", port), &no_main)
             .expect("accepted");
-        live.reload(&mut ctx, &source("two-loops-one-edited", port), &no_main)
+        live.reload_text(&mut ctx, &source("two-loops-one-edited", port), &no_main)
             .expect("accepted")
             .reuse
     };
@@ -614,9 +615,10 @@ fn reuse_does_not_depend_on_how_many_reloads_came_before() {
 /// The control port answers `/diff` itself, at the phase the request names, and
 /// rejects a phase it does not offer.
 ///
-/// Every other case here calls `LiveProgram::diff_against` directly, so this is
-/// what covers the wire: both ways of carrying the source, the leading `phase=`,
-/// and the main loop servicing a `Diff` between ticks.
+/// Every other case here calls `LiveProgram::diff_against` directly (through
+/// `OneFile::diff_text`), so this is what covers the wire: both ways of carrying
+/// the source, the leading `phase=`, and the main loop servicing a `Diff`
+/// between ticks.
 #[test]
 fn the_control_port_answers_a_diff_request() {
     const V1: &str = "[\"> \" + line for line in stdin()]\n";
@@ -944,7 +946,7 @@ fn a_reload_may_add_an_endpoint() {
     let before = exchange(&mut ctx, move || vec![http_post(port, "/sign", "alice")]);
     assert_eq!(before, vec!["alice\n"]);
 
-    live.reload(&mut ctx, &source("guestbook-adds-route", port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook-adds-route", port), &no_main)
         .expect("adding an endpoint is allowed");
 
     let after = exchange(&mut ctx, move || {
@@ -975,9 +977,9 @@ fn a_route_a_version_retired_can_be_served_again() {
         vec!["peek\n"],
     );
 
-    live.reload(&mut ctx, &source("guestbook-drops-route", port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook-drops-route", port), &no_main)
         .expect("dropping a route is allowed");
-    live.reload(&mut ctx, &source("guestbook", port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook", port), &no_main)
         .expect("re-adding the route it dropped is allowed");
 
     assert_eq!(
@@ -1002,11 +1004,11 @@ fn a_program_can_move_back_to_the_port_it_left() {
         vec!["alice\n"],
     );
 
-    live.reload(&mut ctx, &source("guestbook", second), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook", second), &no_main)
         .expect("moving to another port is allowed");
     assert_port_released(first);
 
-    live.reload(&mut ctx, &source("guestbook", first), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook", first), &no_main)
         .expect("moving back is allowed");
     assert_eq!(
         exchange(&mut ctx, move || vec![http_post(first, "/sign", "bob")]),
@@ -1031,7 +1033,7 @@ fn a_version_that_stops_serving_a_route_retires_it() {
     let before = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(before, vec!["peek\n"]);
 
-    live.reload(&mut ctx, &source("guestbook-drops-route", port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook-drops-route", port), &no_main)
         .expect("dropping a stateless route is allowed");
 
     let after = exchange(&mut ctx, move || {
@@ -1062,7 +1064,7 @@ fn a_reload_may_not_change_the_type_of_held_state() {
     assert_eq!(before, vec!["alice\n"]);
 
     let errors = live
-        .reload(&mut ctx, &source("guestbook-retypes-state", port), &no_main)
+        .reload_text(&mut ctx, &source("guestbook-retypes-state", port), &no_main)
         .err()
         .expect("`entries` holds a String; the new version declares it an Int");
     let rendered = format!("{errors:?}");
@@ -1094,7 +1096,7 @@ fn a_retired_variable_seeds_its_replacement() {
     assert_eq!(before, vec!["ok\n", "bob"]);
 
     let report = live
-        .reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
+        .reload_text(&mut ctx, &source("latest-write-migrated", port), &no_main)
         .expect("retiring `latest` is accepted where a `@LoadFrom` reads it");
     // The seed summarizes the position the retired variable folded, so the store
     // resumes above it. Answered from variable identity alone, `marked` reads as
@@ -1129,7 +1131,7 @@ fn a_loaded_variable_may_stay_declared() {
     });
     assert_eq!(before, vec!["ok\n", "bob"]);
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("latest-write-migrated-beside", port),
         &no_main,
@@ -1159,11 +1161,11 @@ fn a_migrating_version_does_not_reload_onto_itself() {
     let (mut ctx, mut live) = start_sink(&source("latest-write", port));
 
     exchange(&mut ctx, move || vec![http_post(port, "/set", "bob")]);
-    live.reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
+    live.reload_text(&mut ctx, &source("latest-write-migrated", port), &no_main)
         .expect("the migration");
 
     let errors = live
-        .reload(&mut ctx, &source("latest-write-migrated", port), &no_main)
+        .reload_text(&mut ctx, &source("latest-write-migrated", port), &no_main)
         .err()
         .expect("`latest` is gone, so there is nothing left for `@LoadFrom` to read");
     let rendered = format!("{errors:?}");
@@ -1190,7 +1192,7 @@ fn a_reload_may_not_load_a_variable_nothing_holds() {
     exchange(&mut ctx, move || vec![http_post(port, "/set", "bob")]);
 
     let errors = live
-        .reload(
+        .reload_text(
             &mut ctx,
             &source("latest-write-loads-a-stranger", port),
             &no_main,
@@ -1217,7 +1219,7 @@ fn a_reload_may_not_load_a_variable_at_another_type() {
     exchange(&mut ctx, move || vec![http_post(port, "/set", "bob")]);
 
     let errors = live
-        .reload(
+        .reload_text(
             &mut ctx,
             &source("latest-write-migrated-retyped", port),
             &no_main,
@@ -1293,7 +1295,7 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
         exchange(&mut ctx, move || vec![http_post(port, "/bump", "a")]),
         vec!["x!\n"],
     );
-    live.reload(&mut ctx, &whole(port), &no_main)
+    live.reload_text(&mut ctx, &whole(port), &no_main)
         .expect("a record carries whole");
     assert_eq!(
         exchange(&mut ctx, move || vec![http_post(port, "/bump", "b")]),
@@ -1306,7 +1308,7 @@ fn a_loaded_record_is_read_at_the_shape_annotated() {
         exchange(&mut ctx, move || vec![http_post(port, "/bump", "a")]),
         vec!["x!\n"],
     );
-    live.reload(&mut ctx, &one_field(port), &no_main)
+    live.reload_text(&mut ctx, &one_field(port), &no_main)
         .expect("the annotation states the shape the predecessor holds");
     assert_eq!(
         exchange(&mut ctx, move || vec![http_post(port, "/bump", "b")]),
@@ -1349,7 +1351,7 @@ fn a_loaded_record_annotated_at_one_field_is_refused() {
     exchange(&mut ctx, move || vec![http_post(port, "/bump", "a")]);
 
     let errors = live
-        .reload(&mut ctx, &one_field(port), &no_main)
+        .reload_text(&mut ctx, &one_field(port), &no_main)
         .err()
         .expect("the site infers a one-field record; the program holds two");
     let rendered = format!("{errors:?}");
@@ -1370,9 +1372,10 @@ fn a_version_loading_state_is_not_a_cold_start() {
     let port = reserve_test_port();
     let mut ctx = GlobalContext::default();
 
-    let errors = LiveProgram::start(&mut ctx, &source("latest-write-migrated", port), &no_main)
-        .err()
-        .expect("there is no previous version to read `latest` from");
+    let errors =
+        LiveProgram::start_text(&mut ctx, &source("latest-write-migrated", port), &no_main)
+            .err()
+            .expect("there is no previous version to read `latest` from");
     let rendered = format!("{errors:?}");
     assert!(
         rendered.contains("`@LoadFrom(latest)`")
@@ -1408,10 +1411,10 @@ fn an_induction_accumulator_carries_into_its_replacement() {
         m
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 8);
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("retiring `n` is accepted where a `@LoadFrom` reads it");
 
     // `80000`, and nothing more: the seed summarizes every position of `[1, 2, 3]`,
@@ -1446,7 +1449,7 @@ fn a_map_valued_variable_carries_whole() {
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(
         drive_main_map(&mut ctx, &mut live),
         vec![
@@ -1456,7 +1459,7 @@ fn a_map_valued_variable_carries_whole() {
         ],
     );
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("retiring a keyed collection is accepted where a `@LoadFrom` reads it");
 
     // The collection carries whole, `sol` included. The writer does not fire
@@ -1500,7 +1503,7 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(
         drive_main_map(&mut ctx, &mut live),
         vec![
@@ -1510,7 +1513,7 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
         ],
     );
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("the migration is a declaration, and the compiler takes it");
 
     // `xrp` is absent: the writer's one position is committed into the value that
@@ -1560,11 +1563,11 @@ fn an_exact_annotation_on_a_rebuilt_collection_is_refused() {
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     let _ = drive_main_map(&mut ctx, &mut live);
 
     let errors = live
-        .reload(&mut ctx, v2, &no_main)
+        .reload_text(&mut ctx, v2, &no_main)
         .err()
         .expect("an exact annotation on a rebuilt collection does not compile today");
     let rendered = format!("{errors:?}");
@@ -1615,13 +1618,13 @@ fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
         )
     };
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(
         drive_main_record_map(&mut ctx, &mut live),
         vec![entry("btc", 7, 2), entry("eth", 8, 1), entry("sol", 9, 3)],
     );
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("the migration is a declaration, and the compiler takes it");
 
     // Every field of every entry the retired version held survives the transform,
@@ -1662,7 +1665,7 @@ fn a_collection_load_naming_nothing_is_refused() {
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(
         drive_main_map(&mut ctx, &mut live),
         vec![
@@ -1672,7 +1675,7 @@ fn a_collection_load_naming_nothing_is_refused() {
         ],
     );
 
-    let rendered = match live.reload(&mut ctx, v2, &no_main) {
+    let rendered = match live.reload_text(&mut ctx, v2, &no_main) {
         Ok(_) => panic!("`nonesuch` is a variable no version ever declared"),
         Err(errors) => format!("{errors:?}"),
     };
@@ -1715,10 +1718,10 @@ fn a_bounded_annotation_does_not_weaken_a_collections_shape_check() {
         await_final(labels)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     let _ = drive_main_map(&mut ctx, &mut live);
 
-    let rendered = match live.reload(&mut ctx, v2, &no_main) {
+    let rendered = match live.reload_text(&mut ctx, v2, &no_main) {
         Ok(_) => panic!("`qty` holds Ints; the new version reads its values as Strings"),
         Err(errors) => format!("{errors:?}"),
     };
@@ -1765,10 +1768,10 @@ fn a_load_resolves_outward_through_the_bindings_around_it() {
         m
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 8);
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("neither `held` nor `seed` is a chain segment the address has");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 80000);
 }
@@ -1804,15 +1807,16 @@ fn a_load_chains_across_successive_versions() {
     );
 
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 7);
 
-    live.reload(&mut ctx, &v2, &no_main).expect("v2 loads `a`");
+    live.reload_text(&mut ctx, &v2, &no_main)
+        .expect("v2 loads `a`");
     // `a` had folded the one position of `[1]`, and the value `b` loads says so,
     // so `b` resumes above it rather than counting it again.
     assert_eq!(drive_main_int(&mut ctx, &mut live), 70);
 
-    live.reload(&mut ctx, &v3, &no_main)
+    live.reload_text(&mut ctx, &v3, &no_main)
         .expect("v3 loads `b`, which v2 declared and this version retires");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 7000);
 }
@@ -1842,10 +1846,10 @@ fn a_version_may_load_more_than_one_variable() {
         await_final(r)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 3);
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("both `p` and `q` are taken over by a load");
     // `3 * 100 + 5`. The one position of `[1]` is in both loaded values, so `r`
     // resumes above it and the writer does not fire again.
@@ -1874,11 +1878,11 @@ fn both_directions_of_refusal_are_reported_together() {
         await_final(b)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     drive_main_int(&mut ctx, &mut live);
 
     let errors = live
-        .reload(&mut ctx, v2, &no_main)
+        .reload_text(&mut ctx, v2, &no_main)
         .err()
         .expect("`a` is dropped and `nonesuch` is not there to load");
     let rendered = format!("{errors:?}");
@@ -1927,10 +1931,10 @@ fn an_undriven_store_has_no_value_to_load() {
     "#};
 
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &v1("y"), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &v1("y"), &no_main).expect("v1 compiles");
     drive_main_int(&mut ctx, &mut live);
     let errors = live
-        .reload(&mut ctx, v2, &no_main)
+        .reload_text(&mut ctx, v2, &no_main)
         .err()
         .expect("nothing read `x`, so its store decided no value");
     let rendered = format!("{errors:?}");
@@ -1942,9 +1946,9 @@ fn an_undriven_store_has_no_value_to_load() {
 
     // The same program, with `x` read: its store is driven, and the load takes it.
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &v1("x"), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &v1("x"), &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 42);
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("a driven store hands its value on");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 42);
 }
@@ -1982,10 +1986,10 @@ fn a_load_inside_an_instantiation_reaches_its_own_variable() {
         a
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 6);
 
-    live.reload(&mut ctx, v2, &no_main)
+    live.reload_text(&mut ctx, v2, &no_main)
         .expect("the load resolves outward to the variable of its own instantiation");
     // The loaded 6 scaled by ten. `[1, 2]` is not folded again: the value
     // loaded already summarizes both its positions.
@@ -2017,11 +2021,11 @@ fn a_top_level_load_does_not_reach_inside_an_instantiation() {
         held
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 6);
 
     let errors = live
-        .reload(&mut ctx, v2, &no_main)
+        .reload_text(&mut ctx, v2, &no_main)
         .err()
         .expect("`total` at the top level names nothing the program holds");
     let rendered = format!("{errors:?}");
@@ -2062,11 +2066,11 @@ fn a_load_is_not_addressed_under_the_binding_it_seeds() {
         held
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 6);
 
     let errors = live
-        .reload(&mut ctx, v2, &no_main)
+        .reload_text(&mut ctx, v2, &no_main)
         .err()
         .expect("`qty` at the top level names nothing the program holds");
     let rendered = format!("{errors:?}");
@@ -2127,7 +2131,7 @@ fn a_load_does_not_refold_the_positions_its_value_summarizes() {
         let prefix: i64 = (1..=decided as i64).sum();
 
         let mut ctx = GlobalContext::default();
-        let mut live = LiveProgram::start(&mut ctx, V0, &no_main).expect("v0 compiles");
+        let mut live = LiveProgram::start_text(&mut ctx, V0, &no_main).expect("v0 compiles");
         for _ in 0..pulls {
             let producer = live
                 .main_producer_mut()
@@ -2136,7 +2140,7 @@ fn a_load_does_not_refold_the_positions_its_value_summarizes() {
             let _ = producer.get(guard);
             ctx.scheduler().check_for_notifications();
         }
-        live.reload(&mut ctx, same, &no_main)
+        live.reload_text(&mut ctx, same, &no_main)
             .expect("`n` is loaded");
         assert_eq!(
             drive_main_int(&mut ctx, &mut live),
@@ -2145,7 +2149,7 @@ fn a_load_does_not_refold_the_positions_its_value_summarizes() {
         );
 
         let mut ctx = GlobalContext::default();
-        let mut live = LiveProgram::start(&mut ctx, V0, &no_main).expect("v0 compiles");
+        let mut live = LiveProgram::start_text(&mut ctx, V0, &no_main).expect("v0 compiles");
         for _ in 0..pulls {
             let producer = live
                 .main_producer_mut()
@@ -2154,7 +2158,7 @@ fn a_load_does_not_refold_the_positions_its_value_summarizes() {
             let _ = producer.get(guard);
             ctx.scheduler().check_for_notifications();
         }
-        live.reload(&mut ctx, other, &no_main)
+        live.reload_text(&mut ctx, other, &no_main)
             .expect("`n` is loaded");
         assert_eq!(
             drive_main_int(&mut ctx, &mut live),
@@ -2179,7 +2183,7 @@ fn a_reload_may_not_drop_state() {
     assert_eq!(before, vec!["alice\n"]);
 
     let errors = live
-        .reload(&mut ctx, &source("guestbook-drops-state", port), &no_main)
+        .reload_text(&mut ctx, &source("guestbook-drops-state", port), &no_main)
         .err()
         .expect("a version that stops declaring `entries` would discard its value");
     let rendered = format!("{errors:?}");
@@ -2226,7 +2230,7 @@ fn a_version_naming_an_unbindable_port_is_refused() {
         .trim_end(),
     );
     let err = live
-        .reload(&mut ctx, &adds_a_held_port, &no_main)
+        .reload_text(&mut ctx, &adds_a_held_port, &no_main)
         .err()
         .expect("the port is held, so the version cannot be installed");
     assert!(
@@ -2259,7 +2263,7 @@ fn retyping_one_field_of_a_record_variable_is_refused() {
     );
 
     let err = live
-        .reload(
+        .reload_text(
             &mut ctx,
             &source("record-accumulator-retyped-field", port),
             &no_main,
@@ -2286,12 +2290,68 @@ fn a_rejected_reload_leaves_the_program_serving() {
     let port = reserve_test_port();
     let (mut ctx, mut live) = start_sink(&source("guestbook", port));
 
-    live.reload(&mut ctx, "x = = 1", &no_main)
+    live.reload_text(&mut ctx, "x = = 1", &no_main)
         .err()
         .expect("a syntax error is not a reload");
 
     let still_serving = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
     assert_eq!(still_serving, vec!["peek\n"]);
+}
+
+/// A running version that no longer compiles is reported as one error, rendered
+/// against the running version's own file rather than the new version's.
+///
+/// The running version reads a source the context it is compared in does not
+/// register, so its recompile fails while the new version compiles.
+#[test]
+fn a_running_version_that_no_longer_compiles_renders_against_its_own_file() {
+    use std::{cell::RefCell, rc::Rc};
+
+    use cambra::{
+        ccl::{Type, context::CompileError},
+        chl_parser::SourceMap,
+        interpreter::{BaseType, Extent, TestDataSource},
+    };
+
+    let running = indoc! {"
+        total := 0
+        for n in source1():
+            total += n
+        total
+    "};
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    ))));
+    let live = LiveProgram::start(
+        &mut ctx,
+        &SourceMap::single("running.cambra", running),
+        &no_main,
+    )
+    .expect("the running version compiles where its source is registered");
+
+    let new = SourceMap::single("new.cambra", "1\n");
+    let Err(errs) = live.diff_against(&GlobalContext::default(), &new, Phase::AsOfRead) else {
+        panic!("a running version that does not compile has no difference to report");
+    };
+    let [CompileError::RunningVersion(rendered)] = errs.as_slice() else {
+        panic!("expected one RunningVersion error, got {errs:?}");
+    };
+    assert!(
+        rendered.contains("running.cambra") && rendered.contains("source1()"),
+        "the errors should quote the running file: {rendered}",
+    );
+    assert!(
+        !rendered.contains("new.cambra"),
+        "the errors should not name the new version's file: {rendered}",
+    );
+    assert!(
+        errs[0]
+            .render(&new)
+            .starts_with("error: the running version no longer compiles:\n"),
+    );
 }
 
 /// Diffing a running program against a new version opens nothing and changes
@@ -2305,7 +2365,7 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
     let (mut ctx, live) = start_sink(&source("guestbook", port));
 
     let identical = live
-        .diff_against(&ctx, &source("guestbook", port), Phase::AsOfRead)
+        .diff_text(&ctx, &source("guestbook", port), Phase::AsOfRead)
         .expect("the running source compiles against its own endpoints")
         .diff;
     assert!(
@@ -2314,7 +2374,7 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
     );
 
     let changed = live
-        .diff_against(
+        .diff_text(
             &ctx,
             &source("guestbook-stateless-edit", port),
             Phase::AsOfRead,
@@ -2399,7 +2459,7 @@ fn two_transaction_groups_keep_their_state_apart() {
         vec!["ok\n", "ok\n", "ok\n", "ok\n", "ok\n", "1234", "9"],
     );
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("two-transactions-one-writer-edited", port),
         &no_main,
@@ -2456,7 +2516,7 @@ fn a_request_that_arrived_before_the_swap_is_answered_after_it() {
     thread::sleep(Duration::from_millis(300));
     assert!(rx.try_recv().is_err(), "no reply before the swap");
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("guestbook-stateless-edit", port),
         &no_main,
@@ -2509,7 +2569,7 @@ fn a_request_that_arrived_before_its_route_was_retired_is_answered() {
     thread::sleep(Duration::from_millis(300));
     assert!(rx.try_recv().is_err(), "no reply before the swap");
 
-    live.reload(&mut ctx, &source("guestbook-drops-route", port), &no_main)
+    live.reload_text(&mut ctx, &source("guestbook-drops-route", port), &no_main)
         .expect("dropping a stateless route is allowed");
 
     let answered = drive_until(&mut ctx, &rx, Duration::from_secs(5));
@@ -2532,7 +2592,7 @@ fn diffing_against_a_version_that_drops_a_route_does_not_retire_it() {
     let (mut ctx, live) = start_sink(&source("guestbook", port));
 
     let changed = live
-        .diff_against(
+        .diff_text(
             &ctx,
             &source("guestbook-drops-route", port),
             Phase::AsOfRead,
@@ -2592,7 +2652,7 @@ fn a_port_whose_last_route_goes_is_released() {
         vec!["a\n", "b\n"],
     );
 
-    live.reload(&mut ctx, &one_port, &no_main)
+    live.reload_text(&mut ctx, &one_port, &no_main)
         .expect("dropping routes declares no state, so it is accepted");
 
     // `/c` shared the kept port, so its address is a 404 rather than a refusal:
@@ -2616,7 +2676,7 @@ fn every_offered_phase_is_a_diff_point() {
 
     for (spelling, phase) in cambra::control_port::OFFERED_PHASES {
         let rendered = live
-            .diff_against(&ctx, &source("guestbook-stateless-edit", port), *phase)
+            .diff_text(&ctx, &source("guestbook-stateless-edit", port), *phase)
             .unwrap_or_else(|e| panic!("diff at {spelling} failed: {e:?}"))
             .diff;
         assert!(
@@ -2641,7 +2701,7 @@ fn a_program_can_be_reloaded_repeatedly() {
         // that must still leave it serving.
         ("guestbook-stateless-edit", "peek edited\n"),
     ] {
-        live.reload(&mut ctx, &source(name, port), &no_main)
+        live.reload_text(&mut ctx, &source(name, port), &no_main)
             .unwrap_or_else(|e| panic!("reload to {name} rejected: {e:?}"));
         let served = exchange(&mut ctx, move || vec![http_get(port, "/peek")]);
         assert_eq!(served, vec![expected], "after reloading to {name}");
@@ -2670,11 +2730,11 @@ fn a_second_reload_does_not_replay_what_the_first_committed() {
     let (mut ctx, mut live) = start_sink(&source("running-log", port));
     let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "1")]);
 
-    live.reload(&mut ctx, &source("running-log-writer-edit", port), &no_main)
+    live.reload_text(&mut ctx, &source("running-log-writer-edit", port), &no_main)
         .expect("editing the writer is allowed");
     let _ = exchange(&mut ctx, move || vec![http_post(port, "/set", "2")]);
 
-    live.reload(&mut ctx, &source("running-log", port), &no_main)
+    live.reload_text(&mut ctx, &source("running-log", port), &no_main)
         .expect("editing it back is allowed");
     let after = exchange(&mut ctx, move || {
         vec![http_post(port, "/set", "3"), http_get(port, "/get")]
@@ -2716,8 +2776,8 @@ fn a_transaction_over_a_fixed_collection_does_not_replay() {
         )
     };
     let mut ctx = GlobalContext::default();
-    let mut live =
-        LiveProgram::start(&mut ctx, &program("log := log + m"), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &program("log := log + m"), &no_main)
+        .expect("v1 compiles");
 
     // Partway: enough pulls to commit some of the eight, not all.
     for _ in 0..6 {
@@ -2729,7 +2789,7 @@ fn a_transaction_over_a_fixed_collection_does_not_replay() {
         ctx.scheduler().check_for_notifications();
     }
 
-    live.reload(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
+    live.reload_text(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
         .expect("`log` is still declared, at the same type");
     let value = drive_main_to_terminal(&mut ctx, &mut live);
 
@@ -2774,8 +2834,8 @@ fn two_writers_to_one_variable_each_keep_their_place() {
         )
     };
     let mut ctx = GlobalContext::default();
-    let mut live =
-        LiveProgram::start(&mut ctx, &program("log := log + m"), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &program("log := log + m"), &no_main)
+        .expect("v1 compiles");
 
     // Partway: enough pulls to commit some of the eight, not all.
     for _ in 0..6 {
@@ -2787,7 +2847,7 @@ fn two_writers_to_one_variable_each_keep_their_place() {
         ctx.scheduler().check_for_notifications();
     }
 
-    live.reload(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
+    live.reload_text(&mut ctx, &program(r#"log := log + m + "!""#), &no_main)
         .expect("`log` is still declared, at the same type");
     let value = drive_main_to_terminal(&mut ctx, &mut live);
 
@@ -2824,7 +2884,7 @@ fn a_transaction_writer_does_not_replay_what_it_committed() {
     let logged = exchange(&mut ctx, move || vec![http_get(port, "/get")]);
     assert_eq!(logged, vec!["123456"]);
 
-    live.reload(&mut ctx, &source("running-log-writer-edit", port), &no_main)
+    live.reload_text(&mut ctx, &source("running-log-writer-edit", port), &no_main)
         .expect("editing a transactional writer is a change between existing endpoints");
 
     let after = exchange(&mut ctx, move || {
@@ -2856,7 +2916,7 @@ fn two_loops_may_swap_which_source_they_read() {
     });
     assert_eq!(before, vec!["1\n", "1\n2\n", "9\n"]);
 
-    live.reload(&mut ctx, &source("two-loops-swapped", port), &no_main)
+    live.reload_text(&mut ctx, &source("two-loops-swapped", port), &no_main)
         .expect("both variables are still declared, at the same types");
 
     // `/a` now writes `b` and answers on `a_resps`; `/b` now writes `a`.
@@ -2894,7 +2954,7 @@ fn a_stateless_route_may_gain_a_transactional_writer_over_an_advanced_source() {
     assert_eq!(before, vec!["b\n"; 6], "`/b` answers, and holds nothing");
 
     let report = live
-        .reload(
+        .reload_text(
             &mut ctx,
             &source("one-transactional-loop-both", port),
             &no_main,
@@ -2951,7 +3011,7 @@ fn two_transactions_may_swap_which_source_they_read() {
         (&"123456".to_string(), &"987654".to_string()),
     );
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("two-transactions-swapped", port),
         &no_main,
@@ -2991,7 +3051,7 @@ fn a_stateless_loop_may_gain_an_accumulator_over_an_advanced_source() {
     });
     assert_eq!(before, vec!["a\n", "q\n"]);
 
-    live.reload(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
+    live.reload_text(&mut ctx, &source("one-stateful-loop-both", port), &no_main)
         .expect("`n` is unchanged and `m` is new");
 
     let after = exchange(&mut ctx, move || {
@@ -3021,7 +3081,7 @@ fn changing_a_declared_init_leaves_a_carried_value_alone() {
     });
     assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("bump-over-source-reseeded", port),
         &no_main,
@@ -3053,7 +3113,7 @@ fn a_variable_that_moves_to_a_fixed_collection_keeps_its_value() {
     });
     assert_eq!(before, vec!["a\n", "aa\n"]);
 
-    live.reload(&mut ctx, &source("bump-over-a-fixed-list", port), &no_main)
+    live.reload_text(&mut ctx, &source("bump-over-a-fixed-list", port), &no_main)
         .expect("`n` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
@@ -3079,7 +3139,7 @@ fn a_fold_over_a_fixed_collection_resumes_where_it_stopped() {
     let before = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
     assert_eq!(before, vec!["yz\n"]);
 
-    live.reload(&mut ctx, &source("bump-over-a-marked-list", port), &no_main)
+    live.reload_text(&mut ctx, &source("bump-over-a-marked-list", port), &no_main)
         .expect("`n` is still declared, at the same type");
 
     let after = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
@@ -3259,8 +3319,8 @@ fn a_fold_interrupted_partway_resumes_at_the_position_it_reached() {
     let mut wrong: Vec<String> = Vec::new();
     for pulls in 0..CUTS {
         let mut ctx = GlobalContext::default();
-        let mut live =
-            LiveProgram::start(&mut ctx, &fold_to_main("n := n + x"), &no_main).expect("compiles");
+        let mut live = LiveProgram::start_text(&mut ctx, &fold_to_main("n := n + x"), &no_main)
+            .expect("compiles");
         for _ in 0..pulls {
             let producer = live
                 .main_producer_mut()
@@ -3270,7 +3330,7 @@ fn a_fold_interrupted_partway_resumes_at_the_position_it_reached() {
             ctx.scheduler().check_for_notifications();
         }
 
-        live.reload(&mut ctx, &fold_to_main(r#"n := n + x + "!""#), &no_main)
+        live.reload_text(&mut ctx, &fold_to_main(r#"n := n + x + "!""#), &no_main)
             .expect("`n` is still declared, at the same type");
 
         let value = drive_main_to_terminal(&mut ctx, &mut live);
@@ -3335,7 +3395,7 @@ fn a_version_installed_mid_fold_is_pulled_without_a_new_arrival() {
         "twenty elements outlast the round that starts them, so the reply is still pending",
     );
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &fold_behind_a_route(r#"n := n + x + "!""#, port),
         &no_main,
@@ -3398,8 +3458,9 @@ fn filtered_fold_to_main(step: &str) -> String {
 fn a_filtered_fold_resumes_at_a_position_of_the_collection_it_filters() {
     const PULLS: usize = 2;
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &filtered_fold_to_main("n := n + x"), &no_main)
-        .expect("compiles");
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &filtered_fold_to_main("n := n + x"), &no_main)
+            .expect("compiles");
     for _ in 0..PULLS {
         let producer = live
             .main_producer_mut()
@@ -3409,7 +3470,7 @@ fn a_filtered_fold_resumes_at_a_position_of_the_collection_it_filters() {
         ctx.scheduler().check_for_notifications();
     }
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &filtered_fold_to_main(r#"n := n + x + "!""#),
         &no_main,
@@ -3439,7 +3500,7 @@ fn a_fold_over_another_fixed_collection_starts_it_from_the_beginning() {
     let before = exchange(&mut ctx, move || vec![http_post(port, "/bump", "x")]);
     assert_eq!(before, vec!["yz\n"]);
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &source("bump-over-another-fixed-list", port),
         &no_main,
@@ -3494,14 +3555,14 @@ fn nested_fold(step: &str) -> String {
 fn a_variable_survives_a_reload_that_kept_its_binding() {
     let mut ctx = GlobalContext::default();
     let mut live =
-        LiveProgram::start(&mut ctx, &nested_fold("+ \"x\""), &no_main).expect("compiles");
+        LiveProgram::start_text(&mut ctx, &nested_fold("+ \"x\""), &no_main).expect("compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.reload(&mut ctx, &nested_fold("+ \"x\""), &no_main)
+    live.reload_text(&mut ctx, &nested_fold("+ \"x\""), &no_main)
         .expect("a reload to the running version is a no-op");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.reload(&mut ctx, &nested_fold("+ \"y\""), &no_main)
+    live.reload_text(&mut ctx, &nested_fold("+ \"y\""), &no_main)
         .expect("`n` is still declared, at the same type");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -3520,10 +3581,10 @@ fn a_variable_survives_a_reload_that_kept_its_binding() {
 fn the_state_guard_survives_a_reload_that_kept_the_binding() {
     let mut ctx = GlobalContext::default();
     let mut live =
-        LiveProgram::start(&mut ctx, &nested_fold("+ \"x\""), &no_main).expect("compiles");
+        LiveProgram::start_text(&mut ctx, &nested_fold("+ \"x\""), &no_main).expect("compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.reload(&mut ctx, &nested_fold("+ \"x\""), &no_main)
+    live.reload_text(&mut ctx, &nested_fold("+ \"x\""), &no_main)
         .expect("a reload to the running version is a no-op");
 
     let dropped = indoc! {r#"
@@ -3534,7 +3595,7 @@ fn the_state_guard_survives_a_reload_that_kept_the_binding() {
         a + ""
     "#};
     let err = live
-        .reload(&mut ctx, dropped, &no_main)
+        .reload_text(&mut ctx, dropped, &no_main)
         .err()
         .expect("`n` is no longer declared, so its value has nowhere to be seeded");
     assert!(
@@ -3588,10 +3649,10 @@ fn a_loop_added_ahead_of_a_same_spelled_one_starts_at_its_init() {
         a
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, only_a, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, only_a, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx");
 
-    live.reload(&mut ctx, &two_instantiations(false, "x", "z"), &no_main)
+    live.reload_text(&mut ctx, &two_instantiations(false, "x", "z"), &no_main)
         .expect("`a` is unchanged and `z` is new");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -3609,11 +3670,11 @@ fn a_loop_added_ahead_of_a_same_spelled_one_starts_at_its_init() {
 #[test]
 fn reordering_two_same_spelled_variables_keeps_their_state_apart() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &two_instantiations(true, "x", "y"), &no_main)
+    let mut live = LiveProgram::start_text(&mut ctx, &two_instantiations(true, "x", "y"), &no_main)
         .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|yyy");
 
-    live.reload(&mut ctx, &two_instantiations(false, "X", "Y"), &no_main)
+    live.reload_text(&mut ctx, &two_instantiations(false, "X", "Y"), &no_main)
         .expect("both are still declared, at the same type");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -3649,13 +3710,13 @@ fn two_instantiations_with_equal_arguments_keep_their_accumulators_apart() {
         )
     };
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &twin("x"), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &twin("x"), &no_main).expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|xx");
 
-    live.reload(&mut ctx, &twin("x"), &no_main)
+    live.reload_text(&mut ctx, &twin("x"), &no_main)
         .expect("a reload to the running version is a no-op");
 
-    live.reload(&mut ctx, &twin("y"), &no_main)
+    live.reload_text(&mut ctx, &twin("y"), &no_main)
         .expect("both are still declared, at the same type");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
@@ -3725,11 +3786,12 @@ const BOUNDARY_ITEMS: &str = r#"["a", "b", "c"]"#;
 #[test]
 fn a_variable_may_move_out_of_a_transaction() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &boundary_pair(true, BOUNDARY_ITEMS, ""), &no_main)
-        .expect("a transactional fold compiles");
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &boundary_pair(true, BOUNDARY_ITEMS, ""), &no_main)
+            .expect("a transactional fold compiles");
     drive_two_positions(&mut ctx, &mut live);
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &boundary_pair(false, BOUNDARY_ITEMS, "!"),
         &no_main,
@@ -3750,7 +3812,7 @@ fn a_variable_may_move_out_of_a_transaction() {
 #[test]
 fn a_variable_may_move_into_a_transaction() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(
+    let mut live = LiveProgram::start_text(
         &mut ctx,
         &boundary_pair(false, BOUNDARY_ITEMS, ""),
         &no_main,
@@ -3758,7 +3820,7 @@ fn a_variable_may_move_into_a_transaction() {
     .expect("an induction fold compiles");
     drive_two_positions(&mut ctx, &mut live);
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &boundary_pair(true, BOUNDARY_ITEMS, "!"),
         &no_main,
@@ -3782,11 +3844,12 @@ fn a_variable_may_move_into_a_transaction() {
 #[test]
 fn a_variable_leaving_a_transaction_for_another_collection_keeps_its_value() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &boundary_pair(true, BOUNDARY_ITEMS, ""), &no_main)
-        .expect("a transactional fold compiles");
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &boundary_pair(true, BOUNDARY_ITEMS, ""), &no_main)
+            .expect("a transactional fold compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "abc");
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &boundary_pair(false, r#"["p", "q", "r"]"#, "!"),
         &no_main,
@@ -3813,7 +3876,7 @@ fn await_final_on_an_induction_accumulator_is_refused() {
             log := log + m
         await_final(log)
     "#};
-    let rendered = match LiveProgram::start(&mut ctx, program, &no_main) {
+    let rendered = match LiveProgram::start_text(&mut ctx, program, &no_main) {
         Ok(_) => panic!("`await_final` applies to a transactional variable"),
         Err(errors) => format!("{errors:?}"),
     };
@@ -3862,7 +3925,7 @@ const THREE_ITEMS: &str = r#"["p", "q", "r"]"#;
 #[test]
 fn swapping_two_anonymous_call_sites_is_refused() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(
+    let mut live = LiveProgram::start_text(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, "x"), (THREE_ITEMS, "z")),
         &no_main,
@@ -3870,7 +3933,7 @@ fn swapping_two_anonymous_call_sites_is_refused() {
     .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|zzz");
 
-    let rendered = match live.reload(
+    let rendered = match live.reload_text(
         &mut ctx,
         &anonymous_sites((THREE_ITEMS, "z"), (TWO_ITEMS, "x")),
         &no_main,
@@ -3927,12 +3990,12 @@ fn a_load_inside_a_duplicated_body_is_refused() {
         count_by([1, 2], 3) * 1000 + count_by([1, 2, 3], 5)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     // 6 at the first site (two steps of 3), 15 at the second (three of 5).
     assert_eq!(drive_main_int(&mut ctx, &mut live), 6015);
 
     let errors = live
-        .reload(&mut ctx, v2, &no_main)
+        .reload_text(&mut ctx, v2, &no_main)
         .err()
         .expect("`total` is two declarations, and the load names neither");
     let rendered = format!("{errors:?}");
@@ -3986,11 +4049,11 @@ fn a_reordered_call_site_under_a_load_is_refused() {
         count_by([1, 2, 3], 5) + count_by([1, 2], 3) * 1000
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     assert_eq!(drive_main_int(&mut ctx, &mut live), 6015);
 
     assert!(
-        live.reload(&mut ctx, v2, &no_main).is_err(),
+        live.reload_text(&mut ctx, v2, &no_main).is_err(),
         "neither site's value belongs to the position it now sits at",
     );
     assert_eq!(
@@ -4009,7 +4072,7 @@ fn a_reordered_call_site_under_a_load_is_refused() {
 #[test]
 fn inserting_ahead_of_an_anonymous_call_site_is_refused() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(
+    let mut live = LiveProgram::start_text(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, "x"), (THREE_ITEMS, "z")),
         &no_main,
@@ -4031,7 +4094,8 @@ fn inserting_ahead_of_an_anonymous_call_site_is_refused() {
         three = THREE_ITEMS,
     );
     assert!(
-        live.reload(&mut ctx, &with_insertion, &no_main).is_err(),
+        live.reload_text(&mut ctx, &with_insertion, &no_main)
+            .is_err(),
         "the insertion shifts both existing declarations",
     );
 }
@@ -4049,7 +4113,7 @@ fn inserting_ahead_of_an_anonymous_call_site_is_refused() {
 #[case::both_sites_edited("X", "Z")]
 fn editing_anonymous_call_sites_in_place_is_accepted(#[case] first: &str, #[case] second: &str) {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(
+    let mut live = LiveProgram::start_text(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, "x"), (THREE_ITEMS, "z")),
         &no_main,
@@ -4057,7 +4121,7 @@ fn editing_anonymous_call_sites_in_place_is_accepted(#[case] first: &str, #[case
     .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|zzz");
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, first), (THREE_ITEMS, second)),
         &no_main,
@@ -4079,7 +4143,7 @@ fn editing_anonymous_call_sites_in_place_is_accepted(#[case] first: &str, #[case
 #[test]
 fn reordering_two_identical_anonymous_call_sites_is_accepted() {
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(
+    let mut live = LiveProgram::start_text(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, "x"), (TWO_ITEMS, "x")),
         &no_main,
@@ -4087,7 +4151,7 @@ fn reordering_two_identical_anonymous_call_sites_is_accepted() {
     .expect("v1 compiles");
     assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "xx|xx");
 
-    live.reload(
+    live.reload_text(
         &mut ctx,
         &anonymous_sites((TWO_ITEMS, "x"), (TWO_ITEMS, "x")),
         &no_main,
@@ -4128,7 +4192,8 @@ fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
         )
     };
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, &fold("", "", "n"), &no_main).expect("v1 compiles");
+    let mut live =
+        LiveProgram::start_text(&mut ctx, &fold("", "", "n"), &no_main).expect("v1 compiles");
     assert_eq!(
         drive_main_to_terminal(&mut ctx, &mut live),
         "abc",
@@ -4136,7 +4201,7 @@ fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
     );
 
     let report = live
-        .reload(
+        .reload_text(
             &mut ctx,
             &fold(
                 "p := base
@@ -4193,10 +4258,10 @@ fn an_exact_annotation_on_a_loaded_collection_names_what_differs() {
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, v1, &no_main).expect("v1 compiles");
     let _ = drive_main_map(&mut ctx, &mut live);
 
-    let rendered = match live.reload(&mut ctx, v2, &no_main) {
+    let rendered = match live.reload_text(&mut ctx, v2, &no_main) {
         Ok(_) => panic!("an exact annotation pins the domain, so the comprehension is rejected"),
         Err(errors) => format!("{errors:?}"),
     };

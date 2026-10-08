@@ -76,8 +76,8 @@ A chumsky combinator parser consumes the layout-resolved token stream and
 produces the AST defined in [`ast.rs`](#stage-3--ast-astrs). Three
 public entry points:
 
-- `parse_module(&str)` — a sequence of top-level statements.
-- `parse_expression(&str)` — a single expression (used by the lowering
+- `parse_module(FileId, &str)` — a sequence of top-level statements.
+- `parse_expression(FileId, &str)` — a single expression (used by the lowering
   tests that build expressions in isolation).
 - `ParseError` — a uniform error type wrapping either a `LexError` or a
   structured chumsky error (`ParseErrorInfo`) carrying its span, found token, and
@@ -115,7 +115,12 @@ The lexer also accepts `^+` and `^=`. Both are experimental, so `docs/chl-spec.m
 Key shape choices:
 
 - **Every node carries a span** via `Spanned<T>`, so diagnostics for any
-  sub-expression have precise location info.
+  sub-expression have precise location info. A `Span` is a `FileId` and a byte
+  range of that file; the `FileId` indexes the compilation's `SourceMap`
+  (`source_map.rs`), which diagnostics render against. The parser receives the
+  `FileId` as chumsky's span context, and chumsky builds every span it derives
+  from the end-of-input span's context, so each node's span names the file the
+  entry point was given.
 - **Operators are typed enums.** `BinOp`, `CmpOp`, `BoolOp`, `UnaryOp`,
   `AugOp` enumerate exactly what CHL accepts. Lowering can match
   exhaustively without an "unsupported operator" arm per variant.
@@ -404,16 +409,16 @@ empty for a custom error, so without it the whole diagnostic degrades to a bare
 
 `ParseResult<T>` exposes two output methods:
 
-- `.render_errors(src_name, src) -> String` — ariadne output with colour disabled
+- `.render_errors(&SourceMap) -> String` — ariadne output with colour disabled
   (for tests, log files, snapshot rendering).
-- `.eprint_errors(src_name, src)` — colour output to stderr (for interactive
+- `.eprint_errors(&SourceMap)` — colour output to stderr (for interactive
   use).
 
 Both build one `Report` per `ParseError`, with a red primary label at
 the failure span and one yellow secondary label per `.as_context()`
 entry. Lex errors get a single-label report.
 
-Every label span goes through `label_range`, which clamps `end` up to `start`.
+Every label span goes through `label_span`, which clamps `end` up to `start`.
 ariadne panics on an inverted range, and chumsky produces one for the
 `.as_context()` spans of a custom error raised inside a `validate`: the context
 records where its labelled parser opened, while the error's own offset has not

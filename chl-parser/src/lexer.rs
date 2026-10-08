@@ -22,7 +22,7 @@
 //! emitted if the last token wasn't one, and the stack is fully unwound with
 //! `DEDENT`s so every `INDENT` has a partner.
 
-use crate::ast::Span;
+use crate::ast::{FileId, Span};
 use logos::Logos;
 use smol_str::SmolStr;
 use std::fmt;
@@ -451,7 +451,7 @@ fn check_tags(raw: &[(Token, Span)]) -> Result<(), LexError> {
 fn lex_failure(source: &str, span: Span) -> LexError {
     match source[span.start..].chars().next() {
         Some('"' | '\'') => LexError::UnterminatedString {
-            span: Span::new(span.start, span.start + 1),
+            span: Span::new(span.file, span.start, span.start + 1),
         },
         _ => LexError::InvalidToken { span },
     }
@@ -501,7 +501,7 @@ impl Level {
     }
 }
 
-/// Tokenise `source` into a layout-resolved token stream.
+/// Tokenise `source`, the text of `file`, into a layout-resolved token stream.
 ///
 /// Caller-visible invariants of the returned stream:
 /// - Always ends with a `Newline` followed by zero or more `Dedent`s back to
@@ -512,12 +512,13 @@ impl Level {
 ///   on. `block_value` in the parser consumes that one.
 /// - No `Newline` appears between a `LParen`/`LBracket`/`LBrace` and its
 ///   matching closer.
-pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
+pub fn tokenize(file: FileId, source: &str) -> Result<Vec<(Token, Span)>, LexError> {
     // Phase 1: raw logos token stream (span-attached, errors surfaced).
     let mut raw: Vec<(Token, Span)> = Vec::new();
     let mut lex = Token::lexer(source);
     while let Some(result) = lex.next() {
-        let span = Span::from(lex.span());
+        let range = lex.span();
+        let span = Span::new(file, range.start, range.end);
         match result {
             Ok(tok) => raw.push((tok, span)),
             Err(()) => return Err(lex_failure(source, span)),
@@ -562,7 +563,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
                 .floor();
             if indent > current {
                 indent_stack.push(Level::Fixed(indent));
-                out.push((Token::Indent, Span::new(line_start, span.start)));
+                out.push((Token::Indent, Span::new(file, line_start, span.start)));
             } else {
                 while indent_stack
                     .last()
@@ -570,7 +571,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
                     .closes_at(indent)
                 {
                     indent_stack.pop();
-                    out.push((Token::Dedent, Span::new(span.start, span.start)));
+                    out.push((Token::Dedent, Span::new(file, span.start, span.start)));
                 }
                 match indent_stack.last_mut().expect("stack invariant: non-empty") {
                     Level::Fixed(c) if *c == indent => {}
@@ -627,7 +628,7 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
     // bracket-depth tracker would have swallowed every `NEWLINE` after the
     // unclosed `(`/`[`/`{`, leaving the parser unable to see statement
     // boundaries for the rest of the file.
-    let end_span = Span::new(source.len(), source.len());
+    let end_span = Span::new(file, source.len(), source.len());
     if bracket_depth > 0 {
         return Err(LexError::UnclosedBracket { span: end_span });
     }
@@ -647,11 +648,17 @@ pub fn tokenize(source: &str) -> Result<Vec<(Token, Span)>, LexError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileId;
     use indoc::indoc;
+
+    /// Tokenise `src` as the root of its own one-file map.
+    fn lex(src: &str) -> Result<Vec<(Token, Span)>, LexError> {
+        tokenize(FileId::ROOT, src)
+    }
 
     /// Strip spans for assertion brevity; spans are exercised separately.
     fn tokens(src: &str) -> Vec<Token> {
-        tokenize(src).unwrap().into_iter().map(|(t, _)| t).collect()
+        lex(src).unwrap().into_iter().map(|(t, _)| t).collect()
     }
 
     #[test]
@@ -678,6 +685,7 @@ mod tests {
     /// opening quote, not at the line break.
     #[test]
     fn a_newline_inside_a_string_is_an_error() {
+        let file = FileId::ROOT;
         for source in [
             "x = \"ab\ncd\"",
             "x = 'ab\ncd'",
@@ -685,9 +693,9 @@ mod tests {
             "x = \"ab",
         ] {
             assert_eq!(
-                tokenize(source),
+                lex(source),
                 Err(LexError::UnterminatedString {
-                    span: Span::new(4, 5)
+                    span: Span::new(file, 4, 5)
                 }),
                 "{source:?}"
             );
@@ -699,6 +707,7 @@ mod tests {
     /// an error at the backtick.
     #[test]
     fn a_backtick_must_touch_its_tag_name() {
+        let file = FileId::ROOT;
         for (source, start) in [
             ("x = ` foo", 4),
             ("x = `(1)", 4),
@@ -707,9 +716,9 @@ mod tests {
             ("x = `if", 4),
         ] {
             assert_eq!(
-                tokenize(source),
+                lex(source),
                 Err(LexError::DetachedBacktick {
-                    span: Span::new(start, start + 1)
+                    span: Span::new(file, start, start + 1)
                 }),
                 "{source:?}"
             );
@@ -724,7 +733,7 @@ mod tests {
                 Token::Newline,
             ]
         );
-        assert!(tokenize("x = `some(1)").is_ok());
+        assert!(lex("x = `some(1)").is_ok());
     }
 
     /// The escape `\n` is two source characters on one line, so it still lexes
@@ -747,11 +756,12 @@ mod tests {
     /// (`docs/chl-spec.md`, "1.8 Operators and punctuation").
     #[test]
     fn operators_absent_from_chl() {
+        let file = FileId::ROOT;
         for (source, start) in [("a / b", 2), ("a % b", 2), ("~a", 0)] {
             assert_eq!(
-                tokenize(source),
+                lex(source),
                 Err(LexError::InvalidToken {
-                    span: Span::new(start, start + 1)
+                    span: Span::new(file, start, start + 1)
                 }),
                 "{source:?}"
             );
@@ -1035,7 +1045,7 @@ mod tests {
         );
         // A later continuation at a different column no longer fits.
         assert!(matches!(
-            tokenize(indoc! {"
+            lex(indoc! {"
                 x = if c:
                         1
                     elif d:
@@ -1115,9 +1125,6 @@ mod tests {
     fn inconsistent_indent_is_an_error() {
         // Indent to 4, dedent to 2 (which is neither 4 nor 0) — error.
         let src = "def f():\n    x\n  y\n";
-        assert!(matches!(
-            tokenize(src),
-            Err(LexError::InconsistentIndent { .. })
-        ));
+        assert!(matches!(lex(src), Err(LexError::InconsistentIndent { .. })));
     }
 }

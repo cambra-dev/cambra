@@ -14,12 +14,12 @@ compile reads the lowering projection alone.
 
 | | |
 |---|---|
-| Input | a `CompiledProgram`: the pane trees, the operator graph, the provenance table, the lowering projection, the parsed surface AST, the source text |
+| Input | a `CompiledProgram`: the pane trees, the operator graph, the provenance table, the lowering projection, the parsed surface AST, the source map |
 | Output | one `InspectorPayload`: `source` (the program text), `panes` (per pane: a node table, and a tree pane's root), `paneLinks` (node→node relations between adjacent panes), `definitions` (use→binder pairs), `diagnostics` (compile errors, empty on success), `meta` |
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | `src/inspector_server`, which serves the payload, and the `web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
-| `span` | throughout: a byte range in the **CHL source text**, never an offset into a rendered pane. Nothing in the payload addresses a pane's text |
+| `span` | throughout: `{file, start, end}`, the byte range `start..end` of the **CHL source text** of the file `file` indexes in the compilation's `SourceMap`, never an offset into a rendered pane. A compilation reads one file, its root, which `source` carries. Nothing in the payload addresses a pane's text |
 
 ## The usage model
 

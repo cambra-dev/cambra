@@ -543,11 +543,11 @@ mod tests {
     /// Parse and lower a CHL program, *without* uniquifying.
     fn lower_only(code: &str) -> Expr {
         let mut ctx = LoweringContext::default();
-        let stmts = chl_parser::parse_module(code)
+        let root = chl_parser::FileId::ROOT;
+        let module = chl_parser::parse_module(root, code)
             .into_result()
-            .expect("parse failed")
-            .body;
-        let lowered = lower_stmts(&stmts, &mut ctx);
+            .expect("parse failed");
+        let lowered = lower_stmts(&module, &mut ctx);
         assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
         lowered.value.expect("lowering produced no value")
     }
