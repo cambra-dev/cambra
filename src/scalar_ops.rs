@@ -1,10 +1,7 @@
 //! The scalar semantics of CHL's binary operators, as a column kernel.
 //!
-//! **One implementation, two callers.** `crate::interpreter::binop` maps these over a
-//! `ColumnValue`, and `crate::ccl::planning::const_fold` calls them on a one-element column
-//! to fold a closed computation. A second implementation for the second caller is what put
-//! the `//` disagreement in two places, and agreement between a compile-time answer and a
-//! run-time one is not a property a test can establish once.
+//! `crate::interpreter::binop` applies these kernels to a `ColumnValue`.
+//! `crate::ccl::planning::const_fold` calls the same kernels on one-element columns.
 //!
 //! The vectorized form is the primitive and the single-element call wraps it, rather than
 //! the other way round: a per-element closure over the column costs about 15% (measured;
@@ -15,7 +12,7 @@
 //! enums live here, with `crate::ccl::BinOpKind` converting into [`BinOpKind`]
 //! (`impl From`, in `src/ccl/ops.rs`) — the one place the two spellings meet.
 
-use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
+use std::ops::{AddAssign, MulAssign, SubAssign};
 
 use bit_vec::BitVec;
 use smol_str::{SmolStr, SmolStrBuilder};
@@ -41,6 +38,29 @@ pub enum ArithmeticKind {
     Pow,
 }
 
+/// Integer division rounding toward negative infinity.
+pub(crate) trait IntFloorDiv: Copy {
+    fn floor_div(self, divisor: Self) -> Self;
+}
+
+impl IntFloorDiv for i64 {
+    fn floor_div(self, divisor: Self) -> Self {
+        let quotient = self / divisor;
+        if self % divisor != 0 && (self < 0) != (divisor < 0) {
+            // A nonzero remainder excludes an exact MIN quotient, so subtraction cannot overflow.
+            quotient - 1
+        } else {
+            quotient
+        }
+    }
+}
+
+impl IntFloorDiv for usize {
+    fn floor_div(self, divisor: Self) -> Self {
+        self / divisor
+    }
+}
+
 /// Integer exponentiation, the scalar behind [`ArithmeticKind::Pow`].
 ///
 /// A separate trait because `**` has no `*Assign` operator to bound
@@ -59,9 +79,10 @@ pub(crate) trait IntPow: Copy {
     ///
     /// Wrapping, so both profiles answer the same. The release profile sets no
     /// `overflow-checks`, and a plain `*` therefore panics on `2 ** 64` in debug and
-    /// answers `0` in release. `zip_arithmetic`'s `+ - * //` are still the plain
-    /// operators and still diverge that way — the vault issue
-    /// `interpreter-integer-arithmetic-divergences` carries the class.
+    /// answers `0` in release. `zip_arithmetic`'s `+`, `-`, and `*` still use plain
+    /// operators and retain that profile-dependent overflow behavior, tracked in the vault
+    /// issue `interpreter-integer-arithmetic-divergences`. Integer division
+    /// panics on zero divisors and on `i64::MIN // -1` in both profiles.
     fn raised(mut self, mut exponent: u64) -> Self {
         let mut acc = Self::ONE;
         while exponent > 0 {
@@ -132,7 +153,7 @@ pub enum LogicKind {
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
 // slows it down by ~15%
 pub(crate) fn zip_arithmetic<
-    T: IntPow + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssign<T>,
+    T: IntPow + IntFloorDiv + AddAssign<T> + SubAssign<T> + MulAssign<T>,
 >(
     op: ArithmeticKind,
     mut l: Vec<T>,
@@ -152,7 +173,10 @@ pub(crate) fn zip_arithmetic<
         ArithmeticKind::Add => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a += *b),
         ArithmeticKind::Sub => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a -= *b),
         ArithmeticKind::Mul => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a *= *b),
-        ArithmeticKind::FloorDiv => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a /= *b),
+        ArithmeticKind::FloorDiv => l
+            .iter_mut()
+            .zip(r.iter())
+            .for_each(|(a, b)| *a = a.floor_div(*b)),
         ArithmeticKind::Pow => l
             .iter_mut()
             .zip(r.iter())
@@ -255,4 +279,87 @@ pub(crate) fn zip_bool_logic(op: LogicKind, mut l: BitVec, r: &BitVec) -> BitVec
         LogicKind::Xnor => l.xnor(r),
     };
     l
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn floor_division_signed_boundaries() {
+        let cases = [
+            (7, 2, 3),
+            (-7, 2, -4),
+            (7, -2, -4),
+            (-7, -2, 3),
+            (6, -2, -3),
+            (-6, 2, -3),
+            (-6, -2, 3),
+            (0, 2, 0),
+            (0, -2, 0),
+            (i64::MIN, 1, i64::MIN),
+            (i64::MIN, 3, -3_074_457_345_618_258_603),
+            (i64::MIN, i64::MIN, 1),
+            (i64::MIN, i64::MAX, -2),
+            (i64::MAX, i64::MIN, -1),
+            (i64::MAX, -1, -i64::MAX),
+            (1, i64::MIN, -1),
+            (-1, i64::MIN, 0),
+        ];
+        let left = cases.iter().map(|&(a, _, _)| a).collect();
+        let right: Vec<_> = cases.iter().map(|&(_, b, _)| b).collect();
+        let expected: Vec<_> = cases.iter().map(|&(_, _, q)| q).collect();
+        assert_eq!(
+            zip_arithmetic(ArithmeticKind::FloorDiv, left, &right),
+            expected
+        );
+    }
+
+    #[test]
+    fn floor_division_satisfies_floor_bounds() {
+        for a in -128_i64..=127 {
+            for b in -128_i64..=127 {
+                if b == 0 {
+                    continue;
+                }
+                let q = i128::from(a.floor_div(b));
+                let (a, b) = (i128::from(a), i128::from(b));
+                if b > 0 {
+                    assert!(q * b <= a && a < (q + 1) * b, "{a} // {b} = {q}");
+                } else {
+                    assert!(q * b >= a && a > (q + 1) * b, "{a} // {b} = {q}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn floor_division_unsigned() {
+        assert_eq!(
+            zip_arithmetic(
+                ArithmeticKind::FloorDiv,
+                vec![0_usize, 7, usize::MAX],
+                &[2, 2, 1]
+            ),
+            vec![0, 3, usize::MAX]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "divide by zero")]
+    fn floor_division_zero_divisor_panics() {
+        zip_arithmetic(ArithmeticKind::FloorDiv, vec![1_i64], &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "divide by zero")]
+    fn floor_division_unsigned_zero_divisor_panics() {
+        zip_arithmetic(ArithmeticKind::FloorDiv, vec![1_usize], &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "divide with overflow")]
+    fn floor_division_unrepresentable_quotient_panics() {
+        zip_arithmetic(ArithmeticKind::FloorDiv, vec![i64::MIN], &[-1]);
+    }
 }

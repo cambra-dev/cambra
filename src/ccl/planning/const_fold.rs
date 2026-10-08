@@ -50,14 +50,6 @@
 //! with a `Lit` mints nothing and duplicates no id, which is why this pass opens no
 //! recording.
 //!
-//! **A `//` whose two definitions disagree.** `docs/chl-spec.md`, "3.3 Arithmetic and
-//! logical operators" calls it floor division, and the runtime truncates toward zero, so
-//! `(0 - 7) // 2` answers -3 where the spec says -4. The two coincide for a non-negative
-//! dividend and a positive divisor, and the fold fires only there, so it holds whichever way
-//! the disagreement is settled. The disagreement itself is the vault issue
-//! `interpreter-integer-arithmetic-divergences`; settling it in the runtime's favour would
-//! retire this exclusion.
-//!
 //! **An operation with no result**: integer overflow, and division by zero. Every
 //! arithmetic case goes through a guard or a `checked_*`, and declining leaves the
 //! application in place for the runtime to evaluate as it would have.
@@ -226,9 +218,7 @@ fn runtime_answers(op: crate::scalar_ops::BinOpKind, left: &Lit, right: &Lit) ->
             A::Add => l.checked_add(*r).is_some(),
             A::Sub => l.checked_sub(*r).is_some(),
             A::Mul => l.checked_mul(*r).is_some(),
-            // Only where floor division and truncation coincide — see the module docs. The
-            // bound also excludes a zero divisor.
-            A::FloorDiv => *l >= 0 && *r > 0,
+            A::FloorDiv => l.checked_div(*r).is_some(),
             // Exponentiation has no no-result case: the runtime raises by squaring through
             // `wrapping_mul`, so a result past `i64` is a wrapped value and the fold
             // answers the same one. A negative exponent cannot arrive — `**` states

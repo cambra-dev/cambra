@@ -311,15 +311,19 @@ fn a_collection_reading_element_is_rejected() {
         sum([sum(xs), 3])"});
 }
 
-/// The second way the fold declines: both operands are literals, and folding would answer
-/// a question `docs/chl-spec.md`, "3.3 Arithmetic and logical operators" (floor division)
-/// and the runtime (truncation toward zero) disagree on. Settling that disagreement is
-/// what makes this element foldable (the vault issue
-/// `interpreter-integer-arithmetic-divergences`).
-#[test]
-#[should_panic(expected = "constant folding did not reduce this one")]
-fn a_negative_floor_division_element_is_rejected() {
-    run_pipeline("sum([(0 - 7) // 2])");
+/// Closed signed floor divisions fold to the greatest integer no larger than the quotient.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum([7 // 2])", 3)]
+#[case("sum([(0 - 7) // 2])", -4)]
+#[case("sum([7 // (0 - 2)])", -4)]
+#[case("sum([(0 - 7) // (0 - 2)])", 3)]
+#[case("sum([6 // (0 - 2)])", -3)]
+#[case("sum([0 // (0 - 2)])", 0)]
+#[case("sum([(-9223372036854775807 - 1) // 3])", -3_074_457_345_618_258_603)]
+#[case("sum([1 // (-9223372036854775807 - 1)])", -1)]
+fn signed_floor_division_elements_fold(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
 
 /// An operation with **no result** is left for the runtime, which is where it faults.
@@ -330,6 +334,7 @@ fn a_negative_floor_division_element_is_rejected() {
 #[timeout(Duration::from_secs(10))]
 #[case::overflow("sum([9223372036854775807 * 2])")]
 #[case::division_by_zero("sum([1 // 0])")]
+#[case::division_overflow("sum([(-9223372036854775807 - 1) // (0 - 1)])")]
 #[should_panic(expected = "constant folding did not reduce this one")]
 fn an_element_with_no_result_is_rejected(#[case] code: &str) {
     run_pipeline(code);
@@ -523,12 +528,9 @@ fn a_negative_comprehension_element_is_rejected_as_an_exponent() {
     check_compile_error("sum([2 ** x for x in [1, 2, -3]])", "__elem >= 0");
 }
 
-/// Overflow **wraps**, in every profile.
-///
-/// The release profile sets no `overflow-checks`, so a plain `*` in `IntPow::raised` would
-/// panic here in debug and answer `0` in release. `zip_arithmetic`'s `+ - * //` still
-/// diverge that way — the vault issue `interpreter-integer-arithmetic-divergences` carries
-/// the class.
+/// Exponentiation wraps on overflow in every profile. Addition, subtraction, and
+/// multiplication retain profile-dependent overflow behavior, tracked in the vault issue
+/// `interpreter-integer-arithmetic-divergences`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::past_the_width("2 ** 64", Value::Int(0))]

@@ -824,7 +824,7 @@ point of use. Mutual recursion between top-level functions is
 | Operator | Semantics |
 |---|---|
 | `a + b`, `a - b`, `a * b` | Integer arithmetic. Overflow is not defined (see *Partiality*, §3). |
-| `a // b` | Integer floor division. Division by zero is not defined (see *Partiality*, §3). |
+| `a // b` | Integer division rounded toward negative infinity: `-7 // 3` is `-3`, not `-2`. This matches [Python's floor division](https://docs.python.org/3/reference/expressions.html#binary-arithmetic-operations), so the shared syntax retains its meaning. Division by zero and overflow are not defined (see [Partiality](#3-expression-semantics)). |
 | `a ** b` | Integer exponentiation, *right*-associative ([2.3 Expression precedence](#23-expression-precedence)). The exponent must be non-negative. Overflow is not defined (see *Partiality*, [3. Expression semantics](#3-expression-semantics)). |
 | `-a` | Integer negation. |
 | `a & b`, `a \| b`, `a ^ b` | **Logical** and / or / xor. Both sides must be `Bool`. (CHL re-uses Python's bitwise tokens for logical operators; there is no separate bitwise operator family.) |
