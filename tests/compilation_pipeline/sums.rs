@@ -363,22 +363,28 @@ fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
     );
 }
 
-/// **Rows at differing domains merged by two appends or by a keyed write do not compile.**
-/// Neither site hands its rows a demand the way a list literal does
-/// (`src/ccl/planning/conditionals.rs`, `child_demand`). These pin the failures as they stand:
-/// two `<<` appends reach planning's refusal of a row it cannot place, and the keyed write
-/// fails group-by recognition's type check.
+/// **Rows at differing domains merged by two appends.** Each append's `box` stands at a
+/// position whose element type is the sum over both rows, so planning keeps it, as a list
+/// literal's element keeps its row's (`src/ccl/planning/conditionals.rs`,
+/// `walk_children_with_demand`).
+#[test]
+fn jagged_rows_merged_by_two_appends() {
+    check_scalar(
+        indoc! {r"
+            x = defer()
+            x << box([1])
+            x << box([2, 3])
+            sum([sum(r) for r in x])
+        "},
+        Value::Int(6),
+    );
+}
+
+/// **Rows at differing domains merged by a keyed write do not compile.** The write hands its
+/// row no demand the way a list literal does, and fails group-by recognition's type check.
+/// Pinned on that failure.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::two_appends(
-    indoc! {r"
-        x = defer()
-        x << box([1])
-        x << box([2, 3])
-        sum([sum(r) for r in x])
-    "},
-    "a row read from a mutable variable is not supported yet"
-)]
 #[case::keyed_write(
     indoc! {r#"
         m: Mut(Map(String, List(Int)), Txn) := box(map([("a", box([1]))]))
@@ -388,10 +394,7 @@ fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
     "#},
     "Bad group expr"
 )]
-fn jagged_rows_merged_by_appends_or_a_keyed_write_do_not_compile(
-    #[case] code: &str,
-    #[case] needle: &str,
-) {
+fn jagged_rows_merged_by_a_keyed_write_do_not_compile(#[case] code: &str, #[case] needle: &str) {
     check_compile_error(code, needle);
 }
 

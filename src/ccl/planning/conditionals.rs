@@ -444,6 +444,27 @@ fn walk_children_with_demand(
                 visit(child, Some(ty.clone()), materialized);
             }
         }
+        // **A compute position passes its result's demand on to what produces the result.**
+        // A per-row choice between collections is a fan-out of morphisms out of the row
+        // (`⊔ᵢ filter_values(π̂ᵢ) ≫ (armᵢ ▷ const)`), and the union's codomain binds the
+        // witness each row's value takes. A chain's result is its last morphism's, and
+        // `𝑥 ▷ const` answers `𝑥` at every input, so the demand reaches the arm's `box`.
+        (Type::Fun { codomain, .. }, TypedExprNode::Compose(elts)) => {
+            let last = elts.len().saturating_sub(1);
+            for (i, child) in elts.iter_mut().enumerate() {
+                let demand = (i == last)
+                    .then(|| child.ty.domain())
+                    .flatten()
+                    .map(|d| Type::fun_like(&child.ty, d, (**codomain).clone()));
+                visit(child, demand, materialized);
+            }
+        }
+        (Type::Fun { codomain, .. }, TypedExprNode::Apply { argument, function })
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)) =>
+        {
+            visit(argument, Some((**codomain).clone()), materialized);
+            visit(function, None, materialized);
+        }
         _ => expr.walk_children_mut(|child| visit(child, below.clone(), materialized)),
     }
 }

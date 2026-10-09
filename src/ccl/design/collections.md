@@ -418,6 +418,28 @@ still have a one-candidate sum during inference. A same-domain boxed conditional
 not erased: realization records its witness in `realized`, and `collapse_determined_sums`
 preserves it so the `Realize` assertion retains its binder.
 
+### A conditional chosen per row
+
+A conditional whose condition reads a lambda's binder, a loop's or a comprehension's, chooses an
+arm per row, and realization does not reach it. Lambda elimination compiles the `Case` in the
+lambda's body as a fan-out of morphisms out of the row, `⊔ᵢ (filter_values(π̂ᵢ) ≫ (armᵢ ▷ const))`:
+each leg keeps the rows whose gate holds and gives each of them its arm. The legs' union is a
+disjoint join over the rows. A filter's predicate is planned as a lifted term
+([Planning a lifted term](optimization.md#planning-a-lifted-term)), so a conditional in one reads
+the element the same way.
+
+With arms over one domain, every row's value is a collection over that domain. With boxed arms
+it is a sum, and the union's codomain binds a witness per row. `unbox` reads that demand through
+each leg: `walk_children_with_demand` hands a chain's last morphism the chain's codomain, and the
+argument of `𝑥 ▷ const` the codomain it answers at every input, so each arm's `box` stays,
+materialized as a jagged list literal's rows are. The iteration walk looks through a standing
+`box` to give its argument an iteration source (`mark_component_source`).
+
+At runtime the fed union merges rows whose values are collections. `UnionOperator` flattens the
+arms' domain to the rows they share whatever their codomain holds, and arms whose rows have
+different domains merge at the bound the node's type declares, as a list literal of boxed rows
+does (`OpConversionContext::witness_domain_extent`).
+
 ### Realization instantiates the witness inside the predicate
 
 Realization substitutes one candidate for the witness at the site, and the predicate of a
