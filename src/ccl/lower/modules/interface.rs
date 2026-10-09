@@ -11,6 +11,8 @@ pub struct Interface {
     /// Every top-level binding, by spelling, public and private alike, so that a
     /// reference to a private member can say so.
     pub(super) members: HashMap<SmolStr, Member>,
+    /// Every top-level type alias, by spelling, public and private alike.
+    pub(super) types: HashMap<SmolStr, TypeMember>,
     /// Where the module performs IO, which makes importing it an error
     /// (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
     pub io_site: Option<Span>,
@@ -27,6 +29,18 @@ pub struct Member {
     pub mut_param: bool,
 }
 
+/// One top-level type alias of a module.
+#[derive(Debug, Clone)]
+pub struct TypeMember {
+    /// The type it names, as its module lowered it: a name its predicates read
+    /// is spelled as the module spells it (`docs/modules.md`, "Imported aliases
+    /// are closed over their module").
+    pub ty: Type,
+    pub public: bool,
+    /// The statement that declares it.
+    pub declared: Span,
+}
+
 impl Interface {
     /// The interface of a module that performs IO at `io_site`. Importing it is
     /// refused, so its members are never reached.
@@ -34,15 +48,19 @@ impl Interface {
         Interface {
             module,
             members: HashMap::new(),
+            types: HashMap::new(),
             io_site: Some(io_site),
         }
     }
 
-    /// The interface of the module `module`, whose top-level bindings are
-    /// `bindings`, and which performs IO at `io_site`, if it does.
+    /// The interface of the module `module`, lowered to `chain`, whose top-level
+    /// bindings and type aliases are `bindings` and `aliases`, and which performs
+    /// IO at `io_site`, if it does.
     pub(super) fn of_lowered(
         module: ModulePath,
+        chain: &Expr,
         bindings: &[TopLevelBinding],
+        aliases: &[TopLevelBinding],
         mut_param_fns: impl Fn(&str) -> bool,
         io_site: Option<Span>,
     ) -> Self {
@@ -59,12 +77,46 @@ impl Interface {
                 )
             })
             .collect();
+        let declared = top_level_types(chain);
+        let types = aliases
+            .iter()
+            .map(|alias| {
+                let ty = declared.get(alias.name.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "module `{module}`'s chain declares its alias `{}`",
+                        alias.name
+                    )
+                });
+                (
+                    alias.name.clone(),
+                    TypeMember {
+                        ty: (*ty).clone(),
+                        public: alias.public,
+                        declared: alias.span,
+                    },
+                )
+            })
+            .collect();
         Interface {
             module,
             members,
+            types,
             io_site,
         }
     }
+}
+
+/// The type each top-level `LetType` on `chain`'s spine declares, by spelling.
+pub(super) fn top_level_types(chain: &Expr) -> HashMap<&str, &Type> {
+    let mut types = HashMap::new();
+    let mut at = chain;
+    while let Some(body) = spine_body(at) {
+        if let TypedExprNode::LetType { name, ty, .. } = &at.node {
+            types.insert(name.as_str(), ty);
+        }
+        at = body;
+    }
+    types
 }
 
 /// One binding at a module's top level, as the source writes it.
@@ -116,6 +168,28 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
         }
     }
     out
+}
+
+/// The type aliases `stmts`, a module's top level, declares, in order.
+pub fn top_level_aliases(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
+    stmts
+        .iter()
+        .filter_map(|stmt| {
+            let (inner, public) = match &stmt.node {
+                ChlStmt::Pub { stmt, .. } => (&stmt.node, true),
+                other => (other, false),
+            };
+            let ChlStmt::Assign { target, value, .. } = inner else {
+                return None;
+            };
+            let (name, _) = crate::ccl::lower::stmts::type_alias_decl(target, value)?;
+            Some(TopLevelBinding {
+                name: name.into(),
+                span: stmt.span,
+                public,
+            })
+        })
+        .collect()
 }
 
 /// The errors of a public name bound more than once at a module's top level

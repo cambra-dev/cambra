@@ -22,11 +22,19 @@ pub struct ModuleScope {
 /// What a `use` name reaches.
 #[derive(Debug, Clone)]
 pub struct Use {
-    /// The member, spelled through its qualifier, or `None` when its module has
-    /// errors of its own.
-    pub member: Option<QualifiedName>,
+    pub reached: Reached,
     /// The `use` item that binds the name.
     pub item: Span,
+}
+
+/// The member a `use` item names: a value or a type alias, as the case of its
+/// spelling says. Each is `None` when its module has errors of its own.
+#[derive(Debug, Clone)]
+pub enum Reached {
+    /// The member, spelled through its qualifier.
+    Value(Option<QualifiedName>),
+    /// The type the alias names, spelled through its qualifier ([`reroot`]).
+    Type(Option<Type>),
 }
 
 /// What an import name reaches (`docs/chl-spec.md`, "9.6 Qualified
@@ -55,6 +63,13 @@ impl LoweringContext {
     pub(crate) fn begin_module(&mut self, scope: ModuleScope) {
         self.type_aliases.clear();
         self.mut_param_fns.clear();
+        // A `use` type name is in scope throughout its module. One whose module
+        // has errors of its own names no type, and stands for any.
+        for (name, used) in &scope.uses {
+            if let Reached::Type(ty) = &used.reached {
+                self.declare_type_throughout(name.as_str(), ty.clone().unwrap_or(Type::Hole));
+            }
+        }
         self.module = scope;
         self.io_site = None;
         self.transactional_vars.clear();
@@ -115,6 +130,17 @@ impl LoweringContext {
         Ok(reached.map(|spelling| spelling.raw()))
     }
 
+    /// The type the type reference `q` names, or `None` when `q`'s module has
+    /// errors of its own, which already fail the compilation.
+    pub(in crate::ccl::lower) fn type_member(
+        &self,
+        q: &ParserQualifiedName,
+        span: Span,
+    ) -> Result<Option<Type>, LoweringError> {
+        self.qualifier_import(q, span, "type")?
+            .reach_type(&q.qualifier[0].node, &q.name.node, span)
+    }
+
     /// The import name `q`'s qualifier is, for a reference to a `what` at
     /// `span`.
     pub(super) fn qualifier_import(
@@ -166,7 +192,7 @@ impl Qualifier {
         if crate::ccl::lower::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
-                format!("the type member `{name}::{member}` is not supported yet"),
+                format!("`{name}::{member}` is a type, not a value"),
             ));
         }
         let Some(interface) = self.reachable() else {
@@ -196,6 +222,41 @@ impl Qualifier {
             ));
         }
         Ok(Some(QualifiedName::new(name).child(member)))
+    }
+
+    /// The type of the public type alias `member`, reached through the qualifier
+    /// `name` at `span` and spelled through it ([`reroot`]), or `None` as for
+    /// [`Qualifier::reach`].
+    pub(super) fn reach_type(
+        &self,
+        name: &str,
+        member: &str,
+        span: Span,
+    ) -> Result<Option<Type>, LoweringError> {
+        if !crate::ccl::lower::stmts::is_type_name(member) {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("`{name}::{member}` is a value, not a type"),
+            ));
+        }
+        let Some(interface) = self.reachable() else {
+            return Ok(None);
+        };
+        let module = &interface.module;
+        let Some(found) = interface.types.get(member) else {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("module `{module}` has no type member `{member}`"),
+            ));
+        };
+        if !found.public {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("`{member}` is private to module `{module}`"),
+            )
+            .with_note(found.declared, "declared here without `pub`"));
+        }
+        Ok(Some(reroot(&found.ty, name)))
     }
 
     /// The interface whose members a reference reaches, or `None` when the module
@@ -229,7 +290,7 @@ pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) 
 /// An import of a module that performs IO is an error at the statement, and so
 /// is a second import binding one name. A `use` item is an error when its member
 /// is not one the module reaches, or when its name is an import name, another
-/// `use` name, or a builtin's.
+/// `use` name, a builtin's, or a built-in type's.
 pub(super) fn module_scope(
     module: &ChlModule,
     labels: Option<ModulePath>,
@@ -286,8 +347,16 @@ pub(super) fn module_scope(
     let mut uses: HashMap<SmolStr, Use> = HashMap::new();
     for (qualifier_name, item) in use_items {
         let bound = item.alias.as_ref().unwrap_or(&item.name);
-        let reached =
-            qualifiers[&qualifier_name].reach(&qualifier_name, &item.name.node, item.name.span);
+        let qualifier = &qualifiers[&qualifier_name];
+        let reached = if crate::ccl::lower::stmts::is_type_name(&item.name.node) {
+            qualifier
+                .reach_type(&qualifier_name, &item.name.node, item.name.span)
+                .map(Reached::Type)
+        } else {
+            qualifier
+                .reach(&qualifier_name, &item.name.node, item.name.span)
+                .map(Reached::Value)
+        };
         let refusal = if let Some(named) = qualifiers.get(&bound.node) {
             Some(
                 LoweringError::unsupported(
@@ -320,6 +389,15 @@ pub(super) fn module_scope(
                     bound.node, item.name.node
                 ),
             ))
+        } else if crate::ccl::lower::is_builtin_type_name(&bound.node) {
+            Some(LoweringError::unsupported(
+                bound.span,
+                format!(
+                    "`{}` is a built-in type, so a `use` name cannot take it: bind the alias \
+                     under another name, `use {} as …`",
+                    bound.node, item.name.node
+                ),
+            ))
         } else {
             reached.as_ref().err().cloned()
         };
@@ -330,7 +408,7 @@ pub(super) fn module_scope(
         uses.insert(
             bound.node.clone(),
             Use {
-                member: reached.expect("an unrefused `use` item reaches its member"),
+                reached: reached.expect("an unrefused `use` item reaches its member"),
                 item: bound.span,
             },
         );
