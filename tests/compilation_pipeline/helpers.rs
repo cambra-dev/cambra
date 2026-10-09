@@ -98,13 +98,26 @@ pub(crate) fn run_pipeline(code: &str) -> Tile {
 }
 
 pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Expr, Tile) {
+    run_program_with_ctx(ctx, &LoadedProgram::test(code))
+}
+
+/// [`run_pipeline`] for a program of any number of files.
+pub(crate) fn run_program(program: &LoadedProgram) -> Tile {
+    let mut ctx = GlobalContext::default();
+    run_program_with_ctx(&mut ctx, program).1
+}
+
+/// [`run_pipeline_with_ctx`] for a program of any number of files.
+pub(crate) fn run_program_with_ctx(
+    ctx: &mut GlobalContext,
+    loaded: &LoadedProgram,
+) -> (Expr, Tile) {
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let loaded = LoadedProgram::test(code);
-    let mut compiled = compile_program(ctx, &loaded, consumer).unwrap_or_render(&loaded);
+    let mut compiled = compile_program(ctx, loaded, consumer).unwrap_or_render(loaded);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     let producer = compiled
@@ -161,7 +174,12 @@ pub(crate) fn check_collection_tile(code: &str, expected: Tile) {
 /// Scalar variant of [`check_tile`]: unwraps the result via
 /// [`cambra::interpreter::ColumnValue::as_single`] before comparing.
 pub(crate) fn check_scalar(code: &str, expected: Value) {
-    let result = run_pipeline(code);
+    check_program_scalar(&LoadedProgram::test(code), expected);
+}
+
+/// [`check_scalar`] for a program of any number of files.
+pub(crate) fn check_program_scalar(program: &LoadedProgram, expected: Value) {
+    let result = run_program(program);
     let scalar = scalar_tile_to_column_value(result);
     assert_eq!(scalar.as_single().unwrap(), expected);
 }

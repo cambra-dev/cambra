@@ -45,6 +45,21 @@ pub(super) fn lower_call(
 ) -> Result<Expr, LoweringError> {
     let name = match &func.node {
         ChlExpr::Name(id) => id.as_str(),
+        // A member of another module is a named callee
+        // (`docs/chl-spec.md`, "9.6 Qualified references").
+        ChlExpr::Qualified(q) => {
+            let Some(member) = ctx.member(q, func.span)? else {
+                return Ok(Expr::error());
+            };
+            if args.is_empty() {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "a call with no arguments reads a registered source, and a module member \
+                     is not one",
+                ));
+            }
+            return lower_application(member, func.span, args, ctx);
+        }
         _ => {
             return Err(LoweringError::unsupported(
                 func.span,
@@ -299,6 +314,10 @@ pub(super) fn lower_call(
         )
         | None => {
             if ctx.sources.contains_key(name) {
+                // Reading a source is IO, which a module that is imported may not
+                // perform.
+                ctx.io_site
+                    .get_or_insert(func.span.join(args.last().map_or(func.span, |a| a.span)));
                 return Ok(Expr::new(TypedExprNode::Source(name.to_string())));
             }
             // For zero-argument calls, only registered sources are allowed.
@@ -326,31 +345,40 @@ pub(super) fn lower_call(
                 }
                 return Ok(acc);
             }
-            // Single-arg call: direct application `f(a)` → `Apply(a, f)`. The
-            // argument is an ordinary value, so it lowers through `lower_expr` —
-            // where the out-of-block transactional read gate applies. (Only a
-            // `Mut`-param callee, handled above, accepts a bare mutable variable pass and
-            // bypasses the gate.)
-            if args.len() == 1 {
-                let arg = lower_expr(&args[0], ctx)?;
-                let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
-                return Ok(Expr::apply(arg, callee));
-            }
-            // Multi-arg call: tuple the arguments and apply once,
-            // `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`. This pairs with
-            // the uncurried multi-arg lambda lowering in [`lower_lambda`] so
-            // that syntactic multi-arg functions compile without any `curry`
-            // combinator appearing in the tree. Arguments lower through the gated
-            // `lower_expr` for the same reason as the single-arg case.
-            let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-            // The tuple is manufactured packing (there is no tuple in the
-            // source call); the callee `Var` images the function name.
-            let args_span = args[0].span.join(args[args.len() - 1].span);
-            let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-            let callee = ctx.tag_image(Expr::var(name.to_string()), func.span);
-            Ok(Expr::apply(arg_tuple, callee))
+            lower_application(Name::raw(name), func.span, args, ctx)
         }
     }
+}
+
+/// The function `callee` names, written at `func_span`, applied to `args`, a
+/// non-empty argument list, as an ordinary call.
+///
+/// One argument applies directly, `f(a)` → `Apply(a, f)`. Several are tupled and
+/// applied once, `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`, which pairs with
+/// the uncurried multi-argument lambda lowering in [`lower_lambda`] so that a
+/// syntactic multi-argument function compiles without a `curry` combinator. Every
+/// argument is an ordinary value, so it lowers through `lower_expr`, where the
+/// out-of-block transactional read gate applies. Only a `Mut`-parameter callee
+/// accepts a bare mutable variable, and its call does not come here.
+fn lower_application(
+    callee: Name,
+    func_span: Span,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    debug_assert!(!args.is_empty(), "an ordinary call has an argument");
+    if args.len() == 1 {
+        let arg = lower_expr(&args[0], ctx)?;
+        let callee = ctx.tag_image(Expr::var(callee), func_span);
+        return Ok(Expr::apply(arg, callee));
+    }
+    let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
+    // The tuple is manufactured packing (there is no tuple in the source call);
+    // the callee images the function the user named.
+    let args_span = args[0].span.join(args[args.len() - 1].span);
+    let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
+    let callee = ctx.tag_image(Expr::var(callee), func_span);
+    Ok(Expr::apply(arg_tuple, callee))
 }
 
 /// Lower group-by and return its present-key domain for re-keying callers.

@@ -1,28 +1,47 @@
-//! The refusal of module syntax, which parses and does not lower yet.
+//! The refusal of module syntax that parses and does not lower yet, and the
+//! placement rules of module statements.
 //!
-//! A program is one file until loading and imports exist (`docs/modules.md`,
-//! "Implementation stack"). [`refuse_module_syntax`] finds every module construct
-//! in a module, at any depth, and [`super::lower_stmts`] lowers nothing when it
-//! finds one. No other lowering site therefore sees an [`ChlStmt::Import`],
-//! [`ChlStmt::Run`], [`ChlStmt::Param`], [`ChlStmt::Discard`], [`ChlStmt::Pub`],
-//! [`ChlExpr::Qualified`], a qualified label, or a qualified tag.
+//! [`refuse_module_syntax`] finds every such construct in a module, at any
+//! depth, and the module lowers nothing when it finds one. It refuses `run`,
+//! `param`, `@Discard`, a `use` clause, `pub` on anything but a value binding, a
+//! write to another module's member, and a method reference. A qualified value,
+//! label, or tag reaches lowering, which resolves it against the module's
+//! import names (`super::modules`). Lowering therefore sees a top-level
+//! [`ChlStmt::Import`] and a top-level [`ChlStmt::Pub`] on a value binding, and
+//! no other module statement.
+//!
+//! The walk also collects every binder the module writes, for the rule that no
+//! binder takes an import name's spelling (`docs/chl-spec.md`, "9.6 Qualified
+//! references").
 
 use super::LoweringError;
 use super::stmts::is_type_name;
 use crate::chl_parser::ast::{
     AssignTarget, CompClause, Comprehension, DiscardHead, Expr as ChlExpr, IfBranch,
-    KindAnnotation, MatchArm, Module as ChlModule, Param, QualifiedName, RecordField, Requirement,
-    Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam, VariantPayload,
+    KindAnnotation, MatchArm, Module as ChlModule, Param, PayloadPattern, QualifiedName,
+    RecordField, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeParam,
+    VariantPayload,
 };
 use smol_str::SmolStr;
 
-/// One error per module construct in `module`, in source order of traversal.
-pub(super) fn refuse_module_syntax(module: &ChlModule) -> Vec<LoweringError> {
+/// What [`refuse_module_syntax`] finds in a module.
+pub(super) struct ModuleSyntax {
+    /// One error per refused construct, in source order of traversal.
+    pub errors: Vec<LoweringError>,
+    /// Every name the module binds, at any depth, with where it is bound.
+    pub binders: Vec<(SmolStr, Span)>,
+}
+
+/// The refused module constructs of `module`, and the names it binds.
+pub(super) fn refuse_module_syntax(module: &ChlModule) -> ModuleSyntax {
     let mut refusals = Refusals::default();
     for stmt in &module.body {
         refusals.stmt(stmt);
     }
-    refusals.errors
+    ModuleSyntax {
+        errors: refusals.errors,
+        binders: refusals.binders,
+    }
 }
 
 /// Spell a qualified name as written: `shop::eu::stock`.
@@ -46,6 +65,7 @@ fn names_a_method(qualifier: &[Spanned<SmolStr>]) -> bool {
 #[derive(Default)]
 struct Refusals {
     errors: Vec<LoweringError>,
+    binders: Vec<(SmolStr, Span)>,
     /// How many statement bodies enclose the statement being checked: 0 at the
     /// module's top level.
     depth: usize,
@@ -93,10 +113,16 @@ impl Refusals {
             }
         }
         match &stmt.node {
-            ChlStmt::Import { .. } => self.refuse(
-                stmt.span,
-                "`import` is not supported yet: a program is a single module",
-            ),
+            ChlStmt::Import { uses, .. } => {
+                if let (Some(first), Some(last)) = (uses.first(), uses.last()) {
+                    let end = last.alias.as_ref().map_or(last.name.span, |a| a.span);
+                    self.refuse(
+                        first.name.span.join(end),
+                        "a `use` clause is not supported yet: reach a member through its \
+                         module, `m::f`",
+                    );
+                }
+            }
             ChlStmt::Run {
                 args, renamed_from, ..
             } => {
@@ -133,11 +159,17 @@ impl Refusals {
             }
             ChlStmt::Discard(_) => self.refuse(stmt.span, "`@Discard` is not supported yet"),
             ChlStmt::Pub { keyword, stmt } => {
-                self.refuse(
-                    *keyword,
-                    "`pub` is not supported yet: a program is a single module, and nothing \
-                     imports its members",
-                );
+                match &stmt.node {
+                    ChlStmt::Assign { .. }
+                    | ChlStmt::AnnAssign { .. }
+                    | ChlStmt::FunctionDef { .. } => {}
+                    ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. } => {
+                        self.refuse(*keyword, "a public mutable variable is not supported yet")
+                    }
+                    // `pub` on any other statement is a parse error, and `pub run`
+                    // is refused with its `run`.
+                    _ => {}
+                }
                 // The statement `pub` marks is checked as any other.
                 self.stmt(stmt);
             }
@@ -196,13 +228,14 @@ impl Refusals {
                 self.stmts(body);
             }
             ChlStmt::FunctionDef {
+                name,
                 type_params,
                 params,
                 output,
                 requires,
                 body,
-                ..
             } => {
+                self.binders.push((name.clone(), stmt.span));
                 self.type_params(type_params);
                 self.params(params);
                 if let Some(output) = output {
@@ -211,7 +244,14 @@ impl Refusals {
                 self.requires(requires);
                 self.stmts(body);
             }
-            ChlStmt::With { context, body, .. } => {
+            ChlStmt::With {
+                binding,
+                context,
+                body,
+            } => {
+                if let Some(binding) = binding {
+                    self.binders.push((binding.clone(), stmt.span));
+                }
                 self.expr(context);
                 self.stmts(body);
             }
@@ -221,27 +261,18 @@ impl Refusals {
 
     fn arms(&mut self, arms: &[MatchArm]) {
         for arm in arms {
-            if let Some(pattern) = &arm.pattern {
-                self.tag(&pattern.tag_qualifier, &pattern.tag, pattern.tag_span);
+            if let Some(pattern) = &arm.pattern
+                && let PayloadPattern::Named(binder) = &pattern.payload
+            {
+                self.binders.push((binder.clone(), pattern.tag_span));
             }
             self.stmts(&arm.body);
         }
     }
 
-    fn tag(&mut self, qualifier: &[Spanned<SmolStr>], tag: &str, tag_span: Span) {
-        if let Some(first) = qualifier.first() {
-            self.refuse(
-                first.span.join(tag_span),
-                format!(
-                    "the qualified tag `{}` is not supported yet: a program is a single module",
-                    spell(qualifier, &format!("`{tag}"))
-                ),
-            );
-        }
-    }
-
     fn params(&mut self, params: &[Param]) {
         for param in params {
+            self.binders.push((param.name.clone(), param.name_span));
             self.annotation(param.annotation.as_ref());
         }
     }
@@ -274,7 +305,7 @@ impl Refusals {
 
     fn target(&mut self, target: &Spanned<AssignTarget>) {
         match &target.node {
-            AssignTarget::Name(_) => {}
+            AssignTarget::Name(name) => self.binders.push((name.clone(), target.span)),
             AssignTarget::Tuple(targets) => {
                 for target in targets {
                     self.target(target);
@@ -284,21 +315,27 @@ impl Refusals {
                 self.expr(target);
                 self.expr(index);
             }
-            AssignTarget::Qualified(q) => self.qualified(q, target.span),
+            AssignTarget::Qualified(q) => {
+                let spelled = spell(&q.qualifier, &q.name.node);
+                if names_a_method(&q.qualifier) {
+                    return self.method_reference(target.span, &spelled);
+                }
+                self.refuse(
+                    target.span,
+                    format!(
+                        "writing `{spelled}`, a member of another module, is not supported yet"
+                    ),
+                );
+            }
         }
     }
 
+    /// A qualified value reference reaches lowering, which resolves it, unless a
+    /// capitalized segment makes it a method reference.
     fn qualified(&mut self, q: &QualifiedName, span: Span) {
-        let spelled = spell(&q.qualifier, &q.name.node);
         if names_a_method(&q.qualifier) {
-            return self.method_reference(span, &spelled);
+            self.method_reference(span, &spell(&q.qualifier, &q.name.node));
         }
-        self.refuse(
-            span,
-            format!(
-                "the qualified name `{spelled}` is not supported yet: a program is a single module"
-            ),
-        );
     }
 
     fn method_reference(&mut self, span: Span, spelled: &str) {
@@ -310,20 +347,7 @@ impl Refusals {
 
     fn fields(&mut self, fields: &[RecordField]) {
         for field in fields {
-            self.label(&field.qualifier, &field.name, field.name_span);
             self.expr(&field.value);
-        }
-    }
-
-    fn label(&mut self, qualifier: &[Spanned<SmolStr>], name: &str, name_span: Span) {
-        if let Some(first) = qualifier.first() {
-            self.refuse(
-                first.span.join(name_span),
-                format!(
-                    "the qualified label `{}` is not supported yet: a program is a single module",
-                    spell(qualifier, name)
-                ),
-            );
         }
     }
 
@@ -350,12 +374,13 @@ impl Refusals {
                 attr_qualifier,
             } => {
                 self.expr(target);
-                match attr_qualifier.first() {
-                    Some(first) if names_a_method(attr_qualifier) => self.method_reference(
+                if let Some(first) = attr_qualifier.first()
+                    && names_a_method(attr_qualifier)
+                {
+                    self.method_reference(
                         first.span.join(*attr_span),
                         &spell(attr_qualifier, attr),
-                    ),
-                    _ => self.label(attr_qualifier, attr, *attr_span),
+                    );
                 }
             }
             ChlExpr::Record(fields) | ChlExpr::BraceRecord(fields) => self.fields(fields),
@@ -410,13 +435,7 @@ impl Refusals {
                 self.expr(target);
                 self.expr(index);
             }
-            ChlExpr::VariantCtor {
-                tag,
-                tag_span,
-                tag_qualifier,
-                payload,
-            } => {
-                self.tag(tag_qualifier, tag, *tag_span);
+            ChlExpr::VariantCtor { payload, .. } => {
                 if let Some(VariantPayload::Term(p) | VariantPayload::Fields(p)) = payload {
                     self.expr(p);
                 }
@@ -473,7 +492,7 @@ mod tests {
     #[test]
     fn each_module_statement_is_refused_at_its_span() {
         let refused = refusals(indoc! {r#"
-            import catalog use Item
+            import catalog use Item, price as p
             run audit
             param port: String
             @Discard
@@ -481,7 +500,7 @@ mod tests {
             1
         "#});
         let messages: Vec<&str> = refused.iter().map(|(_, m)| m.as_str()).collect();
-        assert!(messages[0].starts_with("`import` is not supported yet"));
+        assert!(messages[0].starts_with("a `use` clause is not supported yet"));
         assert!(messages[1].starts_with("`run` is not supported yet"));
         assert!(messages[2].starts_with("`param` is not supported yet"));
         assert_eq!(messages[3], "`@Discard` is not supported yet");
@@ -489,7 +508,7 @@ mod tests {
         assert_eq!(
             spans,
             [
-                "import catalog use Item",
+                "Item, price as p",
                 "run audit",
                 "param port: String",
                 "@Discard\nstock"
@@ -497,62 +516,54 @@ mod tests {
         );
     }
 
-    /// `pub` is refused at the keyword, and the statement it marks is checked
-    /// as any other.
+    /// `pub` on a mutable variable is refused at the keyword, and the
+    /// statement it marks is checked as any other.
     #[test]
-    fn pub_is_refused_at_its_keyword() {
+    fn pub_on_a_mutable_variable_is_refused_at_its_keyword() {
         let refused = refusals(indoc! {"
-            pub limit = cart::max_items
-            limit
+            pub stock := Price::zero
+            stock
         "});
         assert_eq!(refused.len(), 2, "{refused:#?}");
         assert_eq!(refused[0].0, "pub");
-        assert!(refused[0].1.starts_with("`pub` is not supported yet"));
-        assert_eq!(refused[1].0, "cart::max_items");
-        assert!(
-            refused[1]
-                .1
-                .starts_with("the qualified name `cart::max_items` is not supported yet")
+        assert_eq!(
+            refused[0].1,
+            "a public mutable variable is not supported yet"
         );
+        assert_eq!(refused[1].0, "Price::zero");
     }
 
-    /// A qualified name or label is refused wherever it stands: in a type, a
-    /// lambda inside a `def`, a block value, and a comprehension.
+    /// A value binding, a `def` and a type alias take `pub`, and a qualified
+    /// value, label or tag is left to lowering, which resolves it.
     #[test]
-    fn a_qualified_name_is_refused_at_any_depth() {
-        assert_eq!(
-            refused_spans(indoc! {"
-                def total(items: catalog::Items):
-                    f = \\x -> x.catalog::price
-                    [f(i) for i in items if i.this::ok]
-                n = if ready:
-                        (shop::eu::stock).count
-                    else:
-                        0
-                {k: cart::K}
-            "}),
-            [
-                "catalog::Items",
-                "catalog::price",
-                "this::ok",
-                "shop::eu::stock",
-                "cart::K",
-            ]
-        );
+    fn pub_on_a_value_binding_and_a_qualified_name_pass() {
+        let syntax = super::refuse_module_syntax(&parse_module(indoc! {"
+            pub limit = cart::max_items
+            pub def f(x):
+                (cart::price=x.cart::cost, tag=cart::`some(1))
+            pub Dollars = Int
+            limit
+        "}));
+        assert!(syntax.errors.is_empty(), "{:#?}", syntax.errors);
     }
 
-    /// A polymorphic signature's bounds, operand types and associated types
-    /// are checked, on a `def` and in a `forall` type.
+    /// Every binder is collected, at any depth, for the rule that none takes an
+    /// import name.
     #[test]
-    fn a_qualified_name_is_refused_in_a_polymorphic_signature() {
-        assert_eq!(
-            refused_spans(indoc! {"
-                def larger(T <: catalog::Item, a: T, b: T) => T requires Orderable(T, shop::Key):
-                    b if a < b else a
-                pick: forall (T: kinds::K) {T,} => T requires Addable(T, T, Output=cart::T) = id
-            "}),
-            ["catalog::Item", "shop::Key", "kinds::K", "cart::T",]
-        );
+    fn every_binder_is_collected() {
+        let syntax = super::refuse_module_syntax(&parse_module(indoc! {"
+            a, b = (1, 2)
+            def f(x, y):
+                g = \\z -> z
+                [w for w in x]
+            match o:
+                case `some(v):
+                    v
+                case `none:
+                    0
+        "}));
+        let names: Vec<&str> = syntax.binders.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "f", "x", "y", "g", "z", "w", "v"]);
     }
 
     /// A capitalized qualifier segment is a type, so the path names one of its
@@ -562,7 +573,6 @@ mod tests {
         let refused = refusals(indoc! {"
             f = Price::discounted
             g = x.mod::Price::discounted(10)
-            h = mod::Price
             f
         "});
         let refused: Vec<(&str, &str)> = refused
@@ -580,11 +590,6 @@ mod tests {
                     "mod::Price::discounted",
                     "the method reference `mod::Price::discounted` is not supported yet"
                 ),
-                (
-                    "mod::Price",
-                    "the qualified name `mod::Price` is not supported yet: a program is a single \
-                     module"
-                ),
             ]
         );
     }
@@ -600,41 +605,7 @@ mod tests {
                     inv::stock := inv::stock
                 1
             "}),
-            ["c::count", "inv::stock", "inv::stock"]
-        );
-    }
-
-    #[test]
-    fn a_qualified_record_label_is_refused() {
-        let refused = refusals(indoc! {"
-            r = (catalog::price=25, cost=11)
-            r
-        "});
-        assert_eq!(refused.len(), 1, "{refused:#?}");
-        assert_eq!(refused[0].0, "catalog::price");
-        assert!(
-            refused[0]
-                .1
-                .starts_with("the qualified label `catalog::price` is not supported yet")
-        );
-    }
-
-    #[test]
-    fn a_qualified_tag_is_refused_in_a_constructor_and_a_pattern() {
-        let refused = refusals(indoc! {"
-            o = mod2::`some(1)
-            match o:
-                case mod2::`some(v):
-                    v
-                case `none:
-                    0
-        "});
-        let spans: Vec<&str> = refused.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(spans, ["mod2::`some", "mod2::`some"]);
-        assert!(
-            refused[0]
-                .1
-                .starts_with("the qualified tag `mod2::`some` is not supported yet")
+            ["c::count", "inv::stock"]
         );
     }
 
@@ -731,7 +702,7 @@ mod tests {
     fn a_run_argument_is_checked() {
         assert_eq!(
             refused_spans("run storefront(audit=audit_api::log)\n"),
-            ["run storefront(audit=audit_api::log)", "audit_api::log"]
+            ["run storefront(audit=audit_api::log)"]
         );
     }
 }

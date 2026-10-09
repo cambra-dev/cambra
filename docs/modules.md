@@ -1,7 +1,8 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first three items of the [Implementation
-> stack](#implementation-stack) are implemented.
+> stack](#implementation-stack) are implemented, and the first part of the fourth, importing values
+> ([Imports](#imports)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -101,6 +102,10 @@ today.
 
 ### Names carry their home
 
+A shared run's members need neither change below: lowering resolves `m::f` straight to the binder
+the module's chain minted ([Imports](#imports)). Both arrive with runs, whose copies of a module mint
+fresh binders at link time.
+
 Two changes to `Name` (`src/ccl/names.rs`):
 
 - **`Name::Member { owner, base }`**, a new raw form. `owner` is a module path, a run name, or a
@@ -199,6 +204,35 @@ each file's parse, the module graph, and the link order. Every compile entry poi
   order exists only for an acyclic graph.
 - **Compilation.** Loading's errors come first: every file's parse errors, then missing modules and
   cycles. Only the root is lowered, and lowering refuses every `import` and `run`.
+
+### Imports
+
+Importing values is implemented: `import m` and `import a::b as c`, `pub` on value bindings and
+`def`s, and `m::f` as a value, a callee, and a qualifier of labels and tags.
+
+- **An imported module lowers to a chain.** `lower_library` lowers its top-level statements, each
+  wrapping the next, around `MODULE_BODY`, a placeholder for the code of the modules that import it.
+  Each module lowers with fresh block state (`LoweringContext::begin_module`), and its chain is
+  uniquified alone, before any importer lowers.
+- **An interface holds minted names.** `Interface` (`src/ccl/lower/modules.rs`) maps each
+  top-level binding to the binder its chain minted, with its visibility and declaration. `m::f`
+  lowers to that binder. A private member is an error with a label at its declaration, and a
+  missing one is an error.
+- **Linking** replaces each placeholder with the code below it: every imported module once, in
+  link order, around the root, the first in link order outermost.
+- **IO.** A module that declares a sink lowers nothing, and lowering records a module's first read
+  of a registered source. Each `import` of a module that does either is an error, labeled at the IO
+  site.
+- **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
+  label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
+  every module ([Names carry their home](#names-carry-their-home)).
+- **Refused:** `use` clauses, type members (`m::T`), a module as a value, an imported module's
+  mutable state and top-level loops and expression statements, a call to an imported `def` with a
+  `Mut` parameter, and a member of a run. The later parts of the Imports item, and the later items,
+  lift these.
+
+A module whose own errors stop it from lowering has no interface, and a reference into it adds no
+error.
 
 ### The module interface
 
@@ -383,7 +417,8 @@ at a time, with a file list. Clicking a node in another pane opens the file its 
 node of a member also names its run.
 
 This moves every golden wire fixture. The re-bless procedure is in
-[web/CLAUDE.md](../web/CLAUDE.md).
+[web/CLAUDE.md](../web/CLAUDE.md). Until then, a program of several modules gets the degraded
+payload, with a diagnostic saying the inspector shows one file.
 
 ---
 
@@ -501,13 +536,16 @@ One PR per item, each updating the spec and design docs it touches:
    (`src/ccl/lower/module_syntax.rs`).
 3. **Loading and the module graph.** Path resolution, per-file parsing, module paths in the
    `SourceMap`, cycle refusal, link order.
-4. **Imports.** `Name::Member`, `Unique::home`, per-module lowering and uniquification, interfaces,
-   shared runs, the IO check on imports, visibility, `use` clauses, closed aliases, qualified
-   callees, labels and tags that carry their module.
+4. **Imports**, in four parts:
+   1. **Values.** Per-module lowering and uniquification, interfaces, shared runs, the IO check on
+      imports, visibility, qualified callees, labels and tags that carry their module.
+   2. **`use` clauses.**
+   3. **Imported type aliases**, closed over their module.
+   4. **Imported mutable state** and `Mut`-parameter functions.
 5. **Per-module checking.** Inference over one module against the interfaces it uses, contracts in
    the interface, `cambra check`.
-6. **Runs and parameters.** The run tree, per-run copies of a module, value parameters, run-site
-   checks, qualified registries, `VarPath` run paths.
+6. **Runs and parameters.** `Name::Member`, `Unique::home`, the run tree, per-run copies of a
+   module, value parameters, run-site checks, qualified registries, `VarPath` run paths.
 7. **Module types and type parameters.** `Module{…}` and its subtyping, Module-typed parameters
    and the qualified references through them, type parameters.
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`

@@ -411,8 +411,8 @@ fn the_root_files_name_is_its_module_path() {
     }
 }
 
-/// Compiling a program of several modules reports every file's errors and the
-/// root's refusal of `import`, which only the root is lowered for.
+/// Compiling a program of several modules reports every file's errors together,
+/// and a reference into a module with errors of its own adds none.
 #[test]
 fn a_program_of_several_modules_reports_every_files_errors() {
     use crate::ccl::context::{Phase, compile_to};
@@ -420,9 +420,9 @@ fn a_program_of_several_modules_reports_every_files_errors() {
         indoc! {"
             import lib
             import gone
-            1
+            lib::y + gone::z
         "},
-        InMemory::default().with("lib", "y = = 2\n"),
+        InMemory::default().with("lib", "pub y = = 2\n"),
     );
     let errors = compile_to(&program, Phase::Lower).unwrap_err();
     let located: Vec<(&str, String)> = errors
@@ -432,7 +432,7 @@ fn a_program_of_several_modules_reports_every_files_errors() {
             (program.sources().path(span.file), e.message())
         })
         .collect();
-    assert_eq!(located.len(), 4, "{located:#?}");
+    assert_eq!(located.len(), 2, "{located:#?}");
     assert_eq!(located[0].0, "lib.cambra");
     assert_eq!(
         located[1],
@@ -441,11 +441,4 @@ fn a_program_of_several_modules_reports_every_files_errors() {
             "no module `gone`: there is no file `gone.cambra`".to_owned()
         )
     );
-    for (file, message) in &located[2..] {
-        assert_eq!(*file, "main.cambra");
-        assert!(
-            message.starts_with("`import` is not supported yet"),
-            "{message}"
-        );
-    }
 }

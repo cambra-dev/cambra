@@ -38,6 +38,8 @@ mod generators_udf_poly;
 mod joins_aggregates_groupby;
 #[path = "compilation_pipeline/misc.rs"]
 mod misc;
+#[path = "compilation_pipeline/modules.rs"]
+mod modules;
 #[path = "compilation_pipeline/mutability.rs"]
 mod mutability;
 #[path = "compilation_pipeline/nested_loops.rs"]

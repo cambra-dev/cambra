@@ -652,7 +652,25 @@ impl InspectedProgram<'_> {
     /// * `definitions` — [`InspectedProgram::definitions`](super::program::InspectedProgram).
     /// * `diagnostics` — empty.
     /// * `meta` — `payloadKind: "program"`, `schema:` [`SCHEMA_VERSION`].
+    ///
+    /// The payload carries one file. A program of several modules has nodes whose
+    /// spans lie in other files, so its payload is the degraded one, with a
+    /// diagnostic saying why, until the source pane shows several files
+    /// (`docs/modules.md`, "Inspector").
     pub fn build_payload(&self, name: impl Into<String>) -> InspectorPayload {
+        if self.sources().files().count() > 1 {
+            return InspectorPayload::degraded(
+                name,
+                self.source_text(),
+                vec![Diagnostic {
+                    severity: "error".to_string(),
+                    message: "the inspector shows a program of one file, and a program of \
+                              several modules is not supported yet"
+                        .to_string(),
+                    span: None,
+                }],
+            );
+        }
         let source = SourceInfo {
             name: name.into(),
             text: self.source_text().to_string(),
@@ -1586,7 +1604,7 @@ mod tests {
         let root = RootFile {
             path: "main.cambra".to_owned(),
             module: None,
-            text: "import lib\n1\n".to_owned(),
+            text: "import lib\nx = = 1\n1\n".to_owned(),
         };
         let program = LoadedProgram::load(root, &mut InMemory::default().with("lib", "y = = 2\n"));
         let Err(errors) = compile_program(
@@ -1594,7 +1612,7 @@ mod tests {
             &program,
             Box::new(|| {}) as Box<dyn Consumer>,
         ) else {
-            panic!("an import is refused")
+            panic!("both files have a parse error")
         };
         let diagnostics = diagnostics_from_compile_errors(&errors, program.sources());
         let in_lib: Vec<_> = diagnostics
@@ -1607,7 +1625,7 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|d| d.span.is_some_and(|s| s.file == program.sources().root())),
-            "the root's refusal keeps its span: {diagnostics:#?}"
+            "the root's error keeps its span: {diagnostics:#?}"
         );
     }
 

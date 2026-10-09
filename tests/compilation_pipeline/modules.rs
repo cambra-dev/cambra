@@ -1,0 +1,330 @@
+//! Programs of several modules: an imported module's public members reached
+//! through its import name, and labels that belong to a module
+//! (`docs/chl-spec.md`, "9. Modules [Decided]").
+
+use std::panic::{self, AssertUnwindSafe};
+use std::time::Duration;
+
+use cambra::ccl::load::{InMemory, LoadedProgram, RootFile};
+use cambra::interpreter::Value;
+use indoc::indoc;
+use rstest_log::rstest;
+
+use crate::helpers::*;
+use crate::panic_message::panic_message;
+
+/// The program rooted at `root`, with `modules` as its other modules' files, by
+/// module path.
+fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
+    let mut files = modules
+        .iter()
+        .fold(InMemory::default(), |files, (path, text)| {
+            files.with(path, *text)
+        });
+    let root = RootFile {
+        path: "main.cambra".to_owned(),
+        module: None,
+        text: root.to_owned(),
+    };
+    LoadedProgram::load(root, &mut files)
+}
+
+/// The rendered errors of a program that does not compile.
+fn compile_errors(program: &LoadedProgram) -> String {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| run_program(program)));
+    let Err(payload) = result else {
+        panic!("expected the program not to compile");
+    };
+    panic_message(&*payload)
+}
+
+fn assert_refused(program: &LoadedProgram, needle: &str) {
+    let errors = compile_errors(program);
+    assert!(errors.contains(needle), "expected {needle:?} in:\n{errors}");
+}
+
+const CATALOG: &str = indoc! {"
+    pub limit = 10
+    pub def double(x):
+        x * 2
+    pub def id(x):
+        x
+    hidden = 3
+    pub def item(p):
+        (price=p, cost=1)
+    pub def cost_of(r):
+        r.cost
+"};
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_qualified_reference_reaches_a_public_member() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import catalog
+                catalog::double(catalog::limit) + 1
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(21),
+    );
+}
+
+/// A generic member keeps its polymorphism through a qualified reference
+/// (`docs/chl-spec.md`, "9.6 Qualified references").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_qualified_generic_member_keeps_its_polymorphism() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import catalog
+                catalog::id(3) if catalog::id(True) else 0
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(3),
+    );
+}
+
+/// `import a::b as c` binds `c`, and a module reaches the modules it imports.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_import_binds_its_alias_and_a_module_imports_another() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import shop::pricing as p
+                import base
+                p::plus(base::n)
+            "},
+            &[
+                ("base", "pub n = 5\n"),
+                (
+                    "shop::pricing",
+                    indoc! {"
+                        import base
+                        pub def plus(x):
+                            x + base::n
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(10),
+    );
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_private_member_is_refused_with_its_declaration() {
+    let errors = compile_errors(&program(
+        "import catalog\ncatalog::hidden\n",
+        &[("catalog", CATALOG)],
+    ));
+    assert!(
+        errors.contains("`hidden` is private to module `catalog`"),
+        "{errors}"
+    );
+    assert!(errors.contains("declared here without `pub`"), "{errors}");
+    assert!(errors.contains("catalog.cambra"), "{errors}");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_missing_member_is_refused() {
+    assert_refused(
+        &program(
+            "import catalog\ncatalog::missing\n",
+            &[("catalog", CATALOG)],
+        ),
+        "module `catalog` has no member `missing`",
+    );
+}
+
+/// A label written in a module is that module's: the library's `price` is
+/// `catalog::price` to the root, and the root's own `price` is another label.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_label_belongs_to_the_module_that_writes_it() {
+    let root = |body: &str| format!("import catalog\n{body}\n");
+    check_program_scalar(
+        &program(
+            &root("catalog::item(5).catalog::price"),
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(5),
+    );
+    check_program_scalar(
+        &program(
+            &root("catalog::cost_of((catalog::cost=3))"),
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(3),
+    );
+    assert_refused(
+        &program(&root("catalog::item(5).price"), &[("catalog", CATALOG)]),
+        "No field .price for Apply: {catalog::cost: Int@1, catalog::price: Int@5}",
+    );
+    assert_refused(
+        &program(&root("catalog::cost_of((cost=3))"), &[("catalog", CATALOG)]),
+        "No field .catalog::cost for Apply: {cost: Int@3}",
+    );
+}
+
+/// `this::` spells the current module's own label.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn this_qualifies_the_current_modules_label() {
+    check_program_scalar(&program("(this::a=1).a\n", &[]), Value::Int(1));
+}
+
+/// `Option`'s tags are one tag in every module until `Option` is a nominal
+/// variant, so a library's lookup result matches the root's `` `some ``.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn options_tags_are_every_modules() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import prices
+                match prices::find(1):
+                    case `some(v):
+                        v
+                    case `none:
+                        0
+            "},
+            &[(
+                "prices",
+                indoc! {"
+                    table = map([(1, 10), (2, 20)])
+                    pub def find(k):
+                        table[k]?
+                "},
+            )],
+        ),
+        Value::Int(10),
+    );
+}
+
+/// Importing a module that performs IO is an error at the `import`, pointing at
+/// the IO (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn importing_a_module_that_performs_io_is_refused() {
+    let errors = compile_errors(&program(
+        "import audit\n1\n",
+        &[("audit", "out = test_sink()\nout << 1\n")],
+    ));
+    assert!(
+        errors.contains("module `audit` performs IO, so importing it is an error"),
+        "{errors}"
+    );
+    assert!(errors.contains("the IO it performs"), "{errors}");
+}
+
+#[rstest]
+#[case::module_as_a_value("import catalog\ncatalog\n", "`catalog` names a module")]
+#[case::import_name_rebound(
+    "import catalog\ncatalog = 1\ncatalog\n",
+    "`catalog` is an import name, so no binder in its module takes it"
+)]
+#[case::import_name_as_a_parameter(
+    "import catalog\ndef f(catalog):\n    1\nf(2)\n",
+    "`catalog` is an import name"
+)]
+#[case::type_member(
+    "import catalog\nx: catalog::Item = 1\nx\n",
+    "the type member `catalog::Item`"
+)]
+#[case::unknown_qualifier("(nope::a=1).a\n", "`nope` is not an import name of this module")]
+#[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]
+#[case::member_of_a_run("shop::eu::stock\n", "names a member of a run")]
+#[case::second_import_of_a_name(
+    "import catalog\nimport other as catalog\n1\n",
+    "`catalog` is already an import name"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_module_name_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(root, &[("catalog", CATALOG), ("other", "pub x = 1\n")]),
+        needle,
+    );
+}
+
+#[rstest]
+#[case::expression_statement("pub x = 1\nx + 1\n", "an imported module has none")]
+#[case::mutable_state(
+    "stock := 1\n",
+    "mutable state in an imported module is not supported yet"
+)]
+#[case::top_level_loop("for x in [1]:\n    pass\n", "an imported module holds value bindings")]
+#[case::public_name_bound_twice(
+    "pub x = 1\nx = 2\n",
+    "`x` is public, so it is bound exactly once at its module's top level"
+)]
+#[timeout(Duration::from_secs(10))]
+fn an_unsupported_library_statement_is_refused(#[case] library: &str, #[case] needle: &str) {
+    assert_refused(&program("import lib\n1\n", &[("lib", library)]), needle);
+}
+
+/// A reference into a module with errors of its own reports nothing more: the
+/// module's errors account for it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_reference_into_a_module_with_errors_adds_no_error() {
+    let errors = compile_errors(&program(
+        "import lib\nlib::missing\n",
+        &[("lib", "pub x = = 1\n")],
+    ));
+    assert!(!errors.contains("has no member"), "{errors}");
+}
+
+/// A module two others import is evaluated once: its bindings stand once in the
+/// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
+/// asserts no IO").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_module_is_linked_once() {
+    use cambra::ccl::context::{Phase, compile_to};
+    use cambra::ccl::symbolic::symbolic;
+    let program = program(
+        indoc! {"
+            import left
+            import right
+            left::n + right::n
+        "},
+        &[
+            ("base", "pub shared = 7\n"),
+            ("left", "import base\npub n = base::shared + 1\n"),
+            ("right", "import base\npub n = base::shared + 2\n"),
+        ],
+    );
+    let tree = symbolic(&compile_to(&program, Phase::Lower).expect("compiles"));
+    assert_eq!(tree.matches("let shared =").count(), 1, "{tree}");
+    let order: Vec<usize> = ["let shared =", "let n = shared + 1", "let n = shared + 2"]
+        .iter()
+        .map(|binding| {
+            tree.find(binding)
+                .unwrap_or_else(|| panic!("{binding} in {tree}"))
+        })
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "link order: {tree}");
+    check_program_scalar(&program, Value::Int(17));
+}
+
+/// The inspector's payload carries one file, so a program of several modules
+/// gets the degraded payload, saying why.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn the_inspector_refuses_a_program_of_several_modules() {
+    let payload = cambra::inspector_server::snapshot_body_pretty(&program(
+        "import base\nbase::n\n",
+        &[("base", "pub n = 1\n")],
+    ));
+    assert!(payload.contains(r#""payloadKind": "failed""#), "{payload}");
+    assert!(
+        payload.contains("a program of several modules is not supported yet"),
+        "{payload}"
+    );
+}

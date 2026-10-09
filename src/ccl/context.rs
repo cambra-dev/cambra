@@ -22,7 +22,7 @@ use crate::{
             typecheck,
         },
         inline, lambda_elim,
-        lower::{LoweredRoute, LoweringContext, LoweringError, lower_stmts},
+        lower::{LoweredRoute, LoweringContext, LoweringError, modules::lower_program},
         mut_elim, mut_read,
         panes::gate_leaks,
         planning,
@@ -214,6 +214,12 @@ impl CompileError {
                 );
             }
             CompileError::Load(e) => ("loading error", e.span()),
+            CompileError::Lower(e) if !e.notes().is_empty() => {
+                let labels: Vec<(Span, String)> = std::iter::once((e.span(), e.to_string()))
+                    .chain(e.notes().iter().cloned())
+                    .collect();
+                return labels_rendering("lowering error", &e.to_string(), &labels, color);
+            }
             CompileError::Lower(e) => ("lowering error", e.span()),
             CompileError::Infer { span, .. } => ("type inference error", *span),
             CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),
@@ -1943,9 +1949,7 @@ fn run_frontend(
     let table_session = record.then(TableSession::install);
 
     // Loading's errors come first: every file's parse errors, then modules with
-    // no file and cycles. Only the root is lowered until imports exist
-    // (`docs/modules.md`, "Implementation stack"), and lowering refuses every
-    // `import` and `run`, so a program of several modules fails below.
+    // no file and cycles. Lowering then reports every module's errors together.
     let sources = program.sources();
     let root = sources.root();
     let code = sources.text(root);
@@ -1972,7 +1976,7 @@ fn run_frontend(
     // `LoweringLog`, folded once at the handoff below into the always-on lowering
     // projection. It must fully drain before the first phase (`Infer`) session opens.
     let lowering_session = LoweringSession::install();
-    let lower_result = lower_stmts(module, ctx.lowering_ctx());
+    let lower_result = lower_program(program, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
