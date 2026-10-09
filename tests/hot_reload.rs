@@ -125,9 +125,19 @@
 //! binding instead, which is the placement where keeping that binding is what
 //! has to hand the store on.
 
+//! # Branches
+//!
+//! `branching` covers several versions running side by side: branch-and-reload,
+//! each branch's reload against its own version, delete and its tombstones, the
+//! control port's list, info and diff verbs, and where a new producer starts
+//! while another branch lags (`src/ccl/design/program-evolution.md`, "The branch
+//! table").
+
 // A test binary's crate root resolves child modules relative to `tests/`, not to
 // a directory named after this file, so each `mod` names its path. `common` is
 // the gallery's HTTP and scheduler glue, compiled into this binary too.
+#[path = "hot_reload/branching.rs"]
+mod branching;
 #[path = "hot_reload/cases.rs"]
 mod cases;
 #[path = "hot_reload/fanout_lag.rs"]

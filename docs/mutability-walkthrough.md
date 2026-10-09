@@ -839,7 +839,7 @@ finished. The item cursor advances on the **commit-ack**, delivered as a release
 
 A release from the body alone would be wrong, and measurably so: a body releases a row the
 moment it has *consumed* it, long before the attempt commits, which would advance the driver
-past an item still in flight. So `TransactDriver` sits behind a `FanOut` with two branches —
+past an item still in flight. So `TransactDriver` sits behind a `FanOut` with two slots —
 the body and the writer — and advances on their **intersection**: consumed *and* finished.
 
 The same cycle as before, with one extra edge — again with arrows as tiles flowing:
@@ -857,7 +857,7 @@ decision, and once directly. The second edge carries nothing the writer needs �
 the writer has something to **release**, and that release is the ack. That is why the writer
 holds an input it barely reads.
 
-(One edge is left out to keep the picture readable: the writer also takes a store-fan branch
+(One edge is left out to keep the picture readable: the writer also takes a store-fan slot
 of its own, to read the frontier its proposal is built against.)
 
 **Validate-then-allocate is what makes the concurrency safe.** A stale proposal never

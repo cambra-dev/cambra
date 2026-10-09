@@ -1,6 +1,6 @@
 //! Per-producer release bookkeeping for a data source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::interpreter::tiling::Predicate;
 
@@ -76,21 +76,43 @@ impl ProducerReleases {
             })
     }
 
-    /// Record the agreement as the starting point for producers registering from
-    /// now on.
+    /// Record where `predecessor`'s producers stopped as the starting point for
+    /// producers registering from now on.
     ///
-    /// Called when a running program is replaced
-    /// ([`LiveProgram::reload`](crate::live_program::LiveProgram::reload)). The
-    /// operators the replacement rebuilds register as new producers, and a source
-    /// hands a newly-registered one everything it has retained, so without this
-    /// the replacement recomputes the program's history instead of continuing it
-    /// and re-emits an output for every input the replaced version answered.
+    /// Called when a branch's version is replaced, or a branch is created from
+    /// its parent ([`LiveProgram`](crate::live_program::LiveProgram)), with the
+    /// producers the version being replaced holds. The operators the replacement
+    /// rebuilds register as new producers, and a source hands a newly-registered
+    /// one everything it has retained, so without this the replacement
+    /// recomputes the program's history instead of continuing it and re-emits
+    /// an output for every input the replaced version answered.
     ///
-    /// The agreement is the safe answer: an index some producer has not finished
-    /// with is not skipped, so an element that arrived but went unhandled is still
-    /// delivered to whoever takes over.
-    pub(crate) fn carry_to_new_producers(&mut self) {
-        self.on_registration = self.agreed();
+    /// The starting point is the intersection of the predecessor's producers'
+    /// releases, not the agreement over every producer. Another branch's
+    /// producer can lag the predecessor's, and a replacement starting at that
+    /// lag would be offered elements the state it carries already summarizes
+    /// (`src/ccl/design/program-evolution.md`, "Routes across branches"). The
+    /// intersection rather than the newest position, so an index one of the
+    /// predecessor's producers has not finished with is not skipped.
+    ///
+    /// A predecessor with no producer registered here has stopped nowhere on
+    /// this source, so the agreement stands in. It is what a new producer was
+    /// offered before any branch existed, and it is the lowest start a
+    /// registration can have without re-reading what every producer released.
+    pub(crate) fn carry_to_new_producers(&mut self, predecessor: &HashSet<String>) {
+        let mut theirs = self
+            .per_producer
+            .iter()
+            .filter(|(name, _)| predecessor.contains(*name))
+            .map(|(_, released)| released)
+            .peekable();
+        self.on_registration = if theirs.peek().is_none() {
+            self.agreed()
+        } else {
+            theirs.fold(Predicate::True, |agreed, released| {
+                agreed.intersect(released)
+            })
+        };
     }
 
     /// What a producer registering now is recorded as having already released.
@@ -133,7 +155,7 @@ mod tests {
         releases.record("a", &Predicate::at_or_below(Value::UInt(2)));
         assert_eq!(releases.on_registration(), &Predicate::False);
 
-        releases.carry_to_new_producers();
+        releases.carry_to_new_producers(&HashSet::from(["a".to_string()]));
         assert_eq!(
             releases.on_registration(),
             &Predicate::at_or_below(Value::UInt(2))
@@ -144,5 +166,37 @@ mod tests {
         // the agreement back to nothing.
         releases.record("b", &Predicate::False);
         assert_eq!(releases.agreed(), Predicate::at_or_below(Value::UInt(2)));
+    }
+
+    /// With a second branch's producer lagging, a producer registering for the
+    /// predecessor starts where the predecessor's own producers stopped, not at
+    /// the agreement the lagging one holds down. The agreement still governs
+    /// what the source may drop.
+    #[test]
+    fn a_new_producer_starts_where_its_predecessor_stopped_not_where_another_lags() {
+        let mut releases = ProducerReleases::default();
+        releases.record("mine", &Predicate::at_or_below(Value::UInt(5)));
+        releases.record("lagging", &Predicate::at_or_below(Value::UInt(1)));
+
+        releases.carry_to_new_producers(&HashSet::from(["mine".to_string()]));
+        assert_eq!(
+            releases.on_registration(),
+            &Predicate::at_or_below(Value::UInt(5))
+        );
+        releases.record("replacement", &Predicate::False);
+        assert_eq!(releases.agreed(), Predicate::at_or_below(Value::UInt(1)));
+    }
+
+    /// A predecessor that registered nothing with the source starts its new
+    /// producers at the agreement.
+    #[test]
+    fn a_predecessor_that_never_read_the_source_starts_at_the_agreement() {
+        let mut releases = ProducerReleases::default();
+        releases.record("other", &Predicate::at_or_below(Value::UInt(3)));
+        releases.carry_to_new_producers(&HashSet::new());
+        assert_eq!(
+            releases.on_registration(),
+            &Predicate::at_or_below(Value::UInt(3))
+        );
     }
 }

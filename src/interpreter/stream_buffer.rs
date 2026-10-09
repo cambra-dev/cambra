@@ -192,11 +192,15 @@ impl UIntStreamBuffer {
         ColumnValue::from_uints(indices)
     }
 
-    /// Record the agreement as the starting point for producers registering from
-    /// now on — see
+    /// Record where producers registering from now on start: the intersection
+    /// of the releases of `predecessor`'s producers on this source, or the
+    /// agreement where `predecessor` has no producer on it. See
     /// [`ProducerReleases::carry_to_new_producers`](crate::interpreter::producer_releases::ProducerReleases::carry_to_new_producers).
-    pub(crate) fn carry_release_to_new_producers(&mut self) {
-        self.releases.carry_to_new_producers();
+    pub(crate) fn carry_release_to_new_producers(
+        &mut self,
+        predecessor: &std::collections::HashSet<String>,
+    ) {
+        self.releases.carry_to_new_producers(predecessor);
     }
 
     /// Forget `producer`'s release record, because that producer is gone — see
@@ -449,7 +453,7 @@ mod tests {
         buf.release("p", Predicate::False);
         buf.release("p", covering(0, 2));
 
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
         buf.release("late", Predicate::False);
         assert_eq!(
             buf.get_elements("late"),
@@ -471,7 +475,7 @@ mod tests {
     fn carrying_the_release_state_leaves_registered_producers_alone() {
         let mut buf = buffer_with(3);
         buf.release("early", Predicate::False);
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
         assert_eq!(
             buf.get_elements("early"),
             ColumnValue::from_uints(vec![0, 1, 2]),
@@ -486,7 +490,7 @@ mod tests {
         let mut buf = buffer_with(3);
         buf.release("early", Predicate::False);
         buf.release("early", covering(0, 2));
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
         buf.release("late", Predicate::False);
 
         assert_eq!(
@@ -507,7 +511,7 @@ mod tests {
         let mut buf = buffer_with(3);
         buf.release("p1", Predicate::False);
         buf.release("p1", covering(0, 2));
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
 
         // The reload drops `p1`'s operator, so its producer hands the record back.
         buf.releases.retire("p1");
@@ -520,7 +524,7 @@ mod tests {
             "`p2` is the only producer left, so its release frees the prefix",
         );
 
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
         buf.releases.retire("p2");
         buf.release("p3", Predicate::False);
         assert_eq!(
@@ -544,7 +548,7 @@ mod tests {
         // `p` finished index 0; 1 and 2 have arrived and nobody has handled them.
         buf.release("p", covering(0, 0));
 
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
         buf.release("late", Predicate::False);
         assert_eq!(
             buf.get_elements("late"),
@@ -561,7 +565,7 @@ mod tests {
         buf.release("p", Predicate::False);
         buf.release("p", covering(2, 4));
 
-        buf.releases.carry_to_new_producers();
+        buf.releases.carry_to_new_producers(&Default::default());
         buf.release("late", Predicate::False);
         assert_eq!(
             buf.get_elements("late"),
