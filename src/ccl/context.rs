@@ -2961,6 +2961,38 @@ Error: lowering error
         assert_eq!(unrecorded, expected, "without recording");
     }
 
+    /// Without recording, an error inference raises at a node it
+    /// minted itself, outside the final tree, traces to no
+    /// span. `compile_program` resolves it through the table, to the
+    /// element `x`; [`compile_to`] has no table, the node is in
+    /// neither projection, and no node encloses it in the
+    /// tree. `Blame::span` therefore panics in a debug build and
+    /// answers the whole root file in a release build.
+    ///
+    /// The failing node is minted by inference, not by the
+    /// comprehension phase, and the compiler before that phase
+    /// existed fails the same way.
+    ///
+    /// TODO: give inference's mints a projection that is always on,
+    /// as the comprehension phase's have (`design/provenance.md`,
+    /// "The derivation log"), and pin the element's span here
+    /// instead.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "traces to no source span"))]
+    fn an_inference_minted_blame_node_has_no_span_without_recording() {
+        let code = "xs = [1, 2]\n[x for x in xs if x > \"a\"]\n";
+        let sources = SourceMap::single("<test>", code);
+        let errs = GlobalContext::default()
+            .sources_and_sinks()
+            .compile_to(&sources, Phase::Planning)
+            .expect_err("expected a compile error");
+        let span = errs
+            .iter()
+            .find_map(CompileError::span)
+            .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"));
+        assert_eq!(span, Span::new(sources.root(), 0, code.len()));
+    }
+
     /// Every rejection a pass after lowering raises points at the source of what
     /// it rejects. Each case is one phase's check, and one of its errors' spans
     /// covers exactly the `nth` occurrence of `expected` in `code`.
