@@ -86,6 +86,9 @@ pub enum CompileError {
         error: InferError,
         /// Where it was raised.
         span: Span,
+        /// The other positions the error involves, each with its label's text
+        /// (`src/ccl/design/diagnostics.md`, "Secondary labels").
+        related: Vec<(Span, &'static str)>,
     },
     /// Defer/Feed/Define channelization rejected the program (e.g. a defer
     /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
@@ -200,7 +203,11 @@ impl CompileError {
             CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),
             CompileError::Unsupported { span, .. } => ("unsupported program", *span),
         };
-        span_rendering(title, span, &self.message(), sources, color)
+        let related = match self {
+            CompileError::Infer { related, .. } => related.as_slice(),
+            _ => &[],
+        };
+        span_rendering(title, span, &self.message(), related, sources, color)
     }
 }
 
@@ -212,7 +219,8 @@ struct Rendering {
     detail: String,
 }
 
-/// A report titled `title` that labels `span` with `message`.
+/// A report titled `title` that labels `span` with `message`, and each of `related`
+/// with its text.
 ///
 /// A label holds one line: ariadne draws a newline in a label's message as a
 /// break in the report's frame. So the label carries the first line and the rest
@@ -223,6 +231,7 @@ fn span_rendering(
     title: &str,
     span: Span,
     message: &str,
+    related: &[(Span, &'static str)],
     sources: &SourceMap,
     color: bool,
 ) -> Rendering {
@@ -245,6 +254,11 @@ fn span_rendering(
         report: report
             .with_message(title)
             .with_label(Label::new(span).with_message(first).with_color(Color::Red))
+            .with_labels(
+                related
+                    .iter()
+                    .map(|(at, text)| Label::new(*at).with_message(*text).with_color(Color::Blue)),
+            )
             .finish(),
         detail,
     }
@@ -317,9 +331,9 @@ impl<'a> Blame<'a> {
         }
     }
 
-    /// The span `node` traces to. `tree`, when given, is a tree containing
+    /// The span `node` traces to, if any. `tree`, when given, is a tree containing
     /// `node`, whose enclosing nodes the lookup falls back to.
-    fn span(&self, node: NodeId, tree: Option<&Expr>) -> Span {
+    fn traced(&self, node: NodeId, tree: Option<&Expr>) -> Option<Span> {
         let own = |id: &NodeId| {
             self.projection
                 .get(id)
@@ -331,29 +345,56 @@ impl<'a> Blame<'a> {
                 tree.and_then(|tree| enclosing(tree, node))
                     .and_then(|ancestors| ancestors.iter().rev().find_map(own))
             })
-            .unwrap_or_else(|| {
-                if cfg!(debug_assertions) {
-                    panic!(
-                        "{node:?} traces to no source span: it is not in the lowering \
+    }
+
+    /// The span `node` traces to. `tree`, when given, is a tree containing
+    /// `node`, whose enclosing nodes the lookup falls back to.
+    fn span(&self, node: NodeId, tree: Option<&Expr>) -> Span {
+        self.traced(node, tree).unwrap_or_else(|| {
+            if cfg!(debug_assertions) {
+                panic!(
+                    "{node:?} traces to no source span: it is not in the lowering \
                          projection, no recorded provenance derives it from a node that is, \
                          and {}",
-                        if tree.is_some() {
-                            "no node enclosing it in the tree is either"
-                        } else {
-                            "no tree was given to search for an enclosing node"
-                        }
-                    );
-                }
-                self.program
-            })
+                    if tree.is_some() {
+                        "no node enclosing it in the tree is either"
+                    } else {
+                        "no tree was given to search for an enclosing node"
+                    }
+                );
+            }
+            self.program
+        })
     }
 
     fn infer(&self, errors: Vec<LocatedInferError>, tree: &Expr) -> Vec<CompileError> {
         errors
             .into_iter()
-            .map(|Located { error, node_id }| CompileError::Infer {
-                error,
-                span: self.span(node_id, Some(tree)),
+            .map(|located| {
+                let span = self.span(located.node_id, Some(tree));
+                // A related position is a secondary label only where it is not part of
+                // what the primary one underlines.
+                let within = |inner: Span| {
+                    inner.file == span.file && span.start <= inner.start && inner.end <= span.end
+                };
+                let mut related: Vec<(Span, &'static str)> = Vec::new();
+                for r in located.related.iter() {
+                    let at = match r.origin {
+                        crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
+                        crate::ccl::infer_var::Origin::Written(at) => Some(at),
+                    };
+                    if let Some(at) = at
+                        && !within(at)
+                        && !related.iter().any(|(seen, _)| *seen == at)
+                    {
+                        related.push((at, r.role.label()));
+                    }
+                }
+                CompileError::Infer {
+                    error: located.error,
+                    span,
+                    related,
+                }
             })
             .collect()
     }
@@ -2726,7 +2767,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2779,7 +2820,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2821,7 +2862,7 @@ Error: lowering error
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));

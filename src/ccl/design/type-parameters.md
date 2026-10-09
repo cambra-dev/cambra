@@ -1,7 +1,7 @@
 # Type parameters
 
-> **Status: [Sketched].** A proposed implementation of
-> [chl-spec.md, "6.10 Polymorphic types"](../../../docs/chl-spec.md#610-polymorphic-types).
+How the compiler implements
+[chl-spec.md, "6.10 Polymorphic types"](../../../docs/chl-spec.md#610-polymorphic-types).
 
 A written polymorphic type is a `Type`: `Type::Poly` binds type parameters, their kinds, and a
 `requires` clause over a body type. A `def` with type parameters is a binding annotated with one.
@@ -283,7 +283,8 @@ freshens the body, the bounds and the `requires` clause through one copy (`Insta
    the substituted associated type.
 
 A failure in 2 or 3 is blamed on the use, with a secondary label at the bound or the
-requirement as written, the error shape
+requirement as written
+([diagnostics.md, "Secondary labels"](diagnostics.md#secondary-labels)), the error shape
 [chl-spec.md, "A use that checks compiles"](../../../docs/chl-spec.md#a-use-that-checks-compiles)
 states.
 

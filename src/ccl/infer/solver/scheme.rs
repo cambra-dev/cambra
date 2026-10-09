@@ -56,8 +56,9 @@ pub struct Instance {
     /// The body, freshened.
     pub ty: Type,
     /// Each type parameter's instantiation with its bound, freshened through the
-    /// same copy: the use records `instantiation <: bound`.
-    pub bounds: Vec<(Type, Type)>,
+    /// same copy, and where the bound was written: the use records
+    /// `instantiation <: bound`.
+    pub bounds: Vec<(Type, Type, Option<chl_parser::ast::Span>)>,
     /// The scheme's `requires` clause, freshened through the same copy: the use
     /// mints an obligation for each.
     pub requires: Vec<TraitRequirement>,
@@ -138,7 +139,7 @@ impl PolyScheme {
                 done.insert(param.id);
                 if let Some(bound) = &param.bound {
                     let bound = freshen_above(self.level, bound, at, &mut cache);
-                    bounds.push((instantiation, bound));
+                    bounds.push((instantiation, bound, param.bound_at));
                 }
             }
         }
@@ -567,6 +568,7 @@ pub fn freshen_above(
                         param.spelling.clone(),
                         target.level_of(param.level()),
                         bound,
+                        param.bound_at,
                     ))
                 }
             };
@@ -653,6 +655,7 @@ pub fn freshen_above(
             let new_lows: Vec<_> = lows
                 .iter()
                 .map(|b| Bound {
+                    origin: b.origin,
                     self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
@@ -661,6 +664,7 @@ pub fn freshen_above(
             let new_ups: Vec<_> = ups
                 .iter()
                 .map(|b| Bound {
+                    origin: b.origin,
                     self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
                     ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),

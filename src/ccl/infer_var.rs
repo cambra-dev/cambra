@@ -90,6 +90,17 @@ pub fn reset_infer_var_counter() {
 /// through for a future let-poly extension.
 pub type Level = u32;
 
+/// Where a bound, or a demand, came from: the source position a diagnostic's
+/// secondary label points at (`src/ccl/design/diagnostics.md`, "Secondary labels").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The expression whose typing rule recorded it.
+    Node(crate::ccl::provenance::NodeId),
+    /// A bound or a requirement written in a polymorphic type, which is not an
+    /// expression and has no node.
+    Written(chl_parser::ast::Span),
+}
+
 /// A single subtyping bound on an [`InferVar`], stored as the constraint's
 /// **native two-sided form** — each side keeps its own context morphism, and
 /// neither is inverted at record time.
@@ -112,6 +123,11 @@ pub type Level = u32;
 /// round-trip losslessly.
 #[derive(Debug, Clone)]
 pub struct Bound {
+    /// Where the bounding side came from: for a lower bound, the expression the value
+    /// flowing in came from; for an upper bound, what demanded it
+    /// (`src/ccl/design/diagnostics.md`, "Secondary labels"). `None` for a bound no
+    /// source position accounts for, such as one drawn between two types a pass built.
+    pub origin: Option<Origin>,
     /// Morphism on the **holder's** side of the edge (`Subst::id()` unless
     /// the constraint reached the holder under a suspended morphism — e.g. a
     /// dependent application's discharge riding a transitive closure step).
@@ -141,6 +157,7 @@ impl Bound {
     /// substitution rides the edge.
     pub fn conc(ty: Type) -> Self {
         Bound {
+            origin: None,
             self_subst: subst::Subst::id(),
             ty,
             ty_subst: subst::Subst::id(),
@@ -153,6 +170,7 @@ impl Bound {
     pub fn with_subst(ty: Type, ty_subst: subst::Subst) -> Self {
         let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
         Bound {
+            origin: None,
             self_subst: subst::Subst::id(),
             ty,
             ty_subst,
@@ -163,10 +181,17 @@ impl Bound {
     pub fn edge(self_subst: subst::Subst, ty: Type, ty_subst: subst::Subst) -> Self {
         let (ty, ty_subst) = Self::force_witnesses(&ty, &ty_subst);
         Bound {
+            origin: None,
             self_subst,
             ty,
             ty_subst,
         }
+    }
+
+    /// This bound, recording where its bounding side came from.
+    pub fn with_origin(mut self, origin: Option<Origin>) -> Self {
+        self.origin = origin;
+        self
     }
 
     /// The morphism that renders this entry's content in its holder's

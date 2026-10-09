@@ -200,11 +200,12 @@ where
                 .collect::<Vec<_>>()
         };
 
+        // The span is taken outside `ignore_then`, so it covers the opening `[`.
         let list_or_listcomp = just(Token::LBracket)
             .ignore_then(
                 // Empty list `[]`.
                 just(Token::RBracket)
-                    .map_with(|_, e| Spanned::new(e.span(), Expr::List(vec![])))
+                    .to(Expr::List(vec![]))
                     .or(bracketed_expr
                         .clone()
                         .then(choice((
@@ -220,25 +221,22 @@ where
                                 .or_not(),
                         )
                         .then_ignore(just(Token::RBracket))
-                        .map_with(|((first, comp), rest), e| {
-                            let span = e.span();
+                        .map(|((first, comp), rest)| {
                             if let Some(clauses) = comp {
-                                Spanned::new(
-                                    span,
-                                    Expr::ListComp(Comprehension {
-                                        element: Box::new(first),
-                                        clauses,
-                                    }),
-                                )
+                                Expr::ListComp(Comprehension {
+                                    element: Box::new(first),
+                                    clauses,
+                                })
                             } else {
                                 let mut elts = vec![first];
                                 if let Some(rest) = rest {
                                     elts.extend(rest);
                                 }
-                                Spanned::new(span, Expr::List(elts))
+                                Expr::List(elts)
                             }
                         })),
             )
+            .map_with(|node, e| Spanned::new(e.span(), node))
             .boxed();
 
         // Record value `(name=value, …)`: the parentheses are the product

@@ -799,9 +799,10 @@ and a specialization's errors can be either. An error a specialization raises af
 succeeds is held on the frame (`SpecializeFrame::held`) until the definition is checked alone. If
 the check raises it too, at the node the specialization's node copies or as the same defect, it is
 the definition's and is reported once, there. Otherwise it is the use's and is reported once, at
-the use: `def f(c, a): x = a if c else "s"` is sound alone, and a use at `Int` fails at the join,
-which the signature does not show, so the pin succeeds. A use that shares a specialization through
-the memo holds that specialization's errors too, since its types are the same.
+the use, labelled where the body failed: `def f(c, a): x = a if c else "s"` is sound alone, and a
+use at `Int` fails at the join, which the signature does not show, so the pin succeeds. A use that
+shares a specialization through the memo holds that specialization's errors too, since its types
+are the same.
 
 A use inside another specialization's clone is a copy of a use in the enclosing definition's body,
 and has no source position. Each held error records the specializations whose clones it was raised

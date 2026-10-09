@@ -23,6 +23,7 @@ use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{LetScheme, Typing};
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::Trait;
+use crate::ccl::infer_var::Origin;
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
@@ -105,10 +106,13 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     let instance = binding
                         .scheme
                         .instantiate_with_params(ctx.level, &ctx.telescope);
-                    for (instantiation, bound) in instance.bounds {
-                        ctx.require_sub(&instantiation, &bound, &|| {
-                            format!("the bound of a type parameter of `{name}`")
-                        })?;
+                    for (instantiation, bound, bound_at) in instance.bounds {
+                        let check = |ctx: &mut InferCtx| {
+                            ctx.require_sub(&instantiation, &bound, &|| {
+                                format!("the bound of a type parameter of `{name}`")
+                            })
+                        };
+                        ctx.with_demand_at(bound_at.map(Origin::Written), check)?;
                     }
                     // Each requirement becomes an obligation at this use's types, minted
                     // as an operator's is; the associated type it names receives what the
@@ -117,14 +121,17 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     for r in &instance.requires {
                         let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
                         let named = r.assoc.first();
-                        let settled = ctx.require_trait(
-                            r.trait_,
-                            node_id,
-                            &r.args.iter().collect::<Vec<_>>(),
-                            &[],
-                            named.map(|(n, _)| *n),
-                            &at,
-                        )?;
+                        let require = |ctx: &mut InferCtx| {
+                            ctx.require_trait(
+                                r.trait_,
+                                node_id,
+                                &r.args.iter().collect::<Vec<_>>(),
+                                &[],
+                                named.map(|(n, _)| *n),
+                                &at,
+                            )
+                        };
+                        let settled = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
                         if let (Some(settled), Some((_, named))) = (settled, named) {
                             ctx.require_sub(&settled, named, &at)?;
                         }

@@ -456,6 +456,10 @@ pub struct TraitObligation {
     /// The ID of the operator node that spawned this obligation, to
     /// be used as provenance for any resulting refinement body.
     operator_node_id: provenance::NodeId,
+    /// Where the requirement was stated: the operator that needs it, or the
+    /// requirement of a `requires` clause it was instantiated from at a use. A failure
+    /// to satisfy it labels this position as its demand.
+    required_at: crate::ccl::infer_var::Origin,
 }
 
 /// The state of an obligation's product rule, the candidate that answers a product
@@ -505,6 +509,7 @@ impl TraitObligation {
         assoc: Vec<(Assoc, Type)>,
         operator_node_id: provenance::NodeId,
         input_exprs: Vec<TypedExpr>,
+        required_at: crate::ccl::infer_var::Origin,
     ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
@@ -528,6 +533,7 @@ impl TraitObligation {
                 .collect(),
             input_exprs: RefCell::new(input_exprs),
             operator_node_id,
+            required_at,
         })
     }
 
@@ -567,6 +573,7 @@ impl TraitObligation {
                 .collect(),
             input_exprs: RefCell::new(original.input_exprs.borrow().clone()),
             operator_node_id: original.operator_node_id,
+            required_at: original.required_at,
         })
     }
 
@@ -595,6 +602,12 @@ impl TraitObligation {
         }
         #[cfg(debug_assertions)]
         register_watch(self, pos, ty);
+    }
+
+    /// Where this requirement was stated: the operator that needs it, or the
+    /// `requires` clause it was instantiated from.
+    pub fn required_at(&self) -> crate::ccl::infer_var::Origin {
+        self.required_at
     }
 
     /// The candidates still live, for diagnostics and tests.
@@ -720,12 +733,12 @@ impl TraitObligation {
                 for bound in v.bounds.borrow().lower().iter() {
                     match &bound.ty {
                         Type::Infer(below) => stack.push(Rc::clone(below)),
-                        other => contributions.push(other.clone()),
+                        other => contributions.push((other.clone(), bound.origin)),
                     }
                 }
             }
-            for contribution in contributions {
-                deliver(self, pos as u8, &contribution, cache)?;
+            for (contribution, origin) in contributions {
+                deliver(self, pos as u8, &contribution, origin, cache)?;
             }
         }
         Ok(())
@@ -762,7 +775,7 @@ impl TraitObligation {
         match &param.bound {
             // The operand is this parameter, so a requirement missing further up its bound
             // chain is missing of it.
-            Some(bound) => deliver(self, pos, bound, cache).map_err(|e| match e {
+            Some(bound) => deliver(self, pos, bound, None, cache).map_err(|e| match e {
                 ConstrainError::MissingRequirement {
                     trait_, position, ..
                 } => ConstrainError::MissingRequirement {
@@ -842,6 +855,7 @@ impl TraitObligation {
             trait_: self.trait_,
             args,
             assoc,
+            at: None,
         })
     }
 
@@ -1139,6 +1153,7 @@ impl TraitObligation {
                 Vec::new(),
                 self.operator_node_id,
                 self.input_exprs(),
+                self.required_at,
             );
             // A condition is answered by the same `requires` clauses as the product:
             // `Equatable({T, U}, {V, W})` is stated through its components too.
@@ -2145,16 +2160,16 @@ pub(super) fn link_watches(
     // unchecked.
     let (known, params, below) = {
         let bounds = lower.bounds.borrow();
-        let known: Vec<BaseType> = bounds
+        let known: Vec<(BaseType, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
             .iter()
-            .filter_map(|b| offered_base(&b.ty).cloned())
+            .filter_map(|b| offered_base(&b.ty).map(|base| (base.clone(), b.origin)))
             .collect();
-        let params: Vec<Type> = bounds
+        let params: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
             .iter()
             .filter(|b| matches!(offered(&b.ty), Offered::Param(_)))
-            .map(|b| b.ty.clone())
+            .map(|b| (b.ty.clone(), b.origin))
             .collect();
         let below: Vec<Rc<InferVar>> = bounds
             .lower()
@@ -2167,11 +2182,14 @@ pub(super) fn link_watches(
         (known, params, below)
     };
     for (obligation, pos) in &added {
-        for base in &known {
-            obligation.narrow(*pos, base, cache)?;
+        for (base, origin) in &known {
+            if let Err(e) = obligation.narrow(*pos, base, cache) {
+                cache.note_failure_with(*origin, Some(obligation.required_at()));
+                return Err(e);
+            }
         }
-        for param in &params {
-            deliver(obligation, *pos, param, cache)?;
+        for (param, origin) in &params {
+            deliver(obligation, *pos, param, *origin, cache)?;
         }
     }
     // Transitivity: anything flowing into `lower` flows into `upper` too.
@@ -2203,7 +2221,7 @@ pub(super) fn notify_lower(
         watches.clone()
     };
     for (obligation, pos) in watches {
-        deliver(&obligation, pos, contribution, cache)?;
+        deliver(&obligation, pos, contribution, None, cache)?;
     }
     Ok(())
 }
@@ -2216,15 +2234,22 @@ fn deliver(
     obligation: &Rc<TraitObligation>,
     pos: u8,
     contribution: &Type,
+    value: Option<crate::ccl::infer_var::Origin>,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    match offered(contribution) {
+    let delivered = match offered(contribution) {
         Offered::Base(base) => obligation.narrow(pos, base, cache),
         Offered::Product(product) => obligation.narrow_product(pos, product, cache),
         Offered::NotABase => obligation.reject(pos, contribution),
         Offered::Param(param) => obligation.narrow_param(pos, param, cache),
         Offered::Unknown => Ok(()),
+    };
+    // The obligation is the demand a contribution failed: an edge a deposit drew
+    // further in, failing first, has already recorded its own.
+    if delivered.is_err() {
+        cache.note_failure_with(value, Some(obligation.required_at()));
     }
+    delivered
 }
 
 #[cfg(test)]
@@ -2254,6 +2279,7 @@ mod tests {
             vec![(Assoc::Output, out.clone())],
             node_id,
             operands(),
+            crate::ccl::infer_var::Origin::Node(node_id),
         );
         let mut cache = ConstrainCache::new();
 
@@ -2286,6 +2312,7 @@ mod tests {
             vec![(Assoc::Output, out.clone())],
             node_id,
             operands(),
+            crate::ccl::infer_var::Origin::Node(node_id),
         );
         let mut cache = ConstrainCache::new();
 
@@ -2320,6 +2347,7 @@ mod tests {
                 vec![(Assoc::Output, out.clone())],
                 node_id,
                 operands(),
+                crate::ccl::infer_var::Origin::Node(node_id),
             );
             ob.narrow(0, &BaseType::Int, &mut ConstrainCache::new())
                 .expect("Int adds to Int under either trait");
@@ -2349,7 +2377,13 @@ mod tests {
     #[test]
     fn a_comparison_associates_nothing() {
         let node_id = provenance::NodeId::fresh();
-        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
+        let ob = TraitObligation::new(
+            Trait::Equatable,
+            Vec::new(),
+            node_id,
+            operands(),
+            crate::ccl::infer_var::Origin::Node(node_id),
+        );
         let mut cache = ConstrainCache::new();
 
         ob.try_deposit(&mut cache).expect("nothing to deposit");
@@ -2375,6 +2409,7 @@ mod tests {
             vec![(Assoc::Output, out)],
             node_id,
             operands(),
+            crate::ccl::infer_var::Origin::Node(node_id),
         );
         let mut cache = ConstrainCache::new();
 
@@ -2406,7 +2441,13 @@ mod tests {
     fn the_product_rule_pairs_components_by_field() {
         use crate::ccl::infer::solver::constrain_subtype;
         let node_id = provenance::NodeId::fresh();
-        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
+        let ob = TraitObligation::new(
+            Trait::Equatable,
+            Vec::new(),
+            node_id,
+            operands(),
+            crate::ccl::infer_var::Origin::Node(node_id),
+        );
         let (a, b) = (fresh_var(1), fresh_var(1));
         ob.watch(&a, 0);
         ob.watch(&b, 1);
@@ -2481,7 +2522,13 @@ mod tests {
     #[case::product_then_base(false)]
     fn a_base_and_a_product_exclude_each_other(#[case] base_first: bool) {
         let node_id = provenance::NodeId::fresh();
-        let ob = TraitObligation::new(Trait::Equatable, Vec::new(), node_id, operands());
+        let ob = TraitObligation::new(
+            Trait::Equatable,
+            Vec::new(),
+            node_id,
+            operands(),
+            crate::ccl::infer_var::Origin::Node(node_id),
+        );
         let (a, b) = (fresh_var(1), fresh_var(1));
         ob.watch(&a, 0);
         ob.watch(&b, 1);
