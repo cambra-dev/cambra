@@ -74,6 +74,7 @@
 //!   top-level block.
 //! - [`http`] — `http_serve` recognition and lowering.
 
+use crate::ccl::Label;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -1072,8 +1073,8 @@ fn lower_expr_inner(
                     qualifier.is_empty(),
                     "a qualified label is refused before lowering (`refuse_module_syntax`)"
                 );
-                let field_name = name.as_str().to_string();
-                if out.iter().any(|(k, _)| k == &field_name) {
+                let field_name = Label::new(name.as_str());
+                if out.iter().any(|(k, _)| k == field_name) {
                     return Err(LoweringError::unsupported(
                         *name_span,
                         format!("duplicate key `{field_name}` in record literal"),
@@ -1148,7 +1149,7 @@ fn lower_expr_inner(
                 })?;
                 Expr::proj_index(index)
             } else {
-                Expr::proj_field(attr.as_str())
+                Expr::proj_field(Label::new(attr.as_str()))
             };
             let target_expr = lower_expr(target, ctx)?;
             let proj = ctx.tag_image(key, expr.span);
@@ -1188,7 +1189,7 @@ fn lower_expr_inner(
                     ctx.tag_machinery(Expr::lit(Lit::Unit), expr.span, "lower.variant_ctor_unit")
                 }
             };
-            Ok(Expr::variant_ctor(tag.as_str(), payload))
+            Ok(Expr::variant_ctor(Label::new(tag.as_str()), payload))
         }
         ChlExpr::Lambda { params, body } => {
             refuse_capitalized_lambda_binder(params)?;

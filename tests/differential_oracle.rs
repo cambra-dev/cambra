@@ -12,8 +12,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
-use smol_str::SmolStr;
-
 mod type_gen;
 
 use cambra::ccl::infer::solver::compact::{
@@ -131,10 +129,10 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
                 let in_r = if rng.chance(1, 6) { !in_l } else { in_l };
                 let (l, r) = gen_pair(rng, depth - 1);
                 if in_l {
-                    ls.push((key.to_string(), l));
+                    ls.push((key.into(), l));
                 }
                 if in_r {
-                    rs.push((key.to_string(), r));
+                    rs.push((key.into(), r));
                 }
             }
             (Type::Record(ls), Type::Record(rs))
@@ -147,10 +145,10 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
                 let in_r = if rng.chance(1, 6) { !in_l } else { in_l };
                 let (l, r) = gen_pair(rng, depth - 1);
                 if in_l {
-                    ls.push((FieldKey::Name(SmolStr::from(key)), l));
+                    ls.push((FieldKey::Name(key.into()), l));
                 }
                 if in_r {
-                    rs.push((FieldKey::Name(SmolStr::from(key)), r));
+                    rs.push((FieldKey::Name(key.into()), r));
                 }
             }
             (
@@ -198,7 +196,7 @@ fn name_identity(n: &Name) -> String {
     match n {
         Name::Unique { base, uid } => format!("u{uid:?}:{base}"),
         Name::Synthetic { kind, uid } => format!("s{uid:?}:{}", kind.stem()),
-        _ => n.field_key(),
+        _ => n.field_key().to_string(),
     }
 }
 
@@ -295,7 +293,7 @@ fn pred_json(e: &TypedExpr, scope: &mut Vec<Name>) -> Option<String> {
 /// wire form for keys, so `key_json` stays the single encoder.
 fn proj_field_key(k: &ProjKey) -> FieldKey {
     match k {
-        ProjKey::Field(f) => FieldKey::Name(SmolStr::from(f.as_str())),
+        ProjKey::Field(f) => FieldKey::Name(f.clone()),
         ProjKey::Index(i) => FieldKey::Index(*i),
     }
 }

@@ -156,8 +156,6 @@ pub fn fun(d: Type, c: Type) -> Type {
 pub(crate) mod test_helpers {
     use std::rc::Rc;
 
-    use smol_str::SmolStr;
-
     use crate::ccl::{FieldKey, Refinement, Type};
 
     /// The dependent refinement `__elem == <name>` — a predicate referencing an
@@ -187,7 +185,7 @@ pub(crate) mod test_helpers {
                 fields
                     .iter()
                     .map(|(k, t)| match k {
-                        FieldKey::Name(n) => (n.to_string(), t.clone()),
+                        FieldKey::Name(n) => (n.clone(), t.clone()),
                         _ => unreachable!(),
                     })
                     .collect(),
@@ -221,7 +219,7 @@ pub(crate) mod test_helpers {
     pub(crate) fn variant<const N: usize>(tags: [(&str, Type); N]) -> Type {
         Type::variant(
             tags.into_iter()
-                .map(|(k, v)| (FieldKey::Name(SmolStr::from(k)), v))
+                .map(|(k, v)| (FieldKey::Name(k.into()), v))
                 .collect(),
         )
     }

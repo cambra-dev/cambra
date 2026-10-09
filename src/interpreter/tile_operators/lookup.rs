@@ -238,7 +238,7 @@ enum ProducerSource {
 /// `` `some(v) `` — the tag a present key answers with.
 fn some_of(v: Value) -> Value {
     Value::Union {
-        tag: FieldKey::Name(crate::ccl::V_SOME.into()),
+        tag: FieldKey::Name(crate::ccl::V_SOME),
         inner: Box::new(v),
     }
 }
@@ -246,7 +246,7 @@ fn some_of(v: Value) -> Value {
 /// `` `none `` — the tag a decided absence answers with.
 fn none() -> Value {
     Value::Union {
-        tag: FieldKey::Name(crate::ccl::V_NONE.into()),
+        tag: FieldKey::Name(crate::ccl::V_NONE),
         inner: Box::new(Value::Unit),
     }
 }
@@ -617,10 +617,10 @@ mod tests {
     fn option_of_int() -> Extent {
         Extent::Union(TagMap::from_arms(vec![
             (
-                FieldKey::Name(crate::ccl::V_NONE.into()),
+                FieldKey::Name(crate::ccl::V_NONE),
                 Extent::Base(BaseType::Unit),
             ),
-            (FieldKey::Name(crate::ccl::V_SOME.into()), int()),
+            (FieldKey::Name(crate::ccl::V_SOME), int()),
         ]))
     }
 

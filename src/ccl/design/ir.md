@@ -400,8 +400,16 @@ durable forms are:
 |---|---|
 | `Base`, `UIntRange` | Scalar types and dense finite index domains. |
 | `Fun` | A function `𝐴 ⇒ 𝐵` or data collection `𝐴 ⤇ 𝐵`; an optional named binder scopes over the codomain. |
-| `Tuple`, `Record` | Positional and named products. |
+| `Tuple`, `Record` | Positional and named products. A record's field names are `Label`s. |
 | `Variant` | Tagged sum; source tags use `FieldKey::Name`, while anonymous positional sums use `FieldKey::Index`. `Openness` distinguishes a complete tag set from an open requirement. |
+
+A `Label` (`src/ccl/label.rs`) is a record field label or a variant tag: a spelling and the module
+it belongs to ([chl-spec.md, "9.12 Field labels and tags belong to a module"](../../../docs/chl-spec.md#912-field-labels-and-tags-belong-to-a-module)).
+Record types and terms, projections, variant constructors and patterns, and `FieldKey::Name` all
+hold one. The root module's labels have no module path, and they share that namespace with the
+labels the compiler builds for itself and, until `Option` is a nominal variant, with `Option`'s
+`some` and `none`. At run time, where records are keyed by strings, a label is its `Display`
+spelling: `name`, or `module::name` for another module's label.
 | `Refinement` | A base type restricted by a nonempty set of predicates; construction flattens nested refinements. |
 | `DataSource`, `Txn` | An external source's nominal domain and the transaction sequencing domain. |
 | `WitnessRef` | Reference to a dependent-sum witness; eliminated when the sum is consumed or realized. |

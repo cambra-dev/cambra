@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use smol_str::SmolStr;
 
-use crate::ccl::{BaseType, InferVar, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic};
+use crate::ccl::{
+    BaseType, InferVar, Label, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic,
+};
 
 /// The introduction level riding a [`Type::ChanDom`] — deliberately
 /// **identity-transparent**: two channel domains denote the same channel iff
@@ -52,8 +54,8 @@ impl std::hash::Hash for ChanLevel {
 pub enum FieldKey {
     /// Positional field (tuple index).
     Index(usize),
-    /// Named field.
-    Name(SmolStr),
+    /// Named field, or a tag.
+    Name(Label),
 }
 
 impl fmt::Display for FieldKey {
@@ -1130,7 +1132,7 @@ pub enum Type {
     /// An ordered product type with unnamed fields (tuple).
     Tuple(Vec<Type>),
     /// A named product type (record).
-    Record(Vec<(String, Type)>),
+    Record(Vec<(Label, Type)>),
     /// A tagged sum type — each tag has its own payload type.
     ///
     /// Tags are [`FieldKey`]s, the dual of `Record`/`Tuple` keys: `Name`
@@ -1833,9 +1835,9 @@ pub enum TypeKind {
 /// Named here, beside [`Type::option_of`], because the runtime builds the same tag when it
 /// answers a checked lookup (`some_of` in `src/interpreter/tile_operators/lookup.rs`). One
 /// spelling, two builders.
-pub const V_SOME: &str = "some";
+pub const V_SOME: Label = Label::fixed("some");
 /// The `` `none `` tag of an `Option` — a value that is absent. See [`V_SOME`].
-pub const V_NONE: &str = "none";
+pub const V_NONE: Label = Label::fixed("none");
 
 /// The kind part of a `Σ… ⤇ V` rendering — candidates in brackets, every other kind by
 /// name. Brackets rather than braces because braces are the record type's, and candidates
@@ -2546,7 +2548,7 @@ impl Type {
     /// The named product of `fields` — a [`Type::Record`], or
     /// [`BaseType::Unit`] when there are none. See [`Type::tuple`] for why the
     /// empty case collapses.
-    pub fn record(fields: Vec<(String, Self)>) -> Self {
+    pub fn record(fields: Vec<(Label, Self)>) -> Self {
         if fields.is_empty() {
             return Type::Base(BaseType::Unit);
         }
@@ -2582,8 +2584,8 @@ impl Type {
     /// the inferred type structurally instead of differing only by tag order.
     pub fn option_of(payload: Self) -> Self {
         Type::variant(vec![
-            (FieldKey::Name(V_NONE.into()), Type::Base(BaseType::Unit)),
-            (FieldKey::Name(V_SOME.into()), payload),
+            (FieldKey::Name(V_NONE), Type::Base(BaseType::Unit)),
+            (FieldKey::Name(V_SOME), payload),
         ])
     }
 
@@ -2598,8 +2600,7 @@ impl Type {
         let [(none, _), (some, payload)] = arms.as_slice() else {
             return None;
         };
-        (*none == FieldKey::Name(V_NONE.into()) && *some == FieldKey::Name(V_SOME.into()))
-            .then_some(payload)
+        (*none == FieldKey::Name(V_NONE) && *some == FieldKey::Name(V_SOME)).then_some(payload)
     }
 
     /// A **closed** tagged sum: these arms and no others.
@@ -5687,8 +5688,8 @@ mod tests {
 
         // A record payload's braces are the arm's braces.
         let record = Type::Record(vec![
-            ("a".to_string(), Type::Base(BaseType::Int)),
-            ("b".to_string(), Type::Base(BaseType::Int)),
+            ("a".into(), Type::Base(BaseType::Int)),
+            ("b".into(), Type::Base(BaseType::Int)),
         ]);
         assert_eq!(
             Type::variant(vec![(FieldKey::Name("pair".into()), record)]).to_string(),

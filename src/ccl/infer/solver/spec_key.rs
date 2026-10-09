@@ -14,8 +14,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry};
 use std::fmt;
 use std::rc::Rc;
 
-use smol_str::SmolStr;
-
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
@@ -467,12 +465,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Record(fs) => KeyView {
             rec: fs
                 .iter()
-                .map(|(n, t)| {
-                    (
-                        FieldKey::Name(SmolStr::from(n.as_str())),
-                        key_go(t, pol, subst_acc, ctx),
-                    )
-                })
+                .map(|(n, t)| (FieldKey::Name(n.clone()), key_go(t, pol, subst_acc, ctx)))
                 .collect(),
             ..Default::default()
         },
