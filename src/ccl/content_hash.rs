@@ -496,6 +496,7 @@ fn hash_payload<'a>(
         // Fully described by their children and/or name occurrences.
         N::Var(_)
         | N::Defer
+        | N::Abstract
         | N::Error
         | N::Apply { .. }
         | N::ExprStmt { .. }
