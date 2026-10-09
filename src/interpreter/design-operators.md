@@ -1,173 +1,185 @@
 # CCL Operator Specifications
 
-Specifications for each CCL (Cambra Core Language) operator. For the underlying protocol and
-progress algebra formalism, see [docs/operational-semantics/semantics.md](/docs/operational-semantics/semantics.md).
+This reference describes the runtime's tile representation, producer protocol and operator
+conversion. The [operational semantics](../../docs/operational-semantics/semantics.md#1-tilings)
+defines the progress algebra.
 
-Each operator is **stateless** and corresponds to program syntax. Calling `subscribe()` on an
-operator creates a runtime **producer/consumer** pair that manages actual execution state.
-
----
+A `TileOperator` describes a computation. Subscribing connects a consumer to a producer that
+holds execution state. `FanOut` coordinates shared inputs through separate branch producers.
 
 ## Tilings and Tiles
 
-Tilings and Tiles are the data model used by `TileOperator` and `TileProducer`. A `Tiling`
-describes the *shape* of data a producer will emit — analogous to a type. A `Tile` is the
-materialized data itself, shaped according to its `Tiling`.
+An `Extent` describes possible values. A `Tiling` describes how partial results of those values
+are represented. A `Tile` contains a partial result with that shape. An extent alone does not
+distinguish a collection from a store or an aggregate from its final result.
 
 ### Extent
 
-An `Extent` is the type-level view of a value: the set of all values a term can take on. Extents
-are used in `Tiling` to describe domain and codomain shapes, and by producers to track which
-values remain to be emitted or have already been released.
+[`Extent`](types/extent.rs) describes value and domain shapes used by runtime operators.
 
-| Variant | Meaning |
-|---------|---------|
-| `Base(BaseType)` | A primitive type: `Int`, `UInt`, `String`, `Bool`, or `Unit`. |
-| `Function { domain, codomain }` | A function type mapping one extent to another. |
-| `Record(fields)` | A record type with named field extents. |
-| `Union(variants)` | A union type: one of several possible extents. |
-| `UIntRange(IntervalSet<usize>)` | A finite, mutable set of unsigned integer indices. Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and shrunk directly as individual elements or sub-intervals are released by `IterateExtentProducer`. Constructors: `Extent::uint_range(n)` for `[0, n)`, `Extent::uint_range_interval(start, end)` for arbitrary half-open ranges. |
-| `DataSourceDomain(…)` | The domain of a streaming data source; polled externally for new elements. |
-| `Restricted { base, restriction }` | A subset of `base` filtered by a `Restriction` handle; populated at runtime by `Filter` operators. |
+| Variant | Representation |
+| --- | --- |
+| `Base(BaseType)` | A primitive type: `Int`, `UInt`, `String`, `Bool` or `Unit`. |
+| `Function { domain, codomain }` | A mapping between extents. |
+| `Record(fields)` | Field names mapped to their extents. |
+| `Union(variants)` | Tagged alternatives and their extents. |
+| `UIntRange(IntervalSet<usize>)` | A finite set of unsigned indices. `uint_range(n)` creates the half-open range from zero to `n`; `uint_range_interval(start, end)` creates a half-open interval. |
+| `DataSourceDomain(…)` | A streaming source domain whose elements and completion are provided by the source implementation. |
+| `Restricted { base, restriction }` | A base extent with a placeholder restriction handle. The tile path does not implement iteration of this variant. |
 
-At runtime, `Extent`s are responsible for tracking which elements are available and what has been released and forgotten.
+An `IterateExtentProducer` subtracts released indices from its remaining `UIntRange`.
+Source-domain availability and release are delegated to the source implementation.
+Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
+`get_elements` rejects iteration of `Extent::Restricted`.
 
 ### Tiling
 
-Each `TileOperator` declares a `Tiling` that tells consumers what structure to expect:
+[`Tiling`](tiling/tiling_kind.rs) specifies the tiles a `TileOperator` produces.
 
-| Variant | Meaning |
-|---------|---------|
-| `Scalar(Extent)` | A single value, possibly still unknown (represented as an empty `ColumnValue`). |
-| `Record(fields)` | A named collection of sub-tilings, one per field. The tiles are records with fields that are the tiles of the sub-tilings |
-| `DataFunction { domain, codomain }` | A collection `domain ⤇ codomain` — one new dimension over the rows it sits in. `codomain` is a tiling in its own right, so a chain of them nests one node per level and a `Record` may sit between two. Keys accumulate incrementally, and a `domain_predicate` on the tile says which of them are complete. The runtime layout is in the `Tile` table below. |
-| `Aggregation { accumulator }` | An ongoing aggregate. Its accumulator is a tiling: a scalar for a fold that reduces, and the element's own tiling for `Sole`. |
+| Variant | Tile shape |
+| --- | --- |
+| `Scalar(Extent)` | A column of values, empty where no scalar has arrived. |
+| `Record(fields)` | One sub-tiling per field. |
+| `DataFunction { domain, codomain }` | One collection level: keys in the domain extent and values with the codomain tiling. Collections and records can nest. |
+| `Aggregation { kind, accumulator }` | An aggregate kind and its accumulator tiling. A reducing fold has a scalar accumulator; `Sole` retains the element's tiling. |
+| `Store { domain, codomain }` | A step function over a sequencing domain with a per-key state record; see [The store is a changelog, not a function](#the-store-is-a-changelog-not-a-function). |
 
-`Tiling::extent()` converts a `Tiling` to the corresponding `Extent` (the type-level view).
+`extent()` returns the value extent. It removes the aggregation wrapper and maps both
+`DataFunction` and `Store` to `Extent::Function`; that conversion is not an invertible
+encoding of every tiling.
 
-`Tiling::empty_tile()` constructs the starting state for a tile — empty `ColumnValue`s and
-`Predicate::False` domain predicates everywhere.
+`empty_tile()` constructs an empty tile over one enclosing row. A collection starts with an
+empty key run and a `False` completion predicate; its codomain stands over zero rows.
+`empty_at_no_rows()` constructs the zero-row state used to initialize accumulators.
+Records recursively preserve the enclosing row count.
 
 ### Tile
 
-A `Tile` holds the actual data. Its shape mirrors its `Tiling`:
+[`Tile`](tiling/tile.rs) stores partial values in columns. The enclosing row count is one at
+the root and the parent collection's key count inside a codomain.
 
-| Variant | Contents |
-|---------|----------|
-| `Scalar(ColumnValue)` |  The two tiles in this tiling are `⊥` and the specific scalar of the tiling. `⊥` is represented as an empty `ColumnValue` and the scalar is represented as a `ColumnValue` of length 1 |
-| `Record(fields)` | A Record of other `Tiles` |
-| `DataFunction { row_starts, domain, codomain, domain_predicate, deleted }` | A tile is a value of type `T` vectorized over `R` rows: `R` is 1 for the tile as a whole, and inside a collection's `codomain` it is that collection's key count. A collection is the rule that introduces a dimension — `row_starts` has one entry per enclosing row naming where that row's run of `domain` begins, and `codomain` is a tile over those keys. Compressed-Sparse-Row-wise: every row's keys run together in one column, so a chain of collections holds the columns a flat level list would, and unlike a flat list it can say where a `Record` sits between two levels. |
-| `Aggregation { accumulator, terminal }` | Logically, this tiling knows the final number of inputs `N` that will be aggregated and the tiles are of form `(count, accumulator)`.  However, for making this feasible to compute, we instead store a terminal flag indicating `count == N`. |
+| Variant | Stored state |
+| --- | --- |
+| `Scalar(ColumnValue)` | Scalar cells in row order. An empty root column denotes an unknown scalar; a known root scalar has one cell. |
+| `Record { fields, absent }` | A tile per field over the same rows. `absent` records released field cells while sibling fields keep their rows live. |
+| `DataFunction { row_starts, domain, codomain, domain_predicate, deleted }` | Collection keys grouped by enclosing row, their value tiles, completion information and logical deletions. |
+| `Aggregation { kind, accumulator, terminal }` | The aggregate's accumulator tile and per-row completion flags. |
+| `Store { … }` | Per-key changelogs, initial values and progress state, with step-function reads rather than collection lookup. The [commit operator](#the-commit-operator-interpretercommit_operatorrs) defines that contract. |
 
-`Tile::is_terminal()` returns true when a tile carries complete, final data. No larger tiles will ever be returned, although
-equivalent tiles with some data released may.
+For count-augmented aggregate tilings, the runtime's completion flag represents `count == N`
+without storing the final input count. The formal account is
+[Unsplittable Tilings](../../docs/operational-semantics/semantics.md#unsplittable-tilings).
 
-`Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
+A collection's `row_starts` contains one nondecreasing offset per enclosing row into the
+concatenated `domain` column. The next offset, or the column length for the last row, ends
+the run. Equal adjacent offsets represent an empty group. The codomain has one row per key,
+and a nested collection introduces another set of grouped runs. Records may occur between levels.
 
-A merge extends a collection with keys and rows that arrived later; `Tile::merge` states how a
-key both sides hold is merged.
+`domain_predicate` states which key paths are complete, including all values below them.
+`is_terminal()` reads universal completion for a collection, the completion flag for a store,
+and the single-row completion flag for an aggregate. A scalar is terminal when its column is
+nonempty; a record requires every field to be terminal. Terminality does not prevent release
+of data already consumed.
 
-`Tile::append_level` builds a `DataFunction` one level deeper than the function tile it is given,
-out of that tile's codomain: `Product` repeats each row's value across the group it opens.
-One level is the base case, so an operator that appends a level is closed under its own
-output. `Tiling::append_level` is the same step on the static shape.
+`merge` combines newly delivered information. Repeated collection keys merge their groups
+when the values can grow. Scalar columns append rather than replace cells, so a duplicate
+delivery can be misread as another position; consumers must release cells already taken.
+`remove_guarded` releases the region named by a guard.
+`to_guard` identifies releasable data; see [The release contract](#the-release-contract).
 
-The appended level is whole for every parent it names, since a caller appends only once it holds
-each group entire. The innermost level's keys therefore become final, each now holding a whole
-group, and beneath standing levels each is named by its path. The levels above keep the
-completeness they arrived with: a later tile can add to their groups, because `merge` matches a
-key both sides hold and merges their groups. Removals ride through level for level, and the
-appended level has removed nothing.
+`append_level` replaces the innermost collection's values with a newly constructed collection
+level. Each appended group must be whole, so its parent key becomes complete. Completion at
+higher levels is unchanged. `append_open_level_beneath` is the operation for groups that may
+still grow. Both require the new level to have no logical deletions and a `False` completion
+predicate; existing levels retain their own deletion sets. `Tiling::append_level` performs the
+corresponding transformation on the static shape.
 
-Tiles representing collections (`DataFunction`) support logical deletes by storing a `BitSet` of
-deleted values. These are set by filtering operators like `Restrict` and compacted away by stateful
-operators like `Memo` and aggregation. A `DataFunction` carries **one set per domain level**, so a bit
-names a position in that level's own column and a removed group and a removed entry are different
-bits rather than one bit read two ways. A producer marks the level its removals name: the filters
-mark the innermost, a group going by way of its entries, which is where `Tile::retain_keys` reads.
-An operator appending a level leaves its input's removals at the level that named them —
-`append_level` promotes a one-level tile's flat set to level 0, the level its rows now sit at,
-and carries a nested tile's per-level sets through unchanged.
+Each collection level has its own `deleted` bitset, indexed by positions in that level's
+domain column. Removing an outer key removes its subtree; removing an inner key affects only
+that level. `compact` physically removes marked keys. `retain_keys` can instead leave an
+enclosing key with an empty group, which is distinct from deleting that key.
 
-An empty group and a removed key are different tiles: the first is two equal `row_starts`, which
-`Tile::DataFunction`'s `row_starts` field states, and the second is a `deleted` bit at the key's own
-level, taken with its subtree by `Tile::compact`. `Tile::retain_keys` produces the first and never
-the second.
+Logical deletion does not itself release input data. Guards built by `to_guard` include
+logically deleted keys when those keys are releasable. An operator that compacts its input
+before emitting must release the removed keys itself: its consumers cannot release keys
+they never receive. `MapResult`, `MapResultToConst`, `Zip`, `SelectField` and `CheckedLookup`
+use `deleted_keys_guard`; `Memo`, `Aggregate` and `MapAggregate` release the input's
+`to_guard` before compacting.
 
-A deleted row stays in the tile so that a consumer's release reaches it: `Tile::to_guard` names
-every key the tile holds, deleted ones included, so releasing what a tile showed releases its
-filtered rows too. An operator that compacts its input and emits what is left breaks that, since
-no consumer of its output sees the rows it dropped. Such an operator releases them to its input
-itself, through `Tile::deleted_keys_guard` (`MapResult`, `MapResultToConst`, `Zip`, `SelectField`,
-`CheckedLookup`). One that takes the whole input's `to_guard` before compacting and releases it
-(`Memo`, `Aggregate`, `MapAggregate`) already covers them.
-
-`deleted_keys_guard` releases a deleted key of a collection over one row, and panics on any other
-deleted row. A `Domain` guard names a key under every enclosing row, those still to arrive
-included, and a `Codomain` guard is read against every group, so a key deleted under one enclosing
-row, or inside a nested group, has no exact guard: either would release it where it may still be
-live. Naming a key beneath the path that reaches it needs a predicate qualified by that path.
+`deleted_keys_guard` names nested deletions by their complete key paths, preserving an equal
+key under another parent. It returns `None` when no rows are deleted. It rejects a tile that
+has deletions and stands over several enclosing rows: the paths above that tile are unavailable.
+It also rejects deletions inside an aggregate accumulator, for which aggregate guards have no
+representation. These are limits of the guard constructor, not a ban on nested deletions.
 
 ### TileGuard
 
-A `TileGuard` specifies a sub-tiling (a downward-closed, ⊕-closed subset of tiles) of interest. It drives
-demand-directed computation and incremental release, mirroring the intent/yield guard system of
-the previous version of the interpreter.
+A `TileGuard` names a region for demand or release. Its formal interpretation is a
+[guard](../../docs/operational-semantics/semantics.md#2-guards): a downward-closed, ⊕-closed
+subset of a tiling.
 
-| Variant | Meaning |
-|---------|---------|
-| `Scalar(Predicate)` | A value with no keys of its own, named under the paths reaching it: `True` under every path, `False` under none, or `Qualified { enclosing, here: True }` under the paths `enclosing` admits. |
-| `Aggregation(Predicate)` | An aggregate's result, named under the paths reaching it as `Scalar` is. |
-| `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
-| `Function(FunctionGuard)` | Structured interest in a function tile (see below). |
-| `Or(arms)` | Union of two guards no single variant holds: a two-level tile is covered partly by its inner keys and partly by its outer, and `FunctionGuard` has no `Domain`-with-`Codomain` arm. Each arm is a chain of `Codomain` steps ending in one guard (`TileGuard::flatten_or`), so arms naming the same place merge, and an arm beneath a key a shallower arm names whole is dropped. |
+| Variant | Region |
+| --- | --- |
+| `Scalar(Predicate)` | Whole scalar cells under the paths admitted by the predicate. |
+| `Aggregation(Predicate)` | Whole aggregate results under the paths admitted by the predicate. |
+| `Record(fields)` | One region per field. |
+| `Function(FunctionGuard)` | Keys or values within a function tiling, as specified below. |
+| `Or(arms)` | A union of regions that no single guard variant represents, such as a mixture of outer-key and inner-key regions. |
 
-`TileGuard::intersect()` computes the overlap between two guards, and `TileGuard::union()` their
-union; `is_universal()` and `is_empty()` test the extremes. Both run field by field over a
-`Record` guard, which names a region per field (`TileGuard::union`).
+A keyless leaf predicate is `True` for every enclosing path, `False` for none, or
+`Qualified { enclosing, here: True }` for the selected paths. It selects whole cells, not
+portions of a scalar value.
 
-A `Codomain` arm is read against every row of the values it wraps, so `Tile::to_guard` names the
-keys a still-growing row holds by their whole path. Named bare, a key would be released under
-every row, including a row that has not received it yet.
+`intersect` and `union` combine regions. Record guards combine field by field.
+`is_universal` and `is_empty` test the extremes; there are no separate universal/empty
+guard variants. An empty guard annihilates intersection.
 
-TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
-as a `split(guard: &TileGuard)` method on `Tile` in the future.
+`flatten_or` distributes codomain wrappers over unions and produces arms that are chains of
+`Codomain` steps ending in one guard. It merges arms naming the same place and removes regions
+already covered by shallower whole-key guards. This prevents a sequential release from
+retaining a redundant inner arm for each completed outer row.
+
+`check_from` validates a guard against a tiling. A record guard must have exactly the tiling's
+field names. Codomain recursion retains the enclosing extents so qualified predicates can be
+checked at the level they name.
+
+A general `Tile::split(guard)` extraction operation remains proposed, not implemented.
+The formal [split operation](../../docs/operational-semantics/semantics.md#the-split-operation)
+does not imply that runtime method exists.
 
 ### FunctionGuard
 
-Refines interest in a `DataFunction` tiling:
+A `FunctionGuard` distinguishes a collection's keys from the values beneath them.
 
-| Variant | Meaning |
-|---------|---------|
-| `Domain(Predicate)` | Interested only in domain elements matching the predicate. |
-| `Codomain(TileGuard)` | Interested only in codomain elements that are part of the subtiling specified by the guard. |
+| Variant | Region |
+| --- | --- |
+| `Domain(Predicate)` | Selected keys and the complete subtrees under them. |
+| `Codomain(TileGuard)` | Selected regions within the values under those keys. |
 
-Against a `DataFunction` the two compose into a level reference: `Domain` names the outermost
-level, and each enclosing `Codomain` steps one level in, so a tile of 𝑛 levels names its innermost
-under 𝑛−1 wrappers (`Tile::to_guard`).
+`Domain` addresses the current collection level. Each enclosing `Codomain` steps down one
+level; a chain of 𝑛 collections addresses its innermost keys under 𝑛−1 wrappers.
+A predicate that names a nested key must carry its enclosing path when the same key can be
+live under another parent. An unqualified key would name it under every parent, including
+parents not yet delivered.
 
-A `Record` between two levels is a level reference too, not a leaf. Its fields stand over the
-keys the record does, so a collection in one of them is a level under those keys, and a
-`Codomain` naming a record carries a `Record` guard whose fields are read the same way. A key
-is released once every field under it is complete, so a scalar field beside a still-growing
-collection holds the key, though its cell is released on its own (next paragraph).
+A record between collection levels contributes no level of its own. Its fields share the
+record's enclosing rows, and `Codomain(Record(...))` gives each field its own region.
+A whole-key release requires every field's region beneath that key to be whole.
+A scalar field can be released separately while a sibling collection keeps the key open;
+[The release contract](#the-release-contract) owns the resulting absent-cell rule.
 
-A keyless field beneath a level is named by the rows above it: `Scalar(Qualified { enclosing:
-𝑅, here: True })` is that field's cell under the rows 𝑅. This is the only way a guard names
-part of a record without naming whole keys, and it is how the meet of two readers of one
-record, each done with a different field, stays exact. `TileGuard::flatten_or` states a record
-whose every field is whole under 𝑅 as `Domain(𝑅)`.
+`Scalar(Qualified { enclosing: 𝑅, here: True })` names a scalar field's cells under rows 𝑅.
+This preserves field-specific regions when readers release different fields of one record.
+When every field is whole under 𝑅, `flatten_or` lifts the record guard to `Domain(𝑅)`.
 
-A record ends the collection chain, and a collection in one of its fields still grows under the
-record's key. `Tile::holds_a_level` states the two questions that differ there, and which of them
-guards, the merge, and the chain walks each ask.
-
-"Interested in everything" and "interested in nothing" are not separate variants — they are the trivial/degenerate guards, recognized via `is_universal()` / `is_empty()` (an empty guard is the annihilator under `intersect`).
+A record ends a direct collection chain but can still contain collections in its fields.
+`Tile::holds_a_level` and its traversal contract distinguish that case from a value containing
+no incrementally growing collection. Guard traversal and merge must retain those field regions.
 
 ### Predicate
 
-A `Predicate` describes a subset of values within an extent. Used as a domain-completeness
-signal in tiles and as a region specifier in guards.
+A `Predicate` selects values within an extent, or paths through nested collection levels.
+Tiles use predicates to state domain completeness; guards use them to select regions.
 
 | Variant | Meaning |
 |---------|---------|
@@ -175,57 +187,63 @@ signal in tiles and as a region specifier in guards.
 | `False` | No values. Empty predicate; annihilator under `intersect`. |
 | `Intervals(IntervalSet<Value>)` | A scalar key's admitted values, clamped to the type's range. `Predicate::at_or_below(v)` builds the prefix `≤ v`, the upper-bound streaming signal, and `Predicate::below(v)` the strict one. Never built over records. |
 | `Record(fields)` | A componentwise predicate over a record key: one predicate per field, with AND semantics. |
-| `Or(arms)` | A union of componentwise predicates no two of which join into one componentwise predicate, as `flatten_or` leaves it; three or more arms can still cover one componentwise predicate. Arms are always flat (no nested `Or`). |
-| `Qualified { enclosing, here }` | A key of an inner level **under the enclosing path that reaches it**: admits `(k₀ … k_d)` when `(k₀ … k_{d-1})` satisfies `enclosing` and `k_d` satisfies `here`. Built through `Predicate::qualified`, which drops the arm where `enclosing` admits everything. |
-| `Union { tags, rest }` | A predicate over a union-typed extent (`Extent::Union`): one predicate per named tag, and `rest` (`True` or `False`) for every tag it does not name. A value `Union { tag, inner }` satisfies it iff the predicate for `tag`, its own or `rest`, admits `inner`. A predicate need not name every tag of its domain: a column names only the tags it holds, which width subtyping makes fewer than its extent's, and a point names one. Built through `Predicate::tagged`, whose canonical form names no tag that says what `rest` does; `Predicate::over_every_tag` builds one from the whole tag set, which is `True` when every tag is. Used as the domain predicate on tiles emitted by a tagged `UnionProducer`, and split by `UnionProducer::release_impl` to forward each tag's predicate to the upstream input for that tag. A flat union's domain is the one its arms share, which may itself be union-keyed, so its release forwards whole. |
+| `Or(arms)` | Union of the arms' regions. `flatten_or` removes nested `Or` nodes and joins pairs of componentwise arms where possible. |
+| `Qualified { enclosing, here }` | Keys admitted by `here` under paths admitted by `enclosing`. See [Qualified predicates](#qualified-predicates). |
+| `Union { tags, rest }` | Predicate for each named tag of an `Extent::Union`; Boolean `rest` applies to every unnamed tag. |
 
-`Predicate::intersect()`, `union()`, `minus()`, and `subsumes()` are defined between any two
-predicates over one domain, and refuse two predicates over different domains.
-`Predicate::as_bool()` short-circuits to `Some(true/false)` when the predicate is trivially
-`True` or `False`: a record whose fields are *all* `True`, a record with *any* `False` field
-(the fields are an AND, so one empty field admits nothing whatever the others admit), and an
-`Or` whose arms are all `False`.
-A `Union` predicate in canonical form names only tags that differ from `rest`, so `as_bool()`
-answers `None` for it; universality over a union domain is spelled `True`. The set operations
-(`intersect`, `minus`, `union`, `subsumes`) apply tag by tag over every tag either side names,
-reading an unnamed tag as its side's `rest`, and combine the two `rest`s the same way. A prefix
-of a union domain takes the tags ordered before the bound whole and those after it not at all,
-which one `rest` cannot say, so it names every tag and needs the domain to name them from
-(`Predicate::at_or_below_in`,
-[Componentwise predicates and prefixes](#componentwise-predicates-and-prefixes)). `at_or_below`
-panics on a union value.
+`intersect`, `union`, `minus`, and `subsumes` operate on predicates over the same domain.
+Incompatible predicate shapes are rejected, not converted to an approximate region.
+`subsumes(other)` means that every value admitted by `other` is admitted by the receiver.
+
+`as_bool` recognizes empty regions and some representations of the whole domain. A record is
+empty if any field is empty, and universal if every field is universal. An `Or` is empty if
+every arm is empty, and recognized as universal if one arm is universal. Arms that jointly
+cover the domain need not produce `Some(true)`; use `subsumes` for exact containment.
+
+A tagged predicate tests a union value's payload against its tag's predicate, or against `rest`
+when the tag is unnamed. A point names one tag. A column names only the tags present in it,
+which may be fewer than its extent permits. The default therefore remains part of the predicate:
+complementing a finite list of named tags also complements `rest`.
+
+`Predicate::tagged` removes entries equal to `rest` and collapses an empty tag map to `True` or
+`False`. A retained `Union` returns `None` from `as_bool`. A constructor that knows every tag of
+the domain uses `over_every_tag`, which also recognizes universality over that tag set.
+Set operations combine the predicates for every tag named by either operand and combine their
+defaults separately.
+
+A tagged `UnionProducer` splits releases by tag and forwards each payload predicate to that
+tag's input. A flat union instead forwards the whole predicate over the domain shared by its
+arms, even when that domain is itself union-keyed. Prefix construction over union keys is
+specified under [Componentwise predicates and prefixes](#componentwise-predicates-and-prefixes).
 
 ### Qualified predicates
 
-Every arm but `Qualified` is **unqualified**: read against the last component of a path alone,
-it says the same of that key under every enclosing path. That is the whole of what a curried
-collection's levels could state on their own, and it over-claims wherever the levels are not
-alike — a nested induction store keeps its enclosing positions open while the row being run is
-decided, so a key complete under the running row would be claimed under every row.
+`Qualified { enclosing, here }` admits a path when `enclosing` admits its prefix and `here`
+admits its last key. `enclosing` can itself be qualified. `Predicate::exactly(path)` constructs
+a singleton path with one component per level.
 
-`Qualified` states a region of **paths** instead. `enclosing` is itself a predicate over the
-level above's paths, `Qualified` again where the nest is deeper, so depth costs nesting rather
-than a concept per level. `Predicate::exactly(path)` is the singleton region — one qualified
-component per level.
+An unqualified predicate admits the same key under every enclosing path. That is insufficient
+for completeness local to one parent: completing an inner key in one row must not complete
+the same key in all other rows. `Or` can contain qualified arms and forwards the full path to
+each arm.
 
-Reading one takes the whole path. `contains_path` is the read; `contains` panics on a qualified
-predicate rather than answering for a key it cannot place under an enclosing path, because a
-conservative `false` would make the caller act on a region that is not the one it asked about.
-`is_applicable_over` checks it against the extents of the levels the path runs through, where
-`is_applicable_to` checks one level. `TileGuard::covers_path` is the same question asked of a
-guard, and `TileGuard::check_from_under` threads the levels a `Codomain` step has walked past.
+Use `contains_path` to test a path. `contains` takes one key and panics if it encounters a
+qualified predicate; the missing prefix cannot be replaced by a conservative `false` without
+changing the region being tested. `is_applicable_over` checks a predicate against a sequence of
+level extents; `is_applicable_to` checks one extent. The corresponding guard operations are
+`TileGuard::covers_path` and `check_from_under`, which retains the extents crossed by codomain
+steps.
 
-A qualified predicate is a componentwise predicate over two components ([Componentwise predicates
-and prefixes](#componentwise-predicates-and-prefixes)). `split_qualification` splits any predicate
-into the enclosing paths it is qualified by and the keys it admits under them, an unqualified one as
-`(True, self)`, so one rule serves both shapes.
+`Predicate::qualified` returns `False` if either component is empty and returns `here` if
+`enclosing` is universal. `split_qualification` returns the two components of a `Qualified`
+node, or `(True, self)` for another shape. The operations distribute over `Or` before applying
+the [componentwise algebra](#componentwise-predicates-and-prefixes).
 
 ### Restating a moved group
 
-A level's `domain_predicate` names whole paths from its tile's root. An operator that takes a
-row's group out to work on it alone reads the group's statements over the group's own paths, and
-one that puts a group back under a different row, or changes the levels around it, restates what
-the group carries:
+A level's `domain_predicate` is relative to its tile's root. Moving a group changes the paths
+that its predicates describe. Operators apply the following transformations to retain the
+same completeness or release region:
 
 | Move | Restatement |
 |------|-------------|
@@ -235,25 +253,29 @@ the group carries:
 | Insert a level before a path component | `with_level_inserted` |
 | Merge two levels into one keyed by pairs | `with_levels_paired`, and `with_levels_unpaired` for a release handed back |
 
-`Tile::map_level_predicates` applies one to every level of a chain, through record fields, and
-`TileGuard::map_level_predicates` to every level a guard names. A group placed without
-restating names paths under other rows, which the check in
-[The completeness contract](#the-completeness-contract) reports as a change to a complete path.
+`Tile::map_level_predicates` traverses the collection chain and record fields.
+`TileGuard::map_level_predicates` traverses the levels named by a guard. Omitting the
+transformation can attribute completeness to a different row and violate
+[The completeness contract](#the-completeness-contract).
 
 ### Componentwise predicates and prefixes
 
-A `Record` and a `Qualified` predicate are both **componentwise**: products of one predicate per
-component, admitting a key when every component admits its part. A record's components are its
-fields in name order, the order `Value`'s comparison takes them in; a qualified predicate's are
-the enclosing path and the key. One algebra serves both (`Componentwise` in `tiling/predicate.rs`):
+A componentwise predicate is a product of regions: a key is admitted when every component is
+admitted. `Componentwise` in `tiling/predicate.rs` implements this algebra for record fields
+in name order and for the `(enclosing, here)` components of a qualified predicate.
 
-- A meet is componentwise.
-- A join is one componentwise predicate where the two agree on every component but one, and an
-  `Or` otherwise. `flatten_or` joins any two arms this way, so a region stated one row at a time
-  stays one componentwise predicate per run of rows alike, not one arm per row.
-- A difference is a staircase: step `i` keeps what component `i` alone leaves, over the
-  components before it that the subtrahend holds and the components after it untouched.
-- Containment is componentwise, which is exact for a nonempty componentwise predicate.
+| Operation | Rule |
+| --- | --- |
+| Intersection | Intersect corresponding components. |
+| Pairwise join | Combine into one product when at most one component differs; otherwise retain separate `Or` arms. |
+| Difference `A ∖ B` | Union the steps indexed by `i`: use `A[j] ∩ B[j]` before `i`, `A[i] ∖ B[i]` at `i`, and `A[j]` after `i`. |
+| Containment of nonempty `B` | Every component of `A` contains the corresponding component of `B`. |
+
+Subtracting every component independently into one product is incorrect: it would discard
+`(1, 0)` when subtracting `{1} × {1}`. The difference steps retain it.
+`flatten_or` repeatedly joins compatible pairs, which coalesces adjacent rows with the same
+remaining components. It does not find every possible product representation: three or more
+arms can jointly cover one product even when no pair combines.
 
 A **prefix** of a lexicographic order is a staircase of componentwise predicates: `≤ (𝑎, 𝑏)` is
 `{_0 < 𝑎} ∪ {_0 = 𝑎, _1 ≤ 𝑏}`. `domain_prefix` builds one across levels, one qualified arm per
@@ -263,18 +285,17 @@ by a nested loop's `(outer, inner)` pairs is released as a prefix, and a cartesi
 are stated per field, because its factors grow independently; the two meet under the same rules
 as any two componentwise predicates.
 
-A union key `𝑡(𝑣)` is ordered by its tag, then within the tag, so its prefix is every tag before
-`𝑡` whole, `𝑣`'s own prefix under `𝑡`, and no tag after. `Predicate::at_or_below_in` and
-`below_in` build it over the key's domain, which names the tags, and a record key's fields
-recurse with their own domains. `domain_prefix_over` passes each level's domain, which is how
-a loop over a concatenation releases what it has consumed.
+A union key is ordered by tag, then payload. Its prefix includes every earlier tag, the
+payload prefix at the bound's tag, and no later tag. `at_or_below_in` and `below_in` require
+the domain extent to enumerate those earlier tags; `at_or_below` and `below` panic on a union
+value. Record fields recurse with their own extents. `domain_prefix_over` supplies each level's
+extent, allowing a loop over concatenated collections to release its consumed prefix.
 
-`subsumes` is exact. A union on the left may cover a componentwise predicate that no single arm
-covers, so where no arm answers alone it asks whether `other ∖ self` is empty. Exactness rests on
-each region having one spelling where the representation allows it: `Predicate::intervals` clamps a
-set to its type's range, since the interval crate does not know that a `UInt` stops at 0 and would
-keep `(-∞, 3]` and `[0, 3]` apart, and it returns `False` for an empty set and `True` for one
-covering the type.
+`subsumes` handles collective coverage by testing whether `other ∖ self` is empty when no
+individual `Or` arm suffices. `Predicate::intervals` clamps scalar intervals to the value
+type's range and normalizes their bounds, returning `False` for the empty set and `True` for
+the whole type. For example, a `UInt` interval has lower bound zero; treating `(-∞, 3]` and
+`[0, 3]` as distinct regions would give incorrect containment answers.
 
 ### Curry levels
 
@@ -283,110 +304,94 @@ A collection tiling is a curried data function `K₀ ⤇ K₁ ⤇ … ⤇ V`, he
 is `K₀`, `CurryLevel(n)` is `Kₙ` grouped by the `n` levels above it, and
 `CurryLevel(levels)` is the values every level stands over.
 
-An operator acts at one level and leaves the levels above it standing. It states that level
-once, at construction, and every level-addressed read goes through it — `values_at`,
-`group_at`, `per_group`, `wrap_guard`. Destructuring a tile answers for the outermost level,
-so a component that destructures instead of reading its own level reads `domain` and
-`domain_predicate` at level 0 wherever any level stands above it.
+An operator stores its level at construction and uses it for `values_at`, `group_at`,
+`per_group`, and `wrap_guard`. Destructuring the root tile instead reads level zero, regardless
+of the operator's level. `CurryLevel::enclosing` identifies the level whose keys provide the
+rows grouping the selected level. These are not necessarily the root rows: the distinction
+first affects an innermost operation in a collection with three levels.
 
-**The level above is where the rows are.** A level's own `domain_predicate` says which of its
-keys are complete; the rows an operator groups by, and their completeness, belong to
-`CurryLevel::enclosing`. At depth two the enclosing level is the outermost one, so reading
-the wrong one gives the same answer there and a different one at depth three and below.
+Completeness applies to all descendants of a complete path. `Tile::completion_at` combines
+the statements along that path, not just the selected level's `domain_predicate`.
+`MapAggregate` needs this combined statement to decide when a group is final. Checking only
+the outermost statement can leave a completed inner row unresolved while its enclosing
+induction store remains open. The temporal obligations are specified by
+[The completeness contract](#the-completeness-contract).
 
-**Completeness is downward-closed.** A key a level calls complete is complete at every depth
-beneath it, so an element is final as soon as *some* level on its path calls that prefix
-final. An operator that reduces one group per row — `MapAggregate` is the case — therefore
-asks every level on the path rather than the outermost alone. Asking the outermost is sound
-only while the statement says the same of every row: under a nested induction store the enclosing
-positions stay open for as long as the drive runs, while the row being run is decided, so an
-aggregate inside the nest would never settle.
+Level-addressed operators use two constructions:
 
-Operators split into two families by what they replace at their level:
+| Change | Construction | Examples |
+| --- | --- | --- |
+| Replace values without changing enclosing keys | `with_values_at` for the output tiling; `values_at_mut` for the tile. No regrouping is required. | `Zip`, `VariantWrap`, `ExtractFinal` |
+| Rebuild a collection's keys and groups | Extract with `group_at`; rebuild with `regroup_beneath` or `per_group`. | `UnionOperator`, `Uncurry`, `Product`, `StoreDenseRead` |
 
-- **Replacing the values beneath it** — `Zip`, `VariantWrap`, `ExtractFinal`. Their
-  tiling is `with_values_at(input, level, new_values)` and the producer writes
-  `*values_at_mut(level)`. Nothing is grouped, so nothing is split per row. A member that
-  *reads* the rows above it takes them from the level they sit at rather than from the top,
-  because a standing level answers for every induction store beneath it and not for those rows.
-- **Rebuilding the collection level itself** — `UnionOperator`, `Uncurry`, `Product`,
-  `StoreDenseRead`. Each takes the level apart one row of the level above at a time and puts
-  it back with `Tile::regroup_beneath`, handing it the empty level its own output tiling
-  derives (`Tile::per_group` derives it on the call), so a row that has been reached by nothing
-  still answers at the right shape. Operands pulled from their own branches need not hold the
-  same rows, nor hold them at the same positions, so an operator with several finds each row in
-  the others by its path (`Tile::rows_by_path`). A union's standing rows are its arms' together,
-  each arm holding its own share.
+`regroup_beneath` requires an empty tile of the rebuilt output level for the case with no
+enclosing rows. `per_group` derives it from the output tiling. The outermost level is one
+implicit group. Nested levels have one group per enclosing key and require the predicate
+transformations in [Restating a moved group](#restating-a-moved-group).
+
+Separate inputs need not contain the same rows or use the same row indices. Multi-input
+operators match rows by full path with `Tile::rows_by_path`; a union includes the rows from
+all of its arms. A row-reading operator must also use the selected level's enclosing rows,
+even if its output construction only replaces values.
 
 ### CCL types vs. tilings
 
-CCL types and tilings describe a term at two different layers, and the relationship is one of the things that makes the tile pipeline tick.
+A CCL compute function type describes its input and result, not their runtime batching.
+For example, a function of type `Int ⇒ Int` can be applied once to a scalar or at each key of
+a collection. Operator conversion selects the implementation using the input tiling and the
+level at which the function is applied.
 
-The CCL type layer is **pointwise**: `mul : (Int, Int) → Int`, `zip(f, g) : A → (B, C)`. A type describes an element-wise function — "given one input of type A, produce one output of type B." It says nothing about how many `A`s will arrive, in what order, or whether the result will be materialised as a single value or streamed.
-
-The tile layer chooses **how the runtime materialises that pointwise function**. The same pointwise morphism can be compiled to either:
-
-- **A scalar-tiled operator** — evaluate the function on a single input value. One `A` in, one `B` out. Used when the morphism sits at a scalar call site (e.g. a literal tuple fed into a multi-arg UDF).
-- **A function-tiled operator** (`DataFunction`) — evaluate the function across a collection of inputs, essentially vectorising the pointwise definition. Used when the morphism sits downstream of an iteration or data source.
-
-Both compiled forms satisfy the same CCL type; which one a specific call site gets is determined at op-conversion by the upstream `input`'s tiling, which flows in from whatever sits above the operator in the dataflow graph. This is what makes UDFs like `lambda x: x + 1` compile cleanly whether they're called once on a literal or mapped over a source — no duplication at the CCL level, the tile layer specialises automatically.
-
-In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; a zip is handled by [`zip_arms_at`](./tile_operators/fan.rs), which builds [`Zip`] from function-tiled arms and [`MakeRecord`] from arms that all came out scalar, where there is no domain to share. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
+The `MapResult` family uses `change_tiling_result` to preserve enclosing collection levels
+while changing the result tiling. `zip_arms_at` constructs `MakeRecord` when all compiled arms
+are scalar, and `Zip` otherwise, pairing at the supplied level. The operator must preserve any
+collection levels inside the arms' values rather than treating them as additional iteration
+levels. [A product value is a record of tiles](#a-product-value-is-a-record-of-tiles) specifies
+the separate case of a record-valued expression.
 
 ### A product value is a record of tiles
 
-A `Tuple` or `Record` node whose extent is a record compiles to a `Tiling::Record`, each field
-keeping the tiling its own term produced: a scalar field stays a scalar, and a collection field
-stays the collection it was, with the domain it binds. `MakeRecord` assembles it and
-[`SelectField`] reads one field back out. `build_product` in `operator_conversion.rs` chooses it
-by the node's extent.
+`build_product` in `operator_conversion.rs` selects product construction by the node's extent.
+A record extent produces `MakeRecord` and `Tiling::Record`. Each field retains the tiling of
+its compiled term, including any collection levels. `SelectField` projects one of those tiles.
 
-Keeping a field a tile is what lets it grow. A `Tile::DataFunction` merges by appending its
-domain and unioning its domain predicate, which is a collection arriving in pieces. A collection
-materialized into one cell merges as every `Tile::Scalar` does, by appending the column, so two
-deliveries land as two cells: two tables where the program has one collection. The fields settle
-at their own moments, so a release names one field at a time, and a settled scalar beside an
-unsettled collection is released alone.
+A function extent `𝐷 ⤇ {…}` instead describes a collection of records. Its components are
+paired at the level determined by the function type through `zip_arms_named_at`. For example,
+the pair `(acc, i)` used by a pointwise binary operation is assembled beneath the levels over
+which its components were applied. Using that construction for a record of collections would
+change its shape into a collection of records.
 
-A `Tuple` or `Record` node whose extent is a function, `𝐷 ⤇ {…}`, is a collection of records.
-`Tuple([acc, i])` under a binop is one: it pairs its components beneath the levels they were
-applied over, which is what [`Zip`] assembles. Assembling a record extent as a zip instead yields
-`𝐷 ⤇ (𝐴, 𝐵)`, a collection of products, where the type says a product of collections.
+Fields can complete and release independently. A scalar field can be released while a sibling
+collection continues to grow; see [The release contract](#the-release-contract). Collections
+retain the incremental representation described below rather than becoming successive scalar
+cells on each delivery.
 
-`SelectField` is a tile operation. The `RecordField` application is the other projection, and it
-reads a record in a function's codomain one row at a time, so every field must be a value in a
-column. A record holding a collection cannot supply one.
+`RecordField` is distinct from `SelectField`: it projects a materialized record value in a
+function's codomain, one row at a time. It requires column values and cannot project a field
+that remains an incrementally growing collection tile.
 
 ### A collection inside a value stays a tile
 
-A collection inside a value is kept as a `Tile::DataFunction`: its keys in a column beneath the
-rows that hold them, and its values in the tile below. A merge appends keys to it, and a guard
-names them. Operators do not box it into a `Tile::Scalar` column of `Value::Function` maps, which
-would arrive whole and be read only by opening each map. A map value is used only where one value
-is required, as in a variant's payload and a store write.
+An incrementally growing collection is a `Tile::DataFunction`, including when it occurs inside
+a record value. Its keys remain addressable by guards and its codomain remains a tile.
+Materializing each partial delivery into a `Tile::Scalar` cell would append separate map values
+instead of extending one collection.
 
-`Tiling::from_extent` is the tiling a value of an extent takes in this form. `Tile::holds_a_level`,
-and its static counterpart `Tiling::holds_a_level`, asks whether a tile holds a collection this
-way; an operator putting a value into a column asks it, a column having nowhere to put one.
-`Extent::holds_a_collection` asks whether a type contains a collection at all, which a column of
-maps answers yes too. `open_collections` turns a column of maps into this form at every depth,
-and `materialize_collections` turns this form back into maps where one value is required.
+`Tiling::from_extent` constructs this representation. `Tile::holds_a_level` and
+`Tiling::holds_a_level` detect collection levels, including levels inside record fields.
+`Extent::holds_a_collection` instead tests the value type and also recognizes a collection
+already materialized as a map. `open_collections` opens materialized maps recursively;
+`materialize_collections` performs the reverse conversion where a complete value is required.
 
-A pair an operator *forms* follows the same rule, and states it at construction. `Product` pairs
-each row's element with the keys under it: where the element is a plain value the pair rides
-materialized in one column, and where it carries a level — a nest whose elements are collections —
-the pair is a `Tiling::Record` whose `_0` keeps its levels. `Uncurry` reads the rule from the other
-end: it flattens two levels into a pair-keyed one and leaves the values it finds exactly as they
-are, because materializing a level-carrying value is what has no column to go in.
+`Product` preserves collection-valued elements when pairing them with keys: a plain element
+and key fit in one column, but an element containing a collection requires a `Tiling::Record`
+whose `_0` field retains its levels. `Uncurry` combines two key levels into one pair-keyed level
+without materializing their values.
 
-**A variant's payload is the one place a collection rides as a value.** An arm holds one cell per
-position, so `VariantWrap` materializes the collection into it (at the level the payload's own type
-names, not the input's innermost) and `VariantProject` opens it back into levels. An applied
-`` `𝑐(𝑥) `` is one variant value, so a collection-valued `𝑥` is one cell. The cell is emitted once
-the collection is complete, since a materialized value cannot grow. The round trip is what carries
-a feed out of a nest: the enclosing decision's tap holds the inner loop's whole tap collection,
-materialized on the way in and opened on the way out, and the channel flattens the two levels to
-the positions the feed appended at.
+Variant payloads and store writes require materialized values. `VariantWrap` waits for a
+collection payload to complete, then emits it as one cell at the level named by the payload's
+type, not necessarily the input's innermost level. `VariantProject` opens it back into levels.
+For a feed leaving a nested loop, this round trip carries the inner tap collection through the
+enclosing decision's variant payload; the channel then flattens the two collection levels.
 
 ---
 
