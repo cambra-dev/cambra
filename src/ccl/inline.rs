@@ -97,7 +97,61 @@ use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
     let expr = inline_impl(expr);
+    let expr = beta_reduce_variable_arguments(expr);
     inline_list_element_reads(expr, &PredMemo::new()).0
+}
+
+/// β-reduce a lambda applied to a **variable** whose parameter's type reads an enclosing
+/// lambda's binder: `𝑣 ▷ (λ 𝑥 : 𝑇(𝑦) → body)` under `λ 𝑦` becomes `body[𝑥 := 𝑣]`.
+///
+/// Left to lambda elimination, the redex becomes a pairing of two binders that denote one
+/// value, and a parameter type reading an enclosing binder makes that pair a dependent tuple
+/// whose two spellings of one value the types cannot reconcile. A group-by under a loop
+/// whose key reads the loop's binder is this redex: its partition, applied to the key
+/// iterating it, takes a key whose domain reads the loop's binder
+/// (`src/ccl/design/type-inference.md`, "One binder for one value"). The
+/// substitution makes the two binders one name in every type that reads either.
+///
+/// A variable argument makes the reduction a rename, so it duplicates no work. Any other
+/// redex is left to lambda elimination, whose rules read its shape: a group-by's partition
+/// is recognized as a lambda of its own.
+fn beta_reduce_variable_arguments(expr: Expr) -> Expr {
+    beta_reduce_variable_arguments_under(expr, &mut Vec::new())
+}
+
+fn beta_reduce_variable_arguments_under(mut expr: Expr, enclosing: &mut Vec<Name>) -> Expr {
+    if let TypedExprNode::Lambda { param, body } = &mut expr.node {
+        enclosing.push(param.name.clone());
+        let reduced =
+            beta_reduce_variable_arguments_under(std::mem::take(body.as_mut()), enclosing);
+        enclosing.pop();
+        **body = reduced;
+        return expr;
+    }
+    expr.map_children(|child| beta_reduce_variable_arguments_under(child, enclosing));
+    let reducible = matches!(
+        &expr.node,
+        TypedExprNode::Apply { argument, function }
+            if matches!(argument.node, TypedExprNode::Var(_))
+                && !argument.ty.is_handle()
+                && matches!(&function.node, TypedExprNode::Lambda { param, .. }
+                    if crate::ccl::subst::type_free_vars(&param.ty)
+                        .iter()
+                        .any(|n| enclosing.contains(n))
+                        && refinement_discharged_by(&argument.ty, &param.ty))
+    );
+    if !reducible {
+        return expr;
+    }
+    let node_id = expr.node_id();
+    let TypedExprNode::Apply { argument, function } = expr.node else {
+        unreachable!("matched as an application above")
+    };
+    let TypedExprNode::Lambda { param, body } = function.node else {
+        unreachable!("matched as a lambda above")
+    };
+    let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
+    substitute(*body, &param.name, &argument)
 }
 
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.
@@ -773,13 +827,16 @@ fn inline_impl(expr: Expr) -> Expr {
 /// tree are left intact so lambda-elim + simplify still produce the structure
 /// they expect for list comprehensions, scalar BinOps, etc.
 ///
-/// TODO: immediately-applied anonymous lambdas (`Apply(arg, Lambda(x, body))`
-/// not gated on a `Var(name)`) currently fall through this scope and survive
-/// into `lambda_elim`.  They are equationally equivalent to a beta-reduction
-/// here and would benefit from the same treatment, but doing so today
-/// perturbs CCC simplify's input shape for list comprehensions, scalar UDFs,
-/// and BinOp paths in ways that need test-suite triage first.  Revisit if a
-/// case surfaces where the surviving anon-lambda blocks downstream work.
+/// An immediately-applied anonymous lambda (`Apply(arg, Lambda(x, body))` not
+/// gated on a `Var(name)`) falls outside this scope. One applied to a variable
+/// whose parameter type reads an enclosing binder is reduced separately
+/// ([`beta_reduce_variable_arguments`]); every other one survives into
+/// `lambda_elim`, whose rules read its shape — a group-by's partition is
+/// recognized as a lambda of its own.
+///
+/// TODO: reducing the rest is equationally sound, but it perturbs CCC simplify's
+/// input shape for list comprehensions, scalar UDFs, and BinOp paths in ways that
+/// need test-suite triage first.
 fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMemo) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value — a UDF used
     // as an unapplied value, or the function side of a call about to

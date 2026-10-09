@@ -1791,15 +1791,18 @@ opens indexed references at the argument and handles any remaining name-spelled 
 Checking reconstructs this result instead of starting another inference pass.
 
 A lambda whose parameter occurs in the body's type but not its value can eliminate to the
-Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty`. `lambda_elim` distinguishes value freedom
-with `is_free_in_value`; a dependency in a refinement still requires the Pi binder. The same
-situation can arise after pairing and currying introduce a parameter for a point-free body.
+Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty`, where the occurrence is in a refinement on a
+value. `lambda_elim` distinguishes value freedom with `is_free_in_value`; a dependency in a
+refinement still requires the Pi binder. The same situation can arise after pairing and currying
+introduce a parameter for a point-free body.
 
 A lambda eliminates to the Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty` when its parameter
 occurs in `body.ty` and not in the body's value, and `body.ty` is not a data function whose domain
 reads the parameter. A refinement on a collection's domain is a filter, which determines which
-entries exist, so a parameter there varies the body as one free in the value does. Neither shape
-that carries such a filter takes the Pi-constant form:
+entries exist
+([A refinement on a collection's domain is data](#a-refinement-on-a-collections-domain-is-data)),
+so a parameter there varies the body as one free in the value does. Neither shape that carries
+such a filter takes the Pi-constant form:
 
 - The body is a lambda whose binder's type reads the parameter, as in
   `λ r → λ i : {[0, 2] | 𝑝(r)} → 𝑒`. The nested-lambda rule lifts the refinement onto the pair it
@@ -2003,6 +2006,17 @@ opened refinements contain.
 **Application opens at the argument.** Replacing Pi indices with an argument term uses the same
 opening walk as replacing them with a name. `discharge_codomain` supplies this operation to
 post-inference application checking. It is not an index-rebasing pass over an arbitrary type.
+
+**Reading a stored predicate as a term opens.** A predicate's subterms carry types, and a reader
+that compiles or checks the predicate builds new function types around them: lambda elimination
+wraps the predicate in `λ __elem → …`, and the checker rebuilds each subterm's type from its
+children. An index those subterm types hold, read in the stored form, lands under the crossings
+the new function types add, where it names another function. Planning's predicate compilation
+therefore runs on a codomain opened at its binder and closes the result
+(`subst::map_opened_codomain`), and the checker's predicate walk visits a type's children opened
+(`subst::walk_children_opened`). A dependent tuple's components are opened at the names of the
+components before them. Closing leaves a name reference to a function inside the closed structure
+that binds the same name, since that function binds it.
 
 #### Display opens what it descended through
 
@@ -2865,6 +2879,8 @@ That the list is closed is an argument about today's code, not something the com
 
 Obligations ride variables through `freshen_above`, so a generalized function carries its operators' requirements into its scheme. Each use instantiates and resolves its **own** copy — sharing one would let a `String` use empty an `Int` use's candidate set.
 
+---
+
 ## 4.8 Dependent tuples
 
 A dependent tuple `(𝑎 : 𝐴) × 𝐷(𝑎)` is the type of pairs whose second component ranges over a
@@ -2880,18 +2896,21 @@ A dependent tuple differs from a sum of [4.7](#47-dependent-sums): a sum's witne
 fixed per collection, while a dependent tuple's first component is a value and each value has its
 own fiber.
 
-### Where a dependent tuple is born [Planned]
+### Where a dependent tuple is born
 
-Three passes uncurry a family, and all run after inference. `lambda_elim`'s nested-lambda rule
-packs two binders into one, so `λ 𝑎 : 𝐴 → λ 𝑏 : 𝐷(𝑎) → body` becomes
-`curry(λ 𝑝 : (𝑎 : 𝐴) × 𝐷(𝑎) → body)`. `channelize` keys a feed by the positions of every loop
-around it (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). Planning iterates
-a family's entries one outer position at a time.
+`lambda_elim`'s nested-lambda rule packs two binders into one, so `λ 𝑎 : 𝐴 → λ 𝑏 : 𝐷(𝑎) → body`
+becomes `curry(λ 𝑝 : (𝑎 : 𝐴) × 𝐷(𝑎) → body)` when the inner binder's type still reads `𝑎` after
+the rule lifts the inner binder's filters onto the pair. What still reads it is a membership
+refinement: a group-by under a loop whose key reads the loop's binder has keys
+`{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
+always was.
 
-Inference introduces no dependent tuple, and a program cannot write one. A source value whose
-domain depends on an outer element, such as `[x for xs in xss for x in xs]`, is typed during
-inference as a sum, `Σ (σ : SubtypesOf((UInt, UInt))). σ ⤇ 𝑉`, and the dependent tuple is that
-sum's witness at the term that builds it.
+Inference introduces no dependent tuple, and a program cannot write one. Two further births are
+[Planned]: `channelize` keying a feed by the positions of every loop around it
+(`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and a source value whose
+domain depends on an outer element, such as `[x for xs in xss for x in xs]`, typed during
+inference as a sum `Σ (σ : SubtypesOf((UInt, UInt))). σ ⤇ 𝑉` whose witness at the term that
+builds it is a dependent tuple.
 
 ### Representation
 
@@ -2931,6 +2950,11 @@ tuple are already open wherever the tuple is held, so no index shifts. In
 `{Int | __elem ∈ keys(𝑝.0)}`. Check mode's projection rule (`emit_proj`) requires a projection's
 codomain to be that type, read with the projection's own binder as `𝑝`.
 
+The nested-lambda rule types `.1` out of the pair it builds as `(𝑝 : 𝑇) ⇒ 𝐷(𝑝.0)`, with the
+pair's own binder as the projection's, as every morphism eliminated from `λ 𝑝 → …` binds it. The
+projection applied to `𝑝` discharges `𝑝` at itself, which `subst::discharge_codomain` answers by
+opening the codomain at the name.
+
 ### Flattening [Planned]
 
 `flatten_domain` reshapes keys, `((𝑖, 𝑗), 𝑘)` into `(𝑖, 𝑗, 𝑘)`, and channelize uses it to give a
@@ -2947,13 +2971,79 @@ tuple can sit in their bounds. Compaction holds one as an atom (`AtomKey::DepTup
 α-invariant content hash, so two dependent tuples meet where they are equal up to binder names and
 nowhere else. As a collection's domain it is invariant, like every domain.
 
+### A refinement on a collection's domain is data
+
+A refinement on a value records a fact about a value already fixed. A refinement on a
+collection's domain decides which entries exist. A body that is a collection whose own domain
+reads a lambda's parameter varies with the parameter, so the body is not constant in it, and the
+lambda belongs to the nested-lambda rule rather than to the Pi-constant form of
+[4.5](#dependent-application-and-reconstruction). `λ 𝑖 → λ 𝑘 : {Int | 𝑘 ∈ keys(𝑖)} → …`, a
+group-by whose key reads `𝑖`, has such a parameter, as does a comprehension filtered by the
+enclosing binder, `λ 𝑟 → λ 𝑣 : {Int | 𝑣 > 𝑟} → …`.
+
+Only the body's own domain counts. A collection the body holds, such as a group whose domain reads
+its key, is the family a Pi-constant type encodes, which the group-by recognizer plans. A
+collection the body takes as an argument does not vary the body: `sum` over a collection whose
+domain reads the parameter is the same `sum` for every value of it.
+
+### A group-by whose key reads an enclosing binder
+
+The group-by recognizer (`src/ccl/planning/groupby.rs`) buckets a partition
+`{𝐼 | key(𝑒) == 𝑘}` with one `converse`, which needs `key` closed. A key that reads an
+enclosing binder partitions differently for each value of the binder, so lambda elimination reads
+the partition as a filter on the group's elements that reads the enclosing binder, and the
+nested-lambda rule lifts it onto the pair, where planning applies it once per pair. A partition
+that reads the enclosing binder only as the comparand `𝑘` stays the Pi-constant group-by.
+
+### One binder for one value
+
+Two binders that denote one value give every type that reads either two spellings, and types
+compare structurally, so the two spellings disagree. Lowering a comprehension over a group-by
+applies the partition to the key iterating it, `𝑟 ▷ (λ 𝑘 → …)`, which is such a pair. `inline`
+β-reduces a lambda applied to a variable when the lambda's parameter type reads an enclosing
+lambda's binder, which spells `𝑘` as `𝑟` everywhere
+(`src/ccl/design/optimization.md`, "Substitution and beta-reduction").
+
+A lambda applied to a term becomes, after lambda elimination, a pairing `⟨id, 𝑔⟩ ≫ ℎ` whose pair
+`𝑥 = (𝑎, 𝑔(𝑎))` is bound by the dependent projection that starts `ℎ`. The types after the
+projection read `𝑥`. Product β removes the pairing with the projection, so it rewrites `𝑥.0` to
+`𝑎` and `𝑥.1` to `𝑎 ▷ 𝑔` in those types, and declines where the pairing names no binder for `𝑎`
+(`docs/operational-semantics/lowering.md`, "Simplifying expressions").
+
+### Lifting a filter onto the pair
+
+The nested-lambda rule writes a lifted filter over the pair's element, `𝑎 ↦ __elem.0`. A
+subterm whose type restates the pair's own dependent tuple, the key
+`𝑎.1 : {𝐾 | __elem ∈ 𝑀(𝑎.0)}`, would capture under that substitution, since inside the
+refinement `__elem` is the key. The rule removes those restated facts first; the pair's first
+component has the tuple's type, which states them. A substitution reaching any other refinement
+this way fails (`Subst::assert_no_element_capture`), because a nested refinement cannot name an
+enclosing refinement's element.
+
+### Iterating a dependent tuple
+
+A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one
+key collection every row shares. Planning writes it `(𝐹, 𝑔) ▷ curry_over`, where
+`𝐹 : (𝑥 : 𝑋) ⇒ (𝐷(𝑥) ⤇ 𝐷(𝑥))` gives each row its keys (`src/ccl/planning/correlated.rs`,
+`keys_family`), and op-conversion pairs each row with its own keys through `strength`
+(`src/interpreter/design-operators.md`, "A correlated inner comprehension"). A collection every
+row shares is `𝐹 = const(𝐾)`.
+
+A membership component `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}` has the image of `𝑀(𝑥)` as its keys, so `𝐹` is
+`(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`, with `𝑀(𝑥)` written in the indexed form a
+comprehension reaches lambda elimination in, `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the chain `𝑠 ≫ 𝑓`. A second
+component of any other shape, and a tuple of more than two components under one `curry`, are
+refused.
+
 ### At run time
 
 A dependent tuple has no extent, and op-conversion refuses one (`extent_of`). Each value of the
 first component has its own keys, so the tuple's entries are a family of collections rather than
-one collection, and planning is to rewrite a site that ranges over one into a site over that
-family before any operator is built. A nested `Tile::DataFunction` already keeps a separate run
-of keys per row, which is the form a family's keys take at run time.
+one collection, and planning rewrites a site that ranges over one into a site over that family
+before any operator is built ([Iterating a dependent tuple](#iterating-a-dependent-tuple)). A
+nested `Tile::DataFunction` already keeps a separate run of keys per row, and `Converse` and
+`MapDomain` act beneath standing levels, each row's collection on its own, which is how a key
+family runs per row.
 
 ### Open
 
@@ -2962,7 +3052,15 @@ of keys per row, which is the form a family's keys take at run time.
   `dom(𝑐)` indexes `𝑐`.
 - A dependent tuple as the witness of a `SubtypesOf` kind needs a membership check against the
   kind's tuple of key types.
+- Iterating a dependent tuple whose second component is a filter or a per-row list domain.
 - Comparing two dependent tuples componentwise under subtyping, which compaction's atom does not.
+- A nested refinement cannot name an enclosing refinement's element, so the projection rule has no
+  spelling where the projected tuple is a refinement's own element, as in a lifted filter. Indexing
+  element references by the refinements crossed, as `Name::PiBound` indexes function binders,
+  gives it one.
+- A pairing `⟨id, 𝑔⟩ ≫ ℎ` that reaches a type check without product β removing it compares a
+  product against the dependent tuple `ℎ` takes. Typing the pairing at that dependent tuple and
+  comparing types up to projections out of a pairing would accept it.
 
 ---
 

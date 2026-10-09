@@ -68,10 +68,18 @@ For an eligible binding, the pass substitutes the bound expression at free occur
 name and removes the `Let`. At a call whose function position is that name, including a chain of
 applications for a curried call, it reduces an application when the substituted function is a
 lambda: the argument replaces the lambda parameter in its body. If the substituted function is
-not a lambda, the application remains. Applications of unrelated anonymous lambdas are left for
-later passes. Substitution respects binders that shadow the function name and also visits
-refinement predicates stored in type slots, where a use may otherwise be missed by the ordinary
-expression walk.
+not a lambda, the application remains. Substitution respects binders that shadow the function
+name and also visits refinement predicates stored in type slots, where a use may otherwise be
+missed by the ordinary expression walk.
+
+An anonymous lambda applied to a variable is reduced when its parameter type reads an enclosing
+lambda's binder (`beta_reduce_variable_arguments`). Left to lambda elimination, such a redex
+pairs two binders that denote one value into a dependent tuple, and every type that reads either
+then has two spellings
+([One binder for one value](type-inference.md#one-binder-for-one-value)). A variable argument
+makes the reduction a rename, which duplicates no work. Every other anonymous application is left
+for later passes: lambda elimination's rules read its shape, and a group-by's partition applied
+to its key is recognized as a lambda of its own.
 
 Beta-reduction has a further condition for a refined outer parameter: the argument's type must
 entail the parameter's refinements. The pass asserts when it cannot establish that condition,
@@ -224,7 +232,7 @@ A correlated inner comprehension over a collection every row reads is the same s
 collection constant: planning rewrites its `curry(𝑔)` to `⟨id, const(𝐾)⟩ ▷ zip ≫ strength ≫
 map(𝑔)`, where `𝐾` is the collection the inner comprehension ranges over
 (`src/ccl/planning/correlated.rs`). A site whose type is dependent stays one node,
-`(𝐾, 𝑔) ▷ curry_over`, since the chain has no spelling for a domain narrowed by its input
+`(const(𝐾), 𝑔) ▷ curry_over`, since the chain has no spelling for a domain narrowed by its input
 (`src/ccl/ops.rs`, `Builtin::CurryOver`).
 
 #### A pair naming a sum's witness is refused

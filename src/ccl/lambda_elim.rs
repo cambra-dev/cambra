@@ -49,7 +49,10 @@ use crate::ccl::ccl_utils::{
 use crate::ccl::provenance;
 use crate::ccl::simplify::simplify;
 use crate::ccl::ty::FunKind;
-use crate::ccl::{BaseType, BindingTransparency, Branch, Builtin, FieldKey, Lit, Name, Refinement};
+use crate::ccl::{
+    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, CompareKind, FieldKey, Lit, Name,
+    Refinement,
+};
 use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 
 // ---------------------------------------------------------------------------
@@ -301,6 +304,113 @@ pub(crate) fn zip_pair(f: Expr, g: Expr, fun_kind: &FunKind) -> Expr {
     let zip_fn_ty = Type::compute_fun_or_hole(&inner_tuple.ty, &result_ty);
     let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
     Expr::apply(inner_tuple, zip_var).with_ty(result_ty)
+}
+
+/// Remove from the types inside `predicate` each refinement that restates `param`'s own
+/// dependent-tuple type: a later component's type opened at `param`, such as the key
+/// `param.1 : {𝐾 | __elem ∈ 𝑀(param.0)}` of `param : (𝑖 : 𝐼) × {𝐾 | __elem ∈ 𝑀(𝑖)}`.
+///
+/// Lifting the predicate onto a pair rewrites `param` to `__elem.0`, and a refinement that
+/// reads `param` inside a subterm's type binds `__elem` again, so the rewrite would capture
+/// (`subst::Subst`, `assert_no_element_capture`). A restated component fact loses nothing
+/// when removed: the pair's first component is `param`, whose type states it. Only a
+/// refinement equal as a term to one the tuple's type states is removed; any other that
+/// would capture still reaches the substitution and fails there.
+fn remove_restated_component_facts(param: &Name, param_ty: &Type, predicate: &mut TypedExpr) {
+    let Type::DepTuple(components) = param_ty.peel_refinements() else {
+        return;
+    };
+    let restated: Vec<Rc<TypedExpr>> = (1..components.len())
+        .filter_map(|k| {
+            param_ty.component_type(k, |j, ty| {
+                Expr::apply(
+                    Expr::var(param).with_ty(param_ty.clone()),
+                    Expr::proj_index(j).with_ty(Type::fun(param_ty.clone(), ty.clone())),
+                )
+                .with_ty(ty.clone())
+            })
+        })
+        .flat_map(|ty| ty.refinements().to_vec())
+        .filter(|r| is_free(param, &r.predicate))
+        .map(|r| Rc::clone(&r.predicate))
+        .collect();
+    if restated.is_empty() {
+        return;
+    }
+    fn in_type(ty: &mut Type, restated: &[Rc<TypedExpr>]) {
+        if let Type::Refinement(base, refinements) = ty
+            && refinements.iter().any(|r| {
+                restated
+                    .iter()
+                    .any(|f| crate::ccl::eq_term_modulo_ty_slots(&r.predicate, f))
+            })
+        {
+            let kept: crate::ccl::RefinementSet = refinements
+                .iter()
+                .filter(|r| {
+                    !restated
+                        .iter()
+                        .any(|f| crate::ccl::eq_term_modulo_ty_slots(&r.predicate, f))
+                })
+                .cloned()
+                .collect();
+            *ty = Type::refined((**base).clone(), kept);
+        }
+        ty.walk_children_mut(|child| in_type(child, restated));
+    }
+    fn in_expr(e: &mut TypedExpr, restated: &[Rc<TypedExpr>]) {
+        e.walk_type_slots_mut(|t| in_type(t, restated));
+        e.walk_children_mut(|child| in_expr(child, restated));
+    }
+    in_expr(predicate, &restated);
+}
+
+/// The components of a pairing `⟨𝑓₀, 𝑓₁, …⟩ ▷ zip : (𝑎 : 𝐴) ⇒ 𝑇` as terms in its input's
+/// binder: `𝑎 ▷ 𝑓ₖ`, or `𝑎` for an `id` component. `None` for any other term, and for a
+/// pairing whose type names no binder for its input, which leaves nothing to state the
+/// components in.
+pub(crate) fn pairing_components(element: &Expr) -> Option<Vec<Expr>> {
+    let Type::Fun {
+        name: Some(a),
+        domain,
+        ..
+    } = element.ty.peel_refinements()
+    else {
+        return None;
+    };
+    let TypedExprNode::Apply { argument, function } = &element.node else {
+        return None;
+    };
+    if !matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)) {
+        return None;
+    }
+    let TypedExprNode::Tuple(fs) = &argument.node else {
+        return None;
+    };
+    let _g = provenance::enter(
+        element.node_id(),
+        "pairing.components",
+        provenance::Nature::Machinery,
+    );
+    let input = Expr::var(a).with_ty((**domain).clone());
+    Some(
+        fs.iter()
+            .map(|f| match &f.node {
+                TypedExprNode::Builtin(Builtin::Id) => input.clone(),
+                _ => {
+                    let cod = match f.ty.peel_refinements() {
+                        Type::Fun {
+                            name: Some(b),
+                            codomain,
+                            ..
+                        } => crate::ccl::subst::discharge_codomain(b, &input, codomain),
+                        _ => f.ty.codomain().unwrap_or(Type::Hole),
+                    };
+                    Expr::apply(input.clone(), f.clone()).with_ty(cod)
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Build `curry(f)`: `f ▷ curry` = `Apply { argument: f, function: Builtin(Curry) }`.
@@ -841,10 +951,11 @@ fn elim_lambda_kinded(
 }
 
 /// Whether `ty` is a collection whose own domain reads `param`. A refinement there decides
-/// which entries the collection has, a comprehension's filter say, so a body of that type
-/// varies with `param` and is not constant in it. Only the body's own domain counts: a
-/// collection it holds is a value its type describes, and a function's domain is what it
-/// takes.
+/// which entries the collection has, a comprehension's filter or a group-by key's membership
+/// say, so a body of that type varies with `param` and is not constant in it
+/// (`src/ccl/design/type-inference.md`, "A refinement on a collection's domain is data"). Only
+/// the body's own domain counts: a collection it holds, such as a group whose domain reads a
+/// key, is the family a Pi-constant type encodes, and a function's domain is what it takes.
 fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
     matches!(
         ty.peel_refinements(),
@@ -892,6 +1003,30 @@ fn refine_filtering_casts(param: &Name, expr: &mut Expr) -> bool {
     }
     expr.walk_children_mut(|child| rewrote |= refine_filtering_casts(param, child));
     rewrote
+}
+
+/// Whether a cast target's refinement reads `param` other than as the bare comparand of an
+/// equation: `𝑒 ▷ key == param` with `key` closed reads it only as the key a group is
+/// selected by, and anything else reads it inside the filter.
+fn key_reads(param: &Name, target: &Type) -> bool {
+    let Some(refinements) = cast_target_refinement(target) else {
+        return false;
+    };
+    refinements.iter().any(|r| {
+        if !is_free(param, &r.predicate) {
+            return false;
+        }
+        let TypedExprNode::BinOp {
+            left,
+            op: BinOpKind::Compare(CompareKind::Equals),
+            right,
+        } = &r.predicate.node
+        else {
+            return true;
+        };
+        let is_param = |e: &Expr| matches!(&e.node, TypedExprNode::Var(n) if n == param);
+        !((is_param(right) && !is_free(param, left)) || (is_param(left) && !is_free(param, right)))
+    })
 }
 
 /// The lambda a cast-wrapped lambda denotes: `cast(λ 𝑦 : {𝐷 | 𝑟} → body, {𝐷 | 𝑝} ⤇ 𝑉)` is
@@ -1110,7 +1245,16 @@ fn elim_lambda_impl(
             // A `y_ty` naming the inner lambda's witness escapes the Σ binding it here.
             // [`compose_sum_generators`] keeps a generator over a sum from reaching this rule,
             // and [`refuse_escaped_pair_witness`] refuses any other `curry` that keeps one.
-            let bare_pair = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
+            //
+            // **A `y_ty` still reading `param` makes the pair a dependent tuple.** What
+            // stays on it is a membership refinement, which says which keys exist for this
+            // `param`, so the second component's type is chosen by the first's value
+            // (`src/ccl/design/type-inference.md`, "Where a dependent tuple is born").
+            let bare_pair = Type::dep_tuple(vec![
+                (Some(param.clone()), param_ty.clone()),
+                (Some(y.clone()), y_ty.clone()),
+            ]);
+            let dependent = matches!(bare_pair, Type::DepTuple(_));
             let pair_ty = {
                 let onto_pair = |predicate: &Rc<TypedExpr>| {
                     let at = |index: usize, ty: &Type| {
@@ -1134,6 +1278,7 @@ fn elim_lambda_impl(
                     .into_iter()
                     .map(|mut r| {
                         ctx.pair_lifts.rebuild(&mut r, &key, |predicate| {
+                            remove_restated_component_facts(param, param_ty, predicate);
                             *predicate = onto_pair(&Rc::new(predicate.clone()));
                             true
                         });
@@ -1153,17 +1298,35 @@ fn elim_lambda_impl(
             // Also annotate the pair variable itself so that the identity rule in
             // the recursive call can produce a typed `id` morphism.
             let proj0_ty = Type::fun(pair_ty.clone(), param_ty.clone());
-            let proj1_ty = Type::fun(pair_ty.clone(), y_ty.clone());
             let sub_x = Expr::apply(
                 Expr::var(&pair).with_ty(pair_ty.clone()),
                 Expr::proj_index(0).with_ty(proj0_ty.clone()),
             )
             .with_ty(param_ty.clone());
+            // `.1` out of a dependent tuple is a Pi: its type is the second component
+            // opened at the pair's first.
+            let (y_at_pair, proj1_ty) = if dependent {
+                let at = |p: &Name| {
+                    let first = Expr::apply(
+                        Expr::var(p).with_ty(pair_ty.clone()),
+                        Expr::proj_index(0).with_ty(proj0_ty.clone()),
+                    )
+                    .with_ty(param_ty.clone());
+                    crate::ccl::subst::Subst::discharge(param.clone(), first).apply_type(&y_ty)
+                };
+                // The projection's binder is `pair`, as every morphism eliminated from
+                // `λ pair → …` binds it: what follows in a chain reads it by that name.
+                let y_at_pair = at(&pair);
+                let proj1_ty = Type::pi(pair.clone(), pair_ty.clone(), y_at_pair.clone());
+                (y_at_pair, proj1_ty)
+            } else {
+                (y_ty.clone(), Type::fun(pair_ty.clone(), y_ty.clone()))
+            };
             let sub_y = Expr::apply(
                 Expr::var(&pair).with_ty(pair_ty.clone()),
                 Expr::proj_index(1).with_ty(proj1_ty.clone()),
             )
-            .with_ty(y_ty.clone());
+            .with_ty(y_at_pair);
             let merged = substitute(substitute(*inner_body, &y, &sub_y), param, &sub_x);
 
             // The merged pair morphism is the uncurried form of the same nested
@@ -1207,7 +1370,14 @@ fn elim_lambda_impl(
             // Re-targeting the cast onto the eliminated morphism instead does not
             // typecheck: it narrows a data function's domain inside a codomain, and
             // a collection's domain is its data, so no subtyping edge admits that.
-            if is_free(param, &value) {
+            //
+            // **A key function reading `param` makes the partition a filter.** The
+            // group-by planner buckets a partition `key(𝑒) == param` by a closed `key`;
+            // where `key` itself reads `param` — a group-by under a loop whose key reads
+            // the loop's binder — no one bucketing serves every `param`, and the
+            // refinement is a filter on the inner binder that reads the outer one, which
+            // the nested-lambda rule lifts onto the pair.
+            if is_free(param, &value) || key_reads(param, &target) {
                 let refined = refined_lambda(*value, &target, body_ty.clone());
                 return elim_lambda_kinded(ctx, param, param_ty, refined, fun_kind);
             }

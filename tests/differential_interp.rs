@@ -326,6 +326,35 @@ fn a_feed_under_nested_loops(#[case] source: &str) {
     agree(source);
 }
 
+/// A group-by under a loop whose key reads the loop's binder. The groups' keys differ per
+/// iteration, so the group-by is a dependent family: for each loop position, the keys the
+/// key function produces there (`src/ccl/design/type-inference.md`, "4.8 Dependent
+/// tuples").
+#[rstest]
+#[case::every_key_is_the_binder(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> i)])
+"#})]
+#[case::the_group_count_varies(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([1 for g in groupby([1, 2, 3], \e -> e // i)])
+"#})]
+#[case::each_group_aggregated(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> i)])
+"#})]
+#[case::the_group_and_the_binder_both_read(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2, 3]:
+        out << sum([max(g) * i for g in groupby([1, 2, 3, 4], \e -> e // i)])
+"#})]
+fn a_group_by_whose_key_reads_the_loop_binder(#[case] source: &str) {
+    agree(source);
+}
+
 /// A two-clause comprehension whose value reads neither binder.
 #[test]
 fn a_constant_two_clause_comprehension() {

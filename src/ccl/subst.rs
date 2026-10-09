@@ -1190,6 +1190,11 @@ impl Subst {
     }
 
     fn rewrite_type_go(&self, ty: &mut Type, memo: &PredMemo<Subst>) {
+        if let Type::Refinement(_, refinements) = ty {
+            refinements
+                .iter()
+                .for_each(|r| self.assert_no_element_capture(r));
+        }
         match ty {
             Type::BoundedHole(t) => self.rewrite_type_go(t, memo),
             Type::Base(_)
@@ -1337,6 +1342,35 @@ impl Subst {
         (binder.clone(), restricted)
     }
 
+    /// Refuse a rewrite of `r` that would capture: the substitution acts on `r`'s predicate
+    /// and a term it puts there reads [`Name::elem`], which inside `r` is `r`'s own element.
+    ///
+    /// Lifting a filter onto a pair is the substitution whose terms read the element —
+    /// `𝑥 ↦ __elem.0`, the pair's element being the outer `__elem` — and a refinement nested
+    /// in that predicate's subterm types binds `__elem` again. A nested refinement cannot
+    /// name an enclosing refinement's element, so the rewrite has no spelling, and both
+    /// silent answers are wrong: the captured term reads the nested element, and dropping
+    /// the refinement deletes a filter where it sits on a collection's domain. A lift that
+    /// can remove what would be captured does so before it substitutes
+    /// (`lambda_elim`'s nested-lambda rule removes a dependent tuple's restated component
+    /// facts).
+    ///
+    /// TODO: the general fix is to let a refinement name an enclosing refinement's element,
+    /// with element references indexed by the refinements crossed as `Name::PiBound`
+    /// indexes function binders, so the lift writes the enclosing element and nothing is
+    /// removed. Every reader of `__elem` — substitution, the SMT encoding, predicate
+    /// compilation, and the closing and opening walks — would read the index.
+    fn assert_no_element_capture(&self, r: &crate::ccl::Refinement) {
+        let restricted = self.shadow(&Name::elem());
+        assert!(
+            !(restricted.range_mentions(&Name::elem()) && restricted.acts_on(&r.predicate)),
+            "a substitution whose terms read `__elem` reaches a nested refinement it acts on, \
+             `{}`: the rewrite would capture the nested element, and no spelling names the \
+             enclosing one",
+            crate::ccl::symbolic::symbolic(&r.predicate),
+        );
+    }
+
     /// Rewrite a refinement's predicate by this substitution. A no-op clone
     /// under the identity.
     ///
@@ -1355,8 +1389,9 @@ impl Subst {
         // so the substitution acts *under* that binder: shadow it (drop it from
         // the domain) before rewriting the predicate. Unlike an ordinary binder
         // it is never α-renamed — every refinement shares the one global name,
-        // and a predicate only ever references its *own* element through it, so
-        // there is no capture to avoid.
+        // and a predicate only ever references its *own* element through it. A
+        // substitution whose terms read the element would capture here, which the
+        // type walks refuse before reaching this ([`Self::assert_no_element_capture`]).
         let restricted = self.shadow(&Name::elem());
         // Vacuous (no substituted binder occurs free anywhere in the
         // predicate — value or nested type slots): keep the original
@@ -1544,7 +1579,10 @@ impl Subst {
                     self.apply_type(base),
                     refinements
                         .iter()
-                        .map(|r| self.force_refinement(r))
+                        .map(|r| {
+                            self.assert_no_element_capture(r);
+                            self.force_refinement(r)
+                        })
                         .collect(),
                 )
             }
@@ -1994,6 +2032,71 @@ pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
     out
 }
 
+/// Visit `ty`'s structural children as a reader under their binders sees them: a named
+/// function's codomain opened at its binder, and a dependent tuple's component opened at
+/// the names of the components before it. Every other child is visited as stored. The
+/// walk for code that reads the terms a type holds — a predicate typed or compiled must
+/// read its binders as names, since its subterms' types are carried into new function
+/// types (`src/ccl/design/type-inference.md`, "Where the conversions run").
+///
+/// A child visited as stored is borrowed, and an opened one is a fresh copy, owned.
+pub fn walk_children_opened<'t>(ty: &'t Type, mut visit: impl FnMut(Cow<'t, Type>)) {
+    match ty {
+        Type::Fun {
+            name: Some(b),
+            fun_kind,
+            domain,
+            codomain,
+        } => {
+            for w in fun_kind.witnesses() {
+                for t in w.types() {
+                    visit(Cow::Borrowed(t));
+                }
+            }
+            visit(Cow::Borrowed(domain));
+            if references_enclosing_function(codomain) {
+                visit(Cow::Owned(open_pi_binder(
+                    &Mapping::Rename(b.clone()),
+                    codomain,
+                )));
+            } else {
+                visit(Cow::Borrowed(codomain));
+            }
+        }
+        Type::DepTuple(components) => {
+            let names = tuple_component_names(components);
+            for opened in
+                open_tuple_components(components, |j, _| Mapping::Rename(names[j].clone()))
+            {
+                visit(Cow::Owned(opened));
+            }
+        }
+        _ => ty.walk_children(|child| visit(Cow::Borrowed(child))),
+    }
+}
+
+/// A name for each component of a dependent tuple, to open the components after it at: its
+/// own, or a fresh one for a component stored without one.
+pub fn tuple_component_names(components: &[(Option<Name>, Type)]) -> Vec<Name> {
+    components
+        .iter()
+        .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__component")))
+        .collect()
+}
+
+/// Run `edit` on a stored codomain in its opened form and store the result closed again:
+/// the form a rewrite of a function's codomain works in (`src/ccl/design/type-inference.md`,
+/// "Where the conversions run"). A rewrite that reads the stored form instead carries the
+/// codomain's indices under whatever crossings it adds, where they name another function.
+pub fn map_opened_codomain(binder: &Name, codomain: &mut Type, edit: impl FnOnce(&mut Type)) {
+    if !references_enclosing_function(codomain) {
+        return edit(codomain);
+    }
+    let mut opened = open_pi_binder(&Mapping::Rename(binder.clone()), codomain);
+    edit(&mut opened);
+    *codomain = close_pi_binder(binder, &opened);
+}
+
 /// Close each dependent-tuple component's references to the names of the
 /// components before it into indices: component `𝑘` reaches component `𝑗` at
 /// `𝑘 − 1 − 𝑗` (`src/ccl/design/type-inference.md`, "Representation"). Indices
@@ -2039,6 +2142,59 @@ pub fn open_tuple_components(
         opened.push(ty);
     }
     opened
+}
+
+/// Rewrite each projection `binder.𝑘` in `ty`'s predicates to `components[𝑘]`, where
+/// `binder` names the value a pairing `⟨𝑓₀, 𝑓₁, …⟩` built, so `components[𝑘]` is `𝑎 ▷ 𝑓ₖ`
+/// for its input `𝑎`. A bare reference to `binder` stays. The rewrite a pass performs where
+/// it removes the binder of a pairing's value, so nothing reads that binder after it.
+pub fn rewrite_pairing_projections(binder: &Name, components: &[TypedExpr], ty: &mut Type) {
+    fn in_type(ty: &mut Type, binder: &Name, components: &[TypedExpr]) {
+        if let Type::Refinement(_, refinements) = ty {
+            refinements.rewrite_each(|_, r| {
+                let _g = crate::ccl::provenance::enter(
+                    r.predicate.node_id(),
+                    "predicate.pairing",
+                    crate::ccl::provenance::Nature::Machinery,
+                );
+                let mut pred = (*r.predicate).clone();
+                if in_expr(&mut pred, binder, components) {
+                    *r = crate::ccl::Refinement::born(Rc::new(pred));
+                }
+            });
+        }
+        ty.walk_children_mut(|c| in_type(c, binder, components));
+    }
+    // Top-down, so a component standing where `binder.𝑘` stood is not read again as
+    // a projection out of the binder.
+    fn in_expr(e: &mut TypedExpr, binder: &Name, components: &[TypedExpr]) -> bool {
+        if let TypedExprNode::Apply { argument, function } = &e.node
+            && is_var_named(argument, binder)
+            && let TypedExprNode::Proj(crate::ccl::ProjKey::Index(k)) = function.node
+            && let Some(component) = components.get(k)
+        {
+            *e = component.clone();
+            return true;
+        }
+        let mut changed = false;
+        e.walk_type_slots_mut(|t| {
+            let before = t.clone();
+            in_type(t, binder, components);
+            changed |= *t != before;
+        });
+        e.walk_children_mut(|c| changed |= in_expr(c, binder, components));
+        changed
+    }
+    in_type(ty, binder, components);
+}
+
+/// `codomain` opened at `binder`, the function it was read off binding that name.
+fn open_codomain_at(binder: &Name, codomain: &Type) -> Type {
+    if references_enclosing_function(codomain) {
+        open_pi_binder(&Mapping::Rename(binder.clone()), codomain)
+    } else {
+        codomain.clone()
+    }
 }
 
 /// A morphism's `codomain` in the form its *consumer* speaks: descent
@@ -2133,12 +2289,22 @@ impl<'a> PiWalk<'a> {
                 .for_each(|t| self.ty(t, depth)),
             Type::BoundedHole(t) => self.ty(t, depth),
             Type::Fun {
-                domain, codomain, ..
+                name,
+                domain,
+                codomain,
+                ..
             } => {
                 // A binder scopes over its codomain only: the domain stays at
-                // the enclosing depth, the codomain is one crossing deeper.
+                // the enclosing depth, the codomain is one crossing deeper. A name
+                // reference beneath it to its own spelling is its own, so closing
+                // leaves it to that binder.
                 self.ty(domain, depth);
+                let base = self.shadowed.len();
+                if let Some(b) = name {
+                    self.shadowed.push(b.clone());
+                }
                 self.ty(codomain, depth + 1);
+                self.shadowed.truncate(base);
             }
             Type::Refinement(base, refinements) => {
                 self.ty(base, depth);
@@ -2147,9 +2313,14 @@ impl<'a> PiWalk<'a> {
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             // Component `𝑘` sits inside the scopes of the `𝑘` components before it.
             Type::DepTuple(cs) => {
-                for (k, (_, t)) in cs.iter_mut().enumerate() {
+                let base = self.shadowed.len();
+                for (k, (name, t)) in cs.iter_mut().enumerate() {
                     self.ty(t, depth + k as u32);
+                    if let Some(b) = name {
+                        self.shadowed.push(b.clone());
+                    }
                 }
+                self.shadowed.truncate(base);
             }
             Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
             Type::Variant(tags, _) => tags.iter_mut().for_each(|(_, t)| self.ty(t, depth)),
@@ -2385,6 +2556,12 @@ pub fn codomain_depends_on(binder: &Name, codomain: &Type) -> bool {
 /// neither form comes back unchanged, so a caller need not case-split on whether the
 /// codomain is dependent at all.
 pub fn discharge_codomain(binder: &Name, argument: &TypedExpr, codomain: &Type) -> Type {
+    // Applied to its own binder's name, as a projection `𝑝 ▷ .1` typed
+    // `(𝑝 : 𝑇) ⇒ 𝐶(𝑝.0)` is: the discharge is the identity, which is the descent
+    // under the binder.
+    if is_var_named(argument, binder) {
+        return open_codomain_at(binder, codomain);
+    }
     let opened = if references_enclosing_function(codomain) {
         open_pi_binder(
             &Mapping::Discharge(Box::new(argument.clone_preserving_ids())),
@@ -3367,6 +3544,16 @@ mod locally_nameless_tests {
             Type::dep_tuple(components).to_string(),
             "(i : Int) × (j : {Int | i}) × {Int | (i, j)}",
         );
+    }
+
+    /// A substitution whose terms read `__elem`, reaching a nested refinement it acts on,
+    /// fails rather than capture the nested element.
+    #[test]
+    #[should_panic(expected = "would capture the nested element")]
+    fn a_substitution_reading_the_element_does_not_capture() {
+        let x = Name::fresh("x");
+        let lifted = TypedExpr::apply(TypedExpr::var(Name::elem()), TypedExpr::proj_index(0));
+        Subst::discharge(x.clone(), lifted).apply_type(&refined(TypedExpr::var(x)));
     }
 
     /// Two α-variant codomains close to structurally identical types — the

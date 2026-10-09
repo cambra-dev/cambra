@@ -38,7 +38,7 @@
 //!
 //! **A dependent site stays one node.** A correlated filter narrows the inner domain by the
 //! outer value, so `curry(𝑔)`'s type is `(𝑟 : 𝑋) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑊)`, and the chain has
-//! no spelling for it. Such a site becomes `(𝐾, 𝑔) ▷ curry_over` under that type
+//! no spelling for it. Such a site becomes `(const(𝐾), 𝑔) ▷ curry_over` under that type
 //! ([`Builtin::CurryOver`]), and op-conversion builds the operators the chain compiles to.
 
 use super::*;
@@ -111,6 +111,21 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     if !is_builtin(function, Builtin::Curry) || matches!(g.node, TypedExprNode::Builtin(_)) {
         return Ok(None);
     }
+    // **A dependent tuple's entries are a family**: for each enclosing value, the keys of
+    // the component its type picks (`src/ccl/design/type-inference.md`, "Iterating a
+    // dependent tuple"). The site pairs each enclosing value with its own keys rather
+    // than with one collection every row shares.
+    if let Some(Type::DepTuple(components)) = g.ty.domain().map(|d| d.peel_refinements().clone()) {
+        let family = keys_family(&components)?;
+        let family_ty = family.ty.clone();
+        let pair = Expr::tuple(vec![family, g.as_ref().clone_preserving_ids()])
+            .with_ty(Type::Tuple(vec![family_ty, g.ty.clone()]));
+        return Ok(Some(apply_primitive(
+            pair,
+            Builtin::CurryOver,
+            expr.ty.clone(),
+        )));
+    }
     let Some(Type::Tuple(pair)) = g.ty.domain() else {
         return Err(format!(
             "a curried morphism takes the pair of what it is curried over and what it \
@@ -161,8 +176,9 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     // **A dependent site** — a correlated filter narrows the inner domain by the outer
     // value, `(𝑟 : 𝑋) ⇒ ({𝑣 : 𝐷 | 𝑣 > 𝑟} ⤇ 𝑊)` — has no spelling as a chain: the narrowed
     // domain names the chain's input, which no element after the first takes. It stays one
-    // node, `(𝐾, 𝑔) ▷ curry_over`, under `curry`'s own type, and op-conversion builds the
-    // same operators the chain compiles to.
+    // node, `(const(𝐾), 𝑔) ▷ curry_over`, under `curry`'s own type, and op-conversion builds
+    // the same operators the chain compiles to. The keys are the family every row shares,
+    // `const(𝐾)`, as a dependent tuple's are the family [`keys_family`] builds.
     if let Type::Fun {
         name: Some(binder),
         codomain,
@@ -170,9 +186,15 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     } = &expr.ty
         && crate::ccl::subst::codomain_depends_on(binder, codomain)
     {
-        let keys_ty = keys.ty.clone();
-        let pair = Expr::tuple(vec![keys, g.as_ref().clone_preserving_ids()])
-            .with_ty(Type::Tuple(vec![keys_ty, g.ty.clone()]));
+        let collection = keys.ty.clone();
+        let family = apply_primitive(
+            keys,
+            Builtin::Const,
+            Type::fun(enclosing.clone(), collection),
+        );
+        let family_ty = family.ty.clone();
+        let pair = Expr::tuple(vec![family, g.as_ref().clone_preserving_ids()])
+            .with_ty(Type::Tuple(vec![family_ty, g.ty.clone()]));
         return Ok(Some(apply_primitive(
             pair,
             Builtin::CurryOver,
@@ -214,6 +236,109 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     Ok(Some(
         Expr::compose(vec![with_keys, strength, map]).with_ty(expr.ty.clone()),
     ))
+}
+
+/// The morphism taking an enclosing value `𝑥` to the keys of a dependent tuple's second
+/// component at `𝑥`, as a collection holding its keys as its values: `𝐹 : (𝑥 : 𝑋) ⇒ (𝐷(𝑥) ⤇
+/// 𝐷(𝑥))`.
+///
+/// The component is read under a name for `𝑥`. A membership refinement `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}`
+/// states the keys as the image of the collection `𝑀(𝑥)`, so the keys are
+/// `map_domain(converse(𝑀(𝑥)))`, and `𝐹` is `(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`.
+fn keys_family(components: &[(Option<Name>, Type)]) -> Result<Expr, String> {
+    let [(name, enclosing), (_, component)] = components else {
+        return Err(format!(
+            "a dependent tuple of {} components under one `curry` is not supported yet",
+            components.len()
+        ));
+    };
+    let x = name.clone().unwrap_or_else(|| Name::fresh("__x"));
+    let component = crate::ccl::subst::open_pi_binder(
+        &crate::ccl::subst::Mapping::Rename(x.clone()),
+        component,
+    );
+    let image = component
+        .refinements()
+        .iter()
+        .find_map(|r| {
+            r.membership_collection()
+                .filter(|collection| ccl_utils::is_free(&x, collection))
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "a dependent tuple whose second component {component} is not a membership \
+                 reading the first is not supported yet"
+            )
+        })?;
+    let keys = component.peel_refinements().clone();
+    let indices = image
+        .ty
+        .domain()
+        .ok_or_else(|| format!("a membership's collection is a function, got {}", image.ty))?;
+    let image_ty = image.ty.clone();
+    // Indexed, as a comprehension reaches lambda elimination: `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the
+    // chain `𝑠 ≫ 𝑓`, so the collection per `𝑥` is a correlated site planning rewrites
+    // through `strength` rather than a `compose` of morphisms.
+    let r = Name::fresh("__iter_record");
+    let elements = match image.node {
+        TypedExprNode::Compose(elements) => elements,
+        node => vec![TypedExpr { node, ..image }],
+    };
+    let indexed = elements
+        .into_iter()
+        .fold(Expr::var(&r).with_ty(indices.clone()), |acc, f| {
+            let ty = f.ty.codomain().unwrap_or_else(|| {
+                panic!(
+                    "a step of a membership's collection is a function, got {}",
+                    f.ty
+                )
+            });
+            Expr::apply(acc, f).with_ty(ty)
+        });
+    let mut per_row = lambda_elim::run(
+        Expr::lambda(
+            &x,
+            enclosing.clone(),
+            Expr::lambda(&r, indices.clone(), indexed).with_ty(image_ty.clone()),
+        )
+        .with_ty(Type::pi(x.clone(), enclosing.clone(), image_ty.clone())),
+    )
+    .map_err(|e| format!("eliminating a dependent tuple's key collection: {e:?}"))?;
+    // **The head binds `𝑥` for the whole chain**, whether or not its own codomain reads it:
+    // the keys `map_domain` yields are the component at `𝑥`, so its type does, and a
+    // chain scopes a morphism's binder over every morphism after it.
+    if let Type::Fun {
+        fun_kind,
+        domain,
+        codomain,
+        ..
+    } = &per_row.ty
+    {
+        per_row.ty = Type::pi_kinded(
+            x.clone(),
+            (**domain).clone(),
+            (**codomain).clone(),
+            fun_kind.clone(),
+        );
+    }
+    let groups = Type::data_fun(
+        keys.clone(),
+        Type::data_fun(indices.clone(), indices.clone()),
+    );
+    let converse = Expr::builtin(Builtin::Converse).with_ty(Type::fun(image_ty, groups.clone()));
+    let key_set = Type::data_fun(component.clone(), component.clone());
+    let map_domain = Expr::builtin(Builtin::MapDomain).with_ty(Type::fun(groups, key_set.clone()));
+    // Only the family itself binds `𝑥`, so only its type closes it. `converse` and
+    // `map_domain` read it by name, as every morphism after a dependent head of a chain
+    // reads that head's binder.
+    Ok(
+        Expr::compose(vec![per_row, converse, map_domain]).with_ty(Type::pi(
+            x,
+            enclosing.clone(),
+            key_set,
+        )),
+    )
 }
 
 /// `component` with only its membership refinements: the domain of the collection

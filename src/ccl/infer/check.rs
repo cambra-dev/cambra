@@ -957,11 +957,13 @@ fn check_predicates(
     expr: &Expr,
     ctx: &mut CheckCtx,
     visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+    kept: &mut Vec<Type>,
 ) {
     fn in_type(
         ty: &Type,
         ctx: &mut CheckCtx,
         visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+        kept: &mut Vec<Type>,
     ) {
         // **A Σ binds its witnesses over everything below it**, the predicate on its domain
         // included, so Γ gains them here and loses them on the way out. This walk reaches a
@@ -972,7 +974,7 @@ fn check_predicates(
             let inner = ctx.witness_ctx.extended(&binders);
             std::mem::replace(&mut ctx.witness_ctx, inner)
         });
-        in_type_go(ty, ctx, visited);
+        in_type_go(ty, ctx, visited, kept);
         if let Some(outer) = outer {
             ctx.witness_ctx = outer;
         }
@@ -981,6 +983,7 @@ fn check_predicates(
         ty: &Type,
         ctx: &mut CheckCtx,
         visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
+        kept: &mut Vec<Type>,
     ) {
         if let Type::Refinement(base, refinements) = ty {
             for r in refinements {
@@ -1017,13 +1020,24 @@ fn check_predicates(
                         crate::ccl::symbolic::symbolic_typed(&r.predicate)
                     );
                 }
-                check_predicates(&r.predicate, ctx, visited);
+                check_predicates(&r.predicate, ctx, visited, kept);
             }
         }
-        ty.walk_children(|child| in_type(child, ctx, visited));
+        // Under each binder the predicates read it by name, as a term does. An opened
+        // child is a copy, and `visited` keys predicates by address, so each copy is kept
+        // alive in `kept` for the rest of the walk: one freed mid-walk lends its address
+        // to a later predicate, which would then be skipped as already checked. A child
+        // visited as stored lives in the tree and needs no keeping.
+        crate::ccl::subst::walk_children_opened(ty, |child| match child {
+            std::borrow::Cow::Borrowed(child) => in_type(child, ctx, visited, kept),
+            std::borrow::Cow::Owned(child) => {
+                in_type(&child, ctx, visited, kept);
+                kept.push(child);
+            }
+        });
     }
-    expr.walk_type_slots(|ty| in_type(ty, ctx, visited));
-    expr.walk_children(|child| check_predicates(child, ctx, visited));
+    expr.walk_type_slots(|ty| in_type(ty, ctx, visited, kept));
+    expr.walk_children(|child| check_predicates(child, ctx, visited, kept));
 }
 
 /// The rule for [`Builtin::Strength`]: `(𝑋, 𝐶) ⇒ 𝐶′`, where `𝐶′` is `𝐶` over the same keys,
@@ -1104,7 +1118,7 @@ pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     if let Err(e) = check_node(&mut cloned, &mut ctx) {
         ctx.errors.push(e);
     }
-    check_predicates(&cloned, &mut ctx, &mut Default::default());
+    check_predicates(&cloned, &mut ctx, &mut Default::default(), &mut Vec::new());
     if ctx.errors.is_empty() {
         Ok(())
     } else {
