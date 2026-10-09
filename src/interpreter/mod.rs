@@ -42,10 +42,11 @@ use std::rc::Rc;
 // Consumer Protocol
 // ============================================================================
 
-/// A Consumer receives notifications from a producer.
-/// A notification always means new data is available; the consumer should call `get()`.
+/// Receives a signal to pull a producer again; notifications carry no tile data.
+/// Deferred or coalesced notifications need not correspond one-to-one with changed results.
+/// See `src/interpreter/design-operators.md`, "The notification contract".
 pub trait Consumer {
-    /// Notify the consumer that new data is available.
+    /// Notify the consumer that it should pull again.
     fn notify(&mut self);
 }
 
