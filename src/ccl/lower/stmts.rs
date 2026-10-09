@@ -1375,7 +1375,7 @@ pub(super) fn declare_type_params(
         }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
-        ctx.declare_type_param(name, Type::Param(Rc::clone(&param)));
+        ctx.declare_type_throughout(name, Type::Param(Rc::clone(&param)));
         ctx.type_params_in_scope.push(name.to_string());
         declared.push(crate::ccl::ty::PolyParam {
             param,
@@ -1449,7 +1449,7 @@ fn lower_bound(
         .iter()
         .map(|tp| {
             let p = crate::ccl::ty::TypeParam::declared(tp.name.as_str());
-            ctx.declare_type_param(tp.name.as_str(), Type::Param(Rc::clone(&p)));
+            ctx.declare_type_throughout(tp.name.as_str(), Type::Param(Rc::clone(&p)));
             (p.id, tp.name.as_str())
         })
         .collect();
@@ -1791,19 +1791,9 @@ pub(super) fn lower_type_expr_or_poly(
             }
         }
         // A type member of another module (`docs/chl-spec.md`, "9.6 Qualified
-        // references").
-        ChlExpr::Qualified(q) => Err(LoweringError::unsupported(
-            annotation.span,
-            format!(
-                "the type member `{}::{}` is not supported yet",
-                q.qualifier
-                    .iter()
-                    .map(|s| s.node.as_str())
-                    .collect::<Vec<_>>()
-                    .join("::"),
-                q.name.node
-            ),
-        )),
+        // references"). One whose module has errors of its own names no type, and
+        // stands for any.
+        ChlExpr::Qualified(q) => Ok(ctx.type_member(q, annotation.span)?.unwrap_or(Type::Hole)),
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).

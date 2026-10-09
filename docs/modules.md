@@ -1,9 +1,9 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first three items of the [Implementation
-> stack](#implementation-stack) are implemented, the first two parts of the fourth, importing values
-> and `use` clauses ([Imports](#imports)), and a shared run's member's `home` ([Names carry their
-> home](#names-carry-their-home)).
+> stack](#implementation-stack) are implemented, the first three parts of the fourth, importing
+> values, `use` clauses, and type aliases ([Imports](#imports)), and a shared run's member's `home`
+> ([Names carry their home](#names-carry-their-home)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -110,10 +110,9 @@ whose copies of a module mint fresh binders at link time.
 Two changes to `Name` (`src/ccl/names.rs`):
 
 - **`Name::Member { owner, base }`**, a new raw form. `owner` is a module path, a run name, or a
-  Module-typed parameter, as written. Lowering builds it for a qualified reference, for a name a
-  `use` clause on a run binds, and for a free name of an exported alias's predicate ([Imported
-  aliases are closed over their module](#imported-aliases-are-closed-over-their-module)). It exists
-  only between lowering and linking, and one remaining after linking is a compiler defect, asserted.
+  Module-typed parameter, as written. Lowering builds it for a qualified reference to a run's member
+  and for a name a `use` clause on a run binds. It exists only between lowering and linking, and one
+  remaining after linking is a compiler defect, asserted.
 - **`Name::Unique { base, uid, home }`**, where `home` is the run a member belongs to:
   `Shared(module_path)` for a shared run's member, `Run(run_path)` for a member of a run a `run`
   statement declares, and absent for a local. Identity remains the `uid`. `home` is metadata of the
@@ -212,9 +211,9 @@ each file's parse, the module graph, and the link order. Every compile entry poi
 
 ### Imports
 
-Importing values is implemented: `import m` and `import a::b as c`, `use` clauses on an `import`,
-`pub` on value bindings and `def`s, and `m::f` as a value, a callee, and a qualifier of labels and
-tags.
+Importing values and type aliases is implemented: `import m` and `import a::b as c`, `use` clauses
+on an `import`, `pub` on value bindings, `def`s and type aliases, `m::f` as a value, a callee, and a
+qualifier of labels and tags, and `m::T` as a type.
 
 - **An imported module lowers to a chain.** `lower_library` lowers its top-level statements, each
   wrapping the next, around `MODULE_BODY`, a placeholder for the code of the modules that import it.
@@ -223,14 +222,16 @@ tags.
   importer lowers.
 - **An interface holds minted names.** `Interface` (`src/ccl/lower/modules.rs`) maps each
   top-level binding to the binder its chain minted, with its visibility and declaration. `m::f`
-  lowers to that binder. A private member is an error with a label at its declaration, and a
-  missing one is an error.
-- **`use`.** A `use` item reaches its member as `m::f` does, and its name resolves through the
-  module's uniquify scope ([`use` names are environment entries, not
+  lowers to that binder. It also maps each top-level type alias to its type, which `m::T` lowers to
+  ([Imported aliases are closed over their module](#imported-aliases-are-closed-over-their-module)).
+  A private member is an error with a label at its declaration, and a missing one is an error.
+- **`use`.** A `use` item reaches its member as `m::f` or `m::T` does. A value's name resolves
+  through the module's uniquify scope, and a type's is an alias in scope throughout the module
+  ([`use` names are environment entries, not
   bindings](#use-names-are-environment-entries-not-bindings)). A member spelled like a `use` name is
-  an error, and so is a `use` name spelled like an import name, another `use` name, or a builtin. A
-  builtin call resolves by its spelling before scope (`lower_call`), so a `use` name spelled like
-  one would never reach its member.
+  an error, and so is a `use` name spelled like an import name, another `use` name, a builtin, or a
+  built-in type. A builtin call resolves by its spelling before scope (`lower_call`), so a `use`
+  name spelled like one would never reach its member.
 - **Linking** replaces each placeholder with the code below it: every imported module once, in
   link order, around the root, the first in link order outermost.
 - **IO.** A module that declares a sink lowers nothing, and lowering records a module's first read
@@ -239,10 +240,9 @@ tags.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
   label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
   every module ([Names carry their home](#names-carry-their-home)).
-- **Refused:** type members (`m::T` and `use T`), a module as a value, an imported module's
-  mutable state and top-level loops and expression statements, a call to an imported `def` with a
-  `Mut` parameter, and a member of a run. The later parts of the Imports item, and the later items,
-  lift these.
+- **Refused:** a module as a value, an imported module's mutable state and top-level loops and
+  expression statements, a call to an imported `def` with a `Mut` parameter, and a member of a run.
+  The last part of the Imports item, and the later items, lift these.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
@@ -279,20 +279,17 @@ it.
 
 ### Imported aliases are closed over their module
 
-Today an alias use is replaced by the lowered `Type` of its right-hand side
-(`pre_declare_type_aliases`, `src/ccl/lower/stmts.rs`). The type's refinement predicate holds raw
-names, and `uniquify` resolves a predicate's free names in the environment of its syntactic origin,
-which after substitution is the use site. An alias from another module would therefore resolve its
-predicate's names in the user, where `catalog` names something else or nothing.
+An alias's predicate names resolve where the alias is declared, at its `LetType`
+([ir.md, "Type aliases resolve where they are
+declared"](../src/ccl/design/ir.md#type-aliases-resolve-where-they-are-declared)). An imported
+module is uniquified before any importer lowers, so its top-level aliases' predicates already name
+its own minted binders, and `uniquify::run_in` returns those resolved types. The interface holds them, and
+`m::T` in an importer lowers to that type, whose names no binder of the importer can capture.
 
-An exported alias's `Type` enters the interface with each free name of its predicate rewritten to
-`Member { owner, base }` for the exporting module. A top-level alias's predicate sees only the
-module's members and the prelude, so the rewrite covers every free name. Visibility does not apply
-to these rewritten names ([chl-spec.md, "9.13 Private-in-public"](chl-spec.md#913-private-in-public)).
-
-The same use-site resolution can capture within one file: an alias whose predicate names `k`, used
-under a local `k`. This design fixes the top-level case. Whether nested-block aliases capture today
-needs a test.
+A top-level alias's predicate sees only the module's members and the prelude, so every name it
+reads is a binder of its module. Visibility does not apply to those names ([chl-spec.md, "9.13
+Private-in-public"](chl-spec.md#913-private-in-public)), and a private one renders qualified, as
+`inventory::catalog` ([Names carry their home](#names-carry-their-home)).
 
 ### `use` names are environment entries, not bindings
 
@@ -308,7 +305,8 @@ inference does not generalize it (`should_generalize`, [type-inference.md, "3.1 
 Freshening
 (Instantiation)"](../src/ccl/design/type-inference.md#31-let-polymorphism-is-freshening-instantiation)).
 
-`import n use T` for a type alias seeds the root of `m`'s `type_aliases` with `n`'s closed type.
+`import n use T` for a type alias declares `T` in `m`'s `type_aliases` with `n`'s resolved type, in
+scope throughout `m` (`LoweringContext::begin_module`).
 
 ### Intrinsics resolve by identity
 

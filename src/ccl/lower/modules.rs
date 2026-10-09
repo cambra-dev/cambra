@@ -14,8 +14,8 @@ use super::{
     LoweringContext, LoweringError, LoweringResult, lower_library, lower_stmts, sink_site,
 };
 use crate::ccl::load::LoadedProgram;
-use crate::ccl::uniquify;
-use crate::ccl::{Expr, Label, Name, TypedExprNode};
+use crate::ccl::uniquify::{self, Uniquified};
+use crate::ccl::{Expr, Label, Name, Type, TypedExprNode};
 use crate::chl_parser::ast::{
     AssignTarget, Module as ChlModule, QualifiedName, Span, Spanned, Stmt as ChlStmt,
 };
@@ -37,6 +37,8 @@ pub struct Interface {
     /// Every top-level binding, by spelling, public and private alike, so that a
     /// reference to a private member can say so.
     members: HashMap<SmolStr, Member>,
+    /// Every top-level type alias, by spelling, public and private alike.
+    types: HashMap<SmolStr, TypeMember>,
     /// Where the module performs IO, which makes importing it an error
     /// (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
     pub io_site: Option<Span>,
@@ -55,6 +57,17 @@ pub struct Member {
     pub mut_param: bool,
 }
 
+/// One top-level type alias of a module.
+#[derive(Debug, Clone)]
+pub struct TypeMember {
+    /// The type it names, its predicates resolved in its module
+    /// (`docs/modules.md`, "Imported aliases are closed over their module").
+    pub ty: Type,
+    pub public: bool,
+    /// The statement that declares it.
+    pub declared: Span,
+}
+
 impl Interface {
     /// The interface of a module that performs IO at `io_site`. Importing it is
     /// refused, so its members are never reached.
@@ -62,23 +75,28 @@ impl Interface {
         Interface {
             module,
             members: HashMap::new(),
+            types: HashMap::new(),
             io_site: Some(io_site),
         }
     }
 
-    /// The interface of the module whose uniquified chain is `chain` and whose
-    /// top-level bindings are `bindings`. The module lowered without errors, so
-    /// its chain binds every one of them.
+    /// The interface of the module whose uniquified tree is `uniquified` and
+    /// whose top-level bindings and type aliases are `bindings` and `aliases`.
+    /// The module lowered without errors, so its chain binds every binding and
+    /// uniquify resolved every alias.
     ///
     /// A member's name is the binder of the last `let` on the chain's spine
     /// spelled like it, which is the binding in scope where the placeholder
-    /// stands.
+    /// stands. A block declares an alias once, so each top-level alias has one
+    /// type.
     pub fn of_chain(
         module: ModulePath,
-        chain: &Expr,
+        uniquified: &Uniquified,
         bindings: &[TopLevelBinding],
+        aliases: &[TopLevelBinding],
         mut_param_fns: impl Fn(&str) -> bool,
     ) -> Self {
+        let chain = &uniquified.expr;
         let mut minted: HashMap<&str, &Name> = HashMap::new();
         let mut at = chain;
         while let TypedExprNode::Let { binding, body, .. } = &at.node {
@@ -107,9 +125,34 @@ impl Interface {
                 },
             );
         }
+        let resolved: HashMap<&str, &Type> = uniquified
+            .aliases
+            .iter()
+            .map(|(name, ty)| (name.as_str(), ty))
+            .collect();
+        let types = aliases
+            .iter()
+            .map(|alias| {
+                let ty = resolved.get(alias.name.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "module `{module}`'s uniquified tree declares its alias `{}`",
+                        alias.name
+                    )
+                });
+                (
+                    alias.name.clone(),
+                    TypeMember {
+                        ty: (*ty).clone(),
+                        public: alias.public,
+                        declared: alias.span,
+                    },
+                )
+            })
+            .collect();
         Interface {
             module,
             members,
+            types,
             io_site: None,
         }
     }
@@ -198,6 +241,28 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
     out
 }
 
+/// The type aliases `stmts`, a module's top level, declares, in order.
+pub fn top_level_aliases(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
+    stmts
+        .iter()
+        .filter_map(|stmt| {
+            let (inner, public) = match &stmt.node {
+                ChlStmt::Pub { stmt, .. } => (&stmt.node, true),
+                other => (other, false),
+            };
+            let ChlStmt::Assign { target, value, .. } = inner else {
+                return None;
+            };
+            let (name, _) = super::stmts::type_alias_decl(target, value)?;
+            Some(TopLevelBinding {
+                name: name.into(),
+                span: stmt.span,
+                public,
+            })
+        })
+        .collect()
+}
+
 /// The errors of a public name bound more than once at a module's top level
 /// (`docs/chl-spec.md`, "9.5 Visibility"), one at each later binding.
 pub fn public_names_bound_twice(bindings: &[TopLevelBinding]) -> Vec<LoweringError> {
@@ -244,7 +309,10 @@ impl ModuleScope {
     pub fn use_scope(&self) -> HashMap<String, Name> {
         self.uses
             .iter()
-            .filter_map(|(name, used)| Some((name.to_string(), used.member.clone()?)))
+            .filter_map(|(name, used)| match &used.reached {
+                Reached::Value(Some(member)) => Some((name.to_string(), member.clone())),
+                Reached::Value(None) | Reached::Type(_) => None,
+            })
             .collect()
     }
 }
@@ -252,10 +320,19 @@ impl ModuleScope {
 /// What a `use` name reaches.
 #[derive(Debug, Clone)]
 pub struct Use {
-    /// The member's binder, or `None` when its module has errors of its own.
-    pub member: Option<Name>,
+    pub reached: Reached,
     /// The `use` item that binds the name.
     pub item: Span,
+}
+
+/// The member a `use` item names: a value or a type alias, as the case of its
+/// spelling says. Each is `None` when its module has errors of its own.
+#[derive(Debug, Clone)]
+pub enum Reached {
+    /// The member's binder.
+    Value(Option<Name>),
+    /// The type the alias names, resolved in its module.
+    Type(Option<Type>),
 }
 
 /// What an import name reaches.
@@ -278,11 +355,18 @@ impl LoweringContext {
     /// before it left: each module lowers with fresh block state
     /// (`docs/modules.md`, "The module interface").
     pub(crate) fn begin_module(&mut self, scope: ModuleScope) {
+        self.type_aliases.clear();
+        // A `use` type name is in scope throughout its module. One whose module
+        // has errors of its own names no type, and stands for any.
+        for (name, used) in &scope.uses {
+            if let Reached::Type(ty) = &used.reached {
+                self.declare_type_throughout(name.as_str(), ty.clone().unwrap_or(Type::Hole));
+            }
+        }
         self.module = scope;
         self.io_site = None;
         self.transactional_vars.clear();
         self.in_tx_body = false;
-        self.type_aliases.clear();
         self.type_params_in_scope.clear();
         self.shadow_depth.clear();
         self.mut_param_fns.clear();
@@ -338,13 +422,33 @@ impl LoweringContext {
         q: &QualifiedName,
         span: Span,
     ) -> Result<Option<Name>, LoweringError> {
-        let import = match q.qualifier.as_slice() {
-            [this] if this.node == "this" => {
-                return Err(LoweringError::unsupported(
-                    span,
-                    "`this` qualifies a label or a tag, not a value",
-                ));
-            }
+        self.qualifier_import(q, span, "value")?
+            .reach(&q.qualifier[0].node, &q.name.node, span)
+    }
+
+    /// The type the type reference `q` names, or `None` when `q`'s module has
+    /// errors of its own, which already fail the compilation.
+    pub(super) fn type_member(
+        &self,
+        q: &QualifiedName,
+        span: Span,
+    ) -> Result<Option<Type>, LoweringError> {
+        self.qualifier_import(q, span, "type")?
+            .reach_type(&q.qualifier[0].node, &q.name.node, span)
+    }
+
+    /// The import `q`'s qualifier names, for a reference to a `what`.
+    fn qualifier_import(
+        &self,
+        q: &QualifiedName,
+        span: Span,
+        what: &str,
+    ) -> Result<&Import, LoweringError> {
+        match q.qualifier.as_slice() {
+            [this] if this.node == "this" => Err(LoweringError::unsupported(
+                span,
+                format!("`this` qualifies a label or a tag, not a {what}"),
+            )),
             [import] => self
                 .module
                 .imports
@@ -354,18 +458,15 @@ impl LoweringContext {
                         import.span,
                         format!("`{}` is not an import name of this module", import.node),
                     )
-                })?,
-            _ => {
-                return Err(LoweringError::unsupported(
-                    span,
-                    format!(
-                        "`{}` names a member of a run, which is not supported yet",
-                        spell(q)
-                    ),
-                ));
-            }
-        };
-        import.reach(&q.qualifier[0].node, &q.name.node, span)
+                }),
+            _ => Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{}` names a member of a run, which is not supported yet",
+                    spell(q)
+                ),
+            )),
+        }
     }
 }
 
@@ -377,15 +478,12 @@ impl Import {
         if super::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
-                format!("the type member `{name}::{member}` is not supported yet"),
+                format!("`{name}::{member}` is a type, not a value"),
             ));
         }
-        let Some(interface) = &self.interface else {
+        let Some(interface) = self.reachable() else {
             return Ok(None);
         };
-        if interface.io_site.is_some() {
-            return Ok(None);
-        }
         let module = &interface.module;
         let Some(found) = interface.members.get(member) else {
             return Err(LoweringError::unsupported(
@@ -410,6 +508,48 @@ impl Import {
             ));
         }
         Ok(Some(found.name.clone()))
+    }
+
+    /// The type of the public type alias `member`, reached through the import
+    /// name `name` at `span`, or `None` as for [`Import::reach`].
+    fn reach_type(
+        &self,
+        name: &str,
+        member: &str,
+        span: Span,
+    ) -> Result<Option<Type>, LoweringError> {
+        if !super::stmts::is_type_name(member) {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("`{name}::{member}` is a value, not a type"),
+            ));
+        }
+        let Some(interface) = self.reachable() else {
+            return Ok(None);
+        };
+        let module = &interface.module;
+        let Some(found) = interface.types.get(member) else {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("module `{module}` has no type member `{member}`"),
+            ));
+        };
+        if !found.public {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("`{member}` is private to module `{module}`"),
+            )
+            .with_note(found.declared, "declared here without `pub`"));
+        }
+        Ok(Some(found.ty.clone()))
+    }
+
+    /// The interface whose members a reference reaches, or `None` when the module
+    /// has errors of its own or performs IO, each reported where it stands.
+    fn reachable(&self) -> Option<&Interface> {
+        self.interface
+            .as_deref()
+            .filter(|interface| interface.io_site.is_none())
     }
 }
 
@@ -483,12 +623,16 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             interfaces.insert(file, None);
             continue;
         };
-        let chain = uniquify::run_in(chain, &ctx.module.use_scope(), Some(&path));
-        let interface = Interface::of_chain(path, &chain, &top_level_bindings(&ast.body), |name| {
-            ctx.is_mut_param_fn(name)
-        });
+        let uniquified = uniquify::run_in(chain, &ctx.module.use_scope(), Some(&path));
+        let interface = Interface::of_chain(
+            path,
+            &uniquified,
+            &top_level_bindings(&ast.body),
+            &top_level_aliases(&ast.body),
+            |name| ctx.is_mut_param_fn(name),
+        );
         interfaces.insert(file, Some(Rc::new(interface)));
-        chains.push(chain);
+        chains.push(uniquified.expr);
     }
 
     let Some(ast) = program.root() else {
@@ -502,7 +646,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let lowered = lower_stmts(ast, ctx);
     errors.extend(lowered.errors);
     let value = lowered.value.map(|root| {
-        let root = uniquify::run_in(root, &ctx.module.use_scope(), None);
+        let root = uniquify::run_in(root, &ctx.module.use_scope(), None).expr;
         chains
             .into_iter()
             .rev()
@@ -517,7 +661,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
 /// An import of a module that performs IO is an error at the statement, and so
 /// is a second import binding one name. A `use` item is an error when its member
 /// is not one the module's importers reach, or when its name is an import name,
-/// another `use` name, or a builtin's.
+/// another `use` name, a builtin's, or a built-in type's.
 fn module_scope(
     module: &ChlModule,
     labels: Option<ModulePath>,
@@ -584,7 +728,16 @@ fn module_scope(
     let mut uses: HashMap<SmolStr, Use> = HashMap::new();
     for (import_name, item) in use_items {
         let bound = item.alias.as_ref().unwrap_or(&item.name);
-        let reached = imports[&import_name].reach(&import_name, &item.name.node, item.name.span);
+        let import = &imports[&import_name];
+        let reached = if super::stmts::is_type_name(&item.name.node) {
+            import
+                .reach_type(&import_name, &item.name.node, item.name.span)
+                .map(Reached::Type)
+        } else {
+            import
+                .reach(&import_name, &item.name.node, item.name.span)
+                .map(Reached::Value)
+        };
         let refusal = if let Some(import) = imports.get(&bound.node) {
             Some(
                 LoweringError::unsupported(
@@ -617,6 +770,15 @@ fn module_scope(
                     bound.node, item.name.node
                 ),
             ))
+        } else if super::is_builtin_type_name(&bound.node) {
+            Some(LoweringError::unsupported(
+                bound.span,
+                format!(
+                    "`{}` is a built-in type, so a `use` name cannot take it: bind the alias \
+                     under another name, `use {} as …`",
+                    bound.node, item.name.node
+                ),
+            ))
         } else {
             reached.as_ref().err().cloned()
         };
@@ -627,7 +789,7 @@ fn module_scope(
         uses.insert(
             bound.node.clone(),
             Use {
-                member: reached.expect("an unrefused `use` item reaches its member"),
+                reached: reached.expect("an unrefused `use` item reaches its member"),
                 item: bound.span,
             },
         );

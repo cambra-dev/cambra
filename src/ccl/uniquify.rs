@@ -134,7 +134,18 @@ fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::Node
 /// before channelization. The pass is idempotent, so the second run changes
 /// nothing lowering minted.
 pub fn run(expr: Expr) -> Expr {
-    run_in(expr, &HashMap::new(), None)
+    run_in(expr, &HashMap::new(), None).expr
+}
+
+/// What [`run_in`] makes of one module's tree.
+pub struct Uniquified {
+    /// The tree, every binder minted and every `LetType` removed.
+    pub expr: Expr,
+    /// The module's top-level type aliases by spelling, each with its
+    /// predicates resolved where it is declared: what the module exports as its
+    /// type members (`docs/modules.md`, "Imported aliases are closed over their
+    /// module").
+    pub aliases: Vec<(String, Type)>,
 }
 
 /// [`run`] on the tree of one module, with `scope` beneath every binder of
@@ -144,8 +155,13 @@ pub fn run(expr: Expr) -> Expr {
 ///
 /// `home` is the module path of an imported module, whose top-level binders are
 /// minted with it as their [`Name::home`]. A top-level binder is one on the
-/// chain of `let` and `LetType` bodies from the root of `expr`.
-pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<&ModulePath>) -> Expr {
+/// chain of `let` and `LetType` bodies from the root of `expr`, and a
+/// top-level `LetType` declares one of the [`Uniquified::aliases`].
+pub fn run_in(
+    mut expr: Expr,
+    scope: &HashMap<String, Name>,
+    home: Option<&ModulePath>,
+) -> Uniquified {
     debug_assert!(
         scope.values().all(|name| !name.is_raw()),
         "uniquify: a scope entry is a minted name"
@@ -166,6 +182,7 @@ pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<&Modul
     let mut u = Uniquifier {
         home: home.cloned(),
         top_level: true,
+        aliases: Vec::new(),
         env: scope
             .iter()
             .map(|(spelling, name)| (spelling.clone(), vec![name.clone()]))
@@ -209,7 +226,10 @@ pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<&Modul
              terms they replace",
         );
     }
-    expr
+    Uniquified {
+        expr,
+        aliases: u.aliases,
+    }
 }
 
 struct Uniquifier {
@@ -221,6 +241,9 @@ struct Uniquifier {
     /// node clears it on entry, and a top-level `let` or `LetType` sets it again
     /// for its body.
     top_level: bool,
+    /// The top-level `LetType`s walked so far, by spelling, with their types
+    /// resolved ([`Uniquified::aliases`]).
+    aliases: Vec<(String, Type)>,
     /// Lexical environment: source spelling → stack of minted names, the
     /// innermost binder last. Raw `Var`s resolve to the top of their
     /// spelling's stack.
@@ -436,8 +459,11 @@ impl Uniquifier {
             // predicate is rebuilt once, so the uses get this resolution. The node
             // then gives way to its body below. An alias statement among a module's
             // top-level statements leaves the statements below it top-level.
-            TypedExprNode::LetType { ty, body, .. } => {
+            TypedExprNode::LetType { name, ty, body } => {
                 self.ty(ty);
+                if top_level {
+                    self.aliases.push((name.clone(), ty.clone()));
+                }
                 self.top_level = top_level;
                 self.expr(body);
             }
@@ -887,7 +913,8 @@ mod tests {
             ),
             &HashMap::new(),
             Some(&catalog),
-        );
+        )
+        .expr;
         let mut homes = Vec::new();
         fn collect(e: &Expr, out: &mut Vec<(String, Option<ModulePath>)>) {
             e.walk_binders(|b| out.push((b.name.base().to_string(), b.name.home().cloned())));
@@ -916,7 +943,8 @@ mod tests {
             ]),
             &scope,
             None,
-        );
+        )
+        .expr;
         let TypedExprNode::Tuple(items) = &expr.node else {
             panic!("expected a tuple");
         };
