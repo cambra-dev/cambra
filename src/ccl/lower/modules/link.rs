@@ -83,9 +83,9 @@ pub(super) fn raw_scope(names: &HashMap<QualifiedName, Name>) -> HashMap<String,
 /// and a reference into it lowers to an error placeholder without an error of
 /// its own.
 ///
-/// A module that performs IO has no shared run, and each `import` of it is the
-/// error. One that declares a sink is not lowered, so lowering opens nothing for
-/// it.
+/// A module that performs IO or declares state has no shared run, and each
+/// `import` of it is the error. One that declares a sink or state is not
+/// lowered, so lowering opens nothing for it.
 pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> LoweringResult {
     let sources = program.sources();
     let root = sources.root();
@@ -150,7 +150,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
 pub(super) struct ProgramLowering<'a> {
     pub(super) program: &'a LoadedProgram,
     /// Each module other than the root, lowered, by file, or `None` when it has
-    /// no syntax tree, has errors of its own, or declares a sink.
+    /// no syntax tree, has errors of its own, or declares a sink or state.
     pub(super) lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
     /// The names each imported module's shared run reaches, by file
     /// ([`Created::names`]), or `None` when it has none.
@@ -182,7 +182,7 @@ pub(super) struct Created {
 
 impl ProgramLowering<'_> {
     /// Lower the module in `file` once, recording it, or `None` when it has no
-    /// syntax tree, has errors of its own, or declares a sink.
+    /// syntax tree, has errors of its own, or declares a sink or state.
     pub(super) fn lower(&mut self, file: FileId, ctx: &mut LoweringContext) {
         let lowered = self.lower_once(file, ctx).map(Rc::new);
         self.lowered.insert(file, lowered);
@@ -194,9 +194,10 @@ impl ProgramLowering<'_> {
         ctx: &mut LoweringContext,
     ) -> Option<LoweredModule> {
         let ast = self.program.ast(file)?;
-        // Each import of a module that declares a sink is refused for that alone
-        // ([`Self::import_interface`]), and lowering it would open its sink.
-        if sink_site(ast).is_some() {
+        // Each import of a module that declares a sink or state is refused for
+        // that alone ([`Self::import_interface`]), and lowering it would open its
+        // sink.
+        if sink_site(ast).is_some() || state_site(ast).is_some() {
             return None;
         }
         let module = self
@@ -208,7 +209,7 @@ impl ProgramLowering<'_> {
         let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
         let lowered = lower_library(ast, ctx);
-        let io_site = ctx.io_site;
+        let unimportable = ctx.io_site.map(Unimportable::Io);
         let clean = lowered.errors.is_empty() && self.program.parsed_cleanly(file);
         self.errors.extend(lowered.errors);
         let chain = lowered.value.filter(|_| clean)?;
@@ -218,7 +219,7 @@ impl ProgramLowering<'_> {
             &top_level_bindings(&ast.body),
             &top_level_aliases(&ast.body),
             |name| ctx.is_mut_param_fn(name),
-            io_site,
+            unimportable,
         );
         Some(LoweredModule {
             chain,
@@ -230,13 +231,15 @@ impl ProgramLowering<'_> {
     /// The interface an import of the module in `file` reaches, or `None` when
     /// the module has errors of its own.
     pub(super) fn import_interface(&self, file: FileId) -> Option<Rc<Interface>> {
-        // A module that performs IO is refused at each import of it, for that
-        // reason alone (`module_scope`).
+        // A module that performs IO or declares state is refused at each import
+        // of it, for that reason alone (`module_scope`).
         let Some(lowered) = self.lowered.get(&file).cloned().flatten() else {
             let ast = self.program.ast(file)?;
-            let site = sink_site(ast)?;
+            let why = sink_site(ast)
+                .map(Unimportable::Io)
+                .or_else(|| state_site(ast).map(Unimportable::State))?;
             let module = self.program.sources().module(file)?.clone();
-            return Some(Rc::new(Interface::performing_io(module, site)));
+            return Some(Rc::new(Interface::unimportable(module, why)));
         };
         Some(Rc::clone(&lowered.interface))
     }
@@ -246,7 +249,7 @@ impl ProgramLowering<'_> {
     pub(super) fn shared_run(&mut self, file: FileId) -> Option<Expr> {
         let created = self
             .import_interface(file)
-            .filter(|interface| interface.io_site.is_none())
+            .filter(|interface| interface.unimportable.is_none())
             .and_then(|interface| {
                 let home = Home::Shared(interface.module.clone());
                 self.create(file, home)
@@ -341,8 +344,8 @@ pub(super) fn use_names(
 ) -> HashMap<QualifiedName, Name> {
     let mut names = qualified;
     for (bound, used) in &scope.uses {
-        if let Reached::Value(Some(member)) = &used.reached
-            && let Some(binder) = names.get(member).cloned()
+        if let Reached::Value(Some(reference)) = &used.reached
+            && let Some(binder) = names.get(&reference.name).cloned()
         {
             names.insert(QualifiedName::new(bound.clone()), binder);
         }

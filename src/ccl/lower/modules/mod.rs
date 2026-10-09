@@ -26,6 +26,7 @@ use types::*;
 
 use super::{
     LoweringContext, LoweringError, LoweringResult, lower_library, lower_stmts, sink_site,
+    state_site,
 };
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::load::{EdgeKind, LoadedProgram};
