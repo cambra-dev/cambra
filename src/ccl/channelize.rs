@@ -1268,7 +1268,12 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
-        TypedExprNode::ExprStmt { body, .. } => return drop_expr_stmts(*body),
+        // The effect is walked before it is discarded, so a `For`/`MutWrite`/`Begin`
+        // marker inside it reaches the `unreachable!` arm below instead of vanishing.
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            let _ = drop_expr_stmts(*effect);
+            return drop_expr_stmts(*body);
+        }
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -3206,6 +3211,22 @@ mod tests {
         );
         assert!(!s.contains("defer"), "no Defer should remain: {s}");
         assert!(!s.contains("define"), "no Define should remain: {s}");
+    }
+
+    /// A marker in an `ExprStmt`'s effect is rejected, not dropped with the effect.
+    ///
+    /// `mut_elim::run` asserts no `MutWrite` survives it, so the pipeline cannot
+    /// build this tree; the fixture stands in for that assert being removed or
+    /// for a caller that skips the phase.
+    #[test]
+    #[should_panic(expected = "a For/MutWrite/Begin reached channelize")]
+    fn marker_in_statement_effect_panics() {
+        let write = Expr::new(TypedExprNode::MutWrite {
+            name: Name::raw("x"),
+            key: None,
+            value: Box::new(lit(1)),
+        });
+        let _ = run(Expr::expr_stmt(write, lit(0)));
     }
 
     /// `let d = Defer in <body without feeds>` — error, raised at the `let`.
