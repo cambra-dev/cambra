@@ -1345,16 +1345,12 @@ expected type, a join — rather than at the constructor.
 
 ## 4. Statement semantics
 
-A CHL **program** is its top-level block (§2.1): a sequence of
-statements. Each non-terminal statement either introduces a binding
-visible to the remainder of the block, or performs an effect (a feed
-into a deferred output). The block's *value* is the value of its final
-expression statement; if the program registers any sinks (e.g.
-`http_serve`), the program value is implicitly a record of those sinks
-instead.
+A CHL program is a [top-level block](#21-top-level-block) of statements. Nonterminal statements
+introduce bindings, perform permitted effects, or contribute nothing (`pass`). A value-producing
+block takes its value from its final contributing statement. A program that registers sinks,
+such as `http_serve`, instead has an implicit record of those sinks as its program value.
 
-Equivalently — and this is the model to keep in mind when reading
-nested blocks — a sequence
+For example:
 
 ```python
 x = e₁
@@ -1362,13 +1358,10 @@ y = e₂
 e₃
 ```
 
-denotes `e₃` evaluated in an environment where `x` is bound to `e₁`
-and `y` is bound to `e₂`. Bindings are introduced for the remainder
-of their enclosing scope and may not be forward-referenced; the
-execution order of the bound expressions themselves is constrained
-only by data dependencies (§3 — *Evaluation order*), so two
-independent bindings may be evaluated in any order. Statement-level
-scoping is always introduction-then-rest, never two-pass.
+The block evaluates `e₃` with `x` bound to `e₁` and `y` bound to `e₂`. Value bindings become
+visible after introduction; they cannot be forward-referenced. This scope rule does not
+sequence independent computations: [evaluation order](#evaluation-order-is-unspecified) is
+constrained by data dependencies.
 
 ### 4.1 `def` — function definition
 
@@ -1684,25 +1677,15 @@ else:
     block_else
 ```
 
-`if`/`elif`/`else` is a statement. It is value-yielding by position: as the
-last statement of a block, and on the right of an assignment (§4.3). The
-one-line spelling of the same choice is the ternary (§3.6).
+An `if` chain selects the first branch whose guard holds, in source order. If none holds,
+it selects `else` when present; otherwise it produces no value or binding. Guards after the
+selected branch need not be defined, and unselected blocks contribute no effects. These are
+semantic selection rules, as for [short-circuit Boolean operators](#35-short-circuit-not-and-or).
 
-The branches are tried in source-text priority: the value of the
-statement is the value of the block under the first guard that holds,
-and the blocks under later guards do not contribute. If no guard
-holds and an `else` is present, `block_else` is the chosen block;
-if no guard holds and no `else` is present, the `if` statement
-produces no value and contributes no binding to the enclosing scope.
-As with short-circuit `and`/`or` (§3.5), this is a semantic
-property — guards beyond the winning one need not be defined, and
-non-winning blocks contribute no effects.
-
-Each branch's block is itself a statement block. When the `if` chain
-occurs in a position that requires a value (function body, program
-value, an assignment's right-hand side), every branch — including `else` —
-must end in a value-yielding statement, and the missing-`else` case is
-rejected as "if used as an expression, all branches must produce a value."
+An `if` chain produces a value when used as a block's final contributing statement or on an
+[assignment's right-hand side](#43-assignment-forms). In those positions it requires an `else`,
+and every branch must end in a value-producing statement. The chain's value is the selected
+branch's value. The [ternary expression](#36-ternary) provides the one-line form of this choice.
 
 ### 4.6 `for` — iteration
 
@@ -1886,8 +1869,7 @@ every iteration.
 
 ### 4.7 `pass`
 
-A statement that contributes nothing, for a block that takes statements and
-expects no value:
+`pass` contributes no binding, value or effect. For example, it can leave one match arm empty:
 
 ```python
 total := 0
@@ -1900,66 +1882,58 @@ for m in [`debit(3), `credit(4)]:
 total                 # 3
 ```
 
-A `match` arm is where one is needed. An `if` arm can be left out — a guard
-with no `else` does nothing at the positions it rejects — while a `match`'s
-arms partition the scrutinee's tags, so an arm that does nothing is still
-written.
+A missing `else` can omit an `if` action, but a tag-dispatch arm still needs to be written
+when its tag is handled without an action.
 
-`pass` contributes nothing at every position, last included, so a block reads
-as though it were not written. The blocks that expect no value are a `for`-loop
-body, a `with begin():` block, and the `if` / `match` arms inside one.
-Everywhere else a block's value is its last statement, and a block of nothing
-but `pass` has no statement to be one: `def todo(x): pass` is rejected, because
-the function body must yield a value.
+Removing `pass` does not change a block's meaning, including when it is the last statement.
+A value-producing block uses its last remaining statement. A function body containing only
+`pass` is therefore rejected: it has no result.
 
-A loop body of nothing but `pass` is a loop whose body has no effect; the loop
-still runs, once per element of its source. A `with begin():` block of nothing
-but `pass` is rejected, by the rule that a transaction must write or feed
+Loop bodies, transaction bodies, and statement-position branches within them do not require
+a result value. A loop containing only `pass` has no body effect and still iterates over its
+source. A transaction containing only `pass` is rejected because a transaction must write or feed
 ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)).
 
 ### 4.8 `return`
 
 ```python
-return                -- equivalent to `return ()`
+return                # equivalent to `return ()`
 return expression
 ```
 
-`return` produces the enclosing function's result. CHL has no early
-exit: `return e` is only meaningful as the **last** statement of a
-function body, or as the last statement of each branch of a terminal
-`if`/`else`. A `return` followed by further statements is rejected —
-the "return early, fall through otherwise" idiom must be written
-explicitly as `if cond: return e\nelse: <rest>`.
+`return e` supplies a function result; bare `return` supplies unit. It does not perform an
+early exit. It must be the final contributing statement of the function body or of a selected
+terminal branch. Further contributing statements after `return` are rejected.
+
+Write the continuation as an explicit alternative instead of using early return and fallthrough:
+
+```python
+def choose(cond, a, b):
+    if cond:
+        return a
+    else:
+        return b
+```
 
 ### 4.9 Expression statement
 
-A bare expression `e` is a statement. The expression is evaluated; if it
-appears as the **last statement** of a block, its value is the block's
-value. If it appears elsewhere, it must **have an effect** — a feed
-(`target << value`), or a call to an effecting function (one that writes a
-`Mut(…)` parameter or a transactional mutable variable, §8) — otherwise the
-statement is inert and is rejected.
+A final expression statement supplies its block's value. A nonterminal expression statement
+must have a permitted effect: a feed (`target << value`) or a function call that writes a
+`Mut(…)` parameter or transactional mutable variable. An inert nonterminal expression is
+rejected. Function effects must be visible in their types; there are no implicit-effect
+functions. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
-This rules out Python's "expression for its side-effect" idiom for any
-effect *not* visible in a function's signature: CHL has **no
-implicit-effect functions**, so whether a bare call is a legitimate effect
-statement or an inert mistake is decidable from the callee's type.
-
-> **Direction [Decided].** The `requires Transaction` / `given` / `summon`
-> contextual-parameter layer (§8.7) adds a further kind of effecting call —
-> a function that manifests a transaction from context rather than through
-> a `Mut(…)` parameter (`put(req.body.key, req.body.value)` in the
-> north-star `txn_kv`). It is not yet implemented; the effect rule above
-> already covers the implemented `Mut(…)`-parameter and `with begin():`
-> effecting calls.
+**[Decided]** Contextual transaction parameters add calls that obtain their transaction from
+context rather than a `Mut(…)` argument. This extension is not implemented; its contract is
+specified under
+[transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters).
 
 ---
 
 ### 4.10 `match` — tag dispatch
 
-`match` dispatches on the tag of a variant. It is a **block statement**,
-mirroring `if` (§4.5): each `case` names a tag and optionally binds its
-payload for that arm's block.
+`match` selects a block by a variant's tag. Each tagged `case` names one tag and optionally
+binds its payload within that arm:
 
 ```python
 match x:
@@ -1969,141 +1943,94 @@ match x:
         0
 ```
 
-A pattern spells its tag exactly as a constructor does (§3.15), so an arm
-reads as the inverse of what it matches. Three payload spellings make two
-statements:
+A tag uses the same backtick spelling as a [variant constructor](#315-variant-constructors).
+The payload forms are:
 
 | Pattern | Means |
 |---|---|
 | `` case `tag(v): `` | the tag carries a payload; bind it to `v` |
 | `` case `tag(_): `` | the tag carries a payload this arm does not read |
-| `` case `tag: `` | the tag carries **nothing** |
+| `` case `tag: `` | the tag carries nothing |
 
-A binder is an ordinary local, scoped to its arm. `_` is the unused-binder
-spelling and not a name, so the body cannot refer to it. `case _:` uses `_` in
-the same sense, for an arm that names no tag.
+A named payload binder is local to its arm. `_` discards the payload and cannot be referenced
+by the body. Omitting the payload pattern is different: `` case `some: `` requires a
+payload-less tag and does not match `` `some{Int} ``. Use `` case `some(_): `` to ignore a
+payload without requiring its absence.
 
-**The third form states the payload's type rather than eliding the binder.**
-`` `some{Int} `` and `` `some `` are different types (§6.5), so `` case `some: ``
-matches a payload-less `` `some `` and is an error against one carrying an
-`Int`. An arm that has a payload and does not read it is written
-`` case `some(_): ``.
+Each tag may appear in at most one arm. Tagged-arm order does not affect selection because
+the arms partition tags, rather than testing overlapping patterns in priority order.
+Patterns are shallow: there are no nested patterns, literal patterns or per-arm guards.
 
-The default arm below takes no backtick: `_` is the absence of a tag, not a
-tag.
+`case _:` is an optional default arm, without a backtick. It handles tags not named by other
+arms and binds no payload, since those tags can carry different payload types. It must be
+unique and last. A default-only match returns that arm's value without requiring a variant
+scrutinee; the scrutinee is still checked for name resolution and type correctness.
 
-Like `if`, a `match` is value-yielding by position: where a value is
-required (a function body, the program value), every arm's block must end
-in a value-yielding statement.
-
-**Each tag is handled by exactly one arm.** Two arms for one tag is an
-error — the arms *partition* the scrutinee's tags, so first-match never
-arbitrates and arm order is not observable. A per-arm guard would change
-that: two arms could then name one tag and be told apart by their guards,
-which is order-sensitive. Guards are a **[Tentative]** direction (see the
-note at the end of this section), so the partition rule is stated for the
-guard-free language of today.
-
-**`case _:` is the default arm**, matching whatever the tagged arms did
-not. It binds no payload — the tags it covers have different payload
-types, so there is nothing single to bind — and it must be the **last**
-arm, since an arm after it could never be selected. At most one is
-allowed.
-
-A `match` whose *only* arm is the default names no tag, so it dispatches
-on nothing: its value is that arm's, whatever the scrutinee is. It is
-legal and says nothing about the scrutinee's type — which therefore need
-not be a variant. The scrutinee is still an expression in scope and is
-type-checked as one.
-
-Patterns are **shallow**: an arm matches one tag and binds the whole
-payload, with no nesting, no literal patterns, and no per-arm guard.
-
-**Both statement contexts admit a `match`** — a `for`-loop body and a `with
-begin():` block. An arm may `yield` or `<<`, and the fed value may read the arm's
-payload, the loop's accumulators, or both.
+In a value position, including an assignment's right-hand side, every arm must produce a
+value. A statement-position match is also allowed in a loop or transaction body. An arm may
+contribute a yield or feed where the enclosing context permits it; the value can use the
+payload binder and enclosing loop accumulators.
 
 #### The one-line form
 
 ```
-match scrut: case `foo(x): x case `bar(y): to_x(y)
+(match scrut: case `foo(x): x case `bar(y): to_x(y))
 ```
 
-The block with its line breaks removed, and an expression in place of each
-arm's block. `case` delimits the arms, so no separator is needed, and the arm
-list runs to the first token that cannot begin an arm.
+The one-line form uses one expression per arm instead of an indented block. `case` separates
+the arms; no additional separator is used. The arm list consumes consecutive `case` clauses.
 
-**A one-line `match` is legal only inside a bracket** — `(…)`, `[…]`, `{…}` —
-so a `)`, `]` or `}` is always in place to close the arm list. That covers a
-call argument, a list or tuple element, a subscript index, a record field, a
-comprehension clause, and a refinement predicate (§6.4). In a value position
-that has no bracket of its own, the parentheses are written:
+A one-line match requires enclosing parentheses, brackets or braces. It can occur within a
+call argument, list or tuple element, subscript, record field, comprehension clause or
+refinement predicate. Add parentheses when the surrounding position has no delimiter:
 
 ```python
 n = (match msg: case `ping(seq): seq case `close: 0)
 ```
 
-The bracket is what makes nesting readable. An arm body is an ordinary
-expression, which cannot itself derive a one-line `match`, so a nested one
-carries its own bracket and two arm lists never compete for the same `case`.
-Without the requirement, `` match a: case `p: match b: case `q: 1 case `r: 2 ``
-has two readings, and under the greedy one the outer `match` has no way to
-spell an arm after `` `p ``.
+Nested one-line matches require their own delimiters. Without them,
+`` match a: case `p: match b: case `q: 1 case `r: 2 `` does not identify which match owns
+the final arm. Restricting only the immediate arm expression would not resolve this ambiguity:
+lambda bodies and function-type codomains accept full expressions and could reintroduce it.
 
-Restricting the arm body instead of requiring the bracket does not hold: a
-lambda body and a `=>` codomain each take a whole expression, so an inner
-`match` reappears through either of them.
+The indented and one-line forms use the same pattern, selection and value rules.
 
-The indented and one-line forms differ in the arm body and in nothing else:
-same arms, same partition rule, same value.
+**[Tentative]** Extending unused-binder `_` beyond pattern payloads to lambda parameters,
+loop targets and tuple patterns requires a binder-position rule distinct from the type-position
+wildcard in [Atoms](#24-atoms).
 
-> **Direction [Tentative].**
-> `_` is accepted as an unused binder in a **pattern payload** only.
-> Extending it to every binder position — a lambda parameter, a `for` target,
-> a tuple destructuring slot — is **[Tentative]**. It needs a written rule for
-> what distinguishes `_` in a type position (§2.4, where it means "infer this")
-> from `_` in a binder position; position decides it, and nothing states so.
->
-> A per-arm guard (`` case `some(v) if v > 0: ``) is the natural next
-> addition — the IR already carries a guard alongside each arm's pattern —
-> and needs a *tag-test* predicate term so the arm's gate can combine "is
-> this tag" with the guard. It also relaxes the one-arm-per-tag rule above:
-> two arms may then name one tag, and arm order becomes observable between
-> them.
+**[Tentative]** Per-arm guards, such as `` case `some(v) if v > 0: ``, would permit repeated
+tags and make arm order observable. This extension requires a combined tag-and-guard selection
+rule; it is not part of the guard-free match defined here.
 
 ---
 
 ## 5. Scoping and binding
 
-CHL is **lexically scoped**. The scopes are:
+CHL is lexically scoped. Each binding is visible only within its scope:
 
-1. **Top-level scope** — the top-level block (§2.1) of a `.cambra`
-   file.
-2. **Function scope** — the parameters and body of a `def`.
-3. **Lambda scope** — the parameter(s) and body of a `lambda`.
-4. **Comprehension scope** — each `for x in …` clause of a
-   comprehension introduces `x` into the comprehension's scope, visible
-   to subsequent clauses, guards, and the element expression.
-5. **`for`-loop scope** — the loop variable (`target` in
-   `for target in iter:`) is in scope only inside the loop body. After
-   the loop, the name is **not** in scope — there is no "value at the
-   final iteration" to bind it to, because iterations are unordered and
-   may run in parallel (§3, §4.6). This is a deliberate divergence from
-   Python's leaky-loop-variable behaviour. Any value the loop needs to
-   produce for downstream code must be carried out via a loop-carried
-   accumulator (§4.6) or yielded into a deferred collection.
+| Scope | Bindings and visibility |
+| --- | --- |
+| Top-level block | Value bindings are visible after their introduction. |
+| Function or lambda | Parameters are visible in the body; free names refer to the enclosing scope. |
+| Comprehension | Each generator binder is visible to subsequent clauses, guards and the element expression. |
+| `for` body | The loop binder is visible only inside the body. |
+| Match arm | A named payload binder is visible only in that arm. |
 
-A binding form (`=`, annotated `x: T = e`, `:=` (mutable introduction —
-§8.1), `<<=`, `for`, `def`, `lambda`, comprehension `for`) introduces a
-name for the rest of its enclosing scope. Re-binding the same name in the
-same scope with `=` **shadows** (previous values are not recoverable);
-re-writing a mutable with `:=` advances its history rather than shadowing
-(§8.1). (Whether `=` shadowing survives the timeless reading of `=` is
-**[Open]** — see §4.3.)
+A loop binder is not available after the loop. Iterations are unordered, so there is no final
+iteration value to bind there. Results needed outside a loop must be carried by a loop-carried
+accumulator or contributed to a deferred collection; see [iteration](#46-for--iteration).
 
-There is no `global` / `nonlocal` mechanism — closure capture is the
-only way for a function to refer to outer names, and capture is
-read-only.
+An immutable binding shadows an earlier binding with the same name for the rest of its scope.
+The earlier value is no longer accessible through that name. A write to an existing mutable
+binding advances its history rather than introducing a shadowing binding. Defining a deferred
+value with `<<=` resolves an existing deferred name; it does not introduce another name.
+See [Assignment forms](#43-assignment-forms), including the open question about shadowing
+under the decided timeless-equation model.
+
+There is no `global` or `nonlocal` declaration. Functions access enclosing value bindings
+through lexical capture, whose current write restrictions and decided extension are specified
+under [function definitions](#41-def--function-definition).
 
 > **Direction [Decided].** The top-level scope is its module's. Import
 > names, run names, and parameters are in scope throughout the module,

@@ -206,14 +206,9 @@ fn append_outputs_at_tail(
     }
 }
 
-/// Core implementation of [`lower_stmts`] that threads an `outer_bindings`
-/// set — names already in scope above this statement block (e.g., function
-/// parameters). The generator-lowering path uses this to detect mutation
-/// (reassignment of variables from enclosing scopes).
-///
-/// `is_top_level` is `true` only for the outermost call from [`lower_stmts`].
-/// It is `false` for if/else arms, match arms and function bodies, so that `http_serve`
-/// and `test_sink` assignments are rejected outside the top-level program scope.
+/// Lower a nonempty block with the lexical names in `outer_bindings` available to it.
+/// The names distinguish outer-variable writes from local introductions; type checking
+/// establishes mutability later. `is_top_level` permits sink declarations only at program scope.
 pub(super) fn lower_stmts_inner(
     stmts: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
@@ -227,31 +222,20 @@ pub(super) fn lower_stmts_inner(
         "lower_stmts_inner: empty nested block (parser invariant violated)"
     );
 
-    // This block's value is its last *contributing* statement ([`contributing_stmts`]),
-    // and the statements above that one are its prefix. Decided before the snapshots
-    // below, so a block that contributes nothing returns with nothing to restore.
+    // Filter `pass` before selecting the result; an all-pass value block has no result.
     let Some((last_ix, last)) = contributing_stmts(stmts).next_back() else {
         return Err(block_contributes_nothing(stmts));
     };
     let rest = &stmts[..last_ix];
 
-    // A nested block is its own scope: snapshot *both* the transactional
-    // registry and the `mut_param_fns` set so declarations local to this block —
-    // a `Mut(…, Txn)` mutable variable, or a `Mut`-param `def`'s curried call shape —
-    // revert on exit and do not leak into an enclosing or sibling scope.
-    // Induction mutability carries no lowering-time registry (it is the
-    // `Type::History` on the binding, checked post-inference). This block's
-    // `def`s still shadow outer same-named ones *within* the block (pre-registration
-    // overwrites them here; the restore reinstates the outer ones on exit).
-    // Restored on both the success and error paths below.
+    // Restore transactional declarations and Mut-parameter call shapes on both success and
+    // error, so local declarations can shadow without leaking into sibling or outer blocks.
+    // Induction mutability has no lowering registry; its history type is checked later.
     let snapshot = ctx.snapshot_transactional();
     let saved_mut_param_fns = ctx.mut_param_fns.clone();
 
-    // The final statement must be a bare expression, an if/else block, or
-    // a for-loop that contains a yield chain (generator pattern). Wrap the
-    // preceding assignments and function definitions in Let bindings,
-    // innermost-first. (Mutability is carried by `Type::History` and checked
-    // post-inference; introduction-vs-write is decided by lexical scope.)
+    // Lower the terminal before wrapping preceding statements, innermost first.
+    // Alias registration must precede any annotation read by transaction registration.
     let result = with_block_type_aliases(stmts, ctx, |ctx| {
         pre_register_txn_decls(stmts, ctx);
         lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
@@ -267,8 +251,9 @@ pub(super) fn lower_stmts_inner(
     result
 }
 
-/// Lower the final statement in a block, which must be a bare expression, an if/else block,
-/// or a for-loop with a yield chain (generator pattern).
+/// Lower the block's last contributing statement.
+/// Value expressions and conditionals produce their result. Supported terminal loops,
+/// writes and transactions use their effect/Unit paths. A fresh binding is not a result.
 pub(super) fn lower_final_stmt(
     last: &Spanned<ChlStmt>,
     preceding: &[Spanned<ChlStmt>],
@@ -445,14 +430,10 @@ pub(super) fn lower_final_stmt(
     }
 }
 
-/// Lower the right-hand side of an assignment.
-///
-/// A [`ChlExpr::Block`] right-hand side — `x = if c: … else: …`, `x = match v:
-/// …` — is the block statement it wraps, lowered by [`lower_block_value`] in
-/// the scope the assignment sits in. Every position that assigns carries that
-/// scope: a statement block through `preceding` and `outer_bindings`, a
-/// for-loop body and a `with begin():` block through the names bound above the
-/// loop or the transaction.
+/// Lower an assignment's value in its enclosing lexical scope.
+/// Block values use [`lower_block_value`]. Statement, loop and transaction callers must
+/// supply preceding and outer names so branch-local introductions remain distinguishable
+/// from writes to enclosing variables.
 pub(super) fn lower_assigned_value(
     value: &Spanned<ChlExpr>,
     preceding: &[Spanned<ChlStmt>],
@@ -465,19 +446,12 @@ pub(super) fn lower_assigned_value(
     }
 }
 
-/// Lower a block statement standing in value position — the sole entry point
-/// for a [`ChlExpr::Block`].
-///
-/// The scope decides what a name in the block means: `x := e` is a write when
-/// `x` is bound above the block and an introduction when it is not
-/// ([`lower_middle_stmt`]), and a `for` inside a branch reads the same scope to
-/// tell a loop-carried accumulator from a branch-local
-/// ([`find_mutation_loop_vars`]). `preceding` and `outer_bindings` are that
-/// scope.
-///
-/// A write inside one of the block's branches is off the statement spine the
-/// mutability phases read, and is put back on it by
-/// [`push_bindings_into_writing_cases`](crate::ccl::mut_elim::push_bindings_into_writing_cases).
+/// Lower [`ChlExpr::Block`] through the terminal-statement path in the supplied scope.
+/// Scope determines whether `:=` introduces a local or writes an enclosing variable,
+/// including loop-carried writes inside a branch. Later,
+/// [`push_bindings_into_writing_cases`](crate::ccl::mut_elim::push_bindings_into_writing_cases)
+/// exposes branch writes to the statement-chain mutability transformations.
+/// See `src/ccl/design/lowering.md`, "`if` and `match` in value position".
 pub(super) fn lower_block_value(
     stmt: &Spanned<ChlStmt>,
     preceding: &[Spanned<ChlStmt>],
@@ -2372,34 +2346,10 @@ fn lower_type_application(
     }
 }
 
-/// Lower a [`ChlStmt::Match`] to a scrutinee-[`TypedExprNode::Case`].
-///
-/// Each `` case `tag(binder): `` arm becomes one [`Branch`] carrying a
-/// [`Pattern`] — so `match` needs no IR node of its own: the pattern-`Case`
-/// that variant elimination already compiles *is* `match`. Every arm's guard is
-/// the literal `true`, which is what makes tag dispatch and the guarded
-/// `if`/`elif` chain the same first-match rule over one node
-/// (see `src/ccl/design/lowering.md`, "Variants and match").
-///
-/// Exhaustiveness is not checked here and needs no check: inference builds the
-/// expected scrutinee type *from* the arm tags and requires the scrutinee to be
-/// a subtype of it, so a `match` cannot be non-exhaustive with respect to its
-/// own arms. It fails only when the scrutinee's type is pinned independently
-/// (an annotation, or a compiler-produced `Option`) and carries a tag no arm
-/// handles — reported as an extra-tag subtyping failure.
-///
-/// The payload binder is shadowed over the arm body, so an arm binder spelled
-/// like an outer transactional register is treated as the genuine local it is.
-/// A binder-less `case tag:` still binds — to a reserved name the body cannot
-/// mention — because [`Pattern`] always names the payload it narrows; only the
-/// arm's ability to *read* it differs.
-///
-/// A `match` whose **only** arm is `case _:` names no tag at all, so it does not
-/// dispatch: its value is the default arm's, whatever the scrutinee is. It lowers
-/// to that body under an [`TypedExprNode::ExprStmt`] keeping the scrutinee, which
-/// is what still *types* the scrutinee (an unbound or ill-typed one is an error
-/// here as anywhere) while denoting a value that does not depend on it.
-/// `channelize` drops the `ExprStmt` with the rest of them.
+/// Lower a value-producing match, checking each arm as a nested value block.
+/// Inference checks scrutinee coverage; this entry point supplies the arm-body lowering
+/// policy to [`lower_match_over`].
+/// See `src/ccl/design/lowering.md`, "Variants and match" and "The default arm".
 pub(super) fn lower_match(
     match_span: Span,
     scrutinee: &Spanned<ChlExpr>,
@@ -2417,13 +2367,10 @@ pub(super) fn lower_match(
     )
 }
 
-/// [`lower_match`] over how an arm's body is lowered.
-///
-/// The tag rules — one arm per tag, `case _:` last and unique — and the
-/// `Pattern` each arm carries belong to `match` wherever it is written, and a
-/// for-loop body differs only in what a statement in an arm may be
-/// ([`lower_loop_body_chain`]). This is the production the two share, in the
-/// shape `match_arms` has in the parser.
+/// Lower tag dispatch with a caller-selected arm-body policy.
+/// Value blocks and loop statement chains share tag validation and pattern construction.
+/// Reject duplicate tags, repeated defaults and a non-final default. Tagged payload binders
+/// shadow outer names, including transactional names, while lowering their arm.
 pub(super) fn lower_match_over(
     match_span: Span,
     scrutinee: &Spanned<ChlExpr>,
@@ -2470,10 +2417,8 @@ pub(super) fn lower_match_over(
         ));
     }
     let scrutinee_expr = lower_expr(scrutinee, ctx)?;
-    // Only a default arm: nothing is dispatched on, so there is no `Case` to
-    // build — a tag-less `Branch` is a *fallback*, and with no tagged arm to fall
-    // back from it is simply the value. Sequencing it after the scrutinee keeps
-    // the scrutinee typed without letting it decide anything.
+    // Retain the scrutinee for type checking without requiring it to be a variant.
+    // Channelization removes this sequence after inference.
     if arms.len() == 1 && defaults == 1 {
         let body = lower_body(&arms[0].body, outer_bindings, ctx)?;
         return Ok(ctx.tag_image(Expr::expr_stmt(scrutinee_expr, body), match_span));
@@ -2499,19 +2444,14 @@ pub(super) fn lower_match_over(
             });
             continue;
         };
-        // An arm that names no payload still needs a payload name for `Pattern`. Use
-        // a reserved spelling so the body cannot read what it declined to name — for
-        // `_` because that is what `_` means, and for the payload-less form because
-        // there is nothing there to read.
+        // Every Pattern needs a payload binder. Reserve an inaccessible name for absent
+        // or ignored payloads so source code cannot refer to them.
         let binder = match &pat.payload {
             PayloadPattern::Named(name) => name.as_str().to_string(),
             PayloadPattern::Ignored | PayloadPattern::Absent => ctx.fresh_ignored_payload(),
         };
-        // Whether the arm *claims the tag carries nothing*. `` case `tag: `` is a
-        // statement about the type, not an elision of the binder: it matches a
-        // payload-less tag, and `emit_case` turns the claim into a constraint on that
-        // arm's payload. `_` makes no such claim — it has a payload and declines to
-        // read it.
+        // `emit_case` constrains an absent payload to Unit. An ignored payload has no
+        // such constraint: declining to read it does not require its absence.
         let empty_payload = matches!(pat.payload, PayloadPattern::Absent);
         let mut arm_scope = outer_bindings.clone();
         arm_scope.insert(binder.clone());
