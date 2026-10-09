@@ -2039,8 +2039,14 @@ pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
 /// read its binders as names, since its subterms' types are carried into new function
 /// types (`src/ccl/design/type-inference.md`, "Where the conversions run").
 ///
-/// A child visited as stored is borrowed, and an opened one is a fresh copy, owned.
-pub fn walk_children_opened<'t>(ty: &'t Type, mut visit: impl FnMut(Cow<'t, Type>)) {
+/// Each child comes with the binders it was opened at, outermost first, each paired with
+/// the type it ranges over (a component's own type opened as the component is), so a
+/// reader can put them in scope as a term's binders are. A child visited as stored is
+/// borrowed, and an opened one is a fresh copy, owned.
+pub fn walk_children_opened<'t>(
+    ty: &'t Type,
+    mut visit: impl FnMut(&[(Name, Type)], Cow<'t, Type>),
+) {
     match ty {
         Type::Fun {
             name: Some(b),
@@ -2050,28 +2056,28 @@ pub fn walk_children_opened<'t>(ty: &'t Type, mut visit: impl FnMut(Cow<'t, Type
         } => {
             for w in fun_kind.witnesses() {
                 for t in w.types() {
-                    visit(Cow::Borrowed(t));
+                    visit(&[], Cow::Borrowed(t));
                 }
             }
-            visit(Cow::Borrowed(domain));
+            visit(&[], Cow::Borrowed(domain));
             if references_enclosing_function(codomain) {
-                visit(Cow::Owned(open_pi_binder(
-                    &Mapping::Rename(b.clone()),
-                    codomain,
-                )));
+                let opened = open_pi_binder(&Mapping::Rename(b.clone()), codomain);
+                visit(&[(b.clone(), (**domain).clone())], Cow::Owned(opened));
             } else {
-                visit(Cow::Borrowed(codomain));
+                visit(&[], Cow::Borrowed(codomain));
             }
         }
         Type::DepTuple(components) => {
             let names = tuple_component_names(components);
-            for opened in
-                open_tuple_components(components, |j, _| Mapping::Rename(names[j].clone()))
-            {
-                visit(Cow::Owned(opened));
+            let mut binders: Vec<(Name, Type)> = Vec::new();
+            let opened =
+                open_tuple_components(components, |j, _| Mapping::Rename(names[j].clone()));
+            for (opened, name) in opened.into_iter().zip(names.iter()) {
+                visit(&binders, Cow::Owned(opened.clone()));
+                binders.push((name.clone(), opened));
             }
         }
-        _ => ty.walk_children(|child| visit(Cow::Borrowed(child))),
+        _ => ty.walk_children(|child| visit(&[], Cow::Borrowed(child))),
     }
 }
 

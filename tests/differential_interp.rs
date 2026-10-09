@@ -351,8 +351,82 @@ fn a_feed_under_nested_loops(#[case] source: &str) {
     for i in [1, 2, 3]:
         out << sum([max(g) * i for g in groupby([1, 2, 3, 4], \e -> e // i)])
 "#})]
+#[case::a_filter_in_the_key_reads_the_binder(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > i]))])
+"#})]
 fn a_group_by_whose_key_reads_the_loop_binder(#[case] source: &str) {
     agree(source);
+}
+
+/// A group-by whose key function computes its key with a nested collection, a union, or a
+/// conditional. The key function appears in the key domain's predicate and in the partition's,
+/// and each copy's nested refinements read that copy's own parameter.
+#[rstest]
+#[case::a_filter_reading_the_element(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > e]))])
+"#})]
+#[case::a_nested_group_by(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2],
+        \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])
+"#})]
+#[case::a_conditional_on_the_element(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> (e if e > 1 else 0))])
+"#})]
+#[case::a_union(indoc! {r#"
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([1, 2] ++ [3, 4]))])
+"#})]
+#[case::a_conditional_collection(indoc! {r#"
+    c: Bool = True
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 2, 3, 4], \e -> e // sum(box([1, 2]) if c else box([3, 4, 5])))])
+"#})]
+fn a_group_by_whose_key_computes_with_a_collection(#[case] source: &str) {
+    agree(source);
+}
+
+/// A generator called in a filter or a group-by key: its body stays in the predicate until
+/// planning lifts the predicate or the key out of it, which channelizes it.
+#[rstest]
+#[case::in_a_filter(indoc! {r#"
+    def triples(hxs):
+        for hx in hxs:
+            yield hx * 3
+    out = test_sink()
+    out << sum([x for x in [1, 4, 7] if max(triples([1, 2])) > x + 1])
+"#})]
+#[case::in_a_key(indoc! {r#"
+    def triples(hxs):
+        for hx in hxs:
+            yield hx * 3
+    out = test_sink()
+    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> max(triples([1, 2])) // e)])
+"#})]
+#[case::in_a_key_under_a_loop(indoc! {r#"
+    def triples(hxs):
+        for hx in hxs:
+            yield hx * 3
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> max(triples([1, 2])) * i)])
+"#})]
+fn a_generator_called_in_a_predicate(#[case] source: &str) {
+    agree(source);
+}
+
+/// A filter whose predicate aggregates a comprehension filtered by the outer element: the
+/// predicate runs as a correlated site of its own.
+#[test]
+fn a_filter_aggregating_a_correlated_comprehension() {
+    agree(indoc! {r#"
+        out = test_sink()
+        out << sum([x for x in [1, 2, 3] if sum([z for z in [1, 2, 3] if z > x]) > 1])
+    "#});
 }
 
 /// A two-clause comprehension whose value reads neither binder.

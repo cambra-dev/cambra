@@ -52,7 +52,11 @@ use super::predicates::fn_of_bare_predicate;
 /// Emit the filter riding every correlated `curry` site's pair ([`emit_pair_filter`]).
 ///
 /// Runs before planning's first `simplify`, which reads the pair domain the filter leaves.
-pub(super) fn emit_correlated_filters(expr: &mut Expr) {
+/// The error is planning's, from the filter it lifts ([`plan_before_iteration`]).
+pub(super) fn emit_correlated_filters(
+    expr: &mut Expr,
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
     let node_id = expr.node_id();
     if let TypedExprNode::Apply { argument, function } = &mut expr.node
         && is_builtin(function, Builtin::Curry)
@@ -62,12 +66,18 @@ pub(super) fn emit_correlated_filters(expr: &mut Expr) {
             "planning.correlated_filter",
             provenance::Nature::Machinery,
         );
-        if emit_pair_filter(argument) {
+        if emit_pair_filter(argument, witnesses)? {
             // `curry`'s own stamp says what it takes; the argument's domain just moved.
             function.ty = Type::fun(argument.ty.clone(), expr.ty.clone());
         }
     }
-    expr.walk_children_mut(emit_correlated_filters);
+    let mut result = Ok(());
+    expr.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = emit_correlated_filters(child, witnesses);
+        }
+    });
+    result
 }
 
 /// Rewrite every correlated `curry` site through `strength`.
@@ -75,14 +85,17 @@ pub(super) fn emit_correlated_filters(expr: &mut Expr) {
 /// Runs after planning's first `simplify`, so a `curry` exponential eta reduces is gone
 /// first, and before the iteration-site walk, so the `map_domain` this mints is marked like
 /// any other iteration source.
-pub(super) fn pair_correlated_sites(expr: &mut Expr) -> Result<(), String> {
+pub(super) fn pair_correlated_sites(
+    expr: &mut Expr,
+    witnesses: &mut Witnesses,
+) -> Result<(), String> {
     let rewritten = {
         let _g = provenance::enter(
             expr.node_id(),
             "planning.correlated",
             provenance::Nature::Machinery,
         );
-        through_strength(expr)?
+        through_strength(expr, witnesses)?
     };
     if let Some(rewritten) = rewritten {
         *expr = rewritten;
@@ -90,7 +103,7 @@ pub(super) fn pair_correlated_sites(expr: &mut Expr) -> Result<(), String> {
     let mut result = Ok(());
     expr.walk_children_mut(|child| {
         if result.is_ok() {
-            result = pair_correlated_sites(child);
+            result = pair_correlated_sites(child, witnesses);
         }
     });
     result
@@ -100,7 +113,7 @@ pub(super) fn pair_correlated_sites(expr: &mut Expr) -> Result<(), String> {
 /// collection the site ranges over (the module doc says which). `None` where `expr` is not a
 /// correlated site: a `curry` of a builtin is a partial application, which op-conversion
 /// compiles as one.
-fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
+fn through_strength(expr: &Expr, witnesses: &mut Witnesses) -> Result<Option<Expr>, String> {
     let TypedExprNode::Apply {
         argument: g,
         function,
@@ -116,7 +129,7 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
     // dependent tuple"). The site pairs each enclosing value with its own keys rather
     // than with one collection every row shares.
     if let Some(Type::DepTuple(components)) = g.ty.domain().map(|d| d.peel_refinements().clone()) {
-        let family = keys_family(&components)?;
+        let family = keys_family(&components, witnesses)?;
         let family_ty = family.ty.clone();
         let pair = Expr::tuple(vec![family, g.as_ref().clone_preserving_ids()])
             .with_ty(Type::Tuple(vec![family_ty, g.ty.clone()]));
@@ -245,7 +258,10 @@ fn through_strength(expr: &Expr) -> Result<Option<Expr>, String> {
 /// The component is read under a name for `𝑥`. A membership refinement `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}`
 /// states the keys as the image of the collection `𝑀(𝑥)`, so the keys are
 /// `map_domain(converse(𝑀(𝑥)))`, and `𝐹` is `(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`.
-fn keys_family(components: &[(Option<Name>, Type)]) -> Result<Expr, String> {
+fn keys_family(
+    components: &[(Option<Name>, Type)],
+    witnesses: &mut Witnesses,
+) -> Result<Expr, String> {
     let [(name, enclosing), (_, component)] = components else {
         return Err(format!(
             "a dependent tuple of {} components under one `curry` is not supported yet",
@@ -296,7 +312,7 @@ fn keys_family(components: &[(Option<Name>, Type)]) -> Result<Expr, String> {
             });
             Expr::apply(acc, f).with_ty(ty)
         });
-    let mut per_row = lambda_elim::run(
+    let per_row = predicates::eliminate_lifted(
         Expr::lambda(
             &x,
             enclosing.clone(),
@@ -305,6 +321,7 @@ fn keys_family(components: &[(Option<Name>, Type)]) -> Result<Expr, String> {
         .with_ty(Type::pi(x.clone(), enclosing.clone(), image_ty.clone())),
     )
     .map_err(|e| format!("eliminating a dependent tuple's key collection: {e:?}"))?;
+    let mut per_row = plan_before_iteration(per_row, witnesses)?;
     // **The head binds `𝑥` for the whole chain**, whether or not its own codomain reads it:
     // the keys `map_domain` yields are the component at `𝑥`, so its type does, and a
     // chain scopes a morphism's binder over every morphism after it.
@@ -416,7 +433,7 @@ fn inner_source<'a>(g: &'a Expr, inner_domain: &Type) -> Option<&'a Expr> {
 /// for a gate that varies with the element (`src/ccl/ops.rs`, `Builtin::FilterValues`), and a
 /// gate that varies with the row is the same thing. The domain loses the refinement in every
 /// slot the chain is written at, because the term now carries it.
-fn emit_pair_filter(g: &mut Expr) -> bool {
+fn emit_pair_filter(g: &mut Expr, witnesses: &mut Witnesses) -> Result<bool, String> {
     let Type::Fun {
         fun_kind,
         domain,
@@ -424,13 +441,13 @@ fn emit_pair_filter(g: &mut Expr) -> bool {
         ..
     } = &g.ty
     else {
-        return false;
+        return Ok(false);
     };
     let Type::Refinement(bare, filters) = domain.as_ref() else {
-        return false;
+        return Ok(false);
     };
     if !matches!(bare.as_ref(), Type::Tuple(components) if components.len() == 2) {
-        return false;
+        return Ok(false);
     }
     let pair_ty = (**bare).clone();
     let predicates: Vec<Rc<TypedExpr>> = filters
@@ -448,20 +465,18 @@ fn emit_pair_filter(g: &mut Expr) -> bool {
         domain: Box::new(pair_ty.clone()),
         codomain: codomain.clone().into(),
     };
-    let chain = predicates.into_iter().fold(
-        std::mem::replace(g, Expr::builtin(Builtin::Id)),
-        |acc, predicate| {
-            let p = fn_of_bare_predicate(&pair_ty, &predicate, &[]);
-            let filter = apply_primitive(
-                p,
-                Builtin::FilterValues,
-                Type::fun(pair_ty.clone(), pair_ty.clone()),
-            );
-            compose(filter, acc).with_ty(Type::fun(pair_ty.clone(), codomain.clone()))
-        },
-    );
+    let mut chain = std::mem::replace(g, Expr::builtin(Builtin::Id));
+    for predicate in predicates {
+        let p = plan_before_iteration(fn_of_bare_predicate(&pair_ty, &predicate, &[]), witnesses)?;
+        let filter = apply_primitive(
+            p,
+            Builtin::FilterValues,
+            Type::fun(pair_ty.clone(), pair_ty.clone()),
+        );
+        chain = compose(filter, chain).with_ty(Type::fun(pair_ty.clone(), codomain.clone()));
+    }
     *g = chain;
-    true
+    Ok(true)
 }
 
 /// Rewrite the refined pair domain to its bare product in every type slot at or below `e`:

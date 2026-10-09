@@ -116,6 +116,13 @@ pub(super) struct CheckCtx {
     /// Entries accumulate and are never removed — a uniquified name denotes one
     /// binding, so the fact it records stays true.
     opaque_binders: HashMap<Name, Type>,
+    /// The refinement predicates already typed by [`check_slot_predicates`], by address. A
+    /// predicate shared across type slots is one term and is typed once.
+    checked_predicates: std::collections::HashSet<crate::ccl::ty::PredicateId>,
+    /// The opened copies [`check_slot_predicates`] walked, kept alive for the rest of the
+    /// check: `checked_predicates` keys by address, and a copy freed mid-walk lends its
+    /// address to a later predicate, which would then be skipped as already checked.
+    opened_types: Vec<Type>,
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -155,6 +162,8 @@ impl CheckCtx {
             telescope: Telescope::empty(),
             scopes: ScopeStack::default(),
             opaque_binders: HashMap::new(),
+            checked_predicates: Default::default(),
+            opened_types: Vec::new(),
         }
     }
 
@@ -749,7 +758,10 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
         let inner = ctx.witness_ctx.extended(&binders);
         std::mem::replace(&mut ctx.witness_ctx, inner)
     });
-    let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || check_node_rule(expr, ctx));
+    let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        check_slot_predicates(expr, ctx);
+        check_node_rule(expr, ctx)
+    });
     if let Some(outer) = outer {
         ctx.witness_ctx = outer;
     }
@@ -943,28 +955,25 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     Ok(ty)
 }
 
-/// Type every refinement predicate the tree carries, as the function it denotes.
+/// Type every refinement predicate `expr`'s own type slots carry, as the function it denotes.
 ///
-/// A predicate is a term, and the walk above cannot reach it: it hangs off a `Type`, so a
-/// wall comparing types compares it whole and never asks whether it type-checks. That is
-/// the gap two defects on this branch travelled through — a projection inside a predicate
-/// naming a witness the enclosing type does not.
+/// A predicate is a term, and the rules cannot reach it: it hangs off a `Type`, so a check
+/// comparing types compares it whole and never asks whether it type-checks. A projection
+/// inside it naming a witness the enclosing type does not is one defect only this catches.
 ///
 /// Checked in the form it denotes and the form planning will compile, `λ __elem : base →
 /// predicate` ([`crate::ccl::planning::predicates::fn_of_bare_predicate`]), because a bare
 /// predicate is open in `__elem` and would report an unbound variable on its own.
-fn check_predicates(
-    expr: &Expr,
-    ctx: &mut CheckCtx,
-    visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
-    kept: &mut Vec<Type>,
-) {
-    fn in_type(
-        ty: &Type,
-        ctx: &mut CheckCtx,
-        visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
-        kept: &mut Vec<Type>,
-    ) {
+///
+/// Run from [`check_node`], at the node whose slot holds the type, so the predicate is
+/// typed in the scope it is written in: its free names are the binders enclosing that node,
+/// and a variable its rules mint carries their telescope. A walk of its own over the tree's
+/// type slots would type every predicate at the root, where the binder of an enclosing
+/// lambda a nested filter reads is out of scope. The predicate's own subterms — a filter
+/// nested inside it, say — are then reached by the rules walking the scratch lambda, under
+/// `__elem` and the predicate's own binders.
+fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
+    fn in_type(ty: &Type, ctx: &mut CheckCtx) {
         // **A Σ binds its witnesses over everything below it**, the predicate on its domain
         // included, so Γ gains them here and loses them on the way out. This walk reaches a
         // predicate through types rather than through the tree, so nothing else has put
@@ -974,20 +983,18 @@ fn check_predicates(
             let inner = ctx.witness_ctx.extended(&binders);
             std::mem::replace(&mut ctx.witness_ctx, inner)
         });
-        in_type_go(ty, ctx, visited, kept);
+        in_type_go(ty, ctx);
         if let Some(outer) = outer {
             ctx.witness_ctx = outer;
         }
     }
-    fn in_type_go(
-        ty: &Type,
-        ctx: &mut CheckCtx,
-        visited: &mut std::collections::HashSet<crate::ccl::ty::PredicateId>,
-        kept: &mut Vec<Type>,
-    ) {
+    fn in_type_go(ty: &Type, ctx: &mut CheckCtx) {
         if let Type::Refinement(base, refinements) = ty {
             for r in refinements {
-                if !visited.insert(std::rc::Rc::as_ptr(&r.predicate)) {
+                if !ctx
+                    .checked_predicates
+                    .insert(std::rc::Rc::as_ptr(&r.predicate))
+                {
                     continue;
                 }
                 // **The scratch lambda never enters a tree, so it consumes no identity.**
@@ -1020,24 +1027,28 @@ fn check_predicates(
                         crate::ccl::symbolic::symbolic_typed(&r.predicate)
                     );
                 }
-                check_predicates(&r.predicate, ctx, visited, kept);
             }
         }
-        // Under each binder the predicates read it by name, as a term does. An opened
-        // child is a copy, and `visited` keys predicates by address, so each copy is kept
-        // alive in `kept` for the rest of the walk: one freed mid-walk lends its address
-        // to a later predicate, which would then be skipped as already checked. A child
-        // visited as stored lives in the tree and needs no keeping.
-        crate::ccl::subst::walk_children_opened(ty, |child| match child {
-            std::borrow::Cow::Borrowed(child) => in_type(child, ctx, visited, kept),
-            std::borrow::Cow::Owned(child) => {
-                in_type(&child, ctx, visited, kept);
-                kept.push(child);
+        // Under each binder the predicates read it by name, as a term does, and it is in
+        // scope for them as a term's binder is. An opened child is a copy, kept alive in
+        // `opened_types` for the rest of the check (see the field); a child visited as stored
+        // lives in the tree and needs no keeping.
+        crate::ccl::subst::walk_children_opened(ty, |binders, child| {
+            in_type_under(binders, &child, ctx);
+            if let std::borrow::Cow::Owned(child) = child {
+                ctx.opened_types.push(child);
             }
         });
     }
-    expr.walk_type_slots(|ty| in_type(ty, ctx, visited, kept));
-    expr.walk_children(|child| check_predicates(child, ctx, visited, kept));
+    fn in_type_under(binders: &[(Name, Type)], ty: &Type, ctx: &mut CheckCtx) {
+        match binders.split_first() {
+            None => in_type(ty, ctx),
+            Some(((name, bound_at), rest)) => {
+                ctx.scoped(name, bound_at, |ctx| in_type_under(rest, ty, ctx))
+            }
+        }
+    }
+    expr.walk_type_slots(|ty| in_type(ty, ctx));
 }
 
 /// The rule for [`Builtin::Strength`]: `(𝑋, 𝐶) ⇒ 𝐶′`, where `𝐶′` is `𝐶` over the same keys,
@@ -1118,7 +1129,6 @@ pub(crate) fn check_located(expr: &Expr) -> Result<(), Vec<LocatedInferError>> {
     if let Err(e) = check_node(&mut cloned, &mut ctx) {
         ctx.errors.push(e);
     }
-    check_predicates(&cloned, &mut ctx, &mut Default::default(), &mut Vec::new());
     if ctx.errors.is_empty() {
         Ok(())
     } else {

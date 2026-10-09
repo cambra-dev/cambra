@@ -1270,8 +1270,26 @@ fn elim_lambda_impl(
                     let on_element =
                         crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &y_ty))
                             .apply_expr(predicate);
-                    crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
-                        .apply_expr(&on_element)
+                    // **`param` is bound, not substituted, where a nested refinement reads
+                    // it.** Writing `__elem.0` there would capture: the nested refinement
+                    // binds `__elem` to its own element, and no spelling names the
+                    // enclosing one. Applying `λ param → …` to the pair's first component
+                    // leaves the nested refinement reading a binder of the predicate's own
+                    // term, which every reader resolves as it resolves any lambda binder
+                    // in a predicate (`src/ccl/design/type-inference.md`, "Lifting a
+                    // filter onto the pair").
+                    let free = crate::ccl::ccl_utils::count_free(param, &on_element);
+                    if free > crate::ccl::ccl_utils::count_free_in_value(param, &on_element) {
+                        let ty = on_element.ty.clone();
+                        Expr::apply(
+                            at(0, param_ty),
+                            Expr::lambda(param.clone(), param_ty.clone(), on_element),
+                        )
+                        .with_ty(ty)
+                    } else {
+                        crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
+                            .apply_expr(&on_element)
+                    }
                 };
                 let key = (param.clone(), bare_pair.clone());
                 let lifted: Vec<Refinement> = lifting

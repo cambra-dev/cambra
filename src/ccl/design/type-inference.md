@@ -2013,10 +2013,14 @@ wraps the predicate in `λ __elem → …`, and the checker rebuilds each subter
 children. An index those subterm types hold, read in the stored form, lands under the crossings
 the new function types add, where it names another function. Planning's predicate compilation
 therefore runs on a codomain opened at its binder and closes the result
-(`subst::map_opened_codomain`), and the checker's predicate walk visits a type's children opened
-(`subst::walk_children_opened`). A dependent tuple's components are opened at the names of the
-components before them. Closing leaves a name reference to a function inside the closed structure
-that binds the same name, since that function binds it.
+(`subst::map_opened_codomain`), and the checker visits a type's children opened, with the binders
+they were opened at in scope (`subst::walk_children_opened`). A dependent tuple's components are
+opened at the names of the components before them. Closing leaves a name reference to a function
+inside the closed structure that binds the same name, since that function binds it.
+
+The checker types a predicate at the node whose type slot holds it (`check_slot_predicates`), so
+the predicate's free names resolve against the binders enclosing that node, and a refinement
+nested inside the predicate is typed under the predicate's own binders.
 
 #### Display opens what it descended through
 
@@ -3013,12 +3017,16 @@ projection read `𝑥`. Product β removes the pairing with the projection, so i
 ### Lifting a filter onto the pair
 
 The nested-lambda rule writes a lifted filter over the pair's element, `𝑎 ↦ __elem.0`. A
-subterm whose type restates the pair's own dependent tuple, the key
-`𝑎.1 : {𝐾 | __elem ∈ 𝑀(𝑎.0)}`, would capture under that substitution, since inside the
-refinement `__elem` is the key. The rule removes those restated facts first; the pair's first
-component has the tuple's type, which states them. A substitution reaching any other refinement
-this way fails (`Subst::assert_no_element_capture`), because a nested refinement cannot name an
-enclosing refinement's element.
+refinement nested in the filter's subterm types binds `__elem` to its own element, so the
+substitution would capture there, and no spelling names the enclosing element from inside it.
+
+A subterm whose type restates the pair's own dependent tuple, the key
+`𝑎.1 : {𝐾 | __elem ∈ 𝑀(𝑎.0)}`, holds such a refinement. The rule removes those restated facts
+first; the pair's first component has the tuple's type, which states them. Where a nested
+refinement still reads `𝑎`, a filter in the key function reading the loop binder, the rule binds `𝑎`
+instead of substituting it: the lifted filter is `__elem.0 ▷ (λ 𝑎 → 𝑝)`, and the nested refinement
+reads a binder of the filter's own term. A substitution that would capture still fails
+(`Subst::assert_no_element_capture`).
 
 ### Iterating a dependent tuple
 
@@ -3031,9 +3039,10 @@ row shares is `𝐹 = const(𝐾)`.
 
 A membership component `{𝐾 | 𝑘 ∈ 𝑀(𝑥)}` has the image of `𝑀(𝑥)` as its keys, so `𝐹` is
 `(λ 𝑥 → 𝑀(𝑥)) ≫ converse ≫ map_domain`, with `𝑀(𝑥)` written in the indexed form a
-comprehension reaches lambda elimination in, `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the chain `𝑠 ≫ 𝑓`. A second
-component of any other shape, and a tuple of more than two components under one `curry`, are
-refused.
+comprehension reaches lambda elimination in, `λ 𝑟 → 𝑟 ▷ 𝑠 ▷ 𝑓` for the chain `𝑠 ≫ 𝑓`. The
+first morphism binds `𝑥`, whether or not its codomain reads it, since the keys `map_domain` yields
+are stated at `𝑥`. A second component of any other shape, and a tuple of more than two components
+under one `curry`, are refused.
 
 ### At run time
 
