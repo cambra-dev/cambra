@@ -809,7 +809,7 @@ impl TileOperator for Filter {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
             forwarding_consumer(&shared, &scheduler.wakeup_queue()),
@@ -826,7 +826,8 @@ impl TileOperator for Filter {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input: input_producer,
             predicate: predicate_producer,
             level: self.level,
@@ -1433,7 +1434,7 @@ impl TileOperator for Product {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let shared = shared_consumer(consumer);
+        let (shared, gate) = shared_consumer(consumer);
         let level = self
             .paired
             .enclosing()
@@ -1445,7 +1446,8 @@ impl TileOperator for Product {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             outer: self.outer.subscribe(
                 self.outer.tiling().universal_guard(),
                 forwarding_consumer(&shared, &scheduler.wakeup_queue()),

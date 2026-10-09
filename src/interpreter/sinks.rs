@@ -14,7 +14,11 @@ use std::{
     },
 };
 
-use crate::interpreter::{Consumer, DataSink, tile_operators::TileProducer};
+use crate::interpreter::{
+    Consumer, DataSink,
+    scheduler::{SharedConsumer, WakeupQueue},
+    tile_operators::TileProducer,
+};
 
 /// Shared slot for injecting the producer after `subscribe` returns.
 ///
@@ -64,27 +68,33 @@ impl DoneNotifier {
 // Sink consumer
 // ---------------------------------------------------------------------------
 
-/// A [`Consumer`] that, on each notification, pulls the current tile from the
-/// wrapped producer, passes it to the paired [`DataSink`], and fires the
-/// [`DoneNotifier`] when a terminal tile is received.
+/// A [`Consumer`] that, on notification, schedules a pull of the wrapped producer on the
+/// scheduler's sink pull queue
+/// ([`Scheduler::sink_pull_queue`](crate::interpreter::Scheduler::sink_pull_queue)). The pull
+/// passes the current tile to the paired [`DataSink`] and fires the [`DoneNotifier`] when a
+/// terminal tile is received.
+///
+/// The pull is scheduled rather than made in [`notify`](Consumer::notify) because a change
+/// reaches a sink once along every notification path from where it happened, and the queue
+/// holds one pull however many arrive (`src/interpreter/design-operators.md`, "The
+/// notification contract").
 ///
 /// The producer reference is held in an `Option` that starts as `None` and is
 /// filled after [`crate::interpreter::tile_operators::TileOperator::subscribe`] returns (solving the chicken-and-egg:
 /// the consumer must exist before subscribe is called, but subscribe is what
 /// creates the producer).
 ///
-/// So a notification raised *during* `subscribe` — an induction store raises one
-/// to start its loop — arrives with the slot still empty and is dropped. Whoever
-/// fills the slot notifies once afterwards for that reason
-/// ([`crate::ccl::context::compile_program`]); a version installed while work was
-/// outstanding is otherwise never pulled.
+/// A pull scheduled *during* `subscribe` — an induction store notifies to start its
+/// loop — waits on that queue until the scheduler next delivers, by which time the slot
+/// is filled. Whoever fills the slot also pulls once at once ([`pull_now`](Self::pull_now),
+/// from [`crate::ccl::context::compile_program`]).
 pub struct SinkConsumer {
     /// The compiled responses producer, filled in after subscribe returns.
     producer: ProducerSlot,
-    /// The sink that dispatches responses.
-    sink: Arc<dyn DataSink>,
-    /// Fired once when this sink receives a terminal tile.  `None` after it fires.
-    done: Option<DoneNotifier>,
+    /// The pull a notification schedules: one `get` of the producer, handed to the sink.
+    pull: SharedConsumer,
+    /// Where a notification schedules [`pull`](Self::pull).
+    wakeups: WakeupQueue,
 }
 
 impl SinkConsumer {
@@ -92,19 +102,43 @@ impl SinkConsumer {
     ///
     /// The returned consumer holds a shared handle to the `producer` slot. The
     /// caller fills it with the `TileProducer` returned by
-    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] and then
-    /// notifies once, which is the only way this consumer sees the notifications
-    /// `subscribe` itself raised.
-    pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
+    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] and then pulls
+    /// once ([`pull_now`](Self::pull_now)).
+    pub fn new(
+        sink: Arc<dyn DataSink>,
+        done: DoneNotifier,
+        wakeups: WakeupQueue,
+    ) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
+        let producer = slot.clone();
+        let mut done = Some(done);
+        let pull: SharedConsumer = Rc::new(RefCell::new(move || {
+            if let Some(prod) = producer.borrow_mut().as_mut() {
+                let guard = prod.tiling().universal_guard();
+                let tile = prod.get(guard);
+                sink.process(&tile);
+                let is_terminal = tile.is_terminal();
+                prod.release(tile.to_guard());
+                if is_terminal && let Some(notifier) = done.take() {
+                    notifier.signal();
+                }
+            }
+        }));
         (
             Self {
                 producer: slot.clone(),
-                sink,
-                done: Some(done),
+                pull,
+                wakeups,
             },
             slot,
         )
+    }
+
+    /// Pull now rather than when the scheduler next drains. Installing a version pulls it
+    /// at once: the version a reload replaces hands its state to its successor, and one
+    /// replaced before it was ever pulled has opened none to hand on.
+    pub fn pull_now(&self) {
+        self.pull.borrow_mut().notify();
     }
 
     /// Stop dispatching and release the producer chain behind this consumer.
@@ -130,16 +164,9 @@ impl SinkConsumer {
 }
 
 impl Consumer for SinkConsumer {
+    /// Schedules one pull rather than pulling. A change reaches the sink once along every
+    /// path from where it happened, and the queue holds a pull once however many arrive.
     fn notify(&mut self) {
-        if let Some(prod) = self.producer.borrow_mut().as_mut() {
-            let guard = prod.tiling().universal_guard();
-            let tile = prod.get(guard);
-            self.sink.process(&tile);
-            let is_terminal = tile.is_terminal();
-            prod.release(tile.to_guard());
-            if is_terminal && let Some(notifier) = self.done.take() {
-                notifier.signal();
-            }
-        }
+        self.wakeups.request(self.pull.clone());
     }
 }

@@ -2620,7 +2620,8 @@ fn compile_version(
                 .clone();
 
             let notifier = notifiers.pop().unwrap();
-            let (sink_consumer, producer_slot) = SinkConsumer::new(sink, notifier);
+            let (sink_consumer, producer_slot) =
+                SinkConsumer::new(sink, notifier, ctx.scheduler().sink_pull_queue());
             let consumer_rc = Rc::new(RefCell::new(sink_consumer));
             let sink_producer =
                 op.subscribe(universal, Box::new(consumer_rc.clone()), ctx.scheduler());
@@ -2635,15 +2636,12 @@ fn compile_version(
                 )
             );
             *producer_slot.borrow_mut() = Some(sink_producer);
-            // Kick the sink now it has something to pull. Operators notify from
-            // inside `subscribe` (an induction store does, to start its loop), and
-            // a `SinkConsumer` whose slot is still empty drops those — so the work
-            // already available when a version is installed needs a notification
-            // of its own. A first compile is carried by the source reporting its
-            // data as new; a *replacement* is not, because the version it replaces
-            // has already taken that report, so without this a reload lands with
-            // unfinished work and nothing pulls it until the next arrival.
-            consumer_rc.borrow_mut().notify();
+            // Pull the sink now it has something to pull. A first compile is carried
+            // by the source reporting its data as new; a *replacement* is not,
+            // because the version it replaces has already taken that report, so
+            // without this pull a reload lands with unfinished work and nothing
+            // pulls it until the next arrival.
+            consumer_rc.borrow().pull_now();
             outputs.push(CompiledOutput {
                 name,
                 op,

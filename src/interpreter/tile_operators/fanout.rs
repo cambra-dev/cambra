@@ -9,7 +9,7 @@ use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
         Consumer, Position, Scheduler,
-        scheduler::{SharedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
+        scheduler::{GatedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -116,6 +116,10 @@ struct FanOutShared {
     /// fan-outs (the overwhelming majority); `Some` only when constructed
     /// via [`FanOut::new_cyclic`].
     reentrancy: Option<FanOutReentrancy>,
+    /// Set when the input's notification is passed to the branches, cleared when a branch
+    /// pulls. A second one before that says nothing the first did not, so it stops here, as
+    /// it does at an operator's shared consumer (`crate::interpreter::GatedConsumer`).
+    forwarded: Notified,
 }
 
 impl FanOutShared {
@@ -276,6 +280,7 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
+            forwarded: Notified::clear(),
         }));
         Self {
             input: Rc::new(RefCell::new(input)),
@@ -585,6 +590,9 @@ impl TileOperator for FanOutBranch {
                     };
                     let consumers = {
                         let shared = shared_rc.borrow();
+                        if !shared.forwarded.mark_news() {
+                            return;
+                        }
                         shared
                             .live_indices()
                             .map(|i| shared.consumers[i].clone())
@@ -696,6 +704,8 @@ impl TileProducer for FanOutProducer {
         // non-cyclic mode, the producer stays in `shared` and we pull
         // through a regular borrow.
         let shared_rc = self.shared();
+        // Reopened before the pull, as an operator's gate is (`TileProducer::get`).
+        shared_rc.borrow().forwarded.take();
         let cyclic = shared_rc.borrow().reentrancy.is_some();
         let mut result = if cyclic {
             let producer_opt = shared_rc.borrow_mut().producer.take();
@@ -853,7 +863,7 @@ impl TileOperator for Memo {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let notified = Notified::flag();
-        let consumer = shared_consumer(consumer);
+        let (consumer, gate) = shared_consumer(consumer);
         Box::new(MemoProducer {
             base: ProducerBase::listening(
                 MemoProducer::alloc_id(),
@@ -861,7 +871,8 @@ impl TileOperator for Memo {
                 &self.base,
                 scheduler,
                 notified.clone(),
-            ),
+            )
+            .sharing(gate),
             input: self.input.subscribe(
                 intent_guard,
                 notified.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
@@ -895,11 +906,11 @@ struct MemoProducer {
     /// notified finds data the cache did not hold.
     ///
     /// A memo answers from its cache until its input notifies, so every consumer downstream
-    /// counts on its output changing only after a notification. A pull taken without one —
-    /// an empty cache, or a drained input a debug build still probes — can still find new
-    /// data, and then the change reaches no one: a sibling memo over the same input has
-    /// already answered from its own cache and will keep doing so.
-    consumer: SharedConsumer,
+    /// counts on its output changing only after a notification. A pull taken without one, a
+    /// drained input a debug build still probes, can still find new data, and then the
+    /// change reaches no one: a sibling memo over the same input has already answered from
+    /// its own cache and will keep doing so.
+    consumer: GatedConsumer,
     wakeups: WakeupQueue,
 }
 
@@ -932,14 +943,17 @@ impl TileProducer for MemoProducer {
             return self.cached_tile.clone();
         }
         // The cache is cumulative, so when nothing has notified since the last pull it is
-        // already the answer and pulling walks the subtree below to merge nothing. An
-        // empty cache is not an answer yet: a demand read taken outside the delivery loop
-        // — a store's init op reading a seed, a completion read — arrives before anything
-        // has notified, so it pulls. A drained input is left to the rule above rather
-        // than gated here, which is what keeps that rule's debug probe: gating a drained
-        // input would shield it in every build.
+        // already the answer, empty or not, and pulling walks the subtree below to merge
+        // nothing. The flag starts set, so the first pull reads: a demand read taken outside
+        // the delivery loop, a store's init op reading a seed or a completion read, arrives
+        // before anything has notified. Every later change to the input notifies (the
+        // notification contract), so an empty cache read since is the input's answer. Under
+        // a fan-out the cache is what keeps each branch's pull from re-reading the shared
+        // input, which on a first lap is mostly empty. A drained input is left to the rule
+        // above rather than gated here, which is what keeps that rule's debug probe: gating
+        // a drained input would shield it in every build.
         let notified = self.base.notified.take();
-        if !notified && !self.cached_tile.is_empty() && !self.upstream_drained {
+        if !notified && !self.upstream_drained {
             debug_assert!(
                 projection_guard.is_universal(),
                 "a memo answers a gated pull from its whole cache, which is the projection \
@@ -985,7 +999,7 @@ impl TileProducer for MemoProducer {
             let before = self.cached_tile.clone();
             self.cached_tile.merge(input);
             if self.cached_tile != before {
-                self.wakeups.request(self.consumer.clone());
+                self.wakeups.request(self.consumer.shared().clone());
             }
         }
         self.cached_tile.clone()
@@ -1205,6 +1219,43 @@ mod tests {
         )
     }
 
+    /// A fan-out passes its input's notification to its branches once until a branch pulls:
+    /// a second one before that says nothing the first did not.
+    #[test]
+    fn a_fan_out_passes_one_notification_per_pull() {
+        let tiling = partial_tiling();
+        let (input, _pulls, notifier) = Scripted::new(vec![one_row(0, 7)], &tiling);
+        let fan = FanOut::new(Box::new(input));
+        let mut sched = Scheduler::new();
+        let counts: Vec<Rc<Cell<u32>>> = (0..2).map(|_| Rc::new(Cell::new(0))).collect();
+        let mut producers: Vec<Box<dyn TileProducer>> = counts
+            .iter()
+            .map(|count| {
+                let count = count.clone();
+                fan.branch().subscribe(
+                    tiling.universal_guard(),
+                    Box::new(move || count.set(count.get() + 1)),
+                    &mut sched,
+                )
+            })
+            .collect();
+        notify(&notifier);
+        notify(&notifier);
+        let seen = || counts.iter().map(|c| c.get()).collect::<Vec<_>>();
+        assert_eq!(
+            seen(),
+            [1, 1],
+            "the second notification reached the branches unpulled"
+        );
+        producers[0].get(tiling.universal_guard());
+        notify(&notifier);
+        assert_eq!(
+            seen(),
+            [2, 2],
+            "a branch's pull did not let the next notification through"
+        );
+    }
+
     /// A memo whose input has said nothing since its last pull answers from the
     /// cache without reading the input; a notification re-enables the read.
     ///
@@ -1235,14 +1286,13 @@ mod tests {
         assert_eq!(pulls.get(), 2, "a notification re-enables the read");
     }
 
-    /// An **empty** cache is never gated: a demand read taken outside the delivery
-    /// loop arrives before anything has notified, and an empty cache is not yet an
-    /// answer. The input here yields nothing on the first pull and the row on the
-    /// second, so both pulls have to reach it.
+    /// An **empty** cache is gated like any other once the input has been read: the first
+    /// pull reads, because the flag starts set, and from then on the input's next change
+    /// notifies. The input here yields nothing on the first pull and the row on the second.
     #[test]
-    fn a_memo_with_an_empty_cache_reads_its_input_unnotified() {
+    fn a_memo_with_an_empty_cache_reads_its_input_after_a_notification() {
         let tiling = partial_tiling();
-        let (input, pulls, _notifier) =
+        let (input, pulls, notifier) =
             Scripted::new(vec![tiling.empty_tile(), one_row(0, 7)], &tiling);
         let mut memo = Memo::new(Box::new(input));
         let mut sched = Scheduler::new();
@@ -1252,18 +1302,20 @@ mod tests {
             producer.get(tiling.universal_guard()).is_empty(),
             "the input had nothing yet"
         );
-        assert_eq!(pulls.get(), 1);
+        assert_eq!(pulls.get(), 1, "the first pull reads its input");
 
-        let second = producer.get(tiling.universal_guard());
         assert!(
-            !second.is_empty(),
-            "an empty cache pulls again with nothing notified, and finds the row"
+            producer.get(tiling.universal_guard()).is_empty(),
+            "nothing notified, so the empty cache is the answer"
         );
-        assert_eq!(
-            pulls.get(),
-            2,
-            "the empty cache is not an answer to gate on"
+        assert_eq!(pulls.get(), 1, "nothing notified, so the input is not read");
+
+        notify(&notifier);
+        assert!(
+            !producer.get(tiling.universal_guard()).is_empty(),
+            "the notification re-enables the read, which finds the row"
         );
+        assert_eq!(pulls.get(), 2);
     }
 
     /// A `Memo` releases its input universally as soon as the input hands over a
@@ -1287,7 +1339,7 @@ mod tests {
             input: Box::new(upstream),
             cached_tile: tiling.empty_tile(),
             upstream_drained: false,
-            consumer: shared_consumer(Box::new(|| {})),
+            consumer: shared_consumer(Box::new(|| {})).0,
             wakeups: WakeupQueue::default(),
         };
 
