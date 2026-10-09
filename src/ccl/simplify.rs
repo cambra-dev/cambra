@@ -392,9 +392,35 @@ fn ruled(
 /// If `expr` is an n-ary [`TypedExprNode::Compose`], return its elements;
 /// otherwise return a single-element `vec![expr]`.  Used by
 /// [`try_flatten_compose`] to merge already-flattened child compose nodes.
+///
+/// A nested chain whose type is dependent, `(𝑏: 𝐷) ⇒ 𝐶[𝑏]`, ends in the dependent morphism
+/// its codomain is read off (`infer::emit`'s `emit_compose`: the prefix before it preserves
+/// the value). The steps after the nested chain speak `𝑏`, and once spliced they follow that
+/// last morphism directly, whose codomain the checker opens at its own binder. So the last
+/// morphism takes `𝑏` as its binder's name: its codomain is closed, so the name is all that
+/// changes, and it says what the nested chain's type said.
 fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
     match expr.node {
-        TypedExprNode::Compose(elts) => elts,
+        TypedExprNode::Compose(mut elts) => {
+            if let Type::Fun { name: Some(b), .. } = expr.ty.peel_refinements()
+                && let Some(last) = elts.last_mut()
+                && let Type::Fun {
+                    name: Some(k),
+                    codomain,
+                    ..
+                } = &mut last.ty
+                && k != b
+                && crate::ccl::subst::references_enclosing_function(codomain)
+            {
+                debug_assert!(
+                    !crate::ccl::subst::type_free_vars(codomain).contains(k),
+                    "a codomain closed over its binder `{k}` also names it, which the rename \
+                     would leave unbound"
+                );
+                *k = b.clone();
+            }
+            elts
+        }
         _ => vec![expr],
     }
 }
@@ -831,7 +857,15 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
         // A `left ≫ const(g)` collapses to `const(g)` carrying `left`'s *type*
         // domain — sound only when `left` is a pure reshaping, which is exactly what
         // `narrows_domain_irrecoverably` rules out.
-        |left, right| as_const(right).is_some() && !narrows_domain_irrecoverably(left),
+        //
+        // A dependent `const(g)`, `(𝑘: 𝐾) ⇒ 𝐶[𝑘]`, is constant in value but not in type: its
+        // codomain reads the input `left` delivers, and the rest of the chain speaks that
+        // input by `𝑘`'s name. Collapsed, nothing would bind `𝑘`, so it stays a step.
+        |left, right| {
+            as_const(right).is_some()
+                && !narrows_domain_irrecoverably(left)
+                && !is_dependent(&right.ty)
+        },
         |left, right, mint_kind| {
             let Some(g) = as_const(&right) else {
                 unreachable!()
@@ -852,6 +886,15 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
             let new_const = Expr::apply(g.clone(), const_var).with_ty(new_const_ty);
             vec![new_const]
         },
+    )
+}
+
+/// Whether `ty` is a function whose codomain reads its input: `(𝑘: 𝐾) ⇒ 𝐶[𝑘]`.
+fn is_dependent(ty: &Type) -> bool {
+    matches!(
+        ty.peel_refinements(),
+        Type::Fun { name: Some(k), codomain, .. }
+            if crate::ccl::subst::codomain_depends_on(k, codomain)
     )
 }
 

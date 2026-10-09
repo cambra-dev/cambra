@@ -69,6 +69,7 @@ const LIVE: &[&str] = &[
     "function_arg",
     "groupby_source",
     "keyed_write_value",
+    "loop_source",
     "match_arm",
     "match_arm_in_loop",
     "match_scrutinee",
