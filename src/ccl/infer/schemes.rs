@@ -2,6 +2,8 @@
 // Operator/projection scheme registry (Step 7b)
 // ---------------------------------------------------------------------------
 
+use crate::ccl::F_TIME;
+use crate::ccl::F_WRITE;
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
@@ -301,10 +303,7 @@ impl OperatorSchemes {
         // commit view — inline-built like `get_prev_seq`.
         let iota = fresh_var(BODY_LEVEL);
         let nu = fresh_var(BODY_LEVEL);
-        let commit_record = Type::Record(vec![
-            ("time".to_string(), Type::Txn),
-            ("write".to_string(), nu.clone()),
-        ]);
+        let commit_record = Type::Record(vec![(F_TIME, Type::Txn), (F_WRITE, nu.clone())]);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
         // The commit stream (field 0) is a collection — a data function.
         tup.insert(FieldKey::Index(0), Type::data_fun(iota, commit_record));
@@ -480,9 +479,9 @@ mod tests {
         let Type::Record(fields) = rec.as_ref() else {
             panic!("history codomain must be a record, got {rec}");
         };
-        assert_eq!(fields[0].0, "time");
+        assert_eq!(fields[0].0, "time".into());
         assert_eq!(fields[0].1, Type::Txn, "time field is Txn");
-        assert_eq!(fields[1].0, "write");
+        assert_eq!(fields[1].0, "write".into());
 
         // arg 1 (position) is Txn; the write field, the default (arg 2), and
         // the result all share the same freshened variable ν, distinct from ι.

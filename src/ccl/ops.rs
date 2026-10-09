@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::ccl::{AggregateKind, FieldKey};
+use crate::ccl::{AggregateKind, FieldKey, Label};
 
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
@@ -986,7 +986,7 @@ pub enum ProjKey {
     /// Integer-indexed tuple projection: `.0`, `.1`, …
     Index(usize),
     /// Named record-field projection: `.fieldname`.
-    Field(String),
+    Field(Label),
 }
 
 /// Renders bare — `0`, `name` — with the leading dot supplied by the caller, the
@@ -996,7 +996,7 @@ impl fmt::Display for ProjKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ProjKey::Index(n) => write!(f, "{n}"),
-            ProjKey::Field(name) => f.write_str(name),
+            ProjKey::Field(name) => write!(f, "{name}"),
         }
     }
 }

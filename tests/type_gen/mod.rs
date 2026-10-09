@@ -11,8 +11,6 @@
 
 use std::rc::Rc;
 
-use smol_str::SmolStr;
-
 use cambra::ccl::{
     BaseType, BinOpKind, CompareKind, FieldKey, FunKind, FunKindVar, Lit, Name, Openness,
     Refinement, Type, TypeKind, TypedExpr, UnaryOpKind, ccl_utils,
@@ -305,7 +303,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
             let mut fields = Vec::new();
             for key in ["a", "b", "c"] {
                 if rng.chance(1, 2) {
-                    fields.push((key.to_string(), gen_ty(rng, depth - 1, fragment)));
+                    fields.push((key.into(), gen_ty(rng, depth - 1, fragment)));
                 }
             }
             Type::Record(fields)
@@ -315,10 +313,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
             if rng.chance(1, 2) {
                 for key in ["t0", "t1"] {
                     if rng.chance(2, 3) {
-                        tags.push((
-                            FieldKey::Name(SmolStr::from(key)),
-                            gen_ty(rng, depth - 1, fragment),
-                        ));
+                        tags.push((FieldKey::Name(key.into()), gen_ty(rng, depth - 1, fragment)));
                     }
                 }
             } else {
@@ -365,7 +360,7 @@ pub fn edit(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
             }
             Type::Variant(tags, openness) => {
                 let mut tags = tags.clone();
-                tags.push((FieldKey::Name(SmolStr::from("extra")), Type::Txn));
+                tags.push((FieldKey::Name("extra".into()), Type::Txn));
                 Type::Variant(tags, *openness)
             }
             Type::Tuple(ts) => {

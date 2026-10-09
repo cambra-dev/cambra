@@ -1982,7 +1982,7 @@ fn compact_go(
             let mut compacted = BTreeMap::new();
             for (n, v) in fs {
                 compacted.insert(
-                    FieldKey::Name(SmolStr::from(n.as_str())),
+                    FieldKey::Name(n.clone()),
                     compact_go(v, pol, subst_acc, Position::default(), st),
                 );
             }
@@ -2283,6 +2283,7 @@ fn compact_go(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Label;
     use crate::ccl::infer::solver::{
         CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,
     };
@@ -2302,7 +2303,7 @@ mod tests {
     #[test]
     fn a_negative_position_meets_both_sides() {
         let int = || Type::Base(BaseType::Int);
-        let field = |n: &str| (n.to_string(), int());
+        let field = |n: &str| (Label::new(n), int());
         // `demand` is what the body asks of the variable; `value` is what reaches it.
         // `negative` places it at a function's domain rather than its codomain.
         let read_at = |value: Type, demand: Type, negative: bool| {
@@ -2342,8 +2343,8 @@ mod tests {
         );
         let fields = wide.rec.expect("a record shape");
         assert!(
-            fields.contains_key(&FieldKey::Name(SmolStr::from("a")))
-                && fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
+            fields.contains_key(&FieldKey::Name("a".into()))
+                && fields.contains_key(&FieldKey::Name("b".into())),
             "both the demanded field and the one only the value carries: {fields:?}"
         );
 
@@ -2364,7 +2365,7 @@ mod tests {
         );
         let produced_fields = produced_wide.rec.expect("a record shape");
         assert!(
-            produced_fields.contains_key(&FieldKey::Name(SmolStr::from("b"))),
+            produced_fields.contains_key(&FieldKey::Name("b".into())),
             "the field the demand omits survives: {produced_fields:?}"
         );
     }
@@ -2385,8 +2386,8 @@ mod tests {
     #[test]
     fn a_settled_negative_position_closes_an_open_child_demand() {
         let int = || Type::Base(BaseType::Int);
-        let arm = |n: &str, t: Type| (FieldKey::Name(SmolStr::from(n)), t);
-        let rec = |t: Type| Type::Record(vec![("f".to_string(), t)]);
+        let arm = |n: &str, t: Type| (FieldKey::Name(n.into()), t);
+        let rec = |t: Type| Type::Record(vec![("f".into(), t)]);
         let dom = fresh_var(0);
         let mut cache = ConstrainCache::new();
         let value = Type::Variant(
@@ -2406,7 +2407,7 @@ mod tests {
         let field = read
             .rec
             .as_ref()
-            .and_then(|m| m.get(&FieldKey::Name(SmolStr::from("f"))))
+            .and_then(|m| m.get(&FieldKey::Name("f".into())))
             .expect("the record's field");
         let variant = field.var.as_ref().expect("a variant shape");
         assert_eq!(
@@ -2416,7 +2417,7 @@ mod tests {
         );
         assert_eq!(
             variant.tags.keys().collect::<Vec<_>>(),
-            vec![&FieldKey::Name(SmolStr::from("some"))],
+            vec![&FieldKey::Name("some".into())],
             "and the tag the demand does not name is intersected away: {:?}",
             variant.tags
         );
@@ -2549,7 +2550,7 @@ mod tests {
     fn compact_merge_variants_positive_unions() {
         let int_a = CompactType {
             var: Some(CompactVariant::closed(
-                [(FieldKey::Name(SmolStr::from("A")), CompactType::default())]
+                [(FieldKey::Name("A".into()), CompactType::default())]
                     .into_iter()
                     .collect(),
             )),
@@ -2557,7 +2558,7 @@ mod tests {
         };
         let int_b = CompactType {
             var: Some(CompactVariant::closed(
-                [(FieldKey::Name(SmolStr::from("B")), CompactType::default())]
+                [(FieldKey::Name("B".into()), CompactType::default())]
                     .into_iter()
                     .collect(),
             )),
@@ -2565,8 +2566,8 @@ mod tests {
         };
         let merged = CompactType::merge(true, int_a, int_b);
         let var = merged.var.expect("variant present");
-        assert!(var.tags.contains_key(&FieldKey::Name(SmolStr::from("A"))));
-        assert!(var.tags.contains_key(&FieldKey::Name(SmolStr::from("B"))));
+        assert!(var.tags.contains_key(&FieldKey::Name("A".into())));
+        assert!(var.tags.contains_key(&FieldKey::Name("B".into())));
     }
 
     /// Compact merge at negative polarity intersects tags.
@@ -2575,8 +2576,8 @@ mod tests {
         let int_ab = CompactType {
             var: Some(CompactVariant::closed(
                 [
-                    (FieldKey::Name(SmolStr::from("A")), CompactType::default()),
-                    (FieldKey::Name(SmolStr::from("B")), CompactType::default()),
+                    (FieldKey::Name("A".into()), CompactType::default()),
+                    (FieldKey::Name("B".into()), CompactType::default()),
                 ]
                 .into_iter()
                 .collect(),
@@ -2586,8 +2587,8 @@ mod tests {
         let int_bc = CompactType {
             var: Some(CompactVariant::closed(
                 [
-                    (FieldKey::Name(SmolStr::from("B")), CompactType::default()),
-                    (FieldKey::Name(SmolStr::from("C")), CompactType::default()),
+                    (FieldKey::Name("B".into()), CompactType::default()),
+                    (FieldKey::Name("C".into()), CompactType::default()),
                 ]
                 .into_iter()
                 .collect(),
@@ -2596,9 +2597,9 @@ mod tests {
         };
         let merged = CompactType::merge(false, int_ab, int_bc);
         let var = merged.var.expect("variant present");
-        assert!(!var.tags.contains_key(&FieldKey::Name(SmolStr::from("A"))));
-        assert!(var.tags.contains_key(&FieldKey::Name(SmolStr::from("B"))));
-        assert!(!var.tags.contains_key(&FieldKey::Name(SmolStr::from("C"))));
+        assert!(!var.tags.contains_key(&FieldKey::Name("A".into())));
+        assert!(var.tags.contains_key(&FieldKey::Name("B".into())));
+        assert!(!var.tags.contains_key(&FieldKey::Name("C".into())));
     }
 
     /// Openness meets: `Open` survives only when both sides are open.
@@ -2611,7 +2612,7 @@ mod tests {
     fn compact_merge_variants_meets_openness() {
         let arms = |openness| CompactType {
             var: Some(CompactVariant {
-                tags: [(FieldKey::Name(SmolStr::from("A")), CompactType::default())]
+                tags: [(FieldKey::Name("A".into()), CompactType::default())]
                     .into_iter()
                     .collect(),
                 openness,
@@ -2674,7 +2675,7 @@ mod tests {
         // {a: ?} }, payload on rhs: CompactType { rec: {b: ?} }.
         let payload_a = CompactType {
             rec: Some(
-                [(FieldKey::Name(SmolStr::from("a")), CompactType::default())]
+                [(FieldKey::Name("a".into()), CompactType::default())]
                     .into_iter()
                     .collect(),
             ),
@@ -2682,7 +2683,7 @@ mod tests {
         };
         let payload_b = CompactType {
             rec: Some(
-                [(FieldKey::Name(SmolStr::from("b")), CompactType::default())]
+                [(FieldKey::Name("b".into()), CompactType::default())]
                     .into_iter()
                     .collect(),
             ),
@@ -2690,7 +2691,7 @@ mod tests {
         };
         let lhs = CompactType {
             var: Some(CompactVariant::closed(
-                [(FieldKey::Name(SmolStr::from("A")), payload_a)]
+                [(FieldKey::Name("A".into()), payload_a)]
                     .into_iter()
                     .collect(),
             )),
@@ -2698,7 +2699,7 @@ mod tests {
         };
         let rhs = CompactType {
             var: Some(CompactVariant::closed(
-                [(FieldKey::Name(SmolStr::from("A")), payload_b)]
+                [(FieldKey::Name("A".into()), payload_b)]
                     .into_iter()
                     .collect(),
             )),
@@ -2709,10 +2710,7 @@ mod tests {
         // fields intersect → empty rec map (no field in both).
         let merged = CompactType::merge(true, lhs, rhs);
         let var = merged.var.expect("variant present");
-        let payload = var
-            .tags
-            .get(&FieldKey::Name(SmolStr::from("A")))
-            .expect("tag A");
+        let payload = var.tags.get(&FieldKey::Name("A".into())).expect("tag A");
         let rec = payload.rec.as_ref().expect("payload rec present");
         assert!(
             rec.is_empty(),
@@ -2725,7 +2723,7 @@ mod tests {
         let int = || CompactType::from_atom(AtomKey::Prim(BaseType::Int));
         let mut rec = BTreeMap::new();
         for f in fields {
-            rec.insert(FieldKey::Name(SmolStr::from(*f)), int());
+            rec.insert(FieldKey::Name((*f).into()), int());
         }
         CompactType {
             fun: Some(CompactFun {
@@ -2815,8 +2813,8 @@ mod tests {
         assert_eq!(
             *domain,
             Box::new(Type::Record(vec![
-                ("a".to_string(), Type::Base(BaseType::Int)),
-                ("b".to_string(), Type::Base(BaseType::Int)),
+                ("a".into(), Type::Base(BaseType::Int)),
+                ("b".into(), Type::Base(BaseType::Int)),
             ])),
             "the met domain is the union of the two records' fields"
         );

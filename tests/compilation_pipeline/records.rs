@@ -175,8 +175,8 @@ fn test_hash_join_record_body() {
 fn test_datasource_named_record_join() {
     let mut ctx = GlobalContext::default();
     let record_type = Type::Record(vec![
-        ("id".to_string(), Type::Base(BaseType::Int)),
-        ("label".to_string(), Type::Base(BaseType::String)),
+        ("id".into(), Type::Base(BaseType::Int)),
+        ("label".into(), Type::Base(BaseType::String)),
     ]);
     let record_extent = Extent::Record(HashMap::from([
         ("id".to_string(), Extent::Base(BaseType::Int)),

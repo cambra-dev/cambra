@@ -61,7 +61,7 @@ pub fn run_compiled(source: &str) -> Compiled {
     };
     let ty = sinks
         .iter()
-        .find(|(name, _)| name == "out")
+        .find(|(name, _)| name.name() == "out")
         .map(|(_, ty)| ty.clone())
         .expect("the program's type names its sink `out`");
     match sink.value() {
@@ -111,7 +111,10 @@ pub fn convert(v: TileValue, ty: &Type) -> Value {
             fields
                 .into_iter()
                 .map(|(n, v)| {
-                    let t = tys.iter().find(|(f, _)| *f == n).map(|(_, t)| t.clone());
+                    let t = tys
+                        .iter()
+                        .find(|(f, _)| f.to_string() == n)
+                        .map(|(_, t)| t.clone());
                     (n, convert(v, &t.unwrap_or(Type::Hole)))
                 })
                 .collect(),

@@ -20,8 +20,11 @@ pub const STD_ROOT: &str = "std";
 /// Cloning copies a pointer. Two paths are equal when their segments are, and
 /// order compares segments lexicographically, so the order is a function of the
 /// spellings alone and agrees across compilations.
+///
+/// The pointer is thin, one word, because every record label and variant tag
+/// holds an optional path.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ModulePath(Arc<[SmolStr]>);
+pub struct ModulePath(Arc<Vec<SmolStr>>);
 
 impl ModulePath {
     /// The path of `segments`.
@@ -30,7 +33,7 @@ impl ModulePath {
     /// [`segment_error`]'s rule: every caller builds a path from segments the
     /// parser or a file name check already accepted.
     pub fn new(segments: impl IntoIterator<Item = SmolStr>) -> Self {
-        let segments: Arc<[SmolStr]> = segments.into_iter().collect();
+        let segments: Arc<Vec<SmolStr>> = Arc::new(segments.into_iter().collect());
         assert!(!segments.is_empty(), "a module path has a segment");
         debug_assert!(
             segments.iter().all(|s| segment_error(s).is_none()),

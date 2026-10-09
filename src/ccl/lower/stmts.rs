@@ -1,6 +1,7 @@
 //! Statement-block lowering: `Let` chains, `if`/`else`, sink-declaration dispatch, and
 //! mutation-loop dispatch.
 
+use crate::ccl::Label;
 use std::{collections::HashSet, rc::Rc};
 
 use super::*;
@@ -124,7 +125,7 @@ pub(super) fn lower_stmts_recovering(
         .iter()
         .map(|n| {
             let var = ctx.tag_machinery(Expr::var(n), program_span, "lower.sink_outputs");
-            (n.clone(), var)
+            (Label::new(n.as_str()), var)
         })
         .collect();
     let outputs = ctx.tag_machinery(
@@ -1765,7 +1766,7 @@ pub(super) fn lower_type_expr_or_poly(
             let mut out = Vec::with_capacity(fields.len());
             for field in fields {
                 out.push((
-                    field.name.as_str().to_string(),
+                    Label::new(field.name.as_str()),
                     lower_type_expr(&field.value, ctx)?,
                 ));
             }
@@ -1997,7 +1998,7 @@ fn collect_variant_arms(
                     ));
                 }
             };
-            arms.push((FieldKey::Name(tag.as_str().into()), payload));
+            arms.push((FieldKey::Name(Label::new(tag.clone())), payload));
             Ok(())
         }
         _ => Err(LoweringError::unsupported(
@@ -2566,7 +2567,7 @@ pub(super) fn lower_match_over(
         })?;
         branches.push(Branch {
             pattern: Some(Pattern {
-                tag: pat.tag.as_str().to_string(),
+                tag: Label::new(pat.tag.as_str()),
                 binding: TypedBinding {
                     name: binder.into(),
                     ty: Type::Hole,

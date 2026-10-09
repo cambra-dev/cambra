@@ -2,9 +2,8 @@
 // Constraint emitter (Step 7d)
 // ---------------------------------------------------------------------------
 
+use crate::ccl::Label;
 use std::collections::BTreeMap;
-
-use smol_str::SmolStr;
 
 use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::cast_target_refinement;
@@ -1431,17 +1430,14 @@ pub(super) fn emit_tuple<C: Typing>(
 
 /// Record literal: each field value type becomes a named product field.
 pub(super) fn emit_record<C: Typing>(
-    fs: &mut [(String, Expr)],
+    fs: &mut [(Label, Expr)],
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let mut fields = BTreeMap::new();
     for (n, e) in fs.iter_mut() {
         // Deref a bare mutable read to its value, as in `emit_tuple`: the field
         // takes the dereferenced type so no `Mut` appears in the record type.
-        fields.insert(
-            FieldKey::Name(SmolStr::from(n.as_str())),
-            emit_value_read(e, ctx)?,
-        );
+        fields.insert(FieldKey::Name(n.clone()), emit_value_read(e, ctx)?);
     }
     Ok(product(fields))
 }
@@ -2284,7 +2280,7 @@ fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Ty
             positions.push(field_ty);
             Type::Tuple(positions)
         }
-        ProjKey::Field(name) => Type::Record(vec![(name.to_string(), field_ty)]),
+        ProjKey::Field(name) => Type::Record(vec![(name.clone(), field_ty)]),
     }
 }
 
@@ -2395,7 +2391,7 @@ pub(super) fn emit_case<C: Typing>(
         for b in branches.iter_mut() {
             if let Some(p) = &mut b.pattern {
                 let alpha = ctx.binding_slot(&mut p.binding.ty);
-                expected_tags.insert(FieldKey::Name(SmolStr::from(p.tag.as_str())), alpha);
+                expected_tags.insert(FieldKey::Name(p.tag.clone()), alpha);
             }
         }
         // One constraint, always the same shape: the scrutinee flows into the arms'
@@ -2484,13 +2480,13 @@ fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, Loca
 }
 
 pub(super) fn emit_variant_ctor<C: Typing>(
-    tag: &str,
+    tag: &Label,
     payload: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let payload_ty = emit_value_read(payload, ctx)?;
     let mut tags = BTreeMap::new();
-    tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
+    tags.insert(FieldKey::Name(tag.clone()), payload_ty);
     Ok(variant_type(tags))
 }
 
@@ -2661,7 +2657,7 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 /// per-position feed output stream). The decision codomain is the variant
 /// `` {`commit{𝑃} | `abort} ``; the taps live inside the (dense) `commit` payload
 /// record `𝑃`, so peel `commit` and drop the `writes` field.
-pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
+pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
@@ -2748,7 +2744,7 @@ fn emit_transact_writer<C: Typing>(
     // for the constraint, only for the stamped index resolution downstream.
     let mut payload: BTreeMap<FieldKey, Type> = BTreeMap::new();
     payload.insert(
-        FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
+        FieldKey::Name(crate::ccl::F_WRITES),
         Type::Record(
             writer
                 .write_keys
@@ -2759,8 +2755,8 @@ fn emit_transact_writer<C: Typing>(
         ),
     );
     let decision_codom = Type::variant(vec![
-        (FieldKey::Name(SmolStr::from(V_COMMIT)), product(payload)),
-        (FieldKey::Name(SmolStr::from(V_ABORT)), prim(BaseType::Unit)),
+        (FieldKey::Name(V_COMMIT), product(payload)),
+        (FieldKey::Name(V_ABORT), prim(BaseType::Unit)),
     ]);
 
     let body_ty = ctx.subexpr(&mut writer.body)?;
@@ -2799,7 +2795,7 @@ pub(super) fn emit_transact<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     use std::collections::HashMap;
-    let mut fields: Vec<(String, Type)> = Vec::with_capacity(keys.len());
+    let mut fields: Vec<(Label, Type)> = Vec::with_capacity(keys.len());
     // key Name → the type of one committed value (a writer's snapshot / write
     // bound) — the codomain of the key's history.
     let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());

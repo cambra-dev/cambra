@@ -1082,8 +1082,8 @@ in x"
     // Record
     #[case(
         TypedExpr::new(TypedExprNode::Record(vec![
-            ("a".to_string(), Expr::lit(Lit::Int(1))),
-            ("b".to_string(), Expr::lit(Lit::Int(2))),
+            ("a".into(), Expr::lit(Lit::Int(1))),
+            ("b".into(), Expr::lit(Lit::Int(2))),
         ])),
         "(a: 1, b: 2)"
     )]

@@ -9,6 +9,7 @@
 //! `Transact{domain: Txn}`. Causality is re-checked at this wall by
 //! [`crate::ccl::letrec::check_letrec_causal`].
 
+use crate::ccl::Label;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
@@ -463,7 +464,7 @@ fn split_decision_compose(
 }
 
 /// The accumulator label an induction snapshot slot `__prev ≫ .acc` projects.
-fn snapshot_slot_label(slot: &Expr) -> String {
+fn snapshot_slot_label(slot: &Expr) -> Label {
     let projected = match &slot.node {
         TypedExprNode::Compose(elts) => elts.last(),
         TypedExprNode::Apply { function, .. } => Some(&**function),
@@ -539,12 +540,12 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
     let mut write_targets = None;
     let mut decision = None;
     for (name, val) in fields {
-        match name.as_str() {
-            F_WRITE_TARGETS => write_targets = Some(val),
-            F_DECISION => decision = Some(val),
-            // `time` records the commit clock for the model; recognition
-            // ignores it.
-            _ => {}
+        // `time` records the commit clock for the model; recognition ignores
+        // it.
+        if name == F_WRITE_TARGETS {
+            write_targets = Some(val);
+        } else if name == F_DECISION {
+            decision = Some(val);
         }
     }
     let write_targets = unwrap_const(write_targets.expect("commit record carries write_targets"));
@@ -593,7 +594,7 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
 
 /// The history-record tap field a tap binding ``(commits_j ▷ by_commit_time) ≫ .decision ≫
 /// variant_project(`commit) ≫ .field`` projects — its trailing field projection.
-fn tap_field(def: &Expr) -> String {
+fn tap_field(def: &Expr) -> Label {
     let TypedExprNode::Compose(elts) = &def.node else {
         panic!("letrec recognition: tap binding is not a composition");
     };
@@ -622,11 +623,11 @@ fn tap_field(def: &Expr) -> String {
 /// uid, so that distinctness is by spelling rather than by construction, and a
 /// duplicate would put two keys at one projection — the read rewrites below
 /// would route both reads to whichever survived.
-fn hist_record(fields: Vec<(String, Type)>) -> Type {
+fn hist_record(fields: Vec<(Label, Type)>) -> Type {
     debug_assert!(
         {
             let mut seen = HashSet::new();
-            fields.iter().all(|(n, _)| seen.insert(n.as_str()))
+            fields.iter().all(|(n, _)| seen.insert(n))
         },
         "history record labels must be distinct within one record: {:?}",
         fields.iter().map(|(n, _)| n).collect::<Vec<_>>(),
@@ -647,7 +648,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     let mut key_ty: Vec<(Name, Type)> = Vec::new();
     let mut writers: Vec<WriterSite> = Vec::new();
     // Tap binding name → (history-record field, value type).
-    let mut taps: Vec<(Name, String, Type)> = Vec::new();
+    let mut taps: Vec<(Name, Label, Type)> = Vec::new();
     // Every binding name, to assert the continuation has no dangling references.
     let mut binding_names: Vec<Name> = Vec::with_capacity(bindings.len());
 
@@ -702,7 +703,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     // Variable record `{key.field_key(): Fun(Txn, V), …, __to_<defer>: Fun(Txn, V)}`
     // — mutable variable keys (key order) then tap virtual keys (feed order), the exact
     // field order op-conversion\'s `emit_transact`/`build_commit_store` produce.
-    let mut hist_field_tys: Vec<(String, Type)> = key_ty
+    let mut hist_field_tys: Vec<(Label, Type)> = key_ty
         .iter()
         .map(|(n, v)| (n.field_key(), Type::data_fun(Type::Txn, v.clone())))
         .collect();
@@ -721,7 +722,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
 
     // Continuation reads: each history / tap binding reference is a
     // history-record projection `__hist.field : Fun(Txn, V)`.
-    let mut read_map: HashMap<Name, (String, Type)> = HashMap::new();
+    let mut read_map: HashMap<Name, (Label, Type)> = HashMap::new();
     for (n, v) in &key_ty {
         read_map.insert(
             n.clone(),
@@ -938,7 +939,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let Type::Record(payload_field_tys) = &payload_ty else {
         panic!("letrec recognition: commit payload is not a record: {payload_ty}");
     };
-    let feed_fields: Vec<(String, Type)> = payload_field_tys
+    let feed_fields: Vec<(Label, Type)> = payload_field_tys
         .iter()
         .filter(|(n, _)| n != F_WRITES)
         .cloned()
@@ -996,7 +997,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     // names. The slots are what the body reads, in its parameter order, so they give the
     // writer's read keys: every accumulator for a decision that reads them all, none for a
     // constant one.
-    let labels: Vec<String> = inits.iter().map(|(label, _)| label.clone()).collect();
+    let labels: Vec<Label> = inits.iter().map(|(label, _)| label.clone()).collect();
     let slot_accumulators: Vec<usize> = prev_slots
         .iter()
         .map(|slot| {
@@ -1065,14 +1066,14 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
                 (None, _) => init,
             };
             TransactKey {
-                name: Name::fresh(label),
+                name: Name::fresh(label.name()),
                 init,
             }
         })
         .collect();
     let key_names: Vec<Name> = keys.iter().map(|k| k.name.clone()).collect();
 
-    let mut hist_field_tys: Vec<(String, Type)> = keys
+    let mut hist_field_tys: Vec<(Label, Type)> = keys
         .iter()
         .zip(&acc_tys)
         .map(|(k, vty)| {
@@ -1156,7 +1157,7 @@ struct HistReads<'a> {
 /// Key `field`'s history `Fun(D, V)` read off the `Transact`: the projection `__hist.field` of a
 /// top-level `Transact`'s record, or for a nested `Transact` the morphism `__hist ≫ .field` of the
 /// enclosing parameter, one history per enclosing position.
-fn hist_field_read_of(reads: &HistReads<'_>, field: String, field_ty: Type) -> Expr {
+fn hist_field_read_of(reads: &HistReads<'_>, field: Label, field_ty: Type) -> Expr {
     match reads.enclosing {
         None => hist_field_read(reads.hist, reads.hist_ty, field, field_ty),
         Some(ctx_ty) => {
@@ -1170,7 +1171,7 @@ fn hist_field_read_of(reads: &HistReads<'_>, field: String, field_ty: Type) -> E
 
 /// `__hist.field = Apply(Var(__hist), Proj(Field(field)))` — a history-record
 /// projection reading key `field`\'s history `Fun(D, V)`.
-fn hist_field_read(hist: &Name, hist_ty: &Type, field: String, field_ty: Type) -> Expr {
+fn hist_field_read(hist: &Name, hist_ty: &Type, field: Label, field_ty: Type) -> Expr {
     let mut proj = Expr::proj_field(field);
     proj.ty = Type::fun(hist_ty.clone(), field_ty.clone());
     let mut app = Expr::apply(tvar(hist, hist_ty.clone()), proj);
@@ -1468,7 +1469,7 @@ fn history_read_replacement(
 }
 
 /// The declared type of `field` on the history record.
-fn hist_ty_field(hist_ty: &Type, field: &str) -> Type {
+fn hist_ty_field(hist_ty: &Type, field: &Label) -> Type {
     let Type::Record(fs) = hist_ty else {
         panic!("letrec recognition: history-record type is not a record");
     };
