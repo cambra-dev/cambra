@@ -194,7 +194,7 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
 /// string this lands in.
 fn name_identity(n: &Name) -> String {
     match n {
-        Name::Unique { base, uid } => format!("u{uid:?}:{base}"),
+        Name::Unique { base, uid, .. } => format!("u{uid:?}:{base}"),
         Name::Synthetic { kind, uid } => format!("s{uid:?}:{}", kind.stem()),
         _ => n.field_key().to_string(),
     }

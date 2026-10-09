@@ -132,7 +132,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     errors.extend(lowered.errors);
     let value = lowered.value.map(|chain| {
         let scope = use_names(&scope, lowering.shared_names(&scope));
-        let root = uniquify::run_in(chain, &raw_scope(&scope));
+        let root = uniquify::run_in(chain, &raw_scope(&scope), None);
         chains
             .into_iter()
             .rev()
@@ -244,7 +244,10 @@ impl ProgramLowering<'_> {
         let created = self
             .import_interface(file)
             .filter(|interface| interface.io_site.is_none())
-            .and_then(|_| self.create(file));
+            .and_then(|interface| {
+                let home = Home::Shared(interface.module.clone());
+                self.create(file, home)
+            });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
             None => (None, None),
@@ -253,24 +256,26 @@ impl ProgramLowering<'_> {
         chain
     }
 
-    /// Create a run of the module in `file`, or `None` when the module has no
-    /// lowering.
+    /// Create a run of the module in `file` with `home` as its members' home, or
+    /// `None` when the module has no lowering.
     ///
     /// Its chain is a copy of the module's, uniquified with a scope that maps
     /// each name spelled through a qualifier to the binder in the qualifier's
     /// run, and each `use` name to its member's binder.
-    pub(super) fn create(&self, file: FileId) -> Option<Created> {
+    pub(super) fn create(&self, file: FileId, home: Home) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
         let chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");
             lowered.chain.clone()
         };
         let scope = use_names(&lowered.scope, self.shared_names(&lowered.scope));
-        let uniquified = uniquify::run_in(chain, &raw_scope(&scope));
+        let uniquified = uniquify::run_in(chain, &raw_scope(&scope), Some(home.clone()));
         let mut names = scope;
         let (spine, _) = spine(&uniquified);
         for name in spine {
-            names.insert(QualifiedName::new(name.base()), name.clone());
+            if name.home() == Some(&home) {
+                names.insert(QualifiedName::new(name.base()), name.clone());
+            }
         }
         Some(Created {
             chain: uniquified,
