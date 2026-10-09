@@ -1,8 +1,8 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first three items of the [Implementation
-> stack](#implementation-stack) are implemented, and the first part of the fourth, importing values
-> ([Imports](#imports)).
+> stack](#implementation-stack) are implemented, and the first two parts of the fourth, importing
+> values and `use` clauses ([Imports](#imports)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -110,9 +110,9 @@ Two changes to `Name` (`src/ccl/names.rs`):
 
 - **`Name::Member { owner, base }`**, a new raw form. `owner` is a module path, a run name, or a
   Module-typed parameter, as written. Lowering builds it for a qualified reference, for a name a
-  `use` clause binds, and for a free name of an exported alias's predicate ([Imported aliases are
-  closed over their module](#imported-aliases-are-closed-over-their-module)). It exists only between
-  lowering and linking, and one remaining after linking is a compiler defect, asserted.
+  `use` clause on a run binds, and for a free name of an exported alias's predicate ([Imported
+  aliases are closed over their module](#imported-aliases-are-closed-over-their-module)). It exists
+  only between lowering and linking, and one remaining after linking is a compiler defect, asserted.
 - **`Name::Unique { base, uid, home }`**, where `home` is the run a member belongs to:
   `Shared(module_path)` for a shared run's member, `Run(run_path)` for a member of a run a `run`
   statement declares, and absent for a local. Identity remains the `uid`. `home` is metadata of the
@@ -207,17 +207,25 @@ each file's parse, the module graph, and the link order. Every compile entry poi
 
 ### Imports
 
-Importing values is implemented: `import m` and `import a::b as c`, `pub` on value bindings and
-`def`s, and `m::f` as a value, a callee, and a qualifier of labels and tags.
+Importing values is implemented: `import m` and `import a::b as c`, `use` clauses on an `import`,
+`pub` on value bindings and `def`s, and `m::f` as a value, a callee, and a qualifier of labels and
+tags.
 
 - **An imported module lowers to a chain.** `lower_library` lowers its top-level statements, each
   wrapping the next, around `MODULE_BODY`, a placeholder for the code of the modules that import it.
-  Each module lowers with fresh block state (`LoweringContext::begin_module`), and its chain is
-  uniquified alone, before any importer lowers.
+  Each module lowers with fresh block state (`LoweringContext::begin_module`). Each module's tree,
+  the root's included, is uniquified alone, so an imported chain's binders are minted before any
+  importer lowers.
 - **An interface holds minted names.** `Interface` (`src/ccl/lower/modules.rs`) maps each
   top-level binding to the binder its chain minted, with its visibility and declaration. `m::f`
   lowers to that binder. A private member is an error with a label at its declaration, and a
   missing one is an error.
+- **`use`.** A `use` item reaches its member as `m::f` does, and its name resolves through the
+  module's uniquify scope ([`use` names are environment entries, not
+  bindings](#use-names-are-environment-entries-not-bindings)). A member spelled like a `use` name is
+  an error, and so is a `use` name spelled like an import name, another `use` name, or a builtin. A
+  builtin call resolves by its spelling before scope (`lower_call`), so a `use` name spelled like
+  one would never reach its member.
 - **Linking** replaces each placeholder with the code below it: every imported module once, in
   link order, around the root, the first in link order outermost.
 - **IO.** A module that declares a sink lowers nothing, and lowering records a module's first read
@@ -226,13 +234,13 @@ Importing values is implemented: `import m` and `import a::b as c`, `pub` on val
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
   label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
   every module ([Names carry their home](#names-carry-their-home)).
-- **Refused:** `use` clauses, type members (`m::T`), a module as a value, an imported module's
+- **Refused:** type members (`m::T` and `use T`), a module as a value, an imported module's
   mutable state and top-level loops and expression statements, a call to an imported `def` with a
   `Mut` parameter, and a member of a run. The later parts of the Imports item, and the later items,
   lift these.
 
-A module whose own errors stop it from lowering has no interface, and a reference into it adds no
-error.
+A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
+into it adds no error.
 
 ### The module interface
 
@@ -283,9 +291,12 @@ needs a test.
 
 ### `use` names are environment entries, not bindings
 
-`import n use f` in module `m` does not lower to a `let`. It seeds the root of `m`'s uniquify
-environment with `f ↦ Member { owner: n, base: f }`. An unshadowed use of `f` becomes the qualified
-name, and a local `f` shadows it by ordinary lexical scope.
+`import n use f` in module `m` does not lower to a `let`. `m`'s tree is uniquified with `f` mapped
+to the binder `n`'s chain minted for its member `f` beneath every binder of the tree
+(`uniquify::run_in`). An unshadowed use of `f` resolves to that binder, and a local `f` shadows it
+by ordinary lexical scope. The scope has no position, so a `use` name is in scope throughout its
+module, above its `import` too. A `use` clause on a run maps `f` to `Member { owner: r, base: f }` instead
+([Names carry their home](#names-carry-their-home)).
 
 A `let f = n::f` would lose polymorphism. Its right-hand side is a variable, not a lambda, so
 inference does not generalize it (`should_generalize`, [type-inference.md, "3.1 Let-Polymorphism is

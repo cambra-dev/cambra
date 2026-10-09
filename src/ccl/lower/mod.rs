@@ -1338,9 +1338,9 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) ->
     let syntax = module_syntax::refuse_module_syntax(module);
     let mut errors = syntax.errors;
     errors.extend(import_name_binders(&syntax.binders, ctx));
-    errors.extend(modules::public_names_bound_twice(
-        &modules::top_level_bindings(&module.body),
-    ));
+    let members = modules::top_level_bindings(&module.body);
+    errors.extend(modules::public_names_bound_twice(&members));
+    errors.extend(use_name_members(&members, ctx));
     if library {
         errors.extend(library_statement_refusals(&module.body));
     }
@@ -1391,6 +1391,32 @@ fn import_name_binders(binders: &[(SmolStr, Span)], ctx: &LoweringContext) -> Ve
                     format!("`{name}` is an import name, so no binder in its module takes it"),
                 )
                 .with_note(import.statement, "imported here"),
+            )
+        })
+        .collect()
+}
+
+/// One error per member spelled like a `use` name: a `use` name is in scope
+/// throughout its module, so a member of that spelling would give one spelling
+/// two meanings at the top level (`docs/chl-spec.md`, "9.6 Qualified
+/// references").
+fn use_name_members(
+    members: &[modules::TopLevelBinding],
+    ctx: &LoweringContext,
+) -> Vec<LoweringError> {
+    members
+        .iter()
+        .filter_map(|member| {
+            let used = ctx.module.uses.get(&member.name)?;
+            Some(
+                LoweringError::unsupported(
+                    member.span,
+                    format!(
+                        "`{}` is a `use` name, so no member of its module takes it",
+                        member.name
+                    ),
+                )
+                .with_note(used.item, "bound by `use` here"),
             )
         })
         .collect()

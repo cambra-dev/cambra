@@ -3,8 +3,8 @@
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
 //! depth, and the module lowers nothing when it finds one. It refuses `run`,
-//! `param`, `@Discard`, a `use` clause, `pub` on anything but a value binding, a
-//! write to another module's member, and a method reference. A qualified value,
+//! `param`, `@Discard`, `pub` on anything but a value binding, a write to
+//! another module's member, and a method reference. A qualified value,
 //! label, or tag reaches lowering, which resolves it against the module's
 //! import names (`super::modules`). Lowering therefore sees a top-level
 //! [`ChlStmt::Import`] and a top-level [`ChlStmt::Pub`] on a value binding, and
@@ -113,16 +113,6 @@ impl Refusals {
             }
         }
         match &stmt.node {
-            ChlStmt::Import { uses, .. } => {
-                if let (Some(first), Some(last)) = (uses.first(), uses.last()) {
-                    let end = last.alias.as_ref().map_or(last.name.span, |a| a.span);
-                    self.refuse(
-                        first.name.span.join(end),
-                        "a `use` clause is not supported yet: reach a member through its \
-                         module, `m::f`",
-                    );
-                }
-            }
             ChlStmt::Run {
                 args, renamed_from, ..
             } => {
@@ -255,7 +245,9 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
-            ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
+            // An import's module and `use` items resolve against the program
+            // (`super::modules`).
+            ChlStmt::Import { .. } | ChlStmt::Return(None) | ChlStmt::Pass | ChlStmt::Error => {}
         }
     }
 
@@ -492,7 +484,6 @@ mod tests {
     #[test]
     fn each_module_statement_is_refused_at_its_span() {
         let refused = refusals(indoc! {r#"
-            import catalog use Item, price as p
             run audit
             param port: String
             @Discard
@@ -500,19 +491,13 @@ mod tests {
             1
         "#});
         let messages: Vec<&str> = refused.iter().map(|(_, m)| m.as_str()).collect();
-        assert!(messages[0].starts_with("a `use` clause is not supported yet"));
-        assert!(messages[1].starts_with("`run` is not supported yet"));
-        assert!(messages[2].starts_with("`param` is not supported yet"));
-        assert_eq!(messages[3], "`@Discard` is not supported yet");
+        assert!(messages[0].starts_with("`run` is not supported yet"));
+        assert!(messages[1].starts_with("`param` is not supported yet"));
+        assert_eq!(messages[2], "`@Discard` is not supported yet");
         let spans: Vec<&str> = refused.iter().map(|(s, _)| s.trim_end()).collect();
         assert_eq!(
             spans,
-            [
-                "Item, price as p",
-                "run audit",
-                "param port: String",
-                "@Discard\nstock"
-            ]
+            ["run audit", "param port: String", "@Discard\nstock"]
         );
     }
 
