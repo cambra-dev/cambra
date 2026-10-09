@@ -16,12 +16,14 @@
 //! spelling to the binder of the run it reaches. Each imported module has one
 //! shared run, the root one run, and each `run` statement declares another.
 
+mod imports;
 mod interface;
 mod link;
 mod parameters;
 mod scope;
 mod types;
 
+use imports::*;
 pub use interface::*;
 pub use link::*;
 use parameters::*;
@@ -33,16 +35,16 @@ use super::{
     library_statement_refusals, lower_module_body, lower_root, sink_site, state_site,
 };
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
-use crate::ccl::load::{EdgeKind, LoadedProgram};
+use crate::ccl::load::LoadedProgram;
 use crate::ccl::names::QualifiedName;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::uniquify;
-use crate::ccl::{Expr, Home, Label, Name, RunPath, Type, TypedExprNode};
+use crate::ccl::{Expr, Home, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode};
 use crate::chl_parser::ast::{
-    AssignTarget, Module as ChlModule, QualifiedName as ParserQualifiedName, RunArg, Span, Spanned,
-    Stmt as ChlStmt, WrittenPath,
+    AssignTarget, Expr as ChlExpr, KeywordArg, Lit as ChlLit, Module as ChlModule,
+    QualifiedName as ParserQualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp, WrittenPath,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;

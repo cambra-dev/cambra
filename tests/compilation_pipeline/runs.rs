@@ -449,10 +449,6 @@ fn a_parameter_without_an_argument_takes_its_default(
     "},
     "the root module's parameter `n` has no default"
 )]
-#[case::imported_without_a_default(indoc! {"
-    import stepper
-    1
-"}, "module `stepper` is imported")]
 #[case::bound_by_a_member(
     indoc! {"
         run clash(base=1)

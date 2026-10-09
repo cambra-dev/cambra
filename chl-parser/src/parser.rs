@@ -11,9 +11,10 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency, BoolOp, CmpOp,
-    CompClause, Comprehension, DiscardHead, Expr, FileId, IfBranch, KindAnnotation, Lit, MatchArm,
-    MatchPattern, Module, Param, PayloadPattern, QualifiedName, RecordField, Requirement, RunArg,
-    Span, Spanned, Stmt, TypeAnnotation, TypeParam, UnaryOp, UseItem, VariantPayload, WrittenPath,
+    CompClause, Comprehension, DiscardHead, Expr, FileId, IfBranch, KeywordArg, KindAnnotation,
+    Lit, MatchArm, MatchPattern, Module, Param, PayloadPattern, QualifiedName, RecordField,
+    Requirement, Span, Spanned, Stmt, TypeAnnotation, TypeParam, UnaryOp, UseItem, VariantPayload,
+    WrittenPath,
 };
 use crate::lexer::{self, Token};
 use crate::module_path::segment_error;
@@ -1387,29 +1388,38 @@ where
             .or_not()
             .map(Option::unwrap_or_default);
 
-        let import_stmt = just(Token::Import)
-            .ignore_then(module_path())
-            .then(module_alias.clone())
-            .then(use_clause.clone())
-            .map_with(|((path, alias), uses), e| {
-                Spanned::new(e.span(), Stmt::Import { path, alias, uses })
-            });
-
-        let run_arg = binder
+        // The keyword arguments of an `import` or a `run`, `(port="8080")`.
+        let module_args = binder
             .then_ignore(just(Token::Eq))
             .then(expr.clone())
-            .map(|(name, value)| RunArg { name, value });
+            .map(|(name, value)| KeywordArg { name, value })
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .delimited_by(just(Token::LParen), just(Token::RParen))
+            .or_not()
+            .map(Option::unwrap_or_default);
+
+        let import_stmt = just(Token::Import)
+            .ignore_then(module_path())
+            .then(module_args.clone())
+            .then(module_alias.clone())
+            .then(use_clause.clone())
+            .map_with(|(((path, args), alias), uses), e| {
+                Spanned::new(
+                    e.span(),
+                    Stmt::Import {
+                        path,
+                        args,
+                        alias,
+                        uses,
+                    },
+                )
+            });
+
         let run_stmt = just(Token::Run)
             .ignore_then(module_path())
-            .then(
-                run_arg
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen))
-                    .or_not()
-                    .map(Option::unwrap_or_default),
-            )
+            .then(module_args)
             .then(module_alias.clone())
             .then(use_clause)
             .map_with(|(((path, args), alias), uses), e| {
