@@ -3575,14 +3575,11 @@ f({c})"
 /// **Domain-preserving** consumption of a conditional collection — a comprehension,
 /// which carries the domain into its own result rather than collapsing it.
 ///
-/// Directly over the `Case` this works: `lower::comprehension` floats the source `Case`
-/// out of the map, so each arm is built as its own data-kinded `Compose` — the
-/// distribution over the witness happens *syntactically*, before any type-level
-/// elimination is needed.
-///
-/// Through a **variable** there is no `Case` to float, so the distribution has to happen
-/// at the type level, and the sum has to survive it: the comprehension's result ranges
-/// over whichever domain the source took, which is the same sum again.
+/// Directly over the `Case` and through a **variable** alike, the comprehension iterates
+/// the source where it stands: `crate::ccl::comprehension` encodes a `Case` source like
+/// any other, and A-normalization names it. The distribution over the witness happens at
+/// the type level, and the sum has to survive it: the comprehension's result ranges over
+/// whichever domain the source took, which is the same sum again.
 ///
 /// No `Type::Sigma` exists at constraint time here — a Σ is built only by an annotation
 /// and by coalesce — so the arms arrive as two `Fun` *lower bounds* on one variable, and

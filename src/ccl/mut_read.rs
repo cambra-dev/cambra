@@ -145,7 +145,7 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BindingTransparency, Branch, CompClause, Expr, Name, TypedBinding, TypedExprNode,
+    BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
     ccl_utils::spelled_in_a_type,
     lambda_elim::substitute,
     mut_scope::{Muts, is_mut_var, under_param, with},
@@ -346,11 +346,12 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
         // the cast's domain, which is a type, and nothing inside a type is
         // rewritten here (module docs, "Anything inside a type"). A read left
         // standing there is what `InferError::MutableInRefinedType` reports.
-        TypedExprNode::Comprehension { element, clauses } => {
-            for clause in clauses.iter_mut() {
-                if let CompClause::For { iter, .. } = clause {
-                    *iter = operand(std::mem::take(iter), muts, open, minted);
-                }
+        TypedExprNode::Comprehension {
+            generators,
+            element,
+        } => {
+            for g in generators.iter_mut() {
+                g.iter = operand(std::mem::take(&mut g.iter), muts, open, minted);
             }
             **element = block(std::mem::take(element), muts);
             expr

@@ -305,17 +305,16 @@ pub enum TypedExprNode {
         target: Type,
     },
 
-    /// A comprehension kept in surface form: `[element for … if …]`, with the
-    /// clauses still a flat source-ordered list.
+    /// A comprehension kept in surface form: `[element for … if …]`, one
+    /// [`Generator`] per `for` clause, each holding the guards that follow it.
     ///
-    /// Mirrors [`crate::chl_parser::ast::Comprehension`] one-for-one, so the
-    /// generator/guard structure stays readable as a CCL term instead of being
-    /// resolved into the `Lambda`/`Apply` encoding at lowering time.
+    /// Lowering builds this node and [`crate::ccl::comprehension`] turns it into
+    /// the `cast`/`λ`/`▷` encoding before inference.
     Comprehension {
-        /// The element expression, under every clause's binders.
+        /// The generators, in source order. At least one.
+        generators: Vec<Generator>,
+        /// The element expression, under every generator's binder.
         element: Box<TypedExpr>,
-        /// The generators and guards, in source order. See [`CompClause`].
-        clauses: Vec<CompClause>,
     },
 
     /// A binary operation.
@@ -830,30 +829,25 @@ impl TypedExprNode {
     }
 }
 
-/// One clause of a [`TypedExprNode::Comprehension`], mirroring
-/// [`crate::chl_parser::ast::CompClause`] over CCL expressions.
+/// One `for target in iter` clause of a [`TypedExprNode::Comprehension`] and the
+/// `if` clauses that follow it before the next `for`.
 ///
-/// Clauses are held in source order in a single flat list, interleaved as written:
-/// `[e for x in xs if p for y in ys]` is `For`, `If`, `For`. Each `If` guards the
-/// generators to its left, so regrouping into one generator per `For` followed by
-/// its adjacent `If`s recovers the nesting.
+/// `[e for x in xs if p for y in ys]` is two generators: `x` over `xs` guarded by
+/// `p`, then `y` over `ys` with no guard. `target` scopes over `guards`, every
+/// later generator, and the element; `iter` sits outside it.
 ///
-/// The CHL node's `Spanned<AssignTarget>` target becomes a [`TypedBinding`], the
+/// The CHL clause's `Spanned<AssignTarget>` target becomes a [`TypedBinding`], the
 /// binder form every other CCL binding position uses: destructuring patterns are
 /// resolved by lowering, and CCL carries no spans.
 #[derive(Debug, Clone, PartialEq)]
-pub enum CompClause {
-    /// `for target in iter` — binds `target` over the element expression, every
-    /// clause to its right, and the guards attached to it.
-    For {
-        /// The iteration binder, bound to each element of `iter`.
-        target: TypedBinding,
-        /// The iteration source — a `Fun(D, T)` whose domain drives the generator.
-        iter: TypedExpr,
-    },
-    /// `if guard` — keeps the positions where `guard` holds, a `Bool`-typed
-    /// expression over the binders of the generators to its left.
-    If(TypedExpr),
+pub struct Generator {
+    /// The iteration binder, bound to each element of `iter`.
+    pub target: TypedBinding,
+    /// The iteration source — a `Fun(D, T)` whose domain drives the generator.
+    pub iter: TypedExpr,
+    /// The `Bool`-typed guards, in source order, each over the binders of this
+    /// generator and the ones before it.
+    pub guards: Vec<TypedExpr>,
 }
 
 /// A CCL expression with a type slot on every node.
@@ -1621,15 +1615,17 @@ impl TypedExpr {
     /// of needing the allocating one.
     pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a TypedExpr)) {
         match &self.node {
-            // Clause order, then the element — the order the binders come into
-            // scope, which is what lets `scope::for_each_scoped_item` pair each
-            // child with the generator prefix covering it.
-            TypedExprNode::Comprehension { element, clauses } => {
-                for clause in clauses {
-                    match clause {
-                        CompClause::For { iter, .. } => f(iter),
-                        CompClause::If(guard) => f(guard),
-                    }
+            // Each generator's `iter` then its guards, then the element — source
+            // order, which is the order the binders come into scope and what lets
+            // `scope::for_each_scoped_item` pair each child with the generator
+            // prefix covering it.
+            TypedExprNode::Comprehension {
+                generators,
+                element,
+            } => {
+                for g in generators {
+                    f(&g.iter);
+                    g.guards.iter().for_each(&mut f);
                 }
                 f(element.as_ref());
             }
@@ -1822,12 +1818,13 @@ impl TypedExpr {
     /// method.
     pub fn walk_children_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
         match &mut self.node {
-            TypedExprNode::Comprehension { element, clauses } => {
-                for clause in clauses {
-                    match clause {
-                        CompClause::For { iter, .. } => f(iter),
-                        CompClause::If(guard) => f(guard),
-                    }
+            TypedExprNode::Comprehension {
+                generators,
+                element,
+            } => {
+                for g in generators {
+                    f(&mut g.iter);
+                    g.guards.iter_mut().for_each(&mut f);
                 }
                 f(element.as_mut());
             }
@@ -1945,13 +1942,8 @@ impl TypedExpr {
     /// is kept in lockstep — a new binder-bearing variant appears in both.
     pub fn walk_binders<'a>(&'a self, mut f: impl FnMut(&'a TypedBinding)) {
         match &self.node {
-            // A guard binds nothing; a generator binds its target.
-            TypedExprNode::Comprehension { clauses, .. } => {
-                for clause in clauses {
-                    if let CompClause::For { target, .. } = clause {
-                        f(target);
-                    }
-                }
+            TypedExprNode::Comprehension { generators, .. } => {
+                generators.iter().for_each(|g| f(&g.target));
             }
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
@@ -2002,12 +1994,8 @@ impl TypedExpr {
     /// declaration set, same deliberate exhaustiveness.
     pub fn walk_binders_mut(&mut self, mut f: impl FnMut(&mut TypedBinding)) {
         match &mut self.node {
-            TypedExprNode::Comprehension { clauses, .. } => {
-                for clause in clauses {
-                    if let CompClause::For { target, .. } = clause {
-                        f(target);
-                    }
-                }
+            TypedExprNode::Comprehension { generators, .. } => {
+                generators.iter_mut().for_each(|g| f(&mut g.target));
             }
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }

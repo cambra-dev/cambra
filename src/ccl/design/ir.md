@@ -48,12 +48,14 @@ space; a synthetic name records compiler origin rather than claiming a source de
 Structural comparison of copied, already-minted terms preserves binder identity. Independently
 lowered α-equivalent terms can have different `uid`s and need not compare equal. The comprehension
 phase therefore runs after `uniquify`, so the generator source it copies into a loop-join predicate
-is already minted. The whole-program
-pass does not mint again at that copied binding site; several copied sites may carry one `uid`.
-No pass may mint fresh uids on an equality-mediated path: copying must preserve the identities
-that refinement deduplication and other structural comparisons use. Within this mint-once,
-copy-preserving representation, structural comparison implements the α-equivalence checks without
-another scope analysis. It does not identify independently minted α-equivalent trees.
+is already minted and the copy keeps its `uid`s. Lowering's own copies, such as a chained
+comparison's middle operand, are taken before `uniquify`, which mints each copy separately.
+`uniquify` does not mint again at an already-minted binding site, so a predicate shared by `Rc`
+keeps one `uid` at every site it occupies. No pass may mint fresh uids on an equality-mediated path:
+copying must preserve the identities that refinement deduplication and other structural comparisons
+use. Within this mint-once, copy-preserving representation, structural comparison implements the
+α-equivalence checks without another scope analysis. It does not identify independently minted
+α-equivalent trees.
 
 At the post-`uniquify` checkpoint, every binding site must be `Name::Unique`, not merely a minted
 name. A surviving `Synthetic` binder there indicates that a pass minted it too early. The check
@@ -78,17 +80,18 @@ analysis and `Subst::rewrite_expr` use that walk. The scope rules are:
 | `LetRec` | Every group binder binds in every definition and in `body`. |
 | `For` | `target` binds in `body`; `iter` is outside its scope. |
 | `Case` | A branch pattern's payload binder binds in that branch's `guard` and `body` only. |
-| `Comprehension` | A generator's `target` binds in every clause to its right and in `element`; its own `iter` is outside its scope. |
+| `Comprehension` | A generator's `target` binds in its own `guards`, in every later generator, and in `element`; its own `iter` is outside its scope. |
 | `Feed`, `Define`, `MutWrite` | `name` is a use of an enclosing binder. |
 | `Transact` | Keys and writer footprints are history-record labels, not variable uses; the node binds nothing. |
 
 `Binders` borrows binder slots without allocating a list and implements the `shadows` check for
 each child. A comprehension's binders come into scope one generator at a time, so its covering
-scope is a slice of the clause list (`Binders::Clauses`) and the slices nest: a binder appears in
-several of one node's scopes, and the union over them — not the concatenation — is what matches
-`walk_binders`. `Transact` labels are emitted as `KeyRef`, distinct from the `VarRef` occurrences that
-free-variable analysis counts. A node's type slots and their refinement predicates require the
-caller's type walk; the term-scope walk does not traverse them.
+scope is a prefix of its generators (`Binders::Generators`) and the prefixes nest: each scope
+extends the one before it, and the last one matches `walk_binders`. Every other node's scopes are
+disjoint, and their concatenation matches `walk_binders`. `Transact` labels are emitted as `KeyRef`,
+distinct from the `VarRef` occurrences that free-variable analysis counts. A node's type slots and
+their refinement predicates require the caller's type walk; the term-scope walk does not traverse
+them.
 
 The immutable walk lists children in `TypedExpr::walk_children` order. It groups each binder's
 children consecutively, so `for_each_scoped_item_mut` can announce a scope once and pair it with
@@ -145,9 +148,10 @@ lowering avoids that form; see [lowering](lowering.md).
 
 ### `Comprehension` — the surface comprehension node
 
-`Comprehension { element, clauses }` carries `[element for … if …]` with its clauses still a flat
-source-ordered list, mirroring `chl_parser::ast::Comprehension` one for one. Lowering builds it;
-`ccl/comprehension.rs` is the phase that eliminates it, between `mut_read` and inference.
+`Comprehension { generators, element }` carries `[element for … if …]`: one `Generator` per `for`
+clause, holding its `target`, its `iter`, and the `if` clauses that follow it before the next `for`.
+Lowering builds it; `ccl/comprehension.rs` is the phase that eliminates it, between `mut_read` and
+inference.
 
 The phase is placed there because the encoding below is a refined `Cast`, and A-normalization
 leaves a refined cast's value as it finds it: the cast's value and its target's predicate hold two
@@ -189,8 +193,8 @@ is structural and remains available after source annotations are cleared by infe
 ### `Cast` — explicit refinement acquisition
 
 `Cast { value, target }` attaches a refinement to a function's domain. Lowering constructs it for
-loop guards and `groupby`, and `ccl/comprehension.rs` for comprehension filters. The emitted target has the shape
-`{𝐷 | 𝑝} ⤇ 𝑉`, often with holes for 𝐷 and 𝑉.
+loop guards and `groupby`, and `ccl/comprehension.rs` for comprehension filters. The emitted target
+has the shape `{𝐷 | 𝑝} ⤇ 𝑉`, often with holes for 𝐷 and 𝑉.
 The resolved type is written to the wrapping
 expression's `ty`. Keeping `target` in the node lets type and predicate walks find it without
 treating a call annotation as a hidden operand.

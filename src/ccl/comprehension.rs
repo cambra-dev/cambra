@@ -4,8 +4,8 @@
 //!
 //! [`run`] is the phase, between [`crate::ccl::mut_read`] and
 //! [`crate::ccl::infer::infer`]. CHL lowering stops at the surface node — the
-//! element and a flat source-ordered clause list — and this is where that
-//! becomes the `cast`/`λ`/`▷` term inference reads.
+//! element and its [`Generator`]s — and this is where that becomes the
+//! `cast`/`λ`/`▷` term inference reads.
 //!
 //! # Why the encoding is built here
 //!
@@ -26,19 +26,31 @@
 //! phase introduces is the encoding's outer index position, minted
 //! [`Name::iter_record`] — a [`Name::Synthetic`], because α-uniquification has
 //! already run and a raw spelling would shadow its twin in a nested
-//! comprehension. Every generator binder is the one lowering put on the clause,
-//! so the element and the guards already reference it and nothing is renamed.
+//! comprehension. Every generator binder is the one lowering put on the
+//! generator, so the element and the guards already reference it and nothing is
+//! renamed.
+//!
+//! # Provenance
+//!
+//! The encoding's root keeps the comprehension's [`NodeId`]. Each generator's
+//! plumbing (its index read, its source application and its per-element lambda)
+//! is recorded against that generator's `iter`; the outer lambda, the cast, the
+//! loop-join predicate and a fan-out's arms are recorded against the element.
+//! `crate::ccl::context` runs the phase under a
+//! [`DerivationSession`](crate::ccl::provenance::DerivationSession), so those
+//! records resolve an error to a span whether or not the compile captures
+//! provenance.
 
 use std::rc::Rc;
 
 use crate::ccl::{
-    BinOpKind, CompClause, Expr, LogicKind, Name, SharedHoleMint, Type, TypedBinding,
-    TypedExprNode, anf,
+    BinOpKind, Expr, Generator, LogicKind, Name, SharedHoleMint, Type, TypedBinding, TypedExprNode,
+    anf,
     ccl_utils::{
         PredMemo, flatten_trailing_value_case, make_cast, refined_data_fun,
         synthesize_arm_predicate, walk_refined_predicates_mut,
     },
-    provenance::{self, Nature},
+    provenance::{self, Nature, NodeId},
     ty::FunKind,
 };
 
@@ -87,18 +99,16 @@ impl Rewrite<'_> {
             self.depth -= 1;
             // The encoding replaces the whole expression, so the node is taken
             // out of its slot and the marker left in its place is dropped with
-            // it.
-            let TypedExprNode::Comprehension { element, clauses } =
-                std::mem::replace(&mut e.node, TypedExprNode::Defer)
+            // it. The encoding's root takes the comprehension's id back.
+            let comprehension_id = e.node_id();
+            let TypedExprNode::Comprehension {
+                generators,
+                element,
+            } = std::mem::replace(&mut e.node, TypedExprNode::Defer)
             else {
                 unreachable!("matched a Comprehension immediately above")
             };
-            // The recording names the node the rewrite replaces, so every node
-            // the encoding mints — and every copy it takes of a generator
-            // source — hangs off the comprehension rather than reaching the
-            // fold unexplained (`design/provenance.md`).
-            let _frame = provenance::enter(e.node_id(), "comprehension.encode", Nature::Machinery);
-            let encoded = encode(*element, clauses, self.holes);
+            let encoded = encode(comprehension_id, generators, *element, self.holes);
             // A-normalize the encoding — the operand positions it mints are
             // what that pass is for, and a Σ-typed generator source has to be
             // named for its witness to have a binding position at all.
@@ -109,7 +119,9 @@ impl Rewrite<'_> {
             // copied into its own predicate — un-normalized, and the two copies
             // equal. An inner comprehension normalized on its own way out would
             // put a `Let` inside the predicate the outer one copies it into,
-            // where it names a binder the type around it does not bind.
+            // where it names a binder the type around it does not bind. A
+            // comprehension inside a refinement predicate is never at depth 0
+            // ([`ty`](Self::ty)), for the same reason.
             *e = if self.depth == 0 {
                 anf::run(encoded)
             } else {
@@ -119,36 +131,44 @@ impl Rewrite<'_> {
     }
 
     /// Rewrite each refinement predicate riding `t`, once per shared term.
+    ///
+    /// A predicate is a type slot, so a comprehension found in one is encoded
+    /// but not A-normalized: the walk counts as one more open comprehension,
+    /// which keeps every comprehension below it off depth 0.
     fn ty(&mut self, t: &mut Type) {
         // A handle on the same memo, so `self` stays borrowable for the
         // rebuild — which re-enters the memo through `self.expr` → `self.ty`.
         let memo = self.memo.clone();
+        self.depth += 1;
         walk_refined_predicates_mut(t, &memo, &(), &mut |pred, _| {
             self.expr(pred);
             true
         });
+        self.depth -= 1;
     }
 }
 
 /// Does this comprehension encode to a bare `Lambda` — an atomic term?
 ///
 /// True for the identity and loop-join shapes with no guard: those are one
-/// lambda. A guard puts the lambda under a `cast`, and a value-`Case` element
-/// fans out into a `++` of casts, and neither is atomic.
+/// lambda. A guard puts the lambda under a `cast`, and an element that
+/// [`fans_out`] becomes a `++` of casts, and neither is atomic.
 ///
 /// Asked by [`crate::ccl::anf`], which runs before this phase and so has to
 /// decide whether a comprehension needs naming in an operand position from the
 /// shape it will take. Stated here, beside [`encode`], which is what decides it.
-pub fn encodes_to_lambda(element: &Expr, clauses: &[CompClause]) -> bool {
-    if clauses.iter().any(|c| matches!(c, CompClause::If(_))) {
-        return false;
-    }
-    let single_gen = clauses
-        .iter()
-        .filter(|c| matches!(c, CompClause::For { .. }))
-        .count()
-        == 1;
-    !(single_gen && is_value_case(element))
+pub fn encodes_to_lambda(generators: &[Generator], element: &Expr) -> bool {
+    generators.iter().all(|g| g.guards.is_empty()) && !fans_out(generators, element)
+}
+
+/// Does this comprehension's element fan out ([`fan_out_element_case`]) into
+/// one filtered map per arm? True for a single unguarded generator whose
+/// element is a guard-only value `Case`.
+///
+/// Each arm's guard then becomes a refinement predicate, which
+/// [`crate::ccl::anf`] asks about so it leaves those guards as written.
+pub fn fans_out(generators: &[Generator], element: &Expr) -> bool {
+    matches!(generators, [g] if g.guards.is_empty()) && is_value_case(element)
 }
 
 /// Is `element` a guard-only value `Case` — the per-element conditional
@@ -174,34 +194,20 @@ fn named_data_domain(ann: &Type) -> Option<Type> {
     }
 }
 
-/// One generator regrouped from the flat clause list: `(target, iter, guards)`,
-/// where `guards` is the sequence of `if`-clauses that followed this `for` in
-/// source order before the next `for`.
-type CompGenerator = (TypedBinding, Expr, Vec<Expr>);
-
-/// Regroup the flat clause list into one [`CompGenerator`] per `for` clause.
+/// `e` rebuilt at `id`, its type slot and annotation carried over.
 ///
-/// The clauses are interleaved as written, so each `if` attaches to the most
-/// recent `for`. Both invariants asserted here are established by the CHL
-/// parser (`comp_clauses` is `.at_least(1)`) and re-checked by lowering, which
-/// is what rejects a leading `if` with a diagnostic rather than a panic.
-fn group_clauses(clauses: Vec<CompClause>) -> Vec<CompGenerator> {
-    let mut out: Vec<CompGenerator> = Vec::new();
-    for clause in clauses {
-        match clause {
-            CompClause::For { target, iter } => out.push((target, iter, Vec::new())),
-            CompClause::If(guard) => {
-                out.last_mut()
-                    .expect("a comprehension guard follows a generator")
-                    .2
-                    .push(guard);
-            }
-        }
-    }
-    assert!(
-        !out.is_empty(),
-        "a comprehension has at least one generator"
-    );
+/// The encoding's root stands where the comprehension stood, so it takes the
+/// comprehension's id: lowering's projection holds that id, and every node of
+/// the encoding is enclosed by it.
+fn at_id(e: Expr, id: NodeId) -> Expr {
+    let Expr {
+        node,
+        ty,
+        user_annotation,
+        ..
+    } = e;
+    let mut out = Expr::preserve(id, node).with_ty(ty);
+    out.user_annotation = user_annotation;
     out
 }
 
@@ -228,11 +234,35 @@ fn group_clauses(clauses: Vec<CompClause>) -> Vec<CompGenerator> {
 /// join planning recognises the equality shape and translates it to an O(N+M)
 /// hash-join-based restriction.
 ///
-/// TODO this currently has an assumption that all generator variables have distinct names.
-/// This might be a reasonable assumption that we should enforce, or we should fix scoping to
-/// handle that case.
-fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -> Expr {
-    let generators = group_clauses(clauses);
+/// The generator targets are distinct binders, which the encoding relies on:
+/// `uniquify` runs before this phase and gives every binder its own [`Name`].
+///
+/// The root is at `comprehension_id`; see the module docs, "Provenance", for
+/// what every other node is recorded against.
+fn encode(
+    comprehension_id: NodeId,
+    generators: Vec<Generator>,
+    element: Expr,
+    holes: &mut SharedHoleMint,
+) -> Expr {
+    debug_assert!(
+        !generators.is_empty(),
+        "a comprehension has at least one generator"
+    );
+    debug_assert!(
+        generators.iter().enumerate().all(|(i, g)| generators[..i]
+            .iter()
+            .all(|h| h.target.name != g.target.name)),
+        "a comprehension's generator targets are distinct binders after uniquify, found {:?}",
+        generators
+            .iter()
+            .map(|g| &g.target.name)
+            .collect::<Vec<_>>()
+    );
+    let element_id = element.node_id();
+    // Every node not minted under a generator's own recording below is the
+    // element's: the outer lambda, the cast, the predicate, a fan-out's arms.
+    let _element_frame = provenance::enter(element_id, "comprehension.encode", Nature::Machinery);
     let single_gen = generators.len() == 1;
     let outer_var = Name::iter_record();
 
@@ -243,7 +273,12 @@ fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -
     let mut gen_bindings: Vec<TypedBinding> = Vec::new();
     let mut gen_sources: Vec<Expr> = Vec::new();
     let mut pred_op: Option<Expr> = None;
-    for (target, iter, guards) in generators {
+    for Generator {
+        target,
+        iter,
+        guards,
+    } in generators
+    {
         gen_bindings.push(target);
         gen_sources.push(iter);
         for guard in guards {
@@ -253,6 +288,8 @@ fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -
             });
         }
     }
+    // Read before step 4 drains the sources into the body.
+    let gen_ids: Vec<NodeId> = gen_sources.iter().map(Expr::node_id).collect();
 
     // Sources for the loop-join restriction lambda are copies of the sources the
     // body chain uses. Taken here, before step 4 stamps the body copies with
@@ -300,7 +337,10 @@ fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -
     if single_gen && pred_op.is_none() && is_value_case(&element) {
         let source = gen_sources.pop().expect("single generator has one source");
         let binding = gen_bindings.pop().expect("single generator has one binder");
-        return fan_out_element_case(source, &binding, element);
+        return at_id(
+            fan_out_element_case(source, &binding, element),
+            comprehension_id,
+        );
     }
 
     // ---- Step 4: build the body as a nested Apply/Lambda chain ----------------
@@ -353,6 +393,10 @@ fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -
         .enumerate()
         .rev()
     {
+        // This generator's plumbing is its source's: the index read, the
+        // application of the source, and the per-element lambda.
+        let _generator_frame =
+            provenance::enter(gen_ids[i], "comprehension.generator", Nature::Machinery);
         let idx_arg = make_idx_arg(outer_var.clone(), i);
         // **A comprehension is a collection built over its generators.** It binds one
         // position per position of each source, so this is a *built over* relation and not a
@@ -475,7 +519,7 @@ fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -
                 codomain: Box::new(Type::Hole),
             });
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
-        make_cast(unrefined_lambda, target_ty)
+        at_id(make_cast(unrefined_lambda, target_ty), comprehension_id)
     } else {
         // A comprehension is a **data collection** (a map over its source's
         // domain): stamp it `Data` by provenance. The `data_fun(_, _)` annotation
@@ -484,18 +528,20 @@ fn encode(element: Expr, clauses: Vec<CompClause>, holes: &mut SharedHoleMint) -
         // comprehension is data-by-construction, not by a domain guess. (The
         // filtered branch above stamps its own lambda the same way, under a cast
         // whose `refined_data_fun` target then refines the domain.)
-        Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
-            name: None,
-            fun_kind: result_kind,
-            domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
-            codomain: Box::new(Type::Hole),
-        })
+        let lambda =
+            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+                name: None,
+                fun_kind: result_kind,
+                domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
+                codomain: Box::new(Type::Hole),
+            });
+        at_id(lambda, comprehension_id)
     }
 }
 
 /// `λ target → body` at a generator's binder.
 ///
-/// The binder is the one lowering put on the clause, so the lambda it becomes
+/// The binder is the one lowering put on the generator, so the lambda it becomes
 /// binds the same [`Name`] the element and the guards already reference — which
 /// is what keeps this phase from needing to rename anything it did not mint.
 fn per_element_lambda(target: &TypedBinding, body: Expr) -> Expr {
@@ -587,7 +633,9 @@ mod tests {
     use crate::ccl::lower::{LoweringContext, lower_stmts};
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::uniquify;
+    use crate::ccl::{PredicateId, ccl_utils::walk_refined_predicates};
     use rstest::rstest;
+    use std::collections::HashSet;
 
     /// Parse, lower, uniquify, and run the phase — the pipeline prefix that
     /// produces an encoding, minus the passes between that leave a
@@ -653,5 +701,41 @@ mod tests {
     )]
     fn the_encoding(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);
+    }
+
+    /// Every `Let` in a refinement predicate riding `e`, at any depth.
+    fn lets_in_predicates(e: &Expr) -> usize {
+        fn in_term(e: &Expr, inside: bool, visited: &mut HashSet<PredicateId>) -> usize {
+            let mut n = usize::from(inside && matches!(e.node, TypedExprNode::Let { .. }));
+            e.walk_type_slots(|t| {
+                walk_refined_predicates(t, visited, &mut |pred, visited| {
+                    n += in_term(pred, true, visited);
+                });
+            });
+            e.walk_children(|c| n += in_term(c, inside, visited));
+            n
+        }
+        in_term(e, false, &mut HashSet::new())
+    }
+
+    /// No binding A-normalization or this phase seals stands inside a
+    /// predicate. A fanned-out element's guards become per-arm predicates, so
+    /// A-normalization leaves them as written; a comprehension inside
+    /// `groupby`'s predicate is encoded below depth 0, so it is not normalized.
+    #[rstest]
+    #[case::fanned_out_guard("[x + 1 if x + 1 > 2 else 0 for x in [1, 2, 3]]")]
+    #[case::comprehension_in_a_predicate(
+        "g = groupby([y + 10 for y in [2, 3, 4, 5, 6]], \\x -> x // 2)\ng"
+    )]
+    fn no_binding_stands_inside_a_predicate(#[case] code: &str) {
+        let mut lctx = LoweringContext::default();
+        let module = chl_parser::parse_module(chl_parser::FileId::ROOT, code)
+            .into_result()
+            .expect("parse failed");
+        let lowered = lower_stmts(&module, &mut lctx)
+            .into_result()
+            .expect("lowering failed");
+        let out = run(anf::run(uniquify::run(lowered)), lctx.shared_holes());
+        assert_eq!(lets_in_predicates(&out), 0, "{}", symbolic(&out));
     }
 }

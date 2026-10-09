@@ -27,8 +27,9 @@ use crate::{
         panes::gate_leaks,
         planning,
         provenance::{
-            Leak, Located, LoweringSession, NodeId, PhaseScope, ProvenanceTable, SourceProjection,
-            TableSession, fold, fold_lowering, with_active_table,
+            DerivationLog, DerivationSession, Leak, Located, LoweringSession, NodeId, PhaseScope,
+            ProvenanceTable, SourceProjection, TableSession, fold, fold_derivation, fold_lowering,
+            with_active_table,
         },
         symbolic::{symbolic, symbolic_typed},
         transact_phase, uniquify,
@@ -300,11 +301,14 @@ impl From<ConversionError> for CompileError {
 }
 
 /// Resolves a [`Located`] error's node to the source span it traces to, through
-/// the lowering projection.
+/// the lowering projection and the phase projections derived over it.
 ///
-/// A node minted after lowering (an inlined body, a monomorphization clone, a
-/// predicate inference copied out of an annotation) has no entry in the
-/// projection. Its span is then, in order of preference:
+/// A phase projection covers the mints of a phase run under a
+/// [`DerivationSession`], in every compile; today that is the comprehension
+/// phase alone. A node minted after lowering by any other phase (an inlined
+/// body, a monomorphization clone, a predicate inference copied out of an
+/// annotation) has no entry in either. Its span is then, in order of
+/// preference:
 ///
 /// 1. that of the nearest node it was derived from, when the compile records
 ///    provenance (`compile_program` does; [`compile_to`] does not);
@@ -318,6 +322,9 @@ impl From<ConversionError> for CompileError {
 /// than underlining the whole file.
 struct Blame<'a> {
     projection: &'a SourceProjection,
+    /// The phase projections [`derive`](Self::derive) folded, disjoint from
+    /// `projection`'s keys because a phase mints ids lowering never saw.
+    derived: SourceProjection,
     /// The span of the whole root file.
     program: Span,
 }
@@ -327,8 +334,22 @@ impl<'a> Blame<'a> {
         let root = sources.root();
         Blame {
             projection,
+            derived: SourceProjection::new(),
             program: Span::new(root, 0, sources.text(root).len()),
         }
+    }
+
+    /// Fold the derivation log phase `via` wrote into this blame's phase
+    /// projections.
+    fn derive(&mut self, log: &DerivationLog, via: Phase) {
+        let earlier = |id: &NodeId| {
+            self.projection
+                .get(id)
+                .or_else(|| self.derived.get(id))
+                .cloned()
+        };
+        let folded = fold_derivation(log, &earlier, via);
+        self.derived.extend(folded);
     }
 
     /// The span `node` traces to, if any. `tree`, when given, is a tree containing
@@ -337,6 +358,7 @@ impl<'a> Blame<'a> {
         let own = |id: &NodeId| {
             self.projection
                 .get(id)
+                .or_else(|| self.derived.get(id))
                 .and_then(|attr| attr.spans.first().copied())
         };
         own(&node)
@@ -354,8 +376,8 @@ impl<'a> Blame<'a> {
             if cfg!(debug_assertions) {
                 panic!(
                     "{node:?} traces to no source span: it is not in the lowering \
-                         projection, no recorded provenance derives it from a node that is, \
-                         and {}",
+                         projection or a phase projection, no recorded provenance derives it \
+                         from a node that is, and {}",
                     if tree.is_some() {
                         "no node enclosing it in the tree is either"
                     } else {
@@ -1973,7 +1995,7 @@ fn run_frontend(
         stop,
         capture,
         record,
-        &Blame::new(&lowering_projection, sources),
+        Blame::new(&lowering_projection, sources),
         &mut panes,
     )?;
     Ok(Frontend {
@@ -1997,7 +2019,7 @@ fn run_passes(
     stop: Phase,
     capture: &[Phase],
     record: bool,
-    blame: &Blame<'_>,
+    mut blame: Blame<'_>,
     panes: &mut BTreeMap<Phase, Expr>,
 ) -> Result<Expr, Vec<CompileError>> {
     // Phase recording for the rows the pane-pair folds read. One scope per
@@ -2040,9 +2062,16 @@ fn run_passes(
     // of those passes left behind, and the two copies are equal by
     // construction (`crate::ccl::comprehension`). `recorded` because the pass
     // mints the whole encoding.
+    //
+    // Under a `DerivationSession` in every compile, capture or not: the
+    // encoding's lambdas, casts and applications are what inference raises a
+    // comprehension's errors at, and no lowering-projection node encloses them
+    // more tightly than the whole comprehension.
+    let derivation = DerivationSession::install();
     expr = recorded(capture_provenance, Phase::Comprehension, || {
         comprehension::run(expr, ctx.lowering_ctx().shared_holes())
     });
+    blame.derive(&derivation.into_log(), Phase::Comprehension);
     debug!("Comprehensions lowered:\n{}", symbolic(&expr));
     if at_phase_output(Phase::Comprehension, &expr, stop, capture, panes) {
         return Ok(expr);
@@ -2096,7 +2125,7 @@ fn run_passes(
     settle(
         &expr,
         "post-inference",
-        Check::PreChannelizeReportingAmbiguity(blame),
+        Check::PreChannelizeReportingAmbiguity(&blame),
     )?;
 
     // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
@@ -2107,7 +2136,7 @@ fn run_passes(
     // `user_annotation`s. Unlike the surrounding `check_pre_channelize` walls
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
-    check_mut_rules(&expr, blame)?;
+    check_mut_rules(&expr, &blame)?;
 
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
@@ -2171,7 +2200,7 @@ fn run_passes(
     settle(
         &expr,
         "post-inline",
-        Check::PreChannelizeReportingAmbiguity(blame),
+        Check::PreChannelizeReportingAmbiguity(&blame),
     )?;
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
         return Ok(expr);
@@ -2197,7 +2226,7 @@ fn run_passes(
     // is a nested transaction — the callee's inlined `For` would otherwise be
     // silently absorbed into the outer block's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
-    check_transact_rejections(&expr, &txn_mut_vars, blame)?;
+    check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
     mut_elim::check_no_loop_over_a_sum(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
 
     // The two rewrites the transactional slice runs before its own: both mint expression
@@ -2897,6 +2926,39 @@ Error: lowering error
             "blame must land on a node enclosing the conflict, never the whole program \
              and never nothing",
         );
+    }
+
+    /// An error inference raises inside a comprehension's encoding resolves to
+    /// the same span whether or not the compile captures provenance:
+    /// `compile_program` resolves the encoding's nodes through the table,
+    /// [`compile_to`] through the comprehension phase's derivation log
+    /// ([`Blame::derive`]). `element` is raised under the generator's plumbing
+    /// and resolves to its source; `guard` is raised at the cast, the encoding's
+    /// root, which keeps the comprehension's id.
+    #[rstest]
+    #[case::element("[x + \"a\" for x in [1, 2]]\n", 18, 24)]
+    #[case::guard("[x for x in [1, 2] if x]\n", 0, 24)]
+    fn a_comprehension_error_resolves_alike_with_and_without_recording(
+        #[case] code: &str,
+        #[case] start: usize,
+        #[case] end: usize,
+    ) {
+        let sources = SourceMap::single("<test>", code);
+        let expected = Span::new(sources.root(), start, end);
+        let first_span = |errs: Vec<CompileError>| {
+            errs.iter()
+                .find_map(CompileError::span)
+                .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"))
+        };
+        let recorded = first_span(compile_err(&sources));
+        let unrecorded = first_span(
+            GlobalContext::default()
+                .sources_and_sinks()
+                .compile_to(&sources, Phase::Planning)
+                .expect_err("expected a compile error"),
+        );
+        assert_eq!(recorded, expected, "with recording");
+        assert_eq!(unrecorded, expected, "without recording");
     }
 
     /// Every rejection a pass after lowering raises points at the source of what

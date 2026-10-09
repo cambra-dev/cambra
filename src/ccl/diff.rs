@@ -20,7 +20,7 @@ use std::mem::Discriminant;
 use super::content_hash::{cast_target_predicates, content_hash, own_hash, resolved_hash};
 use super::context::{CompileError, Phase, compile_to};
 use super::scope::{ScopedItem, for_each_scoped_item};
-use super::{CompClause, Name, TypedExpr};
+use super::{Name, TypedExpr};
 use crate::chl_parser::SourceMap;
 
 /// Minimum matched-descendant overlap for `bottom_up` candidate admission.
@@ -439,14 +439,15 @@ fn has_unordered_children(e: &TypedExpr) -> bool {
 fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
     use super::TypedExprNode as N;
     match &e.node {
-        N::Comprehension { element, clauses } => {
-            let mut v: Vec<&TypedExpr> = clauses
-                .iter()
-                .map(|c| match c {
-                    CompClause::For { iter, .. } => iter,
-                    CompClause::If(guard) => guard,
-                })
-                .collect();
+        N::Comprehension {
+            generators,
+            element,
+        } => {
+            let mut v: Vec<&TypedExpr> = Vec::new();
+            for g in generators {
+                v.push(&g.iter);
+                v.extend(&g.guards);
+            }
             v.push(element);
             v
         }

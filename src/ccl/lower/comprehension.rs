@@ -1,24 +1,24 @@
 //! List-comprehension and generator-expression lowering to the CCL
 //! [`Comprehension`](TypedExprNode::Comprehension) node.
 //!
-//! The clause list crosses over as written: regrouping it into one generator
-//! per `for`, and the `cast`/`λ`/`▷` encoding that follows, is
+//! Lowering groups the clauses into one [`Generator`] per `for`, each holding
+//! the `if` clauses after it. The `cast`/`λ`/`▷` encoding is
 //! [`crate::ccl::comprehension`]'s, which runs after A-normalization. What
-//! lowering settles is what only the surface AST can answer — a target that
+//! lowering settles is what only the surface AST can answer: a target that
 //! names no value, a guard before any generator, and which names a body or
 //! guard reads as a comprehension local rather than as a transactional mutable
 //! variable.
 
 use super::*;
 use crate::{
-    ccl::{CompClause as CclClause, Expr, TypedBinding, TypedExprNode},
+    ccl::{Expr, Generator, TypedBinding, TypedExprNode},
     chl_parser::ast::{CompClause, Comprehension, Expr as ChlExpr, Spanned},
 };
 
 /// Lower a CHL list comprehension or generator expression to the CCL
 /// [`Comprehension`](TypedExprNode::Comprehension) node.
 ///
-/// Clauses stay in source order. Each generator's target shadows a like-spelled
+/// Generators stay in source order. Each generator's target shadows a like-spelled
 /// transactional mutable variable over the clauses to its right and over the
 /// element, which is the scope [`crate::ccl::scope`] gives it: `[x for x in
 /// xs]` reads `x` in the element as the comprehension local.
@@ -26,11 +26,16 @@ pub(super) fn lower_list_comp(
     comp: &Comprehension,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let mut clauses = Vec::with_capacity(comp.clauses.len());
-    let element = lower_clauses(&comp.clauses, &comp.element, &mut clauses, ctx)?;
+    let mut generators = Vec::new();
+    let element = lower_clauses(&comp.clauses, &comp.element, &mut generators, ctx)?;
+    debug_assert!(
+        !generators.is_empty(),
+        "the CHL parser requires at least one comprehension clause, and a leading guard \
+         is rejected above, so a comprehension has a generator"
+    );
     Ok(Expr::new(TypedExprNode::Comprehension {
+        generators,
         element: Box::new(element),
-        clauses,
     }))
 }
 
@@ -43,7 +48,7 @@ pub(super) fn lower_list_comp(
 fn lower_clauses(
     rest: &[CompClause],
     element: &Spanned<ChlExpr>,
-    out: &mut Vec<CclClause>,
+    out: &mut Vec<Generator>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let Some((clause, rest)) = rest.split_first() else {
@@ -53,9 +58,10 @@ fn lower_clauses(
         CompClause::For { target, iter } => {
             let iter = lower_expr(iter, ctx)?;
             let name = extract_name_target(target, "comprehension target")?;
-            out.push(CclClause::For {
+            out.push(Generator {
                 target: TypedBinding::new_unannotated(name.clone()),
                 iter,
+                guards: Vec::new(),
             });
             ctx.with_shadowed([name], |ctx| lower_clauses(rest, element, out, ctx))
         }
@@ -70,7 +76,10 @@ fn lower_clauses(
                 ));
             }
             let guard = lower_expr(guard, ctx)?;
-            out.push(CclClause::If(guard));
+            out.last_mut()
+                .expect("checked non-empty above")
+                .guards
+                .push(guard);
             lower_clauses(rest, element, out, ctx)
         }
     }
@@ -83,8 +92,8 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use rstest::rstest;
 
-    // Lowering stops at the surface node: clauses in source order, nothing
-    // regrouped and nothing encoded. The `cast`/`λ`/`▷` encoding these become
+    // Lowering stops at the surface node: generators in source order, each
+    // holding its guards, and nothing encoded. The `cast`/`λ`/`▷` encoding these become
     // is `crate::ccl::comprehension`'s, and is tested there.
 
     #[rstest]
@@ -108,7 +117,7 @@ in [x + y for x in [10, 20]]"
         "[y for y in [x for x in [10, 20]]]",
         "[y for y in [x for x in [10, 20]]]"
     )]
-    // Guards and extra generators keep their source positions in the one list.
+    // Each guard rides the generator before it, and renders where it was written.
     #[case(
         "[x + y for x in [1, 2] if x > 1 for y in [3] if y < 4]",
         "[x + y for x in [1, 2] if x > 1 for y in [3] if y < 4]"

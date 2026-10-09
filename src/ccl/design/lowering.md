@@ -82,9 +82,10 @@ in body
 The semicolon denotes an `ExprStmt` that sequences the loop before the final defer read. Nested
 loops produce nested compositions. Bindings before the loop become enclosing `Let` nodes; bindings
 in its body become per-iteration `Let` nodes. A generator expression goes through
-`lower_list_comp` instead, which builds a `Comprehension` node holding the element and the clause
-list as written; `ccl/comprehension.rs` turns that into the lambda and application encoding, whose
-shape depends on the number of generators and guards.
+`lower_list_comp` instead, which builds a `Comprehension` node holding the element and one
+generator per `for` clause, each with the guards that follow it; `ccl/comprehension.rs` turns that
+into the lambda and application encoding, whose shape depends on the number of generators and
+guards.
 
 An ordinary `=` inside a loop body introduces an immutable local when its name belongs to that
 body or is fresh there. Assignment to an enclosing name is rejected with a diagnostic directing

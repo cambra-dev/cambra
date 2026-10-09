@@ -58,27 +58,25 @@
 //! reference inference will reject as unbound, or a reserved name resolved
 //! by other means.
 //!
-//! **Mint before copy.** Lowering duplicates a few already-lowered subtrees
-//! (a comprehension's generator sources are cloned into its loop-join
-//! predicate; chained comparisons clone the shared middle operand). A copy
-//! made of *raw* trees would mint distinct uids per copy here, making
-//! α-equivalent copies structurally unequal — and the loop-join shape relies
-//! on the copies comparing equal (refinement dedup collapses the
-//! predicate's source against the body's). So lowering runs this pass on a
-//! subtree *before* cloning it (see `lower_list_comp` Phase 1), and the
-//! whole-program run treats minted names as settled: minted binding sites
-//! are not re-minted and push nothing on the environment (their bound
-//! variables are already resolved; their free variables are still raw and
-//! resolve against the environment at the position of each copy). The same
-//! contract makes the pass idempotent. A consequence: after lowering a uid
-//! may legitimately occur at several binding sites — copies preserve uids —
-//! so the checked invariant is "every binding site is minted", not global
-//! binder uniqueness.
+//! **Mint before copy.** A copy made of a *raw* tree mints distinct uids per
+//! copy here, making α-equivalent copies structurally unequal. A copy that
+//! refinement dedup has to collapse against its origin is therefore made
+//! after this pass: [`crate::ccl::comprehension`] copies each generator source
+//! into its loop-join predicate, and runs after `uniquify`. Lowering's own
+//! copies are made before it (a chained comparison clones its middle operand),
+//! and nothing compares them. This pass treats minted names as settled: minted
+//! binding sites are not re-minted and push nothing on the environment (their
+//! bound variables are already resolved; their free variables are still raw
+//! and resolve against the environment at the position of each copy), which
+//! makes the pass idempotent. A uid may legitimately occur at several binding
+//! sites — a predicate shared by `Rc` is rebuilt once, and a later copy
+//! preserves uids — so the checked invariant is "every binding site is
+//! minted", not global binder uniqueness.
 
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::PredMemo;
-use crate::ccl::{CompClause, Expr, Name, Type, TypedBinding, TypedExprNode};
+use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
 
 /// Every **distinct** refinement-predicate term reachable from `expr`, as a
 /// multiset of their id-sets, deduped by `Rc` pointer.
@@ -205,12 +203,8 @@ struct Uniquifier {
     /// **Why reusing an entry is sound here**, given that the transform resolves
     /// free variables against `env` — context the memo key does not name (see
     /// [`PredMemo`]'s note on key-determined transforms). Lowering shares a
-    /// predicate `Rc` across slots only by *copying one refinement*, and where it
-    /// copies an already-lowered subtree it runs this pass on that subtree
-    /// **before** cloning (see the module docs' "mint before copy"). So every
-    /// occurrence sharing an `Rc` either sits in one scope, or is a copy whose
-    /// binders are already minted and whose free variables therefore resolve the
-    /// same way wherever the copy lands. Two occurrences that *should* uniquify
+    /// predicate `Rc` across slots only by *copying one refinement*, so every
+    /// occurrence sharing an `Rc` sits in one scope. Two occurrences that *should* uniquify
     /// differently — the same predicate spelling under two different bindings —
     /// arrive as distinct `Rc`s, which is what the scope-blind-equality test at the
     /// bottom of this file pins.
@@ -372,19 +366,20 @@ impl Uniquifier {
                 }
             }
 
-            // A generator's target is minted before the clauses to its right
-            // and the element are walked; its own `iter` is walked before the
-            // mint. The scoping is `crate::ccl::scope`'s, stated there.
-            TypedExprNode::Comprehension { element, clauses } => {
+            // A generator's target is minted before its guards, the generators
+            // after it, and the element are walked; its own `iter` is walked
+            // before the mint. The scoping is `crate::ccl::scope`'s, stated there.
+            TypedExprNode::Comprehension {
+                generators,
+                element,
+            } => {
                 let mut bases: Vec<Option<String>> = Vec::new();
-                for clause in clauses.iter_mut() {
-                    match clause {
-                        CompClause::For { target, iter } => {
-                            self.expr(iter);
-                            self.binding_tys(target);
-                            bases.push(self.bind(target));
-                        }
-                        CompClause::If(guard) => self.expr(guard),
+                for g in generators.iter_mut() {
+                    self.expr(&mut g.iter);
+                    self.binding_tys(&mut g.target);
+                    bases.push(self.bind(&mut g.target));
+                    for guard in &mut g.guards {
+                        self.expr(guard);
                     }
                 }
                 self.expr(element);
@@ -750,14 +745,12 @@ mod tests {
         assert_eq!(v, &binding.name);
     }
 
-    // Mint-before-copy: a second run leaves a minted tree untouched.
-    //
-    // On the lowered tree, not [`pipeline_front`]'s: the comprehension phase
-    // mints a `Synthetic` binder, which this pass's post-run check rejects
-    // because at *its* boundary a synthetic means a pass minted too early.
+    // A second run leaves a minted tree untouched, including the copy lowering
+    // takes before this pass: a chained comparison clones its middle operand,
+    // here an aggregate over a comprehension, which binds `x`.
     #[test]
     fn idempotent_on_minted_trees() {
-        let expr = run(lower_only("k = 1\n[x for x in [1, 2, 3] if x > k]\n"));
+        let expr = run(lower_only("k = 1\n0 < sum([x + k for x in [1, 2]]) < 5\n"));
         // The second run must see the same nodes, not a freshened copy of them.
         let again = run(expr.clone_preserving_ids());
         assert_eq!(expr, again, "uniquify must be idempotent");

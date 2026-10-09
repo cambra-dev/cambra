@@ -19,9 +19,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::scope::{ScopedItem, for_each_scoped_item};
-use super::{
-    CompClause, FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode,
-};
+use super::{FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode};
 
 /// A 64-bit term fingerprint under the chosen free-variable and structural hashing rules.
 /// Equal fingerprints can collide; they do not prove term equivalence.
@@ -123,9 +121,8 @@ fn collect(e: &TypedExpr, out: &mut HashMap<NodeId, ContentHash>) {
 ///
 /// Never hash the whole `Name`. A binder may be `Raw` in one lowering and
 /// `Unique`/`Synthetic` — carrying a globally-fresh, run-varying `uid` — in
-/// another: lowering uniquifies some subexpressions in place (e.g.
-/// comprehension sources via `uniquify::run`), and uids are non-deterministic
-/// *by design*.
+/// another: a tree hashed before `uniquify` holds raw binders and one hashed
+/// after it holds minted ones, and uids are non-deterministic *by design*.
 ///
 /// Under [`FreeVars::BySpelling`] the identity is the spelling, which is what
 /// survives independent compilation. Its imprecision — two distinct binders
@@ -419,19 +416,14 @@ fn hash_payload<'a>(
 ) {
     use TypedExprNode as N;
     match &e.node {
-        // The clause *shape* — how many clauses and which kind each is — plus
-        // each generator's binder. The clause expressions and the element are
+        // The shape — how many generators, and how many guards each holds —
+        // plus each generator's binder. The sources, guards and element are
         // children, reached by the scoped fold.
-        N::Comprehension { clauses, .. } => {
-            clauses.len().hash(h);
-            for clause in clauses {
-                match clause {
-                    CompClause::For { target, .. } => {
-                        0u8.hash(h);
-                        hash_binding(target, env, wenv, free, fold, h);
-                    }
-                    CompClause::If(_) => 1u8.hash(h),
-                }
+        N::Comprehension { generators, .. } => {
+            generators.len().hash(h);
+            for g in generators {
+                hash_binding(&g.target, env, wenv, free, fold, h);
+                g.guards.len().hash(h);
             }
         }
         // `Realize` wraps the value it realizes and adds no content of its own beyond the

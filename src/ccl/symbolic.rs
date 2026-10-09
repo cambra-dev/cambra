@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, CompClause, Expr, Lit,
-    LogicKind, Type, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
+    TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -219,22 +219,23 @@ fn fmt(expr: &Expr, min_prec: Precedence, opts: &SymbolicOpts) -> String {
 /// Returns `(self_prec, rendered_text)` without outer parentheses.
 fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
     let res = match &expr.node {
-        // Surface form: the element, then the clauses in source order. The
-        // comprehension phase is what turns this into the `cast`/`λ`/`▷`
-        // encoding, so a tree that still carries one renders as the
-        // comprehension it is.
-        TypedExprNode::Comprehension { element, clauses } => {
+        // Surface form: the element, then each generator followed by its
+        // guards, which is CHL's own spelling. The comprehension phase turns
+        // this into the `cast`/`λ`/`▷` encoding, so a tree that still carries
+        // one renders as the comprehension it is.
+        TypedExprNode::Comprehension {
+            generators,
+            element,
+        } => {
             let mut out = format!("[{}", fmt(element, Precedence::Lowest, opts));
-            for clause in clauses {
-                match clause {
-                    CompClause::For { target, iter } => out.push_str(&format!(
-                        " for {} in {}",
-                        target.name,
-                        fmt(iter, Precedence::Lowest, opts)
-                    )),
-                    CompClause::If(guard) => {
-                        out.push_str(&format!(" if {}", fmt(guard, Precedence::Lowest, opts)))
-                    }
+            for g in generators {
+                out.push_str(&format!(
+                    " for {} in {}",
+                    g.target.name,
+                    fmt(&g.iter, Precedence::Lowest, opts)
+                ));
+                for guard in &g.guards {
+                    out.push_str(&format!(" if {}", fmt(guard, Precedence::Lowest, opts)));
                 }
             }
             out.push(']');

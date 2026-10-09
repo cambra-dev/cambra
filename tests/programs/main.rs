@@ -39,6 +39,7 @@ mod http_greeter;
 mod inner_join;
 mod join_then_groupby;
 mod ledger_balance;
+mod list_comp;
 mod list_min;
 mod nonneg_inventory;
 mod polymorphic;
