@@ -52,6 +52,7 @@ use crate::ccl::Expr;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
 use crate::chl_parser::ast::Span;
 use crate::interpreter::operator_graph::{EdgeKind, EdgeRole, GraphNode, InputEdge, OperatorGraph};
+use smol_str::SmolStr;
 
 use super::definitions::Definition;
 use super::program::{InspectedProgram, PaneContent};
@@ -347,7 +348,7 @@ pub struct DefinitionEntry {
     /// The binder's source span.
     pub def_span: Span,
     /// The bound name.
-    pub name: String,
+    pub name: SmolStr,
 }
 
 /// A diagnostic entry.

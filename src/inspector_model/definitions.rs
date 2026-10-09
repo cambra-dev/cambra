@@ -56,6 +56,7 @@ use crate::ccl::provenance::SourceProjection;
 use crate::ccl::{Expr, Name, TypedExprNode};
 use crate::chl_parser::SourceMap;
 use crate::chl_parser::ast::Span;
+use smol_str::SmolStr;
 
 /// One resolved use→binder pair: a name occurrence, the binder's source site,
 /// and the bound name.
@@ -66,7 +67,7 @@ pub(super) struct Definition {
     /// The span of the name written at the binder's binding site.
     pub(super) def_span: Span,
     /// The bound name.
-    pub(super) name: String,
+    pub(super) name: SmolStr,
 }
 
 /// Every resolved use→binder pair in `tree`, in first-visit pre-order.
@@ -160,7 +161,7 @@ fn collect_uses(
                 out.push(Definition {
                     use_span,
                     def_span,
-                    name: name.to_string(),
+                    name: SmolStr::new(name),
                 });
             }
         }
@@ -191,7 +192,7 @@ mod tests {
                 (
                     code[d.use_span.start..d.use_span.end].to_string(),
                     code[d.def_span.start..d.def_span.end].to_string(),
-                    d.name,
+                    d.name.to_string(),
                 )
             })
             .collect()

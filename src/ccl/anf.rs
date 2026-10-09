@@ -880,7 +880,7 @@ mod tests {
     const MUL: BinOpKind = BinOpKind::Arithmetic(ArithmeticKind::Mul);
 
     fn var(name: &str) -> Expr {
-        Expr::var(Name::Raw(name.to_string()))
+        Expr::var(Name::Raw(name.into()))
     }
 
     fn lit(n: i64) -> Expr {

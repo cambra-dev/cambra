@@ -57,7 +57,7 @@ bit-vec = "0.8.0"
 intervalsets = "0.1.0-alpha.2"
 # Pinned to the version `intervalsets` already pulls in, so the tree builds one copy.
 itertools = "0.13"
-smol_str = "0.3.6"
+smol_str = { version = "0.3.6", features = ["serde"] }
 stacker = "0.1"
 # The inspector wire types (`src/inspector_model`) derive `Serialize`; the
 # transport (`src/inspector_server`) renders them with `serde_json`. Both are

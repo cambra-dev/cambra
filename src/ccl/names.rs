@@ -50,6 +50,8 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use smol_str::SmolStr;
+
 /// A globally-fresh binder identity. Minted only via [`Uid::fresh`]; nothing
 /// observes its numeric value (only `uid` *equality*), so non-determinism
 /// across process runs is fine — uniqueness is all that matters.
@@ -220,10 +222,10 @@ impl std::hash::Hash for PiRef {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Name {
     /// Lowering's output; identity is the string. See module docs.
-    Raw(String),
+    Raw(SmolStr),
     /// A uniquified source binder; identity is `uid`, `base` is the source
     /// spelling kept as display metadata.
-    Unique { base: String, uid: Uid },
+    Unique { base: SmolStr, uid: Uid },
     /// A compiler-introduced binder; identity is `uid`, `kind` is its
     /// provenance and whole display (no source spelling — that was noise).
     Synthetic { kind: SyntheticKind, uid: Uid },
@@ -248,7 +250,7 @@ impl Name {
     /// A raw lowering name (identity is the string). Reserved spellings must go
     /// through their dedicated constructor instead, or they would compare
     /// unequal to the reserved variant — the `debug_assert` catches that slip.
-    pub fn raw(base: impl Into<String>) -> Self {
+    pub fn raw(base: impl Into<SmolStr>) -> Self {
         let base = base.into();
         debug_assert!(
             base != ReservedName::Elem.spelling(),
@@ -261,7 +263,7 @@ impl Name {
     /// globally fresh `uid` for identity. Uniquification's minter — the only
     /// thing that should produce a [`Name::Unique`] (a compiler-introduced
     /// binder is a [`Name::Synthetic`], not this).
-    pub fn fresh(base: impl Into<String>) -> Self {
+    pub fn fresh(base: impl Into<SmolStr>) -> Self {
         Name::Unique {
             base: base.into(),
             uid: Uid::fresh(),
@@ -543,7 +545,7 @@ mod tests {
         assert!(!Name::raw("y").is_elem());
         // A Raw spelled like the reserved name is still a different variant
         // (and only reachable in release; debug_assert guards construction).
-        assert_ne!(Name::elem(), Name::Raw("__elem".to_string()));
+        assert_ne!(Name::elem(), Name::Raw("__elem".into()));
     }
 
     #[test]
