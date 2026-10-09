@@ -302,6 +302,24 @@ impl LoadedProgram {
         self.modules[0].ast.as_ref()
     }
 
+    /// The tree of `file`, or `None` when the lexer rejected it.
+    pub fn ast(&self, file: FileId) -> Option<&Module> {
+        self.module(file).ast.as_ref()
+    }
+
+    /// Whether `file` parsed without errors.
+    pub fn parsed_cleanly(&self, file: FileId) -> bool {
+        self.module(file).parse_errors.is_empty()
+    }
+
+    /// The file of the module `path` names, if loading found one.
+    pub fn file_of(&self, path: &ModulePath) -> Option<FileId> {
+        self.modules
+            .iter()
+            .map(|m| m.file)
+            .find(|&file| self.sources.module(file) == Some(path))
+    }
+
     /// Every module, each after every module it has an edge to, or `None` when
     /// the module graph has a cycle (`docs/modules.md`, "Linking").
     pub fn link_order(&self) -> Option<&[FileId]> {

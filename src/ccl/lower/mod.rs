@@ -74,7 +74,6 @@
 //!   top-level block.
 //! - [`http`] — `http_serve` recognition and lowering.
 
-use crate::ccl::Label;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -96,6 +95,7 @@ use crate::{
         http_server::{SharedHttpServer, UnopenedRoute, UnopenedRouteSink},
     },
 };
+use smol_str::SmolStr;
 
 mod comprehension;
 mod exprs;
@@ -103,6 +103,7 @@ mod functions;
 mod http;
 mod loops;
 mod module_syntax;
+pub mod modules;
 mod sinks;
 mod stmts;
 #[cfg(any(test, feature = "test-helpers"))]
@@ -147,6 +148,9 @@ pub enum LoweringError {
         span: Span,
         /// Human-readable description of why the construct is unsupported.
         message: String,
+        /// Further spans the error points at, each with its label: the
+        /// declaration a reference cannot reach, for one.
+        notes: Vec<(Span, String)>,
     },
 }
 
@@ -171,6 +175,21 @@ impl LoweringError {
         LoweringError::Unsupported {
             span,
             message: message.into(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// This error, also pointing at `span` with `label`.
+    pub fn with_note(mut self, span: Span, label: impl Into<String>) -> Self {
+        let LoweringError::Unsupported { notes, .. } = &mut self;
+        notes.push((span, label.into()));
+        self
+    }
+
+    /// The further spans the error points at, each with its label.
+    pub fn notes(&self) -> &[(Span, String)] {
+        match self {
+            LoweringError::Unsupported { notes, .. } => notes,
         }
     }
 
@@ -429,6 +448,14 @@ pub struct LoweringContext {
     /// (`crate::ccl::comprehension`), which states the same domain equations on
     /// the same tree and so must not reuse an id lowering already spent.
     pub(crate) shared_holes: SharedHoleMint,
+
+    /// The module being lowered: whose labels its unqualified ones are, and
+    /// what its import names reach. Set per module by
+    /// [`begin_module`](Self::begin_module).
+    pub(super) module: modules::ModuleScope,
+    /// Where the module being lowered performs IO, if it does: the first call to
+    /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
+    pub(super) io_site: Option<Span>,
 }
 
 /// A type name a block or a definition declares, and the type it names.
@@ -1022,11 +1049,22 @@ fn lower_expr_inner(
                     ),
                 ));
             }
+            if ctx.is_import_name(name) {
+                return Err(LoweringError::unsupported(
+                    expr.span,
+                    format!(
+                        "`{name}` names a module, and a module as a value is not supported yet"
+                    ),
+                ));
+            }
             Ok(Expr::var(name.to_string()))
         }
-        ChlExpr::Qualified(_) => {
-            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
-        }
+        // A member of another module lowers to the binder its module's chain
+        // minted for it (`modules`).
+        ChlExpr::Qualified(q) => Ok(match ctx.member(q, expr.span)? {
+            Some(member) => Expr::var(member),
+            None => Expr::error(),
+        }),
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
         ChlExpr::Compare {
             left,
@@ -1069,11 +1107,7 @@ fn lower_expr_inner(
                 value,
             } in fields
             {
-                debug_assert!(
-                    qualifier.is_empty(),
-                    "a qualified label is refused before lowering (`refuse_module_syntax`)"
-                );
-                let field_name = Label::new(name.as_str());
+                let field_name = ctx.label(qualifier, name, *name_span)?;
                 if out.iter().any(|(k, _)| k == field_name) {
                     return Err(LoweringError::unsupported(
                         *name_span,
@@ -1133,10 +1167,6 @@ fn lower_expr_inner(
             attr_span,
             attr_qualifier,
         } => {
-            debug_assert!(
-                attr_qualifier.is_empty(),
-                "a qualified label is refused before lowering (`refuse_module_syntax`)"
-            );
             let key = if attr.starts_with(|c: char| c.is_ascii_digit()) {
                 // Only magnitude can fail here: the parser admits an integer literal,
                 // so the digits are a non-negative number, but not necessarily one a
@@ -1149,7 +1179,7 @@ fn lower_expr_inner(
                 })?;
                 Expr::proj_index(index)
             } else {
-                Expr::proj_field(Label::new(attr.as_str()))
+                Expr::proj_field(ctx.label(attr_qualifier, attr, *attr_span)?)
             };
             let target_expr = lower_expr(target, ctx)?;
             let proj = ctx.tag_image(key, expr.span);
@@ -1164,14 +1194,11 @@ fn lower_expr_inner(
         // manufactured and tagged here.
         ChlExpr::VariantCtor {
             tag,
+            tag_span,
             tag_qualifier,
             payload,
-            ..
         } => {
-            debug_assert!(
-                tag_qualifier.is_empty(),
-                "a qualified tag is refused before lowering (`refuse_module_syntax`)"
-            );
+            let label = ctx.label(tag_qualifier, tag, *tag_span)?;
             let payload = match payload {
                 Some(ChlVariantPayload::Term(p)) => lower_expr(p, ctx)?,
                 // Braces are a *type*'s field list; in a term the payload is
@@ -1189,7 +1216,7 @@ fn lower_expr_inner(
                     ctx.tag_machinery(Expr::lit(Lit::Unit), expr.span, "lower.variant_ctor_unit")
                 }
             };
-            Ok(Expr::variant_ctor(Label::new(tag.as_str()), payload))
+            Ok(Expr::variant_ctor(label, payload))
         }
         ChlExpr::Lambda { params, body } => {
             refuse_capitalized_lambda_binder(params)?;
@@ -1272,11 +1299,72 @@ fn lower_expr_inner(
 /// `channelize` removes all `Feed` nodes and then collapses the `ExprStmt` to
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
-    // Module syntax parses and does not lower yet; a module using it lowers
-    // nothing, so no lowering site has to account for it.
-    let mut errors = module_syntax::refuse_module_syntax(module);
+    lower_module(module, ctx, false)
+}
+
+/// Lower `module`, an imported module, to the chain of its top-level bindings
+/// around [`modules::MODULE_BODY`], the placeholder for the code that imports it
+/// (`modules`).
+///
+/// An imported module has no value of its own (`docs/chl-spec.md`, "9.17 No
+/// trailing expressions"), and holds only value bindings, `def`s and type
+/// aliases until imported state is supported.
+pub fn lower_library(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
+    lower_module(module, ctx, true)
+}
+
+/// Where `module`, an imported module, binds a sink: the first statement that
+/// declares one, which makes importing it an error (`docs/chl-spec.md`, "9.7
+/// Importing asserts no IO"). Reading a source is the other IO a module can
+/// perform, and lowering records it ([`LoweringContext::io_site`]).
+pub fn sink_site(module: &ChlModule) -> Option<Span> {
+    module.body.iter().find_map(|stmt| {
+        let inner = match &stmt.node {
+            ChlStmt::Pub { stmt, .. } => &stmt.node,
+            other => other,
+        };
+        match inner {
+            ChlStmt::Assign { target, value, .. } => {
+                sink_declaration(target, value).map(|_| stmt.span)
+            }
+            _ => None,
+        }
+    })
+}
+
+fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) -> LoweringResult {
+    // Module syntax that does not lower yet makes the module lower nothing, so no
+    // lowering site has to account for it.
+    let syntax = module_syntax::refuse_module_syntax(module);
+    let mut errors = syntax.errors;
+    errors.extend(import_name_binders(&syntax.binders, ctx));
+    errors.extend(modules::public_names_bound_twice(
+        &modules::top_level_bindings(&module.body),
+    ));
+    if library {
+        errors.extend(library_statement_refusals(&module.body));
+    }
     let value = if errors.is_empty() {
-        lower_stmts_recovering(module, ctx, &mut errors)
+        // `pub` decides what an importer reaches, which the interface records,
+        // and an `import` binds a name lowering resolves through the module's
+        // scope. Neither leaves anything in the lowered tree.
+        let unmarked = ChlModule {
+            file: module.file,
+            body: module
+                .body
+                .iter()
+                .filter(|stmt| !matches!(stmt.node, ChlStmt::Import { .. }))
+                .map(|stmt| match &stmt.node {
+                    ChlStmt::Pub { stmt, .. } => (**stmt).clone(),
+                    _ => stmt.clone(),
+                })
+                .collect(),
+        };
+        if library {
+            lower_library_recovering(&unmarked, ctx, &mut errors)
+        } else {
+            lower_stmts_recovering(&unmarked, ctx, &mut errors)
+        }
     } else {
         None
     };
@@ -1287,6 +1375,63 @@ pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringRes
         (span.file, span.start, span.end)
     });
     LoweringResult { value, errors }
+}
+
+/// One error per binder spelled like an import name: `m::f` names a module, so a
+/// binder spelled `m` would give one spelling two meanings in one scope
+/// (`docs/chl-spec.md`, "9.6 Qualified references").
+fn import_name_binders(binders: &[(SmolStr, Span)], ctx: &LoweringContext) -> Vec<LoweringError> {
+    binders
+        .iter()
+        .filter_map(|(name, span)| {
+            let import = ctx.module.imports.get(name.as_str())?;
+            Some(
+                LoweringError::unsupported(
+                    *span,
+                    format!("`{name}` is an import name, so no binder in its module takes it"),
+                )
+                .with_note(import.statement, "imported here"),
+            )
+        })
+        .collect()
+}
+
+/// One error per top-level statement of an imported module that lowering does
+/// not support there: anything but a value binding, a `def`, a type alias, an
+/// `import`, or `pass`.
+fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
+    stmts
+        .iter()
+        .filter_map(|stmt| {
+            let inner = match &stmt.node {
+                ChlStmt::Pub { stmt, .. } => &stmt.node,
+                other => other,
+            };
+            let message = match inner {
+                ChlStmt::Assign { .. }
+                | ChlStmt::AnnAssign { .. }
+                | ChlStmt::FunctionDef { .. }
+                | ChlStmt::Import { .. }
+                | ChlStmt::Pass
+                | ChlStmt::Error => return None,
+                ChlStmt::Expr(_) => {
+                    "an expression statement at a module's top level gives the module a value, \
+                     and an imported module has none"
+                }
+                ChlStmt::MutAssign { .. }
+                | ChlStmt::AugAssign { .. }
+                | ChlStmt::LoadFrom { .. }
+                | ChlStmt::Define { .. } => {
+                    "mutable state in an imported module is not supported yet"
+                }
+                _ => {
+                    "this statement at an imported module's top level is not supported yet: an \
+                     imported module holds value bindings, `def`s and type aliases"
+                }
+            };
+            Some(LoweringError::unsupported(stmt.span, message))
+        })
+        .collect()
 }
 
 #[cfg(test)]

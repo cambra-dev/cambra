@@ -300,17 +300,20 @@ loop body's last statement before `pass` removal. In a final-position loop whose
 loop. Removing the trailing `pass` selects the supported path. This is a lowering limitation,
 not intended `pass` semantics.
 
-## Module syntax — refused before lowering
+## Module syntax
 
-`import`, `run`, `param`, `@RenamedFrom`, `@Discard`, `pub`, qualified names, and qualified labels
-and tags parse ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules [Decided]") and do not lower
-yet.
-`refuse_module_syntax` (`ccl/lower/module_syntax.rs`) walks the whole module, every block and every
-expression, and reports one `LoweringError::Unsupported` per construct. `lower_stmts` lowers nothing
-when it reports, so no statement walker or expression arm has a rule for these forms. The arms that
-must name `Expr::Qualified` or `AssignTarget::Qualified` are `unreachable!`. A path with a
-capitalized qualifier segment, `Price::discounted`, is refused as a method reference rather than as
-module syntax ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and methods [Decided]").
+A top-level `import`, `pub` on a value binding or a `def`, and a qualified value, label, or tag lower
+([docs/modules.md, "Imports"](../../../docs/modules.md#imports)). Lowering resolves each qualified
+form against the module's import names (`ccl/lower/modules.rs`): a value to the binder the imported
+module's chain minted, and a label to a `Label` of the module it names. A qualified type is refused
+where `lower_type_expr` meets it.
 
-A module that uses module syntax therefore reports only those refusals, and none of the lowering
-errors its other statements would raise.
+The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules
+[Decided]") and does not lower yet: `run`, `param`, `@RenamedFrom`, `@Discard`, a `use` clause,
+`pub` on a mutable variable, and a write to another module's member. `refuse_module_syntax`
+(`ccl/lower/module_syntax.rs`) walks the whole module, every block and every expression, and reports
+one `LoweringError::Unsupported` per construct, and the module lowers nothing when it reports. A
+path with a capitalized qualifier segment, `Price::discounted`, is refused as a method reference
+rather than as module syntax ([chl-spec.md](../../../docs/chl-spec.md), "6.8 Nominal types and
+methods [Decided]"). A module that uses refused syntax therefore reports only those refusals, and
+none of the lowering errors its other statements would raise.
