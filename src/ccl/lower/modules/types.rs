@@ -11,15 +11,32 @@ use super::*;
 /// Each predicate is rebuilt as a new term derived from the one its module
 /// lowered, renamed or not: the module's own run holds that one, so the two
 /// trees share no node.
-pub(super) fn reroot(ty: &Type, qualifier: &str) -> Type {
-    fn rename(expr: &mut Expr, qualifier: &str, bound: &mut Vec<Name>) {
+pub(super) fn reroot_alias(ty: &AliasType, qualifier: &QualifiedName) -> AliasType {
+    match ty {
+        AliasType::Type(ty) => AliasType::Type(reroot(ty, qualifier)),
+        AliasType::Module(module) => AliasType::Module(Rc::new(ModuleType {
+            entries: module
+                .entries
+                .iter()
+                .map(|entry| ModuleEntry {
+                    name: entry.name.clone(),
+                    ty: reroot_alias(&entry.ty, qualifier),
+                })
+                .collect(),
+        })),
+    }
+}
+
+/// [`reroot_alias`] on a type.
+pub(super) fn reroot(ty: &Type, qualifier: &QualifiedName) -> Type {
+    fn rename(expr: &mut Expr, qualifier: &QualifiedName, bound: &mut Vec<Name>) {
         let depth = bound.len();
         for_each_scoped_item_mut(expr, &mut |item| match item {
             ScopedItemMut::VarRef(name) => {
                 if let Name::Raw(spelling) = &*name
                     && !bound.contains(name)
                 {
-                    *name = QualifiedName::new(qualifier).qualify(spelling);
+                    *name = qualifier.qualify(spelling);
                 }
             }
             ScopedItemMut::KeyRef(_) => {}

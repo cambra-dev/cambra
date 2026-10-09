@@ -1,6 +1,7 @@
 //! Statement-block lowering: `Let` chains, `if`/`else`, sink-declaration dispatch, and
 //! mutation-loop dispatch.
 
+use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
 use std::{collections::HashSet, rc::Rc};
 
 use super::modules::module_body;
@@ -36,6 +37,7 @@ pub(super) fn lower_chain_recovering(
     }
     let outer_bindings = HashSet::new();
     errors.extend(pre_declare_type_aliases(stmts, ctx));
+    errors.extend(ctx.declare_module_parameters(stmts));
     pre_register_txn_decls(stmts, ctx);
     let span = match (stmts.first(), stmts.last()) {
         (Some(first), Some(last)) => first.span.join(last.span),
@@ -137,6 +139,7 @@ pub(super) fn lower_stmts_recovering(
         return None;
     }
     errors.extend(pre_declare_type_aliases(stmts, ctx));
+    errors.extend(ctx.declare_module_parameters(stmts));
     let defined = nominal::define_nominal_types(stmts, ctx);
     if !defined.is_empty() {
         errors.extend(defined);
@@ -674,6 +677,16 @@ pub(super) fn lower_middle_stmt(
         // (`nominal::bind_constructors`).
         ChlStmt::TypeDecl(_) if is_top_level => Ok(body),
         ChlStmt::TypeDecl(decl) => Err(nominal::refuse_nested(stmt.span, decl)),
+        // A member bound to a module binds no value: it is a name of the module
+        // that reaches its members (`modules`).
+        ChlStmt::Assign {
+            target:
+                Spanned {
+                    node: AssignTarget::Name(name),
+                    ..
+                },
+            ..
+        } if is_top_level && ctx.binds_module(name, stmt.span) => Ok(body),
         // `x = e` and `Price::new(r) = p`: each name a shadowing `let`.
         ChlStmt::Assign {
             target,
@@ -1036,11 +1049,7 @@ pub(super) fn lower_middle_stmt(
             else {
                 return Ok(body);
             };
-            let mut arguments = Vec::with_capacity(args.len());
-            for arg in args {
-                let span = arg.name.span.join(arg.value.span);
-                arguments.push((arg.name.node.clone(), span, lower_expr(&arg.value, ctx)?));
-            }
+            let arguments = ctx.run_arguments(&name, args)?;
             Ok(ctx.take_run(&name, module, stmt.span, arguments, body))
         }
         // A value parameter is a `let` of its default, or, with none, of an
@@ -1051,6 +1060,21 @@ pub(super) fn lower_middle_stmt(
             annotation,
             default,
         } => {
+            // A Module-typed parameter binds a `let` per value its Module type
+            // names, each run binding it to the argument's member
+            // (`LoweringContext::declare_module_parameters`).
+            if let Some(parameter) = ctx
+                .parameters
+                .iter()
+                .find(|p| p.name == name.node && p.module().is_some())
+            {
+                let lets = parameter.entry_lets();
+                return Ok(lets.into_iter().rev().fold(body, |body, (binder, ty)| {
+                    let value = ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span);
+                    let bound = Expr::let_bind_annotated(binder.raw(), value, body, ty);
+                    ctx.tag_image(bound, stmt.span)
+                }));
+            }
             let value = match default {
                 Some(default) => lower_expr(default, ctx)?,
                 None => ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span),
@@ -1067,8 +1091,8 @@ pub(super) fn lower_middle_stmt(
             ctx.parameters.push(modules::Parameter {
                 name: name.node.clone(),
                 declared: stmt.span,
-                annotation: annotation.clone(),
                 default: default.is_some(),
+                kind: modules::ParameterKind::Value(annotation.clone()),
             });
             let bound = match annotation {
                 Some(ty) => Expr::let_bind_annotated(name.node.as_str(), value, body, ty),
@@ -1644,7 +1668,7 @@ pub(super) fn declare_type_params(
         }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
-        ctx.declare_type_throughout(name, Type::Param(Rc::clone(&param)));
+        ctx.declare_type_throughout(name, AliasType::Type(Type::Param(Rc::clone(&param))));
         ctx.type_params_in_scope.push(name.to_string());
         declared.push(crate::ccl::ty::PolyParam {
             param,
@@ -1718,7 +1742,10 @@ fn lower_bound(
         .iter()
         .map(|tp| {
             let p = crate::ccl::ty::TypeParam::declared(tp.name.as_str());
-            ctx.declare_type_throughout(tp.name.as_str(), Type::Param(Rc::clone(&p)));
+            ctx.declare_type_throughout(
+                tp.name.as_str(),
+                AliasType::Type(Type::Param(Rc::clone(&p))),
+            );
             (p.id, tp.name.as_str())
         })
         .collect();
@@ -2039,7 +2066,11 @@ pub(super) fn lower_type_expr_or_poly(
                 return Ok(ty);
             }
             match ctx.type_alias(id.as_str(), annotation.span) {
-                AliasAt::InScope(ty) => Ok(ty.clone()),
+                AliasAt::InScope(AliasType::Type(ty)) => Ok(ty.clone()),
+                AliasAt::InScope(AliasType::Module(_)) => Err(module_type_as_value_type(
+                    annotation.span,
+                    &format!("`{id}`"),
+                )),
                 AliasAt::Below => Err(LoweringError::unsupported(
                     annotation.span,
                     format!(
@@ -2059,7 +2090,15 @@ pub(super) fn lower_type_expr_or_poly(
         // A type member of another module (`docs/chl-spec.md`, "9.6 Qualified
         // references"). One whose module has errors of its own names no type, and
         // stands for any.
-        ChlExpr::Qualified(q) => Ok(ctx.type_member(q, annotation.span)?.unwrap_or(Type::Hole)),
+        ChlExpr::Qualified(q) => match ctx.type_member(q, annotation.span)? {
+            Some(AliasType::Type(ty)) => Ok(ty),
+            Some(AliasType::Module(_)) => Err(module_type_as_value_type(
+                annotation.span,
+                &format!("`{}`", crate::ccl::names::QualifiedName::of(q)),
+            )),
+            None => Ok(Type::Hole),
+        },
+        ChlExpr::ModuleType(_) => Err(module_type_as_value_type(annotation.span, "`Module{…}`")),
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
@@ -2200,6 +2239,98 @@ pub(super) fn lower_type_expr_or_poly(
     }
 }
 
+/// The error of a Module type, spelled `what`, written at `span` where a value's
+/// type stands (`docs/chl-spec.md`, "9.8 Module types").
+fn module_type_as_value_type(span: Span, what: &str) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        format!(
+            "{what} is a Module type, the type of a module, and no value has one: it is \
+             written as a parameter's type, an alias, or a member of another Module type"
+        ),
+    )
+}
+
+/// What `annotation` names where a Module type may stand: a parameter's
+/// annotation, an alias's right-hand side, and an entry of a Module type. A
+/// Module type, written or through an alias, is a [`ModuleType`]; anything else
+/// is a type, lowered by [`lower_type_expr_or_poly`].
+pub(super) fn lower_alias_type(
+    annotation: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<AliasType, LoweringError> {
+    match &annotation.node {
+        ChlExpr::ModuleType(fields) => {
+            let mut entries: Vec<ModuleEntry> = Vec::with_capacity(fields.len());
+            for field in fields {
+                if !field.qualifier.is_empty() {
+                    return Err(LoweringError::unsupported(
+                        field.name_span,
+                        "a Module type's entry names a member of the module, which takes no \
+                         qualifier",
+                    ));
+                }
+                if is_type_name(&field.name) {
+                    return Err(LoweringError::unsupported(
+                        field.name_span,
+                        "a type member of a Module type is not supported yet",
+                    ));
+                }
+                if entries.iter().any(|entry| entry.name == field.name) {
+                    return Err(LoweringError::unsupported(
+                        field.name_span,
+                        format!("`{}` is named twice in this Module type", field.name),
+                    ));
+                }
+                // A feed entry is a feed handle, its domain left to inference as
+                // a `Feed` parameter's is.
+                if let ChlExpr::Call { func, args } = &field.value.node
+                    && let ChlExpr::Name(head) = &func.node
+                {
+                    match (head.as_str(), args.as_slice()) {
+                        ("Mut", _) => {
+                            return Err(LoweringError::unsupported(
+                                field.value.span,
+                                format!(
+                                    "`{}` is a `Txn` variable, which a Module type does not name \
+                                     yet",
+                                    field.name
+                                ),
+                            ));
+                        }
+                        ("Feed", [value]) => {
+                            let value = lower_type_expr(value, ctx)?;
+                            entries.push(ModuleEntry {
+                                name: field.name.clone(),
+                                ty: AliasType::Type(Type::feed(Type::Hole, value)),
+                            });
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                entries.push(ModuleEntry {
+                    name: field.name.clone(),
+                    ty: lower_alias_type(&field.value, ctx)?,
+                });
+            }
+            Ok(AliasType::Module(Rc::new(ModuleType { entries })))
+        }
+        ChlExpr::Name(id) if name_type(id.as_str()).is_none() => {
+            match ctx.type_alias(id.as_str(), annotation.span) {
+                AliasAt::InScope(AliasType::Module(module)) => {
+                    Ok(AliasType::Module(Rc::clone(module)))
+                }
+                _ => Ok(AliasType::Type(lower_type_expr_or_poly(annotation, ctx)?)),
+            }
+        }
+        ChlExpr::Qualified(q) => Ok(ctx
+            .type_member(q, annotation.span)?
+            .unwrap_or(AliasType::Type(Type::Hole))),
+        _ => Ok(AliasType::Type(lower_type_expr_or_poly(annotation, ctx)?)),
+    }
+}
+
 /// Name a CHL expression form in the surface's own words.
 ///
 /// The alternative is `{:?}` on the parser AST, which puts a multi-line
@@ -2235,6 +2366,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         | ChlExpr::BraceRecord(_)
         | ChlExpr::BraceGroup(_)
         | ChlExpr::BraceRefinement { .. }
+        | ChlExpr::ModuleType(_)
         | ChlExpr::FunctionType { .. }
         | ChlExpr::Forall { .. }
         | ChlExpr::VariantCtor { .. }
@@ -2467,7 +2599,7 @@ pub(super) fn pre_declare_type_aliases(
             ));
             continue;
         }
-        match lower_type_expr_or_poly(rhs, ctx) {
+        match lower_alias_type(rhs, ctx) {
             Ok(ty) => ctx.declare_type_alias(name, stmt.span, ty),
             // The inner error names the form in surface words
             // ([`describe_type_form`]), so it composes into one sentence.
