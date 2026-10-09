@@ -50,6 +50,9 @@ lowered α-equivalent terms can have different `uid`s and need not compare equal
 phase therefore runs after `uniquify`, so the generator source it copies into a loop-join predicate
 is already minted and the copy keeps its `uid`s. Lowering's own copies, such as a chained
 comparison's middle operand, are taken before `uniquify`, which mints each copy separately.
+Lowering uniquifies each module's tree alone, with the module's `use` names beneath its binders
+([docs/modules.md, "`use` names are environment entries, not
+bindings"](../../../docs/modules.md#use-names-are-environment-entries-not-bindings)).
 `uniquify` does not mint again at an already-minted binding site, so a predicate shared by `Rc`
 keeps one `uid` at every site it occupies. No pass may mint fresh uids on an equality-mediated path:
 copying must preserve the identities that refinement deduplication and other structural comparisons

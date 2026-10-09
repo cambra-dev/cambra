@@ -3717,8 +3717,8 @@ deletes no state.
 ## 9. Modules [Decided]
 
 A **module** is one `.cambra` file. The statements of this section, qualified names, and qualified
-labels and tags parse. `import`, `pub`, and qualified values, labels, and tags lower, and lowering
-refuses the rest. A module is used in one of two ways:
+labels and tags parse. `import` with its `use` clause, `pub`, and qualified values, labels, and tags
+lower, and lowering refuses the rest. A module is used in one of two ways:
 
 - **Importing** it brings its public members into scope. Importing asserts that the module performs
   no IO. Its members and its state exist once in the program, however many modules import it
@@ -3939,8 +3939,9 @@ Module type. `::` separates the name from the member, and `.` stays record proje
   including the special forms and `Mut`-parameter call shapes that dispatch on the callee. Through
   a parameter, `p::f(x)` takes its call shape from `f`'s type in the parameter's Module type.
 - A qualified generic member keeps its polymorphism: `n::id(1)` and `n::id("a")` both check.
-- Names bound by `use` are ordinary names and may be shadowed by locals. A member of the importing
-  module with the same spelling is an error naming both sites.
+- A name bound by `use` is in scope throughout its module, including above the statement, as an
+  import name is. A local may shadow it. A member of the importing module with the same spelling is
+  an error naming both sites.
 
 ### 9.7 Importing asserts no IO
 

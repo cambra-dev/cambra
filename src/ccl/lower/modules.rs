@@ -19,7 +19,7 @@ use crate::ccl::{Expr, Label, Name, TypedExprNode};
 use crate::chl_parser::ast::{
     AssignTarget, Module as ChlModule, QualifiedName, Span, Spanned, Stmt as ChlStmt,
 };
-use crate::chl_parser::{FileId, ModulePath};
+use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -222,8 +222,8 @@ pub fn public_names_bound_twice(bindings: &[TopLevelBinding]) -> Vec<LoweringErr
     errors
 }
 
-/// The module being lowered: whose labels its unqualified ones are, and the
-/// modules its import names reach.
+/// The module being lowered: whose labels its unqualified ones are, the
+/// modules its import names reach, and the members its `use` names reach.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleScope {
     /// The module an unqualified label belongs to, or `None` for the root's
@@ -232,6 +232,30 @@ pub struct ModuleScope {
     /// The import names in scope, each in scope throughout the module
     /// (`docs/chl-spec.md`, "9.6 Qualified references").
     pub imports: HashMap<SmolStr, Import>,
+    /// The names `use` clauses bind, each in scope throughout the module beneath
+    /// every local binder (`docs/modules.md`, "`use` names are environment
+    /// entries, not bindings").
+    pub uses: HashMap<SmolStr, Use>,
+}
+
+impl ModuleScope {
+    /// The scope the module's tree is uniquified in: each `use` name that
+    /// reaches a member, mapped to the member's binder.
+    pub fn use_scope(&self) -> HashMap<String, Name> {
+        self.uses
+            .iter()
+            .filter_map(|(name, used)| Some((name.to_string(), used.member.clone()?)))
+            .collect()
+    }
+}
+
+/// What a `use` name reaches.
+#[derive(Debug, Clone)]
+pub struct Use {
+    /// The member's binder, or `None` when its module has errors of its own.
+    pub member: Option<Name>,
+    /// The `use` item that binds the name.
+    pub item: Span,
 }
 
 /// What an import name reaches.
@@ -314,7 +338,6 @@ impl LoweringContext {
         q: &QualifiedName,
         span: Span,
     ) -> Result<Option<Name>, LoweringError> {
-        let member = q.name.node.as_str();
         let import = match q.qualifier.as_slice() {
             [this] if this.node == "this" => {
                 return Err(LoweringError::unsupported(
@@ -342,13 +365,22 @@ impl LoweringContext {
                 ));
             }
         };
+        import.reach(&q.qualifier[0].node, &q.name.node, span)
+    }
+}
+
+impl Import {
+    /// The binder of the public member `member`, reached through the import name
+    /// `name` at `span`, or `None` when the module has errors of its own or
+    /// performs IO, each of which is reported where it stands.
+    fn reach(&self, name: &str, member: &str, span: Span) -> Result<Option<Name>, LoweringError> {
         if super::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
-                format!("the type member `{}` is not supported yet", spell(q)),
+                format!("the type member `{name}::{member}` is not supported yet"),
             ));
         }
-        let Some(interface) = &import.interface else {
+        let Some(interface) = &self.interface else {
             return Ok(None);
         };
         if interface.io_site.is_some() {
@@ -372,9 +404,8 @@ impl LoweringContext {
             return Err(LoweringError::unsupported(
                 span,
                 format!(
-                    "`{}` takes a `Mut` parameter, and calling such a function across modules is \
-                     not supported yet",
-                    spell(q)
+                    "`{name}::{member}` takes a `Mut` parameter, and calling such a function \
+                     across modules is not supported yet"
                 ),
             ));
         }
@@ -397,8 +428,10 @@ fn spell(q: &QualifiedName) -> String {
 /// (`docs/modules.md`, "Linking").
 ///
 /// Each imported module lowers in link order, with the interfaces of the modules
-/// before it, and is uniquified alone. The root lowers last, and the imported
-/// modules' chains wrap it, the first in link order outermost. A module whose
+/// before it. The root lowers last, and the imported modules' chains wrap it,
+/// the first in link order outermost. Every module is uniquified alone, with its
+/// `use` names beneath its binders, so a name one module mints is settled before
+/// another module's tree surrounds it. A module whose
 /// own errors stop it from lowering has no interface, and a reference into it
 /// lowers to an error placeholder without an error of its own.
 ///
@@ -425,7 +458,14 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             interfaces.insert(file, None);
             continue;
         };
-        let scope = module_scope(ast, Some(path.clone()), program, &interfaces, &mut errors);
+        let scope = module_scope(
+            ast,
+            Some(path.clone()),
+            program,
+            &interfaces,
+            ctx,
+            &mut errors,
+        );
         ctx.begin_module(scope);
         if let Some(site) = sink_site(ast) {
             interfaces.insert(file, Some(Rc::new(Interface::performing_io(path, site))));
@@ -443,7 +483,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             interfaces.insert(file, None);
             continue;
         };
-        let chain = uniquify::run(chain);
+        let chain = uniquify::run_in(chain, &ctx.module.use_scope());
         let interface = Interface::of_chain(path, &chain, &top_level_bindings(&ast.body), |name| {
             ctx.is_mut_param_fn(name)
         });
@@ -457,11 +497,12 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             errors,
         };
     };
-    let scope = module_scope(ast, None, program, &interfaces, &mut errors);
+    let scope = module_scope(ast, None, program, &interfaces, ctx, &mut errors);
     ctx.begin_module(scope);
     let lowered = lower_stmts(ast, ctx);
     errors.extend(lowered.errors);
     let value = lowered.value.map(|root| {
+        let root = uniquify::run_in(root, &ctx.module.use_scope());
         chains
             .into_iter()
             .rev()
@@ -471,19 +512,24 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
 }
 
 /// The scope `module` lowers in: `labels` as the module of its unqualified
-/// labels, and an [`Import`] per `import` statement. An import of a module that
-/// performs IO is an error at the statement, and so is a second import binding
-/// one name.
+/// labels, an [`Import`] per `import` statement, and a [`Use`] per `use` item.
+///
+/// An import of a module that performs IO is an error at the statement, and so
+/// is a second import binding one name. A `use` item is an error when its member
+/// is not one the module's importers reach, or when its name is an import name,
+/// another `use` name, or a builtin's.
 fn module_scope(
     module: &ChlModule,
     labels: Option<ModulePath>,
     program: &LoadedProgram,
     interfaces: &HashMap<FileId, Option<Rc<Interface>>>,
+    ctx: &LoweringContext,
     errors: &mut Vec<LoweringError>,
 ) -> ModuleScope {
     let mut imports: HashMap<SmolStr, Import> = HashMap::new();
+    let mut use_items = Vec::new();
     for stmt in &module.body {
-        let ChlStmt::Import { path, alias, .. } = &stmt.node else {
+        let ChlStmt::Import { path, alias, uses } = &stmt.node else {
             continue;
         };
         // A segment the parser refused names no module.
@@ -524,6 +570,7 @@ fn module_scope(
                 .with_note(site, "the IO it performs"),
             );
         }
+        use_items.extend(uses.iter().map(|item| (name.clone(), item)));
         imports.insert(
             name,
             Import {
@@ -533,5 +580,61 @@ fn module_scope(
             },
         );
     }
-    ModuleScope { labels, imports }
+
+    let mut uses: HashMap<SmolStr, Use> = HashMap::new();
+    for (import_name, item) in use_items {
+        let bound = item.alias.as_ref().unwrap_or(&item.name);
+        let reached = imports[&import_name].reach(&import_name, &item.name.node, item.name.span);
+        let refusal = if let Some(import) = imports.get(&bound.node) {
+            Some(
+                LoweringError::unsupported(
+                    bound.span,
+                    format!(
+                        "`{}` is an import name, so no binder in its module takes it",
+                        bound.node
+                    ),
+                )
+                .with_note(import.statement, "imported here"),
+            )
+        } else if let Some(earlier) = uses.get(&bound.node) {
+            Some(
+                LoweringError::unsupported(
+                    bound.span,
+                    format!("`{}` is already a `use` name", bound.node),
+                )
+                .with_note(earlier.item, "bound by `use` here first"),
+            )
+        } else if SurfaceBuiltin::from_name(&bound.node).is_some()
+            || ctx.sources.contains_key(bound.node.as_str())
+        {
+            // A builtin resolves by its spelling before scope is consulted, so a
+            // `use` name spelled like one would never reach its member.
+            Some(LoweringError::unsupported(
+                bound.span,
+                format!(
+                    "`{}` is a builtin, so a `use` name cannot take it: bind the member under \
+                     another name, `use {} as …`",
+                    bound.node, item.name.node
+                ),
+            ))
+        } else {
+            reached.as_ref().err().cloned()
+        };
+        if let Some(refusal) = refusal {
+            errors.push(refusal);
+            continue;
+        }
+        uses.insert(
+            bound.node.clone(),
+            Use {
+                member: reached.expect("an unrefused `use` item reaches its member"),
+                item: bound.span,
+            },
+        );
+    }
+    ModuleScope {
+        labels,
+        imports,
+        uses,
+    }
 }

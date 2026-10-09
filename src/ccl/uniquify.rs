@@ -128,9 +128,23 @@ fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::Node
     out
 }
 
-/// α-uniquify every binder in `expr` (see module docs). Runs once per
-/// program, immediately after lowering and before channelization.
-pub fn run(mut expr: Expr) -> Expr {
+/// α-uniquify every binder in `expr` (see module docs). Lowering runs it on
+/// each module's tree, and the pipeline runs it again on the linked program
+/// before channelization. The pass is idempotent, so the second run changes
+/// nothing lowering minted.
+pub fn run(expr: Expr) -> Expr {
+    run_in(expr, &HashMap::new())
+}
+
+/// [`run`] with `scope` beneath every binder of `expr`: a raw reference that no
+/// binder of `expr` binds resolves to the name `scope` maps its spelling to. A
+/// module's `use` names enter its tree this way (`docs/modules.md`, "`use`
+/// names are environment entries, not bindings").
+pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>) -> Expr {
+    debug_assert!(
+        scope.values().all(|name| !name.is_raw()),
+        "uniquify: a scope entry is a minted name"
+    );
     // Snapshot every node's `NodeId` before the rename so we can assert
     // it survives unchanged (collected only under debug_assertions).
     #[cfg(debug_assertions)]
@@ -145,7 +159,10 @@ pub fn run(mut expr: Expr) -> Expr {
     let before_preds = distinct_predicate_terms(&expr);
 
     let mut u = Uniquifier {
-        env: HashMap::new(),
+        env: scope
+            .iter()
+            .map(|(spelling, name)| (spelling.clone(), vec![name.clone()]))
+            .collect(),
         // Replacing, not deriving: this walk reaches every occurrence of every
         // predicate it rebuilds, so no original survives beside its rebuild. The
         // tripwire below asserts that 1:1 correspondence on every compile.
@@ -153,7 +170,9 @@ pub fn run(mut expr: Expr) -> Expr {
     };
     u.expr(&mut expr);
     debug_assert!(
-        u.env.values().all(|stack| stack.is_empty()),
+        u.env
+            .iter()
+            .all(|(spelling, stack)| stack.len() == usize::from(scope.contains_key(spelling))),
         "uniquify: environment must be fully unwound after the walk"
     );
     #[cfg(debug_assertions)]
@@ -823,6 +842,37 @@ mod tests {
         };
         assert!(n.is_raw());
         assert_eq!(n.base(), "never_bound");
+    }
+
+    /// A scope entry sits beneath every binder: a free reference resolves to it,
+    /// and a binder of the same spelling shadows it.
+    #[test]
+    fn a_scope_entry_resolves_free_references_beneath_binders() {
+        let member = Name::fresh("f");
+        let scope = HashMap::from([("f".to_string(), member.clone())]);
+        // (f, λ f → f)
+        let expr = run_in(
+            Expr::tuple(vec![
+                Expr::var("f"),
+                Expr::lambda("f", Type::Hole, Expr::var("f")),
+            ]),
+            &scope,
+        );
+        let TypedExprNode::Tuple(items) = &expr.node else {
+            panic!("expected a tuple");
+        };
+        let TypedExprNode::Var(free) = &items[0].node else {
+            panic!("expected a var");
+        };
+        assert_eq!(*free, member);
+        let TypedExprNode::Lambda { param, body } = &items[1].node else {
+            panic!("expected a lambda");
+        };
+        let TypedExprNode::Var(bound) = &body.node else {
+            panic!("expected a var");
+        };
+        assert_eq!(bound, &param.name);
+        assert_ne!(*bound, member);
     }
 
     // LetRec α-renames without capture: the group binders shadow an outer

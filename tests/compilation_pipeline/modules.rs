@@ -115,6 +115,136 @@ fn an_import_binds_its_alias_and_a_module_imports_another() {
     );
 }
 
+/// `use` binds a member unqualified, under its own name or an alias, and a
+/// generic member keeps its polymorphism (`docs/chl-spec.md`, "9.2 Imports").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_use_item_binds_a_member_unqualified() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import catalog use id, double as twice
+                twice(id(3)) if id(True) else 0
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(6),
+    );
+}
+
+/// A `use` name is in scope throughout its module, above its `import` too.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_use_name_is_in_scope_above_its_import() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                four = double(2)
+                import catalog use double
+                four
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(4),
+    );
+}
+
+/// A local binder shadows a `use` name, a parameter and a binding in a `def`
+/// alike (`docs/chl-spec.md`, "9.6 Qualified references").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_local_shadows_a_use_name() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import catalog use double, limit
+                def by_parameter(double):
+                    double + 1
+                def by_binding(x):
+                    limit = x + 100
+                    limit
+                by_parameter(1) + by_binding(1) + double(limit)
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(2 + 101 + 20),
+    );
+}
+
+/// An imported module's own `use` names resolve within it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_module_uses_a_member_of_another() {
+    check_program_scalar(
+        &program(
+            "import pricing use plus
+plus(1)
+",
+            &[
+                (
+                    "base",
+                    "pub n = 5
+",
+                ),
+                (
+                    "pricing",
+                    indoc! {"
+                        import base use n
+                        pub def plus(x):
+                            x + n
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(6),
+    );
+}
+
+#[rstest]
+#[case::private_member(
+    "import catalog use hidden\n",
+    "`hidden` is private to module `catalog`"
+)]
+#[case::missing_member(
+    "import catalog use missing\n",
+    "module `catalog` has no member `missing`"
+)]
+#[case::type_member(
+    "import catalog use Item\n",
+    "the type member `catalog::Item` is not supported yet"
+)]
+#[case::bound_by_a_member(
+    "import catalog use limit\nlimit = 1\n",
+    "`limit` is a `use` name, so no member of its module takes it"
+)]
+#[case::bound_by_a_def(
+    "import catalog use double\ndef double(x):\n    x\n",
+    "`double` is a `use` name, so no member of its module takes it"
+)]
+#[case::an_import_name(
+    "import other\nimport catalog use limit as other\n",
+    "`other` is an import name, so no binder in its module takes it"
+)]
+#[case::bound_twice(
+    "import catalog use limit, double as limit\n",
+    "`limit` is already a `use` name"
+)]
+#[case::bound_by_two_imports(
+    "import catalog use limit\nimport other use x as limit\n",
+    "`limit` is already a `use` name"
+)]
+#[case::a_builtin("import catalog use double as sum\n", "`sum` is a builtin")]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_use_item_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(
+            &format!("{root}1\n"),
+            &[("catalog", CATALOG), ("other", "pub x = 1\n")],
+        ),
+        needle,
+    );
+}
+
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_private_member_is_refused_with_its_declaration() {
@@ -268,16 +398,16 @@ fn an_unsupported_library_statement_is_refused(#[case] library: &str, #[case] ne
     assert_refused(&program("import lib\n1\n", &[("lib", library)]), needle);
 }
 
-/// A reference into a module with errors of its own reports nothing more: the
-/// module's errors account for it.
+/// A reference or a `use` item into a module with errors of its own reports
+/// nothing more: the module's errors account for it.
 #[rstest]
+#[case::qualified("import lib\nlib::missing\n")]
+#[case::used("import lib use missing\nmissing\n")]
 #[timeout(Duration::from_secs(10))]
-fn a_reference_into_a_module_with_errors_adds_no_error() {
-    let errors = compile_errors(&program(
-        "import lib\nlib::missing\n",
-        &[("lib", "pub x = = 1\n")],
-    ));
+fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
+    let errors = compile_errors(&program(root, &[("lib", "pub x = = 1\n")]));
     assert!(!errors.contains("has no member"), "{errors}");
+    assert!(!errors.contains("missing"), "{errors}");
 }
 
 /// A module two others import is evaluated once: its bindings stand once in the

@@ -150,7 +150,7 @@ pipeline; individual pass contracts belong to the linked design documents.
 | Stage | Transformation |
 | --- | --- |
 | Load | `LoadedProgram::load`, before `run_frontend`: read the root and every module it imports or runs, parse each file to a recoverable CHL AST, and refuse module-graph cycles; see [loading](modules.md#loading) and [parser design](../chl-parser/design-chl-parser.md#stage-2--parser-parserrs). |
-| Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). Each imported module lowers to a chain of its bindings, uniquified alone, and linking puts the chains around the root; see [imports](modules.md#imports). |
+| Lower | CHL AST to CCL, with annotations and source attribution; see [lowering](../src/ccl/design/lowering.md). Each module lowers and is uniquified alone, an imported module to a chain of its bindings, and linking puts the chains around the root; see [imports](modules.md#imports). |
 | Uniquify | Give term binders distinct identities so later passes substitute without capture; see [structured names](../src/ccl/design/ir.md#structured-names-and-α-uniquification-barendregt-convention). |
 | A-normalize | `anf::run` names compound operands before inference. |
 | Name mutable reads | `mut_read::run` gives mutable reads immutable names that refinements can reference. |
