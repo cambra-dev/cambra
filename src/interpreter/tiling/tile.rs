@@ -20,44 +20,26 @@ use crate::{
 /// A materialized data tile produced by a [`TileProducer`](crate::interpreter::tile_operators::TileProducer).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tile {
-    /// A Tile representing a known or unknown single value.
-    ///
-    /// Scalars are represented as ColumnValues so that they can be operated on as a vector when
-    /// embedded inside other tilings.  Empty ColumnValue represents a still-unknown scalar.
+    /// Scalar cells in enclosing-row order; an empty root column is an unknown scalar.
     Scalar(ColumnValue),
     /// A record of tiles, one per field, standing over the same rows.
     ///
-    /// Under a collection level each field is a column over that level's keys, and a scalar
-    /// field may hold no cell at some of them. `absent` lists, per field, the rows at which it
-    /// holds none, and the field's column holds the other rows' cells in order. A row is
-    /// absent from a field once its cell there has been released while a sibling still
-    /// growing, a collection, keeps the row open: the per-row counterpart of an empty
-    /// top-level scalar (`src/interpreter/design-operators.md`, "The release contract"). A
-    /// field with no entry holds a cell at every row, or, before it has arrived, at none.
+    /// `absent` records released scalar cells by field and row; each affected column holds
+    /// the remaining cells in row order. Sibling collections may keep those rows open.
+    /// A field without an `absent` entry has a cell at every row, or at none before arrival.
+    /// See `src/interpreter/design-operators.md`, "The release contract".
     Record {
         fields: HashMap<String, Tile>,
         absent: HashMap<String, BitSet>,
     },
-    /// A collection, `keys ⤇ values` — one new dimension over the rows it sits in.
-    ///
-    /// **A tile is a value of its type vectorized over `R` rows**, and `R` is set by
-    /// position: 1 at the top level, and inside a collection's `codomain`, that collection's
-    /// key count. A [`Self::Scalar`] is one entry per row and a [`Self::Record`] is one
-    /// sub-tile per field at the same `R`; a collection groups instead of pairing, which is
-    /// what `row_starts` records.
-    ///
-    /// Stored Compressed-Sparse-Row-wise: `domain` is every row's keys run together, and
-    /// `codomain` is a tile over those keys. A chain of collections nests one node per level,
-    /// holding the same columns a flat level list would — and unlike a flat list it can say
-    /// where a record sits between two levels, which is what lets records and collections
-    /// nest freely.
+    /// One collection level, grouped by enclosing row in compressed sparse row form.
+    /// There is one enclosing row at the root and one per parent key inside a codomain.
+    /// The recursive codomain permits records between collection levels.
+    /// See `src/interpreter/design-operators.md`, "Tile".
     DataFunction {
-        /// Where each row's run of keys begins in `domain`, one entry per row. **Non-decreasing**:
-        /// two equal starts are a row whose group holds nothing. A key with an empty group is
-        /// a collection that is empty, which an aggregate folds to its identity; a key that is
-        /// gone is absent from `domain` instead.
-        ///
-        /// At the top level this is `[0]` — the one row, whose group is the whole collection.
+        /// One nondecreasing domain offset per enclosing row; `[0]` at the root.
+        /// Equal adjacent offsets denote an empty group, not a deleted enclosing key.
+        /// An aggregate over an empty group yields its identity.
         row_starts: ColumnValue,
         /// Every row's keys, run together. Unique within a row and otherwise in the order
         /// they were delivered, which is what [`valid_over`] checks and all a lookup
@@ -1280,10 +1262,8 @@ impl Tile {
         }
     }
 
-    /// The tile at `level`, which is `self` at [`CurryLevel::OUTERMOST`].
-    ///
-    /// Where [`Self::deepest_values`] goes all the way down, this stops where an operator
-    /// says to — at the levels its inputs share, below which each of them keeps its own.
+    /// The tile at `level`, preserving any deeper levels inside its values.
+    /// Returns `self` at [`CurryLevel::OUTERMOST`]; panics if the collection chain is shorter.
     pub fn values_at(&self, level: CurryLevel) -> &Tile {
         match (level.index(), self) {
             (0, _) => self,
@@ -1303,23 +1283,15 @@ impl Tile {
         codomain.values_at_mut(level.in_codomain())
     }
 
-    /// Rebuild the level at `level`, one row of the level above it at a time — the deepest
-    /// standing level at a time.
+    /// Rebuild a collection level from one replacement group per enclosing row.
+    /// `group` receives the enclosing row's flat key index and returns a collection with
+    /// predicates relative to its own root. The result qualifies them by that row's path.
+    /// Only this level's `row_starts` change; higher key counts and row starts are preserved.
     ///
-    /// `group` answers the collection replacing the group at each row, indexed by that
-    /// row's flat key position; `empty_level` is what replaces it where there are no rows
-    /// yet, since the rebuilt level's shape is the caller's to say and not derivable from
-    /// the input's. Only the rebuilt level's `row_starts` are recomputed — the levels
-    /// above keep their own, their key counts being untouched.
-    ///
-    /// This is for an operation that changes the **keys** beneath the standing levels:
-    /// pairing two of them into one, merging a partition's arms. An operation that leaves
-    /// the keys alone and only replaces the values wants
-    /// [`values_at_mut`](Self::values_at_mut) instead, which needs no regrouping — a zip
-    /// beneath standing levels is that one.
-    ///
-    /// At the outermost level the whole tile is one group, so an operator written against
-    /// this needs no separate arm for the un-nested case.
+    /// `empty_level` must have the output level's shape and zero rows; it is used when there
+    /// are no enclosing rows. At the outermost level, the result is `group(0)`.
+    /// Use [`values_at_mut`](Self::values_at_mut) when keys do not change.
+    /// See `src/interpreter/design-operators.md`, "Curry levels".
     pub fn regroup_beneath(
         &self,
         level: CurryLevel,
@@ -1375,14 +1347,8 @@ impl Tile {
         out
     }
 
-    /// [`Self::regroup_beneath`] with the empty level read off `out`, the tiling of the
-    /// result.
-    ///
-    /// The empty level is always `out.values_at(level).empty_at_no_rows()` — the level
-    /// being rebuilt, emptied, not the codomain beneath it and not a level assembled from
-    /// parts. Deriving it here rather than taking it is what keeps a caller from passing
-    /// the wrong one, which answers a row that has reached nothing with a tile of the
-    /// wrong shape.
+    /// [`Self::regroup_beneath`] with the zero-row tile derived from `out.values_at(level)`.
+    /// The empty case uses the rebuilt collection's shape, not its codomain's shape.
     pub fn per_group(
         &self,
         out: &Tiling,
@@ -1392,14 +1358,11 @@ impl Tile {
         self.regroup_beneath(level, out.values_at(level).empty_at_no_rows(), group)
     }
 
-    /// Row `row`'s group at `level`, beneath the standing levels above it, as a collection
-    /// in its own right — that level with every other row emptied. `None` where this tile
-    /// has not reached that row.
-    ///
-    /// The companion to [`regroup_beneath`](Self::regroup_beneath): one takes a row's group
-    /// apart, the other puts the results back. At the outermost level the whole tile is the
-    /// one group, so an operator written against the pair needs no arm for the un-nested
-    /// case.
+    /// Extract an enclosing row's group at `level`, with predicates relative to the group.
+    /// Returns `None` if that enclosing row is absent. At the outermost level, borrows the
+    /// whole tile as the single group. Completeness inherited from an enclosing level
+    /// becomes explicit in the extracted group.
+    /// See `src/interpreter/design-operators.md`, "Restating a moved group".
     pub fn group_at(&self, level: CurryLevel, row: usize) -> Option<Cow<'_, Tile>> {
         // Borrowed at the outermost level: the whole tile *is* the one group, and this sits
         // on the nested read's per-pull path, where cloning it would copy the store every

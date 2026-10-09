@@ -21,20 +21,9 @@ fn same_region(a: &Predicate, b: &Predicate) -> bool {
     a == b || (a.subsumes(b) && b.subsumes(a))
 }
 
-/// The two predicate shapes that are **componentwise**: products of one predicate per component,
-/// admitting a key when every component admits its part.
-///
-/// A [`Record`](Predicate::Record) is a componentwise predicate over one record key's fields, taken
-/// in name order, which is the order [`Value`]'s comparison takes them in. A
-/// [`Qualified`](Predicate::Qualified) predicate is a componentwise predicate over two components,
-/// the enclosing path and the key under it; an unqualified predicate is the componentwise predicate
-/// `(True, itself)` ([`split_qualification`](Predicate::split_qualification)).
-///
-/// Both shapes take one algebra, written once over the components: componentwise predicates meet
-/// component by component, join where they differ in at most one component, and one componentwise
-/// predicate less another is a staircase of componentwise predicates. Containment is componentwise
-/// too, which is exact for products: a nonempty componentwise predicate lies inside another exactly
-/// when each of its components does.
+/// Product-region operations for record fields and `(enclosing, here)` qualifications.
+/// Record components use field-name order, matching [`Value`] comparison.
+/// See `src/interpreter/design-operators.md`, "Componentwise predicates and prefixes".
 enum Componentwise {
     Record(Vec<String>),
     Qualified,
@@ -153,16 +142,14 @@ fn join_with_any(arm: &Predicate, arms: &[Predicate]) -> Option<(usize, Predicat
         .find_map(|(at, other)| join(arm, other).map(|joined| (at, joined)))
 }
 
-/// A predicate that describes a subset of values in an extent.
+/// A region of values or paths used for completeness and release.
 ///
-/// **One region has one spelling** wherever the representation allows it, because the derived
-/// `PartialEq` is what release accumulation tests to decide whether a release added anything
-/// ([`TileProducer::release`](crate::interpreter::tile_operators::TileProducer)): an ordered set is
-/// an [`Intervals`](Self::Intervals) clamped to its type's range ([`intervals`](Self::intervals)),
-/// an empty region is [`False`](Self::False), and a region covering the whole type is
-/// [`True`](Self::True). A union of componentwise predicates has more than one spelling in general;
-/// [`flatten_or`](Self::flatten_or) joins componentwise predicates that share all but one
-/// component, and [`subsumes`](Self::subsumes) compares regions rather than spellings.
+/// Construct intervals through [`intervals`](Self::intervals) and unions through
+/// [`flatten_or`](Self::flatten_or). Release accumulation compares representations with
+/// `PartialEq`, so normalization prevents repeated equivalent releases from appearing to grow.
+/// General unions can still have different representations of one region; use
+/// [`subsumes`](Self::subsumes) for containment.
+/// See `src/interpreter/design-operators.md`, "Predicate".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     True,
@@ -179,44 +166,22 @@ pub enum Predicate {
     /// componentwise predicate that no two of them make, so an `Or` is not proof the region is no
     /// single componentwise predicate. Invariant: arms never directly nest another `Or`.
     Or(Vec<Predicate>),
-    /// Predicate over a discriminated-union domain: one predicate per **named tag**, and
-    /// `rest` for every tag it does not name.
+    /// Payload predicates for named tags, with `rest` applying to every unnamed tag.
     ///
-    /// Admits a value `Union { tag, inner }` iff the predicate for `tag` — its own, or
-    /// `rest` — admits `inner`.
-    ///
-    /// A predicate need not name every tag of its domain, and cannot always: a column
-    /// carries only the tags it holds, which width subtyping makes fewer than its extent's
-    /// (see [`TagMap`], "Why keyed rather than positional"), and a point names one. `rest`
-    /// is what makes that exact. A point or a column's keys leave `rest` false, and a
-    /// complement flips it, so `True ∖ 𝑝` needs no list of the tags `𝑝` leaves out.
-    ///
-    /// Canonical form, kept by [`Predicate::tagged`]: no named tag's predicate is `rest`'s
-    /// value, and a union naming no tag is `True` or `False`. Universality is therefore
-    /// spelled `True`: a union naming every tag of its domain `True` over a `false` rest is
-    /// not recognized as everything, so a constructor that knows the whole tag set spells it
-    /// through [`Predicate::over_every_tag`].
+    /// Use [`tagged`](Self::tagged) to remove entries equal to `rest`. A constructor with
+    /// the complete domain tag set uses [`over_every_tag`](Self::over_every_tag) to recognize
+    /// universality. Points and columns need not know that full set; complementing their
+    /// predicate also complements `rest`.
     Union {
         tags: TagMap<Predicate>,
         rest: bool,
     },
-    /// A key of an inner level **qualified by the enclosing path that reaches it**:
-    /// admits `(k₀ … k_d)` when `(k₀ … k_{d-1})` satisfies `enclosing` and `k_d`
-    /// satisfies `here`.
+    /// Keys admitted by `here` under paths admitted by `enclosing`.
     ///
-    /// Every other arm is **unqualified**: read against the last component of a path
-    /// alone, it admits the same key value under every enclosing path, so on its own it
-    /// states one parent's keys only by stating every parent's.
-    /// `enclosing` is itself a predicate over the level above's paths, `Qualified` again
-    /// where the nest is deeper, so depth costs nesting rather than a concept per level.
-    ///
-    /// A componentwise predicate over `(enclosing, here)`, so it takes the same algebra as a record
-    /// ([`Componentwise`]).
-    ///
-    /// Built through [`qualified`](Predicate::qualified), which drops the arm where
-    /// `enclosing` admits everything: admitting the same keys everywhere is what the
-    /// predicate says without it, so one region keeps one spelling. A predicate over the
-    /// outermost level is never qualified — there is no enclosing path to name.
+    /// Construct with [`qualified`](Self::qualified), which removes empty or universal
+    /// qualifications. Read with [`contains_path`](Self::contains_path), not `contains`.
+    /// `enclosing` can itself be qualified; an `Or` can contain qualified arms.
+    /// See `src/interpreter/design-operators.md`, "Qualified predicates".
     Qualified {
         enclosing: Box<Predicate>,
         here: Box<Predicate>,
