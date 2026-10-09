@@ -98,6 +98,9 @@ struct KeyView {
     /// handle at one position stay distinguishable rather than one shadowing the
     /// other. Each maps to `(value, domain)`.
     history: BTreeMap<HistoryKind, (Box<KeyView>, Box<KeyView>)>,
+    /// Nominal contributions, keyed by declaration so two nominal types at one
+    /// position stay distinguishable. Each maps to its arguments in order.
+    nominal: BTreeMap<Rc<crate::ccl::nominal::NominalDecl>, Vec<KeyView>>,
 }
 
 /// Structural equality, with `refinements` compared as a set.
@@ -123,6 +126,7 @@ impl PartialEq for KeyView {
             && self.rec == other.rec
             && self.var == other.var
             && self.history == other.history
+            && self.nominal == other.nominal
     }
 }
 
@@ -168,6 +172,18 @@ impl KeyView {
                     let (v0, d0) = e.get_mut();
                     v0.union(*value);
                     d0.union(*domain);
+                }
+            }
+        }
+        for (decl, args) in other.nominal {
+            match self.nominal.entry(decl) {
+                Entry::Vacant(e) => {
+                    e.insert(args);
+                }
+                Entry::Occupied(mut e) => {
+                    for (a0, a) in e.get_mut().iter_mut().zip(args) {
+                        a0.union(a);
+                    }
                 }
             }
         }
@@ -344,6 +360,9 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
                 "Type::BoundedHole reached the solver; `normalize_annotation` must erase it"
             )
         }
+        Type::Split { .. } => {
+            unreachable!("a split argument stands only in a nominal type, which keys its sides")
+        }
         // A type parameter keys by identity. A live use's instantiation holds none,
         // since instantiation replaces each with a fresh variable; a use inside a
         // generic definition checked alone, coalesced in place, does.
@@ -497,6 +516,26 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             let domain = key_go(domain, pol, subst_acc, ctx);
             KeyView {
                 history: BTreeMap::from([(*history_kind, (Box::new(value), Box::new(domain)))]),
+                ..Default::default()
+            }
+        }
+        // A contravariant argument flips, as a function's domain does; an invariant one
+        // keys at this polarity, as a history's children do. A bipolar one keys both its
+        // sides, as compaction holds them (`NominalDecl::sided_variances`).
+        Type::Nominal(decl, args) => {
+            let mut sides = Vec::new();
+            for (t, v) in args.iter().zip(&decl.body().variances) {
+                if *v == crate::ccl::nominal::Variance::Bipolar {
+                    let (input, output) = crate::ccl::nominal::sides(t);
+                    sides.push(key_go(input, !pol, subst_acc, ctx));
+                    sides.push(key_go(output, pol, subst_acc, ctx));
+                } else {
+                    sides.push(key_go(t, v.polarity(pol), subst_acc, ctx));
+                }
+            }
+            let args = sides;
+            KeyView {
+                nominal: BTreeMap::from([(decl.clone(), args)]),
                 ..Default::default()
             }
         }

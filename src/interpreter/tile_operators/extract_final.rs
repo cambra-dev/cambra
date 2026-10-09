@@ -286,12 +286,13 @@ impl TileProducer for ExtractFinalProducer {
                 sub
             } else {
                 // Built at the *declared* extent: a tag `match` collapses its arms to their
-                // join, and the arm that answers carries only its own tag.
+                // join, and the arm that answers carries only its own tag. Laid out as this
+                // operator's tiling, which keeps a product a record of columns.
                 let cv = scalar_tile_to_column_value(*codomain);
-                Tile::Scalar(ColumnValue::from_values(
-                    vec![cv.index_at(final_idx)],
-                    &extent,
-                ))
+                column_value_to_tile(
+                    ColumnValue::from_values(vec![cv.index_at(final_idx)], &extent),
+                    self.tiling(),
+                )
             };
             self.final_tile = Some(tile.clone());
             return tile;

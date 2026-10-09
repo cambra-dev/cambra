@@ -2923,6 +2923,13 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
     `type Stream(T): cons(T, Stream(T))` settles at covariant. In
     `type Ping(T): p(T, Ping(T) => Int)`, the direct `T` gives covariant and the next round adds
     contravariant through the domain, so `T` settles at invariant.
+  - **A join of two values of one type joins argument by argument.** A covariant argument joins
+    and a contravariant one meets. An argument invariant because its parameter appears at both
+    polarities joins where the parameter is read and meets where it is written, so
+    `Cell::cell(1, f) if c else Cell::cell(2, g)`, for `type Cell(T): cell(T, T => T)`, has a type
+    both arms have: what it holds reads as `Int`. An argument invariant because its parameter
+    appears at an equality position, as `K` in `index(FullMap(K, Int))`, has no join unless the
+    two arguments agree, as two collections over different domains have none.
   - **The variance is part of the type's interface.** Adding `on(T => Int)` to a covariant type
     makes it invariant, which changes subtyping at every use, so the interface a module check
     prints states each parameter's variance
@@ -4936,8 +4943,9 @@ with parser-level support that lowering rejects:
   or Unicode `[k ↦ v, …]` are superseded by the map-literal decision.
 - **Map comprehensions** — `[k -> v for …]` is a comprehension of pairs, and reading one as a
   `Map` is `map([k -> v for …])` ([3.12 Comprehensions](#312-comprehensions)).
-- **Nominal types** — `type` declarations, constructors, associated functions and methods, and
-  `@RenamedFrom` on a type are **[Decided]** and unimplemented
+- **Nominal types** — a recursive `type` declaration, constructor patterns, `extract`, associated
+  functions and methods, `@RenamedFrom` on a type, and carrying a value of a nominal type over a
+  reload are **[Decided]** and unimplemented
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
 - **The target syntax at large** — the mutation and transaction **core is implemented** (`:=`,
   `with begin():`, `Mut(…, Txn)` mutable variables, feeds — §8), now spelled in the canonical target

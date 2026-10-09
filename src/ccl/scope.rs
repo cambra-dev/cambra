@@ -299,7 +299,7 @@ where
         }
         N::UnaryOp(_, inner) => open(f, inner),
         N::Aggregate { input, .. } => open(f, input),
-        N::VariantCtor { payload, .. } => open(f, payload),
+        N::VariantCtor { payload, .. } | N::NominalCtor { payload, .. } => open(f, payload),
         N::List(elts)
         | N::Tuple(elts)
         | N::Compose(elts)
@@ -567,6 +567,7 @@ where
         | N::UnaryOp(..)
         | N::Aggregate { .. }
         | N::VariantCtor { .. }
+        | N::NominalCtor { .. }
         | N::List(_)
         | N::Tuple(_)
         | N::Record(_)
@@ -643,6 +644,15 @@ mod tests {
             node(N::List(vec![var("e0"), var("e1")])),
             case_with_two_branches(),
             TypedExpr::variant_ctor("T", var("pl")),
+            TypedExpr::nominal_ctor(
+                crate::ccl::nominal::NominalDecl::declared(
+                    "N".into(),
+                    Vec::new(),
+                    chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                ),
+                "c",
+                var("pl"),
+            ),
             transact_one_key_one_writer(),
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),
             node(N::For {
@@ -776,6 +786,7 @@ mod tests {
         N::List(_) => "List",
         N::Case { .. } => "Case",
         N::VariantCtor { .. } => "VariantCtor",
+        N::NominalCtor { .. } => "NominalCtor",
         N::Transact { .. } => "Transact",
         N::LetRec { .. } => "LetRec",
         N::For { .. } => "For",

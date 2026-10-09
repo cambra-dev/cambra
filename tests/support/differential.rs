@@ -107,6 +107,33 @@ pub fn convert(v: TileValue, ty: &Type) -> Value {
                 payload: Box::new(convert(*inner, &arm)),
             }
         }
+        // A nominal value is held as the variant of its constructors; the type says which
+        // declaration's constructor the tag is.
+        (TileValue::Union { tag, inner }, Type::Nominal(decl, args)) => {
+            let ctor = tag.to_string();
+            let payload = decl
+                .ctor(&ctor)
+                .map(|c| decl.instantiate(&c.payload(), args))
+                .unwrap_or(Type::Hole);
+            Value::Nominal {
+                ty: decl.name.to_string(),
+                ctor,
+                payload: Box::new(convert(*inner, &payload)),
+            }
+        }
+        // A tuple is held as a record keyed by position, `_0`, `_1`, ….
+        (TileValue::Record(fields), Type::Tuple(tys)) => Value::Record(
+            fields
+                .into_iter()
+                .map(|(n, v)| {
+                    let t = n
+                        .strip_prefix('_')
+                        .and_then(|i| i.parse::<usize>().ok())
+                        .and_then(|i| tys.get(i).cloned());
+                    (n.to_string(), convert(v, &t.unwrap_or(Type::Hole)))
+                })
+                .collect(),
+        ),
         (TileValue::Record(fields), Type::Record(tys)) => Value::Record(
             fields
                 .into_iter()

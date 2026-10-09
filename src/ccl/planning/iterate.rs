@@ -279,6 +279,17 @@ pub(super) fn insert_iterate_recurse(
                 mark_component_source(field, realized);
             }
         }
+        // A constructor's payload is a component of the nominal value, as a product's is. A
+        // `box` entering the sum the declaration states stays, and is the identity at run
+        // time, so the collection it boxes is the source.
+        TypedExprNode::NominalCtor { payload, .. } => match &mut payload.node {
+            TypedExprNode::Apply { argument, function }
+                if matches!(&function.node, TypedExprNode::Builtin(Builtin::Box)) =>
+            {
+                mark_component_source(argument, realized);
+            }
+            _ => mark_component_source(payload, realized),
+        },
         _ => {}
     }
 }

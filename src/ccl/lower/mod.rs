@@ -103,6 +103,7 @@ mod functions;
 mod http;
 mod loops;
 mod module_syntax;
+mod nominal;
 mod sinks;
 mod stmts;
 #[cfg(any(test, feature = "test-helpers"))]
@@ -147,6 +148,9 @@ pub enum LoweringError {
         span: Span,
         /// Human-readable description of why the construct is unsupported.
         message: String,
+        /// Other positions the message names, each with its label: the first declaration
+        /// of a name declared twice.
+        related: Vec<(Span, &'static str)>,
     },
     /// A program the language accepts and the compiler cannot compile yet, refused here
     /// rather than left to fail in a later phase: a compiler gap to fix, not a mistake in
@@ -156,6 +160,8 @@ pub enum LoweringError {
         span: Span,
         /// What the compiler does not handle.
         message: String,
+        /// Other positions the message names, each with its label, as for `Unsupported`.
+        related: Vec<(Span, &'static str)>,
     },
 }
 
@@ -181,7 +187,17 @@ impl LoweringError {
         LoweringError::Unsupported {
             span,
             message: message.into(),
+            related: Vec::new(),
         }
+    }
+
+    /// This error with `span` labelled `label` beside its primary span.
+    pub fn with_related(mut self, span: Span, label: &'static str) -> Self {
+        match &mut self {
+            LoweringError::Unsupported { related, .. }
+            | LoweringError::Internal { related, .. } => related.push((span, label)),
+        }
+        self
     }
 
     /// Construct an `Internal` lowering error at the given span.
@@ -189,6 +205,7 @@ impl LoweringError {
         LoweringError::Internal {
             span,
             message: message.into(),
+            related: Vec::new(),
         }
     }
 
@@ -196,6 +213,14 @@ impl LoweringError {
     pub fn span(&self) -> Span {
         match self {
             LoweringError::Unsupported { span, .. } | LoweringError::Internal { span, .. } => *span,
+        }
+    }
+
+    /// The other positions the error names, each with its label.
+    pub fn related(&self) -> &[(Span, &'static str)] {
+        match self {
+            LoweringError::Unsupported { related, .. }
+            | LoweringError::Internal { related, .. } => related,
         }
     }
 }
@@ -402,6 +427,12 @@ pub struct LoweringContext {
     /// same-named alias in the body is an error rather than a shadow
     /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
     pub(super) type_params_in_scope: Vec<String>,
+
+    /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
+    /// nominal type"). Unlike an alias, a nominal type survives lowering as a
+    /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
+    /// snapshotted.
+    pub(super) nominal_types: Vec<Rc<crate::ccl::nominal::NominalDecl>>,
 
     /// Shadow-depth counter keyed by surface spelling: how many enclosing local
     /// binders — loop targets, comprehension generators, lambda/`def` params —
@@ -797,6 +828,11 @@ impl LoweringContext {
         self.type_aliases.get(name)
     }
 
+    /// The nominal type the module declares under `name`.
+    pub(super) fn nominal_type(&self, name: &str) -> Option<Rc<crate::ccl::nominal::NominalDecl>> {
+        self.nominal_types.iter().find(|d| d.name == name).cloned()
+    }
+
     /// Whether `name` is a type parameter of a definition being lowered.
     pub(super) fn is_type_param(&self, name: &str) -> bool {
         self.type_params_in_scope.iter().any(|n| n == name)
@@ -974,9 +1010,7 @@ fn lower_expr_inner(
             }
             Ok(Expr::var(name.to_string()))
         }
-        ChlExpr::Qualified(_) => {
-            unreachable!("a qualified name is refused before lowering (`refuse_module_syntax`)")
-        }
+        ChlExpr::Qualified(q) => nominal::lower_member(q, expr.span, ctx),
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
         ChlExpr::Compare {
             left,

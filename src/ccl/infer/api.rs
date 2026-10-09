@@ -1566,7 +1566,7 @@ fn collect_expr_errors(
             );
             expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
         }
-        TypedExprNode::VariantCtor { payload, .. } => {
+        TypedExprNode::VariantCtor { payload, .. } | TypedExprNode::NominalCtor { payload, .. } => {
             collect_expr_errors(payload, strictness, errors, seen_refinements);
         }
         // `Case` carries per-branch pattern bindings on `TypedBinding`
@@ -1708,6 +1708,10 @@ fn collect_type_errors(
             )));
             return;
         }
+        // A nominal type is concrete, and stays to operator conversion
+        // (`src/ccl/design/nominal-types.md`, "After inference"). Its arguments are
+        // walked below.
+        Type::Nominal(..) | Type::Split { .. } => {}
         Type::Fun { fun_kind, .. } => {
             // Coalesce resolves every kind var to a concrete `Data`/`Compute`
             // (`FunKind::resolved`); a surviving `FunKind::Var` is a missed resolution

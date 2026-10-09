@@ -235,6 +235,10 @@ fn undetermined_witness(ty: &Type) -> bool {
 /// argument stands where the application stands, and an annotation naming a described kind lands
 /// on the application while the introduction states the single candidate the value is.
 ///
+/// A constructor's payload is handed the parameter type its declaration states at the node's
+/// arguments, since no type slot in the tree states it. `type Bag(T) = List(T)` declares a
+/// described sum there, which the payload's `box` enters and which only the position says.
+///
 /// `emit_case` merges its branches the same way and needs no arm: realization consumes a
 /// collection-valued `Case` before this walk reaches it. Every other position types its child by
 /// the child's own term.
@@ -252,6 +256,12 @@ fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
         }
         TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => Some(effective.clone()),
         TypedExprNode::List(_) => effective.codomain(),
+        TypedExprNode::NominalCtor { decl, ctor, .. } => match effective.peel_refinements() {
+            Type::Nominal(applied, args) if applied == decl => decl.ctor(ctor).map(|c| {
+                crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&c.payload(), args))
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }

@@ -984,6 +984,66 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
     );
 }
 
+/// A variable holding a nominal value does not carry over a reload yet. A renamed type has
+/// the representation of the old one, so comparing extents would let the value through
+/// where the spec refuses it (`docs/chl-spec.md`, "Reloading a nominal type").
+#[test]
+fn a_reload_refuses_a_variable_of_a_nominal_type() {
+    let (reply, _) = stdin_across_reload(
+        indoc! {r#"
+            type Price = Int
+
+            n: Mut(Price) := Price::new(0)
+            for line in stdin():
+                n := Price::new(1)
+            n
+        "#},
+        indoc! {r#"
+            type Cost = Int
+
+            n: Mut(Cost) := Cost::new(0)
+            for line in stdin():
+                n := Cost::new(1)
+            n
+        "#},
+        "a",
+        "b",
+    );
+    assert!(
+        reply.contains("`n` holds a value of a nominal type"),
+        "the rejection should name the variable holding a nominal value: {reply}"
+    );
+}
+
+/// The refusal reads the running program's type too: a structural variant with the
+/// representation of the nominal type it replaces does not take the value over.
+#[test]
+fn a_reload_refuses_a_nominal_value_retyped_to_its_representation() {
+    let (reply, _) = stdin_across_reload(
+        indoc! {r#"
+            type Price = Int
+
+            n: Mut(Price) := Price::new(0)
+            for line in stdin():
+                n := Price::new(1)
+            n
+        "#},
+        indoc! {r#"
+            n: Mut({`new{Int}}) := `new(0)
+            for line in stdin():
+                n := `new(1)
+            n
+        "#},
+        "a",
+        "b",
+    );
+    assert!(
+        reply.contains("`n` holds a value of a nominal type"),
+        "the rejection should name the variable the running program holds at a nominal type: \
+         {reply}"
+    );
+}
+
 /// A version may add an endpoint, and serves it as soon as the swap completes.
 ///
 /// The endpoint set is not frozen: a route the registry already holds is bound

@@ -231,6 +231,27 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
 
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+        } => {
+            // `emit_nominal_ctor` checks the payload against the parameter type with its
+            // refinements stripped, because the function's parameter annotation discharged
+            // them; a node built anywhere else would have its refinements never discharged.
+            // Inference meets the node as lowering built it; the post-inference check meets
+            // it after inlining has substituted the argument, which is already checked.
+            debug_assert!(
+                matches!(&payload.node, TypedExprNode::Var(n) if n.base() == "__ctor_arg")
+                    || matches!(&payload.node, TypedExprNode::Lit(crate::ccl::Lit::Unit)),
+                "a NominalCtor is built only as its constructor function's body or as a \
+                 nullary constructor's value; anywhere else its refinements are never \
+                 discharged, got payload {}",
+                symbolic(payload)
+            );
+            emit_nominal_ctor(decl, ctor, payload, ctx)?
+        }
+
         TypedExprNode::Source(name) => match ctx.sources.get(name) {
             Some(t) => t.clone(),
             None => return Err(ctx.raise(InferError::UnboundVariable(name.to_string()))),
@@ -508,11 +529,15 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             emit_annotation_predicates(d, ctx)?;
             emit_annotation_predicates(c, ctx)
         }
-        Type::Tuple(ts) => {
+        Type::Tuple(ts) | Type::Nominal(_, ts) => {
             for t in ts.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
             Ok(())
+        }
+        Type::Split { input, output } => {
+            emit_annotation_predicates(input, ctx)?;
+            emit_annotation_predicates(output, ctx)
         }
         Type::DepTuple(cs) => {
             for (_, t) in cs.iter_mut() {
@@ -2526,6 +2551,38 @@ pub(super) fn emit_variant_ctor<C: Typing>(
     let mut tags = BTreeMap::new();
     tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
     Ok(variant_type(tags))
+}
+
+/// The constructor `ctor` of the nominal type `decl` builds `decl` applied to fresh
+/// arguments, with the payload below the constructor's parameter type at those arguments
+/// (`src/ccl/design/nominal-types.md`, "The constructor rule").
+///
+/// The parameter type is compared with its refinements stripped. The node is only the
+/// body of the function its declaration lowers to, whose annotation states the parameter
+/// type in full, or a constructor that declares no parameters, so each call discharges the
+/// refinements where it applies that function ([`TypedExprNode::NominalCtor`]).
+pub(super) fn emit_nominal_ctor<C: Typing>(
+    decl: &std::rc::Rc<crate::ccl::nominal::NominalDecl>,
+    ctor: &str,
+    payload: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let payload_ty = emit_value_read(payload, ctx)?;
+    let declared = decl.ctor(ctor).unwrap_or_else(|| {
+        panic!(
+            "`{}` declares no constructor `{ctor}`; lowering builds a nominal constructor \
+             only from the declaration",
+            decl.name
+        )
+    });
+    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
+    let expected =
+        crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&declared.payload(), &args));
+    let expected = ctx.normalize(&expected);
+    ctx.require_sub(&payload_ty, &expected, &|| {
+        format!("the argument of constructor `{}::{ctor}`", decl.name)
+    })?;
+    Ok(Type::Nominal(decl.clone(), args))
 }
 
 /// What [`compose_chain`] reports back about the chain it walked: the head

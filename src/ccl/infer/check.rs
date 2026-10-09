@@ -22,8 +22,8 @@ use crate::ccl::{
 use super::emit::{
     emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast, emit_compose,
     emit_copair, emit_disjoint_join, emit_expr_stmt, emit_for, emit_lambda, emit_let, emit_letrec,
-    emit_list, emit_mut_decl, emit_proj, emit_record, emit_transact, emit_tuple, emit_unary,
-    emit_variant_ctor,
+    emit_list, emit_mut_decl, emit_nominal_ctor, emit_proj, emit_record, emit_transact, emit_tuple,
+    emit_unary, emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::{LetScheme, Typing, escaped_opaque_binders};
@@ -866,6 +866,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
 
         TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
+
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+        } => emit_nominal_ctor(decl, ctor, payload, ctx)?,
 
         TypedExprNode::Compose(elts) => emit_compose(elts, &recorded_ty, ctx)?,
 

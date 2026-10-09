@@ -1327,6 +1327,27 @@ pub enum Type {
     ///
     /// See `src/ccl/design/type-parameters.md`.
     Poly(Rc<PolyType>),
+    /// A **nominal type** applied to its type arguments: `Shape`, `Option(Int)`
+    /// (`docs/chl-spec.md`, "6.8 Nominal types and methods \[Decided\]").
+    ///
+    /// Related only to another application of the same declaration, argument by argument
+    /// as each parameter's [`Variance`](crate::ccl::nominal::Variance) requires. The
+    /// arguments are its children; the declaration is an identity, so a walk does not
+    /// enter its constructors.
+    ///
+    /// **Concrete**, and kept to operator conversion: a pass that reads a value's shape reads
+    /// it through [`Type::structure`], which answers the representation.
+    Nominal(Rc<crate::ccl::nominal::NominalDecl>, Vec<Type>),
+    /// The argument of a [`Bipolar`](crate::ccl::nominal::Variance::Bipolar) parameter of a
+    /// [`Type::Nominal`] whose two sides differ: the **input**, which the parameter's
+    /// negative occurrences read, and the **output**, which its positive ones read
+    /// (`src/ccl/design/nominal-types.md`, "Variance").
+    ///
+    /// Stands only there. An argument that is any other type is both sides at once, which
+    /// is every argument a program writes and every value a constructor builds; a join of
+    /// two values is what makes the sides differ, `Cell(Int@1)` and `Cell(Int@2)` joining
+    /// to the input both accept and the output `Int`.
+    Split { input: Box<Type>, output: Box<Type> },
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
 }
@@ -2411,6 +2432,15 @@ fn fmt_type(
         Type::DataSource(name) => write!(f, "source({name})"),
         Type::ChanDom(name, _) => write!(f, "chan({name})"),
         Type::Param(param) => write!(f, "{}", param.spelling),
+        Type::Nominal(decl, args) if args.is_empty() => write!(f, "{}", decl.name),
+        Type::Nominal(decl, args) => {
+            let args: Vec<String> = args.iter().map(|t| at(t, binders).to_string()).collect();
+            write!(f, "{}({})", decl.name, args.join(", "))
+        }
+        // No program writes one, so it has no CHL spelling; this names both sides.
+        Type::Split { input, output } => {
+            write!(f, "in {} out {}", at(input, binders), at(output, binders))
+        }
         // The spec's notation, `forall (T, U <: B) V`.
         Type::Poly(poly) => {
             let params: Vec<String> = poly
@@ -3019,6 +3049,29 @@ impl Type {
         found
     }
 
+    /// The type whose shape this one has: a nominal type's
+    /// [`representation`](crate::ccl::nominal::NominalDecl::representation), and every other
+    /// type itself.
+    ///
+    /// A nominal type keeps its name to operator conversion, so a pass that reads a value's
+    /// shape, rather than relating its type, reads it through this
+    /// (`src/ccl/design/nominal-types.md`, "After inference"). Only the head is replaced:
+    /// a nominal type inside the representation is read through again where a walk reaches
+    /// it.
+    pub fn structure(&self) -> Cow<'_, Type> {
+        match self {
+            Type::Nominal(decl, args) => Cow::Owned(decl.representation(args)),
+            _ => Cow::Borrowed(self),
+        }
+    }
+
+    /// Whether a [`Type::Nominal`] occurs anywhere in this type.
+    pub fn mentions_nominal(&self) -> bool {
+        let mut found = matches!(self, Type::Nominal(..));
+        self.walk_children(|child| found |= child.mentions_nominal());
+        found
+    }
+
     pub fn peel_refinements(&self) -> &Type {
         match self {
             // One layer suffices: `Type::refined` flattens, so a refinement's
@@ -3448,6 +3501,14 @@ impl Type {
                 *history_kind,
             ),
             Type::Poly(poly) => Type::Poly(Rc::new(poly.map_types(Type::without_pi_names))),
+            Type::Nominal(decl, args) => Type::Nominal(
+                decl.clone(),
+                args.iter().map(Type::without_pi_names).collect(),
+            ),
+            Type::Split { input, output } => Type::Split {
+                input: Box::new(input.without_pi_names()),
+                output: Box::new(output.without_pi_names()),
+            },
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -3553,6 +3614,11 @@ impl Type {
             // A `Poly`'s bounds are its children as its body is: a pass that rewrites
             // types (uniquify's α-renaming, `subst`) must reach a refinement in a bound.
             Type::Poly(poly) => poly.types().for_each(f),
+            Type::Nominal(_, args) => args.iter().for_each(f),
+            Type::Split { input, output } => {
+                f(input);
+                f(output);
+            }
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.
@@ -3617,6 +3683,11 @@ impl Type {
             | Type::Param(_)
             | Type::Txn => {}
             Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
+            Type::Nominal(_, args) => args.iter_mut().for_each(f),
+            Type::Split { input, output } => {
+                f(input);
+                f(output);
+            }
             // A bounded annotation's bound is an ordinary child type — a pass
             // that rewrites types (uniquify's α-renaming, `subst`) must reach
             // inside it exactly as it reaches inside a `Refinement`.
@@ -4159,6 +4230,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::List(_)
         | N::Case { .. }
         | N::VariantCtor { .. }
+        | N::NominalCtor { .. }
         | N::For { .. }
         | N::MutDecl { .. }
         | N::MutWrite { .. }
@@ -4402,6 +4474,18 @@ fn eq_term_modulo_ty_slots_go(
                 payload: p2,
             },
         ) => t1 == t2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
+        (
+            N::NominalCtor {
+                decl: d1,
+                ctor: c1,
+                payload: p1,
+            },
+            N::NominalCtor {
+                decl: d2,
+                ctor: c2,
+                payload: p2,
+            },
+        ) => d1 == d2 && c1 == c2 && eq_term_modulo_ty_slots_go(p1, p2, pairs),
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
                 && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
@@ -4508,6 +4592,10 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
         TypedExprNode::UnaryOp(kind, _) => kind.hash(state),
         TypedExprNode::Aggregate { kind, .. } => kind.hash(state),
         TypedExprNode::VariantCtor { tag, .. } => tag.hash(state),
+        TypedExprNode::NominalCtor { decl, ctor, .. } => {
+            decl.hash(state);
+            ctor.hash(state);
+        }
         TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
         TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),
         _ => {}

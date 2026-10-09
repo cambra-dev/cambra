@@ -496,6 +496,19 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             Precedence::Atom,
             format!("`{tag}({})", fmt(payload, Precedence::Lowest, opts)),
         ),
+        // A nominal constructor keeps its type's name, as the source spells it.
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+        } => (
+            Precedence::Atom,
+            format!(
+                "{}::{ctor}({})",
+                decl.name,
+                fmt(payload, Precedence::Lowest, opts)
+            ),
+        ),
 
         // `transact (k = init, …) { [reads]⇒[writes] over <source> do <body>;
         // … }` — the shared keys with their seeds, then one writer clause per

@@ -77,6 +77,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         List(_) => "List".to_string(),
         Case { .. } => "Case".to_string(),
         VariantCtor { tag, .. } => format!("VariantCtor(.{tag})"),
+        NominalCtor { decl, ctor, .. } => format!("NominalCtor({}::{ctor})", decl.name),
         LoadFrom(n) => format!("LoadFrom({n})"),
         Realize(_) => "Realize".to_string(),
         Transact { .. } => "Transact".to_string(),

@@ -455,6 +455,13 @@ fn state_refusal(conflicts: &[StateConflict]) -> ReloadError {
              `@LoadFrom` can say which one it reads."
         } else if unseatable
             .iter()
+            .any(|c| matches!(c, StateConflict::NominalState { .. }))
+        {
+            "\nA reload does not yet compare a nominal type's declaration with its \
+             predecessor's, so it refuses every variable whose type mentions one, an \
+             unchanged declaration included."
+        } else if unseatable
+            .iter()
             .any(|c| matches!(c, StateConflict::LoadFromAt { .. }))
         {
             // The declaration's annotation is what the value is read

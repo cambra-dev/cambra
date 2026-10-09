@@ -246,6 +246,7 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `BinOp`, `UnaryOp` | Typed scalar operations with expression operands. |
 | `Tuple`, `Record`, `List` | Positional product, named product, and source list construction. Elements may be expressions. |
 | `VariantCtor` | Tag and payload construction, dual to a `Case` pattern. |
+| `NominalCtor` | A nominal type's constructor applied to its payload, typed by the declaration rather than as a variant ([nominal-types.md](nominal-types.md#constructors)). |
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
 | `Compose` | Function composition in application order, built by lowering and lambda elimination. |
 | `ExprStmt` | Statement expression followed by its continuation. |
