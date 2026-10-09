@@ -76,7 +76,7 @@ pub enum Token {
     Forall,
     #[token("requires", priority = 3)]
     Requires,
-    // The module keywords (`docs/chl-spec.md`, "9. Modules [Decided]").
+    // The module keywords (`docs/chl-spec.md`, "9. Modules").
     #[token("import", priority = 3)]
     Import,
     #[token("use", priority = 3)]

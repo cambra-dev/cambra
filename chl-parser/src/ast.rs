@@ -33,7 +33,7 @@ pub use super::source_map::FileId;
 // index and byte offsets, exactly what the `/api/snapshot` schema specifies.
 // The field names are already lowercase single words, so no `rename_all` is
 // needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Span {
     pub file: FileId,
     pub start: usize,
