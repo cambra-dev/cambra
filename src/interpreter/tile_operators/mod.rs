@@ -508,7 +508,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                     let positions = store_decided_positions(decided, 0);
                     let names: Vec<SmolStr> = one.store_keys().cloned().collect();
                     for name in names {
-                        let key = store_key(&name);
+                        let key = store_key(&crate::ccl::Label::from_runtime_key(&name));
                         // A store waiting for its seed has none yet; once it has one it
                         // keeps it.
                         let seed = store_seed_value(&one, &key);
@@ -1233,7 +1233,10 @@ pub(crate) mod test_helpers {
         );
         let mut engine = CommitEngine::unopened();
         let step = |engine: &mut CommitEngine, p: u64| {
-            let writes = HashMap::from([(store_key("acc"), Value::Int(p as i64))]);
+            let writes = HashMap::from([(
+                store_key(&crate::ccl::Label::new("acc")),
+                Value::Int(p as i64),
+            )]);
             engine.step(Position::new(Value::UInt(p)), Some(writes));
             engine.render_full_store_tile(&tiling)
         };

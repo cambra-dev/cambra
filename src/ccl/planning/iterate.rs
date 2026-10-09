@@ -1413,13 +1413,13 @@ mod tests {
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("expected Record, got: {}", symbolic(&expr));
         };
-        let xs = &fields.iter().find(|(n, _)| n == "xs").unwrap().1;
+        let xs = &fields.iter().find(|(n, _)| n.name() == "xs").unwrap().1;
         assert!(
             is_iterate_apply(chain_head(xs)),
             "the collection field `xs` is a site: {}",
             symbolic(xs)
         );
-        let n = &fields.iter().find(|(n, _)| n == "n").unwrap().1;
+        let n = &fields.iter().find(|(n, _)| n.name() == "n").unwrap().1;
         assert!(
             matches!(n.node, TypedExprNode::Lit(_)),
             "the scalar field `n` is untouched: {}",

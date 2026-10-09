@@ -53,7 +53,7 @@ use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
-use crate::ccl::F_WRITES;
+use crate::ccl::{F_WRITES, Label};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
     Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue, shared_consumer,
@@ -683,7 +683,7 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
         engines
             .iter()
             .flat_map(|(_, e)| e.changes.keys().chain(e.seed.keys()))
-            .all(|key| { store_key_name(key).is_some_and(|name| logs.contains_key(name)) }),
+            .all(|key| { store_key_name(key).is_some_and(|name| logs.contains_key(&name)) }),
         "a write or seed names a key outside the store's declared key space, so \
          rendering would drop it: declared {:?}",
         logs.keys().collect::<Vec<_>>(),
@@ -709,7 +709,7 @@ fn store_tile(engines: &[(Vec<Value>, &CommitEngine)], tiling: &Tiling, terminal
             let Tiling::DataFunction { codomain, .. } = log else {
                 unreachable!("a store key's changelog tiling is a collection")
             };
-            let runtime = store_key(&key);
+            let runtime = store_key(&Label::from_runtime_key(&key));
             let mut starts = Vec::with_capacity(engines.len());
             let mut positions: Vec<Value> = Vec::new();
             let mut written: Vec<Value> = Vec::new();
@@ -1090,7 +1090,7 @@ pub fn store_value_at(tile: &Tile, t: &Position, key: &Value) -> Option<Value> {
 /// store, `key` is outside its key space, or the key has no value until its first
 /// change (a collection-valued one, whose log starts empty).
 pub fn store_seed_value(tile: &Tile, key: &Value) -> Option<Value> {
-    Some(tile.store_seed(store_key_name(key)?)?.index_at(0))
+    Some(tile.store_seed(&store_key_name(key)?)?.index_at(0))
 }
 
 /// `key`'s value written **at exactly** tick `t` — the delta at tick `t` if it
@@ -1219,7 +1219,7 @@ pub fn fold_changelog_key_ascending(
 pub fn store_snapshot_at(tile: &Tile, t: &Position) -> HashMap<Value, Value> {
     tile.store_keys()
         .filter_map(|name| {
-            let key = store_key(name);
+            let key = store_key(&Label::from_runtime_key(name));
             Some((key.clone(), store_value_at(tile, t, &key)?))
         })
         .collect()
@@ -1661,7 +1661,7 @@ pub fn commit_clock_domain() -> Extent {
 /// the values written there. `None` for a tile that is not a store, for a value that is
 /// not a store key, and for a key outside this store's key space.
 fn changelog<'a>(tile: &'a Tile, key: &Value) -> Option<(&'a ColumnValue, &'a Tile)> {
-    tile.store_changelog(store_key_name(key)?)
+    tile.store_changelog(&store_key_name(key)?)
 }
 
 /// The value a changelog holds at index `i`.
@@ -1695,7 +1695,7 @@ pub fn proposal_stream_tiling(key_extent: &Extent, value_extent: &Extent) -> Til
                 Tiling::Scalar(Extent::Base(BaseType::UInt)),
             ),
             (SmolStr::from(F_READS), Tiling::Scalar(map.clone())),
-            (SmolStr::from(F_WRITES), Tiling::Scalar(map)),
+            (F_WRITES.runtime_key(), Tiling::Scalar(map)),
         ])),
     )
 }
@@ -2100,7 +2100,7 @@ impl CommitProducer {
             crate::interpreter::tile_operators::assert_no_absent_cells(&absent);
             let snaps = record_field(&fields, F_SNAP);
             let reads = record_field(&fields, F_READS);
-            let writes = record_field(&fields, F_WRITES);
+            let writes = record_field(&fields, &F_WRITES.runtime_key());
             // The proposal tile is an offset window: its domain carries the
             // absolute step values (the writer compacts its released prefix), so
             // read the step from the domain column and index the codomain by
@@ -6253,7 +6253,7 @@ fn decision_at_index(
     );
     let n_carry = write_keys.len() - tap_fields.len();
     let mut writes = Vec::with_capacity(write_keys.len());
-    match payload.get(F_WRITES)? {
+    match payload.get(&F_WRITES.runtime_key())? {
         Value::Record(writes_rec) => {
             debug_assert_eq!(
                 writes_rec.len(),
@@ -6268,7 +6268,7 @@ fn decision_at_index(
                 else {
                     return None;
                 };
-                writes.push(writes_rec.get(name.as_str())?.clone());
+                writes.push(writes_rec.get(&name.runtime_key())?.clone());
             }
         }
         // A read-only transaction's empty write set lowers to a unit value (not
@@ -6516,7 +6516,7 @@ impl TransactWriterProducer {
                     Tile::Scalar(ColumnValue::Variants(reads)),
                 ),
                 (
-                    SmolStr::from(F_WRITES),
+                    F_WRITES.runtime_key(),
                     Tile::Scalar(ColumnValue::Variants(writes)),
                 ),
             ]))),
@@ -6935,7 +6935,7 @@ mod tests {
     /// ([`store_key`](crate::interpreter::operator_conversion::store_key)), which is the
     /// shape `body_decision_at` reads the write set's names back from.
     fn acct(name: &str) -> Value {
-        store_key(name)
+        store_key(&Label::new(name))
     }
 
     /// Build a read/write set or initial state from `(account, balance)` pairs.
@@ -7339,7 +7339,7 @@ mod tests {
     /// the key the same way the CCL side does.
     fn commit_payload_extent(key: &str) -> Extent {
         Extent::Record(HashMap::from([(
-            SmolStr::from(F_WRITES),
+            F_WRITES.runtime_key(),
             Extent::Record(HashMap::from([(SmolStr::from(key), value_extent())])),
         )]))
     }
@@ -7349,8 +7349,8 @@ mod tests {
     /// are listed in is immaterial.
     fn decision_union_extent(payload: Extent) -> Extent {
         Extent::Union(TagMap::from_arms(vec![
-            (FieldKey::Name(V_COMMIT.into()), payload),
-            (FieldKey::Name(V_ABORT.into()), Extent::Base(BaseType::Unit)),
+            (FieldKey::Name(V_COMMIT), payload),
+            (FieldKey::Name(V_ABORT), Extent::Base(BaseType::Unit)),
         ]))
     }
 
@@ -7360,9 +7360,9 @@ mod tests {
     fn commit_value(key: &str, write: Value) -> Value {
         let writes_rec = Value::Record(HashMap::from([(SmolStr::from(key), write)]));
         Value::Union {
-            tag: FieldKey::Name(V_COMMIT.into()),
+            tag: FieldKey::Name(V_COMMIT),
             inner: Box::new(Value::Record(HashMap::from([(
-                SmolStr::from(F_WRITES),
+                F_WRITES.runtime_key(),
                 writes_rec,
             )]))),
         }
@@ -7371,7 +7371,7 @@ mod tests {
     /// A `` `abort `` decision value (a carry / no proposal).
     fn abort_value() -> Value {
         Value::Union {
-            tag: FieldKey::Name(V_ABORT.into()),
+            tag: FieldKey::Name(V_ABORT),
             inner: Box::new(Value::Unit),
         }
     }
@@ -8072,7 +8072,7 @@ mod tests {
         }
 
         const KEYS: u64 = 4;
-        let key = |i: usize| store_key(&format!("k{i}"));
+        let key = |i: usize| store_key(&Label::new(format!("k{i}")));
         let read_int = |m: &HashMap<Value, Value>, k: usize| match &m[&key(k)] {
             Value::Int(n) => *n,
             other => unreachable!("key holds an int, got {other:?}"),
@@ -8219,7 +8219,7 @@ mod tests {
 
     /// A store key's seed — its value before any change.
     fn seed_of(tile: &Tile, key: &str) -> Option<Value> {
-        store_seed_value(tile, &store_key(key))
+        store_seed_value(tile, &store_key(&Label::new(key)))
     }
 
     /// A store key's changelog as `(tick, value)` pairs.
@@ -8262,7 +8262,7 @@ mod tests {
         init.keys()
             .map(|k| {
                 let name = store_key_name(k).expect("an initial state is keyed by store keys");
-                (SmolStr::from(name), Tiling::Scalar(value_extent()))
+                (name, Tiling::Scalar(value_extent()))
             })
             .collect()
     }
@@ -8281,7 +8281,7 @@ mod tests {
         let seed: HashMap<Value, Value> = tile
             .store_keys()
             .filter_map(|name| {
-                let key = store_key(name);
+                let key = store_key(&Label::from_runtime_key(name));
                 Some((key.clone(), store_seed_value(tile, &key)?))
             })
             .collect();
@@ -8290,7 +8290,7 @@ mod tests {
                 let delta = tile
                     .store_keys()
                     .filter_map(|name| {
-                        let key = store_key(name);
+                        let key = store_key(&Label::from_runtime_key(name));
                         Some((key.clone(), store_delta_at(tile, &tick, &key)?))
                     })
                     .collect();
@@ -8854,7 +8854,7 @@ mod tests {
                     )),
                 ),
                 (
-                    SmolStr::from(F_WRITES),
+                    F_WRITES.runtime_key(),
                     Tile::Scalar(ColumnValue::Variants(
                         emitted.iter().map(|p| map_to_value(&p.2)).collect(),
                     )),

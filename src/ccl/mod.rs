@@ -44,6 +44,7 @@ pub mod uniquify;
 mod aggregate;
 mod expr;
 mod infer_var;
+mod label;
 mod ops;
 mod ty;
 
@@ -55,6 +56,7 @@ pub use names::{Name, PiRef};
 pub use aggregate::*;
 pub use expr::*;
 pub use infer_var::*;
+pub use label::Label;
 pub use ops::*;
 pub use ty::*;
 

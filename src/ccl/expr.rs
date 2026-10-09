@@ -4,8 +4,9 @@
 //! types.
 
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
 use smol_str::SmolStr;
+
+use crate::ccl::{AggregateKind, BinOpKind, Builtin, Label, Lit, Name, ProjKey, Type, UnaryOpKind};
 
 /// The `commit` tag of a writer **decision variant** —
 /// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
@@ -14,16 +15,16 @@ use smol_str::SmolStr;
 /// [`crate::ccl::ccl_utils::wrap_decision_variant`], and the runtime
 /// (`body_decision_at`) decodes the tag: `commit` proposes the payload's writes,
 /// `abort` denies (carry, no proposal).
-pub const V_COMMIT: &str = "commit";
+pub const V_COMMIT: Label = Label::fixed("commit");
 /// The `abort` tag of a writer **decision variant** — the nullary
 /// whole-transaction deny (nothing fired). See [`V_COMMIT`].
-pub const V_ABORT: &str = "abort";
+pub const V_ABORT: Label = Label::fixed("abort");
 /// The `writes` field of a [`WriterSite`] decision record — the proposed new
 /// values keyed by the mutable variable each is for (`writes.k` for the key
 /// spelled `k`, via [`Name::field_key`](crate::ccl::Name::field_key)). A slot
 /// therefore carries which variable it belongs to, which is what lets a second
 /// compilation of one program match a store's contents back to its declarations.
-pub const F_WRITES: &str = "writes";
+pub const F_WRITES: Label = Label::fixed("writes");
 // Tags of a **reply tap** on a decision record. A tap `__to_<defer>_k` has a value
 // exactly at the positions it fires, and its type says so: `` {`fired{𝑉} | `idle}
 // ``. A feed under one arm of cross-key routing fires on its own route only, so a
@@ -36,10 +37,10 @@ pub const F_WRITES: &str = "writes";
 // domain-restricting feed value (an arm's `variant_project`) cannot do — see
 // `feed_reading_payload_error` in `src/ccl/lower/loops.rs`.
 /// The tag of a tap that fired at this position, carrying the fed value.
-pub const V_FIRED: &str = "fired";
+pub const V_FIRED: Label = Label::fixed("fired");
 /// The tag of a tap that did not fire at this position. Nullary: a tap that did
 /// not fire has no value, which is what the gate it replaces only implied.
-pub const V_IDLE: &str = "idle";
+pub const V_IDLE: Label = Label::fixed("idle");
 
 // Field names of a **commit-record** binding — the intermediate representation
 // [`crate::ccl::transact_phase`] emits and [`crate::ccl::planning::plan_loops`]
@@ -52,15 +53,15 @@ pub const V_IDLE: &str = "idle";
 // reach recognition; `time` records the commit clock for the model's honesty.
 /// The `time` field of a commit-record binding — the transaction's commit time
 /// `begin(r)`, at which the writer's mutable variable snapshots are read.
-pub const F_TIME: &str = "time";
+pub const F_TIME: Label = Label::fixed("time");
 /// The `write_targets` field of a commit-record binding — a positional tuple of
 /// the write-set keys' history bindings (`write_targets.i` is the history of
 /// `write_keys[i]`), the encoding recognition reads a site's `write_keys` off.
-pub const F_WRITE_TARGETS: &str = "write_targets";
+pub const F_WRITE_TARGETS: Label = Label::fixed("write_targets");
 /// The `decision` field of a commit-record binding — the writer's verbatim
 /// `` {`commit{writes, __to_<defer>*} | `abort} `` decision variant, applied to the
 /// mutable variable snapshot at the commit time. Recognition lifts the writer body out of it.
-pub const F_DECISION: &str = "decision";
+pub const F_DECISION: Label = Label::fixed("decision");
 /// The `write` field of a **per-key commit view** — the single value a site's
 /// commit proposes for one mutable variable key (`decision ▷ variant_project(`commit) ▷
 /// .writes.k`, re-projected). A key's history binding searches the `⧺`-merged
@@ -68,7 +69,7 @@ pub const F_DECISION: &str = "decision";
 /// transaction (the ``variant_project(`commit)`` eliminator drops `` `abort ``
 /// positions), the exact record shape the design doc gives `get_prev_txn`'s
 /// history argument.
-pub const F_WRITE: &str = "write";
+pub const F_WRITE: Label = Label::fixed("write");
 
 /// Whether a binder's references may be discharged to its definiens.
 ///
@@ -454,8 +455,8 @@ pub enum TypedExprNode {
     /// is inferred from `payload`. Width-subtyping then lets the resulting
     /// singleton variant flow into any consumer expecting a superset of tags.
     VariantCtor {
-        /// Tag name; arbitrary identifier.
-        tag: String,
+        /// The tag.
+        tag: Label,
         /// Payload expression.
         payload: Box<TypedExpr>,
     },
@@ -474,7 +475,7 @@ pub enum TypedExprNode {
         /// The declaration whose constructor this is.
         decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
         /// The constructor's name.
-        ctor: String,
+        ctor: SmolStr,
         /// The constructor's payload ([`crate::ccl::nominal::NominalCtor::payload`]).
         payload: Box<TypedExpr>,
     },
@@ -695,7 +696,7 @@ pub enum TypedExprNode {
     ///
     /// Lowered from Python dict literals with bare identifier keys.
     /// Field access `r.field` lowers to `Apply(r, Proj(ProjKey::Field("field")))`.
-    Record(Vec<(SmolStr, TypedExpr)>),
+    Record(Vec<(Label, TypedExpr)>),
 
     /// A reference to an externally-registered data source, identified by name.
     ///
@@ -1527,7 +1528,7 @@ impl TypedExpr {
     /// Construct a first-class projection morphism node.
     ///
     /// `Proj(Field(f))` acts as the function `λ t → t.f`.
-    pub fn proj_field(field: impl Into<SmolStr>) -> Self {
+    pub fn proj_field(field: impl Into<Label>) -> Self {
         Self::new(TypedExprNode::Proj(ProjKey::Field(field.into())))
     }
 
@@ -1653,7 +1654,7 @@ impl TypedExpr {
     ///
     /// Produces a singleton variant value at the inference layer. Width-
     /// subtyping flows it into any consumer expecting a superset of tags.
-    pub fn variant_ctor(tag: impl Into<String>, payload: TypedExpr) -> Self {
+    pub fn variant_ctor(tag: impl Into<Label>, payload: TypedExpr) -> Self {
         Self::new(TypedExprNode::VariantCtor {
             tag: tag.into(),
             payload: Box::new(payload),
@@ -1664,7 +1665,7 @@ impl TypedExpr {
     /// `decl` with its constructor `ctor`.
     pub fn nominal_ctor(
         decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
-        ctor: impl Into<String>,
+        ctor: impl Into<SmolStr>,
         payload: TypedExpr,
     ) -> Self {
         Self::new(TypedExprNode::NominalCtor {
@@ -2448,12 +2449,12 @@ pub struct MethodCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PatternHead {
     /// `` `tag ``: a tag of a structural variant.
-    Tag(String),
+    Tag(Label),
     /// `N::c`: the constructor `ctor` of the nominal type `decl`. Every head of one `Case`
     /// names the same declaration, or none does.
     Constructor {
         decl: std::rc::Rc<crate::ccl::nominal::NominalDecl>,
-        ctor: String,
+        ctor: SmolStr,
     },
 }
 
@@ -2468,10 +2469,12 @@ impl std::fmt::Display for PatternHead {
 }
 
 impl PatternHead {
-    /// The tag a matching row carries: the tag itself, or the constructor's name.
-    pub fn tag(&self) -> &str {
+    /// The tag a matching row carries: the tag itself, or the constructor's
+    /// ([`crate::ccl::nominal::ctor_tag`]).
+    pub fn tag(&self) -> Label {
         match self {
-            PatternHead::Tag(tag) | PatternHead::Constructor { ctor: tag, .. } => tag,
+            PatternHead::Tag(tag) => tag.clone(),
+            PatternHead::Constructor { ctor, .. } => crate::ccl::nominal::ctor_tag(ctor),
         }
     }
 }
@@ -2505,7 +2508,7 @@ pub struct Pattern {
 
 impl Pattern {
     /// The tag a matching row carries ([`PatternHead::tag`]).
-    pub fn tag(&self) -> &str {
+    pub fn tag(&self) -> Label {
         self.head.tag()
     }
 }

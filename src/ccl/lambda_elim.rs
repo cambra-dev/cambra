@@ -40,7 +40,7 @@
 //! | `add`/`sub`/… (and compares / logic) | `Builtin(BinOp(op))` for `op: BinOpKind` | binary scalar ops |
 //! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |
 
-use smol_str::SmolStr;
+use crate::ccl::Label;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
@@ -821,7 +821,7 @@ fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
     let mut tags: Vec<(FieldKey, Type)> = branches
         .iter()
         .filter_map(|b| b.pattern.as_ref())
-        .map(|p| (FieldKey::Name(p.tag().into()), p.binding.ty.clone()))
+        .map(|p| (FieldKey::Name(p.tag()), p.binding.ty.clone()))
         .collect();
     // Join in the scrutinee's own tags. Without a default arm this adds nothing —
     // the scrutinee's tags are a subset of the arms' (`emit_case`'s `require_sub`).
@@ -908,7 +908,7 @@ fn build_scrutinee_case_cform(
             .pattern
             .expect("guarded: scrutinee-Case branches all bind a pattern");
         let payload_ty = pat.binding.ty.clone();
-        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag().into())))
+        let vp = Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag())))
             .with_ty(Type::fun(consumed.clone(), payload_ty.clone()));
         // eᵢ as a point-free morphism `Pᵢ ⇒ Vᵢ`, reading the projected payload.
         // `elim_lambda` abstracts the binder and leaves the walk to its caller.
@@ -1649,7 +1649,7 @@ fn elim_lambda_impl(
         // This keeps the same structural invariant: the Record node always has type
         // Record([..., Fun(D, Ti), ...]) and the Fun wrapper lives on the Apply/Zip node.
         TypedExprNode::Record(fields) => {
-            let elim_fields: Vec<(SmolStr, Expr)> = fields
+            let elim_fields: Vec<(Label, Expr)> = fields
                 .into_iter()
                 .map(|(k, e)| {
                     elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()).map(|r| (k, r))
@@ -1942,10 +1942,14 @@ fn elim_lambda_impl(
         //
         // A nominal constructor lowers the same way: its value is the union row of its
         // type's representation, tagged by the constructor's name.
-        TypedExprNode::VariantCtor { tag, payload }
-        | TypedExprNode::NominalCtor {
-            ctor: tag, payload, ..
-        } => {
+        ctor @ (TypedExprNode::VariantCtor { .. } | TypedExprNode::NominalCtor { .. }) => {
+            let (tag, payload) = match ctor {
+                TypedExprNode::VariantCtor { tag, payload } => (tag, payload),
+                TypedExprNode::NominalCtor { ctor, payload, .. } => {
+                    (crate::ccl::nominal::ctor_tag(&ctor), payload)
+                }
+                _ => unreachable!("matched as a constructor"),
+            };
             // `variant_wrap` carries the tag itself, so there is nothing to resolve
             // here and nothing to fail: the node's type need not have been
             // width-subtyped up to its consumer's tag set for the injection to be
@@ -1959,7 +1963,7 @@ fn elim_lambda_impl(
             // eᵢ  ⟹  point-free `param_ty ⇒ P_c`.
             let payload_pf = elim_lambda_kinded(ctx, param, param_ty, *payload, fun_kind.clone())?;
             // variant_wrap(c) : P_c ⇒ Union (the tag injection).
-            let vw = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(tag.as_str().into())))
+            let vw = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(tag.clone())))
                 .with_ty(Type::fun(payload_ty, body_ty.clone()));
             Ok(typed_compose(vec![payload_pf, vw]).with_ty(result_ty))
         }
@@ -2063,7 +2067,7 @@ fn elim_lambda_impl(
                 // empty restriction for a tag the value never carries, which is
                 // exactly what width subtyping means. Nothing to resolve, nothing
                 // to reject.
-                let tag_key = FieldKey::Name(pat.tag().into());
+                let tag_key = FieldKey::Name(pat.tag());
                 seen_tags.push(tag_key.clone());
                 let payload_ty = pat.binding.ty.clone();
                 let payload_name = pat.binding.name.clone();

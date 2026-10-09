@@ -18,7 +18,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::ccl_utils::strip_refinements;
 use crate::ccl::{
-    BaseType, FieldKey, FunKind, Type, TypeKind, TypeParam, TypeParamId, V_NONE, V_SOME,
+    BaseType, FieldKey, FunKind, Label, Type, TypeKind, TypeParam, TypeParamId, V_NONE, V_SOME,
 };
 
 /// The name the compiler-provided `Option` declaration binds.
@@ -47,12 +47,12 @@ fn option_declaration() -> Rc<NominalDecl> {
     );
     decl.define(vec![
         NominalCtor {
-            name: V_NONE.into(),
+            name: V_NONE.name().into(),
             span,
             params: Vec::new(),
         },
         NominalCtor {
-            name: V_SOME.into(),
+            name: V_SOME.name().into(),
             span,
             params: vec![(None, Type::Param(t))],
         },
@@ -73,6 +73,14 @@ fn option_declaration() -> Rc<NominalDecl> {
 /// and `option_values` in `tests/it/differential_interp.rs` checks that the two agree.
 pub fn option() -> Rc<NominalDecl> {
     OPTION_DECL.with(Rc::clone)
+}
+
+/// The tag a value built by the constructor `ctor` carries once nominal types erase: the
+/// constructor's name, as a label of the root's namespace whichever module declares the
+/// type. Construction, patterns and erasure all build it here, so they agree, and the
+/// runtime's checked lookup builds `Option`'s the same way ([`V_SOME`]).
+pub fn ctor_tag(ctor: &str) -> Label {
+    Label::new(ctor)
 }
 
 /// The compiler-provided declaration `name` names, if any.
@@ -373,7 +381,7 @@ impl NominalDecl {
             .iter()
             .map(|c| {
                 let payload = self.instantiate(&strip_refinements(&c.payload()), args);
-                (FieldKey::Name(c.name.clone()), payload)
+                (FieldKey::Name(ctor_tag(&c.name)), payload)
             })
             .collect();
         arms.sort_by(|(a, _), (b, _)| a.cmp(b));
