@@ -1727,9 +1727,13 @@ fn collect_type_errors(
         // A bounded annotation inference never normalized. Reported at every
         // strictness, exactly like `Hole`: both are lowering markers whose whole
         // contract is that inference consumes them.
-        Type::BoundedHole(_) => errors.push(InferError::UnresolvedBoundedHole {
-            at: context_sym.to_string(),
-        }),
+        // A surviving marker is reported once, not again for each type inside it.
+        Type::BoundedHole(_) => {
+            errors.push(InferError::UnresolvedBoundedHole {
+                at: context_sym.to_string(),
+            });
+            return;
+        }
         Type::Infer(var) => {
             // Pre-channelize, an induction accumulator's domain is still `Infer` (a
             // `Mut(V)` with no annotated domain — the unified phase resolves it
@@ -1760,9 +1764,13 @@ fn collect_type_errors(
             "type parameter `{}` survived inference at `{context_sym}`",
             param.spelling
         ))),
-        Type::Poly(_) => errors.push(InferError::Unsupported(format!(
-            "polymorphic type `{ty}` survived inference at `{context_sym}`"
-        ))),
+        // Reported once, like `BoundedHole`: its body and bounds are not walked.
+        Type::Poly(_) => {
+            errors.push(InferError::Unsupported(format!(
+                "polymorphic type `{ty}` survived inference at `{context_sym}`"
+            )));
+            return;
+        }
         Type::Fun { fun_kind, .. } => {
             // Coalesce resolves every kind var to a concrete `Data`/`Compute`
             // (`FunKind::resolved`); a surviving `FunKind::Var` is a missed resolution
@@ -1830,16 +1838,13 @@ fn collect_type_errors(
                 }
             }
         }
-        Type::Variant(..) | Type::WitnessRef(_) => {}
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
+        Type::Variant(..)
+        | Type::WitnessRef(_)
+        | Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn => {}
     }
-    // A surviving marker is reported once, not again for each type inside it.
-    if matches!(ty, Type::Poly(_) | Type::BoundedHole(_)) {
-        return;
-    }
-    // A function's children include its witness kinds' types (`Type::walk_children`): a
-    // candidate and a key bound's parameter are ordinary types that inference resolves like
-    // any other, so an unresolved one there is the same defect as in the domain.
     ty.walk_children(|c| collect_type_errors(c, context_sym, strictness, errors, seen_refinements));
 }
 
@@ -3976,7 +3981,15 @@ mod tests {
             Type::BoundedHole(Box::new(Type::Hole)),
             poly,
         ]));
-        assert_eq!(check_fully_typed(&expr).map_err(|e| e.len()), Err(2));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![
+                InferError::UnresolvedBoundedHole { at: "1".into() },
+                InferError::Unsupported(
+                    "polymorphic type `forall () _` survived inference at `1`".into()
+                ),
+            ])
+        );
     }
 
     /// A `Type::Hole` on the root node fails with `UnresolvedHole`.
