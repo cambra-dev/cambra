@@ -1763,12 +1763,7 @@ fn collect_type_errors(
         Type::Poly(_) => errors.push(InferError::Unsupported(format!(
             "polymorphic type `{ty}` survived inference at `{context_sym}`"
         ))),
-        Type::Fun {
-            domain,
-            codomain,
-            fun_kind,
-            ..
-        } => {
+        Type::Fun { fun_kind, .. } => {
             // Coalesce resolves every kind var to a concrete `Data`/`Compute`
             // (`FunKind::resolved`); a surviving `FunKind::Var` is a missed resolution
             // that would silently display `⇒` and behave as `Compute`. Catch it
@@ -1777,17 +1772,6 @@ fn collect_type_errors(
                 !matches!(fun_kind, crate::ccl::ty::FunKind::Var(_)),
                 "unresolved FunKind::Var survived coalesce at `{context_sym}`"
             );
-            // **A kind's children are types.** A candidate and a key bound's parameter are
-            // alike ordinary types that inference resolves like any other, so an unresolved
-            // one there is the same defect as in the domain.
-            // They are reachable only through the kind, which no other walk enters.
-            for w in fun_kind.witnesses() {
-                for t in w.types() {
-                    collect_type_errors(t, context_sym, strictness, errors, seen_refinements);
-                }
-            }
-            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
-            collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
         }
         // A product with no fields is `Unit` — the one empty-product type
         // (`docs/chl-spec.md`, "6.6 The empty product is unit"). `Type::tuple` /
@@ -1801,9 +1785,6 @@ fn collect_type_errors(
                 "empty Tuple type at `{context_sym}`: the empty product is Unit \
                  (build products with Type::tuple)"
             );
-            for elem in elems {
-                collect_type_errors(elem, context_sym, strictness, errors, seen_refinements);
-            }
         }
         Type::Record(fields) => {
             debug_assert!(
@@ -1811,20 +1792,8 @@ fn collect_type_errors(
                 "empty Record type at `{context_sym}`: the empty product is Unit \
                  (build products with Type::record)"
             );
-            for (_, ty) in fields {
-                collect_type_errors(ty, context_sym, strictness, errors, seen_refinements);
-            }
         }
-        Type::Variant(tags, _) => {
-            for (_, payload) in tags {
-                collect_type_errors(payload, context_sym, strictness, errors, seen_refinements);
-            }
-        }
-        Type::History {
-            value,
-            domain,
-            history_kind,
-        } => {
+        Type::History { history_kind, .. } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, an `Overwrite`
             // history by the unified phase (`transact_phase` / `mut_elim`).
@@ -1837,10 +1806,8 @@ fn collect_type_errors(
                     "{what} at `{context_sym}`"
                 )));
             }
-            collect_type_errors(value, context_sym, strictness, errors, seen_refinements);
-            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
         }
-        Type::Refinement(inner, refinements) => {
+        Type::Refinement(_, refinements) => {
             // Walk each predicate term only once: a predicate term shared by
             // `Rc` across occurrences (its own type slots can carry the same
             // refinement) is a DAG, so this dedups it. (Immutable predicates
@@ -1862,11 +1829,18 @@ fn collect_type_errors(
                     );
                 }
             }
-            collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
-        Type::WitnessRef(_) => {}
+        Type::Variant(..) | Type::WitnessRef(_) => {}
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
+    // A surviving marker is reported once, not again for each type inside it.
+    if matches!(ty, Type::Poly(_) | Type::BoundedHole(_)) {
+        return;
+    }
+    // A function's children include its witness kinds' types (`Type::walk_children`): a
+    // candidate and a key bound's parameter are ordinary types that inference resolves like
+    // any other, so an unresolved one there is the same defect as in the domain.
+    ty.walk_children(|c| collect_type_errors(c, context_sym, strictness, errors, seen_refinements));
 }
 
 /// Check that the types in a fully-annotated expression tree are semantically
@@ -3987,6 +3961,22 @@ mod tests {
             check_fully_typed(&expr),
             Err(vec![InferError::UnresolvedBoundedHole { at: "1".into() }])
         );
+    }
+
+    /// A `Poly` or `BoundedHole` survivor is reported once; the walk does not descend
+    /// into its body or bound, so a `Hole` there is not reported a second time.
+    #[test]
+    fn test_check_fully_typed_survivor_children_not_reported() {
+        let poly = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+            params: vec![],
+            requires: vec![],
+            body: Type::Hole,
+        }));
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::tuple(vec![
+            Type::BoundedHole(Box::new(Type::Hole)),
+            poly,
+        ]));
+        assert_eq!(check_fully_typed(&expr).map_err(|e| e.len()), Err(2));
     }
 
     /// A `Type::Hole` on the root node fails with `UnresolvedHole`.
