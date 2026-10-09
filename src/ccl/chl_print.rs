@@ -586,10 +586,9 @@ fn project<'a>(
     use crate::ccl::ProjKey;
     match (node, key) {
         (TypedExprNode::Tuple(elts), ProjKey::Index(i)) => elts.get(*i).map(|x| (x, depth)),
-        (TypedExprNode::Record(fields), ProjKey::Field(n)) => fields
-            .iter()
-            .find(|(k, _)| k.as_str() == n.as_str())
-            .map(|(_, x)| (x, depth)),
+        (TypedExprNode::Record(fields), ProjKey::Field(n)) => {
+            fields.iter().find(|(k, _)| k == n).map(|(_, x)| (x, depth))
+        }
         _ => None,
     }
 }

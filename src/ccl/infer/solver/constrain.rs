@@ -17,8 +17,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use smol_str::SmolStr;
-
 use crate::ccl::ccl_utils::discharge_transparent_lets;
 use crate::ccl::infer_var::Origin;
 use crate::ccl::subst::Subst;
@@ -690,7 +688,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
 /// would then depend on whether the two sides happened to be structurally
 /// identical.
 ///
-/// Nothing in `Type` enforces uniqueness — `Record(Vec<(SmolStr, Type)>)` admits
+/// Nothing in `Type` enforces uniqueness — `Record(Vec<(Label, Type)>)` admits
 /// duplicates and the builders merely happen not to produce them — so this is a
 /// real invariant that is not type-enforced, which is where a `debug_assert`
 /// earns its keep. `dup_key_record_trips_the_uniquely_keyed_invariant` pins that
@@ -1295,7 +1293,7 @@ fn constrain_go_impl(
                     Some((_, t0)) => constrain_go(t0, t1, sl, sr, cache, scope)?,
                     None => {
                         return Err(ConstrainError::MissingField {
-                            key: FieldKey::Name(SmolStr::from(name.as_str())),
+                            key: FieldKey::Name(name.clone()),
                             in_type: lhs.clone(),
                         });
                     }
@@ -2260,8 +2258,6 @@ mod tests {
     use crate::ccl::ty::FunKindVar;
     use std::rc::Rc;
 
-    use smol_str::SmolStr;
-
     use super::*;
     use crate::ccl::infer::solver::test_helpers::{record, refined, variant};
     use crate::ccl::infer::solver::{coalesce_compact, compact_type, fresh_var, fun, prim};
@@ -2838,7 +2834,7 @@ mod tests {
             .expect_err("[A, B] <: [A] should be rejected: B not in rhs");
         match err {
             ConstrainError::ExtraTag { tag, .. } => {
-                assert_eq!(tag, FieldKey::Name(SmolStr::from("B")))
+                assert_eq!(tag, FieldKey::Name("B".into()))
             }
             other => panic!("expected ExtraTag, got {other:?}"),
         }

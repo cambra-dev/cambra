@@ -1,6 +1,6 @@
 //! Miscellaneous utilities for working with CCL.
 
-use smol_str::SmolStr;
+use crate::ccl::Label;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use crate::ccl::{
 /// is the variant *tag* — so this constant is phase-internal plumbing, not part
 /// of the observable decision protocol (hence it lives here, beside the wrapper,
 /// rather than among the AST field constants in `expr.rs`).
-pub(crate) const COMMIT_SELECTOR: &str = "commit";
+pub(crate) const COMMIT_SELECTOR: Label = Label::fixed("commit");
 
 /// Disjoin control-flow `paths` into one boolean commit gate — the writer
 /// decision's `commit` field, true exactly where some path commits. Short-circuits
@@ -163,7 +163,7 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
             });
             continue;
         };
-        let tag = FieldKey::Name(pat.tag.clone().into());
+        let tag = FieldKey::Name(pat.tag.clone());
         let payload_ty = pat.binding.ty.clone();
         let mut guard = Expr::apply(
             scrut.clone(),
@@ -225,10 +225,10 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
 /// feed's fire path, so a feed-only committing position appends a change carrying
 /// the tap (the caller folds fires into `commit` before calling; see
 /// `transact_phase`'s `commit_paths` and `letrec_phase`'s widen).
-pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(SmolStr, Expr, Expr)]) -> Expr {
-    let mut fields: Vec<(SmolStr, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
-    fields.push((SmolStr::from(COMMIT_SELECTOR), commit.clone()));
-    fields.push((SmolStr::from(F_WRITES), writes));
+pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(Label, Expr, Expr)]) -> Expr {
+    let mut fields: Vec<(Label, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
+    fields.push((COMMIT_SELECTOR, commit.clone()));
+    fields.push((F_WRITES, writes));
     for (field, value, fire) in feeds {
         // Wrap unconditionally iff the fire path *is* the commit — a structural
         // test (no Boolean simplification). Such a tap fires at every position the
@@ -256,15 +256,15 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(SmolStr, Exp
 /// inject and `body_decision_at` decodes.
 pub fn tap_variant_ty(value_ty: Type) -> Type {
     Type::variant(vec![
-        (FieldKey::Name(V_FIRED.into()), value_ty),
-        (FieldKey::Name(V_IDLE.into()), Type::Base(BaseType::Unit)),
+        (FieldKey::Name(V_FIRED), value_ty),
+        (FieldKey::Name(V_IDLE), Type::Base(BaseType::Unit)),
     ])
 }
 
 /// `` `fired(value) `` — a tap carrying its fed value.
 pub fn tap_fired(value: Expr) -> Expr {
     let ty = tap_variant_ty(value.ty.clone());
-    let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_FIRED.into())))
+    let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_FIRED)))
         .with_ty(Type::fun(value.ty.clone(), ty.clone()));
     Expr::apply(value, wrap).with_ty(ty)
 }
@@ -273,7 +273,7 @@ pub fn tap_fired(value: Expr) -> Expr {
 /// positions carry.
 pub fn tap_idle(value_ty: Type) -> Expr {
     let ty = tap_variant_ty(value_ty);
-    let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_IDLE.into())))
+    let wrap = Expr::builtin(Builtin::VariantWrap(FieldKey::Name(V_IDLE)))
         .with_ty(Type::fun(Type::Base(BaseType::Unit), ty.clone()));
     Expr::apply(unit_expr(), wrap).with_ty(ty)
 }
@@ -321,8 +321,8 @@ fn tap_gated(fire: Expr, value: Expr) -> Expr {
 /// decodes.
 pub fn decision_variant_ty(payload_ty: Type) -> Type {
     Type::variant(vec![
-        (FieldKey::Name(V_COMMIT.into()), payload_ty),
-        (FieldKey::Name(V_ABORT.into()), Type::Base(BaseType::Unit)),
+        (FieldKey::Name(V_COMMIT), payload_ty),
+        (FieldKey::Name(V_ABORT), Type::Base(BaseType::Unit)),
     ])
 }
 
@@ -370,7 +370,7 @@ pub fn commit_project(decision_ty: &Type) -> Expr {
     // The projection names the tag, so a decision variant materialized in any arm
     // order reads the same — there is no position for the runtime decode to agree
     // with, and `commit_payload_ty` below finds the payload by the same name.
-    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_COMMIT.into()))).with_ty(Type::fun(
+    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_COMMIT))).with_ty(Type::fun(
         decision_ty.clone(),
         commit_payload_ty(decision_ty),
     ))
@@ -418,7 +418,7 @@ pub(crate) fn statement_tag_cases_to_guards(expr: Expr) -> Expr {
 /// collection, so the `` `fired `` payload need answer nowhere else.
 pub fn fired_project(value_ty: Type) -> Expr {
     let tap_ty = tap_variant_ty(value_ty.clone());
-    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_FIRED.into())))
+    Expr::builtin(Builtin::VariantProject(FieldKey::Name(V_FIRED)))
         .with_ty(Type::fun(tap_ty, value_ty))
 }
 
@@ -469,7 +469,7 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             // Split the `commit` selector out from the payload fields (everything
             // else — `writes` and the `__to_<defer>*` taps, in order).
             let mut commit: Option<Expr> = None;
-            let mut payload_fields: Vec<(SmolStr, Expr)> = Vec::with_capacity(fields.len());
+            let mut payload_fields: Vec<(Label, Expr)> = Vec::with_capacity(fields.len());
             for (k, v) in fields {
                 if k == COMMIT_SELECTOR {
                     commit = Some(v);

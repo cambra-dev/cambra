@@ -2,6 +2,7 @@
 // parents need specialized child types before resolving their own type.
 // See `src/ccl/design/type-inference.md`, "Coalesce ordering and read stability".
 
+use crate::ccl::Label;
 use crate::ccl::infer::api::RelatedPositions;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1095,7 +1096,7 @@ pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
 /// Checked here rather than inside the pin because it reads the scrutinee's resolved
 /// tags, and the pin precedes the scrutinee's walk.
 #[cfg(debug_assertions)]
-fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[String]) {
+fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[Label]) {
     let Some(Type::Variant(tags, _)) =
         scrutinee.map(|s| crate::ccl::ccl_utils::strip_refinements(&s.ty))
     else {
@@ -1105,7 +1106,7 @@ fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[S
         debug_assert!(
             !tags
                 .iter()
-                .any(|(k, _)| *k == crate::ccl::FieldKey::Name(tag.as_str().into())),
+                .any(|(k, _)| *k == crate::ccl::FieldKey::Name(tag.clone())),
             "Case arm `{tag} had no value reach its payload, but the scrutinee carries \
              that tag — the width rule should have constrained it from the scrutinee",
         );
@@ -1113,7 +1114,7 @@ fn assert_pinned_tags_are_unreachable(scrutinee: Option<&Expr>, pinned_tags: &[S
 }
 
 #[cfg(not(debug_assertions))]
-fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &[String]) {}
+fn assert_pinned_tags_are_unreachable(_scrutinee: Option<&Expr>, _pinned_tags: &[Label]) {}
 
 /// Whether a **value** has reached `ty` — as opposed to merely something
 /// determining what it must be.
@@ -1427,7 +1428,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // a parameter of the definition, and pinning it would decide a type no
             // use chose.
             let pin = !ctx.discarding || scrutinee.as_ref().is_some_and(|s| value_reaches(&s.ty));
-            let pinned_tags: Vec<String> = branches
+            let pinned_tags: Vec<Label> = branches
                 .iter()
                 .filter_map(|b| b.pattern.as_ref())
                 .filter(|p| pin && pin_unobservable_arm_payload(p))
@@ -3171,7 +3172,7 @@ mod tests {
         use crate::ccl::{Branch, Pattern, TypedBinding};
         let arm = |tag: &str, b: &str| Branch {
             pattern: Some(Pattern {
-                tag: tag.to_string(),
+                tag: tag.into(),
                 binding: TypedBinding {
                     name: b.into(),
                     ty: Type::Hole,
@@ -3232,7 +3233,7 @@ mod tests {
     fn specialization_domain_is_its_own_argument() {
         let variant_of = |t: Type| {
             Type::variant(vec![(
-                crate::ccl::FieldKey::Name(smol_str::SmolStr::new("a")),
+                crate::ccl::FieldKey::Name(smol_str::SmolStr::new("a").into()),
                 t,
             )])
         };

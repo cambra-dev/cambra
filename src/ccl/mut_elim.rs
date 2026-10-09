@@ -48,7 +48,7 @@
 //! the node entirely would mean teaching planning's iteration staging to find
 //! writer sources inside letrec bindings — deferred until something needs it.)
 
-use smol_str::SmolStr;
+use crate::ccl::Label;
 use std::collections::HashMap;
 
 use crate::ccl::{
@@ -1249,7 +1249,7 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
 /// routes it as an ordinary channel contribution.
 struct FeedSite {
     defer: Name,
-    field: SmolStr,
+    field: Label,
     value: Expr,
     /// The feed statement this tap is recorded against, so the view resolves to
     /// the `<<` the user wrote rather than to the enclosing loop.
@@ -1284,7 +1284,7 @@ fn writes_key_view(
     domain_ty: &Type,
     writes_ty: &Type,
     decision_ty: &Type,
-    acc: &str,
+    acc: &Label,
     vty: &Type,
 ) -> Expr {
     let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
@@ -1316,13 +1316,13 @@ fn hist_field_view(
     h: &Name,
     hist_ty: &Type,
     domain_ty: &Type,
-    field: &str,
+    field: &Label,
     field_ty: &Type,
     decision_ty: &Type,
 ) -> Expr {
     let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
     let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
-    let mut proj = Expr::proj_field(field);
+    let mut proj = Expr::proj_field(field.clone());
     proj.ty = Type::fun(payload_ty, field_ty.clone());
     let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), vp, proj]);
     comp.ty = Type::fun_like(hist_ty, domain_ty.clone(), field_ty.clone());
@@ -1720,8 +1720,15 @@ pub(crate) fn fold_induction_loop(
     // the history is a causal reference (see `check_letrec_causal`); the defaults
     // are the accumulators' pre-loop bindings, under the same labels as the write
     // set they default.
-    let writes_view = hist_field_view(&h, &hist_ty, &domain_ty, F_WRITES, &writes_ty, &decision_ty);
-    let seeds: Vec<(SmolStr, Expr)> = accs
+    let writes_view = hist_field_view(
+        &h,
+        &hist_ty,
+        &domain_ty,
+        &F_WRITES,
+        &writes_ty,
+        &decision_ty,
+    );
+    let seeds: Vec<(Label, Expr)> = accs
         .iter()
         .map(|a| {
             let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
@@ -2967,12 +2974,12 @@ fn decision_record(commit: Expr, write_elts: Vec<Expr>, writes_ty: &Type) -> Exp
     ));
     writes.ty = writes_ty.clone();
     let mut rec = Expr::new(TypedExprNode::Record(vec![
-        (SmolStr::from(COMMIT_SELECTOR), commit),
-        (SmolStr::from(F_WRITES), writes),
+        (COMMIT_SELECTOR, commit),
+        (F_WRITES, writes),
     ]));
     rec.ty = Type::Record(vec![
-        (SmolStr::from(COMMIT_SELECTOR), Type::Base(BaseType::Bool)),
-        (SmolStr::from(F_WRITES), writes_ty.clone()),
+        (COMMIT_SELECTOR, Type::Base(BaseType::Bool)),
+        (F_WRITES, writes_ty.clone()),
     ]);
     rec
 }
@@ -3070,7 +3077,7 @@ fn attach_feed_fields(decision: Expr, feeds: &[FeedSite]) -> Expr {
                 false,
                 &bool_ty,
             );
-            let feed_tuples: Vec<(SmolStr, Expr, Expr)> = feeds
+            let feed_tuples: Vec<(Label, Expr, Expr)> = feeds
                 .iter()
                 .map(|f| (f.field.clone(), f.value.clone(), f.fire.clone()))
                 .collect();

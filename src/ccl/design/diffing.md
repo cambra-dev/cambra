@@ -219,7 +219,8 @@ must not use these fingerprints as a complete comparison of unresolved inference
 ### A name rendered into a string is past the point uid-robustness applies
 
 Hashing can ignore a `Name`'s uid only while the value is represented as a name. A record label or
-projection key is a string; its bytes participate in the hash without name normalization.
+projection key is a `Label`, whose spelling and module participate in the hash without name
+normalization.
 
 `Name::field_key` therefore uses the base spelling for mutable-variable record fields. A
 `Transact` consumer resolves those labels in its own `keys_map`, so labels need to be unique

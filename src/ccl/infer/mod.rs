@@ -78,7 +78,7 @@ pub(super) fn product(fields: BTreeMap<FieldKey, Type>) -> Type {
             fields
                 .into_iter()
                 .map(|(k, t)| match k {
-                    FieldKey::Name(n) => (n.clone(), t),
+                    FieldKey::Name(n) => (n, t),
                     _ => unreachable!(),
                 })
                 .collect(),
