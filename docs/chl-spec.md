@@ -2708,19 +2708,19 @@ The rules, and what each one is doing:
   reserved without being writable as annotations at all — the unit type is
   written `{}` (§6.6) and `Txn` is read only in a `Mut(V, Txn)` second slot.
 - **An alias is block-scoped** (§5), and each block declares a given name once.
-  An alias in an inner block shadows a same-named outer one for that block, and
-  the outer one is back at the end of it.
-- **The name is in scope throughout its block.** An annotation above the alias
-  statement reads it, unlike a value binding (§3.2): a type is not evaluated, so
-  there is no order for it to respect.
-- **A right-hand side names only the aliases above it.** `Loop = Loop` and a
-  chain naming an alias declared below it are unresolved names. A recursive
-  alias is therefore unwritable; §4.3 exempts recursive types from the `rec`
-  marker, but what one would denote is unworked.
+  An alias in an inner block shadows a same-named outer one from its statement
+  to the end of that block, and the outer one is back after it.
+- **The name is in scope from its statement to the end of its block**, as a
+  value binding's is (§3.2). An annotation above the statement does not read it,
+  and neither does the right-hand side, so `Loop = Loop` and a chain naming an
+  alias declared below it are unresolved names. A recursive alias is therefore
+  unwritable; §4.3 exempts recursive types from the `rec` marker, but what one
+  would denote is unworked.
 
-An alias is erased at lowering, where each use is replaced by the type the name
-was declared with. A program written with an alias and the same program with the
-alias expanded lower to the same CCL, so no later phase knows the name.
+An alias is erased before type checking. Each use stands for the type the name
+was declared with, and a predicate in that type reads the bindings its
+declaration sees, so a local below the alias spelled like one of them does not
+change what the alias means. No later phase knows the name.
 
 **[Open]** — whether an alias may be **parameterised** (`Pair(T) = {T, T}`),
 which is the difference between naming a type and naming a type constructor. A
@@ -3929,8 +3929,7 @@ Module type. `::` separates the name from the member, and `.` stays record proje
   module spelled like one of them is an error. `m::f` names a module, so a value binder spelled `m`
   would give one spelling two meanings in one scope.
 - Import names and run names are in scope throughout their module, including above the statement.
-  They are static facts rather than evaluations, so no order constrains them. Type aliases follow
-  the same rule ([6.7 Type-alias statements](#67-type-alias-statements)).
+  They are static facts rather than evaluations, so no order constrains them.
 - A qualified member is a named callee. `cart::total(x)` is a call to the member it resolves to,
   including the special forms and `Mut`-parameter call shapes that dispatch on the callee. Through
   a parameter, `p::f(x)` takes its call shape from `f`'s type in the parameter's Module type.

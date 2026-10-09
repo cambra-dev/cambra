@@ -137,10 +137,11 @@ pub(super) fn lower_stmts_recovering(
     Some(append_outputs_at_tail(body, outputs, program_span, ctx))
 }
 
-/// Walk to the innermost non-`Let`/`ExprStmt` continuation and wrap it with
-/// `ExprStmt(current_tail, outputs)`.
+/// Walk to the innermost continuation below the program's `Let`, `MutDecl`,
+/// `ExprStmt` and `LetType` nodes and wrap it with `ExprStmt(current_tail,
+/// outputs)`.
 ///
-/// Recurses through both `Let` and `ExprStmt` nodes: a for-loop in the middle
+/// Recurses through each of them: a for-loop in the middle
 /// of the program produces an `ExprStmt(effect, continuation)` where the
 /// continuation may contain further `Let` bindings from later `http_serve`
 /// calls.  Stopping at the first `ExprStmt` would place the outputs `Record`
@@ -192,6 +193,18 @@ fn append_outputs_at_tail(
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
+                    body: Box::new(new_body),
+                },
+                ..expr
+            }
+        }
+        // A type alias declared above a sink holds the sink's binding in its body.
+        TypedExprNode::LetType { name, ty, body } => {
+            let new_body = append_outputs_at_tail(*body, outputs, program_span, ctx);
+            Expr {
+                node: TypedExprNode::LetType {
+                    name,
+                    ty,
                     body: Box::new(new_body),
                 },
                 ..expr
@@ -526,11 +539,8 @@ pub(super) fn lower_middle_stmt(
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // mutable write (the mutation operators are `:=` and `+=`), so even a
         // top-level `=` to a name that is *also* a live mutable variable just shadows it.
-        // A type alias declares no value, so the continuation passes through
-        // unchanged: `pre_declare_type_aliases` already put the name in scope, and
-        // the statement leaves no trace in the lowered program.
         ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
-            Ok(body)
+            Ok(lower_type_alias_decl(target, stmt.span, body, ctx))
         }
         ChlStmt::Assign {
             target,
@@ -1329,7 +1339,7 @@ pub(super) fn declare_type_params(
         }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
-        ctx.declare_type_alias(name, Type::Param(Rc::clone(&param)));
+        ctx.declare_type_param(name, Type::Param(Rc::clone(&param)));
         ctx.type_params_in_scope.push(name.to_string());
         declared.push(crate::ccl::ty::PolyParam {
             param,
@@ -1403,7 +1413,7 @@ fn lower_bound(
         .iter()
         .map(|tp| {
             let p = crate::ccl::ty::TypeParam::declared(tp.name.as_str());
-            ctx.declare_type_alias(tp.name.as_str(), Type::Param(Rc::clone(&p)));
+            ctx.declare_type_param(tp.name.as_str(), Type::Param(Rc::clone(&p)));
             (p.id, tp.name.as_str())
         })
         .collect();
@@ -1725,14 +1735,25 @@ pub(super) fn lower_type_expr_or_poly(
         // never a variant: a tag is written with its backtick wherever it appears.
         // An alias is substituted by the type it names, so no alias survives this
         // function and nothing downstream of lowering knows the name.
-        ChlExpr::Name(id) => name_type(id.as_str())
-            .or_else(|| ctx.type_alias(id.as_str()).cloned())
-            .ok_or_else(|| {
-                LoweringError::unsupported(
+        ChlExpr::Name(id) => {
+            if let Some(ty) = name_type(id.as_str()) {
+                return Ok(ty);
+            }
+            match ctx.type_alias(id.as_str(), annotation.span) {
+                AliasAt::InScope(ty) => Ok(ty.clone()),
+                AliasAt::Below => Err(LoweringError::unsupported(
+                    annotation.span,
+                    format!(
+                        "`{id}` is declared below this use: a type alias is in scope from its \
+                         statement to the end of its block"
+                    ),
+                )),
+                AliasAt::Undeclared => Err(LoweringError::unsupported(
                     annotation.span,
                     format!("unknown type annotation: {id}"),
-                )
-            }),
+                )),
+            }
+        }
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
@@ -2044,15 +2065,40 @@ pub(super) fn type_alias_decl<'a>(
     }
 }
 
+/// `body` under the type alias `statement` declares, a
+/// [`TypedExprNode::LetType`] over `body`. The alias binds no value, and
+/// `pre_declare_type_aliases` has already put its name in scope; the node holds
+/// its type where it is declared, which is where uniquify resolves the names
+/// its predicates read. A declaration that was refused leaves `body` alone.
+pub(super) fn lower_type_alias_decl(
+    target: &Spanned<AssignTarget>,
+    statement: Span,
+    body: Expr,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let AssignTarget::Name(name) = &target.node else {
+        unreachable!("a type alias's target is its name");
+    };
+    match ctx.declared_type_alias(name, statement) {
+        Some(ty) => {
+            let declared = Expr::let_type(name.as_str(), ty.clone(), body);
+            ctx.tag_image(declared, statement)
+        }
+        None => body,
+    }
+}
+
 /// Declare every type alias of a block, in source order, before the block's
 /// statements are lowered.
 ///
 /// A forward pass, unlike the statement fold it precedes: blocks lower
 /// right-to-left, so an alias declared on reaching its own statement would be
-/// invisible to every annotation below it. Declaring the block's aliases up front
-/// puts each one in scope throughout its block, and running in source order is
-/// what holds an alias's right-hand side to the aliases above it — `A = A` and a
-/// chain naming an alias declared later are unresolved names here.
+/// invisible to every annotation below it. Each declaration records its
+/// statement, and a use sees only the declarations whose statements end before
+/// it ([`LoweringContext::type_alias`]), so an alias is in scope from its
+/// statement to the end of its block. Running in source order is what holds an
+/// alias's right-hand side to the aliases above it — `A = A` and a chain naming
+/// an alias declared later are unresolved names here.
 ///
 /// The right-hand side is lowered once, at the declaration, so a refinement
 /// predicate sees the scope the alias statement sees. Every use substitutes that
@@ -2104,7 +2150,7 @@ pub(super) fn pre_declare_type_aliases(
             continue;
         }
         match lower_type_expr_or_poly(rhs, ctx) {
-            Ok(ty) => ctx.declare_type_alias(name, ty),
+            Ok(ty) => ctx.declare_type_alias(name, stmt.span, ty),
             // The inner error names the form in surface words
             // ([`describe_type_form`]), so it composes into one sentence.
             Err(inner) => errors.push(LoweringError::unsupported(

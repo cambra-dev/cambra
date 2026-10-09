@@ -86,6 +86,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         // The declaring half of `:=`, named after its binder as `MutWrite` is
         // after its target.
         MutDecl { binding, .. } => format!("MutDecl({})", binding.name),
+        LetType { name, .. } => format!("LetType({name})"),
         Tuple(_) => "Tuple".to_string(),
         Proj(k) => format!("Proj({k:?})"),
         Record(_) => "Record".to_string(),

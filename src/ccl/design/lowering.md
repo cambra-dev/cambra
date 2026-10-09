@@ -268,10 +268,17 @@ inference to check.
 
 A capitalized assignment `Name = T` declares a type alias. `pre_declare_type_aliases` scans each
 block forward before its statements lower, converts every right-hand side through
-`lower_type_expr`, and records the result in `LoweringContext::type_aliases`. A later type use
-substitutes that `Type`; the alias statement emits no `Let`. An alias may refer to an earlier alias
-in its block, but not to itself or a later alias. Built-in type names cannot be redefined, and a
-name cannot be declared twice in one block.
+`lower_type_expr`, and records the result with its statement in `LoweringContext::type_aliases`. A
+type use substitutes the `Type` of the innermost declaration whose statement ends before the use,
+and a use above every declaration of its name is refused. An alias may therefore refer to an
+earlier alias in its block, but not to itself or a later alias. Built-in type names cannot be
+redefined, and a name cannot be declared twice in one block. A type parameter is declared in the
+same table, in scope throughout its definition.
+
+The alias statement emits a `LetType` over the rest of its block (`lower_type_alias_decl`), holding
+the same `Type` its uses substitute. Uniquify resolves the type's predicates at that node, so a
+predicate reads the bindings the declaration sees, and then removes it ([ir.md, "Type aliases
+resolve where they are declared"](ir.md#type-aliases-resolve-where-they-are-declared)).
 
 `with_block_type_aliases` snapshots and restores the alias map around nested blocks. Top-level
 recovery declares aliases directly and collects their errors so other statements can still be

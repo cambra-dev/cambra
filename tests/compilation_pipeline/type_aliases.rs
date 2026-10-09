@@ -268,6 +268,124 @@ fn inner_alias_shadows_an_outer_one() {
     );
 }
 
+/// An alias is in scope from its statement to the end of its block, so an
+/// annotation above the statement does not see it.
+#[test]
+fn alias_used_above_its_declaration_is_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            def f(x: Pos) => Int:
+                x
+
+            Pos = {Int where _ > 0}
+            f(1)
+        "#},
+        "`Pos` is declared below this use",
+    );
+}
+
+/// A use above an inner block's declaration of a name sees the alias the
+/// enclosing block declares, as a value binding would.
+#[test]
+fn a_use_above_an_inner_redeclaration_sees_the_outer_alias() {
+    check_scalar(
+        indoc! {r#"
+            Small = {Int where _ < 100}
+
+            def f(x):
+                a: Small = 50
+                Small = {Int where _ < 10}
+                b: Small = 5
+                a + b
+
+            f(0)
+        "#},
+        Value::Int(55),
+    );
+}
+
+/// An alias's predicate names the binding in scope where the alias is declared,
+/// so a parameter spelled like it does not capture it at a use.
+#[test]
+fn a_parameter_does_not_capture_an_aliass_predicate() {
+    check_scalar(
+        indoc! {r#"
+            k = 0
+            Pos = {Int where _ > k}
+
+            def f(k):
+                x: Pos = 5
+                x
+
+            f(10)
+        "#},
+        Value::Int(5),
+    );
+}
+
+/// Every use of an alias shares its predicate, so each resolves where the alias
+/// is declared, not where the first use stands.
+#[test]
+fn every_use_of_an_alias_resolves_where_it_is_declared() {
+    check_scalar(
+        indoc! {r#"
+            k = 0
+            Pos = {Int where _ > k}
+
+            def f(k):
+                x: Pos = 5
+                x
+
+            y: Pos = 1
+            f(-10) + y
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// An alias declared in a `def` body resolves its predicate there, under the
+/// body's own bindings, and a nested parameter below it does not capture it.
+#[test]
+fn an_alias_in_a_def_body_resolves_in_that_body() {
+    check_scalar(
+        indoc! {r#"
+            def f(x):
+                k = 0
+                Above = {Int where _ > k}
+
+                def g(k):
+                    y: Above = 5
+                    y
+
+                g(100) + x
+
+            f(1)
+        "#},
+        Value::Int(6),
+    );
+}
+
+/// A loop body is a block, and a binding below an alias in it does not capture
+/// the alias's predicate.
+#[test]
+fn a_binding_below_an_alias_in_a_loop_body_does_not_capture_it() {
+    check_scalar(
+        indoc! {r#"
+            k = 0
+            total := 0
+
+            for i in [1, 2, 3]:
+                Pos = {Int where _ > k}
+                k = 100
+                n: Pos = i
+                total += n
+
+            total
+        "#},
+        Value::Int(6),
+    );
+}
+
 /// Source order holds an alias's right-hand side to the aliases above it, so a
 /// self-reference has nothing to resolve against.
 #[test]

@@ -1183,8 +1183,9 @@ pub enum Phase {
     /// Lowering CHL source into CCL.
     Lower,
     /// The 1:1 binder rename in [`crate::ccl::uniquify`]. **Never
-    /// constructed**: `uniquify` preserves every node id, so it has nothing to
-    /// record. The variant exists so the axis covers every phase.
+    /// constructed**: `uniquify` preserves every node id but those of the
+    /// `LetType` nodes it removes, and mints none, so it has nothing to record.
+    /// The variant exists so the axis covers every phase.
     Uniquify,
     /// A-normalization ([`crate::ccl::anf`]): naming every compound
     /// sub-expression via a fresh `Let`, so only atomic terms occupy operand

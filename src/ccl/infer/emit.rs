@@ -205,6 +205,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             body,
         } => emit_let(binding, bound_expr, body, ctx)?,
 
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         TypedExprNode::MutDecl {
             binding,
             init,

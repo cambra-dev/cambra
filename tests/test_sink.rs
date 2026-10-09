@@ -623,3 +623,16 @@ fn a_collection_fed_from_inside_a_loop_does_not_compile() {
         "the span is the element `x`: {rendered}"
     );
 }
+
+/// A type alias above a sink holds the sink's binding in its scope, so the sink record
+/// at the program's tail still reads the sink.
+#[test]
+fn a_sink_below_a_type_alias_is_read() {
+    let v = observe_one(indoc! {r#"
+        Small = Int
+        out = test_sink()
+        x: Small = 3
+        out << x
+    "#});
+    assert_eq!(format!("{}", v.expect("a value")), "Function [ () -> 3 ]");
+}

@@ -365,18 +365,22 @@ pub struct LoweringContext {
     /// transactions are rejected by checking this flag before entering a block.
     pub(super) in_tx_body: bool,
 
-    /// Type aliases in scope, by the capitalized name each one binds.
+    /// Type aliases declared in the blocks being lowered, by the capitalized name
+    /// each one binds, innermost declaration last.
     ///
     /// An alias names an existing type rather than making a new one, so the
     /// entry holds the already-lowered [`Type`] and a use site substitutes it
-    /// (`docs/chl-spec.md`, "6.7 Type-alias statements"). Nothing downstream of
-    /// lowering sees the name: a program written with an alias and the same
-    /// program with the alias expanded lower to the same CCL.
+    /// (`docs/chl-spec.md`, "6.7 Type-alias statements"). The declaration
+    /// lowers to a [`TypedExprNode::LetType`] holding that type, which is where
+    /// its predicates' names resolve; uniquify then removes it, so no later
+    /// phase knows the name.
     ///
     /// **Block-scoped**, snapshotted and restored around each block the way
     /// [`transactional_vars`](Self::transactional_vars) is, and keyed by surface
-    /// spelling because lowering precedes uniquify.
-    pub(super) type_aliases: HashMap<String, Type>,
+    /// spelling because lowering precedes uniquify. A block declares its aliases
+    /// before it lowers, so each entry records its statement, and a use sees the
+    /// innermost declaration whose statement ends before it.
+    pub(super) type_aliases: HashMap<String, Vec<DeclaredAlias>>,
 
     /// The type parameters of the definitions being lowered, by spelling. A type
     /// parameter is scoped like an alias declared in its definition's block, and a
@@ -424,6 +428,26 @@ pub struct LoweringContext {
     /// (`crate::ccl::comprehension`), which states the same domain equations on
     /// the same tree and so must not reuse an id lowering already spent.
     pub(crate) shared_holes: SharedHoleMint,
+}
+
+/// A type name a block or a definition declares, and the type it names.
+#[derive(Debug, Clone)]
+pub(super) struct DeclaredAlias {
+    /// The alias statement, below which the alias is in scope, or `None` for a
+    /// type parameter, which is in scope throughout its definition.
+    statement: Option<Span>,
+    ty: Type,
+}
+
+/// What a capitalized name means as a type at a use
+/// ([`LoweringContext::type_alias`]).
+pub(super) enum AliasAt<'a> {
+    /// The alias in scope there names this type.
+    InScope(&'a Type),
+    /// An alias of the name is declared in an enclosing block, below the use.
+    Below,
+    /// No enclosing block declares an alias of the name.
+    Undeclared,
 }
 
 impl LoweringContext {
@@ -755,27 +779,71 @@ impl LoweringContext {
 
     /// Snapshot the type-alias table so a block's declarations can be undone on
     /// exit. Paired with [`restore_type_aliases`](Self::restore_type_aliases).
-    pub(super) fn snapshot_type_aliases(&self) -> HashMap<String, Type> {
+    pub(super) fn snapshot_type_aliases(&self) -> HashMap<String, Vec<DeclaredAlias>> {
         self.type_aliases.clone()
     }
 
     /// Restore the type-alias table to a
     /// [`snapshot_type_aliases`](Self::snapshot_type_aliases) checkpoint,
     /// discarding the aliases the block declared.
-    pub(super) fn restore_type_aliases(&mut self, snapshot: HashMap<String, Type>) {
+    pub(super) fn restore_type_aliases(&mut self, snapshot: HashMap<String, Vec<DeclaredAlias>>) {
         self.type_aliases = snapshot;
     }
 
-    /// Bind `name` to `ty` for the rest of the enclosing block. An alias in an
-    /// inner block shadows a same-named outer one until the block's snapshot is
+    /// Bind `name` to `ty` from the end of `statement`, the alias's declaration,
+    /// to the end of the enclosing block. An alias in an inner block shadows a
+    /// same-named outer one below its statement, until the block's snapshot is
     /// restored.
-    pub(super) fn declare_type_alias(&mut self, name: impl Into<String>, ty: Type) {
-        self.type_aliases.insert(name.into(), ty);
+    pub(super) fn declare_type_alias(
+        &mut self,
+        name: impl Into<String>,
+        statement: Span,
+        ty: Type,
+    ) {
+        self.type_aliases
+            .entry(name.into())
+            .or_default()
+            .push(DeclaredAlias {
+                statement: Some(statement),
+                ty,
+            });
     }
 
-    /// The type `name` aliases, if any.
-    pub(super) fn type_alias(&self, name: &str) -> Option<&Type> {
-        self.type_aliases.get(name)
+    /// Bind the type parameter `name` to `ty` throughout the definition being
+    /// lowered (`docs/chl-spec.md`, "Type parameters").
+    pub(super) fn declare_type_param(&mut self, name: impl Into<String>, ty: Type) {
+        self.type_aliases
+            .entry(name.into())
+            .or_default()
+            .push(DeclaredAlias {
+                statement: None,
+                ty,
+            });
+    }
+
+    /// What `name` means as a type at `at`, the span of a use.
+    pub(super) fn type_alias(&self, name: &str, at: Span) -> AliasAt<'_> {
+        let Some(declared) = self.type_aliases.get(name) else {
+            return AliasAt::Undeclared;
+        };
+        match declared
+            .iter()
+            .rev()
+            .find(|alias| alias.statement.is_none_or(|s| s.end <= at.start))
+        {
+            Some(alias) => AliasAt::InScope(&alias.ty),
+            None => AliasAt::Below,
+        }
+    }
+
+    /// The type of the alias `name` that `statement` declares, or `None` when its
+    /// declaration was refused.
+    pub(super) fn declared_type_alias(&self, name: &str, statement: Span) -> Option<&Type> {
+        self.type_aliases
+            .get(name)?
+            .iter()
+            .find(|alias| alias.statement == Some(statement))
+            .map(|alias| &alias.ty)
     }
 
     /// Whether `name` is a type parameter of a definition being lowered.

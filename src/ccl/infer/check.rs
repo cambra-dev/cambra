@@ -845,6 +845,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             body,
         } => emit_let(binding, bound_expr, body, ctx)?,
 
+        TypedExprNode::LetType { .. } => {
+            unreachable!("uniquify removes every `LetType`")
+        }
         TypedExprNode::MutDecl {
             binding,
             init,
