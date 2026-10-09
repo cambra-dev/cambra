@@ -612,7 +612,7 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
         g: forall (T) T = m
         1
     "},
-    "annotated as T, but inferred as {Int where _ == 5}",
+    "annotated as forall (T) T, but inferred as {Int where _ == 5}",
 )]
 // The annotation fits the value, so what refuses it is that the name it binds is
 // monomorphic.
@@ -625,6 +625,112 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
     "`g` is annotated with a polymorphic type, but its right-hand side is monomorphic",
 )]
 fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// A mismatch against a polymorphic annotation prints the right-hand side's type as
+/// polymorphic over the variables it quantifies (`docs/chl-spec.md`, "Polymorphic
+/// type annotations"). Each variable is a parameter named in order of first
+/// appearance, an upper bound standing beside one is its bound, and a trait
+/// obligation on one is a requirement.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::requirement_with_a_concrete_operand(
+    indoc! {"
+        def inc(a):
+            a + 1
+        pick: forall (T) T => T = inc
+        1
+    "},
+    "annotated as forall (T) T => T, but inferred as forall (A) A => Int requires Addable(A, Int, Output=Int)",
+)]
+#[case::requirement_over_two_parameters(
+    indoc! {"
+        def less(a, b):
+            a < b
+        pick: forall (T) {T, T} => T = less
+        1
+    "},
+    "inferred as forall (A, B) {A, B} => Bool requires Orderable(A, B)",
+)]
+#[case::requirement_naming_its_output(
+    indoc! {"
+        def add(a, b):
+            a + b
+        pick: forall (T) {T, T} => T = add
+        1
+    "},
+    "inferred as forall (A, B, C) {A, B} => C requires Addable(A, B, Output=C)",
+)]
+#[case::bound_written_inline_where_the_parameter_occurs_once(
+    indoc! {"
+        def at(a):
+            a.at
+        pick: forall (T) T => Int = at
+        1
+    "},
+    "inferred as forall (A) {at: A} => A",
+)]
+#[case::bound_on_a_parameter_occurring_twice(
+    indoc! {"
+        def both(a):
+            (a.at, a)
+        pick: forall (T) T => T = both
+        1
+    "},
+    "inferred as forall (A <: {at: B}, B) A => {B, A}",
+)]
+// The notation has no join of a parameter and a concrete type; the printed type
+// marks it rather than dropping either side.
+#[case::join_the_notation_cannot_write(
+    indoc! {"
+        def f(c, a):
+            a if c else 1
+        pick: forall (T) {Bool, T} => T = f
+        1
+    "},
+    "inferred as forall (A) {Bool, A} => A ∨ {Int where _ == 1}",
+)]
+#[case::lambda_right_hand_side(
+    indoc! {"
+        pick: forall (T) T => T = \\x -> x + 1
+        1
+    "},
+    "inferred as forall (A) A => Int requires Addable(A, Int, Output=Int)",
+)]
+#[case::filter_reading_a_collection(
+    indoc! {"
+        ys = [(1, 2), (3, 4)]
+        def keep(n):
+            [p for p in ys if p.0 > n]
+        pick: forall (T) T => T = keep
+        1
+    "},
+    "inferred as forall (A) (n: A) => FullMap({UInt where _ < 2 and ys[_].0 > n}, {Int, Int}) requires Orderable(Int, A)",
+)]
+// A variable of the enclosing scope is one type, not a parameter.
+#[case::enclosing_scope_variable(
+    indoc! {"
+        def outer(y):
+            pick: forall (T) T => T = \\x -> y
+            pick(1)
+        outer(2)
+    "},
+    "inferred as forall (A) A => ‹?",
+)]
+#[case::enclosing_scope_variable_in_a_requirement(
+    indoc! {"
+        def outer(y):
+            pick: forall (T) T => T = \\x -> x + y
+            pick(1)
+        outer(2)
+    "},
+    "inferred as forall (A, B) A => B requires Addable(A, ‹?",
+)]
+fn an_annotation_mismatch_prints_the_inferred_polymorphic_type(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
     check_compile_error(code, needle);
 }
 

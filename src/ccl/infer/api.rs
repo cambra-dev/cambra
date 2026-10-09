@@ -340,6 +340,16 @@ pub enum InferError {
         /// The type that inference determined.
         inferred: Type,
     },
+    /// A binding's right-hand side does not meet its polymorphic annotation: an
+    /// [`AnnotationMismatch`](Self::AnnotationMismatch) whose inferred type is shown as
+    /// a polymorphic type over the variables the right-hand side quantifies
+    /// (`src/ccl/design/type-parameters.md`, "Printing an inferred polymorphic type").
+    PolyAnnotationMismatch {
+        /// The polymorphic type the user wrote.
+        annotation: Box<Type>,
+        /// The right-hand side's type.
+        inferred: Box<crate::ccl::infer::solver::display::InferredPoly>,
+    },
     /// Collections over domains with no common answer met at one position.
     ///
     /// A collection's domain **is** its data, so a join may not narrow it: two collections
@@ -673,6 +683,13 @@ impl InferError {
             } => {
                 each(annotation);
                 each(inferred);
+            }
+            InferError::PolyAnnotationMismatch {
+                annotation,
+                inferred,
+            } => {
+                each(annotation);
+                inferred.map_types(&mut each);
             }
             InferError::DomainJoinConflict { domains, .. } => domains.iter_mut().for_each(each),
             InferError::NoTraitInstance {
@@ -1066,6 +1083,17 @@ impl std::fmt::Debug for InferError {
                     "Annotation mismatch: annotated as {}, but inferred as {}",
                     crate::ccl::chl_print::chl_type(annotation),
                     crate::ccl::chl_print::chl_type(inferred)
+                )
+            }
+            InferError::PolyAnnotationMismatch {
+                annotation,
+                inferred,
+            } => {
+                write!(
+                    f,
+                    "Annotation mismatch: annotated as {}, but inferred as {}",
+                    crate::ccl::chl_print::chl_type(annotation),
+                    crate::ccl::chl_print::chl_inferred_poly(inferred)
                 )
             }
             InferError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),

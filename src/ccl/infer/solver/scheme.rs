@@ -804,8 +804,18 @@ fn freshen_watches(
             // re-mints through this cache.
             copy.map_assumptions(|t| freshen_above(lim, t, target, cache));
         }
-        // Phase 2: now that re-entry finds the copy, freshen the output and the
-        // input expressions a refinement template builds from.
+        // Phase 2: now that re-entry finds the copy, freshen every operand, and the
+        // output and the input expressions a refinement template builds from. An
+        // operand the definition's operator minted is above the cutoff, and its copy
+        // is reached here rather than only through the type being freshened: the
+        // variable a literal flows into is reached through no type, and the copy
+        // states its requirement whole only with it. An obligation the enclosing scope
+        // minted has its operands at or below the cutoff; they freshen to themselves,
+        // the copy watches none of them, and it states no requirement of the
+        // definition's.
+        for operand in obligation.operands().into_iter().flatten() {
+            freshen_above(lim, &operand, target, cache);
+        }
         copy.set_assoc_types(
             obligation
                 .assoc_types()
