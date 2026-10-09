@@ -845,8 +845,9 @@ fn an_introduction_in_a_loop_carrying_only_transactional_writes_is_rejected() {
     );
 }
 
-/// A `for` nested in a mutation loop that writes no mutable variable declared outside it
-/// has no recurrence to fold, whatever else its body does, and is refused at lowering.
+/// A `for` nested in a mutation loop that neither feeds nor writes a mutable variable declared
+/// outside it has no recurrence to fold and contributes nothing, and is refused at lowering.
+/// One that feeds is a feed-only loop (`tests/differential_interp.rs`).
 #[rstest]
 #[case::binds_only(indoc! {r#"
     t := 0
@@ -865,16 +866,7 @@ fn an_introduction_in_a_loop_carrying_only_transactional_writes_is_rejected() {
             z += 1
     t
 "#})]
-#[case::feeds_only(indoc! {r#"
-    t := 0
-    o = defer()
-    for i in [1, 2]:
-        t += i
-        for j in [10, 20]:
-            o << j
-    t + sum(o)
-"#})]
-fn a_nested_loop_writing_nothing_outside_it_is_rejected(#[case] code: &str) {
+fn a_nested_loop_neither_feeding_nor_writing_outside_it_is_rejected(#[case] code: &str) {
     expect_compile_error(
         code,
         "a nested `for` loop must write a mutable variable declared outside it",

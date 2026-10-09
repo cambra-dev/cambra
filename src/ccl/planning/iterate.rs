@@ -111,6 +111,16 @@ pub(super) fn insert_iterate_recurse(
     if matches!(&expr.node, TypedExprNode::List(_)) {
         return;
     }
+    // A domain rewriter's positions, `[𝑖…] ▷ flatten_domain` or `▷ permute_domain`, are the
+    // literal list op-conversion reads off it (`extract_usize_list`), not a collection anything
+    // iterates. The morphism it rewrites is the iteration site, which the application around
+    // this one marks.
+    if let TypedExprNode::Apply { function, .. } = &expr.node
+        && (is_builtin(function, Builtin::FlattenDomain)
+            || is_builtin(function, Builtin::PermuteDomain))
+    {
+        return;
+    }
     // A zipped product pairs its components beneath the levels they were applied over:
     // op-conversion's `Zip` arm fans the outer input out to each component, so each is
     // compiled with `input=Some(fan_out_branch)`. The value-position arms below would mark a
@@ -226,6 +236,12 @@ pub(super) fn insert_iterate_recurse(
         {
             wrap_with_iterate(argument, realized, "checked-lookup-collection");
         }
+        // `𝑐 ▷ const` compiles `𝑐` with `input=None` and broadcasts what it produces over
+        // the input (`MapResultToConst`), so `𝑐` is an iteration site exactly when it holds
+        // a collection, as a product's component is.
+        TypedExprNode::Apply { argument, function } if is_builtin(function, Builtin::Const) => {
+            mark_component_source(argument, realized);
+        }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.
         TypedExprNode::Apply { argument, function }
@@ -280,10 +296,21 @@ pub(super) fn insert_iterate_recurse(
 ///
 /// A tuple, a record and the program's trailing `Record` differ only in whether a
 /// component carries a name, so the rule is one rule.
+///
+/// A variant's payload is a component the same way: `𝑐 ▷ variant_wrap(tag)` compiles `𝑐` with
+/// the input the wrap is given and wraps what it produces, so the rule looks through the wrap.
 fn mark_component_source(
     component: &mut Expr,
     realized: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) {
+    if let TypedExprNode::Apply { argument, function } = &mut component.node
+        && matches!(
+            function.node,
+            TypedExprNode::Builtin(Builtin::VariantWrap(_))
+        )
+    {
+        return mark_component_source(argument, realized);
+    }
     if component.ty.is_collection() {
         wrap_with_iterate(component, realized, "product-component-source");
     }

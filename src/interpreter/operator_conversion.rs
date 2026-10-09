@@ -2472,9 +2472,12 @@ fn convert_impl_inner(
                 return Ok(Box::new(MapResult::new_at(input, collection, ctx.level())));
             }
             // The argument is a root, a stream of its own, so the function applied to it
-            // runs over the root's iteration rather than the enclosing node's.
+            // runs over the root's iteration rather than the enclosing node's. An applied
+            // `variant_wrap` takes its argument whole as the payload, so none of the
+            // argument's levels stand above it.
             let arg = convert_impl(argument, None, ctx)?;
-            let level = CurryLevel::new(usize::from(argument.ty.is_collection()));
+            let whole_payload = matches!(as_builtin(function), Some(Builtin::VariantWrap(_)));
+            let level = CurryLevel::new(usize::from(argument.ty.is_collection() && !whole_payload));
             convert_at(function, Some(arg), level, ctx)
         }
 

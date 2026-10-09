@@ -997,11 +997,11 @@ fn lower_nested_loop(
         ));
     }
     // A nested loop is folded as a recurrence over what it writes of the loops around it,
-    // so one that writes none of their mutable variables has nothing to fold: its body only
-    // binds, feeds, or writes variables of its own. That shape is not realized yet. A bare
-    // call may be a pass-by-reference write (`bump(y)`), which lowering runs too early to
-    // see, so a body holding one and no feed is left for `mut_elim` to classify, as a flat
-    // loop's is: it drops one whose calls turn out to write nothing.
+    // so one that writes none of their mutable variables has nothing to fold. One that feeds
+    // is a feed-only loop; one whose body only binds or writes variables of its own is not
+    // realized yet. A bare call may be a pass-by-reference write (`bump(y)`), which lowering
+    // runs too early to see, so a body holding one and no feed is left for `mut_elim` to
+    // classify, as a flat loop's is: it drops one whose calls turn out to write nothing.
     let mut writes = Vec::new();
     collect_mutation_loop_vars(
         body_stmts,
@@ -1010,16 +1010,31 @@ fn lower_nested_loop(
         &mut HashSet::new(),
     );
     let feeds = for_body_has_feed(body_stmts) || for_body_has_yield(body_stmts);
-    if writes.is_empty() && (!body_has_bare_call(body_stmts) || feeds) {
+    if writes.is_empty() && !feeds && !body_has_bare_call(body_stmts) {
         return Err(LoweringError::unsupported(
             for_span,
-            "a nested `for` loop must write a mutable variable declared outside it: one \
-             whose body only binds values, feeds, calls, or writes variables of its own is \
-             not supported yet.",
+            "a nested `for` loop must write a mutable variable declared outside it or \
+             feed: one whose body only binds values or writes variables of its own is not \
+             supported yet.",
         ));
     }
     let iter_var = extract_name_target(target, "for-loop target")?;
     let source = lower_expr(iter, ctx)?;
+    // One that feeds and writes nothing outside it is a feed-only loop, built as one is
+    // anywhere ([`tagged_for_loop`]); a `yield` in it feeds the enclosing generator.
+    if writes.is_empty() && feeds {
+        let frame_introduced = HashSet::from([iter_var.clone()]);
+        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            lower_for_body_stmts(
+                body_stmts,
+                yield_defer,
+                outer_bindings,
+                frame_introduced,
+                ctx,
+            )
+        })?;
+        return Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx));
+    }
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
         // A `yield` in the inner body feeds the generator the enclosing loop is in, one
         // value per inner iteration.

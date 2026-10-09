@@ -775,7 +775,13 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
 4. **Routes feeds**: each channel becomes a letrec-body output, unioned (`++`) across sites. A
    feed outside a `with begin():` block is a function over its contributing loop's domain. A feed
    inside one reads its value off the commit record (a per-commit tap), keyed by commit time
-   through `by_commit_time`, so its domain is `Txn`.
+   through `by_commit_time`, so its domain is `Txn`. A feed under nested loops is keyed by the
+   tuple of every enclosing loop's position. An inner loop that writes nothing outside it is not
+   a recurrence: each of its feeds is a tap of the enclosing loop's decision, one collection per
+   enclosing position in the form a nested comprehension lowers to. A tap holds a collection
+   level per loop around its feed, which `mut_elim` counts as it builds the tap; the hoist
+   uncurries those levels into the tuple key and feeds each value through a loop over the
+   result, `for x in tap: defer << x`, so a `Feed` appends one element wherever it stands.
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator

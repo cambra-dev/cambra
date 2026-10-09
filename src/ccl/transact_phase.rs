@@ -80,7 +80,9 @@ use crate::ccl::{
     F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
     WriterSite,
     ccl_utils::{free_names_in_value, is_free_in_value, synthesize_arm_predicate},
-    mut_elim::{close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys},
+    mut_elim::{
+        LoopFeed, close_recurrence_group, fold_induction_loop, hoist_feeds, mut_var_value_tys,
+    },
     provenance,
     provenance::{Located, NodeId},
     subst::Subst,
@@ -949,7 +951,7 @@ struct CrossDomain {
     /// a fact about it.
     parents: Vec<NodeId>,
     reads: Vec<(TypedBinding, Expr)>,
-    feeds: Vec<(Name, Expr)>,
+    feeds: Vec<LoopFeed>,
     acc_views: HashMap<Name, CrossAcc>,
 }
 
@@ -3343,7 +3345,7 @@ impl StorePlan {
     }
 
     /// The feed views to hoist over this store's body, in source order.
-    fn feed_views(&self) -> Vec<(Name, Expr)> {
+    fn feed_views(&self) -> Vec<LoopFeed> {
         self.hoisted
             .iter()
             .map(|f| {
@@ -3358,7 +3360,12 @@ impl StorePlan {
                     f.tap_ty.domain().unwrap_or(Type::Hole),
                     f.value_ty.clone(),
                 );
-                (f.defer.clone(), view)
+                // One value per commit: the tap is keyed by commit time alone.
+                LoopFeed {
+                    defer: f.defer.clone(),
+                    view,
+                    levels: 1,
+                }
             })
             .collect()
     }
@@ -3536,7 +3543,7 @@ fn cross_level(cross: &CrossDomain, stores: &[StorePlan], carried: &[Vec<Expr>])
         .iter()
         .chain(cross.reads.iter())
         .map(|(_, e)| e)
-        .chain(cross.feeds.iter().map(|(_, e)| e))
+        .chain(cross.feeds.iter().map(|f| &f.view))
         .filter_map(|e| level_of(e, stores, carried))
         .max()
 }

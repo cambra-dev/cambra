@@ -581,6 +581,15 @@ fn try_pairwise_in_compose(
     // composition this node is no longer part of.
     if !(collapsed && expr.ty.sum().is_some() && ty.sum().is_none()) {
         expr.ty = ty;
+        // A collapsed constant `𝑔 ▷ const` takes the chain's type, which may be a collection
+        // where the step it was reduced in was a capability, and `const`'s own stamp is read
+        // off the application it heads.
+        if collapsed
+            && let TypedExprNode::Apply { argument, function } = &mut expr.node
+            && is_builtin(function, Builtin::Const)
+        {
+            function.ty = Type::compute_fun_or_hole(&argument.ty, &expr.ty);
+        }
     }
     // A chain's domain is its **head's**, and a rewrite can put a term there that was typed
     // at an unnarrowed element — the projection a predicate compiled at a narrowed base

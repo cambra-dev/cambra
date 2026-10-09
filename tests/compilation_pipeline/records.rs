@@ -512,18 +512,14 @@ fn test_filter_over_a_projected_component(#[case] code: &str, #[case] expected: 
     check_scalar(code, expected);
 }
 
-/// A record built per element with a collection component does not compile yet.
-///
-/// A product value holds a collection, but a record inside a comprehension's body is a
-/// component per element. A constant list component there reaches op-conversion with no
-/// iteration planned for it.
-///
-/// Pinned rather than ignored, so the error it reaches is a ledger entry: whoever fixes
-/// it sees this case turn from a pinned panic into a passing one.
+/// A record built per element with a constant collection component: the component is the
+/// same collection at every element, broadcast over the comprehension's rows.
 #[test]
-#[should_panic(expected = "list literal reached op-conversion without an input")]
-fn a_per_element_record_holding_a_list_literal_is_not_yet_planned() {
-    run_pipeline("xs = [1, 2]; ys = [(a=l, b=[1, 2]) for l in xs]; ys");
+fn a_per_element_record_holding_a_list_literal() {
+    check_scalar(
+        "xs = [1, 2]; ys = [(a=l, b=[1, 2]) for l in xs]; sum([y.a * sum(y.b) for y in ys])",
+        Value::Int(9),
+    );
 }
 
 /// A record built per element whose collection component reads the element is refused at

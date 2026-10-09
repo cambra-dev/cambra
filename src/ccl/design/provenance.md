@@ -486,7 +486,7 @@ snapshots: `infer/solve` (`mono.specialize`,
 `letrec.hoist_writer_body`, `letrec.terminalize_write`),
 `transact_phase` (strip, unwrap block, writer, commit record, history binding,
 key rebind, key-init stash, store, the cross-domain and await-final rules), and
-`channelize` (`channelize.cluster`, `channelize.defer_lift`,
+`channelize` (`channelize.cluster`, `channelize.feed`, `channelize.defer_lift`,
 `channelize.defer_collapse`), `transact_phase`'s as-of-read rewrite
 (`transact.as_of_read`), and `lambda_elim` (`lambda_elim.abstract`,
 `lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Three

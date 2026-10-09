@@ -1244,8 +1244,8 @@ pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
 /// fresh record field carrying its per-iteration value, and that value
 /// (already resolved in the read-your-writes environment at the feed site).
 /// The loop's history binding computes the field alongside the recurrence;
-/// the phase hoists `Feed(defer, __hist ▷ .field)` out of the loop so channelize
-/// routes it as an ordinary channel contribution.
+/// the phase hoists a loop over `__hist ▷ .field` feeding each value
+/// ([`hoist_feeds`]), which channelize routes as an ordinary loop's feed.
 struct FeedSite {
     defer: Name,
     field: String,
@@ -1260,6 +1260,9 @@ struct FeedSite {
     /// emits the reply only there; its path also joins the commit gate so the
     /// firing position appends a change carrying the tap.
     fire: Expr,
+    /// How many loop levels `value` already holds, curried outermost first: 0 for a
+    /// value fed here, one per loop for an inner loop's whole tap collection.
+    levels: usize,
 }
 
 /// `p ▷ .i : elt_ty` — projection of a tuple-typed variable (a writer-body
@@ -1351,7 +1354,7 @@ fn hist_field_view(
 pub(crate) fn close_recurrence_group(
     bindings: Vec<(TypedBinding, Expr)>,
     reads: Vec<(TypedBinding, Expr)>,
-    feeds: Vec<(Name, Expr)>,
+    feeds: Vec<LoopFeed>,
     cont: Expr,
 ) -> Expr {
     let mut body = cont;
@@ -1372,28 +1375,62 @@ pub(crate) fn close_recurrence_group(
     .with_ty(ty)
 }
 
-/// Wrap `body` in one `Feed(defer, view)` per collected in-body feed, so
-/// `channelize` routes each per-position value stream to its channel. Each
-/// `view` is the feed's value stream over its contributing domain — for an
-/// induction loop, `__hist ▷ .__to_<feed>` (see [`hist_field_view`]); for a `with
-/// begin():` block, a commit-record tap binding. Both the mutation-loop phase
-/// and the transaction phase collect their feeds differently but hoist them
-/// through this one routine.
+/// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
+/// keyed by the positions of the `levels` loops around the feed, curried outermost first —
+/// for an induction loop, `__hist ▷ .__to_<feed>` (see [`hist_field_view`]); for a `with
+/// begin():` block, a commit-record tap binding.
+pub(crate) struct LoopFeed {
+    pub defer: Name,
+    pub view: Expr,
+    pub levels: usize,
+}
+
+/// Wrap `body` in one loop per collected in-body feed, feeding each value the loop fed:
+/// `for x in view: defer << x`, over `view` flattened to one level keyed by the tuple of
+/// positions (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). A `Feed`
+/// appends one element, so a loop's whole tap is fed through a loop over it, which
+/// `channelize` routes as it routes any loop's feed. Both the mutation-loop phase and the
+/// transaction phase collect their feeds differently but hoist them through this one
+/// routine.
 ///
 /// **Invariant (load-bearing): source order is preserved.** Feeds are wrapped in
 /// reverse, so the first source feed becomes the *outermost* `ExprStmt`.
 /// `channelize` collects feeds outermost-first into a channel's union, so
 /// this ordering is what fixes the union's variant tags when several feeds
 /// target one defer. Pass `feeds` in source order.
-pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
-    for (defer, view) in feeds.into_iter().rev() {
-        let mut feed = Expr::feed(defer, view);
-        feed.ty = Type::Base(BaseType::Unit);
+pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
+    for LoopFeed {
+        defer,
+        view,
+        levels,
+    } in feeds.into_iter().rev()
+    {
+        // The loop is what the view became, so it is recorded under the view, which is
+        // itself recorded under the feed that rode the tap.
+        let g = provenance::enter(view.node_id(), FEED_LABEL, provenance::Nature::Expansion);
+        let view = crate::ccl::channelize::flatten_nested_contribution(view, levels);
+        let each = feed_each(defer, view);
+        drop(g);
         // `expr_stmt` carries the body's type itself — an `ExprStmt`'s type *is*
         // its body's.
-        body = Expr::expr_stmt(feed, body);
+        body = Expr::expr_stmt(each, body);
     }
     body
+}
+
+/// `for x in collection: defer << x` — the loop `collection ≫ (λ x → Feed(defer, x))`.
+fn feed_each(defer: Name, collection: Expr) -> Expr {
+    let (domain_ty, item_ty) = fun_parts(&collection.ty);
+    let x = Name::fresh("__fed");
+    let mut feed = Expr::feed(defer, tvar(&x, item_ty.clone()));
+    feed.ty = Type::Base(BaseType::Unit);
+    let mut lambda = Expr::lambda(x, item_ty.clone(), feed);
+    lambda.ty = Type::fun(item_ty, Type::Base(BaseType::Unit));
+    let collection_ty = collection.ty.clone();
+    let mut each = Expr::compose(vec![collection, lambda]);
+    // A loop over the collection is a read of it, so it is whatever the collection is.
+    each.ty = Type::fun_like(&collection_ty, domain_ty, Type::Base(BaseType::Unit));
+    each
 }
 
 /// Rewrite one loop. `cont` is the raw continuation after the loop
@@ -1420,8 +1457,8 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
 /// record keyed by the variable written, matching the transaction decision
 /// convention; the guard reads the *writes
 /// projection* of the history (causal — see `check_letrec_causal`); each
-/// feed rides the decision as a `__to_<feed>` field, hoisted to
-/// `Feed(defer, __hist ≫ .__to_<feed>)` for `channelize` to route.
+/// feed rides the decision as a `__to_<feed>` field, hoisted as a loop over
+/// `__hist ≫ .__to_<feed>` feeding each value ([`hoist_feeds`]) for `channelize` to route.
 fn transform_loop(
     loop_site: StmtSite,
     target: TypedBinding,
@@ -1570,8 +1607,8 @@ pub(crate) struct InductionFold {
     pub reads: Vec<(TypedBinding, Expr)>,
     /// `(acc, x_final)` renames to apply to the continuation before recursing.
     pub renames: Vec<(Name, Name)>,
-    /// `(defer, view)` feeds to hoist over the continuation, in source order.
-    pub feed_views: Vec<(Name, Expr)>,
+    /// Feeds to hoist over the continuation, in source order.
+    pub feed_views: Vec<LoopFeed>,
     /// The history binder and its shape, for per-position accumulator reads.
     pub hist: Name,
     pub hist_ty: Type,
@@ -1818,7 +1855,12 @@ pub(crate) fn fold_induction_loop(
                 crate::ccl::ccl_utils::fired_project(f.value.ty.clone()),
             ]);
             view.ty = Type::fun_like(&hist_ty, domain_ty.clone(), f.value.ty.clone());
-            (f.defer.clone(), view)
+            // This loop's positions are one more level over what the feed held.
+            LoopFeed {
+                defer: f.defer.clone(),
+                view,
+                levels: 1 + f.levels,
+            }
         })
         .collect();
 
@@ -1838,10 +1880,10 @@ pub(crate) fn fold_induction_loop(
 
 /// Rewrite an accumulator-free loop — a read-only `with begin():` transaction
 /// fed out (`for target in iter: out << value`) — to the plain-map form. Each
-/// in-block feed becomes `Feed(defer, iter ≫ (λ target → value))`: the loop
-/// source mapped through the fed value at each position, hoisted out of the loop
-/// for `channelize` to route as an ordinary channel contribution. There is
-/// no history binding and no letrec.
+/// in-block feed becomes a loop of its own, `iter ≫ (λ target → Feed(defer, value))`,
+/// which `channelize` routes as an ordinary loop's feed: its channel is the loop
+/// source mapped through the fed value at each position. There is no history
+/// binding and no letrec.
 ///
 /// When `value` is a read of a transactional mutable variable (a `Var` `transact_phase`
 /// rebound to `as_of_read(__hist.k)`, constant in `target`), the map broadcasts that
@@ -1878,18 +1920,18 @@ fn transform_feed_only_loop(
         let g = site.enter(FEED_LABEL, provenance::Nature::Expansion);
         loop_site.blamed_in(&g);
 
-        let value_ty = value.ty.clone();
-        let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
-        lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
-        let mut map = Expr::compose(vec![iter.clone(), lambda]);
-        // Mapping a value function over the loop's source: the chain is a read of `iter`, so
-        // it is whatever `iter` is. `Type::fun` would declare `Compute` and the channel this
-        // becomes is a collection — its every use says so.
-        map.ty = Type::fun_like(&iter.ty, domain_ty.clone(), value_ty);
-        let mut feed = Expr::feed(defer, map);
-        feed.ty = Type::Base(BaseType::Unit);
+        // The loop with this feed alone in its body, `iter ≫ (λ target → Feed(defer, value))`,
+        // which `channelize` routes as it does any loop's feed.
+        let unit = Type::Base(BaseType::Unit);
+        let mut feed = Expr::feed(defer, value);
+        feed.ty = unit.clone();
+        let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), feed);
+        lambda.ty = Type::fun(target.ty.clone(), unit.clone());
+        let mut each = Expr::compose(vec![iter.clone(), lambda]);
+        // A loop over the source is a read of `iter`, so it is whatever `iter` is.
+        each.ty = Type::fun_like(&iter.ty, domain_ty.clone(), unit);
         // As above: `expr_stmt` carries the continuation's type itself.
-        body_out = Expr::expr_stmt(feed, body_out);
+        body_out = Expr::expr_stmt(each, body_out);
     }
     body_out
 }
@@ -2423,6 +2465,7 @@ fn transform_chain(
                         value: val,
                         fire: path.clone(),
                         site,
+                        levels: 0,
                     });
                     transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
                 }
@@ -2464,6 +2507,35 @@ fn transform_chain(
                 } => {
                     let spliced = Expr::let_in(binding, *bound_expr, Expr::expr_stmt(*rest, *body));
                     transform_chain(spliced, env, accs, writes_ty, entering, path, feeds)
+                }
+                // An inner loop that writes no mutable variable outside it, which lowering
+                // builds as it builds a feed-only loop anywhere: `𝑠 ≫ (λ 𝑥 → body)`. It
+                // carries nothing, so there is no recurrence to fold. Each feed in it rides
+                // this decision as a tap, as an inner recurrence's does below: one
+                // collection per position of this level.
+                node @ TypedExprNode::Compose(_) => {
+                    let site = StmtSite::new(stmt_id, effect_id);
+                    let feed_loop = crate::ccl::TypedExpr {
+                        node,
+                        ty: effect.ty,
+                        user_annotation: effect.user_annotation,
+                        node_id: effect_id,
+                    };
+                    for (defer, value, levels) in
+                        crate::ccl::channelize::loop_contributions(feed_loop)
+                    {
+                        let value = Subst::discharge_env_in_place(value, env);
+                        let field = defer.defer_tap_field(feeds.len());
+                        feeds.push(FeedSite {
+                            defer,
+                            field,
+                            value,
+                            fire: path.clone(),
+                            site,
+                            levels,
+                        });
+                    }
+                    transform_chain(*body, env, accs, writes_ty, entering, path, feeds)
                 }
                 // An inner loop — a recurrence nested in the enclosing one. Folding it
                 // here is what makes nesting work at any depth: the fold walks the
@@ -2526,7 +2598,12 @@ fn transform_chain(
                     // descends through the `letrec` this group builds, so the view's
                     // reference to the inner history is in scope where the field lands.
                     let site = StmtSite::new(stmt_id, effect_id);
-                    for (defer, view) in fold.feed_views {
+                    for LoopFeed {
+                        defer,
+                        view,
+                        levels,
+                    } in fold.feed_views
+                    {
                         let field = defer.defer_tap_field(feeds.len());
                         feeds.push(FeedSite {
                             defer,
@@ -2534,6 +2611,7 @@ fn transform_chain(
                             value: view,
                             fire: path.clone(),
                             site,
+                            levels,
                         });
                     }
                     let rest = transform_chain(*body, env, accs, writes_ty, entering, path, feeds);

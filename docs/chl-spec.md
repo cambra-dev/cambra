@@ -4381,9 +4381,6 @@ with parser-level support that lowering rejects:
 - **`while` loops** — currently a parse error (the `while` keyword is
   not yet recognised). Tracked as future work under mutability
   ("while loop lowering").
-- **A nested `for` loop that writes no mutable variable declared outside
-  it** — rejected at lowering: it has no recurrence of the loops around
-  it to fold.
 - **A mutable variable introduced inside a transaction block** — a `with
   begin():` block may write mutable variables declared outside it but not
   introduce its own, which would need a sequencing domain nested inside commit
