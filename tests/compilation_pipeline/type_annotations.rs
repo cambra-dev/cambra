@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
+use bit_set::BitSet;
 use indoc::indoc;
 use rstest::rstest;
 
-use crate::helpers::{check_compile_error, check_scalar};
+use crate::helpers::{check_compile_error, check_scalar, check_tile};
 
-use cambra::interpreter::Value;
+use cambra::interpreter::{ColumnValue, Predicate, Tile, Value};
 
 #[test]
 fn refinement() {
@@ -943,11 +946,11 @@ x := 3
 ys = [x ^+ i for i in [1,2]]
 ys
         "#},
-        "λ i : Int → let __anf : Int@3 ^= x
-in __anf ^+ i
+        "λ i : Int → let __read : Int@3 ^= x
+in __read ^+ i
 to
-let __anf : (Int ⇒ Int@3) = x ▷ const
-in (((id, __anf ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
+let __read : (Int ⇒ Int@3) = x ▷ const
+in (((id, __read ▷ const) ▷ zip ≫ apply, id) ▷ zip, add_refined ▷ const) ▷ zip ≫ apply
 with (Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})",
     )
 }
@@ -965,5 +968,100 @@ y = x ^+ x
 z: {Int where _ >= 0} = y
 z        "#},
         "post-planning produced an invalid tree",
+    )
+}
+
+/// Type inference drops the refinement from the `ys` function, making
+/// its type `(Int => Int)`, because the refinement contains an opaque
+/// read of `x`. During lambda_elim, a debug assertion rebuilds a
+/// refined type for the codomain from the body (containing `x`, which
+/// is now immutable, and has had its opaque read erased).  The two
+/// types are not structurally equal, and so the assertion fails.
+///
+/// This is the assert `reading_mut_in_comprehension_not_supported`
+/// pins for the unfiltered case. A filter, a nested comprehension and a
+/// conditional element each reach it too, where before the comprehension
+/// phase they failed inference with `MutableInRefinedType`.
+///
+/// TODO: Fix by mirroring the opaque dropping logic in lambda_elim's
+/// type reconstruction, or by dropping non-data-fun-domain type
+/// refinements (and debug assertion logic that reconstructs them)
+/// after inference.
+#[cfg(debug_assertions)]
+#[rstest]
+#[case::filtered(
+    indoc! {r#"
+x := 3
+ys = [x ^+ i for i in [1,2,3] if i > 1]
+ys
+    "#},
+    "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})"
+)]
+#[case::nested(
+    indoc! {r#"
+x := 3
+ys = [[x ^+ j for j in [1,2]] for i in [1,2] if i > 1]
+ys
+    "#},
+    "(Int ⇒ Int) vs ((j: Int) ⇒ {Int | __elem == x ▷ const ^+ j})"
+)]
+#[case::conditional_element(
+    indoc! {r#"
+x := 3
+ys = [x ^+ i if i > 1 else 0 for i in [1,2,3]]
+ys
+    "#},
+    "(Int ⇒ Int) vs ((i: Int) ⇒ {Int | __elem == x ▷ const ^+ i})"
+)]
+fn a_comprehension_that_reads_a_mut_fails_lambda_elims_reconstruction(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    check_compile_error(code, needle)
+}
+
+/// A filter over a mutable source. The comprehension phase copies the source
+/// into the cast's predicate after `mut_read` has rewritten the read of `xs`,
+/// so both copies carry the rewrite and no mutable variable reaches the
+/// predicate.
+#[test]
+fn filtering_a_comprehension_over_a_mut_source() {
+    check_tile(
+        indoc! {r#"
+xs := [1,2,3]
+ys = [i for i in xs if i > 1]
+ys
+        "#},
+        Tile::data_function(
+            ColumnValue::UInts(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    )
+}
+
+/// A filtered two-generator comprehension whose element reads a mutable
+/// variable and whose guard does not.
+#[test]
+fn filtering_a_two_generator_comprehension_that_reads_a_mut() {
+    check_tile(
+        indoc! {r#"
+x := 3
+ys = [x ^+ i + j for i in [1,2] for j in [5,6] if i < j]
+ys
+        "#},
+        Tile::data_function(
+            ColumnValue::Records(HashMap::from([
+                ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1])),
+                ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1])),
+            ])),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![9, 10, 10, 11]))),
+            Predicate::Record(HashMap::from([
+                ("_0".into(), Predicate::True),
+                ("_1".into(), Predicate::True),
+            ])),
+            BitSet::new(),
+        ),
     )
 }

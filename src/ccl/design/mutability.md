@@ -622,6 +622,8 @@ CHL source
                         mutable-variable read is named where it is performed)
   → mut_read           (read segments: adopt A-normalization's read bindings, mint for a
                         value-position `match`'s scrutinee)
+  → comprehension      (the surface `Comprehension` node → the cast/λ/▷ encoding; eliminates
+                        Comprehension)
   → infer + check      (on the surface-CCL tree; Feed(V) with a rigid ChanDom domain types the defers)
   → mut_read unbind    (substitute the binders mut_read minted back, except where a type spells one;
                         A-normalization's read bindings stay)
@@ -1387,7 +1389,7 @@ The value-`Case` positions ride the same union-of-restricts:
 - **Comprehension over / with a conditional** — *implemented*. A conditional **element**
   (`[a if g(x) else b for x in xs]`) fans the source out by each arm's *element-dependent* gate —
   `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of filtered maps (`fan_out_element_case` in
-  `lower::comprehension`), since a value `Case` has no fixed driver and must gate the iteration
+  `crate::ccl::comprehension`), since a value `Case` has no fixed driver and must gate the iteration
   source rather than a `Units(1)` one.
 
   A conditional **source** (`[e for x in (xs if c else ys)]`) needs no lowering rule at all: it is

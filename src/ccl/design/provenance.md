@@ -838,9 +838,11 @@ bit is what says so until every phase in the pair records.
   expression *root* — a call's callee `Var`, each comparison of `a < b < c`, the
   projection of `x[i]`, and every statement-level image (statements are not
   `Spanned<ChlExpr>`s, so a statement has no `Source` node at all). The converse
-  holds too: a comprehension lowers to a `Cast` wrapper the user never wrote, and
-  as the expression's root that `Cast` *is* `Source`. What is lost from `nature`
-  is preserved in the `label` — `"lower.image"` marks an image either way.
+  holds too: `groupby(c, key)` lowers to a `Lambda` the user never wrote, and as
+  the expression's root that `Lambda` is `Source`. The comprehension phase's
+  encoding is rooted at the `Comprehension` node's id, so the `Cast` or `Lambda`
+  there keeps that node's `Source` entry. What is lost from `nature` is preserved
+  in the `label` — `"lower.image"` marks an image either way.
 
   **`label`, unlike `nature`, has no rule: it is per-rule judgment, and carries no
   cross-site guarantee.** Making `Source` structural moved the judgment call from
@@ -929,6 +931,27 @@ bit is what says so until every phase in the pair records.
   Where it stands: **every pair is gated**, from `pre-inference → post-inference`
   down to `post-planning → post-conversion`. Capture is total across the whole
   pipeline.
+
+### The derivation log
+
+A phase run under a `DerivationSession` writes every recording that closes inside it to a
+`DerivationLog` as well as to the table, in every compile. The session exists for a phase whose
+mints inference can raise an error at, and whose mints no lowering-projection node encloses more
+tightly than the construct they encode. Without it, a compile that captures nothing (`compile_to`)
+resolves such an error to the enclosing construct's span or, when the blame node is outside the
+tree, to no span at all. The comprehension phase (`ccl/comprehension.rs`) is the one phase run under
+it.
+
+`fold_derivation` folds the log into a projection over the lowering projection. A mint takes the
+spans of the node its recording named and the recording's own tag; a copy mirrors its origin. The
+steps are read in closing order, so a recording that names or copies a node an inner recording
+minted finds that node already folded. A step whose named node or origin is in neither projection
+contributes no entry. `Blame` consults this projection after the lowering projection and before the
+table.
+
+A recording under the session names no blame and consumes nothing beyond its named node, which
+`log_derivation` debug-asserts. The fold attributes a birth to the named node alone, so either
+channel would make it narrower than the table's attribution.
 
 ## Operator conversion
 

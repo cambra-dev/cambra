@@ -69,6 +69,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
     let recorded_ty = expr.ty.clone();
     let has_ann = expr.user_annotation.is_some();
     let mut ty = match &mut expr.node {
+        TypedExprNode::Comprehension { .. } => {
+            unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
+        }
         TypedExprNode::Lit(lit) => {
             // A literal's type is its singleton, `{Int | __elem == n}`, and the
             // three nodes of that `__elem == n` term are minted *here* — the

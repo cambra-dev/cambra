@@ -439,6 +439,18 @@ fn has_unordered_children(e: &TypedExpr) -> bool {
 fn child_exprs(e: &TypedExpr) -> Vec<&TypedExpr> {
     use super::TypedExprNode as N;
     match &e.node {
+        N::Comprehension {
+            generators,
+            element,
+        } => {
+            let mut v: Vec<&TypedExpr> = Vec::new();
+            for g in generators {
+                v.push(&g.iter);
+                v.extend(&g.guards);
+            }
+            v.push(element);
+            v
+        }
         N::Lit(_)
         | N::Var(_)
         | N::Builtin(_)

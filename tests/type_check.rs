@@ -18,6 +18,7 @@ use std::{cell::RefCell, rc::Rc};
 use cambra::ccl::{
     Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode,
     ccl_utils::walk_refined_predicates,
+    comprehension,
     infer::{
         InferError, LocatedInferError, TypeInferenceContext, check_pre_channelize, infer,
         lit_singleton,
@@ -86,7 +87,7 @@ fn lower_uniquified(module: &chl_ast::Module, lctx: &mut LoweringContext) -> Exp
     let expr = lower_stmts(module, lctx)
         .into_result()
         .expect("lowering failed");
-    uniquify::run(expr)
+    comprehension::run(uniquify::run(expr), lctx.shared_holes())
 }
 
 /// Parse Python module code, lower to CCL, run type inference, and return the
@@ -3574,14 +3575,11 @@ f({c})"
 /// **Domain-preserving** consumption of a conditional collection — a comprehension,
 /// which carries the domain into its own result rather than collapsing it.
 ///
-/// Directly over the `Case` this works: `lower::comprehension` floats the source `Case`
-/// out of the map, so each arm is built as its own data-kinded `Compose` — the
-/// distribution over the witness happens *syntactically*, before any type-level
-/// elimination is needed.
-///
-/// Through a **variable** there is no `Case` to float, so the distribution has to happen
-/// at the type level, and the sum has to survive it: the comprehension's result ranges
-/// over whichever domain the source took, which is the same sum again.
+/// Directly over the `Case` and through a **variable** alike, the comprehension iterates
+/// the source where it stands: `crate::ccl::comprehension` encodes a `Case` source like
+/// any other, and A-normalization names it. The distribution over the witness happens at
+/// the type level, and the sum has to survive it: the comprehension's result ranges over
+/// whichever domain the source took, which is the same sum again.
 ///
 /// No `Type::Sigma` exists at constraint time here — a Σ is built only by an annotation
 /// and by coalesce — so the arms arrive as two `Fun` *lower bounds* on one variable, and
@@ -5480,9 +5478,7 @@ b = box([10, 20]) if d else box([10, 20, 30])
 sum([x + y for x in a for y in b])"
             .trim(),
     );
-    let mut expr = lower_stmts(&stmts, &mut lctx)
-        .into_result()
-        .expect("lowering failed");
+    let mut expr = lower_uniquified(&stmts, &mut lctx);
     infer(&mut expr, &mut ictx).expect("inference failed");
     check_pre_channelize(&expr).expect("post-inference consistency wall must accept the tree");
 

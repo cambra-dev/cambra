@@ -944,15 +944,9 @@ mod tests {
     // max over a variable
     #[case("max(xs)", "Max(xs)")]
     // sum over a list comprehension — input becomes a lambda
-    #[case(
-        "sum([x for x in [10, 20]])",
-        "Sum(λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x))"
-    )]
+    #[case("sum([x for x in [10, 20]])", "Sum([x for x in [10, 20]])")]
     // max over a list comprehension with a body expression
-    #[case(
-        "max([x + 1 for x in [10, 20]])",
-        "Max(λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + 1))"
-    )]
+    #[case("max([x + 1 for x in [10, 20]])", "Max([x + 1 for x in [10, 20]])")]
     fn test_lower_aggregate(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
@@ -984,7 +978,7 @@ mod tests {
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "[Sum(x) for x in λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)]"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

@@ -72,6 +72,7 @@ const ALLOWED_VIA: &[&str] = &[
     "Lower",
     "Anf",
     "MutRead",
+    "Comprehension",
     "Infer",
     "Inline",
     "Transact",

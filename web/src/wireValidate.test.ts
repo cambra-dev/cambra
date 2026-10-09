@@ -9,6 +9,7 @@ import { PANE_IDS, SCHEMA_VERSION, validateSnapshot } from "./wireValidate";
 import arithmeticJson from "./__fixtures__/arithmetic.snapshot.json";
 import polymorphicJson from "./__fixtures__/polymorphic.snapshot.json";
 import listMinJson from "./__fixtures__/list_min.snapshot.json";
+import listCompJson from "./__fixtures__/list_comp.snapshot.json";
 import failedJson from "./__fixtures__/failed.snapshot.json";
 import deferLiftJson from "./__fixtures__/defer_lift.snapshot.json";
 import sourceSharedJson from "./__fixtures__/source_shared.snapshot.json";
@@ -18,6 +19,7 @@ describe("validateSnapshot: real fixtures", () => {
     ["arithmetic", arithmeticJson],
     ["polymorphic", polymorphicJson],
     ["list_min", listMinJson],
+    ["list_comp", listCompJson],
     ["failed", failedJson],
     ["defer_lift", deferLiftJson],
     ["source_shared", sourceSharedJson],
@@ -46,6 +48,16 @@ describe("validateSnapshot: real fixtures", () => {
       expect(it?.tiling).toContain("Source(stdin)");
       expect(it?.inputs).toEqual([]);
     }
+  });
+
+  it("list_comp carries the comprehension phase's tag", () => {
+    // The row exists so the two ALLOWED_VIA lists cannot drift apart unseen,
+    // which holds only while some node on the wire carries this phase's tag.
+    const snap = validateSnapshot(listCompJson);
+    const vias = snap.panes.flatMap((p) =>
+      p.nodes.flatMap((n) => ("rewritten" in n && n.rewritten ? [n.rewritten.via] : [])),
+    );
+    expect(vias).toContain("Comprehension");
   });
 
   it("the failed (degraded) fixture validates with empty panes", () => {

@@ -329,6 +329,34 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
             expr
         }
 
+        // A comprehension is still in surface form here
+        // (`crate::ccl::comprehension` builds its `cast` after this pass), so
+        // each part is treated as the position it becomes.
+        //
+        // **The element is its own block**: it becomes the per-element lambda's
+        // body, and a read there names a binding of its own, per position,
+        // exactly as a lambda body's does.
+        //
+        // **A generator source is an ordinary operand** of the statement
+        // carrying the comprehension. The copy the loop-join predicate takes of
+        // it is taken after this pass, so both copies carry the rewrite and stay
+        // equal.
+        //
+        // **A guard is not rewritten.** It becomes the refinement predicate on
+        // the cast's domain, which is a type, and nothing inside a type is
+        // rewritten here (module docs, "Anything inside a type"). A read left
+        // standing there is what `InferError::MutableInRefinedType` reports.
+        TypedExprNode::Comprehension {
+            generators,
+            element,
+        } => {
+            for g in generators.iter_mut() {
+                g.iter = operand(std::mem::take(&mut g.iter), muts, open, minted);
+            }
+            **element = block(std::mem::take(element), muts);
+            expr
+        }
+
         TypedExprNode::Case {
             scrutinee,
             branches,

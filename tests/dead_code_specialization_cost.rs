@@ -17,6 +17,7 @@ mod alloc_probe;
 
 use alloc_probe::allocations;
 use cambra::ccl::{
+    comprehension,
     infer::{TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
     uniquify,
@@ -52,7 +53,7 @@ fn inference_allocations(code: &str) -> usize {
     // Uniquify outside the measurement window, as the pipeline does before
     // `infer`: inference allocates against α-unique binders in the product, so
     // measuring it on source spellings measures a tree it never sees.
-    let mut expr = uniquify::run(expr);
+    let mut expr = comprehension::run(uniquify::run(expr), lctx.shared_holes());
     let mut ictx = TypeInferenceContext::new();
     let mut typed = false;
     let allocs = allocations(|| typed = infer(&mut expr, &mut ictx).is_ok());

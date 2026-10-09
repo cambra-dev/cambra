@@ -12,6 +12,7 @@
 //! "Sharing is an invariant, not an optimization detail".
 
 use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
+use cambra::ccl::comprehension;
 use cambra::ccl::context::{GlobalContext, compile_program};
 use cambra::ccl::infer::{TypeInferenceContext, infer};
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
@@ -32,7 +33,7 @@ fn infer_source(code: &str) -> Expr {
     let mut expr = lower_stmts(&module, &mut lctx)
         .value
         .expect("lowering should succeed");
-    expr = uniquify::run(expr);
+    expr = comprehension::run(uniquify::run(expr), lctx.shared_holes());
     let mut ictx = TypeInferenceContext::new();
     infer(&mut expr, &mut ictx).expect("inference should succeed");
     expr

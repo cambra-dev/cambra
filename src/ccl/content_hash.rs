@@ -121,9 +121,8 @@ fn collect(e: &TypedExpr, out: &mut HashMap<NodeId, ContentHash>) {
 ///
 /// Never hash the whole `Name`. A binder may be `Raw` in one lowering and
 /// `Unique`/`Synthetic` — carrying a globally-fresh, run-varying `uid` — in
-/// another: lowering uniquifies some subexpressions in place (e.g.
-/// comprehension sources via `uniquify::run`), and uids are non-deterministic
-/// *by design*.
+/// another: a tree hashed before `uniquify` holds raw binders and one hashed
+/// after it holds minted ones, and uids are non-deterministic *by design*.
 ///
 /// Under [`FreeVars::BySpelling`] the identity is the spelling, which is what
 /// survives independent compilation. Its imprecision — two distinct binders
@@ -417,6 +416,16 @@ fn hash_payload<'a>(
 ) {
     use TypedExprNode as N;
     match &e.node {
+        // The shape — how many generators, and how many guards each holds —
+        // plus each generator's binder. The sources, guards and element are
+        // children, reached by the scoped fold.
+        N::Comprehension { generators, .. } => {
+            generators.len().hash(h);
+            for g in generators {
+                hash_binding(&g.target, env, wenv, free, fold, h);
+                g.guards.len().hash(h);
+            }
+        }
         // `Realize` wraps the value it realizes and adds no content of its own beyond the
         // discriminant hashed by the caller.
         N::Realize(v) => hash_payload(v, env, wenv, free, fold, h),

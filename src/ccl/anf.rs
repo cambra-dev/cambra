@@ -119,18 +119,17 @@
 //! collection reads — and it is the shape a programmer writing `tmp = e`
 //! ahead of `out << tmp` gets.
 //!
-//! **A refined `Cast`'s value.** A filtered comprehension lowers to
-//! `cast({_ | __elem ▷ src ▷ 𝑝} ⤇ _, λ __iter_record → __iter_record ▷ src ▷
-//! 𝑓)`, and the two `src` are one term placed twice
-//! (`crate::ccl::lower::comprehension`, Phase 1's mint-before-copy contract):
-//! inference dedups the predicate-side refinement against the body-side one by
-//! structural equality. The predicate rides a type slot, which this pass never
-//! descends into, so naming a sub-expression under the cast rewrites the body
-//! copy alone — and the fresh uid each hoist mints means normalizing the
-//! predicate copy too would still produce a second, unequal name. The two
-//! copies then type at unrelated witnesses. So a refined cast's value is left
-//! exactly as lowering built it; an unrefined one, carrying no predicate to
-//! hold a copy, normalizes like any other operand.
+//! **A refined `Cast`'s value.** `groupby(c, key)` lowers to
+//! `cast({_ | __elem ▷ c ▷ key == __gb_k} ⤇ _, λ __gb_i → __gb_i ▷ c)`
+//! (`crate::ccl::lower::exprs`'s `lower_groupby`), and the two `c` are one term
+//! placed twice: inference dedups the predicate-side refinement against the
+//! body-side one by structural equality. The predicate rides a type slot, which
+//! this pass never descends into, so naming a sub-expression under the cast
+//! rewrites the body copy alone — and the fresh uid each hoist mints means
+//! normalizing the predicate copy too would still produce a second, unequal
+//! name. The two copies then type at unrelated witnesses. So a refined cast's
+//! value is left exactly as lowering built it; an unrefined one, carrying no
+//! predicate to hold a copy, normalizes like any other operand.
 //!
 //! **A value-position `Case`'s scrutinee.** `match c[k]?:` dispatches on a
 //! *dependent* result — the checked lookup's codomain discharges its key
@@ -196,17 +195,28 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
     if is_mut_var(e, muts) {
         return false;
     }
-    matches!(
-        e.node,
+    match &e.node {
         TypedExprNode::Lit(_)
-            | TypedExprNode::Var(_)
-            | TypedExprNode::Source(_)
-            | TypedExprNode::LoadFrom(_)
-            | TypedExprNode::Proj(_)
-            | TypedExprNode::Defer
-            | TypedExprNode::Builtin(_)
-            | TypedExprNode::Lambda { .. }
-    )
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::LoadFrom(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Defer
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Lambda { .. } => true,
+        // A comprehension is atomic when the term it encodes to is — which is
+        // the unfiltered shape, one `Lambda`
+        // ([`crate::ccl::comprehension::encodes_to_lambda`]). Deciding it on the
+        // encoding rather than on the node keeps a comprehension named in
+        // exactly the operand positions its encoding would be, which is what a
+        // dependent source needs: a `Σ`-typed collection bound by a `let` puts
+        // its witness out of scope at every use of the binder.
+        TypedExprNode::Comprehension {
+            generators,
+            element,
+        } => crate::ccl::comprehension::encodes_to_lambda(generators, element),
+        _ => false,
+    }
 }
 
 /// Normalize `e` in a "tail" position — one that is already going to be
@@ -232,6 +242,48 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         out
     };
     match e.node {
+        // A comprehension is still in surface form here —
+        // `crate::ccl::comprehension` turns it into the `cast`/`λ`/`▷`
+        // encoding after this pass — so each part normalizes at the position
+        // it will occupy.
+        //
+        // **Nothing that becomes a predicate normalizes.** A guard becomes the
+        // refinement predicate of the cast `crate::ccl::comprehension` emits,
+        // and a generator source is copied into that same predicate, so both
+        // reach a type slot — the position the `Cast` arm's rule is about, and
+        // one this pass never descends into. A binding sealed inside either
+        // would stand inside a predicate, where it names a binder the type
+        // around it does not bind. A fanned-out element's `Case` guards
+        // ([`crate::ccl::comprehension::fans_out`]) become per-arm cast
+        // predicates the same way, so only that element's arm bodies
+        // normalize.
+        //
+        // Every other element becomes the per-element lambda's body and
+        // normalizes exactly as a `Lambda` body does.
+        //
+        // Nothing hoists *out*: a generator's target scopes over its guards,
+        // every later generator, and the element, and the element's own
+        // bindings seal around it.
+        TypedExprNode::Comprehension {
+            generators,
+            element,
+        } => {
+            // Under **no** mutable variables: a comprehension is a map, so its
+            // element is evaluated once per source position with no write in
+            // between, and a read of an enclosing mutable variable denotes one
+            // value throughout. The hoist a read gets elsewhere exists to keep
+            // it in sequence with the writes beside it, and here there are
+            // none.
+            let element = if crate::ccl::comprehension::fans_out(&generators, &element) {
+                normalize_fan_out_arms(*element)
+            } else {
+                normalize(*element, &Muts::new())
+            };
+            rebuild(TypedExprNode::Comprehension {
+                generators,
+                element: Box::new(element),
+            })
+        }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Source(_)
@@ -257,17 +309,17 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
 
         TypedExprNode::Cast { value, target } => {
             // **The third recognition contract: a refined cast's value is
-            // copied into its own target.** A filtered comprehension lowers to
-            // `cast({_ | __elem ▷ src ▷ 𝑝} ⤇ _, λ __iter_record → __iter_record
-            // ▷ src ▷ 𝑓)`, and the two `src` are one term placed twice
-            // (`crate::ccl::lower::comprehension`, Phase 1's "mint before copy"
-            // contract): inference dedups the predicate-side refinement against
-            // the body-side one by structural equality. The predicate rides a
-            // type slot, which this pass never descends into, so naming a
-            // sub-expression here would rewrite the body copy alone — and the
-            // fresh uid each hoist mints means running this pass on the
-            // predicate copy too would still produce a second, unequal name.
-            // The two copies then type at unrelated witnesses.
+            // copied into its own target.** `groupby(c, key)` lowers to
+            // `cast({_ | __elem ▷ c ▷ key == __gb_k} ⤇ _, λ __gb_i → __gb_i ▷
+            // c)` (`crate::ccl::lower::exprs`'s `lower_groupby`), and the two
+            // `c` are one term placed twice: inference dedups the
+            // predicate-side refinement against the body-side one by structural
+            // equality. The predicate rides a type slot, which this pass never
+            // descends into, so naming a sub-expression here would rewrite the
+            // body copy alone — and the fresh uid each hoist mints means
+            // running this pass on the predicate copy too would still produce a
+            // second, unequal name. The two copies then type at unrelated
+            // witnesses.
             //
             // So a refined cast's value is left as it stands. Only an
             // unrefined one — a `cast` re-viewing a value at a kind, carrying
@@ -505,6 +557,55 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             e.node.kind_name()
         ),
     }
+}
+
+/// Normalize the arm bodies of a comprehension element that
+/// [`crate::ccl::comprehension::fans_out`], leaving every guard as written.
+///
+/// Each guard becomes the refinement predicate of its arm's cast, a type slot
+/// this pass never descends into, while each body becomes that arm's
+/// per-element lambda body. A trailing `true → Case{…}` arm (an `elif` chain)
+/// is flattened into the same partition by the fan-out
+/// ([`crate::ccl::ccl_utils::flatten_trailing_value_case`]), so its inner
+/// `Case` is treated the same way rather than normalized as a body.
+fn normalize_fan_out_arms(e: Expr) -> Expr {
+    let id = e.node_id();
+    let ty = e.ty.clone();
+    let annotation = e.user_annotation;
+    let TypedExprNode::Case {
+        scrutinee,
+        branches,
+    } = e.node
+    else {
+        unreachable!("a fanned-out comprehension element is a value `Case`")
+    };
+    let last = branches.len().saturating_sub(1);
+    let branches = branches
+        .into_iter()
+        .enumerate()
+        .map(|(i, branch)| {
+            let nested = i == last && crate::ccl::ccl_utils::is_trailing_nested_case(&branch);
+            Branch {
+                pattern: branch.pattern,
+                guard: branch.guard,
+                body: if nested {
+                    normalize_fan_out_arms(branch.body)
+                } else {
+                    normalize(branch.body, &Muts::new())
+                },
+            }
+        })
+        .collect();
+    let mut out = Expr::preserve(
+        id,
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        },
+    )
+    .with_ty(ty);
+    out.user_annotation = annotation;
+    out
 }
 
 /// Normalize `e` and, if the result is not atomic, hoist it into one fresh

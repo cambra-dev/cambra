@@ -50,6 +50,11 @@ polymorphic polymorphic
 # own span, identity-linked across every pane, and the degenerate operator graph
 # with one node nothing subscribes. The one to read when asking what the wire looks like at all.
 list_min list_min
+# One unfiltered comprehension, used once: the only row whose nodes carry
+# `via: "Comprehension"`, so a drift between wire_check.rs's ALLOWED_VIA and
+# wireValidate.ts's fails here. A let-bound comprehension would not do:
+# monomorphization re-tags its clone `mono.specialize`.
+list_comp list_comp
 # A deliberate type error -> the degraded (payloadKind: "failed") payload: empty
 # panes and paneLinks, non-empty diagnostics. The only row that is not a
 # successful compile.

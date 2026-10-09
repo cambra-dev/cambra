@@ -305,6 +305,18 @@ pub enum TypedExprNode {
         target: Type,
     },
 
+    /// A comprehension kept in surface form: `[element for … if …]`, one
+    /// [`Generator`] per `for` clause, each holding the guards that follow it.
+    ///
+    /// Lowering builds this node and [`crate::ccl::comprehension`] turns it into
+    /// the `cast`/`λ`/`▷` encoding before inference.
+    Comprehension {
+        /// The generators, in source order. At least one.
+        generators: Vec<Generator>,
+        /// The element expression, under every generator's binder.
+        element: Box<TypedExpr>,
+    },
+
     /// A binary operation.
     BinOp {
         /// The left-hand operand.
@@ -784,6 +796,7 @@ impl TypedExprNode {
             TypedExprNode::Builtin(_) => "Builtin",
             TypedExprNode::Apply { .. } => "Apply",
             TypedExprNode::Cast { .. } => "Cast",
+            TypedExprNode::Comprehension { .. } => "Comprehension",
             TypedExprNode::Realize(_) => "Realize",
             TypedExprNode::BinOp { .. } => "BinOp",
             TypedExprNode::UnaryOp { .. } => "UnaryOp",
@@ -814,6 +827,27 @@ impl TypedExprNode {
             TypedExprNode::Error => "Error",
         }
     }
+}
+
+/// One `for target in iter` clause of a [`TypedExprNode::Comprehension`] and the
+/// `if` clauses that follow it before the next `for`.
+///
+/// `[e for x in xs if p for y in ys]` is two generators: `x` over `xs` guarded by
+/// `p`, then `y` over `ys` with no guard. `target` scopes over `guards`, every
+/// later generator, and the element; `iter` sits outside it.
+///
+/// The CHL clause's `Spanned<AssignTarget>` target becomes a [`TypedBinding`], the
+/// binder form every other CCL binding position uses: destructuring patterns are
+/// resolved by lowering, and CCL carries no spans.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Generator {
+    /// The iteration binder, bound to each element of `iter`.
+    pub target: TypedBinding,
+    /// The iteration source — a `Fun(D, T)` whose domain drives the generator.
+    pub iter: TypedExpr,
+    /// The `Bool`-typed guards, in source order, each over the binders of this
+    /// generator and the ones before it.
+    pub guards: Vec<TypedExpr>,
 }
 
 /// A CCL expression with a type slot on every node.
@@ -1581,6 +1615,20 @@ impl TypedExpr {
     /// of needing the allocating one.
     pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a TypedExpr)) {
         match &self.node {
+            // Each generator's `iter` then its guards, then the element — source
+            // order, which is the order the binders come into scope and what lets
+            // `scope::for_each_scoped_item` pair each child with the generator
+            // prefix covering it.
+            TypedExprNode::Comprehension {
+                generators,
+                element,
+            } => {
+                for g in generators {
+                    f(&g.iter);
+                    g.guards.iter().for_each(&mut f);
+                }
+                f(element.as_ref());
+            }
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
@@ -1770,6 +1818,16 @@ impl TypedExpr {
     /// method.
     pub fn walk_children_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut TypedExpr)) {
         match &mut self.node {
+            TypedExprNode::Comprehension {
+                generators,
+                element,
+            } => {
+                for g in generators {
+                    f(&mut g.iter);
+                    g.guards.iter_mut().for_each(&mut f);
+                }
+                f(element.as_mut());
+            }
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
@@ -1884,6 +1942,9 @@ impl TypedExpr {
     /// is kept in lockstep — a new binder-bearing variant appears in both.
     pub fn walk_binders<'a>(&'a self, mut f: impl FnMut(&'a TypedBinding)) {
         match &self.node {
+            TypedExprNode::Comprehension { generators, .. } => {
+                generators.iter().for_each(|g| f(&g.target));
+            }
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
             | TypedExprNode::MutDecl { binding: param, .. }
@@ -1933,6 +1994,9 @@ impl TypedExpr {
     /// declaration set, same deliberate exhaustiveness.
     pub fn walk_binders_mut(&mut self, mut f: impl FnMut(&mut TypedBinding)) {
         match &mut self.node {
+            TypedExprNode::Comprehension { generators, .. } => {
+                generators.iter_mut().for_each(|g| f(&mut g.target));
+            }
             TypedExprNode::Lambda { param, .. }
             | TypedExprNode::Let { binding: param, .. }
             | TypedExprNode::MutDecl { binding: param, .. }

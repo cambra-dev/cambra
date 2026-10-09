@@ -195,7 +195,12 @@ pub(crate) const PANES: [PaneSpec; 7] = [
     PaneSpec {
         name: "post-inference",
         content: PaneKind::Ir,
-        phases: &[Phase::Anf, Phase::MutRead, Phase::Infer],
+        phases: &[
+            Phase::Anf,
+            Phase::MutRead,
+            Phase::Comprehension,
+            Phase::Infer,
+        ],
         gated: true,
     },
     PaneSpec {

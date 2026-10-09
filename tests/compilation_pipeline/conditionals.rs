@@ -605,11 +605,10 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 // ---------------------------------------------------------------------------
 // Comprehension over a conditional collection
 //
-// `[f(x) for x in (xs if c else ys)]` floats the source `Case` out of the map
-// (`lower::comprehension`) — `Case{gᵢ → [f(x) for x in srcᵢ]}` — with each arm
-// built as a `Compose` (`src ≫ λx→body`) so it carries the source's *data* kind.
-// The arms then join into the Σ at coalesce and compile via the gate fan-out,
-// rather than colliding as compute-kinded lambdas over distinct index domains.
+// `[f(x) for x in (xs if c else ys)]` iterates the source `Case` where it stands:
+// `crate::ccl::comprehension` encodes it like any other generator source, and
+// A-normalization names it. The `Case`'s arms join into the Σ at coalesce and
+// compile via the gate fan-out, rather than colliding over distinct index domains.
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -958,7 +957,7 @@ fn test_conditional_between_comprehensions(#[case] code: &str, #[case] expected:
 //
 // `[a if g(x) else b for x in xs]` — a per-element conditional — fans the source
 // out by each arm's *element-dependent* first-match gate
-// (`lower::comprehension::fan_out_element_case`): `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`.
+// (`crate::ccl::comprehension`'s `fan_out_element_case`): `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`.
 // Each arm is a filtered map (source restricted by the gate, mapped by the arm
 // value); the gates partition the source, so the `++`-union recombines the arms
 // by position into the fully-mapped collection. A `Copair`, so the

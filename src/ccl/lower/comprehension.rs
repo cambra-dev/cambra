@@ -1,541 +1,88 @@
 //! List-comprehension and generator-expression lowering to the CCL
-//! `Lambda`/`Apply` encoding (identity, loop-join, and hash-join shapes).
+//! [`Comprehension`](TypedExprNode::Comprehension) node.
+//!
+//! Lowering groups the clauses into one [`Generator`] per `for`, each holding
+//! the `if` clauses after it. The `cast`/`λ`/`▷` encoding is
+//! [`crate::ccl::comprehension`]'s, which runs after A-normalization. What
+//! lowering settles is what only the surface AST can answer: a target that
+//! names no value, a guard before any generator, and which names a body or
+//! guard reads as a comprehension local rather than as a transactional mutable
+//! variable.
 
 use super::*;
 use crate::{
-    ccl::{
-        BinOpKind, Expr, LogicKind, Name, Type, TypedExprNode,
-        ccl_utils::{
-            flatten_trailing_value_case, make_cast, refined_data_fun, synthesize_arm_predicate,
-        },
-        uniquify,
-    },
-    chl_parser::ast::{AssignTarget, CompClause, Comprehension, Expr as ChlExpr, Spanned},
+    ccl::{Expr, Generator, TypedBinding, TypedExprNode},
+    chl_parser::ast::{CompClause, Comprehension, Expr as ChlExpr, Spanned},
 };
 
-/// The [`Type::SharedHole`] a source annotation uses to *name* its domain, if it
-/// does. Only a name is adoptable: a `Hole` domain is anonymous (nothing else can
-/// refer to it) and a concrete one is already settled.
-fn named_data_domain(ann: &Type) -> Option<Type> {
-    match ann {
-        Type::Fun { domain, .. } => match domain.as_ref() {
-            d @ Type::SharedHole(_) => Some(d.clone()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Lower a CHL list comprehension to the CCL Lambda/Apply encoding.
+/// Lower a CHL list comprehension or generator expression to the CCL
+/// [`Comprehension`](TypedExprNode::Comprehension) node.
 ///
-/// Handles three cases based on the number of generators and predicates:
-///
-/// **Single generator, no predicate** — identity encoding:
-/// ```text
-/// λ __iter_record → __iter_record ▷ lower(source) ▷ (λ var → lower(body))
-/// ```
-///
-/// **Multiple generators / non-equality predicates** — loop-join encoding.
-/// The outer lambda carries a [`Refinement`](crate::ccl::Refinement) predicate
-/// with the combined guard expression; the runtime filters via a correlation vector:
-/// ```text
-/// λ __iter_record : {T | pred} →
-///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
-///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
-/// ```
-///
-/// **Two generators, single equality predicate** — hash-join encoding.
-/// Detected by [`try_extract_ccl_equality_join`] on the lowered predicate.
-/// The outer lambda carries the same [`Refinement`](crate::ccl::Refinement)
-/// predicate (an equality `build_var == probe_var`); join planning
-/// (`crate::ccl::join_plan`) recognises the equality shape and translates it to
-/// an O(N+M) hash-join-based restriction:
-/// ```text
-/// λ __iter_record : {T | build_var == probe_var} →
-///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
-///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
-/// ```
-///
-/// All lambdas are produced with `param.ty = Type::Hole`; [`crate::ccl::infer`]
-/// converts the placeholder to a registered inference variable and fills in the
-/// type annotations before compilation.
-///
-/// TODO this currently has an assumption that all generator variables have distinct names.
-/// This might be a reasonable assumption that we should enforce, or we should fix scoping to
-/// handle that case.
+/// Generators stay in source order. Each generator's target shadows a like-spelled
+/// transactional mutable variable over the clauses to its right and over the
+/// element, which is the scope [`crate::ccl::scope`] gives it: `[x for x in
+/// xs]` reads `x` in the element as the comprehension local.
 pub(super) fn lower_list_comp(
     comp: &Comprehension,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // CHL's comprehension stores clauses (`for ... in ...` and `if ...`) in a
-    // single flat list, interleaved in source order. Regroup into one
-    // generator per `for`, each followed by any adjacent `if`s, so the rest
-    // of this routine can operate on (target, iter, [guards]) triples.
-    let generators = group_comp_clauses(&comp.clauses)?;
-
-    // ---- Phase 1: Lower each generator's source and register its loop variable ----
-    // We keep the source operators and index domains for later use when building the
-    // Apply/Lambda chains.  Each loop variable is pushed onto the lowering scope so
-    // that body and predicate expressions can reference it.
-    let mut gen_sources: Vec<Expr> = Vec::new();
-    let mut gen_iter_vars: Vec<String> = Vec::new();
-    let mut gen_spans: Vec<Span> = Vec::new();
-
-    for (target, iter, _) in generators.iter() {
-        // Mint binder uids inside the source *now*, before Phase 5/6 clone it
-        // into both the body chain and the loop-join predicate: copies of a
-        // minted tree stay structurally equal (uids are preserved by
-        // cloning), which is what lets inference dedup the predicate-side
-        // refinements against the body-side ones. See the "mint before
-        // copy" contract in `crate::ccl::uniquify`.
-        let source = uniquify::run(lower_expr(iter, ctx)?);
-        let var_name = extract_name_target(target, "comprehension target")?;
-        gen_iter_vars.push(var_name);
-        gen_sources.push(source);
-        gen_spans.push(iter.span);
-    }
-
-    // ---- Phase 2: Lower body and all predicates to CCL -------------------------
-    // The generator variables are in scope over the element and guards — shadow
-    // them so a body/guard read of a like-named transactional mutable variable is read
-    // as the comprehension local, not gated as an out-of-block mutable variable read
-    // (`[x for x in xs]`).
-    let chl_preds: Vec<&Spanned<ChlExpr>> = generators
-        .iter()
-        .flat_map(|(_, _, ifs)| ifs.iter().copied())
-        .collect();
-    let (body, lowered_preds) = ctx.with_shadowed(gen_iter_vars.clone(), |ctx| {
-        let body = lower_expr(&comp.element, ctx)?;
-        // We hold on to the original CHL guard nodes only to build human-readable
-        // description strings; all detection logic operates on the lowered CCL.
-        let lowered_preds: Vec<Expr> = chl_preds
-            .iter()
-            .map(|e| lower_expr(e, ctx))
-            .collect::<Result<_, _>>()?;
-        Ok::<(Expr, Vec<Expr>), LoweringError>((body, lowered_preds))
-    })?;
-
-    // Combine all `if` guards into a single loop-join predicate (used when hash
-    // join is not applicable — non-equality, 3+ generators, or multiple predicates).
-    let mut pred_op: Option<Expr> = None;
-    for (_chl_pred, lowered) in chl_preds.iter().zip(lowered_preds) {
-        pred_op = Some(match pred_op {
-            Some(lhs) => Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered),
-            None => lowered,
-        });
-    }
-
-    // Sources for the loop-join restriction lambda are cloned from the
-    // already-lowered gen_sources (Phase 5 drains it, so clone here).
-    let mut pred_sources: Vec<Expr> = if pred_op.is_some() {
-        gen_sources.clone()
-    } else {
-        Vec::new()
-    };
-
-    // ---- Phase 4: Build the outer iteration variable ------------------------------
-    // Single generator: iterate directly over that source's index domain.
-    // Multiple generators: pack all index domains into a Record so the body can
-    // address each one via RecordField and the runtime produces the cartesian
-    // product.
-    // With a predicate: wrap in Restricted so the runtime filters via a correlation
-    // vector computed from the predicate (see Phase 6).
-    let single_gen = generators.len() == 1;
-    let outer_var = "__iter_record";
-
-    // Helper: build the index argument for generator `i` — untagged, for the
-    // Phase-6 loop-join predicate chain only (predicate-position nodes live in
-    // a type slot outside the `walk_children` domain and stay unseeded).
-    // Single-gen: a bare VarRef to the outer variable.
-    // Multi-gen: a RecordField projection of the i-th field from the outer record.
-    let make_idx_arg = |var: Name, i: usize| -> Expr {
-        let vref = Expr::var(var);
-        if single_gen {
-            vref
-        } else {
-            Expr::apply(vref, Expr::proj_index(i))
-        }
-    };
-
-    // ---- Phase 4.6: Fan out a value-`Case` *element* into filtered maps ----------
-    // `[a if g(x) else b for x in xs]` — a comprehension whose *element* is a
-    // per-element conditional — lowers with a value-`Case` body. The `Case`
-    // cannot float out (its guards reference the comprehension variable `x`), so
-    // instead fan out the source by each arm's first-match gate:
-    // `[eᵢ if gᵢ … for x in xs]` ⟹ `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`,
-    // `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm restricts the source by its
-    // (element-dependent) gate — the ordinary filter refinement — and maps by
-    // that arm's value; the gates partition the source, so the union recombines
-    // the arms by position into the fully-mapped collection. A `Copair`
-    // (not a `Case`), so the compute-kinded per-arm maps do not need to join.
-    // Single generator, no comprehension filter; the value arms may reference `x`.
-    if single_gen
-        && pred_op.is_none()
-        && matches!(
-            &body.node,
-            TypedExprNode::Case { scrutinee: None, branches }
-                if branches.iter().all(|b| b.pattern.is_none())
-        )
-    {
-        let source = gen_sources.pop().expect("single generator has one source");
-        return Ok(fan_out_element_case(
-            source,
-            &gen_iter_vars[0],
-            outer_var,
-            body,
-            comp.element.span,
-            ctx,
-        ));
-    }
-
-    // ---- Phase 5: Build the body as a nested Apply/Lambda chain ------------------
-    // Working innermost-first (reverse order) we wrap the accumulated expression:
-    //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
-    // All chain plumbing is manufactured encoding of the comprehension rule,
-    // spanned to its generator's iterable.
-    // An **unfiltered single-generator** comprehension iterates *exactly* its
-    // source's domain, and nothing in the lowered shape says so: the `▷` records
-    // only `__iter_record <: dom(source)`, the direction an argument flows. One
-    // `SharedHole` states the equality, on the two positions the claim is about —
-    // the comprehension's own `data_fun` domain and the source's. Both are
-    // concrete `Data`, and a data domain is *invariant*
-    // (`src/ccl/design/type-inference.md`, "Data domains are invariant"), so the
-    // one-way `inferred <: ann` edge each annotation records becomes two and the
-    // two domains are identified rather than merely ordered.
-    //
-    // Restricted to this shape because it is the only one where the equality
-    // holds: a *filtered* comprehension's domain is `{D | pred}`, a strict subset
-    // of its source's, and a *multi-generator* one's is a product of all of them.
-    // Those keep their `Hole` and stay ordered by the argument edge alone.
-    //
-    // A source that already *names* its domain keeps that name — a nested
-    // comprehension, whose own annotation carries the id minted here. Adopting it
-    // says the stronger thing (these two iterate one domain) where minting a second
-    // id would overwrite the annotation carrying it. A `groupby` source names no
-    // domain: its key binder states the keys directly, as membership in what its key
-    // morphism produces, so there is nothing for a second position to share.
-    let iter_dom = (single_gen && pred_op.is_none()).then(|| {
-        gen_sources[0]
-            .user_annotation
-            .as_ref()
-            .and_then(named_data_domain)
-            .unwrap_or_else(|| ctx.fresh_shared_hole())
-    });
-    // **The result is a collection built over its sources.** Each generator's source gets
-    // a kind of its own and the result records that it is built over it: a comprehension
-    // binds one index position per index position of each source, which is a
-    // concatenation and not a join. One variable shared across the generators says
-    // something else — that they are one kind — which conflates two sources into one
-    // index, and leaves the second index to be recovered from the shape of the domain
-    // tuple by whatever walks it.
-    let result_kind = crate::ccl::ty::FunKind::fresh_data();
-    let crate::ccl::ty::FunKind::Var(result_kv) = &result_kind else {
-        unreachable!("fresh_data is a kind variable")
-    };
-    let result_kv = Rc::clone(result_kv);
-    let lc = "lower.comprehension";
-    let mut body_expr: Expr = body;
-    for (i, (iter_var, source)) in gen_iter_vars
-        .iter()
-        .zip(gen_sources.drain(..))
-        .enumerate()
-        .rev()
-    {
-        let gspan = gen_spans[i];
-        let idx_arg = if single_gen {
-            ctx.tag_machinery(Expr::var(Name::raw(outer_var)), gspan, lc)
-        } else {
-            let vref = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), gspan, lc);
-            let proj = ctx.tag_machinery(Expr::proj_index(i), gspan, lc);
-            ctx.tag_machinery(Expr::apply(vref, proj), gspan, lc)
-        };
-        // **A comprehension is a collection built over its generators.** It binds one
-        // position per position of each source, so this is a *built over* relation and not a
-        // bound: a bound would claim the result is another spelling of its source, pair
-        // positions that are not the same position, and give a multi-generator comprehension
-        // the arity of its widest source rather than the sum.
-        //
-        // **Every generator, including one that needs no stamp.** Positions are absolute, so
-        // a generator left out shifts every later one onto the wrong source; a source that
-        // contributes no position has to contribute that, not nothing.
-        //
-        // In **generator order**: the loop nests the applications back to front, and the
-        // outermost binder is the first generator's, so a source goes in front of the ones
-        // already recorded.
-        //
-        // The two branches differ in where the kind comes from, and in whether the shared
-        // domain still has to be stamped: an annotation naming a domain is where the id
-        // came from, and re-stamping would discard it.
-        let source = match source.user_annotation.as_ref().and_then(Type::fun_kind) {
-            Some(annotated) => {
-                result_kv.contributes_first(annotated.clone());
-                // An annotation states a kind, a domain, or both, and only the domain
-                // decides whether the id is already there. A source whose annotation
-                // states the kind alone leaves `domain: Hole`, so `named_data_domain`
-                // found no id to adopt and the shared one minted above still has to reach
-                // it — without that the two domains are ordered by the argument edge and
-                // nothing says they are one, which is what lets the two readings of one
-                // invariant position diverge.
-                //
-                // The test is the annotation's shape, `Type::data_fun(Hole, Hole)`, and
-                // not `groupby` in particular: a comprehension can iterate a `groupby`,
-                // the `set` / `map` re-keying constructors (`lower_rekeyed`), or a
-                // conditional comprehension's arm, each annotated that way. The equation
-                // holds for all of them, an unfiltered single-generator comprehension's
-                // domain being its source's domain whatever shape the source has.
-                match (&iter_dom, source.user_annotation.clone()) {
-                    (
-                        Some(shared),
-                        Some(Type::Fun {
-                            name,
-                            fun_kind,
-                            domain,
-                            codomain,
-                        }),
-                    ) if matches!(*domain, Type::Hole) => source.with_user_annotation(Type::Fun {
-                        name,
-                        fun_kind,
-                        domain: Box::new(shared.clone()),
-                        codomain,
-                    }),
-                    _ => source,
-                }
-            }
-            None => {
-                assert!(
-                    source.user_annotation.is_none(),
-                    "a generator source's annotation is a function type, found {:?}",
-                    source.user_annotation
-                );
-                let src_kind = crate::ccl::ty::FunKind::fresh_data();
-                let src_dom = iter_dom.clone().unwrap_or(Type::Hole);
-                result_kv.contributes_first(src_kind.clone());
-                source.with_user_annotation(Type::Fun {
-                    name: None,
-                    fun_kind: src_kind,
-                    domain: Box::new(src_dom),
-                    codomain: Box::new(Type::Hole),
-                })
-            }
-        };
-        let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
-        let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
-        body_expr = ctx.tag_machinery(Expr::apply(indexed_source, per_elem), gspan, lc);
-    }
-    // One contribution per generator, which is what makes position *i* of the result the
-    // position `source_of` resolves it to.
-    assert_eq!(
-        result_kv.built_over().len(),
-        gen_iter_vars.len(),
-        "a comprehension is built over one kind per generator"
+    let mut generators = Vec::new();
+    let element = lower_clauses(&comp.clauses, &comp.element, &mut generators, ctx)?;
+    debug_assert!(
+        !generators.is_empty(),
+        "the CHL parser requires at least one comprehension clause, and a leading guard \
+         is rejected above, so a comprehension has a generator"
     );
-
-    // ---- Phase 6: Attach restriction ----------
-    if let Some(pred_op) = pred_op {
-        // Non-equality or multi-predicate: loop-join restriction predicate.
-        // The refinement's element is the implicit REFINEMENT_BINDER (the
-        // record over which the correlation vector ranges); the predicate is a
-        // bare boolean expression, not a lambda.
-        let mut pred_expr: Expr = pred_op;
-        for (i, (iter_var, pred_source)) in gen_iter_vars
-            .iter()
-            .zip(pred_sources.drain(..))
-            .enumerate()
-            .rev()
-        {
-            pred_expr = Expr::apply(
-                Expr::apply(make_idx_arg(Name::elem(), i), pred_source),
-                Expr::lambda(iter_var, Type::Hole, pred_expr),
-            );
-        }
-        // A refined parameter lowers to a `cast(refined_data_fun, λ outer_var →
-        // body_expr)` — a pure type-level assertion of the predicate-refined
-        // domain.  The refinement is carried by the cast's target type; the
-        // Cast Apply arm in `infer::emit` constructs the refined result
-        // from it, and the generic annotation handler infers the predicate's
-        // sub-expressions.
-        // The outer lambda and its cast wrapper are chain plumbing too;
-        // whichever of them is the comprehension's root is re-tagged as the
-        // expression's direct image by `lower_expr`.
-        let element_span = comp.element.span;
-        // The lambda under the cast is the *same collection* the cast re-views,
-        // so it carries the same `Data` provenance stamp the unfiltered branch
-        // puts on its lambda (below). The cast target's `Data` alone is not
-        // enough: a cast re-views its value at the target's kind, so a `Compute`
-        // lambda underneath is a second, contradictory answer to what this function
-        // is — one that survives into elimination, where the point-free form of
-        // the collection inherits the lambda's kind and reads as a capability.
-        let unrefined_lambda = ctx.tag_machinery(
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
-                name: None,
-                fun_kind: result_kind.clone(),
-                domain: Box::new(Type::Hole),
-                codomain: Box::new(Type::Hole),
-            }),
-            element_span,
-            lc,
-        );
-        ctx.tag_predicate(&pred_expr, element_span, "lower.comp_filter_pred");
-        let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind.clone());
-        Ok(ctx.tag_machinery(make_cast(unrefined_lambda, target_ty), element_span, lc))
-    } else {
-        // A comprehension is a **data collection** (a map over its source's
-        // domain): stamp it `Data` by provenance. The `data_fun(_, _)` annotation
-        // is a concrete-kind stamp (`emit_node`), the unfiltered counterpart of
-        // the filtered branch's `refined_data_fun` (also `Data`) cast target — so a
-        // comprehension is data-by-construction, not by a domain guess. (The
-        // filtered branch above stamps its own lambda the same way, under a cast
-        // whose `refined_data_fun` target then refines the domain.)
-        Ok(ctx.tag_machinery(
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
-                name: None,
-                fun_kind: result_kind,
-                domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
-                codomain: Box::new(Type::Hole),
-            }),
-            comp.element.span,
-            lc,
-        ))
-    }
+    Ok(Expr::new(TypedExprNode::Comprehension {
+        generators,
+        element: Box::new(element),
+    }))
 }
 
-/// Hand out a tree copy of `origin` for one arm of a fan-out. Every arm is a
-/// sibling, including the first: a fan-out places the same subtree under several
-/// arms and no arm is privileged. The copy sink records each copy as a `Copy` of
-/// the origin, so every arm's attribution mirrors the original's.
+/// Lower `rest` onto `out` and then `element`, each under the generators to its
+/// left.
 ///
-/// Keeping the first arm's ids was measured at 30 ids saved over the whole
-/// pipeline suite, max subtree 5 — which does not pay for a second code path.
-fn fan_out_copy(origin: &Expr, label: &'static str) -> Expr {
-    use crate::ccl::provenance::copy_frame;
-    let _frame = copy_frame(label);
-    origin.clone()
-}
-
-/// Fan out a single-generator comprehension whose *element* is a value-`Case`
-/// into a union of filtered maps: `[eᵢ if gᵢ … for x in src]` ⟹
-/// `⧺ᵢ [eᵢ for x in src if π̂ᵢ]`, first-match `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm is a
-/// filtered map — the source restricted on its domain by the arm's
-/// (element-dependent) gate (a `cast` carrying the refinement, exactly the shape
-/// Phase 6 builds for a comprehension `if`-filter), composed with the arm's value
-/// map. The gates partition the source, so the `++`-union recombines the arms by
-/// position into the fully-mapped collection.
-fn fan_out_element_case(
-    source: Expr,
-    iter_var: &str,
-    outer_var: &str,
-    body: Expr,
-    span: Span,
+/// Recursive rather than a loop because a generator's target scopes over
+/// everything after it and [`LoweringContext::with_shadowed`] is a scoped
+/// bracket: the recursion *is* the nesting.
+fn lower_clauses(
+    rest: &[CompClause],
+    element: &Spanned<ChlExpr>,
+    out: &mut Vec<Generator>,
     ctx: &mut LoweringContext,
-) -> Expr {
-    let TypedExprNode::Case { branches, .. } = body.node else {
-        unreachable!("fan_out_element_case requires a Case body")
+) -> Result<Expr, LoweringError> {
+    let Some((clause, rest)) = rest.split_first() else {
+        return lower_expr(element, ctx);
     };
-    // Flatten a nested `elif` element (`a if p else b if q else c`, a trailing
-    // `true → Case{…}`) into one flat partition, so each arm is a plain value.
-    let branches = flatten_trailing_value_case(branches);
-    let mut prior_guards: Vec<Expr> = Vec::new();
-    // The source subtree is placed once per arm in the element map and once more in
-    // that arm's gate, so every use after the first must be a freshened copy.
-    let arms: Vec<Expr> = branches
-        .into_iter()
-        .map(|b| {
-            let gate = synthesize_arm_predicate(&b.guard, &prior_guards);
-            prior_guards.push(b.guard);
-            // Element map: `λ __idx → __idx ▷ src ▷ (λ x → eᵢ)`. Every node here is
-            // manufactured encoding of the fan-out rule — the arm *bodies* keep their
-            // own images, recorded when they were lowered.
-            let ec = "lower.comp_elem_case";
-            let idx_var = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), span, ec);
-            let arm_src = fan_out_copy(&source, "lower.comp_elem_case_source");
-            let read = ctx.tag_machinery(Expr::apply(idx_var, arm_src), span, ec);
-            let arm_body = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, b.body), span, ec);
-            let applied = ctx.tag_machinery(Expr::apply(read, arm_body), span, ec);
-            // The arm *is* a filtered comprehension — a collection — so it carries
-            // the `Data` stamp, like every other comprehension lambda. The cast
-            // below refines its domain by the arm's gate; the target's `Data`
-            // does not reach the lambda underneath.
-            let elem_map = ctx.tag_machinery(
-                Expr::lambda(outer_var, Type::Hole, applied)
-                    .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
-                span,
-                ec,
-            );
-            // Gate over the source domain: `__elem ▷ src ▷ (λ x → π̂ᵢ)` — the bare
-            // refinement predicate, matching Phase 6's loop-join filter shape.
-            let gate_on_source = Expr::apply(
-                Expr::apply(
-                    Expr::var(Name::elem()),
-                    fan_out_copy(&source, "lower.comp_elem_case_source"),
-                ),
-                Expr::lambda(iter_var, Type::Hole, gate),
-            );
-            // `gate_on_source` rides the cast target's refinement predicate — a
-            // type slot outside the `walk_children` walk — so nothing else will
-            // record its interior, and `collect_tree_ids` now enumerates it.
-            // Sweep it (`design/provenance.md`, "Walking the ids", crossing 1).
-            ctx.tag_predicate(&gate_on_source, span, "lower.comp_arm_gate_pred");
-            let target = refined_data_fun(
-                Type::Hole,
-                gate_on_source,
-                Type::Hole,
-                crate::ccl::ty::FunKind::fresh_data(),
-            );
-            ctx.tag_machinery(make_cast(elem_map, target), span, ec)
-        })
-        .collect();
-    // A one-arm value `Case` (degenerate) is just the single filtered map.
-    if arms.len() == 1 {
-        arms.into_iter().next().expect("checked len == 1")
-    } else {
-        ctx.tag_machinery(Expr::copair(arms), span, "lower.comp_elem_case")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Comprehension regrouping
-// ---------------------------------------------------------------------------
-
-/// One generator clause regrouped from a CHL comprehension's flat clause list:
-/// `(target, iter, ifs)`, where `ifs` is the sequence of `if`-guards that
-/// followed this `for` in source order before the next `for`.
-type CompGenerator<'a> = (
-    &'a Spanned<AssignTarget>,
-    &'a Spanned<ChlExpr>,
-    Vec<&'a Spanned<ChlExpr>>,
-);
-
-/// Regroup the flat CHL comprehension clause list into one [`CompGenerator`]
-/// per `for` clause.
-///
-/// CHL stores comprehension clauses (`for ... in ...` and `if ...`) in a
-/// single list in source order; the downstream lowering logic expects each
-/// generator's guards bundled with it, so we walk the clauses and attach each
-/// `If` to its most recent `For`. A leading `If` (before any `For`) is a
-/// parse-level error category but is defensively rejected here too.
-fn group_comp_clauses(clauses: &[CompClause]) -> Result<Vec<CompGenerator<'_>>, LoweringError> {
-    let mut out: Vec<CompGenerator<'_>> = Vec::new();
-    for clause in clauses {
-        match clause {
-            CompClause::For { target, iter } => out.push((target, iter, Vec::new())),
-            CompClause::If(guard) => {
-                let Some(last) = out.last_mut() else {
-                    return Err(LoweringError::unsupported(
-                        guard.span,
-                        "comprehension `if` clause must follow a `for` clause",
-                    ));
-                };
-                last.2.push(guard);
+    match clause {
+        CompClause::For { target, iter } => {
+            let iter = lower_expr(iter, ctx)?;
+            let name = extract_name_target(target, "comprehension target")?;
+            out.push(Generator {
+                target: TypedBinding::new_unannotated(name.clone()),
+                iter,
+                guards: Vec::new(),
+            });
+            ctx.with_shadowed([name], |ctx| lower_clauses(rest, element, out, ctx))
+        }
+        CompClause::If(guard) => {
+            // A guard attaches to the generator before it, so one standing
+            // ahead of every generator attaches to nothing. The parser accepts
+            // the shape; this is where it is refused.
+            if out.is_empty() {
+                return Err(LoweringError::unsupported(
+                    guard.span,
+                    "comprehension `if` clause must follow a `for` clause",
+                ));
             }
+            let guard = lower_expr(guard, ctx)?;
+            out.last_mut()
+                .expect("checked non-empty above")
+                .guards
+                .push(guard);
+            lower_clauses(rest, element, out, ctx)
         }
     }
-    // The CHL `comp_clauses` parser uses `.at_least(1)`, so the input list is
-    // never empty in a parsed comprehension.
-    assert!(
-        !out.is_empty(),
-        "group_comp_clauses: empty clause list (parser invariant violated)"
-    );
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -545,40 +92,35 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use rstest::rstest;
 
-    // -----------------------------------------------------------------------
-    // List comprehension tests
-    // -----------------------------------------------------------------------
+    // Lowering stops at the surface node: generators in source order, each
+    // holding its guards, and nothing encoded. The `cast`/`λ`/`▷` encoding these become
+    // is `crate::ccl::comprehension`'s, and is tested there.
 
     #[rstest]
-    // Identity: element passes through unchanged; lambdas are unannotated (infer fills them in).
-    #[case(
-        "[x for x in [10, 20]]",
-        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x)"
-    )]
-    // Constant body: loop variable unused in body.
-    #[case(
-        "[42 for x in [10, 20]]",
-        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → 42)"
-    )]
-    // BinOp body: loop variable used in arithmetic.
-    #[case(
-        "[x + 2 for x in [10, 20]]",
-        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + 2)"
-    )]
-    // Outer capture: y is captured from an enclosing let binding.
+    // Identity: the element passes through unchanged.
+    #[case("[x for x in [10, 20]]", "[x for x in [10, 20]]")]
+    // Constant element: the generator variable is unused.
+    #[case("[42 for x in [10, 20]]", "[42 for x in [10, 20]]")]
+    // BinOp element: the generator variable is used in arithmetic.
+    #[case("[x + 2 for x in [10, 20]]", "[x + 2 for x in [10, 20]]")]
+    // Outer capture: `y` comes from an enclosing let binding.
     #[case(
         "\
 y = 5
 [x + y for x in [10, 20]]",
         "\
 let y = 5
-in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
+in [x + y for x in [10, 20]]"
     )]
-    // Nested comprehension: all lambdas unannotated; infer annotates them in a
-    // subsequent pass.
+    // Nested comprehension: the inner one is the outer one's generator source.
     #[case(
         "[y for y in [x for x in [10, 20]]]",
-        "λ __iter_record → __iter_record ▷ (λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x)) ▷ (λ y → y)"
+        "[y for y in [x for x in [10, 20]]]"
+    )]
+    // Each guard rides the generator before it, and renders where it was written.
+    #[case(
+        "[x + y for x in [1, 2] if x > 1 for y in [3] if y < 4]",
+        "[x + y for x in [1, 2] if x > 1 for y in [3] if y < 4]"
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
@@ -588,20 +130,10 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         assert_eq!(symbolic(&ccl), expected);
     }
 
-    // -----------------------------------------------------------------------
-    // Generator expression tests
-    // -----------------------------------------------------------------------
-
     #[rstest]
-    // Generator expression: identical output to equivalent list comp.
-    #[case(
-        "(x for x in [10, 20])",
-        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x)"
-    )]
-    #[case(
-        "(x + 2 for x in [10, 20])",
-        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + 2)"
-    )]
+    // A generator expression lowers identically to the equivalent list comp.
+    #[case("(x for x in [10, 20])", "[x for x in [10, 20]]")]
+    #[case("(x + 2 for x in [10, 20])", "[x + 2 for x in [10, 20]]")]
     fn test_lower_generator_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
@@ -617,11 +149,6 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         let ccl = lower_stmts(&stmts, &mut ctx)
             .into_result()
             .expect("lowering failed");
-        // The source node should appear in the symbolic output.
-        assert!(
-            symbolic(&ccl).contains("source(src)"),
-            "expected source(src) in output, got: {}",
-            symbolic(&ccl)
-        );
+        assert_eq!(symbolic(&ccl), "[x for x in source(src)]");
     }
 }

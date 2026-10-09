@@ -26,6 +26,11 @@
 //! - [`Case`](TypedExprNode::Case) — each branch's `pattern.binding` scopes
 //!   over that branch's `guard` and `body`, and nothing else; the scrutinee and
 //!   the other branches are outside it.
+//! - [`Comprehension`](TypedExprNode::Comprehension) — each generator's
+//!   `target` scopes over its own `guards`, every later generator, and
+//!   `element`; its own `iter` sits outside it. The covering scope is therefore
+//!   a generator *prefix* ([`Binders::Generators`]), and the prefixes nest, so
+//!   one binder appears in several of a comprehension's scopes.
 //! - [`Feed`](TypedExprNode::Feed) / [`Define`](TypedExprNode::Define) /
 //!   [`MutWrite`](TypedExprNode::MutWrite) — the `name` field is a *use* of the
 //!   defer handle / mutable variable bound elsewhere, not a binder. It is
@@ -58,6 +63,11 @@
 //!   hands it the change point directly, as a [`ScopedItemMut::Scope`] item.
 //! - **Binders are innermost-last** within a scope — the order a consumer that
 //!   maintains a De Bruijn environment needs to push them in.
+//! - **A scope lists every binder covering its children**, including ones an
+//!   earlier scope of the same node already listed. A `Comprehension` is the
+//!   one node whose scopes nest: each extends the one before it, and its last
+//!   scope lists exactly [`TypedExpr::walk_binders`]. Every other node's scopes
+//!   are disjoint, and their concatenation is `walk_binders`.
 //!
 //! # What does *not* live here
 //!
@@ -68,7 +78,7 @@
 //! predicates, `is_free_in_value` deliberately does not. This module is about
 //! the *term* spine's binding structure only, matching `walk_children`.
 
-use super::{Name, TypedBinding, TypedExpr, TypedExprNode};
+use super::{Generator, Name, TypedBinding, TypedExpr, TypedExprNode};
 
 /// The binders a node puts in scope over one of its children.
 ///
@@ -95,6 +105,15 @@ pub enum Binders<'a> {
     /// A whole mutually-recursive group: every member scopes over every child
     /// the group covers (see [`LetRec`](TypedExprNode::LetRec)).
     Group(&'a [(TypedBinding, TypedExpr)]),
+    /// The targets of a **prefix** of a
+    /// [`Comprehension`](TypedExprNode::Comprehension)'s generators: the
+    /// generators whose binders are already open at the child's position.
+    ///
+    /// A prefix rather than a flat set because a comprehension's binders come
+    /// into scope one generator at a time — `[e for x in xs for y in f(x)]`
+    /// has `f(x)` under `x` and `e` under both — and slicing the generator list
+    /// is what states that without copying the binders out of it.
+    Generators(&'a [Generator]),
 }
 
 impl<'a> Binders<'a> {
@@ -105,6 +124,7 @@ impl<'a> Binders<'a> {
             Binders::Ambient => false,
             Binders::One(b) => &b.name == name,
             Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
+            Binders::Generators(gs) => gs.iter().any(|g| &g.target.name == name),
         }
     }
 
@@ -112,12 +132,16 @@ impl<'a> Binders<'a> {
     /// environment stack pushes them in.
     pub fn iter(self) -> impl Iterator<Item = &'a TypedBinding> {
         const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
-        let (one, group) = match self {
-            Binders::Ambient => (None, EMPTY),
-            Binders::One(b) => (Some(b), EMPTY),
-            Binders::Group(g) => (None, g),
+        const NO_GENERATORS: &[Generator] = &[];
+        let (one, group, generators) = match self {
+            Binders::Ambient => (None, EMPTY, NO_GENERATORS),
+            Binders::One(b) => (Some(b), EMPTY, NO_GENERATORS),
+            Binders::Group(g) => (None, g, NO_GENERATORS),
+            Binders::Generators(gs) => (None, EMPTY, gs),
         };
-        one.into_iter().chain(group.iter().map(|(b, _)| b))
+        one.into_iter()
+            .chain(group.iter().map(|(b, _)| b))
+            .chain(generators.iter().map(|g| &g.target))
     }
 
     /// Does this scope introduce nothing? True for [`Binders::Ambient`] — the
@@ -131,6 +155,7 @@ impl<'a> Binders<'a> {
             Binders::Ambient => true,
             Binders::One(_) => false,
             Binders::Group(g) => g.is_empty(),
+            Binders::Generators(gs) => gs.is_empty(),
         }
     }
 
@@ -147,6 +172,9 @@ impl<'a> Binders<'a> {
             (Binders::Ambient, Binders::Ambient) => true,
             (Binders::One(a), Binders::One(b)) => std::ptr::eq(a, b),
             (Binders::Group(a), Binders::Group(b)) => {
+                a.as_ptr() == b.as_ptr() && a.len() == b.len()
+            }
+            (Binders::Generators(a), Binders::Generators(b)) => {
                 a.as_ptr() == b.as_ptr() && a.len() == b.len()
             }
             _ => false,
@@ -209,7 +237,39 @@ where
         f(ScopedItem::Child { expr, binders });
     }
 
+    /// Yield a comprehension child under the targets of `open_generators`, or
+    /// in the node's own scope when no generator is open yet.
+    fn comp_child<'a, F: FnMut(ScopedItem<'a>) + ?Sized>(
+        f: &mut F,
+        expr: &'a TypedExpr,
+        open_generators: &'a [Generator],
+    ) {
+        if open_generators.is_empty() {
+            open(f, expr);
+        } else {
+            under(f, expr, Binders::Generators(open_generators));
+        }
+    }
+
     match &e.node {
+        // A generator's target scopes over its own guards, every later
+        // generator, and the element; its own `iter` sits outside it. So
+        // generator 𝑘's `iter` is under the first 𝑘 targets, its guards under
+        // the first 𝑘 + 1, and the element under all of them. A generator's
+        // guards share a scope with the next generator's `iter`, and the last
+        // generator's guards with the element.
+        N::Comprehension {
+            generators,
+            element,
+        } => {
+            for (k, g) in generators.iter().enumerate() {
+                comp_child(f, &g.iter, &generators[..k]);
+                for guard in &g.guards {
+                    comp_child(f, guard, &generators[..=k]);
+                }
+            }
+            comp_child(f, element, generators);
+        }
         // ---- Leaves ---------------------------------------------------------
         // `LoadFrom` is a leaf here, not a `VarRef`. Its name addresses a variable the
         // *retired* version declared, so it is the source's own spelling and stays
@@ -520,7 +580,8 @@ where
         | N::MutDecl { .. }
         | N::LetRec { .. }
         | N::For { .. }
-        | N::Case { .. } => {}
+        | N::Case { .. }
+        | N::Comprehension { .. } => {}
     }
 }
 
@@ -528,7 +589,8 @@ where
 mod tests {
     use super::*;
     use crate::ccl::{
-        Branch, Builtin, Lit, Pattern, ProjKey, Type, TypedBinding, TypedExprNode as N, WriterSite,
+        Branch, Builtin, Generator, Lit, Pattern, ProjKey, Type, TypedBinding, TypedExprNode as N,
+        WriterSite,
     };
 
     fn var(n: &str) -> TypedExpr {
@@ -559,6 +621,7 @@ mod tests {
                 value: Box::new(var("v")),
                 target: Type::Hole,
             }),
+            comprehension_two_guarded_generators(),
             TypedExpr::binop(
                 var("l"),
                 crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
@@ -615,6 +678,27 @@ mod tests {
             node(N::Defer),
             node(N::Error),
         ]
+    }
+
+    /// `[ce for ct1 in cxs1 if cg1 for ct2 in cxs2 if cg2]` — the node whose
+    /// scopes *nest*: `cxs1` sits outside every target, `cg1` and `cxs2` under
+    /// `ct1` alone, and `cg2` and the element under both.
+    fn comprehension_two_guarded_generators() -> TypedExpr {
+        node(N::Comprehension {
+            generators: vec![
+                Generator {
+                    target: bind("ct1"),
+                    iter: var("cxs1"),
+                    guards: vec![var("cg1")],
+                },
+                Generator {
+                    target: bind("ct2"),
+                    iter: var("cxs2"),
+                    guards: vec![var("cg2")],
+                },
+            ],
+            element: Box::new(var("ce")),
+        })
     }
 
     /// A payload-binding branch followed by a payload-free one: the node that
@@ -681,6 +765,7 @@ mod tests {
         N::Builtin(_) => "Builtin",
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
+        N::Comprehension { .. } => "Comprehension",
         N::Realize(_) => "Realize",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",
@@ -756,16 +841,34 @@ mod tests {
 
     /// The scoped walk and [`TypedExpr::walk_binders`] must agree on which
     /// bindings a node declares — the former by scope, the latter by slot.
+    ///
+    /// A node's scopes are disjoint, and their concatenation is `walk_binders`,
+    /// except a `Comprehension`'s: its binders come into scope one generator at
+    /// a time, so each scope extends the one before it and the last one is
+    /// `walk_binders`. Checking the concatenation everywhere else is what
+    /// catches a binder slot listed in two scopes that should be disjoint, such
+    /// as a `Case` payload leaking into a sibling branch.
     #[test]
     fn declared_binders_match_walk_binders() {
+        fn ptrs(b: Binders<'_>) -> Vec<*const TypedBinding> {
+            b.iter().map(|b| b as *const _).collect()
+        }
         for e in corpus() {
             let mut declared: Vec<*const TypedBinding> = Vec::new();
             e.walk_binders(|b| declared.push(b));
 
-            let scoped: Vec<*const TypedBinding> = scope_runs(&e)
-                .into_iter()
-                .flat_map(|s| s.iter().map(|b| b as *const _).collect::<Vec<_>>())
-                .collect();
+            let runs = scope_runs(&e);
+            let scoped: Vec<*const TypedBinding> = if matches!(e.node, N::Comprehension { .. }) {
+                for w in runs.windows(2) {
+                    assert!(
+                        ptrs(w[1]).starts_with(&ptrs(w[0])),
+                        "a comprehension's scopes must each extend the one before"
+                    );
+                }
+                runs.last().map(|r| ptrs(*r)).unwrap_or_default()
+            } else {
+                runs.iter().flat_map(|r| ptrs(*r)).collect()
+            };
             assert_eq!(
                 declared,
                 scoped,

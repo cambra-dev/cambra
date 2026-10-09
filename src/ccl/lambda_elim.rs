@@ -1616,9 +1616,9 @@ fn elim_lambda_impl(
 
         // A value-selecting `Case` inside a bare lambda body (`λ x → Case{[gᵢ → eᵢ]}`),
         // where the gate `gᵢ(x)` varies with the element. A *comprehension* element
-        // conditional (`[a if g(x) else b for x in xs]`) is fanned out at
-        // comprehension lowering (`lower::comprehension::fan_out_element_case`) into
-        // `⧺ᵢ src|π̂ᵢ ≫ eᵢ`, so it never reaches here. This arm handles the residual
+        // conditional (`[a if g(x) else b for x in xs]`) is fanned out into
+        // `⧺ᵢ src|π̂ᵢ ≫ eᵢ` by `crate::ccl::comprehension`'s `fan_out_element_case`,
+        // so it never reaches here. This arm handles the residual
         // shapes — a per-element conditional in a lambda whose *iteration source is not
         // visible at lowering* (a writer decision body: `if 𝑝: a := … else: b := …`, a
         // per-key carry-forward merge, an `if/else`-both-write accumulator).

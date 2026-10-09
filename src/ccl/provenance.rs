@@ -1404,6 +1404,11 @@ thread_local! {
     /// attribution is a literal span rather than a reference resolved later (see
     /// [`LoweringStep`]).
     static ACTIVE_LOWERING_LOG: RefCell<Option<LoweringRecord>> = const { RefCell::new(None) };
+
+    /// The derivation log, installed by an always-on [`DerivationSession`].
+    /// `None` ⇒ no phase is deriving into one. Written alongside the table, not
+    /// instead of it.
+    static ACTIVE_DERIVATION_LOG: RefCell<Option<DerivationLog>> = const { RefCell::new(None) };
 }
 
 /// One in-flight recording, accumulating the ids born and copied while its guard
@@ -1519,6 +1524,35 @@ impl OpenRecording {
              `enter` on the node being rewritten; a lowering leaf mint belongs in \
              `lowering_leaf`",
         );
+    }
+
+    /// Append this recording to a [`DerivationLog`]: one
+    /// [`DerivationStep::Mint`] for its births, one [`DerivationStep::Copy`] per
+    /// origin it copied.
+    ///
+    /// Blame is not logged: [`fold_derivation`] attributes a birth to the named
+    /// node alone, so a recording that widens its attribution would be folded
+    /// narrower than the table folds it.
+    fn log_derivation(&self, log: &mut DerivationLog) {
+        debug_assert!(
+            self.blame.is_empty() && self.consumed.is_empty(),
+            "recording {:?} names blame or consumed ids under a DerivationSession, which \
+             folds a birth to its named node alone",
+            self.label,
+        );
+        if let Some(named) = self.named
+            && !self.births.is_empty()
+        {
+            log.push(DerivationStep::Mint {
+                named,
+                produced: self.births.clone(),
+                nature: self.nature,
+                label: self.label,
+            });
+        }
+        for (origin, produced) in group_copies(&self.copies) {
+            log.push(DerivationStep::Copy { origin, produced });
+        }
     }
 
     /// Finalize this recording into a [`LoweringLog`]. Lowering opens a guard
@@ -1916,6 +1950,13 @@ impl Drop for RecordingGuard {
             stack.pop()
         });
         let Some(frame) = frame else { return };
+        // A derivation session logs every recording that closes inside it,
+        // whether or not a phase scope also rows it into the table.
+        ACTIVE_DERIVATION_LOG.with(|slot| {
+            if let Some(log) = slot.borrow_mut().as_mut() {
+                frame.log_derivation(log);
+            }
+        });
         // Lowering records into its own log; under a phase scope the rows go to
         // the table, tagged with the ambient phase. Under neither, the write is a
         // silent no-op: the recording captured, and has nowhere to land.
@@ -2207,6 +2248,133 @@ impl Drop for LoweringSession {
     fn drop(&mut self) {
         ACTIVE_LOWERING_LOG.with(|slot| *slot.borrow_mut() = None);
     }
+}
+
+/// One step of a [`DerivationLog`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DerivationStep {
+    /// `produced` were minted by a recording that named `named`.
+    Mint {
+        /// The node the recording named.
+        named: NodeId,
+        /// The ids minted while it was the innermost open recording.
+        produced: Vec<NodeId>,
+        /// The recording's nature.
+        nature: Nature,
+        /// The recording's label.
+        label: RewriteLabel,
+    },
+    /// `produced` are freshened copies of `origin`.
+    Copy {
+        /// The node copied.
+        origin: NodeId,
+        /// The copies.
+        produced: Vec<NodeId>,
+    },
+}
+
+/// The recordings a phase closed, in closing order, kept whether or not
+/// provenance capture is on.
+///
+/// A phase whose mints an error can be raised at, and whose mints have no
+/// lowering-projection ancestor in the tree around them, needs this to resolve
+/// that error to a span when [`compile_to`](crate::ccl::context::compile_to)
+/// records nothing. [`fold_derivation`] turns it into a projection over the
+/// lowering projection. See `design/provenance.md`, "The derivation log".
+pub(crate) type DerivationLog = Vec<DerivationStep>;
+
+/// RAII installer for a [`DerivationLog`], the always-on sink a phase's
+/// recordings write to beside the table.
+///
+/// Non-reentrant, and never open while lowering's log is: lowering's records
+/// carry literal spans and go to its own sink.
+pub(crate) struct DerivationSession {
+    // Not `Copy`/`Clone`; holds the installed-log invariant for its lifetime.
+    _private: (),
+}
+
+impl DerivationSession {
+    /// Install a fresh, empty derivation log as this thread's sink.
+    pub(crate) fn install() -> Self {
+        debug_assert!(
+            ACTIVE_LOWERING_LOG.with(|slot| slot.borrow().is_none()),
+            "a DerivationSession opened while lowering's log is installed",
+        );
+        ACTIVE_DERIVATION_LOG.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            debug_assert!(
+                slot.is_none(),
+                "a DerivationSession is already installed on this thread",
+            );
+            *slot = Some(DerivationLog::new());
+        });
+        DerivationSession { _private: () }
+    }
+
+    /// Drain and return the log, ending the session.
+    pub(crate) fn into_log(self) -> DerivationLog {
+        ACTIVE_DERIVATION_LOG.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+impl Drop for DerivationSession {
+    fn drop(&mut self) {
+        ACTIVE_DERIVATION_LOG.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Fold `log`, written by phase `via`, into a projection of the ids it minted
+/// or copied, resolving each through `base` and through the entries the fold
+/// has already made. `base` answers for ids an earlier projection holds.
+///
+/// A mint takes its named node's spans and the recording's tag; a copy mirrors
+/// its origin. Steps are read in closing order, so a recording that names or
+/// copies a node an inner recording minted finds that node already folded. A
+/// step whose named node or origin resolves to nothing contributes no entry,
+/// and a lookup for one of its ids falls through to the caller's next answer.
+pub(crate) fn fold_derivation(
+    log: &DerivationLog,
+    base: &dyn Fn(&NodeId) -> Option<SourceAttribution>,
+    via: Phase,
+) -> SourceProjection {
+    let mut out = SourceProjection::new();
+    for step in log {
+        match step {
+            DerivationStep::Mint {
+                named,
+                produced,
+                nature,
+                label,
+            } => {
+                let Some(spans) = base(named)
+                    .or_else(|| out.get(named).cloned())
+                    .map(|a| a.spans)
+                else {
+                    continue;
+                };
+                let attr = SourceAttribution {
+                    spans,
+                    rewritten: RewriteTag {
+                        via,
+                        nature: *nature,
+                        label,
+                    },
+                };
+                for p in produced {
+                    out.insert(*p, attr.clone());
+                }
+            }
+            DerivationStep::Copy { origin, produced } => {
+                let Some(attr) = base(origin).or_else(|| out.get(origin).cloned()) else {
+                    continue;
+                };
+                for p in produced {
+                    out.insert(*p, attr.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// RAII installer for the ambient [`Phase`] every row is tagged with.
@@ -3252,7 +3420,7 @@ mod tests {
             total += take_predicate_sweep_skips();
         }
         assert_eq!(
-            total, 30,
+            total, 8,
             "the predicate sweep skipped {total} nodes over the corpus",
         );
     }

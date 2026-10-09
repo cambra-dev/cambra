@@ -219,6 +219,28 @@ fn fmt(expr: &Expr, min_prec: Precedence, opts: &SymbolicOpts) -> String {
 /// Returns `(self_prec, rendered_text)` without outer parentheses.
 fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
     let res = match &expr.node {
+        // Surface form: the element, then each generator followed by its
+        // guards, which is CHL's own spelling. The comprehension phase turns
+        // this into the `cast`/`λ`/`▷` encoding, so a tree that still carries
+        // one renders as the comprehension it is.
+        TypedExprNode::Comprehension {
+            generators,
+            element,
+        } => {
+            let mut out = format!("[{}", fmt(element, Precedence::Lowest, opts));
+            for g in generators {
+                out.push_str(&format!(
+                    " for {} in {}",
+                    g.target.name,
+                    fmt(&g.iter, Precedence::Lowest, opts)
+                ));
+                for guard in &g.guards {
+                    out.push_str(&format!(" if {}", fmt(guard, Precedence::Lowest, opts)));
+                }
+            }
+            out.push(']');
+            (Precedence::Atom, out)
+        }
         TypedExprNode::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
 
         // A `PiBound` reference prints as the name of the function that binds

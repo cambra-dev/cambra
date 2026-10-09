@@ -767,6 +767,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {
+        TypedExprNode::Comprehension { .. } => {
+            unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
+        }
         // Verify the **base**, trust the refinement. A literal's singleton predicate
         // (`{Int | __elem == 5}`) is a resolved predicate like any other, and by the
         // time this mode runs post-planning it has been compiled to point-free form.

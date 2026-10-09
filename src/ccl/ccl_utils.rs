@@ -778,7 +778,7 @@ pub fn synthesize_arm_predicate(guard: &Expr, prior: &[Expr]) -> Expr {
 /// Returns `true` if `b` is a trailing `true → Case{…}` arm whose body is itself
 /// a guard-only value `Case` — the shape an `elif` chain lowers to
 /// (`a if p else b if q else c`; the `else` binds the nested conditional).
-fn is_trailing_nested_case(b: &Branch) -> bool {
+pub(crate) fn is_trailing_nested_case(b: &Branch) -> bool {
     b.pattern.is_none()
         && matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))
         && matches!(
@@ -794,7 +794,7 @@ fn is_trailing_nested_case(b: &Branch) -> bool {
 /// The first-match encoding ([`synthesize_arm_predicate`]) composes the guards
 /// correctly across the flattened arms. Shared by the value-`Case` compilation
 /// ([`crate::ccl::lambda_elim`]) and the comprehension element fan-out
-/// ([`crate::ccl::lower`]).
+/// ([`crate::ccl::comprehension`]).
 pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
     while branches.last().is_some_and(is_trailing_nested_case) {
         let last = branches.pop().expect("checked non-empty via last()");

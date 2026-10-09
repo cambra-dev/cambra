@@ -93,6 +93,7 @@ const ALLOWED_VIA = [
   "Lower",
   "Anf",
   "MutRead",
+  "Comprehension",
   "Infer",
   "Inline",
   "Transact",
