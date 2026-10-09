@@ -6,30 +6,8 @@ use std::{
 
 use crate::interpreter::{Consumer, DataSourceDomainExtentImpl, value_probe::ProbeSlot};
 
-/// A handle to the scheduler's **deferred-wakeup queue**.
-///
-/// The notification model is push-from-source: a source announces new data via
-/// [`Scheduler::check_for_notifications`], which the driver calls *between*
-/// pulls. But an operator that advances its own state one pull at a time — a
-/// store recurrence closed through a cyclic feedback `FanOut` — has
-/// more to compute after a partial pull with **no external trigger pending**,
-/// and it cannot simply `notify()` from inside `get`: the notify graph is cyclic
-/// (the feedback `FanOut`), so a synchronous notification during a `get`
-/// re-enters an operator that is mid-`get` holding a `RefCell` borrow.
-///
-/// Instead such a producer calls [`WakeupQueue::request`] with its consumer. The
-/// request is delivered by the next [`Scheduler::check_for_notifications`] — with
-/// no `get`-borrow held anywhere — so the driver re-pulls without spinning and
-/// without re-entering the graph mid-borrow.
-///
-/// The alternation is load-bearing rather than conventional: an operator holding a
-/// cumulative cache answers from it while its input has said nothing
-/// ([`crate::interpreter::tile_operators::Notified`]), so a caller that pulls without
-/// delivering never reaches the operators below it. `pull_laps` is that alternation,
-/// for tests.
-///
-/// A shareable consumer handle: a consumer the queue can hold and deliver later
-/// (and that a producer can clone to re-arm on its next pull).
+/// A consumer handle shared by notification forwarders and deferred wakeups.
+/// It carries notifications, not tile data.
 pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
 
 /// Share one operator's consumer between several of its inputs.
@@ -40,27 +18,15 @@ pub fn shared_consumer(mut consumer: Box<dyn Consumer>) -> SharedConsumer {
     Rc::new(RefCell::new(move || consumer.notify()))
 }
 
-/// A fresh `Box<dyn Consumer>` forwarding to `shared` — what `subscribe` wants for
-/// an input whose notifications should reach the operator's own consumer.
-///
-/// The closure is not ceremony: a `Box<Rc<RefCell<dyn Consumer>>>` is not itself a
-/// `Consumer`, because the blanket impl over `Rc<RefCell<C>>` needs a *sized* `C`,
-/// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
-/// impl something sized to bite on.
+/// Forward input notifications to `shared`, deferring delivery if it is already borrowed.
+/// The closure supplies a sized `Consumer`; the blanket `Rc<RefCell<C>>` implementation
+/// does not accept an unsized `dyn Consumer` as `C`.
 pub fn forwarding_consumer(shared: &SharedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
     let shared = shared.clone();
     let wakeups = wakeups.clone();
     Box::new(move || {
-        // A notification that re-enters a consumer already being notified is deferred to
-        // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
-        // and nesting closes a cycle through *two* inputs of one operator: the inner store
-        // sits downstream of the enclosing body and its read feeds back into it, so one
-        // upstream change reaches the body's `Zip` along both arms. Delivering the second
-        // inside the first would re-enter the consumer. Dropping it would lose a change the
-        // call in progress may already have pulled past: a cascade can contain a pull, and
-        // a wake after one carries what arrived too late for it. Deferred, it is delivered
-        // outside any cascade, where it cannot re-enter, and at worst wakes a consumer
-        // whose next pull finds nothing new.
+        // A cyclic notification can return through another input after this consumer has
+        // already pulled. Dropping it would lose the later change; queue it for a new drain.
         match shared.try_borrow_mut() {
             Ok(mut consumer) => consumer.notify(),
             Err(_) => wakeups.request(shared.clone()),
@@ -68,6 +34,9 @@ pub fn forwarding_consumer(shared: &SharedConsumer, wakeups: &WakeupQueue) -> Bo
     })
 }
 
+/// Deferred notifications delivered outside the current pull or notification cascade.
+/// Consumers are deduplicated by handle identity. A request during a drain waits for the
+/// next drain. See `src/interpreter/design-operators.md`, "The notification contract".
 #[derive(Clone, Default)]
 pub struct WakeupQueue(Rc<RefCell<Vec<SharedConsumer>>>);
 
@@ -76,9 +45,7 @@ impl WakeupQueue {
     /// [`Scheduler::check_for_notifications`] — i.e. once the current `get`
     /// stack has fully unwound.
     pub fn request(&self, consumer: SharedConsumer) {
-        // A consumer already waiting is not queued twice. A wake is an edge, not a count,
-        // and a drive re-arms on every pull it makes progress on, so the same consumer is
-        // requested many times between drains.
+        // Notifications request another read; repeated requests do not count separate changes.
         let mut queued = self.0.borrow_mut();
         if queued.iter().any(|waiting| Rc::ptr_eq(waiting, &consumer)) {
             return;
@@ -101,11 +68,8 @@ impl WakeupQueue {
     }
 }
 
-/// Basic scheduler implementation.
-///
-/// Tracks [`IterateExtent`](crate::interpreter::tile_operators::IterateExtent)s that generate data from external sources (e.g.
-/// data sources) and need to be polled for new data each tick, and carries the
-/// [`WakeupQueue`] for producers that request their own re-pull.
+/// Poll registered source handles and deliver source notifications and deferred wakeups.
+/// See `src/interpreter/design-operators.md`, "The notification contract".
 #[derive(Default)]
 pub struct Scheduler {
     source_handles: HashMap<String, SourceHandle>,
@@ -191,13 +155,9 @@ other's subscribers",
         self.wakeups.clone()
     }
 
-    /// Pull what each source has received into its buffer, and return the
-    /// consumers to wake, without waking them.
-    ///
-    /// No consumer is notified, so no `get` runs and nothing is released. A
-    /// source's retained window read between this and [`deliver`](Self::deliver)
-    /// holds this pass's arrivals. After `deliver`, a sink has pulled them and a
-    /// `Memo` may have released them.
+    /// Buffer source arrivals and return consumers to notify, without notifying them.
+    /// Inspect retained source windows before [`deliver`](Self::deliver) if those arrivals
+    /// are needed: delivery may cause a sink to pull and release them.
     pub fn poll_sources(&mut self) -> Delivery {
         let mut woken = Vec::new();
         for (source, consumers) in self.source_handles.values_mut() {
@@ -220,10 +180,8 @@ other's subscribers",
             consumer.borrow_mut().notify();
             delivered = true;
         }
-        // Deliver deferred wakeups now — outside any `get`, so a notification
-        // that fans through the cyclic operator graph does not re-enter an
-        // operator mid-borrow (see [`WakeupQueue`]). They follow the source
-        // notifications because a wakeup is a notification too and can pull.
+        // Take the queue after source delivery, outside its notification cascades.
+        // Requests created while this snapshot drains remain queued for the next drain.
         for consumer in self.wakeups.take() {
             consumer.borrow_mut().notify();
             delivered = true;
@@ -240,14 +198,10 @@ other's subscribers",
     }
 }
 
-/// The consumers a [`Scheduler::poll_sources`] found new data for, not yet
-/// notified.
-///
-/// Holds them strongly from the poll to the delivery, so a consumer dropped in
-/// between is still notified once. Dropping a `Delivery` without passing it to
-/// [`Scheduler::deliver`] leaves the data buffered with no consumer woken, and a
-/// sink-only program then stalls: `#[must_use]` catches a delivery that is
-/// ignored, and `Drop` catches one that is bound and forgotten.
+/// Pending source notifications returned by [`Scheduler::poll_sources`].
+/// Holds consumers strongly until delivery, even if their registrations are dropped meanwhile.
+/// Pass to [`Scheduler::deliver`]; dropping a nonempty delivery leaves arrivals unannounced
+/// and triggers a debug assertion unless the thread is unwinding.
 #[must_use = "a polled delivery must be passed to `Scheduler::deliver`"]
 pub struct Delivery(Vec<SharedConsumer>);
 
@@ -264,15 +218,11 @@ impl Drop for Delivery {
     }
 }
 
-/// Deliver, then pull — `laps` times, stopping as soon as `done` accepts the tile or the
-/// program is quiescent. Returns the last tile pulled.
-///
-/// The alternation `src/main.rs` runs, and the one a test should write. A lap runs on any
-/// pull that reaches the store, so a loop that only pulls is not stalled by itself; what
-/// it loses is the read. An operator holding a cumulative cache answers from that cache
-/// while its input has said nothing ([`crate::interpreter::tile_operators::Notified`]),
-/// so the pull stops there and never reaches the store at all. Delivering is what
-/// re-enables the read.
+/// Deliver notifications and pull up to `laps` times, returning the last tile.
+/// Stop early when `done` succeeds or, after the first lap, no notification was delivered,
+/// the result is unchanged and the wakeup queue is empty. With zero laps, return an empty tile.
+/// Delivery is required to invalidate notification-gated caches between pulls.
+/// See `src/interpreter/design-operators.md`, "The notification contract".
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn pull_laps(
     scheduler: &mut Scheduler,

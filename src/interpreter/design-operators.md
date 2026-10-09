@@ -397,166 +397,178 @@ enclosing decision's variant payload; the channel then flattens the two collecti
 
 ## The producer protocol
 
-Four calls cross each subscription edge. `TileProducer::get` and `TileProducer::release` are each a
-provided method that runs what every producer shares and then calls a required `_impl`, so no
-producer restates the checks below. `TileOperator::subscribe` is required and shares nothing.
+A subscription connects one producer to one consumer. `TileOperator::subscribe` constructs
+that producer with an intent guard, a consumer notification handle and a scheduler.
+`FanOut` shares an input through separate branch producers; each branch still has one consumer.
 
-- **`subscribe(intent, consumer, scheduler)`** builds a `TileProducer` answering for `intent`, the
-  region of the operator's tiling the consumer asks for. The producer keeps `consumer` to notify. A
-  producer has exactly one consumer: sharing goes through a `FanOut`, whose branches are separate
-  producers.
-- **`Consumer::notify()`** says the producer has new data. It carries no payload, and the consumer
-  answers it by calling `get`. A producer does not notify from inside a `get`, because the
-  notification graph is cyclic through a feedback `FanOut` and a synchronous notify re-enters an
-  operator that is mid-`get` holding a `RefCell` borrow. A producer with more to compute and no
-  external trigger pending queues its consumer on the scheduler's `WakeupQueue`, and
-  `Scheduler::deliver` notifies it between pulls.
-- **`get(projection)`** returns the producer's current tile restricted to `projection`, and is the
-  only way data crosses an edge. The wrapper asserts that the tile conforms to the producer's
-  tiling, and in debug builds that it is a valid tile holding no data inside `obsolete_guard`.
-- **`release(obsolete)`** adds `obsolete` to the producer's `obsolete_guard`, and calls
-  `release_impl` only when the guard grew. What a release promises is
-  [The release contract](#the-release-contract).
+| Call | Contract |
+| --- | --- |
+| `subscribe(intent, consumer, scheduler)` | Establish the subscription for the requested region of the output tiling. |
+| `Consumer::notify()` | Signal that the consumer should pull again. It carries no tile and does not count individual changes. |
+| `get(projection)` | Request the current tile for a projection. Tile values cross the edge only through this call. |
+| `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
 
-A source is not a producer. The scheduler polls each source (`Scheduler::poll_sources`) and
-notifies the consumers registered on it (`Scheduler::deliver`); `check_for_notifications` runs the
-two in turn.
+`get` and `release` are provided `TileProducer` methods around required producer-specific
+`get_impl` and `release_impl` methods. The `get` wrapper removes released scalar record cells,
+checks the returned tile, records a probe observation and returns the result. It does not
+implement projection for the producer.
+
+| Check | Build configuration |
+| --- | --- |
+| Returned tile matches the producer's tiling (`check_from`) | All builds |
+| Returned tile contains no data inside `obsolete_guard` | Debug assertions |
+| Tile structure passes `validate_tile` | Debug assertions |
+| Previously complete paths obey the completeness contract | Debug assertions |
+
+The `release` wrapper checks that the guard matches the tiling in every build, normalizes it,
+and unions it into `obsolete_guard`. If the accumulated representation changes, it calls
+`release_impl` with the normalized argument, not with the entire accumulated guard.
+
+Sources are polled separately from producers. `Scheduler::poll_sources` buffers source arrivals
+and returns a `Delivery` without notifying consumers. `Scheduler::deliver` notifies those
+consumers, then drains deferred wakeups. `check_for_notifications` performs both operations.
+See [The notification contract](#the-notification-contract) for delivery and reentrancy rules.
 
 ### Producer attribution and probes
 
-A `subscribe` builds exactly one producer. `ProducerBase::new` takes the building operator's
-`OperatorBase` and the `Scheduler` the subscribe received, so every producer records the operator
-that built it (`ProducerBase::node_id`) and holds the scheduler's `ProbeSlot`. An input's producer
-is built by the input's own `subscribe`. Two producers of different types built for one
-operator could share a probe key, since `alloc_id` counts per type; `ProbeTable` fails a
-`debug_assert!` when a second name arrives under one key.
+Each `subscribe` returns one producer attributed to the operator that constructs it.
+`ProducerBase::new` records the operator's `node_id` and the scheduler's `ProbeSlot`.
+Input producers are constructed by their own operators' subscriptions.
 
-A probe observes one producer's `get`. The `get` wrapper records a rendered, row-capped reading of
-the tile into the probe keyed `(node_id, producer_id)`, after `get_impl` returns and after the
-checks above, and returns the tile unchanged. A probe therefore sees only tiles the protocol
-accepted, and changes nothing a consumer receives. The wrapper records nothing while the slot is
-empty, which is every run without a connected `/api/live` client (see
-[design.md](../inspector_model/design.md#probing-follows-the-live-route)). Dropping a producer
-detaches its probe. The probe frame `src/inspector_model/frame.rs` renders from the table is
-described in [design.md](../inspector_model/design.md#the-live-model-is-a-separate-path).
+Probe keys are `(node_id, producer_id)`. `alloc_id` counts by producer display name, so two
+producer types built for one operator could collide; `ProbeTable` checks conflicting names
+with a debug assertion. Observations are rendered with a row limit after `get_impl` and the
+wrapper checks, without changing the tile returned to the consumer. No probe-table borrow is
+held across `get_impl`, whose upstream pulls may use the same table.
+
+An empty probe slot records nothing. Connection lifetime is specified by
+[Probing follows the live route](../inspector_model/design.md#probing-follows-the-live-route).
+Dropping a producer detaches its probe. The rendered frame is specified by
+[The live model is a separate path](../inspector_model/design.md#the-live-model-is-a-separate-path).
 
 ## The release contract
 
-`release(𝑅)` says the data in 𝑅 is **never requested again, and never returned again** — the same promise from each end of the wire. It holds at every granularity: a consumed prefix, one arm of a union, a record field, or the whole tiling (the *universal* release, after which the only conforming tile is the empty one). This is what makes bounded execution possible — a producer may reclaim 𝑅, and every tile it emits afterwards lies outside its accumulated obsolete guard.
+After `release(𝑅)`, the consumer must not request data in 𝑅 again and the producer must not
+return it. Subsequent pulls remain valid outside the accumulated obsolete region. After a
+universal release, every subsequent result must be empty.
 
-Every operator must obey it in both directions, because a violation yields **wrong results rather than an error**. A producer that returns released data hands its consumer values that consumer already took delivery of; a `Tile::Scalar`'s positions are implicit, so `merge` cannot tell "this position again" from "one more position" and appends, and one value silently becomes two, surfacing wherever it is later broadcast. An operator that fails to forward a release it could make strands upstream state instead — `FanOut` forwards the *intersection* of its branches' guards, so one branch that swallows a release blocks reclamation for all of them.
+Release permits reclamation and prevents duplicate delivery. Scalar positions are implicit:
+merging an already consumed cell can append another cell rather than detect the duplicate.
+The producer wrapper checks for returned released data in debug builds, but the contract
+applies in every build. An operator must also forward the releases permitted by its input
+usage. `FanOut` forwards the intersection of its branches' releases; a branch that retains a
+region prevents the shared input from reclaiming it.
 
-`TileProducer::get` checks the producer's half in debug builds: the returned tile must carry no live data inside the accumulated `obsolete_guard`. What an operator can forward depends on how it reads its input, so it is specified per operator below.
+`release_impl` must honor or reject the incoming guard. The wrapper accumulates it before
+calling the implementation, so ignoring it does not cancel the promise. Operators that only
+support whole-value release use `TileGuard::expect_universal_or_empty` to reject partial guards
+at release time, even if no subsequent pull would exercise the `get` postcondition.
 
-An operator must therefore **reject a guard it cannot honor rather than ignore it**. The guard accumulates in `obsolete_guard` whether or not `release_impl` acts on it, so dropping one silently leaves the operator free to re-emit that region — from its own state, or by re-reading an input it never passed the release to. Every `release_impl` is exhaustive; an operator with no sub-region to reclaim piecewise checks the guard with `TileGuard::expect_universal_or_empty`. Rejecting fires where the guard arrives, which does not depend on anything pulling afterwards — the `get` post-condition only fires if something does.
-
-A keyless field's cell beneath a level is released at its row. A scalar cell is whole once it
-is there, so `to_guard` names it at the row holding it, even while a sibling field, a collection
-still growing, keeps the row open. The row then holds no cell of that field, which a record tile
-states per field (`Tile::Record`'s `absent`), as an empty top-level scalar does for the one row
-it has. A producer rebuilds a row from inputs released by whole key, so it would hold the cell
-again; `TileProducer::get` leaves a released cell out of what every producer returns. An operator
-whose input lacks a row because it gave that row's cell back keeps the row with the field absent
-(`Zip`).
+A scalar record field can be released at its enclosing row before a sibling collection is
+complete. `Tile::to_guard` names that cell, and `Tile::Record::absent` records its absence
+without removing the row. A producer may reconstruct the row from inputs released only by
+whole key; the `get` wrapper removes those previously released field cells before returning
+it. `Zip` also preserves a row with an absent field when that field's input has already
+released its cell.
 
 ### Guard operations are exact
 
-`TileGuard::intersect`, `TileGuard::union`, `TileGuard::flatten_or`, and every function that
-restates a guard for another operator's tiling name exactly the region they denote. A region the
-representation cannot spell is a gap in the guard algebra. The fix is a spelling for it, and until
-then the operation fails loudly (`todo!`, `unimplemented!`). It never answers a smaller region,
-and never a larger one.
+Guard algebra is exact. `intersect`, `union`, `flatten_or`, and guard restatements must preserve
+the specified region. An unrepresentable result requires a new representation; until it is
+implemented, the operation must fail rather than return an approximation.
 
-A consumer may release less than it has finished with, since what it releases is its own promise,
-provided it can take the unreleased data again ([A `Memo` releases everything it
-takes](#a-memo-releases-everything-it-takes)). An operator computing a guard from the guards it
-received has no such choice:
+An understated result can prevent upstream reclamation; an overstated result can discard data
+still needed by a reader. Subsequent unions, intersections and release-growth comparisons use
+the returned representation, so neither error is confined to one call.
 
-- An understated guard fails to forward a release the operator could make, which strands upstream
-  state. A `FanOut` forwards the meet of its branches, so one understated meet blocks
-  reclamation for every branch.
-- An overstated guard releases data a reader still needs, which yields wrong results.
-- Either one is a different region from then on. `TileProducer::release` compares the spelling of
-  the accumulated guard to decide whether a release added anything, and every later union and
-  meet is computed from that spelling.
+A consumer may choose to release less than it has consumed only if it can accept that data
+again. That choice does not permit an implementation to approximate a requested guard operation.
+For the caching case, see
+[A `Memo` releases everything it takes](#a-memo-releases-everything-it-takes).
 
 ### A `Memo` releases everything it takes
 
-`Memo` merges every delivery into its cache, and a merge takes each position once: a position
-delivered again is rejected by `Tile::merge`, whether or not the two values agree. So `Memo`
-releases, with `Tile::to_guard`, everything it merges. What that release leaves are the keys of
-open groups, which grow by key, and join-shaped values, an aggregation's accumulator or a store,
-which combine. A scalar cell left there is one the input will deliver again, and debug builds
-report it where `Memo` takes it (`Tile::holds_a_plain_value`).
+`Memo` must release the plain values it merges into its cumulative cache, because a later
+delivery must not append the same cells again. It obtains the input's `to_guard` before
+compaction, then releases that region upstream. Open collection groups and join-combined
+aggregate or store state can remain unreleased. A debug check uses `holds_a_plain_value` to
+reject an input whose release would leave ordinary values available for duplicate delivery.
 
-`to_guard` meets this by naming, by its whole path, every key whose level calls it complete, and
-every scalar cell at the row holding it, whether or not its key is complete (the keyless-field
-rule above). A scalar beside a growing collection is released as it arrives, and the input
-leaves it out of what it delivers afterwards.
+`to_guard` includes complete keys by full path and scalar cells at their enclosing rows,
+including cells whose enclosing key is still open. A universal input release latches
+`upstream_drained`. Release builds then return the cache without pulling that input again;
+debug builds continue pulling to exercise its post-release checks.
 
 ### What a producer holds
 
-A release is what lets a producer reclaim state, so what a producer still holds is how a
-program's retention is measured. `TileProducer::state_info` answers it for the producer alone,
-as a `ProducerStateInfo` counting values: a cached tile's cells (`Tile::cell_count`), an
-accumulator's, a store's seeds, changelog entries and decided positions, a driver window's rows.
-A producer that keeps nothing past a pull answers zero, and a producer's inputs report their own.
-`inspect` records the count on the producer's node, so a walk of the producer tree sums a
-program's state. A count that grows with how far a program has run, where its data does not, is
-state it never gives back (`a_long_nest_holds_the_same_store_state_at_any_length`).
+`TileProducer::state_info` reports values retained by that producer between pulls, excluding
+its inputs' state. Counts include cached cells (`Tile::cell_count`), accumulators, store seeds,
+changelog entries, decided positions and driver-window rows. A stateless producer returns zero.
+`inspect` attaches the count to the producer's node for retention measurements.
+
+The unit is values, not bytes. Retention that grows with execution length despite bounded live
+data indicates unreclaimed state; `a_long_nest_holds_the_same_store_state_at_any_length` tests
+this property for nested stores.
 
 ## The completeness contract
 
-A level's `domain_predicate` is its **statement** of completeness: it names the paths reaching
-that level that are **complete**. A complete path keeps its keys and values from then on and
-stays complete. The statement covers every path at its level, including paths under rows that
-have not arrived, and a path is complete at every depth beneath a level that calls it complete
-([Curry levels](#curry-levels)), so a statement about some rows only names them
-([Qualified predicates](#qualified-predicates)).
+A level's `domain_predicate` declares complete paths, including paths beneath rows that have
+not arrived. A complete path cannot gain keys or change values. Its descendants are complete
+at every depth; see [Curry levels](#curry-levels). A statement limited to particular enclosing
+rows must name them with [qualified predicates](#qualified-predicates).
 
-A release is the only way a complete path's content leaves an output: a producer may drop what
-was released, and may stop stating it complete. Nothing is added beneath a complete path,
-released or not. A consumer that needs a statement after releasing the region it covers keeps
-the statement itself.
+Release permits removal of completed data and withdrawal of the corresponding completeness
+statement. It does not permit new content beneath that path. A consumer needing completeness
+information after release must retain that information itself.
 
-`TileProducer::get` checks this in debug builds against the producer's previous output
-(`completeness_violation`):
+In debug builds, `TileProducer::get` compares consecutive outputs through
+`completeness_violation`. It checks that:
 
-1. every region the last output called complete, less what was released, the new one still
-   calls complete;
-2. every key and value the last output held beneath a complete path, the new one holds
-   unchanged or has dropped because it was released, and it holds nothing beneath a complete
-   path that the last output did not.
+1. Previously complete regions remain complete, except where released.
+2. Previously present keys and values beneath complete paths remain unchanged, or are absent
+   because they were released.
+3. No new key or value appears beneath a previously complete path.
 
-A violation panics and names the producer tree.
+A violation panics with the producer tree. Store checks cover both semantic reads at decided
+positions and the component collections: seeds, frontiers, changelogs and decided positions.
+Frontiers must not move backward. Store release guards name sequencing positions.
 
-A `Tile::Store` is checked twice: once by what it answers (each row's seed, frontier, and each
-key's value at every decided position), and once part by part, since its changelogs, decided set
-and frontier are collections over its rows with statements of their own. A release of the store
-names its positions, which are each part's keys.
-
-Where an output path's content comes from several inputs, the arms of a `Zip` or a union or the
-two sides of a pairing, the path is complete only where every input calls it complete, so the
-operator intersects their statements. A union arm
-released whole stands in as an empty tile stating `True`, which constrains nothing.
+For output assembled from multiple inputs, completeness requires all contributing inputs to
+be complete. `Zip`, unions and pairing operators therefore intersect their statements.
+A fully released union arm contributes an empty tile with `True` completeness and imposes
+no further restriction.
 
 ## The notification contract
 
-A producer whose output changes on a pull wakes its consumer. The change is made inside a
-`get`, while the producers that must re-pull are still on the stack, so the wake is queued
-(`WakeupQueue`) and delivered after the pull returns (`Scheduler::check_for_notifications`). A
-`Memo` answers from its cache until notified, so without the wake it keeps the old output, and
-a program waiting on it stalls without an error.
+An output change discovered during a pull must wake readers that may still hold the previous
+result. That wake is deferred through `WakeupQueue`, not delivered synchronously inside
+`get`: a feedback path could re-enter a producer while its `RefCell` is borrowed.
 
-- A store's output changes when it opens, decides a position or commits, and closes.
-  `ChangeNotifier` compares each pull's output with the last and wakes the store's readers
-  when they differ.
-- A `Memo` pulled without a notification, its cache still empty or a drained input a debug
-  build still probes, wakes its consumer when the pull finds data the cache did not hold.
+`ChangeNotifier` compares successive store outputs and queues a wake when they differ,
+including initialization, decided positions, commits and closure. A `Memo` that pulls without
+a notification also queues a wake if the pull changes its cache. Such pulls occur when the
+cache is empty or a debug build probes a drained input. Otherwise, an unnotified nonempty
+cache can answer without reaching its input, so omitting the wake can stall execution.
 
-The contract makes a stuck program observable. A program is **quiescent** when a lap delivers no
-notification and answers what the lap before did: every operator then sees what it saw, so
-nothing moves until an input changes, and `pull_laps` stops there.
+`Notified::Flag` starts set, is set by an input notification and is cleared when taken by a
+pull. `Notified::Always` is used when no flag intercepts the input's notifications.
+Sharing notification handles does not share tile data; tiles still pass through `get`.
+
+`forwarding_consumer` delivers immediately when its consumer can be borrowed. A reentrant
+notification is queued rather than dropped: the notification already in progress may have
+pulled before the new change arrived. The queue deduplicates consumers by handle identity.
+`Scheduler::deliver` notifies source consumers first, then takes the current wakeup queue.
+A wake requested during that drain remains for the next drain.
+
+`poll_sources` and `deliver` are separate so a caller can inspect buffered arrivals before a
+sink pulls and releases them. A `Delivery` retains its consumers strongly until delivery.
+Dropping a nonempty delivery without delivering it is a debug assertion failure, except
+during unwinding; the data remains buffered but no consumer has been woken.
+
+The test helper `pull_laps` alternates notification delivery and pulls. It returns when its
+completion predicate succeeds, the lap limit is reached, or a lap after the first delivers
+no notification, returns the previous tile, and leaves no deferred wakeup. That last case is
+quiescence relative to the current inputs, not proof that no source can change later.
 
 ## Tile Operators
 
