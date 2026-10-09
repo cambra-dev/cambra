@@ -390,6 +390,31 @@ fn a_group_by_whose_key_computes_with_a_collection(#[case] source: &str) {
     agree(source);
 }
 
+/// A conditional element of a comprehension nested in another comprehension or under a loop,
+/// reading the enclosing binder, or reading a mutable variable.
+#[rstest]
+#[case::reading_the_outer_binder(indoc! {r#"
+    out = test_sink()
+    out << sum([sum([(w if w > 3 else 0) for z in [1, 2]]) for w in [3, 4]])
+"#})]
+#[case::gating_on_the_inner_binder(indoc! {r#"
+    out = test_sink()
+    out << sum([sum([(w if z > 1 else z) for z in [1, 2]]) for w in [3, 4]])
+"#})]
+#[case::under_a_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum([(i if q > 1 else q) for q in [1, 2, 3]])
+"#})]
+#[case::reading_a_mutable_variable(indoc! {r#"
+    x := 3
+    out = test_sink()
+    out << sum([x ^+ i if i > 1 else 0 for i in [1, 2, 3]])
+"#})]
+fn a_conditional_element_reading_an_enclosing_binder(#[case] source: &str) {
+    agree(source);
+}
+
 /// A generator called in a filter or a group-by key: its body stays in the predicate until
 /// planning lifts the predicate or the key out of it, which channelizes it.
 #[rstest]

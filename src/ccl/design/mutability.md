@@ -1293,8 +1293,8 @@ today rather than silently mishandled.
 >
 > **Implemented**: scalar / compute ternaries (the C-form), data-collection selection (the gate
 > fan-out, reconciled to the Σ by its subtyping rule), source-less conditional
-> feeds, a **conditional element** in a comprehension (`[a if g(x) else b for x in xs]`, fanned out
-> over the source by the element-dependent gate), a comprehension **over a conditional collection**
+> feeds, a **conditional element** in a comprehension (`[a if g(x) else b for x in xs]`, a value
+> `Case` in the element's lambda), a comprehension **over a conditional collection**
 > (`[f(x) for x in (xs if c else ys)]`, consumed by opening the sum like any other), a conditional
 > **between** standalone comprehensions (`([…]) if c else ([…])` — the maps carry `Data` after kind
 > inference, so their arms join into a Σ), a **conditional induction write** (`if 𝑝: total += x`
@@ -1393,10 +1393,11 @@ The value-`Case` positions ride the same union-of-restricts:
   (`Name::defer_tap_field`), and the `Case` is never fanned out. A loop that does not has only the
   per-arm channels above. Extending one leaves the other's cases uncovered.
 - **Comprehension over / with a conditional** — *implemented*. A conditional **element**
-  (`[a if g(x) else b for x in xs]`) fans the source out by each arm's *element-dependent* gate —
-  `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`, a union of filtered maps (`fan_out_element_case` in
-  `crate::ccl::comprehension`), since a value `Case` has no fixed driver and must gate the iteration
-  source rather than a `Units(1)` one.
+  (`[a if g(x) else b for x in xs]`) stays a value `Case` in the element's lambda, and lambda
+  elimination compiles it as it compiles every per-element conditional:
+  `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)`, a disjoint join over the element stream. Under an enclosing
+  comprehension or loop, the element stream is the pair of the enclosing and the inner binder, so
+  a gate may read either.
 
   A conditional **source** (`[e for x in (xs if c else ys)]`) needs no lowering rule at all: it is
   an ordinary consumption, and the comprehension's result is the sum bound back over the witness

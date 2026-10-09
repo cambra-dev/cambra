@@ -253,9 +253,7 @@ Three shapes, and the choice between them is about what the copy *denotes*:
 original id is a *fate* question, and keep-first guesses it wrong exactly when
 position 0 is the copy that later dies. Freshening needs no knowledge of
 downstream fates: the original either survives in place and keeps its id, or dies
-and is consumed by the rewrite that dropped it. (Lowering's `fan_out_copy` is
-keep-first on purpose — it is the phase that *mints* the originals, so position 0
-is the source image by construction.)
+and is consumed by the rewrite that dropped it.
 
 **Freshen at placement, not at construction.** Most phases build intermediate
 structures — guard vectors, path conjunctions, per-branch environments — whose
