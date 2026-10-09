@@ -1508,7 +1508,8 @@ pub(super) fn lower_requirements(
                     a.value.span,
                     format!(
                         "`{n}=…` names a type parameter or a base type; no instance of \
-                         `{trait_}` associates `{ty}`"
+                         `{trait_}` associates `{}`",
+                        crate::ccl::chl_print::chl_type(&ty)
                     ),
                 ));
             }
@@ -1551,8 +1552,12 @@ fn expand_requirement(
     out: &mut Vec<Rc<crate::ccl::ty::TraitRequirement>>,
 ) -> Result<(), LoweringError> {
     let unsatisfiable = |args: &[Type]| {
-        let mut shown: Vec<String> = args.iter().map(|t| t.to_string()).collect();
-        shown.extend(assoc.iter().map(|(name, t)| format!("{name}={t}")));
+        let mut shown: Vec<String> = args.iter().map(crate::ccl::chl_print::chl_type).collect();
+        shown.extend(
+            assoc
+                .iter()
+                .map(|(name, t)| format!("{name}={}", crate::ccl::chl_print::chl_type(t))),
+        );
         LoweringError::unsupported(
             span,
             format!(

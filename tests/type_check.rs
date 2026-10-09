@@ -4382,7 +4382,7 @@ fn products_sharing_a_field_join_on_it() {
 
         f(1, 2)
     "#},
-    "{Int | __elem >= __arg_tuple_0.0}"
+    "{Int where _ >= ‹__arg_tuple_0›.0}"
 )]
 fn a_user_written_refinement_keeps_its_binder_reference(
     #[case] code: &str,

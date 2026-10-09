@@ -612,7 +612,7 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
         g: forall (T) T = m
         1
     "},
-    "annotated as T, but inferred as Int@5",
+    "annotated as T, but inferred as {Int where _ == 5}",
 )]
 // The annotation fits the value, so what refuses it is that the name it binds is
 // monomorphic.
@@ -807,6 +807,15 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
         1
     "},
     "no instance of `Equatable` accepts",
+)]
+// The operands print in CHL.
+#[case::product_against_a_base(
+    indoc! {"
+        def f(T, U, a: {T, U}) => Bool requires Equatable({T, U}, Int):
+            True
+        1
+    "},
+    "no instance of `Equatable` accepts ({T, U}, Int)",
 )]
 #[case::requirement_over_a_collection(
     indoc! {"

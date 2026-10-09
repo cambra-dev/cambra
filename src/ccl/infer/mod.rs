@@ -192,8 +192,36 @@ fn blame_node_for_place(
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
 /// in error messages. Falls back to [`Type::Hole`] if coalesce fails (which
 /// can happen for types with incompatible bounds that triggered the error).
+///
+/// The types inside its refinement predicates are resolved too, here rather than
+/// when the message is written: the variables' bounds are gone by then, and the
+/// message reads them (`chl_print` writes a read of a collection as `xs[i]` and a
+/// call as `f(x)`, which only the callee's type tells apart).
 pub(super) fn coalesce_for_error(ty: &Type) -> Type {
-    resolve_var_type(ty).unwrap_or(Type::Hole)
+    let mut resolved = resolve_var_type(ty).unwrap_or(Type::Hole);
+    resolve_predicate_types(&mut resolved);
+    resolved
+}
+
+/// Resolve every node type inside `ty`'s refinement predicates, on a copy of each
+/// predicate: the copy is for a message, so nothing shares it.
+fn resolve_predicate_types(ty: &mut Type) {
+    fn resolve_expr(e: &mut TypedExpr) {
+        if let Ok(resolved) = resolve_var_type(&e.ty) {
+            e.ty = resolved;
+        }
+        resolve_predicate_types(&mut e.ty);
+        e.walk_children_mut(resolve_expr);
+    }
+    if let Type::Refinement(_, refinements) = ty {
+        refinements.rewrite_each(|_, r| {
+            let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
+            let mut predicate = (*r.predicate).clone();
+            resolve_expr(&mut predicate);
+            *r = Refinement::born(Rc::new(predicate));
+        });
+    }
+    ty.walk_children_mut(resolve_predicate_types);
 }
 
 /// Map a [`ConstrainError`] onto the public [`InferError`] enum.

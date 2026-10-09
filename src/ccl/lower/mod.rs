@@ -1253,6 +1253,12 @@ pub(crate) mod test_helpers {
         )))
     }
 
+    /// Lower the CHL type expression `code`, a polymorphic type included.
+    pub(crate) fn lower_type(code: &str) -> Type {
+        super::stmts::lower_type_expr_or_poly(&parse_expr(code), &mut LoweringContext::default())
+            .unwrap_or_else(|e| panic!("`{code}` lowers as a type: {e:?}"))
+    }
+
     /// Parse a CHL module, the root of its own one-file map, keeping its errors.
     pub(crate) fn parse_module_result(code: &str) -> chl_parser::parser::ParseResult<ChlModule> {
         chl_parser::parse_module(FileId::ROOT, code)
