@@ -510,14 +510,9 @@ pub(super) fn lower_final_stmt(
         }
         // A run as the program's final statement: its chain around `Unit`, since
         // a run has no value of its own.
-        ChlStmt::Run { path, alias, .. } => {
+        ChlStmt::Run { .. } => {
             let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.run_unit");
-            Ok(
-                match (path.to_path(), modules::run_name(path, alias.as_ref())) {
-                    (Some(module), Some(name)) => ctx.take_run(&name, module, last.span, unit),
-                    _ => unit,
-                },
-            )
+            lower_middle_stmt(last, preceding, unit, outer_bindings, ctx, true)
         }
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
@@ -929,14 +924,44 @@ pub(super) fn lower_middle_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_standalone_transaction(stmt, body, &scope, ctx)
         }
-        // A run stands at its statement: its chain around the rest of the module
+        // A run stands at its statement, with its arguments bound above it
         // (`docs/chl-spec.md`, "9.3 Runs").
-        ChlStmt::Run { path, alias, .. } => Ok(
-            match (path.to_path(), modules::run_name(path, alias.as_ref())) {
-                (Some(module), Some(name)) => ctx.take_run(&name, module, stmt.span, body),
-                _ => body,
-            },
-        ),
+        ChlStmt::Run {
+            path, alias, args, ..
+        } => {
+            let (Some(module), Some(name)) =
+                (path.to_path(), modules::run_name(path, alias.as_ref()))
+            else {
+                return Ok(body);
+            };
+            let mut arguments = Vec::with_capacity(args.len());
+            for arg in args {
+                let span = arg.name.span.join(arg.value.span);
+                arguments.push((arg.name.node.clone(), span, lower_expr(&arg.value, ctx)?));
+            }
+            Ok(ctx.take_run(&name, module, stmt.span, arguments, body))
+        }
+        // A value parameter is a `let` of its default, or, with none, of a
+        // placeholder. Each run of the module binds it to the run's argument, and
+        // refuses one with neither (`docs/modules.md`, "Runs").
+        ChlStmt::Param {
+            name,
+            annotation,
+            default,
+        } => {
+            let value = match default {
+                Some(default) => lower_expr(default, ctx)?,
+                None => ctx.tag_image(Expr::error(), stmt.span),
+            };
+            let bound = match annotation {
+                Some(annotation) => {
+                    let ty = lower_type_expr(&annotation.ty, ctx)?;
+                    Expr::let_bind_annotated(name.node.as_str(), value, body, ty)
+                }
+                None => Expr::let_bind(name.node.as_str(), value, body),
+            };
+            Ok(ctx.tag_image(bound, stmt.span))
+        }
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(body),

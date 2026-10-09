@@ -647,6 +647,7 @@ mod tests {
                 name: "eu".into(),
                 module: chl_parser::ModulePath::new(["shop".into()]),
                 statement: chl_parser::ast::Span::new(chl_parser::FileId::ROOT, 0, 0),
+                arguments: Vec::new(),
                 body: Box::new(var("rest")),
             }),
             TypedExpr::mut_decl(

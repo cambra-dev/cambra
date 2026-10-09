@@ -293,10 +293,12 @@ pub enum Stmt {
     /// `return value` (only valid inside a function body; not enforced here).
     Return(Option<Spanned<Expr>>),
 
-    /// `import a::b as c use f, T as U` — bind the shared run of a module
-    /// (`docs/chl-spec.md`, "9.2 Imports").
+    /// `import a::b(arg=e, …) as c use f, T as U` — bind the shared run of a
+    /// module at its arguments (`docs/chl-spec.md`, "9.2 Imports"). `args` is
+    /// empty for both `import m` and `import m()`.
     Import {
         path: ModulePath,
+        args: Vec<ModuleArg>,
         alias: Option<Spanned<SmolStr>>,
         uses: Vec<UseItem>,
     },
@@ -306,7 +308,7 @@ pub enum Stmt {
     /// `run m()`.
     Run {
         path: ModulePath,
-        args: Vec<RunArg>,
+        args: Vec<ModuleArg>,
         alias: Option<Spanned<SmolStr>>,
         uses: Vec<UseItem>,
         /// The predecessor's run this one was, from `@RenamedFrom(eu)` on the
@@ -406,9 +408,9 @@ pub struct UseItem {
     pub alias: Option<Spanned<SmolStr>>,
 }
 
-/// One keyword argument of a [`Stmt::Run`]: `port="8080"`.
+/// One keyword argument of a [`Stmt::Run`] or a [`Stmt::Import`]: `port="8080"`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RunArg {
+pub struct ModuleArg {
     pub name: Spanned<SmolStr>,
     pub value: Spanned<Expr>,
 }

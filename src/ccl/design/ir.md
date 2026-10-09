@@ -208,12 +208,13 @@ statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify r
 
 ### `Run` — a `run` statement before linking
 
-`Run { name, module, statement, body }` is the `run` statement at `statement` that declares the run
-`name` of `module`, over `body`, the rest of the declaring module. A module lowers once, before any
-run of it exists, so the statement cannot stand for the run's chain yet. Linking creates the run
-and replaces the node with its chain around `body` ([docs/modules.md, "A module lowers
-once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
-each has an unreachable arm for one.
+`Run { name, module, statement, arguments, body }` is the `run` statement at `statement` that
+declares the run `name` of `module`, over `body`, the rest of the declaring module. `arguments`
+names the parameters it passes arguments for, each bound in a `let` above the node. A module
+lowers once, before any run of it exists, so the statement cannot stand for the run's chain yet.
+Linking creates the run and replaces the node with its chain around `body` ([docs/modules.md, "A
+module lowers once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a
+`Run`, and each has an unreachable arm for one.
 
 ### `Cast` — explicit refinement acquisition
 

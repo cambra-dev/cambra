@@ -245,6 +245,11 @@ impl RunPath {
     pub fn child(&self, name: impl Into<SmolStr>) -> RunPath {
         RunPath(self.0.iter().cloned().chain([name.into()]).collect())
     }
+
+    /// The run's own name, the path's last segment, or `None` for the root.
+    pub fn last(&self) -> Option<&SmolStr> {
+        self.0.last()
+    }
 }
 
 impl fmt::Display for RunPath {
