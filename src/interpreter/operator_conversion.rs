@@ -1574,7 +1574,7 @@ the compilation declined outlives it here"
     }
 
     /// Seed this context with what a previous version offered.
-    pub fn inherit(&mut self, offer: Offer) {
+    pub fn accept_offer(&mut self, offer: Offer) {
         self.offer = offer;
     }
 

@@ -302,7 +302,7 @@ impl FanOut {
     /// takes a [`recurrence_slot`](Self::recurrence_slot) instead — see
     /// [`FanHold`].
     pub fn slot(&self) -> Box<dyn TileOperator> {
-        self.branch_holding(FanHold::Reader {
+        self.slot_holding(FanHold::Reader {
             shared: self.shared.clone(), // shares the Rc — always connected
             input: self.input.clone(),
         })
@@ -314,13 +314,13 @@ impl FanOut {
     /// recover each position's prior value. Such a reader must not own the
     /// fan-out — see [`FanHold`].
     pub fn recurrence_slot(&self) -> Box<dyn TileOperator> {
-        self.branch_holding(FanHold::Recurrence {
+        self.slot_holding(FanHold::Recurrence {
             shared: Rc::downgrade(&self.shared),
             input: Rc::downgrade(&self.input),
         })
     }
 
-    fn branch_holding(&self, hold: FanHold) -> Box<dyn TileOperator> {
+    fn slot_holding(&self, hold: FanHold) -> Box<dyn TileOperator> {
         let result = FanOutSlot {
             hold,
             base: OperatorBase::new(self.tiling.clone()),

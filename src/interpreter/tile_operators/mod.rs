@@ -138,7 +138,7 @@ pub trait TileOperator {
     ///
     /// The children are [`visit_inputs`](Self::visit_inputs)' `Value` edges, so
     /// an operator states what it holds once and this reads the same answer the
-    /// graph walk does. `Share` edges are left out: a fan branch's edge to its
+    /// graph walk does. `Share` edges are left out: a fan slot's edge to its
     /// fan input would draw the shared subtree once per branch, and following
     /// only `Value` edges is what makes this terminate without a cycle guard —
     /// they are acyclic, which `assert_graph_invariants` pins.
@@ -270,7 +270,7 @@ pub(crate) use impl_operator_base;
 /// flag in.
 ///
 /// A producer instance has exactly one consumer — sharing goes through a
-/// [`FanOut`](crate::interpreter::tile_operators::FanOut), whose branches are separate
+/// [`FanOut`](crate::interpreter::tile_operators::FanOut), whose slots are separate
 /// producers with separate flags — so "since the consumer last pulled" and "since anyone
 /// last pulled" are the same statement.
 #[derive(Clone)]
@@ -846,8 +846,8 @@ pub trait TileProducer {
     /// The [`NodeId`] of the operator that built this producer, or `None` for a
     /// producer built outside any [`TileOperator::subscribe`].
     ///
-    /// One operator can build several producers — a `FanOut` branch is
-    /// subscribed once per branch — so this identifies the operator and not the
+    /// One operator can build several producers — a `FanOut` slot is
+    /// subscribed once per slot — so this identifies the operator and not the
     /// instance. [`producer_id`](Self::producer_id) is the instance.
     fn operator_id(&self) -> Option<NodeId> {
         self.base().node_id
@@ -1043,7 +1043,7 @@ impl ProducerStateInfo {
 ///    emitted at a position is never changed (only `release` shrinks the view).
 /// 2. Positions are absolute and never shift; a released prefix may be compacted
 ///    away, but the live suffix keeps its position values.
-/// 3. Because a released prefix desyncs a fanned branch, a stateful sequencing
+/// 3. Because a released prefix desyncs a fanned slot, a stateful sequencing
 ///    producer is wired with exactly one consumer (the cycle uses
 ///    [`FanOut::new_cyclic`] around the *operator*; the producer itself is never
 ///    fanned). Fanning one is a wiring bug, not a user error.

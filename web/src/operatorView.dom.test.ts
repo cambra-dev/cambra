@@ -147,7 +147,7 @@ describe("OperatorView", () => {
     expect(drawn).toEqual(pane.nodes.map((n) => n.nodeId).sort((a, b) => a - b));
   });
 
-  it("suppresses the fan branches and the constants, and keeps them addressable", async () => {
+  it("suppresses the fan slots and the constants, and keeps them addressable", async () => {
     const { body, pane } = await mountGraph(polymorphic, "post-conversion");
     const boxes = idsOf(body, ".graph-node");
     const suppressed = pane.nodes

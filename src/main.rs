@@ -41,7 +41,7 @@ fn poll_control(
 /// Pull one branch's `main` output once, print what it delivered, and answer
 /// whether it has now finished.
 ///
-/// The default branch's value prints as `Got value: …` and every other
+/// `main`'s value prints as `Got value: …` and every other
 /// branch's as `Got value from <branch>: …`
 /// (`src/ccl/design/program-evolution.md`, "A reload changes no other branch").
 fn pull_main(branch: &str, producer: &mut dyn TileProducer) -> bool {

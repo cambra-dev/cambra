@@ -107,7 +107,8 @@ impl fmt::Display for Origin {
 /// and the operators it holds.
 struct Branch {
     name: String,
-    /// `None` for the root, which was not created by branch-and-reload.
+    /// `None` for the branch the process starts with, which was not created by
+    /// branch-and-reload.
     origin: Option<Origin>,
     /// The current version's number.
     version: u64,
@@ -138,7 +139,7 @@ struct Branch {
 impl Branch {
     /// Every producer registered with a data source that this branch holds:
     /// the ones its current version's compilation registered, and the ones under
-    /// the operators its record holds. What a source's start for a replacement's
+    /// the operators its operator map holds. What a source's start for a replacement's
     /// new producers is taken from (`src/ccl/design/program-evolution.md`,
     /// "Routes across branches").
     fn source_producers(&self) -> HashSet<String> {
@@ -175,7 +176,7 @@ impl Branch {
         self.program.outputs.clear();
     }
 
-    /// Install `program` as this entry's version `version`, holding `record`.
+    /// Install `program` as this entry's version, holding `operator_map`.
     fn install(&mut self, program: CompiledProgram, operator_map: OperatorMap, reuse: ReuseTally) {
         let (program, main_producer) = driving(program);
         self.program = program;
@@ -217,10 +218,10 @@ pub struct BranchSummary {
     pub name: String,
     /// The current version number.
     pub version: u64,
-    /// The branch origin: `None` for the root.
+    /// The branch origin: `None` for the branch the process starts with.
     pub origin: Option<Origin>,
-    /// How many distinct fan-outs the entry's record holds, sink consumers not
-    /// counted.
+    /// How many distinct fan-outs the entry's operator map holds, sink
+    /// consumers not counted.
     pub operators: usize,
     /// How many of those some other entry also holds.
     pub shared: usize,
@@ -304,7 +305,7 @@ impl From<Vec<CompileError>> for BranchError {
 /// The process's branch table, and the verbs that change what runs.
 ///
 /// Every branch runs from the moment it is created. The table is never empty:
-/// the root is created with the process, and the last branch cannot be deleted.
+/// `main@1` is created with the process, and the last branch cannot be deleted.
 pub struct LiveProgram {
     /// Every branch the table holds, in creation order.
     branches: Vec<Branch>,
@@ -530,7 +531,7 @@ impl LiveProgram {
             branch_main_consumer(&main_notified, main_consumer),
         )?;
         let (program, main_producer) = driving(program);
-        let root = Branch {
+        let main = Branch {
             name: MAIN_BRANCH.to_string(),
             origin: None,
             version: 1,
@@ -545,7 +546,7 @@ impl LiveProgram {
             operator_map: ctx.take_operator_map(),
         };
         Ok(LiveProgram {
-            branches: vec![root],
+            branches: vec![main],
             tombstones: HashMap::new(),
         })
     }
@@ -906,19 +907,19 @@ the lagging branch first"
         };
 
         // Where this branch's producers stopped, read while they all exist:
-        // tearing the graph down drops its outputs' producers, and a record dies
-        // with its producer.
+        // tearing the graph down drops its outputs' producers, and a producer's
+        // release record dies with the producer.
         ctx.carry_release_from(&self.branches[at].source_producers());
         let bound_elsewhere = self.routes_bound_except(Some(at));
         self.debug_assert_sink_consumers_unshared(at);
         let branch = &mut self.branches[at];
         branch.tear_down();
         // The offer holds the branch's operators until conversion is over, as a
-        // single program's reload always has; the entry takes the new record
-        // once the compile is done.
-        let previous_record = std::mem::take(&mut branch.operator_map);
-        ctx.offer_predecessor(&previous_record);
-        drop(previous_record);
+        // single program's reload always has; the entry takes the new operator
+        // map once the compile is done.
+        let previous = std::mem::take(&mut branch.operator_map);
+        ctx.offer_predecessor(&previous);
+        drop(previous);
         // The tree the torn-down graph was built from is still here — a teardown
         // drops the producers, not the program — so the compile below can be
         // told which of its nodes the offer already has an operator for.
@@ -945,10 +946,13 @@ the lagging branch first"
     ///
     /// The reload takes the parent's version as its predecessor: the difference,
     /// the state guard and the correspondence are all taken against the parent,
-    /// and the compile is offered the parent's entry by reference, which is read
-    /// and left as it was. Each operator the new version keeps is the parent's,
-    /// subscribed through one more fan-out slot, and each store it rebuilds is
-    /// seeded from the value the parent's variable holds now. The new version
+    /// and the compile is offered the parent's operator map by reference. The
+    /// map lists the same operators afterwards. Building the offer reopens each
+    /// fan-out it holds, which drops dead slots and resets `inspect` bookkeeping,
+    /// while live slots keep their guards ([`OperatorMap::handover`]). Each
+    /// operator the new version keeps is the parent's, subscribed through one
+    /// more fan-out slot, and each store it rebuilds is seeded from the value the
+    /// parent's variable holds now. The new version
     /// builds its own sink consumers, so nothing of the parent's is torn down.
     ///
     /// The copy of the parent's entry the doc describes is never materialized:

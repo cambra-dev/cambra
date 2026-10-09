@@ -139,7 +139,7 @@ fn list(ctx: &mut GlobalContext, live: &mut LiveProgram) -> String {
     reply.body
 }
 
-/// Branch-and-reload creates the branch at version `1` with provenance
+/// Branch-and-reload creates the branch at version `1` with origin
 /// `main@1`, forks its variable from `main`'s value, and leaves `main` serving
 /// what it served. The reply names both versions and carries the reload's
 /// report.
@@ -523,7 +523,7 @@ fn list_and_info_report_versions_and_origin() {
     );
     assert_eq!(body, with_port(PLUSSED_LOG, port), "the current source");
 
-    let root = ask(
+    let main = ask(
         &mut ctx,
         &mut live,
         ControlRequest::Info {
@@ -531,9 +531,9 @@ fn list_and_info_report_versions_and_origin() {
         },
     );
     assert!(
-        root.body.starts_with("main\tversion=3\tfrom=-\t"),
+        main.body.starts_with("main\tversion=3\tfrom=-\t"),
         "{}",
-        root.body
+        main.body
     );
     let missing = ask(
         &mut ctx,
@@ -547,7 +547,7 @@ fn list_and_info_report_versions_and_origin() {
 
 /// Deleting a branch leaves a tombstone: the name answers 404 until recreated,
 /// and the recreated branch continues the numbering, lists none of the
-/// tombstone's versions, and records its own provenance.
+/// tombstone's versions, and records its own origin.
 #[test]
 fn a_recreated_name_continues_its_tombstones_numbering() {
     let (port, mut ctx, mut live) = running_log_with_ab();
@@ -679,7 +679,7 @@ fn deleting_a_branch_frees_only_what_no_other_entry_holds() {
 
 /// The last branch in the table cannot be deleted; any other can, `main`
 /// included, and a branch created from a deleted one keeps running and keeps
-/// its provenance.
+/// its origin.
 #[test]
 fn the_last_branch_cannot_be_deleted() {
     let (port, mut ctx, mut live) = running_log_with_ab();
@@ -1043,10 +1043,10 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
     );
 }
 
-/// The root's first version was installed by the process's first compile,
-/// which keeps nothing, so `/branch/main/info` lists it as `kept=0/<bound>`.
+/// `main@1` was installed by the process's first compile, which keeps
+/// nothing, so `/branch/main/info` lists it as `kept=0/<bound>`.
 #[test]
-fn the_roots_first_version_keeps_nothing() {
+fn mains_first_version_keeps_nothing() {
     let (mut ctx, _src) = with_src();
     let live = LiveProgram::start_text(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     let info = live.render_info(MAIN_BRANCH).expect("main exists");

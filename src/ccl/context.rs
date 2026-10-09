@@ -627,9 +627,8 @@ impl SourceSinkRegistry {
     ///
     /// A request that arrived before the retirement gets that same 404 rather
     /// than waiting, because the source holding it outlives the route: a retired
-    /// version's operators reach it through the inheritance they are offered to
-    /// the next compilation in
-    /// ([`DataSourceDomainExtentImpl::answer_in_flight`](crate::interpreter::DataSourceDomainExtentImpl::answer_in_flight)).
+    /// version's operators reach it through the offer the next compilation
+    /// receives ([`DataSourceDomainExtentImpl::answer_in_flight`](crate::interpreter::DataSourceDomainExtentImpl::answer_in_flight)).
     fn retire_routes_absent_from(
         &mut self,
         still_bound: &HashSet<String>,
@@ -857,7 +856,7 @@ impl GlobalContext {
     /// retired ([`Scheduler::forget_source`]).
     pub fn offer_predecessor(&mut self, predecessor: &OperatorMap) {
         self.conversion = OpConversionContext::new();
-        self.conversion.inherit(predecessor.handover());
+        self.conversion.accept_offer(predecessor.handover());
     }
 
     /// The operator map of what the last compilation built and kept, for the
@@ -907,8 +906,8 @@ impl GlobalContext {
     /// whose value would move between two declarations the source tells apart
     /// only by where they appear. See [`StateConflict`].
     ///
-    /// `predecessor` is the record the reload would offer: the branch's own
-    /// entry, or the parent's for branch-and-reload.
+    /// `predecessor` is the operator map the reload would offer: the branch's
+    /// own, or the parent's for branch-and-reload.
     pub fn state_conflicts(&self, predecessor: &OperatorMap, planned: &Expr) -> Vec<StateConflict> {
         self.conversion.state_conflicts(predecessor, planned)
     }

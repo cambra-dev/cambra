@@ -48,7 +48,7 @@ export type LiveGroup = {
       /**
        * What each producer last answered.
        *
-       * Several, because a `FanOut` branch is subscribed once per branch. Every
+       * Several, because a `FanOut` slot is subscribed once per slot. Every
        * fact about an answer — its shape, its counts, its completeness, how far
        * behind it is — belongs to one of these and not to the operator, so the
        * pane draws a line per producer rather than one line per node.
@@ -233,7 +233,7 @@ interface BodyLine {
    * Identity across frames, so a replacement frame updates the line in place.
    *
    * Qualified by the producer that answered it, not by the domain key alone: an
-   * operator builds one producer per `FanOut` branch, and two of them holding a
+   * operator builds one producer per `FanOut` slot, and two of them holding a
    * row at one key are two rows. The role leads, so a producer whose row is
    * keyed `__dropped` cannot collide with its own marker.
    */

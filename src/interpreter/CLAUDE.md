@@ -28,7 +28,7 @@ Concretely:
   docs for the contract — but the data on the wire is still a [`Tile`].
   A cyclic pull is served the fan's cached snapshot rather than
   re-entering the inner producer, which is why such a cycle advances one
-  step per outer pull.  The branch that closes the cycle is a
+  step per outer pull.  The slot that closes the cycle is a
   `FanOut::recurrence_slot`, which does not own the fan: an owning
   handle taken from inside the fan's own input chain retains that whole
   subgraph for the life of the process — see [`FanHold`].

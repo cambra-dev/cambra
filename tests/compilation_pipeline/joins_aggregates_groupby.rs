@@ -650,7 +650,7 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
 /// A **shared grouping**: bound once, used many times.
 ///
 /// A `groupby` is a collection, so it is `let`-bound and compiled once behind a
-/// `Memo`, with each use taking a `FanOut` branch — the same treatment any other
+/// `Memo`, with each use taking a `FanOut` slot — the same treatment any other
 /// collection gets. Every case here uses one grouping more than once, which is
 /// what the sharing is for: the partition is built once however many keys are
 /// looked up or iterations run over it.

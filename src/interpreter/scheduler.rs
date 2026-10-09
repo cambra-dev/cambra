@@ -152,7 +152,7 @@ impl Scheduler {
     ///
     /// A source producer is attributed to whatever subscribed it, so the branch
     /// table can say which producers a branch holds: a fan-out records the
-    /// readers its input chain registered, and a compilation the readers its
+    /// producers its input chain registered, and a compilation the producers its
     /// outputs registered (`src/ccl/design/program-evolution.md`, "Routes across
     /// branches"). Frames nest, because a fan-out's input is subscribed from
     /// inside a compilation's.
@@ -160,20 +160,20 @@ impl Scheduler {
         self.producer_frames.push(Vec::new());
     }
 
-    /// Close the innermost frame and return the readers registered in it.
+    /// Close the innermost frame and return the producers registered in it.
     ///
-    /// The readers are also added to the enclosing frame, so a frame's record
-    /// covers every reader registered below it, including those under a nested
+    /// The producers are also added to the enclosing frame, so a frame's record
+    /// covers every producer registered below it, including those under a nested
     /// fan-out.
     pub fn end_source_producers(&mut self) -> Vec<String> {
-        let readers = self
+        let producers = self
             .producer_frames
             .pop()
             .expect("`end_source_producers` closes a frame `begin_source_producers` opened");
         if let Some(outer) = self.producer_frames.last_mut() {
-            outer.extend(readers.iter().cloned());
+            outer.extend(producers.iter().cloned());
         }
-        readers
+        producers
     }
 
     /// Record that the producer named `producer` registered with a data source.

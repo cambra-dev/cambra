@@ -107,7 +107,7 @@ pub fn inline_capability_lambdas(expr: Expr) -> Expr {
 /// inlining is how it reaches its call sites to be specialized there.
 ///
 /// A **collection** is not. The binding is the data, so op-conversion compiles
-/// it once behind a `Memo` and hands every use a `FanOut` branch; inlining it
+/// it once behind a `Memo` and hands every use a `FanOut` slot; inlining it
 /// would rebuild the whole collection per use. That is the entire rule, and
 /// [`FunKind`](crate::ccl::ty::FunKind) is exactly the distinction — see
 /// `src/ccl/design/type-inference.md`, "4.6 Data vs compute functions".
