@@ -205,6 +205,21 @@ fn an_augmented_write_in_a_loop() {
     "#});
 }
 
+/// A filter reading both binders of a nested loop, inside the loop's write. The filter's
+/// predicate and its rows reach each enclosing position separately, so a pull can hold rows
+/// whose answers have not arrived.
+#[test]
+fn a_filter_reading_both_nested_binders() {
+    agree(indoc! {r#"
+        acc := 0
+        for i in [1, 2]:
+            for q in [1, 2, 3]:
+                acc := acc + sum([z * i * q for z in [1, 2, 3] if z > i - q])
+        out = test_sink()
+        out << acc
+    "#});
+}
+
 /// Group keys compared through the loop key, rather than folded away by an aggregate.
 /// Inference panics: the group key binder `__gb_k` escapes into a bound outside its scope.
 /// Pinned at the interpreter's answer and the compiler's panic.
