@@ -3717,8 +3717,8 @@ deletes no state.
 ## 9. Modules [Decided]
 
 A **module** is one `.cambra` file. The statements of this section, qualified names, and qualified
-labels and tags parse. `import` with its `use` clause, `pub`, and qualified values, labels, and tags
-lower, and lowering refuses the rest. A module is used in one of two ways:
+labels and tags parse. `import` with its `use` clause, `pub`, qualified values, labels, and tags,
+and qualified type aliases lower, and lowering refuses the rest. A module is used in one of two ways:
 
 - **Importing** it brings its public members into scope. Importing asserts that the module performs
   no IO. Its members and its state exist once in the program, however many modules import it

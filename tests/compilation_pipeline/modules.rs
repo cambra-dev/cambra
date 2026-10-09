@@ -209,9 +209,9 @@ plus(1)
     "import catalog use missing\n",
     "module `catalog` has no member `missing`"
 )]
-#[case::type_member(
+#[case::missing_type_member(
     "import catalog use Item\n",
-    "the type member `catalog::Item` is not supported yet"
+    "module `catalog` has no type member `Item`"
 )]
 #[case::bound_by_a_member(
     "import catalog use limit\nlimit = 1\n",
@@ -270,6 +270,101 @@ fn a_missing_member_is_refused() {
         ),
         "module `catalog` has no member `missing`",
     );
+}
+
+/// A module's type aliases, as `shapes` declares them: `Small` names a
+/// refinement over the private `cap`, `Pair` a record, and `Hidden` is private.
+const SHAPES: &str = indoc! {"
+    cap = 10
+    pub Small = {Int where _ < cap}
+    pub Pair = {left: Int, right: Int}
+    Hidden = Int
+    pub def first(p: Pair) => Int:
+        p.left
+"};
+
+/// An imported alias names the type its module declares, by qualified name and
+/// through `use`, under its own name or an alias (`docs/chl-spec.md`, "9.2
+/// Imports").
+#[rstest]
+#[case::qualified("import shapes\nx: shapes::Small = 5\nx\n")]
+#[case::used("import shapes use Small\nx: Small = 5\nx\n")]
+#[case::used_under_an_alias("import shapes use Small as Tiny\nx: Tiny = 5\nx\n")]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_alias_names_its_modules_type(#[case] root: &str) {
+    check_program_scalar(&program(root, &[("shapes", SHAPES)]), Value::Int(5));
+}
+
+/// An imported alias's predicate reads the bindings its declaration sees, so
+/// the importer's own `cap` does not capture it, and a value it rejects is
+/// rejected wherever the alias is used.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_alias_is_closed_over_its_module() {
+    let importer =
+        |value: i64| format!("import shapes\ncap = 100\nx: shapes::Small = {value}\nx + cap\n");
+    check_program_scalar(
+        &program(&importer(5), &[("shapes", SHAPES)]),
+        Value::Int(105),
+    );
+    let errors = compile_errors(&program(&importer(50), &[("shapes", SHAPES)]));
+    assert!(
+        errors.contains("annotated as {Int where _ < shapes::cap}"),
+        "{errors}"
+    );
+}
+
+/// An imported record alias is the record type its module writes, labels and
+/// all, so the importer builds it with that module's labels.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_record_alias_carries_its_modules_labels() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import shapes use Pair
+                p: Pair = (shapes::left=1, shapes::right=2)
+                shapes::first(p) + p.shapes::right
+            "},
+            &[("shapes", SHAPES)],
+        ),
+        Value::Int(3),
+    );
+}
+
+/// An alias may be built from another module's alias, and carries its type.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_alias_is_built_from_another_modules_alias() {
+    check_program_scalar(
+        &program(
+            "import sizes use Medium\nx: Medium = 5\nx\n",
+            &[
+                ("shapes", SHAPES),
+                ("sizes", "import shapes\npub Medium = shapes::Small\n"),
+            ],
+        ),
+        Value::Int(5),
+    );
+}
+
+#[rstest]
+#[case::private(
+    "import shapes\nx: shapes::Hidden = 1\nx\n",
+    "`Hidden` is private to module `shapes`"
+)]
+#[case::private_through_use(
+    "import shapes use Hidden\n1\n",
+    "`Hidden` is private to module `shapes`"
+)]
+#[case::bound_by_an_alias(
+    "import shapes use Small\nSmall = Int\n1\n",
+    "`Small` is a `use` name, so no member of its module takes it"
+)]
+#[case::a_builtin_type("import shapes use Small as Int\n1\n", "`Int` is a built-in type")]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_type_member_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(&program(root, &[("shapes", SHAPES)]), needle);
 }
 
 /// A label written in a module is that module's: the library's `price` is
@@ -363,9 +458,17 @@ fn importing_a_module_that_performs_io_is_refused() {
     "import catalog\ndef f(catalog):\n    1\nf(2)\n",
     "`catalog` is an import name"
 )]
-#[case::type_member(
+#[case::missing_type_member(
     "import catalog\nx: catalog::Item = 1\nx\n",
-    "the type member `catalog::Item`"
+    "module `catalog` has no type member `Item`"
+)]
+#[case::type_member_as_a_value(
+    "import catalog\ncatalog::Item\n",
+    "`catalog::Item` is a type, not a value"
+)]
+#[case::value_member_as_a_type(
+    "import catalog\nx: catalog::limit = 1\nx\n",
+    "`catalog::limit` is a value, not a type"
 )]
 #[case::unknown_qualifier("(nope::a=1).a\n", "`nope` is not an import name of this module")]
 #[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]
