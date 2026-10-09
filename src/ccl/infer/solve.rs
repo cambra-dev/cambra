@@ -1048,56 +1048,23 @@ fn check_scope_valid_go(
             related: RelatedPositions::default(),
         });
     }
-    match &expr.node {
-        TypedExprNode::Lambda { param, body, .. } => {
-            let mut s = scope.clone();
-            s.insert(param.name.clone());
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            check_scope_valid_go(bound_expr, scope, witnesses, errors);
-            let mut s = scope.clone();
-            s.insert(binding.name.clone());
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            if let Some(sc) = scrutinee {
-                check_scope_valid_go(sc, scope, witnesses, errors);
-            }
-            for b in branches {
+    // The binders are the ones `for_each_scoped_item` states for every node, so a node that
+    // introduces one is checked under it without this walk restating which nodes bind.
+    crate::ccl::scope::for_each_scoped_item(expr, &mut |item| {
+        if let crate::ccl::scope::ScopedItem::Child {
+            expr: child,
+            binders,
+        } = item
+        {
+            if binders.is_empty() {
+                check_scope_valid_go(child, scope, witnesses, errors);
+            } else {
                 let mut s = scope.clone();
-                if let Some(p) = &b.pattern {
-                    s.insert(p.binding.name.clone());
-                }
-                check_scope_valid_go(&b.guard, &s, witnesses, errors);
-                check_scope_valid_go(&b.body, &s, witnesses, errors);
+                s.extend(binders.iter().map(|b| b.name.clone()));
+                check_scope_valid_go(child, &s, witnesses, errors);
             }
         }
-        // Mutual recursion: the whole group is in scope in every binding
-        // body and in the letrec body.
-        TypedExprNode::LetRec { bindings, body } => {
-            let mut s = scope.clone();
-            s.extend(bindings.iter().map(|(b, _)| b.name.clone()));
-            for (_, def) in bindings {
-                check_scope_valid_go(def, &s, witnesses, errors);
-            }
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        TypedExprNode::For { target, iter, body } => {
-            check_scope_valid_go(iter, scope, witnesses, errors);
-            let mut s = scope.clone();
-            s.insert(target.name.clone());
-            check_scope_valid_go(body, &s, witnesses, errors);
-        }
-        _ => expr.walk_children(|c| check_scope_valid_go(c, scope, witnesses, errors)),
-    }
+    });
 }
 
 /// Resolve a type that may contain inference variables into a concrete
@@ -2896,6 +2863,28 @@ mod tests {
         let mut errors = Vec::new();
         check_scope_valid(&lam, &std::collections::BTreeSet::new(), &mut errors);
         assert_eq!(errors, vec![]);
+    }
+
+    // A mutable variable introduction scopes like a `let`: its binder is in scope over the
+    // body, where a filter reading the variable puts it in a refinement, and not over the
+    // seed.
+    #[test]
+    fn scope_check_scopes_a_mutable_variable_over_its_body_only() {
+        use super::check_scope_valid;
+        use crate::ccl::infer::InferError;
+        let mut body = lit_int(1);
+        body.ty = refined_int(TypedExpr::var("x"));
+        let mut init = lit_int(0);
+        init.ty = refined_int(TypedExpr::var("x"));
+        let init_id = init.node_id();
+        let decl = TypedExpr::mut_decl("x", Type::Hole, init, body);
+        let mut errors = Vec::new();
+        check_scope_valid(&decl, &std::collections::BTreeSet::new(), &mut errors);
+        let [located] = errors.as_slice() else {
+            panic!("expected one ScopeViolation, on the seed; got {errors:?}");
+        };
+        assert!(matches!(located.error, InferError::ScopeViolation { .. }));
+        assert_eq!(located.node_id, init_id, "the seed is outside the binder");
     }
 
     // Appendix case L: a predicate whose only free variable is the
