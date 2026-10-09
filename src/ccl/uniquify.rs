@@ -78,6 +78,7 @@
 use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::PredMemo;
+use crate::ccl::module_type::AliasType;
 use crate::ccl::names::Home;
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
 use std::sync::Arc;
@@ -146,7 +147,7 @@ pub struct Uniquified {
     /// predicates resolved where it is declared: what the module exports as its
     /// type members (`docs/modules.md`, "Imported aliases are closed over their
     /// module").
-    pub aliases: Vec<(String, Type)>,
+    pub aliases: Vec<(String, AliasType)>,
 }
 
 /// [`run`] on the tree of one module, with `scope` beneath every binder of
@@ -240,7 +241,7 @@ struct Uniquifier {
     top_level: bool,
     /// The top-level `LetType`s walked so far, by spelling, with their types
     /// resolved ([`Uniquified::aliases`]).
-    aliases: Vec<(String, Type)>,
+    aliases: Vec<(String, AliasType)>,
     /// Lexical environment: source spelling → stack of minted names, the
     /// innermost binder last. Raw `Var`s resolve to the top of their
     /// spelling's stack.
@@ -467,7 +468,7 @@ impl Uniquifier {
             // then gives way to its body below. An alias statement among a module's
             // top-level statements leaves the statements below it top-level.
             TypedExprNode::LetType { name, ty, body } => {
-                self.ty(ty);
+                ty.walk_types_mut(&mut |ty| self.ty(ty));
                 if top_level {
                     self.aliases.push((name.clone(), ty.clone()));
                 }

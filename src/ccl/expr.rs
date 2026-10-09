@@ -3,6 +3,7 @@
 //! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`WriterSite`] support
 //! types.
 
+use crate::ccl::module_type::AliasType;
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Label, Lit, Name, ProjKey, Type, UnaryOpKind};
 use crate::chl_parser::ModulePath;
@@ -380,8 +381,10 @@ pub enum TypedExprNode {
     /// A `run` statement in a module being lowered: the run `name` of `module`,
     /// declared by the statement at `statement`, with the rest of the declaring
     /// module in `body` (`docs/modules.md`, "A module lowers once").
-    /// `arguments` are the parameters the statement passes arguments for, each
-    /// bound above the node.
+    /// `arguments` are the parameters the statement passes value arguments
+    /// for, each bound above the node, and `modules` each module argument, by
+    /// its parameter: the module's spelling in the declaring module, and the
+    /// argument's span.
     ///
     /// Exists only between lowering and linking. Linking replaces it with the
     /// run's chain around `body`, so no pass after it sees one, and each has an
@@ -391,6 +394,7 @@ pub enum TypedExprNode {
         module: ModulePath,
         statement: Span,
         arguments: Vec<SmolStr>,
+        modules: Vec<(SmolStr, String, Span)>,
         body: Box<TypedExpr>,
     },
 
@@ -405,8 +409,8 @@ pub enum TypedExprNode {
     LetType {
         /// The alias's spelling, for rendering.
         name: String,
-        /// The type the alias names.
-        ty: Type,
+        /// The type, or the Module type, the alias names.
+        ty: AliasType,
         /// The rest of the block the alias is declared in.
         body: Box<TypedExpr>,
     },
@@ -1419,7 +1423,7 @@ impl TypedExpr {
 
     /// Construct a [`TypedExprNode::LetType`] — the type alias `name = ty`, declared
     /// over `body`.
-    pub fn let_type(name: impl Into<String>, ty: Type, body: Self) -> Self {
+    pub fn let_type(name: impl Into<String>, ty: AliasType, body: Self) -> Self {
         Self::new(TypedExprNode::LetType {
             name: name.into(),
             ty,
@@ -2150,10 +2154,10 @@ impl TypedExpr {
         if let Some(annotation) = &self.user_annotation {
             f(annotation);
         }
-        if let TypedExprNode::Cast { target, .. } | TypedExprNode::LetType { ty: target, .. } =
-            &self.node
-        {
-            f(target);
+        match &self.node {
+            TypedExprNode::Cast { target, .. } => f(target),
+            TypedExprNode::LetType { ty, .. } => ty.walk_types(&mut f),
+            _ => {}
         }
         if let TypedExprNode::Transact {
             domain, parameter, ..
@@ -2180,10 +2184,10 @@ impl TypedExpr {
         if let Some(annotation) = &mut self.user_annotation {
             f(annotation);
         }
-        if let TypedExprNode::Cast { target, .. } | TypedExprNode::LetType { ty: target, .. } =
-            &mut self.node
-        {
-            f(target);
+        match &mut self.node {
+            TypedExprNode::Cast { target, .. } => f(target),
+            TypedExprNode::LetType { ty, .. } => ty.walk_types_mut(&mut f),
+            _ => {}
         }
         if let TypedExprNode::Transact {
             domain, parameter, ..

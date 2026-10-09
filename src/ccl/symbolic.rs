@@ -10,6 +10,7 @@
 //!
 //! The public entry point is [`symbolic`].
 
+use crate::ccl::module_type::AliasType;
 use crate::ccl::{
     ArithmeticKind, BinOpKind, BindingTransparency, Branch, Builtin, Expr, Lit, LogicKind, Type,
     TypedExprNode, UnaryOpKind,
@@ -186,6 +187,22 @@ pub(crate) fn symbolic_under(expr: &Expr, binders: Option<&PiBinderEnv<'_>>) -> 
 /// descended through, so it takes the same environment the predicate does.
 fn ty_at<'a>(ty: &'a Type, opts: &'a SymbolicOpts<'a>) -> crate::ccl::ty::TypeUnder<'a, 'a> {
     crate::ccl::ty::TypeUnder(ty, opts.pi_binders)
+}
+
+/// What a type alias names, rendered as [`ty_at`] renders a type, a Module
+/// type entry by entry.
+fn alias_type_at(ty: &AliasType, opts: &SymbolicOpts) -> String {
+    match ty {
+        AliasType::Type(ty) => ty_at(ty, opts).to_string(),
+        AliasType::Module(module) => {
+            let entries: Vec<String> = module
+                .entries
+                .iter()
+                .map(|entry| format!("{}: {}", entry.name, alias_type_at(&entry.ty, opts)))
+                .collect();
+            format!("Module{{{}}}", entries.join(", "))
+        }
+    }
 }
 
 /// Render one transaction writer: `[reads]⇒[writes] over <source> do <body>` —
@@ -397,7 +414,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             let body_str = fmt(body, Precedence::Lowest, opts);
             (
                 Precedence::Lowest,
-                format!("let type {name} = {}\nin {body_str}", ty_at(ty, opts)),
+                format!(
+                    "let type {name} = {}\nin {body_str}",
+                    alias_type_at(ty, opts)
+                ),
             )
         }
 

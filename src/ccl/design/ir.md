@@ -195,7 +195,9 @@ is structural and remains available after source annotations are cleared by infe
 
 ### Type aliases resolve where they are declared
 
-`LetType { name, ty, body }` is the type alias `name = ty` declared over `body`. It binds no value:
+`LetType { name, ty, body }` is the type alias `name = ty` declared over `body`, where `ty` is a
+type or a Module type, each of whose entries holds a type ([docs/modules.md, "Module types are not
+value types"](../../../docs/modules.md#module-types-are-not-value-types)). It binds no value:
 lowering substitutes `ty` at every use, so nothing refers to `name`. The node holds `ty` where the
 alias is declared, because a refinement predicate in `ty` reads values, as `Pos = {Int where _ > k}`
 reads `k`, and those names resolve in the declaration's scope, not at a use under a local `k`.
@@ -208,13 +210,15 @@ statements"](../../../docs/chl-spec.md#67-type-alias-statements)), so uniquify r
 
 ### `Run` — a `run` statement before linking
 
-`Run { name, module, statement, arguments, body }` is the `run` statement at `statement` that
-declares the run `name` of `module`, over `body`, the rest of the declaring module. `arguments`
-names the parameters it passes arguments for, each bound in a `let` above the node. A module
-lowers once, before any run of it exists, so the statement cannot stand for the run's chain yet.
-Linking creates the run and replaces the node with its chain around `body` ([docs/modules.md, "A
-module lowers once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a
-`Run`, and each has an unreachable arm for one.
+`Run { name, module, statement, arguments, modules, body }` is the `run` statement at `statement`
+that declares the run `name` of `module`, over `body`, the rest of the declaring module.
+`arguments` names the parameters it passes value arguments for, each bound in a `let` above the
+node, and `modules` holds each module argument: its parameter, the module as the declaring module
+spells it, and the argument's span. A module lowers once, before any run of it exists, so the
+statement cannot stand for the run's chain yet. Linking creates the run and replaces the node with
+its chain around `body` ([docs/modules.md, "A module lowers
+once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
+each has an unreachable arm for one.
 
 ### `Cast` — explicit refinement acquisition
 

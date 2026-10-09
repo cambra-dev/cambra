@@ -84,6 +84,7 @@ use std::{
 use crate::{
     ccl::{
         Branch, Expr, Lit, Name, RunPath, SharedHoleMint, Type, TypedExprNode,
+        module_type::AliasType,
         provenance::{Nature, RewriteLabel},
     },
     chl_parser::ast::{
@@ -395,7 +396,8 @@ pub struct LoweringContext {
     /// each one binds, innermost declaration last.
     ///
     /// An alias names an existing type rather than making a new one, so the
-    /// entry holds the already-lowered [`Type`] and a use site substitutes it
+    /// entry holds the already-lowered [`Type`], or Module type, and a use site
+    /// substitutes it
     /// (`docs/chl-spec.md`, "6.7 Type-alias statements"). The declaration
     /// lowers to a [`TypedExprNode::LetType`] holding that type, which is where
     /// its predicates' names resolve; uniquify then removes it, so no later
@@ -468,6 +470,19 @@ pub struct LoweringContext {
     /// The sinks the module being lowered declares, in the order lowered, which
     /// each run of it registers ([`Self::register_sinks`]).
     declared_sinks: Vec<DeclaredSink>,
+    /// The spelling and type of each `let` each Module-typed parameter of the
+    /// module being lowered binds, one per value its Module type names, by the
+    /// parameter ([`Self::declare_module_parameters`]).
+    pub(super) module_parameters: HashMap<SmolStr, Vec<(String, Type)>>,
+    /// The Module type of each Module-typed parameter of the module being
+    /// lowered.
+    pub(super) module_parameter_types: HashMap<SmolStr, Rc<crate::ccl::module_type::ModuleType>>,
+    /// The module each Module-typed parameter's default names, as the module
+    /// being lowered spells it.
+    pub(super) module_parameter_defaults: HashMap<SmolStr, String>,
+    /// Every binder the module being lowered writes, with its span, for the rule
+    /// that none takes a name that denotes a module ([`import_name_binders`]).
+    pub(super) module_binders: Vec<(SmolStr, Span)>,
 }
 
 /// A sink a module declares: lowering binds its name, and each run of the
@@ -494,14 +509,14 @@ pub(super) struct DeclaredAlias {
     /// name in scope throughout: a type parameter in its definition, or a `use`
     /// type name in its module.
     statement: Option<Span>,
-    ty: Type,
+    ty: AliasType,
 }
 
 /// What a capitalized name means as a type at a use
 /// ([`LoweringContext::type_alias`]).
 pub(super) enum AliasAt<'a> {
-    /// The alias in scope there names this type.
-    InScope(&'a Type),
+    /// The alias in scope there names this type or Module type.
+    InScope(&'a AliasType),
     /// An alias of the name is declared in an enclosing block, below the use.
     Below,
     /// No enclosing block declares an alias of the name.
@@ -908,7 +923,7 @@ impl LoweringContext {
         &mut self,
         name: impl Into<String>,
         statement: Span,
-        ty: Type,
+        ty: AliasType,
     ) {
         self.type_aliases
             .entry(name.into())
@@ -922,7 +937,7 @@ impl LoweringContext {
     /// Bind `name` to `ty` throughout the scope being lowered: a type parameter
     /// throughout its definition (`docs/chl-spec.md`, "Type parameters"), or a
     /// `use` type name throughout its module.
-    pub(super) fn declare_type_throughout(&mut self, name: impl Into<String>, ty: Type) {
+    pub(super) fn declare_type_throughout(&mut self, name: impl Into<String>, ty: AliasType) {
         self.type_aliases
             .entry(name.into())
             .or_default()
@@ -949,7 +964,7 @@ impl LoweringContext {
 
     /// The type of the alias `name` that `statement` declares, or `None` when its
     /// declaration was refused.
-    pub(super) fn declared_type_alias(&self, name: &str, statement: Span) -> Option<&Type> {
+    pub(super) fn declared_type_alias(&self, name: &str, statement: Span) -> Option<&AliasType> {
         self.type_aliases
             .get(name)?
             .iter()
@@ -1136,7 +1151,8 @@ fn lower_expr_inner(
                 return Err(LoweringError::unsupported(
                     expr.span,
                     format!(
-                        "`{name}` names a module, and a module as a value is not supported yet"
+                        "`{name}` names a module, which is a value only as a run argument or a \
+                         binding"
                     ),
                 ));
             }
@@ -1216,6 +1232,12 @@ fn lower_expr_inner(
             expr.span,
             "`{…}` is type syntax (a record type `{name: T}`); \
              a record value is written `(name=value)`",
+        )),
+        // A Module type names the type of a module, not a value.
+        ChlExpr::ModuleType(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "`Module{…}` is a Module type, the type of a module; it is written as a \
+             parameter's type or an alias, not as a value",
         )),
         // A refinement `{T where p}` is structural *type* syntax; it names a
         // type, not a value. (Accepted in annotation position — see
@@ -1469,7 +1491,13 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     // lowering site has to account for it.
     let syntax = module_syntax::refuse_module_syntax(module);
     let mut errors = syntax.errors;
-    errors.extend(import_name_binders(&syntax.binders, ctx));
+    errors.extend(import_name_binders(&syntax.binders, ctx, |kind| {
+        !matches!(
+            kind,
+            modules::QualifierKind::Parameter | modules::QualifierKind::Binding
+        )
+    }));
+    ctx.module_binders = syntax.binders;
     let members = modules::top_level_bindings(&module.body);
     errors.extend(modules::public_names_bound_twice(&members));
     errors.extend(use_name_members(&members, ctx));
@@ -1513,18 +1541,39 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     LoweringResult { value, errors }
 }
 
-/// One error per binder spelled like an import name or a run name: `m::f` names
-/// a module's member, so a binder spelled `m` would give one spelling two
-/// meanings in one scope (`docs/chl-spec.md`, "9.6 Qualified references").
-fn import_name_binders(binders: &[(SmolStr, Span)], ctx: &LoweringContext) -> Vec<LoweringError> {
+/// One error per binder spelled like a name that denotes a module, other than
+/// a binding of a module itself: `m::f` names a module's member, so a binder
+/// spelled `m` would give one spelling two meanings in one scope
+/// (`docs/chl-spec.md`, "9.6 Qualified references").
+///
+/// `kinds` selects the names checked: an import's, a run's, and a `use` name's
+/// are in scope before the module lowers, and a parameter's and a binding's once
+/// they are declared ([`LoweringContext::declare_module_parameters`]).
+pub(super) fn import_name_binders(
+    binders: &[(SmolStr, Span)],
+    ctx: &LoweringContext,
+    kinds: impl Fn(modules::QualifierKind) -> bool,
+) -> Vec<LoweringError> {
     binders
         .iter()
         .filter_map(|(name, span)| {
-            let qualifier = ctx.module.qualifiers.get(name.as_str())?;
-            let (what, note) = if qualifier.run {
-                ("a run name", "run here")
-            } else {
-                ("an import name", "imported here")
+            let qualifier = ctx
+                .module
+                .qualifiers
+                .get(name.as_str())
+                .filter(|q| kinds(q.kind))?;
+            let own =
+                qualifier.statement.start <= span.start && span.end <= qualifier.statement.end;
+            if qualifier.kind == modules::QualifierKind::Binding && own {
+                return None;
+            }
+            let what = qualifier.kind.describe();
+            let note = match qualifier.kind {
+                modules::QualifierKind::Import => "imported here",
+                modules::QualifierKind::Run => "run here",
+                modules::QualifierKind::Parameter => "the parameter",
+                modules::QualifierKind::Binding => "bound here",
+                modules::QualifierKind::Use { .. } => "bound by `use` here",
             };
             Some(
                 LoweringError::unsupported(

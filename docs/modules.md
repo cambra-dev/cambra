@@ -39,9 +39,11 @@ Two properties depend on that:
   against the module interface in type position, or against the parameter's Module type when `n`
   is a parameter.
 
-A Module-typed parameter names exactly one run in each copy of its module, so linking binds it to
-that run. After linking, `audit::events` is the argument run's member itself: specialization and
-planning see `audit::events`, and checking against the Module type costs nothing downstream.
+A Module-typed parameter names exactly one run in each run of its module. It lowers to a `let` per
+entry, `audit::events`, and creating a run of its module binds each to the argument run's member at
+the type the Module type gives it ([Module types are not value
+types](#module-types-are-not-value-types)). Specialization and planning see the member, and
+checking against the Module type costs one `let`.
 
 ## Linking
 
@@ -107,7 +109,8 @@ today.
 A reference to another module's member needs no name of its own kind. It lowers to a raw name
 spelled through its qualifier, `m::f` or `eu::f`, and creating the run it stands in resolves that
 spelling to the binder of the run the qualifier reaches ([A module lowers
-once](#a-module-lowers-once)).
+once](#a-module-lowers-once)). Through a Module-typed parameter it is the `let` the parameter binds,
+`audit::f` ([Module types are not value types](#module-types-are-not-value-types)).
 
 One change to `Name` (`src/ccl/names.rs`): **`Name::Unique { base, uid, home }`**, where `home` is
 the run a member belongs to: `Shared(SharedRun)` for a shared run's member, its module path and its
@@ -283,11 +286,11 @@ Importing values and type aliases is implemented: `import m`, `import a::b as c`
   statement that reaches it. Two sets are compared as written, so an omitted argument and one equal
   to its default reach two shared runs, where chl-spec.md's "9.2 Imports" has them reach one.
   Comparing them needs a default evaluated at link time ([Link-time constants](#dependencies)). An
-  argument is a literal; anything else is an error at the argument ([Dependencies](#dependencies)).
-  Each argument is bound at the head of the shared run's chain, at its parameter's type, and a
-  parameter with neither an argument nor a default is an error at the `import`.
-- **Refused:** a module as a value, and a member of a run another module declares. The later items
-  lift these.
+  argument is a literal or an import name; anything else is an error at the argument
+  ([Dependencies](#dependencies)). An import name's shared run is part of the key,
+  `shop(counter=counter)`, and is created first (`ProgramLowering::ensure_shared_run`). Each literal
+  is bound at the head of the shared run's chain, at its parameter's type, and a parameter with
+  neither an argument nor a default is an error at the `import`.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
@@ -309,6 +312,8 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   run path, `eu::out` (`LoweringContext::register_sinks`). The program's tail reads it through the
   binder the run's chain minted (`LoweringContext::run_sink_names`). A run's mutable variables are
   labeled by run path in history records, so two runs keep two histories.
+- **A run's feed is fed through its run name.** `a::events << e` feeds the run's public feed, as
+  `events << e` does inside it: a feed's target may be qualified (`feed_target`).
 - **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
   an error at the second `run` statement, with a note at the first. A route address is a literal,
   so two runs of one module that serves a route always conflict.
@@ -321,10 +326,10 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   statement. An unannotated parameter's type is inferred from the module's uses, so a bad argument
   for one is reported where the module uses it, until a module is checked alone. The root takes
   every parameter's default, and a parameter without one is an error there.
-- **Refused:** a type parameter and a parameter of Module type (item 7), `@RenamedFrom`, and a `run`
-  in an imported module. `pub` on a `run` is a parse error: a module returns a run by binding it to
-  a public member, which waits on Module types. `pub` on `:=` is refused, so no module reaches
-  another run's mutable variable.
+- **Refused:** a type parameter (item 7), `@RenamedFrom`, and a `run` in an imported module. `pub`
+  on a `run` is a parse error, since a module returns a run by binding it to a public member
+  ([Module types are not value types](#module-types-are-not-value-types)). `pub` on `:=` is
+  refused, so no module reaches another run's mutable variable.
 
 ### The module interface
 
@@ -372,6 +377,52 @@ A top-level alias's predicate sees only the module's members and the prelude, so
 reads is a binder of its module. Visibility does not apply to those names ([chl-spec.md, "9.13
 Private-in-public"](chl-spec.md#913-private-in-public)), and a private one renders qualified, as
 `inventory::catalog` ([Names carry their home](#names-carry-their-home)).
+
+### Module types are not value types
+
+A Module type is a `ModuleType` (`src/ccl/module_type.rs`), its entries in the order written, and
+not a `Type`: no value has one ([chl-spec.md, "9.8 Module types"](chl-spec.md#98-module-types)).
+What a type alias names is an `AliasType`, a `Type` or a `ModuleType`, and a `LetType` holds one,
+so an alias of a Module type is declared, exported, and closed over its module as any alias is
+([Imported aliases are closed over their module](#imported-aliases-are-closed-over-their-module)).
+A Module type is written as a parameter's annotation, an alias's right-hand side, or an entry of
+another Module type (`lower_alias_type`). Anywhere else it is an error, as is a Module type's alias
+named as a value's type.
+
+A name denotes a module when it is an import name, a run name, a parameter annotated with a Module
+type, a top-level binding of a module, `pub audit = a`, or a `use` name of a member bound to one.
+Each is a `Qualifier`, and so is a path through public members bound to a module, `shop::audit`.
+A qualifier spells a member reached through it as the module it names is spelled: a binding
+`k = c` spells `k::f` as `c::f`, and through an interface `h::k::f` is `h::c::f`
+(`ModuleMember::spelling`). Creating a run then resolves those spellings as any other, and a
+binding needs no names of its own.
+
+A Module-typed parameter lowers once, before any argument exists
+(`LoweringContext::declare_module_parameters`). Its Module type gives it a view (`ModuleView`) and
+a `let` per value entry at the head of its module's chain, `audit::count`, at the entry's type. A
+reference through it resolves to that `let`, so the module sees the entry's type, and a member the
+Module type does not name is an error at the reference. A binding of the parameter, or of a path
+through it, reaches what the parameter does. A module entry reaches its members through its own
+Module type, with its values' `let`s spelled under it, `shop::audit::events`.
+
+A `run` statement passing a module to a Module-typed parameter checks, while the declaring module
+lowers, that the module has every member the Module type names, public (`uncovered`). Passing a
+parameter on checks the next run's Module type against the parameter's view. A parameter annotated
+with a Module type must be passed a module, and a module must be passed to one. Creating the run
+binds each entry's `let` to the argument's member, imaged at the argument, so a member whose type
+does not fit is the argument's error (`ProgramLowering::bind_module_parameter`). The argument's
+members are those of the run or shared run it names, or, for a parameter passed on, those of that
+parameter's argument (`module_names`). A default names an import, checked while the module lowers
+and taken by a run that passes no argument.
+
+A polymorphic entry's `let` carries its polymorphic type, as a `def` with type parameters does. A
+feed entry, `Feed(T)`, is a feed handle with its domain left to inference, and `audit::events << e`
+feeds the argument's feed through the `let`. A binding exported in an interface carries its
+spelling and its view, so a module reaching `h::k` reaches what `k` does in `h`.
+
+Not implemented: an entry that is a `Txn` variable or a type member, an argument's member with a
+`Mut` parameter, and a label through a Module-typed parameter, whose module is the argument's and
+is not known where the module lowers.
 
 ### `use` names are environment entries, not bindings
 
@@ -659,7 +710,8 @@ One PR per item, each updating the spec and design docs it touches:
    1. **Arguments to an import.** One shared run per module and distinct set of constant arguments
       ([chl-spec.md, "9.2 Imports"](chl-spec.md#92-imports)), with a literal as the constant.
    2. **Module types.** `Module{…}`, Module-typed parameters and the qualified references through
-      them, and an import name or run name as an argument.
+      them, an import name or run name as an argument, a member bound to a run, and feeding another
+      run's feed.
    3. **Type parameters**, and a type as an argument.
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed, route uniqueness across runs.
@@ -702,7 +754,7 @@ the [Implementation stack](#implementation-stack).
   link-time constants and when they are evaluated ([chl-spec.md, "9.19 Open
   questions"](chl-spec.md#919-open-questions)). Until it exists a route address is a literal
   ([Intrinsics resolve by identity](#intrinsics-resolve-by-identity)), and an import argument is a
-  literal, a type, or an import name or run name.
+  literal, a type, or an import name.
 - **`Feed(…)` declarations** ([chl-spec.md, "8.4 Feeds are the second form of
   mutability"](chl-spec.md#84-feeds-are-the-second-form-of-mutability)), for a public feed with no
   initializer.

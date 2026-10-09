@@ -17,21 +17,22 @@
 //! shared run, the root one run, and each `run` statement declares another.
 
 use super::{
-    DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
+    AliasAt, DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
     library_statement_refusals, lower_module_body, lower_root, sink_site, state_site,
 };
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::load::LoadedProgram;
+use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::uniquify;
-use crate::ccl::{Expr, Home, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode};
+use crate::ccl::{Argument, Expr, Home, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode};
 use crate::chl_parser::ast::{
     AssignTarget, Expr as ChlExpr, Lit as ChlLit, Module as ChlModule, ModuleArg,
     ModulePath as AstModulePath, QualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// The spelling of the placeholder a module's chain holds where the code below
@@ -49,22 +50,103 @@ pub struct Interface {
     members: HashMap<SmolStr, Member>,
     /// Every top-level type alias, by spelling, public and private alike.
     types: HashMap<SmolStr, TypeMember>,
-    /// Each value parameter, in the order declared.
+    /// Every top-level binding of a module, by spelling, public and private
+    /// alike.
+    modules: HashMap<SmolStr, ModuleMember>,
+    /// Each parameter, in the order declared.
     parameters: Vec<Parameter>,
     /// Why importing the module is an error, if it is.
     pub unimportable: Option<Unimportable>,
 }
 
-/// One value parameter of a module.
+/// One parameter of a module.
 #[derive(Debug, Clone)]
 pub struct Parameter {
     pub name: SmolStr,
     /// The `param` statement.
     pub declared: Span,
-    /// Its annotated type, as its module lowered it, if it has one.
+    /// Its annotated type, as its module lowered it, if it has one and it is a
+    /// value's type.
     pub annotation: Option<Type>,
+    /// Its Module type, if it takes a module.
+    pub module: Option<Rc<ModuleType>>,
     /// Whether it has a default, which a run that passes no argument takes.
     pub default: bool,
+    /// A Module-typed parameter's default, the module it names as its module
+    /// spells it.
+    pub module_default: Option<String>,
+}
+
+/// A top-level binding of a module, `pub audit = a`: a member that is a module
+/// (`docs/chl-spec.md`, "9.3 Runs").
+#[derive(Debug, Clone)]
+pub struct ModuleMember {
+    pub public: bool,
+    /// The statement that binds it.
+    pub declared: Span,
+    /// The module it is bound to.
+    pub module: ModulePath,
+    /// What that module declares, or `None` when it has errors of its own.
+    pub interface: Option<Rc<Interface>>,
+    /// How its declaring module spells the module it is bound to: `a`, or
+    /// `shop::audit`.
+    pub spelling: String,
+    /// What it reaches when it is bound to a Module-typed parameter, spelled
+    /// in its declaring module.
+    pub view: Option<Rc<ModuleView>>,
+}
+
+/// What a Module-typed parameter reaches of the module it takes: each member
+/// its Module type names, a value as the spelling of the `let` the parameter
+/// binds for it, `audit::count`, and a module as its own view.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleView {
+    pub values: HashMap<SmolStr, String>,
+    pub modules: HashMap<SmolStr, Rc<ModuleView>>,
+}
+
+impl ModuleView {
+    /// The view of a Module-typed parameter spelled `prefix` with the Module
+    /// type `ty`, pushing the spelling and type of the `let` each value entry
+    /// binds onto `lets`. A module entry's values bind `let`s spelled under it,
+    /// `shop::audit::events`.
+    fn of(prefix: &str, ty: &ModuleType, lets: &mut Vec<(String, Type)>) -> ModuleView {
+        let mut view = ModuleView::default();
+        for entry in &ty.entries {
+            let spelling = format!("{prefix}::{}", entry.name);
+            match &entry.ty {
+                AliasType::Type(ty) => {
+                    lets.push((spelling.clone(), ty.clone()));
+                    view.values.insert(entry.name.clone(), spelling);
+                }
+                AliasType::Module(ty) => {
+                    let inner = ModuleView::of(&spelling, ty, lets);
+                    view.modules.insert(entry.name.clone(), Rc::new(inner));
+                }
+            }
+        }
+        view
+    }
+
+    /// Each member `ty` names that this view does not reach, at any depth,
+    /// spelled under `prefix`, or alone when `prefix` is empty.
+    fn missing(&self, prefix: &str, ty: &ModuleType) -> Vec<String> {
+        let mut missing = Vec::new();
+        for entry in &ty.entries {
+            let spelled = match prefix {
+                "" => entry.name.to_string(),
+                prefix => format!("{prefix}::{}", entry.name),
+            };
+            match (&entry.ty, self.modules.get(&entry.name)) {
+                (AliasType::Type(_), _) if self.values.contains_key(&entry.name) => {}
+                (AliasType::Module(ty), Some(module)) => {
+                    missing.extend(module.missing(&spelled, ty));
+                }
+                _ => missing.push(spelled),
+            }
+        }
+        missing
+    }
 }
 
 /// What makes a module one that is run and not imported (`docs/chl-spec.md`,
@@ -94,7 +176,7 @@ pub struct TypeMember {
     /// The type it names, as its module lowered it: a name its predicates read
     /// is spelled as the module spells it (`docs/modules.md`, "Imported aliases
     /// are closed over their module").
-    pub ty: Type,
+    pub ty: AliasType,
     pub public: bool,
     /// The statement that declares it.
     pub declared: Span,
@@ -116,6 +198,7 @@ impl Interface {
             module,
             members: HashMap::new(),
             types: HashMap::new(),
+            modules: HashMap::new(),
             parameters: Vec::new(),
             unimportable: Some(why),
         }
@@ -128,7 +211,7 @@ impl Interface {
         module: ModulePath,
         ast: &ChlModule,
         chain: &Expr,
-        mut_param_fns: impl Fn(&str) -> bool,
+        ctx: &LoweringContext,
         unimportable: Option<Unimportable>,
     ) -> Self {
         let bindings = &top_level_bindings(&ast.body);
@@ -138,28 +221,54 @@ impl Interface {
             .body
             .iter()
             .filter_map(|stmt| match &stmt.node {
-                ChlStmt::Param { name, default, .. } => Some(Parameter {
-                    name: name.node.clone(),
-                    declared: stmt.span,
-                    annotation: annotations.get(name.node.as_str()).cloned().flatten(),
-                    default: default.is_some(),
-                }),
+                ChlStmt::Param { name, default, .. } => {
+                    let module = ctx.module_parameter_types.get(&name.node).cloned();
+                    Some(Parameter {
+                        name: name.node.clone(),
+                        declared: stmt.span,
+                        annotation: match module {
+                            Some(_) => None,
+                            None => annotations.get(name.node.as_str()).cloned().flatten(),
+                        },
+                        module,
+                        default: default.is_some(),
+                        module_default: ctx.module_parameter_defaults.get(&name.node).cloned(),
+                    })
+                }
                 _ => None,
             })
             .collect();
-        let members = bindings
-            .iter()
-            .map(|binding| {
-                (
+        let mut members = HashMap::new();
+        let mut modules = HashMap::new();
+        for binding in bindings {
+            if let Some(bound) = ctx
+                .module
+                .qualifiers
+                .get(binding.name.as_str())
+                .filter(|q| q.kind == QualifierKind::Binding)
+            {
+                modules.insert(
                     binding.name.clone(),
-                    Member {
+                    ModuleMember {
                         public: binding.public,
                         declared: binding.span,
-                        mut_param: mut_param_fns(&binding.name),
+                        module: bound.module.clone(),
+                        interface: bound.interface.clone(),
+                        spelling: bound.spelling.clone(),
+                        view: bound.view.clone(),
                     },
-                )
-            })
-            .collect();
+                );
+                continue;
+            }
+            members.insert(
+                binding.name.clone(),
+                Member {
+                    public: binding.public,
+                    declared: binding.span,
+                    mut_param: ctx.is_mut_param_fn(&binding.name),
+                },
+            );
+        }
         let declared = top_level_types(chain);
         let types = aliases
             .iter()
@@ -184,6 +293,7 @@ impl Interface {
             module,
             members,
             types,
+            modules,
             parameters,
             unimportable,
         }
@@ -207,7 +317,7 @@ fn parameter_annotations(chain: &Expr) -> HashMap<&str, Option<Type>> {
 }
 
 /// The type each top-level `LetType` on `chain`'s spine declares, by spelling.
-fn top_level_types(chain: &Expr) -> HashMap<&str, &Type> {
+fn top_level_types(chain: &Expr) -> HashMap<&str, &AliasType> {
     let mut types = HashMap::new();
     let mut at = chain;
     loop {
@@ -233,6 +343,23 @@ fn top_level_types(chain: &Expr) -> HashMap<&str, &Type> {
 ///
 /// Each predicate it changes is rebuilt as a new term derived from the one its
 /// module lowered, which that module's own uses still share.
+fn reroot_alias(ty: &AliasType, qualifier: &str) -> AliasType {
+    match ty {
+        AliasType::Type(ty) => AliasType::Type(reroot(ty, qualifier)),
+        AliasType::Module(module) => AliasType::Module(Rc::new(ModuleType {
+            entries: module
+                .entries
+                .iter()
+                .map(|entry| ModuleEntry {
+                    name: entry.name.clone(),
+                    ty: reroot_alias(&entry.ty, qualifier),
+                })
+                .collect(),
+        })),
+    }
+}
+
+/// [`reroot_alias`] on a type.
 fn reroot(ty: &Type, qualifier: &str) -> Type {
     fn rename(expr: &mut Expr, qualifier: &str, bound: &mut Vec<Name>) -> bool {
         let mut changed = false;
@@ -416,19 +543,19 @@ pub fn public_names_bound_twice(bindings: &[TopLevelBinding]) -> Vec<LoweringErr
 }
 
 /// The module being lowered: whose labels its unqualified ones are, the
-/// modules its import names and run names reach, and the members its `use`
-/// names reach.
+/// modules its names reach, and the members its `use` names reach.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleScope {
     /// The module an unqualified label belongs to, or `None` for the root's
     /// namespace ([`Label`]).
     pub labels: Option<ModulePath>,
-    /// The import names and run names in scope (`docs/chl-spec.md`, "9.6
+    /// The names in scope that denote a module (`docs/chl-spec.md`, "9.6
     /// Qualified references").
     pub qualifiers: HashMap<SmolStr, Qualifier>,
-    /// The names `use` clauses bind. An import's are in scope throughout the
-    /// module beneath every local binder (`docs/modules.md`, "`use` names are
-    /// environment entries, not bindings"), and a run's from its statement down.
+    /// The names `use` clauses bind to values and types. An import's are in
+    /// scope throughout the module beneath every local binder (`docs/modules.md`,
+    /// "`use` names are environment entries, not bindings"), and a run's from its
+    /// statement down.
     pub uses: HashMap<SmolStr, Use>,
 }
 
@@ -448,29 +575,76 @@ pub struct Use {
 pub enum Reached {
     /// The member, as a reference through its qualifier.
     Value(Option<Reference>),
-    /// The type the alias names, spelled through its qualifier ([`reroot`]).
-    Type(Option<Type>),
+    /// The type or Module type the alias names, spelled through its qualifier
+    /// ([`reroot`]).
+    Type(Option<AliasType>),
 }
 
-/// What an import name or a run name reaches (`docs/chl-spec.md`, "9.6
-/// Qualified references").
+/// What a name that denotes a module reaches: an import name, a run name, a
+/// Module-typed parameter, a binding of a module, or a `use` name of a member
+/// bound to one (`docs/chl-spec.md`, "9.6 Qualified references").
 #[derive(Debug, Clone)]
 pub struct Qualifier {
-    /// The module whose members it reaches.
+    /// The module whose members it reaches, whose labels it qualifies.
     pub module: ModulePath,
     /// The module's file, or `None` when loading found none.
     pub file: Option<FileId>,
     /// For an import name, the shared run it reaches, or `None` when its
     /// arguments are in error.
     pub shared: Option<SharedRun>,
-    /// The `import` or `run` statement that binds the name.
+    /// The statement that binds the name.
     pub statement: Span,
     /// What the module declares. `None` when the module has no file or has
-    /// errors of its own, which are reported where they stand.
+    /// errors of its own, which are reported where they stand, and for a
+    /// Module-typed parameter, which reaches what its view names.
     pub interface: Option<Rc<Interface>>,
-    /// Whether it is a run name, in scope from its statement down, rather than
-    /// an import name, in scope throughout its module.
-    pub run: bool,
+    pub kind: QualifierKind,
+    /// How this module spells a member reached through the name: `eu::f`
+    /// through `eu`, and `shop::a::f` through a binding `shop::audit = a`.
+    pub spelling: String,
+    /// For a Module-typed parameter, or a module reached through one: what its
+    /// Module type names, each spelled under `view_base`.
+    pub view: Option<Rc<ModuleView>>,
+    /// The spelling the view's spellings are under: empty for this module's own
+    /// parameter, and `shop::` for one `shop`'s module declares.
+    pub view_base: String,
+}
+
+/// How a [`Qualifier`]'s name is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifierKind {
+    Import,
+    Run,
+    Parameter,
+    /// A top-level binding of a module, `audit = a`.
+    Binding,
+    /// A `use` name of a member bound to a module: an import's, in scope
+    /// throughout its module, or a run's, from its statement down.
+    Use {
+        run: bool,
+    },
+}
+
+impl QualifierKind {
+    /// Whether the name is in scope from its statement down, as an evaluation
+    /// is, rather than throughout its module.
+    pub fn sequential(self) -> bool {
+        matches!(
+            self,
+            QualifierKind::Run | QualifierKind::Binding | QualifierKind::Use { run: true }
+        )
+    }
+
+    /// The name's kind, as a diagnostic says it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            QualifierKind::Import => "an import name",
+            QualifierKind::Run => "a run name",
+            QualifierKind::Parameter => "a parameter of Module type",
+            QualifierKind::Binding => "a binding of a module",
+            QualifierKind::Use { .. } => "a `use` name of a module",
+        }
+    }
 }
 
 /// The spellings of `Option`'s tags. They share the root's namespace in every
@@ -485,6 +659,9 @@ impl LoweringContext {
         self.type_aliases.clear();
         self.mut_param_fns.clear();
         self.declared_sinks.clear();
+        self.module_parameters.clear();
+        self.module_parameter_types.clear();
+        self.module_parameter_defaults.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
         // for a function with a `Mut` parameter takes the curried call shape the
@@ -492,7 +669,7 @@ impl LoweringContext {
         for (name, used) in &scope.uses {
             match &used.reached {
                 Reached::Type(ty) => {
-                    let ty = ty.clone().unwrap_or(Type::Hole);
+                    let ty = ty.clone().unwrap_or(AliasType::Type(Type::Hole));
                     match used.run {
                         None => self.declare_type_throughout(name.as_str(), ty),
                         Some(_) => self.declare_type_alias(name.as_str(), used.item, ty),
@@ -512,15 +689,217 @@ impl LoweringContext {
         self.shadow_depth.clear();
     }
 
-    /// Whether `name` is one of this module's import names or run names.
+    /// Declare each Module-typed parameter and each binding of a module among
+    /// the top-level `stmts`, once the module's type aliases are declared
+    /// (`docs/modules.md`, "Module types are not value types").
+    ///
+    /// A parameter is Module-typed when its annotation is a Module type. Its
+    /// view of what its Module type names is a name of the module, and it binds
+    /// a `let` per value entry, `audit::count`, which each run of the module
+    /// binds to its argument's member ([`ProgramLowering::create`]). Its default,
+    /// if it has one, names a module. A binding of a module, `k = a`, is a name
+    /// of the module that reaches what `a` does.
+    pub(super) fn declare_module_parameters(
+        &mut self,
+        stmts: &[Spanned<ChlStmt>],
+    ) -> Vec<LoweringError> {
+        let mut errors = Vec::new();
+        for stmt in stmts {
+            let ChlStmt::Param {
+                name,
+                annotation: Some(annotation),
+                default,
+            } = &stmt.node
+            else {
+                continue;
+            };
+            let ty = match self.module_annotation(&annotation.ty) {
+                Ok(Some(ty)) => ty,
+                Ok(None) => continue,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            if let Some(earlier) = self.module.qualifiers.get(&name.node) {
+                errors.push(
+                    LoweringError::unsupported(
+                        stmt.span,
+                        format!("`{}` is already {}", name.node, earlier.kind.describe()),
+                    )
+                    .with_note(earlier.statement, "bound here first"),
+                );
+                continue;
+            }
+            let mut lets = Vec::new();
+            let view = ModuleView::of(&name.node, &ty, &mut lets);
+            if let Some(default) = default {
+                match self.module_named(default) {
+                    Some(Ok(value)) => {
+                        errors.extend(uncovered(&value, &ty, default.span, stmt.span));
+                        self.module_parameter_defaults
+                            .insert(name.node.clone(), value.spelling);
+                    }
+                    Some(Err(error)) => errors.push(error),
+                    None => errors.push(LoweringError::unsupported(
+                        default.span,
+                        format!(
+                            "`{}` is of Module type, so its default names a module: an import \
+                             name",
+                            name.node
+                        ),
+                    )),
+                }
+            }
+            self.module.qualifiers.insert(
+                name.node.clone(),
+                Qualifier {
+                    module: ModulePath::new([name.node.clone()]),
+                    file: None,
+                    shared: None,
+                    statement: stmt.span,
+                    interface: None,
+                    kind: QualifierKind::Parameter,
+                    spelling: name.node.to_string(),
+                    view: Some(Rc::new(view)),
+                    view_base: String::new(),
+                },
+            );
+            self.module_parameters.insert(name.node.clone(), lets);
+            self.module_parameter_types.insert(name.node.clone(), ty);
+        }
+        for stmt in stmts {
+            let ChlStmt::Assign { target, value, .. } = &stmt.node else {
+                continue;
+            };
+            let AssignTarget::Name(name) = &target.node else {
+                continue;
+            };
+            // A qualifier in error leaves the statement a value's binding, whose
+            // lowering reports the error.
+            let Some(Ok(segments)) = self.module_path(value) else {
+                continue;
+            };
+            let value = match self.qualifier_path(&segments, value.span) {
+                Ok(value) => value,
+                // The statement still binds a module, one with errors of its
+                // own, so a reference through it reports nothing more.
+                Err(error) => {
+                    errors.push(error);
+                    Qualifier {
+                        interface: None,
+                        view: None,
+                        ..self.module.qualifiers[segments[0].node.as_str()].clone()
+                    }
+                }
+            };
+            let binding = Qualifier {
+                statement: stmt.span,
+                kind: QualifierKind::Binding,
+                ..value
+            };
+            self.module.qualifiers.insert(name.clone(), binding);
+        }
+        errors.extend(super::import_name_binders(
+            &self.module_binders,
+            self,
+            |kind| matches!(kind, QualifierKind::Parameter | QualifierKind::Binding),
+        ));
+        errors
+    }
+
+    /// The Module type `annotation` names, if it names one: written, or through
+    /// an alias or a type member. A name that is not a type reports nothing
+    /// here, since the parameter's `let` lowers its annotation as a value's type.
+    fn module_annotation(
+        &mut self,
+        annotation: &Spanned<ChlExpr>,
+    ) -> Result<Option<Rc<ModuleType>>, LoweringError> {
+        let named = match &annotation.node {
+            ChlExpr::ModuleType(_) => super::stmts::lower_alias_type(annotation, self)?,
+            ChlExpr::Name(id) => match self.type_alias(id, annotation.span) {
+                AliasAt::InScope(ty) => ty.clone(),
+                AliasAt::Below | AliasAt::Undeclared => return Ok(None),
+            },
+            ChlExpr::Qualified(q) if super::stmts::is_type_name(&q.name.node) => {
+                match self.type_member(q, annotation.span) {
+                    Ok(Some(ty)) => ty,
+                    Ok(None) | Err(_) => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(match named {
+            AliasType::Module(module) => Some(module),
+            AliasType::Type(_) => None,
+        })
+    }
+
+    /// The module `expr` names, if it is written as one: a name of this module
+    /// that denotes a module, or a path through public members bound to one,
+    /// `shop::audit`. `None` when `expr` is any other expression, a path to a
+    /// value member among them.
+    pub(super) fn module_named(
+        &self,
+        expr: &Spanned<ChlExpr>,
+    ) -> Option<Result<Qualifier, LoweringError>> {
+        Some(
+            self.module_path(expr)?
+                .and_then(|segments| self.qualifier_path(&segments, expr.span)),
+        )
+    }
+
+    /// The segments of `expr`, if it is written as a path that names a module,
+    /// or the error that makes its qualifier name nothing. Its qualifier is
+    /// resolved regardless of scope, so a path written above the statement that
+    /// binds its first segment names what it names below it.
+    fn module_path(
+        &self,
+        expr: &Spanned<ChlExpr>,
+    ) -> Option<Result<Vec<Spanned<SmolStr>>, LoweringError>> {
+        let segments: Vec<Spanned<SmolStr>> = match &expr.node {
+            ChlExpr::Name(name) => vec![Spanned::new(expr.span, name.clone())],
+            ChlExpr::Qualified(q) => q
+                .qualifier
+                .iter()
+                .cloned()
+                .chain([q.name.clone()])
+                .collect(),
+            _ => return None,
+        };
+        let first = self
+            .module
+            .qualifiers
+            .get(segments.first()?.node.as_str())?;
+        // A path ending at a value member names a value.
+        let (last, rest) = segments.split_last()?;
+        if !rest.is_empty() {
+            match member_path(first.clone(), rest) {
+                Ok(at) if !at.has_module_member(&last.node) => return None,
+                Ok(_) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Some(Ok(segments))
+    }
+
+    /// Whether `name` is one of this module's names that denote a module.
     pub(super) fn is_import_name(&self, name: &str) -> bool {
         self.module.qualifiers.contains_key(name)
+    }
+
+    /// Whether `statement`, binding `name`, binds a module rather than a value.
+    pub(super) fn binds_module(&self, name: &str, statement: Span) -> bool {
+        self.module
+            .qualifiers
+            .get(name)
+            .is_some_and(|q| q.kind == QualifierKind::Binding && q.statement == statement)
     }
 
     /// The label `name`, qualified by `qualifier`, written in this module.
     ///
     /// Unqualified or qualified by `this`, it is this module's label. Qualified
-    /// by an import name or a run name, it is the label of that name's module.
+    /// by a name that denotes a module, it is the label of that module.
     pub(super) fn label(
         &self,
         qualifier: &[Spanned<SmolStr>],
@@ -530,16 +909,17 @@ impl LoweringContext {
         let module = match qualifier {
             [] => self.module.labels.as_ref(),
             [this] if this.node == "this" => self.module.labels.as_ref(),
-            [qualifier] => {
-                let module = &self.qualifier(qualifier, span)?.module;
-                return Ok(Label::in_module(module.clone(), name));
-            }
-            [first, ..] => {
-                return Err(LoweringError::unsupported(
-                    first.span.join(span),
-                    "a label of a run another module declares is not supported yet: a label's \
-                     qualifier is `this`, an import name, or a run name",
-                ));
+            _ => {
+                let at = self.qualifier_path(qualifier, span)?;
+                // Which module a parameter's argument is is not known where the
+                // module lowers, since it lowers once for every run of it.
+                if at.view.is_some() {
+                    return Err(LoweringError::unsupported(
+                        span,
+                        "a label through a parameter of Module type is not supported yet",
+                    ));
+                }
+                return Ok(Label::in_module(at.module, name));
             }
         };
         Ok(match module {
@@ -555,88 +935,160 @@ impl LoweringContext {
         q: &QualifiedName,
         span: Span,
     ) -> Result<Option<Reference>, LoweringError> {
-        self.qualifier_import(q, span, "value")?
-            .reach(&q.qualifier[0].node, &q.name.node, span)
+        self.qualifier_of(q, span, "value")?.reach(
+            &spell_qualifier(&q.qualifier),
+            &q.name.node,
+            span,
+        )
     }
 
-    /// The type the type reference `q` names, or `None` when `q`'s module has
-    /// errors of its own, which already fail the compilation.
+    /// The type or Module type the type reference `q` names, or `None` when
+    /// `q`'s module has errors of its own, which already fail the compilation.
     pub(super) fn type_member(
         &self,
         q: &QualifiedName,
         span: Span,
-    ) -> Result<Option<Type>, LoweringError> {
-        self.qualifier_import(q, span, "type")?
-            .reach_type(&q.qualifier[0].node, &q.name.node, span)
+    ) -> Result<Option<AliasType>, LoweringError> {
+        self.qualifier_of(q, span, "type")?.reach_type(
+            &spell_qualifier(&q.qualifier),
+            &q.name.node,
+            span,
+        )
     }
 
-    /// The import name or run name `q`'s qualifier is, for a reference to a
-    /// `what` at `span`.
-    fn qualifier_import(
+    /// The module `q`'s qualifier names, for a reference to a `what` at `span`.
+    fn qualifier_of(
         &self,
         q: &QualifiedName,
         span: Span,
         what: &str,
-    ) -> Result<&Qualifier, LoweringError> {
+    ) -> Result<Qualifier, LoweringError> {
         match q.qualifier.as_slice() {
             [this] if this.node == "this" => Err(LoweringError::unsupported(
                 span,
                 format!("`this` qualifies a label or a tag, not a {what}"),
             )),
-            [name] => self.qualifier(name, span),
-            _ => Err(LoweringError::unsupported(
-                span,
-                format!(
-                    "`{}` names a member of a run another module declares, which is not \
-                     supported yet",
-                    spell(q)
-                ),
-            )),
+            segments => self.qualifier_path(segments, span),
         }
     }
 
-    /// The import name or run name `name`, written in a reference at `span`. A
-    /// run name is in scope from its `run` statement to the end of its module.
+    /// The module the qualifier `segments` names, written in a reference at
+    /// `span`. Its first segment is a name of this module that denotes a
+    /// module, and each later one is a public member of the module before it
+    /// that is bound to a module: `shop::audit` in `shop::audit::events`.
+    pub(super) fn qualifier_path(
+        &self,
+        segments: &[Spanned<SmolStr>],
+        span: Span,
+    ) -> Result<Qualifier, LoweringError> {
+        let first = segments.first().expect("a qualifier has a segment");
+        member_path(self.qualifier(first, span)?.clone(), segments)
+    }
+
+    /// The name `name` of this module that denotes a module, written in a
+    /// reference at `span`. A run name, a binding, and a run's `use` name are in
+    /// scope from their statement to the end of their module.
     fn qualifier(&self, name: &Spanned<SmolStr>, span: Span) -> Result<&Qualifier, LoweringError> {
         let Some(qualifier) = self.module.qualifiers.get(name.node.as_str()) else {
             return Err(LoweringError::unsupported(
                 name.span,
                 format!(
-                    "`{}` is not an import name or a run name of this module",
+                    "`{}` does not name a module here: it is not an import name, a run name, or \
+                     a parameter or binding of a module",
                     name.node
                 ),
             ));
         };
-        if qualifier.run && span.start < qualifier.statement.end {
-            return Err(LoweringError::unsupported(
-                name.span,
-                format!(
-                    "the run `{}` is declared below this use: a run is in scope from its \
-                     statement to the end of its module",
-                    name.node
-                ),
-            )
-            .with_note(qualifier.statement, "declared here"));
-        }
+        qualifier.in_scope_at(&name.node, name.span, span)?;
         Ok(qualifier)
+    }
+
+    /// The arguments `args` of the `run` statement at `statement` declaring the
+    /// run `run`, split by the parameter each is for: a value, lowered here, and
+    /// a module, named here, for a parameter of Module type. A module passed to
+    /// a parameter must reach every member the parameter's Module type names.
+    pub(super) fn run_arguments(
+        &mut self,
+        run: &str,
+        args: &[ModuleArg],
+    ) -> Result<RunArguments, LoweringError> {
+        // A run of a module with errors of its own is not created, and its
+        // arguments report nothing more, as a reference into the module does.
+        let Some(parameters) = self
+            .module
+            .qualifiers
+            .get(run)
+            .and_then(|q| q.interface.as_ref())
+            .map(|interface| interface.parameters.clone())
+        else {
+            return Ok(RunArguments::default());
+        };
+        let mut arguments = RunArguments::default();
+        for arg in args {
+            let span = arg.name.span.join(arg.value.span);
+            let parameter = parameters.iter().find(|p| p.name == arg.name.node);
+            match (
+                parameter.and_then(|p| p.module.as_ref()),
+                self.module_named(&arg.value),
+            ) {
+                (Some(ty), Some(module)) => {
+                    let module = module?;
+                    let declared = parameter.expect("matched above").declared;
+                    if let Some(error) = uncovered(&module, ty, span, declared).into_iter().next() {
+                        return Err(error);
+                    }
+                    arguments
+                        .modules
+                        .push((arg.name.node.clone(), module.spelling, span));
+                }
+                (Some(_), None) => {
+                    return Err(LoweringError::unsupported(
+                        arg.value.span,
+                        format!(
+                            "the parameter `{}` is of Module type, and its argument is not a \
+                             module: pass an import name or a run name",
+                            arg.name.node
+                        ),
+                    )
+                    .with_note(parameter.expect("matched above").declared, "the parameter"));
+                }
+                (None, Some(_)) if parameter.is_some() => {
+                    return Err(LoweringError::unsupported(
+                        span,
+                        format!(
+                            "this argument is a module, and the parameter `{}` is not annotated \
+                             with a Module type",
+                            arg.name.node
+                        ),
+                    )
+                    .with_note(parameter.expect("matched above").declared, "the parameter"));
+                }
+                _ => {
+                    let value = super::lower_expr(&arg.value, self)?;
+                    arguments.values.push((arg.name.node.clone(), span, value));
+                }
+            }
+        }
+        Ok(arguments)
     }
 
     /// The rest of the module, `body`, below the `run` statement at `statement`
     /// that declares the run `name` of `module` with `arguments`: a
     /// [`TypedExprNode::Run`] over a `let` per value its `use` clause binds,
-    /// below a `let` per argument. The `use` name's `let` keeps a generic member
-    /// generic (`src/ccl/design/type-inference.md`, "A name of a generalized
-    /// binding").
+    /// below a `let` per value argument. The `use` name's `let` keeps a generic
+    /// member generic (`src/ccl/design/type-inference.md`, "A name of a
+    /// generalized binding").
     ///
-    /// Each argument is bound under the name its parameter reads
+    /// Each value argument is bound under the name its parameter reads
     /// ([`argument_name`]), at the parameter's type spelled through the run name
-    /// ([`reroot`]), so a mismatch is the argument's error.
+    /// ([`reroot`]), so a mismatch is the argument's error. Each module argument
+    /// rides the node, as the module's spelling.
     pub(super) fn take_run(
         &mut self,
         name: &str,
         module: ModulePath,
         statement: Span,
-        arguments: Vec<(SmolStr, Span, Expr)>,
+        arguments: RunArguments,
         body: Expr,
     ) -> Expr {
         let mut used: Vec<(SmolStr, Name, Span)> = self
@@ -667,9 +1119,11 @@ impl LoweringContext {
             module,
             statement,
             arguments: arguments
+                .values
                 .iter()
                 .map(|(parameter, ..)| parameter.clone())
                 .collect(),
+            modules: arguments.modules,
             body: Box::new(body),
         });
         let run = self.tag_image(run, statement);
@@ -690,6 +1144,7 @@ impl LoweringContext {
             })
             .unwrap_or_default();
         arguments
+            .values
             .into_iter()
             .rev()
             .fold(run, |body, (parameter, span, value)| {
@@ -703,6 +1158,47 @@ impl LoweringContext {
     }
 }
 
+/// The arguments of one `run` statement ([`LoweringContext::run_arguments`]).
+#[derive(Default)]
+pub(super) struct RunArguments {
+    /// Each value argument, by its parameter: its span and its lowered value.
+    values: Vec<(SmolStr, Span, Expr)>,
+    /// Each module argument, by its parameter: the module's spelling in the
+    /// declaring module, and the argument's span.
+    modules: Vec<(SmolStr, String, Span)>,
+}
+
+/// One error per member the Module type `ty` names that the module `value`,
+/// passed at `span` to the parameter `declared`, does not reach publicly
+/// (`docs/chl-spec.md`, "9.8 Module types").
+fn uncovered(value: &Qualifier, ty: &ModuleType, span: Span, declared: Span) -> Vec<LoweringError> {
+    let missing = match (&value.view, value.reachable()) {
+        (Some(view), _) => view
+            .missing("", ty)
+            .into_iter()
+            .map(|member| {
+                format!(
+                    "the Module type of `{}` does not name `{member}`",
+                    value.spelling
+                )
+            })
+            .collect(),
+        (None, Some(interface)) => interface.missing(ty),
+        // A module with errors of its own reaches nothing, as its references do.
+        (None, None) => Vec::new(),
+    };
+    missing
+        .into_iter()
+        .map(|why| {
+            LoweringError::unsupported(
+                span,
+                format!("this module does not fit the parameter's Module type: {why}"),
+            )
+            .with_note(declared, "the parameter")
+        })
+        .collect()
+}
+
 /// The name the `run` statement with `path` and `alias` binds, or `None` when
 /// the parser refused a segment of the path.
 pub(super) fn run_name(path: &AstModulePath, alias: Option<&Spanned<SmolStr>>) -> Option<SmolStr> {
@@ -710,11 +1206,77 @@ pub(super) fn run_name(path: &AstModulePath, alias: Option<&Spanned<SmolStr>>) -
     Some(alias.map_or_else(|| last_segment(&module), |alias| alias.node.clone()))
 }
 
+impl Interface {
+    /// What the Module type `ty` names that this module does not declare as
+    /// public members of the right kind, each as a diagnostic says it.
+    fn missing(&self, ty: &ModuleType) -> Vec<String> {
+        let module = &self.module;
+        let mut missing = Vec::new();
+        for entry in &ty.entries {
+            let name = &entry.name;
+            match &entry.ty {
+                AliasType::Type(_) => match self.members.get(name) {
+                    Some(member) if !member.public => {
+                        missing.push(format!("`{name}` is private to module `{module}`"));
+                    }
+                    Some(member) if member.mut_param => missing.push(format!(
+                        "`{name}` takes a `Mut` parameter, and a parameter's Module type does \
+                         not reach one yet"
+                    )),
+                    Some(_) => {}
+                    None => missing.push(format!("module `{module}` has no member `{name}`")),
+                },
+                AliasType::Module(inner) => match self.modules.get(name) {
+                    Some(member) if !member.public => {
+                        missing.push(format!("`{name}` is private to module `{module}`"));
+                    }
+                    Some(member) => match (&member.view, &member.interface) {
+                        (Some(view), _) => missing.extend(
+                            view.missing(name, inner)
+                                .into_iter()
+                                .map(|m| format!("its Module type does not name `{m}`")),
+                        ),
+                        (None, Some(interface)) => missing.extend(interface.missing(inner)),
+                        (None, None) => {}
+                    },
+                    None => missing.push(format!(
+                        "module `{module}` has no member `{name}` bound to a module"
+                    )),
+                },
+            }
+        }
+        missing
+    }
+}
+
 impl Qualifier {
+    /// Whether this, bound to `name`, is in scope at `span`, where `at` writes
+    /// the name: a run name, a binding, and a run's `use` name are in scope from
+    /// their statement to the end of their module, and the others throughout it.
+    fn in_scope_at(&self, name: &str, at: Span, span: Span) -> Result<(), LoweringError> {
+        if !self.kind.sequential() || span.start >= self.statement.end {
+            return Ok(());
+        }
+        let what = match self.kind {
+            QualifierKind::Run => format!("the run `{name}`"),
+            _ => format!("`{name}`"),
+        };
+        Err(LoweringError::unsupported(
+            at,
+            format!(
+                "{what} is declared below this use: {} is in scope from its statement to the \
+                 end of its module",
+                self.kind.describe()
+            ),
+        )
+        .with_note(self.statement, "declared here"))
+    }
+
     /// The public member `member`, reached through the qualifier `name` at
     /// `span`, as a raw name spelled through it, or `None` when the module has
     /// errors of its own or is not importable, each of which is reported where
-    /// it stands.
+    /// it stands. Through a Module-typed parameter it is the `let` the
+    /// parameter binds, and only a member its Module type names is reached.
     fn reach(
         &self,
         name: &str,
@@ -727,10 +1289,36 @@ impl Qualifier {
                 format!("`{name}::{member}` is a type, not a value"),
             ));
         }
+        let is_module = |name: &str, member: &str| {
+            LoweringError::unsupported(
+                span,
+                format!(
+                    "`{name}::{member}` is a module, which is a value only as an argument or a \
+                     binding: reach its members as `{name}::{member}::…`"
+                ),
+            )
+        };
+        if let Some(view) = &self.view {
+            return match view.values.get(member) {
+                Some(spelling) => Ok(Some(Reference {
+                    name: Name::raw(format!("{}{spelling}", self.view_base)),
+                    mut_param: false,
+                })),
+                None if view.modules.contains_key(member) => Err(is_module(name, member)),
+                None => Err(LoweringError::unsupported(
+                    span,
+                    format!("the Module type of `{name}` has no member `{member}`"),
+                )
+                .with_note(self.statement, "declared here")),
+            };
+        }
         let Some(interface) = self.reachable() else {
             return Ok(None);
         };
         let module = &interface.module;
+        if interface.modules.contains_key(member) {
+            return Err(is_module(name, member));
+        }
         let Some(found) = interface.members.get(member) else {
             return Err(LoweringError::unsupported(
                 span,
@@ -745,24 +1333,33 @@ impl Qualifier {
             .with_note(found.declared, "declared here without `pub`"));
         }
         Ok(Some(Reference {
-            name: Name::raw(format!("{name}::{member}")),
+            name: Name::raw(format!("{}::{member}", self.spelling)),
             mut_param: found.mut_param,
         }))
     }
 
-    /// The type of the public type alias `member`, reached through the qualifier
-    /// `name` at `span` and spelled through it ([`reroot`]), or `None` as for
-    /// [`Qualifier::reach`].
+    /// The type or Module type of the public type alias `member`, reached
+    /// through the qualifier `name` at `span` and spelled through it
+    /// ([`reroot`]), or `None` as for [`Qualifier::reach`].
     fn reach_type(
         &self,
         name: &str,
         member: &str,
         span: Span,
-    ) -> Result<Option<Type>, LoweringError> {
+    ) -> Result<Option<AliasType>, LoweringError> {
         if !super::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
                 format!("`{name}::{member}` is a value, not a type"),
+            ));
+        }
+        if self.view.is_some() {
+            return Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{name}::{member}` is a type member through a parameter, which is not \
+                     supported yet"
+                ),
             ));
         }
         let Some(interface) = self.reachable() else {
@@ -782,15 +1379,91 @@ impl Qualifier {
             )
             .with_note(found.declared, "declared here without `pub`"));
         }
-        Ok(Some(reroot(&found.ty, name)))
+        Ok(Some(reroot_alias(&found.ty, &self.spelling)))
+    }
+
+    /// Whether `member` is a member of this module bound to a module.
+    fn has_module_member(&self, member: &str) -> bool {
+        match &self.view {
+            Some(view) => view.modules.contains_key(member),
+            None => self
+                .reachable()
+                .is_some_and(|interface| interface.modules.contains_key(member)),
+        }
+    }
+
+    /// The public member `segment` bound to a module, reached through the
+    /// qualifier `name`: `audit` in `shop::audit::events`. Through a module
+    /// with errors of its own it is a module with no interface, as that
+    /// module's other members are `None`.
+    fn module_member(
+        &self,
+        name: &str,
+        segment: &Spanned<SmolStr>,
+    ) -> Result<Qualifier, LoweringError> {
+        let member = segment.node.as_str();
+        if let Some(view) = &self.view {
+            let Some(inner) = view.modules.get(member) else {
+                return Err(LoweringError::unsupported(
+                    segment.span,
+                    format!(
+                        "the Module type of `{name}` has no member `{member}` that is a module"
+                    ),
+                )
+                .with_note(self.statement, "declared here"));
+            };
+            return Ok(Qualifier {
+                spelling: format!("{}::{member}", self.spelling),
+                view: Some(Rc::clone(inner)),
+                ..self.clone()
+            });
+        }
+        let Some(interface) = self.reachable() else {
+            return Ok(Qualifier {
+                interface: None,
+                ..self.clone()
+            });
+        };
+        let module = &interface.module;
+        let Some(found) = interface.modules.get(member) else {
+            return Err(LoweringError::unsupported(
+                segment.span,
+                format!("module `{module}` has no member `{member}` bound to a module"),
+            ));
+        };
+        if !found.public {
+            return Err(LoweringError::unsupported(
+                segment.span,
+                format!("`{member}` is private to module `{module}`"),
+            )
+            .with_note(found.declared, "declared here without `pub`"));
+        }
+        Ok(Qualifier {
+            module: found.module.clone(),
+            interface: found.interface.clone(),
+            spelling: format!("{}::{}", self.spelling, found.spelling),
+            view: found.view.clone(),
+            view_base: format!("{}::", self.spelling),
+            ..self.clone()
+        })
+    }
+
+    /// The public member `member` bound to a module, for a `use` item that names
+    /// it, or `None` when `member` is not one, so the item names a value.
+    fn used_module(&self, member: &str) -> Option<Result<Qualifier, LoweringError>> {
+        if !self.has_module_member(member) {
+            return None;
+        }
+        let segment = Spanned::new(self.statement, SmolStr::from(member));
+        Some(self.module_member(&self.spelling, &segment))
     }
 
     /// The interface whose members a reference reaches, or `None` when the module
     /// has errors of its own or performs IO, each reported where it stands.
     fn reachable(&self) -> Option<&Interface> {
-        self.interface
-            .as_deref()
-            .filter(|interface| interface.unimportable.is_none() || self.run)
+        self.interface.as_deref().filter(|interface| {
+            interface.unimportable.is_none() || self.kind != QualifierKind::Import
+        })
     }
 }
 
@@ -803,8 +1476,30 @@ fn argument_name(run: &str, parameter: &str) -> Name {
     Name::raw(format!("__run::{run}::{parameter}"))
 }
 
+/// The module `segments` names, whose first segment names `first`: each later
+/// segment is a public member of the module before it that is bound to a module.
+fn member_path(
+    first: Qualifier,
+    segments: &[Spanned<SmolStr>],
+) -> Result<Qualifier, LoweringError> {
+    let mut at = first;
+    for (i, segment) in segments.iter().enumerate().skip(1) {
+        at = at.module_member(&spell_qualifier(&segments[..i]), segment)?;
+    }
+    Ok(at)
+}
+
+/// A qualifier as written: `shop::audit`.
+fn spell_qualifier(segments: &[Spanned<SmolStr>]) -> String {
+    segments
+        .iter()
+        .map(|segment| segment.node.as_str())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
 /// `q` as written: `cart::total`.
-fn spell(q: &QualifiedName) -> String {
+pub(super) fn spell(q: &QualifiedName) -> String {
     let mut out = String::new();
     for segment in &q.qualifier {
         out.push_str(&segment.node);
@@ -843,21 +1538,25 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let order = program.link_order().unwrap_or_default();
     // Each import's shared run is decided by what it writes, before any module
     // lowers, so each lowers knowing the shared run its imports reach.
-    let mut sites = lowering.shared_runs();
+    let sites = lowering.shared_runs();
     for &file in order {
         if file != root {
             lowering.lower(file, ctx);
         }
     }
     let mut chains = Vec::new();
-    for &file in order {
-        if file == root {
-            continue;
-        }
-        for (run, site) in sites.remove(&file).unwrap_or_default() {
-            if let Some(chain) = lowering.shared_run(file, run, &site, ctx) {
-                chains.push(chain);
-            }
+    // A shared run is created after the shared runs it reaches, and a run's
+    // key holds the keys of the imports it passes, so the order is well founded.
+    let position: HashMap<FileId, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, file)| (*file, i))
+        .collect();
+    let mut in_order: Vec<&SharedRun> = sites.keys().collect();
+    in_order.sort_by_key(|run| (position.get(&sites[*run].0).copied(), (*run).clone()));
+    for run in in_order {
+        if sites[run].0 != root {
+            lowering.ensure_shared_run(run, &sites, &mut chains, ctx);
         }
     }
 
@@ -891,9 +1590,29 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let sinks = std::mem::take(&mut ctx.declared_sinks);
     let mut errors = std::mem::take(&mut lowering.errors);
     errors.extend(lowered.errors);
-    let value = lowered.value.map(|chain| {
+    let parameters: Vec<(SmolStr, Span, Rc<ModuleType>, String)> = ast
+        .body
+        .iter()
+        .filter_map(|stmt| {
+            let ChlStmt::Param { name, .. } = &stmt.node else {
+                return None;
+            };
+            let ty = ctx.module_parameter_types.get(&name.node)?;
+            let default = ctx.module_parameter_defaults.get(&name.node)?;
+            Some((name.node.clone(), stmt.span, Rc::clone(ty), default.clone()))
+        })
+        .collect();
+    let value = lowered.value.map(|mut chain| {
         let mut qualified = lowering.shared_names(&scope);
-        let chain = lowering.expand_runs(chain, &RunPath::default(), &mut qualified, ctx);
+        // The root's Module-typed parameters take their defaults.
+        let mut modules = HashMap::new();
+        for (name, declared, ty, default) in parameters {
+            let names = Rc::new(names_under(&qualified, &default));
+            let at = (declared, declared);
+            chain = lowering.bind_module_parameter(chain, &name, &ty, &names, at, ctx);
+            modules.insert(name, names);
+        }
+        let chain = lowering.expand_runs(chain, &RunPath::default(), &mut qualified, &modules, ctx);
         let (chain, refused) = finish_program(&ast.body, chain, &sinks, ctx);
         lowering.errors.extend(refused);
         let scope = use_names(&scope, qualified);
@@ -937,17 +1656,28 @@ struct ProgramLowering<'a> {
 struct ImportSite {
     statement: Span,
     /// Each argument, by its parameter: its span and its value.
-    arguments: HashMap<SmolStr, (Span, Lit)>,
+    arguments: HashMap<SmolStr, (Span, Argument)>,
 }
 
 /// The arguments a run is created with ([`ProgramLowering::create`]).
 enum Supplied<'a> {
-    /// A run's: the parameters its `run` statement passes arguments for, each
-    /// bound above the run under its run name.
-    Run(&'a [SmolStr]),
-    /// A shared run's: its import's constants, bound at the head of its chain
-    /// under its spelling, `scaled(scale=3)`.
+    /// A run's: the parameters its `run` statement passes value arguments for,
+    /// each bound above the run under its run name, and its module arguments,
+    /// each the names its module reaches, with the argument's span.
+    Run(&'a [SmolStr], Vec<ModuleArgument>),
+    /// A shared run's: its import's constants, a literal bound at the head of
+    /// its chain under its spelling, `scaled(scale=3)`, and an import name
+    /// reaching its shared run.
     Import(&'a SharedRun, &'a ImportSite),
+}
+
+/// A module passed to a Module-typed parameter, at `span`: the names its run
+/// reaches ([`Created::names`]).
+#[derive(Clone)]
+struct ModuleArgument {
+    parameter: SmolStr,
+    names: Rc<HashMap<String, Name>>,
+    span: Span,
 }
 
 /// A module lowered once ([`ProgramLowering::lower`]).
@@ -1001,13 +1731,7 @@ impl ProgramLowering<'_> {
         let clean = lowered.errors.is_empty() && self.program.parsed_cleanly(file);
         self.errors.extend(lowered.errors);
         let chain = lowered.value.filter(|_| clean)?;
-        let interface = Interface::of_lowered(
-            module,
-            ast,
-            &chain,
-            |name| ctx.is_mut_param_fn(name),
-            unimportable,
-        );
+        let interface = Interface::of_lowered(module, ast, &chain, ctx, unimportable);
         Some(LoweredModule {
             chain,
             interface: Rc::new(interface),
@@ -1066,21 +1790,29 @@ impl ProgramLowering<'_> {
         self.importable(file).then(|| Rc::clone(&lowered.interface))
     }
 
-    /// The shared runs the program's `import` statements reach, by the file of
-    /// their module, each with the first statement that reaches it: one per
-    /// module and distinct set of arguments. Records the shared run each
-    /// statement reaches.
-    ///
-    /// An argument is a literal for now (`docs/modules.md`, "Dependencies"). An
-    /// argument that is not one, or that names no parameter or one already given
-    /// an argument, is an error at the argument, and its import reaches no shared
-    /// run.
-    fn shared_runs(&mut self) -> HashMap<FileId, BTreeMap<SharedRun, ImportSite>> {
-        let mut runs: HashMap<FileId, BTreeMap<SharedRun, ImportSite>> = HashMap::new();
+    fn shared_runs(&mut self) -> HashMap<SharedRun, (FileId, ImportSite)> {
+        let mut runs: HashMap<SharedRun, (FileId, ImportSite)> = HashMap::new();
         for importer in self.program.sources().files() {
             let Some(ast) = self.program.ast(importer) else {
                 continue;
             };
+            let import_names: HashMap<SmolStr, Span> = ast
+                .body
+                .iter()
+                .filter_map(|stmt| import_name(stmt).map(|name| (name, stmt.span)))
+                .collect();
+            let run_names: HashSet<SmolStr> = ast
+                .body
+                .iter()
+                .filter_map(|stmt| match &stmt.node {
+                    ChlStmt::Run { path, alias, .. } => run_name(path, alias.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            // Each import whose arguments are well formed, with each import name
+            // it passes, by the statement that binds the name. One whose
+            // arguments are not reaches no shared run.
+            let mut pending = Vec::new();
             for stmt in &ast.body {
                 let ChlStmt::Import { path, args, .. } = &stmt.node else {
                     continue;
@@ -1097,6 +1829,7 @@ impl ProgramLowering<'_> {
                 else {
                     continue;
                 };
+                let errors = self.errors.len();
                 let parameters: HashSet<&str> = target
                     .body
                     .iter()
@@ -1105,43 +1838,139 @@ impl ProgramLowering<'_> {
                         _ => None,
                     })
                     .collect();
-                let mut errors = misused_arguments(args, &module, &parameters);
-                let mut arguments = HashMap::new();
+                self.errors
+                    .extend(misused_arguments(args, &module, &parameters));
+                let mut arguments = Vec::new();
                 for arg in args {
-                    match constant(&arg.value.node) {
-                        Some(value) => {
-                            arguments.insert(arg.name.node.clone(), (arg.value.span, value));
+                    let value = match (&arg.value.node, constant(&arg.value.node)) {
+                        (_, Some(value)) => Ok(value),
+                        (ChlExpr::Name(name), None) if import_names.contains_key(name) => {
+                            Err(import_names[name])
                         }
-                        None => errors.push(LoweringError::unsupported(
-                            arg.value.span,
-                            "an argument to an import is supported only as a literal for now",
-                        )),
+                        (ChlExpr::Name(name), None) if run_names.contains(name) => {
+                            self.errors.push(LoweringError::unsupported(
+                                arg.value.span,
+                                format!(
+                                    "`{name}` is a run name, and a run is not an argument to \
+                                     an import: a shared run stands outside every run"
+                                ),
+                            ));
+                            continue;
+                        }
+                        _ => {
+                            self.errors.push(LoweringError::unsupported(
+                                arg.value.span,
+                                "an argument to an import is supported only as a literal or \
+                                 an import name for now",
+                            ));
+                            continue;
+                        }
+                    };
+                    arguments.push((arg.name.node.clone(), arg.value.span, value));
+                }
+                if self.errors.len() == errors {
+                    pending.push((stmt.span, file, module, arguments));
+                }
+            }
+            // An import that passes an import name reaches its shared run once
+            // that import's is known, so the imports resolve in rounds. One left
+            // when a round resolves none passes an import whose arguments are in
+            // error, or is in a cycle of imports passing each other.
+            let mut resolved: HashMap<Span, Option<SharedRun>> = import_names
+                .values()
+                .filter(|import| !pending.iter().any(|(statement, ..)| statement == *import))
+                .map(|import| (*import, None))
+                .collect();
+            while !pending.is_empty() {
+                let before = pending.len();
+                pending.retain(|(statement, file, module, arguments)| {
+                    let mut key = Vec::new();
+                    let mut site = HashMap::new();
+                    for (parameter, span, value) in arguments {
+                        let argument = match value {
+                            Ok(value) => Argument::Lit(value.clone()),
+                            Err(import) => match resolved.get(import) {
+                                Some(Some(run)) => Argument::Module(run.clone()),
+                                Some(None) => {
+                                    resolved.insert(*statement, None);
+                                    return false;
+                                }
+                                None => return true,
+                            },
+                        };
+                        key.push((parameter.clone(), argument.clone()));
+                        site.insert(parameter.clone(), (*span, argument));
+                    }
+                    key.sort();
+                    let run = SharedRun {
+                        module: module.clone(),
+                        arguments: key.into(),
+                    };
+                    resolved.insert(*statement, Some(run.clone()));
+                    self.imports.insert(*statement, run.clone());
+                    runs.entry(run).or_insert((
+                        *file,
+                        ImportSite {
+                            statement: *statement,
+                            arguments: site,
+                        },
+                    ));
+                    false
+                });
+                if pending.len() == before {
+                    for (statement, ..) in pending.drain(..) {
+                        self.errors.push(LoweringError::unsupported(
+                            statement,
+                            "this import's arguments pass imports that pass it, in a cycle",
+                        ));
                     }
                 }
-                if !errors.is_empty() {
-                    self.errors.extend(errors);
-                    continue;
-                }
-                let mut key: Vec<_> = arguments
-                    .iter()
-                    .map(|(parameter, (_, value))| (parameter.clone(), value.clone()))
-                    .collect();
-                key.sort();
-                let run = SharedRun {
-                    module,
-                    arguments: key.into(),
-                };
-                self.imports.insert(stmt.span, run.clone());
-                runs.entry(file)
-                    .or_default()
-                    .entry(run)
-                    .or_insert(ImportSite {
-                        statement: stmt.span,
-                        arguments,
-                    });
             }
         }
         runs
+    }
+
+    /// Lower the shared run `run`, of those in `sites`, if it is not lowered
+    /// yet, after each shared run it reaches: those its module imports and those
+    /// its arguments name. Each chain is pushed onto `chains` once its own
+    /// shared runs' are.
+    fn ensure_shared_run(
+        &mut self,
+        run: &SharedRun,
+        sites: &HashMap<SharedRun, (FileId, ImportSite)>,
+        chains: &mut Vec<Expr>,
+        ctx: &mut LoweringContext,
+    ) {
+        if self.shared.contains_key(run) {
+            return;
+        }
+        // Each shared run is created once, and a cycle among imports is refused
+        // by loading, so the entry made here ends the recursion.
+        self.shared.insert(run.clone(), None);
+        let (file, site) = &sites[run];
+        let mut reached: Vec<SharedRun> = run
+            .arguments
+            .iter()
+            .filter_map(|(_, argument)| match argument {
+                Argument::Module(run) => Some(run.clone()),
+                Argument::Lit(_) => None,
+            })
+            .collect();
+        if let Some(ast) = self.program.ast(*file) {
+            reached.extend(
+                ast.body
+                    .iter()
+                    .filter_map(|stmt| self.imports.get(&stmt.span).cloned()),
+            );
+        }
+        for reached in &reached {
+            if sites.contains_key(reached) {
+                self.ensure_shared_run(reached, sites, chains, ctx);
+            }
+        }
+        if let Some(chain) = self.shared_run(*file, run.clone(), site, ctx) {
+            chains.push(chain);
+        }
     }
 
     /// Create the shared run `run` of the imported module in `file`, for the
@@ -1199,25 +2028,84 @@ impl ProgramLowering<'_> {
             .map(|(path, _)| path.clone())
             .unwrap_or_default();
         let prefix = match supplied {
-            Supplied::Run(_) => place
+            Supplied::Run(..) => place
                 .as_ref()
                 .and_then(|(path, _)| path.last())
                 .expect("a run has a name")
                 .to_string(),
             Supplied::Import(run, _) => run.to_string(),
         };
+        let own = self.shared_names(&lowered.scope);
+        let mut modules: HashMap<SmolStr, Rc<HashMap<String, Name>>> = HashMap::new();
         for parameter in &lowered.interface.parameters {
-            let given = match supplied {
-                Supplied::Run(arguments) => arguments.contains(&parameter.name),
-                Supplied::Import(_, site) => site.arguments.contains_key(&parameter.name),
-            };
-            if given {
-                let argument = ctx.tag_image(
-                    Expr::var(argument_name(&prefix, &parameter.name)),
-                    parameter.declared,
-                );
-                read_argument(&mut chain, &parameter.name, argument);
-                continue;
+            if let Some(ty) = &parameter.module {
+                let argument = match &supplied {
+                    Supplied::Run(_, arguments) => arguments
+                        .iter()
+                        .find(|argument| argument.parameter == parameter.name)
+                        .map(|argument| (Rc::clone(&argument.names), argument.span)),
+                    Supplied::Import(_, site) => match site.arguments.get(&parameter.name) {
+                        Some((span, Argument::Module(run))) => {
+                            let names = self.shared.get(run).cloned().flatten();
+                            Some((names.unwrap_or_default(), *span))
+                        }
+                        Some((span, Argument::Lit(_))) => {
+                            self.errors.push(
+                                LoweringError::unsupported(
+                                    *span,
+                                    format!(
+                                        "the parameter `{}` is of Module type, and its argument \
+                                         is not a module: pass an import name",
+                                        parameter.name
+                                    ),
+                                )
+                                .with_note(parameter.declared, "the parameter"),
+                            );
+                            continue;
+                        }
+                        None => None,
+                    },
+                }
+                .or_else(|| {
+                    let default = parameter.module_default.as_ref()?;
+                    Some((Rc::new(names_under(&own, default)), parameter.declared))
+                });
+                if let Some((names, span)) = argument {
+                    let at = (span, parameter.declared);
+                    chain = self.bind_module_parameter(chain, &parameter.name, ty, &names, at, ctx);
+                    modules.insert(parameter.name.clone(), names);
+                    continue;
+                }
+            } else {
+                let given = match &supplied {
+                    Supplied::Run(arguments, _) => arguments.contains(&parameter.name),
+                    Supplied::Import(_, site) => match site.arguments.get(&parameter.name) {
+                        Some((_, Argument::Lit(_))) => true,
+                        Some((span, Argument::Module(_))) => {
+                            self.errors.push(
+                                LoweringError::unsupported(
+                                    *span,
+                                    format!(
+                                        "this argument is a module, and the parameter `{}` is \
+                                         not annotated with a Module type",
+                                        parameter.name
+                                    ),
+                                )
+                                .with_note(parameter.declared, "the parameter"),
+                            );
+                            continue;
+                        }
+                        None => false,
+                    },
+                };
+                if given {
+                    let argument = ctx.tag_image(
+                        Expr::var(argument_name(&prefix, &parameter.name)),
+                        parameter.declared,
+                    );
+                    read_argument(&mut chain, &parameter.name, argument);
+                    continue;
+                }
             }
             if parameter.default {
                 continue;
@@ -1239,13 +2127,20 @@ impl ProgramLowering<'_> {
                         parameter.name
                     ),
                 ),
-                (None, Supplied::Run(_)) => unreachable!("a run has a `run` statement"),
+                (None, Supplied::Run(..)) => unreachable!("a run has a `run` statement"),
             };
             self.errors
                 .push(error.with_note(parameter.declared, "the parameter"));
         }
-        if let Supplied::Import(_, site) = supplied {
-            let mut arguments: Vec<_> = site.arguments.iter().collect();
+        if let Supplied::Import(_, site) = &supplied {
+            let mut arguments: Vec<_> = site
+                .arguments
+                .iter()
+                .filter_map(|(parameter, (span, argument))| match argument {
+                    Argument::Lit(value) => Some((parameter, (span, value))),
+                    Argument::Module(_) => None,
+                })
+                .collect();
             arguments.sort_by(|l, r| l.0.cmp(r.0));
             for (parameter, (span, value)) in arguments.into_iter().rev() {
                 let ty = lowered
@@ -1263,8 +2158,8 @@ impl ProgramLowering<'_> {
                 chain = ctx.tag_image(bound, *span);
             }
         }
-        let mut qualified = self.shared_names(&lowered.scope);
-        let chain = self.expand_runs(chain, &path, &mut qualified, ctx);
+        let mut qualified = own;
+        let chain = self.expand_runs(chain, &path, &mut qualified, &modules, ctx);
         let (sinks, refused) = match &place {
             Some(place) => ctx.register_sinks(&lowered.sinks, Some(place)),
             None => (Vec::new(), Vec::new()),
@@ -1277,6 +2172,17 @@ impl ProgramLowering<'_> {
         for name in spine {
             if name.home() == home.as_ref() {
                 names.insert(name.base().to_string(), name.clone());
+            }
+        }
+        // A member bound to a module reaches what that module does, so a Module
+        // type naming it, `shop: Module{k: …}`, finds its members under it.
+        for (name, member) in &lowered.interface.modules {
+            let reached = match &member.view {
+                Some(view) => view_names(view, &names),
+                None => names_under(&names, &member.spelling),
+            };
+            for (spelling, binder) in reached {
+                names.insert(format!("{name}::{spelling}"), binder);
             }
         }
         // Each sink the run declares is read at the program's tail through the
@@ -1293,6 +2199,41 @@ impl ProgramLowering<'_> {
         })
     }
 
+    /// `chain`, a copy of a module's chain, with each `let` the Module-typed
+    /// parameter `parameter` of type `ty` binds bound to its member among
+    /// `names`, what the module passed at `at.0` reaches. A member it lacks is an
+    /// error at the argument, with a note at the parameter, `at.1`.
+    fn bind_module_parameter(
+        &mut self,
+        mut chain: Expr,
+        parameter: &str,
+        ty: &ModuleType,
+        names: &HashMap<String, Name>,
+        at: (Span, Span),
+        ctx: &mut LoweringContext,
+    ) -> Expr {
+        let (span, declared) = at;
+        let mut lets = Vec::new();
+        ModuleView::of(parameter, ty, &mut lets);
+        for (binder, _) in lets {
+            let entry = &binder[parameter.len() + 2..];
+            match names.get(entry) {
+                Some(member) => chain = rebind_entry(chain, &binder, member.clone(), span, ctx),
+                None => self.errors.push(
+                    LoweringError::unsupported(
+                        span,
+                        format!(
+                            "this module does not fit the parameter's Module type: it has no \
+                             public member `{entry}`"
+                        ),
+                    )
+                    .with_note(declared, "the parameter"),
+                ),
+            }
+        }
+        chain
+    }
+
     /// `expr`, a module's chain, with each [`TypedExprNode::Run`] on its spine
     /// replaced by the run it declares, at a run path under `path`, around the
     /// rest of the module. Each name a created run reaches is recorded in
@@ -1302,37 +2243,50 @@ impl ProgramLowering<'_> {
         expr: Expr,
         path: &RunPath,
         qualified: &mut HashMap<String, Name>,
+        modules: &HashMap<SmolStr, Rc<HashMap<String, Name>>>,
         ctx: &mut LoweringContext,
     ) -> Expr {
         if matches!(expr.node, TypedExprNode::Run { .. }) {
-            {
-                let TypedExprNode::Run {
-                    name,
-                    module,
-                    statement,
-                    arguments,
-                    body,
-                } = expr.node
-                else {
-                    unreachable!("matched a `Run` above");
-                };
-                let run_path = path.child(name.clone());
-                let created = self.program.file_of(&module).and_then(|file| {
-                    let home = Home::Run(run_path.clone());
-                    let place = Some((run_path, statement));
-                    self.create(file, Some(home), place, Supplied::Run(&arguments), ctx)
-                });
-                let body = self.expand_runs(*body, path, qualified, ctx);
-                return match created {
-                    Some(created) => {
-                        for (spelling, binder) in created.names {
-                            qualified.insert(format!("{name}::{spelling}"), binder);
-                        }
-                        link(created.chain, body)
-                    }
-                    None => body,
-                };
+            let TypedExprNode::Run {
+                name,
+                module,
+                statement,
+                arguments,
+                modules: passed,
+                body,
+            } = expr.node
+            else {
+                unreachable!("matched a `Run` above");
+            };
+            let passed = passed
+                .into_iter()
+                .map(|(parameter, spelling, span)| ModuleArgument {
+                    parameter,
+                    names: Rc::new(module_names(&spelling, qualified, modules)),
+                    span,
+                })
+                .collect();
+            let run_path = path.child(name.clone());
+            let created = self.program.file_of(&module).and_then(|file| {
+                let home = Home::Run(run_path.clone());
+                let place = Some((run_path, statement));
+                self.create(
+                    file,
+                    Some(home),
+                    place,
+                    Supplied::Run(&arguments, passed),
+                    ctx,
+                )
+            });
+            let Some(created) = created else {
+                return self.expand_runs(*body, path, qualified, modules, ctx);
+            };
+            // The rest of the module, below the run, reaches it.
+            for (spelling, binder) in created.names {
+                qualified.insert(format!("{name}::{spelling}"), binder);
             }
+            let body = self.expand_runs(*body, path, qualified, modules, ctx);
+            return link(created.chain, body);
         }
         // The rest of the spine is moved out and back, so no node is minted.
         match expr.node {
@@ -1344,7 +2298,7 @@ impl ProgramLowering<'_> {
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr,
-                    body: Box::new(self.expand_runs(*body, path, qualified, ctx)),
+                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
                 },
                 ..expr
             },
@@ -1356,14 +2310,14 @@ impl ProgramLowering<'_> {
                 node: TypedExprNode::MutDecl {
                     binding,
                     init,
-                    body: Box::new(self.expand_runs(*body, path, qualified, ctx)),
+                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
                 },
                 ..expr
             },
             TypedExprNode::ExprStmt { expr: effect, body } => Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
-                    body: Box::new(self.expand_runs(*body, path, qualified, ctx)),
+                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
                 },
                 ..expr
             },
@@ -1371,7 +2325,7 @@ impl ProgramLowering<'_> {
                 node: TypedExprNode::LetType {
                     name,
                     ty,
-                    body: Box::new(self.expand_runs(*body, path, qualified, ctx)),
+                    body: Box::new(self.expand_runs(*body, path, qualified, modules, ctx)),
                 },
                 ..expr
             },
@@ -1434,6 +2388,20 @@ impl ProgramLowering<'_> {
     }
 }
 
+/// The import name `stmt` binds, if it is an `import` whose path the parser
+/// accepted.
+fn import_name(stmt: &Spanned<ChlStmt>) -> Option<SmolStr> {
+    let ChlStmt::Import { path, alias, .. } = &stmt.node else {
+        return None;
+    };
+    let module = path.to_path()?;
+    Some(
+        alias
+            .as_ref()
+            .map_or_else(|| last_segment(&module), |alias| alias.node.clone()),
+    )
+}
+
 /// The constant `expr` spells, if it is one: a literal, or a negated integer
 /// literal.
 fn constant(expr: &ChlExpr) -> Option<Lit> {
@@ -1449,6 +2417,96 @@ fn constant(expr: &ChlExpr) -> Option<Lit> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// What the view `view` reaches among `names`, a run's names: each value under
+/// its entry's name, at any depth, `log::events` for a module entry `log`.
+fn view_names(view: &ModuleView, names: &HashMap<String, Name>) -> HashMap<String, Name> {
+    let mut reached = HashMap::new();
+    for (entry, spelling) in &view.values {
+        if let Some(binder) = names.get(spelling) {
+            reached.insert(entry.to_string(), binder.clone());
+        }
+    }
+    for (entry, inner) in &view.modules {
+        for (spelling, binder) in view_names(inner, names) {
+            reached.insert(format!("{entry}::{spelling}"), binder);
+        }
+    }
+    reached
+}
+
+/// The names under `prefix` in `names`, each without it: what the module
+/// spelled `prefix` reaches, `count` for `c::count`.
+fn names_under(names: &HashMap<String, Name>, prefix: &str) -> HashMap<String, Name> {
+    let prefix = format!("{prefix}::");
+    names
+        .iter()
+        .filter_map(|(spelling, name)| {
+            Some((spelling.strip_prefix(&prefix)?.to_string(), name.clone()))
+        })
+        .collect()
+}
+
+/// The names the module spelled `spelling` reaches, in a run whose names are
+/// `qualified` and whose Module-typed parameters take the modules `modules`.
+/// A spelling through a parameter, `audit` or `audit::log`, reaches what the
+/// parameter's argument does.
+fn module_names(
+    spelling: &str,
+    qualified: &HashMap<String, Name>,
+    modules: &HashMap<SmolStr, Rc<HashMap<String, Name>>>,
+) -> HashMap<String, Name> {
+    let (first, rest) = spelling.split_once("::").unwrap_or((spelling, ""));
+    match modules.get(first) {
+        Some(names) if rest.is_empty() => (**names).clone(),
+        Some(names) => names_under(names, rest),
+        None => names_under(qualified, spelling),
+    }
+}
+
+/// `chain`, a copy of a module's chain, with the `let` the Module-typed
+/// parameter binds under `binder`, `audit::count`, bound to the argument's
+/// member `member` and imaged at the argument at `span`, so a member whose
+/// type does not fit is the argument's error.
+fn rebind_entry(
+    chain: Expr,
+    binder: &str,
+    member: Name,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let Expr { node, .. } = &chain;
+    let TypedExprNode::Let { binding, .. } = node else {
+        unreachable!("a module's parameters head its chain, and `{binder}` is one's");
+    };
+    if matches!(&binding.name, Name::Raw(spelling) if spelling == binder) {
+        let TypedExprNode::Let { binding, body, .. } = chain.node else {
+            unreachable!("matched a `let` above");
+        };
+        let member = ctx.tag_image(Expr::var(member), span);
+        let ty = binding
+            .user_annotation
+            .expect("an entry's `let` carries the entry's type");
+        let bound = Expr::let_bind_annotated(binder, member, *body, ty);
+        return ctx.tag_image(bound, span);
+    }
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = chain.node
+    else {
+        unreachable!("matched a `let` above");
+    };
+    Expr {
+        node: TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body: Box::new(rebind_entry(*body, binder, member, span, ctx)),
+        },
+        ..chain
     }
 }
 
@@ -1586,7 +2644,10 @@ fn module_scope(
                     shared: shared.get(&stmt.span).cloned(),
                     statement: stmt.span,
                     interface,
-                    run: false,
+                    kind: QualifierKind::Import,
+                    spelling: name.to_string(),
+                    view: None,
+                    view_base: String::new(),
                 };
                 (name, qualifier, uses)
             }
@@ -1618,39 +2679,44 @@ fn module_scope(
                     module,
                     statement: stmt.span,
                     interface: interfaces.get(&stmt.span).cloned().flatten(),
-                    run: true,
+                    kind: QualifierKind::Run,
+                    spelling: name.to_string(),
+                    view: None,
+                    view_base: String::new(),
                 };
                 (name, qualifier, uses)
             }
             _ => continue,
         };
         if let Some(earlier) = qualifiers.get(&name) {
-            let what = |q: &Qualifier| {
-                if q.run {
-                    "a run name"
-                } else {
-                    "an import name"
-                }
-            };
             errors.push(
                 LoweringError::unsupported(
                     stmt.span,
-                    format!("`{name}` is already {}", what(earlier)),
+                    format!("`{name}` is already {}", earlier.kind.describe()),
                 )
                 .with_note(earlier.statement, "bound here first"),
             );
             continue;
         }
-        let run = qualifier.run.then(|| name.clone());
+        let run = (qualifier.kind == QualifierKind::Run).then(|| name.clone());
         use_items.extend(uses.iter().map(|item| (name.clone(), run.clone(), item)));
         qualifiers.insert(name, qualifier);
     }
 
     let mut uses: HashMap<SmolStr, Use> = HashMap::new();
+    let mut module_uses: HashMap<SmolStr, Qualifier> = HashMap::new();
     for (qualifier_name, run, item) in use_items {
         let bound = item.alias.as_ref().unwrap_or(&item.name);
         let qualifier = &qualifiers[&qualifier_name];
-        let reached = if super::stmts::is_type_name(&item.name.node) {
+        // A member bound to a module makes its `use` name a name of that module.
+        let module = if super::stmts::is_type_name(&item.name.node) {
+            None
+        } else {
+            qualifier.used_module(&item.name.node)
+        };
+        let reached = if module.is_some() {
+            Ok(Reached::Value(None))
+        } else if super::stmts::is_type_name(&item.name.node) {
             qualifier
                 .reach_type(&qualifier_name, &item.name.node, item.name.span)
                 .map(Reached::Type)
@@ -1664,12 +2730,20 @@ fn module_scope(
                 LoweringError::unsupported(
                     bound.span,
                     format!(
-                        "`{}` is an import name or a run name, so no binder in its module takes \
-                         it",
-                        bound.node
+                        "`{}` is {}, so no binder in its module takes it",
+                        bound.node,
+                        named.kind.describe()
                     ),
                 )
                 .with_note(named.statement, "bound here"),
+            )
+        } else if let Some(earlier) = module_uses.get(&bound.node) {
+            Some(
+                LoweringError::unsupported(
+                    bound.span,
+                    format!("`{}` is already a `use` name", bound.node),
+                )
+                .with_note(earlier.statement, "bound by `use` here first"),
             )
         } else if let Some(earlier) = uses.get(&bound.node) {
             Some(
@@ -1702,10 +2776,24 @@ fn module_scope(
                 ),
             ))
         } else {
-            reached.as_ref().err().cloned()
+            match &module {
+                Some(Err(error)) => Some(error.clone()),
+                _ => reached.as_ref().err().cloned(),
+            }
         };
         if let Some(refusal) = refusal {
             errors.push(refusal);
+            continue;
+        }
+        if let Some(Ok(module)) = module {
+            module_uses.insert(
+                bound.node.clone(),
+                Qualifier {
+                    statement: bound.span,
+                    kind: QualifierKind::Use { run: run.is_some() },
+                    ..module
+                },
+            );
             continue;
         }
         uses.insert(
@@ -1717,6 +2805,7 @@ fn module_scope(
             },
         );
     }
+    qualifiers.extend(module_uses);
     ModuleScope {
         labels,
         qualifiers,
