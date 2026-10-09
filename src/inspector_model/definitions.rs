@@ -134,13 +134,13 @@ fn collect_uses(
 ) {
     match &expr.node {
         // An ordinary bound occurrence: its binder is the one sharing its uid.
-        TypedExprNode::Var(Name::Unique { uid, base }) => {
+        TypedExprNode::Var(Name::Unique { uid, base, .. }) => {
             if let (Some(use_span), Some(&def_span)) = (node_span(expr, projection), sites.get(uid))
             {
                 out.push(Definition {
                     use_span,
                     def_span,
-                    name: base.clone(),
+                    name: base.to_string(),
                 });
             }
         }

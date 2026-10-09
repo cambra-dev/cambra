@@ -431,16 +431,51 @@ fn an_imported_module_is_linked_once() {
         ],
     );
     let tree = symbolic(&compile_to(&program, Phase::Lower).expect("compiles"));
-    assert_eq!(tree.matches("let shared =").count(), 1, "{tree}");
-    let order: Vec<usize> = ["let shared =", "let n = shared + 1", "let n = shared + 2"]
-        .iter()
-        .map(|binding| {
-            tree.find(binding)
-                .unwrap_or_else(|| panic!("{binding} in {tree}"))
-        })
-        .collect();
+    assert_eq!(tree.matches("let base::shared =").count(), 1, "{tree}");
+    let order: Vec<usize> = [
+        "let base::shared =",
+        "let left::n = base::shared + 1",
+        "let right::n = base::shared + 2",
+    ]
+    .iter()
+    .map(|binding| {
+        tree.find(binding)
+            .unwrap_or_else(|| panic!("{binding} in {tree}"))
+    })
+    .collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "link order: {tree}");
     check_program_scalar(&program, Value::Int(17));
+}
+
+/// A type alias among a module's top-level statements leaves the members below
+/// it top-level, so they carry their module too.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_member_below_a_type_alias_carries_its_module() {
+    let errors = compile_errors(&program(
+        "import lib\nx: {Int where _ > lib::limit} = 5\nx\n",
+        &[("lib", "Small = Int\npub limit: Small = 10\n")],
+    ));
+    assert!(
+        errors.contains("annotated as {Int where _ > lib::limit}"),
+        "{errors}"
+    );
+}
+
+/// An imported member renders with its module, so a diagnostic names
+/// `catalog::limit` rather than a bare `limit` (`docs/modules.md`, "Names carry
+/// their home").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_diagnostic_qualifies_an_imported_member() {
+    let errors = compile_errors(&program(
+        "import catalog\nx: {Int where _ > catalog::limit} = 5\nx\n",
+        &[("catalog", CATALOG)],
+    ));
+    assert!(
+        errors.contains("annotated as {Int where _ > catalog::limit}"),
+        "{errors}"
+    );
 }
 
 /// The inspector's payload carries one file, so a program of several modules

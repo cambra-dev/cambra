@@ -311,6 +311,10 @@ pub enum InferError {
     /// shape that made the demand is typically partial — a projection requires only the
     /// one field it reads — so rendering it opposite the found type describes a type the
     /// program never had.
+    ///
+    /// `found` is boxed for the reason [`InferError::TypeMismatch`]'s types are:
+    /// inline, beside a [`FieldKey`] and the label, this would be the widest
+    /// variant, over the `result_large_err` budget.
     MissingField {
         /// The key the required shape demands and `found` does not carry. For a
         /// positional key this is the **widest** position demanded, not the first
@@ -318,7 +322,7 @@ pub enum InferError {
         /// 100-wide tuple, and the position that is actually missing is `.99`.
         key: FieldKey,
         /// The product that should have carried `key`.
-        found: Type,
+        found: Box<Type>,
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
@@ -678,9 +682,8 @@ impl InferError {
                     each(expected);
                 }
             }
-            InferError::MissingField { found, .. } | InferError::ExpectedFunction { found, .. } => {
-                each(found)
-            }
+            InferError::MissingField { found, .. } => each(found),
+            InferError::ExpectedFunction { found, .. } => each(found),
             InferError::AnnotationMismatch {
                 annotation,
                 inferred,
@@ -1140,7 +1143,7 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
-            InferError::MissingField { key, found, at } => match (key, found) {
+            InferError::MissingField { key, found, at } => match (key, &**found) {
                 // A tuple's positions are its width, so that is the fact to state: the
                 // projection asked for a position past the end.
                 (FieldKey::Index(i), Type::Tuple(elems)) => write!(
