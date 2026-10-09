@@ -233,6 +233,11 @@ impl<'a> InspectedProgram<'a> {
         &self.pane_maps
     }
 
+    /// Every file the program was compiled from.
+    pub(super) fn sources(&self) -> &SourceMap {
+        self.sources
+    }
+
     /// The root file's text (the payload's `source.text`).
     pub(super) fn source_text(&self) -> &str {
         self.sources.text(self.sources.root())

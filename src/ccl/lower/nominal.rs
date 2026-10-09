@@ -23,7 +23,7 @@ use super::{LoweringContext, LoweringError};
 use crate::ccl::nominal::{NominalCtor, NominalDecl};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam};
 use crate::ccl::{
-    Expr, Lit, MethodCandidate, Pattern, PatternHead, Type, TypedBinding, TypedExprNode,
+    Expr, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding, TypedExprNode,
 };
 use crate::ccl::{V_NONE, V_SOME};
 use crate::chl_parser::ast::{
@@ -645,6 +645,13 @@ fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Memb
         .map(|f| (Member::Associated { arity: f.arity }, f.span))
 }
 
+/// Whether `q` is a name qualified by one type, `Shape::circle`: a member of a nominal
+/// type rather than of another module, whose qualifier is lowercase
+/// (`docs/chl-spec.md`, "9.6 Qualified references").
+pub(super) fn names_a_type_member(q: &QualifiedName) -> bool {
+    matches!(q.qualifier.as_slice(), [ty] if super::stmts::is_type_name(&ty.node))
+}
+
 /// The declaration and member `q` names, `Shape::circle`.
 fn resolve_member(
     q: &QualifiedName,
@@ -721,7 +728,7 @@ pub(super) fn lower_member_call(
         )),
         _ => {
             let binding = member_reference(&decl, name, ctx);
-            super::exprs::apply_named(&binding, span, args, ctx)
+            super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
         }
     }
 }
@@ -925,7 +932,7 @@ pub(super) fn constructor_arm_pattern(
 /// `try_extract_fanout_feed`). The payload's name is minted, so no binder in `body` can
 /// capture it.
 pub(super) fn bind_parameters(
-    payload: &crate::ccl::Name,
+    payload: &Name,
     binds: Vec<(String, usize)>,
     body: Expr,
     span: Span,
@@ -936,12 +943,7 @@ pub(super) fn bind_parameters(
         let read = ctx.tag_machinery(Expr::var(payload.clone()), span, label);
         let proj = ctx.tag_machinery(Expr::proj_index(i), span, label);
         let field = ctx.tag_machinery(Expr::apply(read, proj), span, label);
-        super::functions::substitute_param_in_body(
-            acc,
-            &crate::ccl::Name::raw(name.as_str()),
-            &field,
-            label,
-        )
+        super::functions::substitute_param_in_body(acc, &Name::raw(name.as_str()), &field, label)
     })
 }
 

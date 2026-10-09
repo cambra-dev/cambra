@@ -50,6 +50,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::chl_parser::ast::QualifiedName as ParserQualifiedName;
 use smol_str::SmolStr;
 
 /// A globally-fresh binder identity. Minted only via [`Uid::fresh`]; nothing
@@ -541,6 +542,63 @@ impl fmt::Display for Name {
             Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
             _ => f.write_str(self.base()),
         }
+    }
+}
+
+/// A name as a module writes it, through the qualifiers before it: `f`, or
+/// `cart::total`. It is a [`ParserQualifiedName`]'s segments without their
+/// spans, so it can key a map, and it can spell a name no source writes:
+/// `lib::dep::f`, the member `f` of `dep` as a module importing `lib` reaches
+/// it. A reference lowers to the raw name its segments join with `::`
+/// ([`Self::raw`]), which the scope a run is uniquified in maps to the binder
+/// it reaches (`raw_scope` in `src/ccl/lower/modules/link.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QualifiedName(Vec<SmolStr>);
+
+impl QualifiedName {
+    /// The spelling of the name `name` alone.
+    pub fn new(name: impl Into<SmolStr>) -> Self {
+        QualifiedName(vec![name.into()])
+    }
+
+    /// `q` as written.
+    pub fn of(q: &ParserQualifiedName) -> Self {
+        QualifiedName(
+            q.qualifier
+                .iter()
+                .chain([&q.name])
+                .map(|segment| segment.node.clone())
+                .collect(),
+        )
+    }
+
+    /// The spelling of `name` through this one: `cart` and `total` spell
+    /// `cart::total`.
+    pub fn child(&self, name: impl Into<SmolStr>) -> Self {
+        let mut segments = self.0.clone();
+        segments.push(name.into());
+        QualifiedName(segments)
+    }
+
+    /// `rest` spelled through this one.
+    pub fn then(&self, rest: &QualifiedName) -> Self {
+        QualifiedName(self.0.iter().chain(&rest.0).cloned().collect())
+    }
+
+    /// Its segments, outermost qualifier first.
+    pub fn segments(&self) -> &[SmolStr] {
+        &self.0
+    }
+
+    /// The raw name a reference with this spelling lowers to.
+    pub fn raw(&self) -> Name {
+        Name::raw(self.to_string())
+    }
+}
+
+impl fmt::Display for QualifiedName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.join("::"))
     }
 }
 

@@ -4,6 +4,7 @@
 use crate::ccl::Label;
 use std::{collections::HashSet, rc::Rc};
 
+use super::modules::module_body;
 use super::*;
 use crate::{
     ccl::{
@@ -16,6 +17,40 @@ use crate::{
         TypeParam,
     },
 };
+
+/// [`lower_stmts_recovering`] for an imported module, which has no final value: every
+/// statement wraps the next, and the last wraps [`MODULE_BODY`](super::modules::MODULE_BODY),
+/// the placeholder linking replaces with the code that imports the module.
+pub(super) fn lower_library_recovering(
+    module: &ChlModule,
+    ctx: &mut LoweringContext,
+    errors: &mut Vec<LoweringError>,
+) -> Option<Expr> {
+    let stmts = &module.body[..];
+    let outer_bindings = HashSet::new();
+    errors.extend(pre_declare_type_aliases(stmts, ctx));
+    pre_register_txn_decls(stmts, ctx);
+    let span = match (stmts.first(), stmts.last()) {
+        (Some(first), Some(last)) => first.span.join(last.span),
+        _ => Span::new(module.file, 0, 0),
+    };
+    let placeholder = ctx.tag_machinery(module_body(), span, "lower.module_body");
+    let body = contributing_stmts(stmts)
+        .rev()
+        .fold(placeholder, |acc, (i, stmt)| {
+            let backup = acc.clone_preserving_ids();
+            match lower_middle_stmt(stmt, &stmts[..i], acc, &outer_bindings, ctx, true) {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(e);
+                    // As in `lower_stmts_recovering`: the partial tree is not consumed
+                    // past lowering, so the placeholder's role is structural.
+                    Expr::expr_stmt(Expr::error(), backup)
+                }
+            }
+        });
+    Some(body)
+}
 
 /// Top-level statement-iteration with per-statement error recovery.
 ///
@@ -1934,6 +1969,20 @@ pub(super) fn lower_type_expr_or_poly(
                 },
             }
         }
+        // A type member of another module (`docs/chl-spec.md`, "9.6 Qualified
+        // references").
+        ChlExpr::Qualified(q) => Err(LoweringError::unsupported(
+            annotation.span,
+            format!(
+                "the type member `{}::{}` is not supported yet",
+                q.qualifier
+                    .iter()
+                    .map(|s| s.node.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+                q.name.node
+            ),
+        )),
         // Type application `List(T)`: a type constructor applied to argument
         // types. Application uses parentheses at both levels
         // (`docs/chl-spec.md`).
@@ -1949,7 +1998,7 @@ pub(super) fn lower_type_expr_or_poly(
             let mut out = Vec::with_capacity(fields.len());
             for field in fields {
                 out.push((
-                    Label::new(field.name.as_str()),
+                    ctx.label(&field.qualifier, &field.name, field.name_span)?,
                     lower_type_expr(&field.value, ctx)?,
                 ));
             }
@@ -2156,7 +2205,13 @@ fn collect_variant_arms(
             collect_variant_arms(left, arms, ctx)?;
             collect_variant_arms(right, arms, ctx)
         }
-        ChlExpr::VariantCtor { tag, payload, .. } => {
+        ChlExpr::VariantCtor {
+            tag,
+            tag_span,
+            tag_qualifier,
+            payload,
+        } => {
+            let label = ctx.label(tag_qualifier, tag, *tag_span)?;
             let payload = match payload {
                 // A bare tag carries no payload, so its payload type is `Unit` —
                 // the same type the bare constructor `` `tag `` injects.
@@ -2178,7 +2233,7 @@ fn collect_variant_arms(
                     ));
                 }
             };
-            arms.push((FieldKey::Name(Label::new(tag.clone())), payload));
+            arms.push((FieldKey::Name(label), payload));
             Ok(())
         }
         _ => Err(LoweringError::unsupported(
@@ -2743,7 +2798,7 @@ pub(super) fn lower_match_over(
     };
     // After the one-type check, so two arms naming same-spelled constructors of two types
     // are reported as two types rather than as a repeated constructor.
-    if let Some(dup) = first_duplicate_tag(arms) {
+    if let Some(dup) = first_duplicate_tag(arms, ctx)? {
         return Err(LoweringError::unsupported(
             match_span,
             format!(
@@ -2826,7 +2881,7 @@ pub(super) fn lower_match_over(
         })?;
         branches.push(Branch {
             pattern: Some(Pattern {
-                head: PatternHead::Tag(Label::new(pat.tag.as_str())),
+                head: PatternHead::Tag(ctx.label(&pat.tag_qualifier, &pat.tag, pat.tag_span)?),
                 binding: TypedBinding {
                     name: binder.into(),
                     ty: Type::Hole,
@@ -2852,21 +2907,44 @@ pub(super) fn lower_match_over(
 }
 
 /// The first tag or constructor appearing on more than one arm, if any: a tag by its
-/// name, a constructor qualified by its type.
-fn first_duplicate_tag(arms: &[MatchArm]) -> Option<String> {
+/// label, so two arms match one tag when their labels agree whatever their spellings,
+/// and a constructor qualified by its type.
+fn first_duplicate_tag(
+    arms: &[MatchArm],
+    ctx: &LoweringContext,
+) -> Result<Option<String>, LoweringError> {
+    /// What an arm matches: a tag, or a constructor of the type it names.
+    #[derive(PartialEq, Eq, Hash)]
+    enum Matched<'a> {
+        Tag(Label),
+        Constructor { ty: &'a SmolStr, ctor: &'a SmolStr },
+    }
     let mut seen = HashSet::new();
-    arms.iter()
-        .filter_map(|arm| match arm.pattern.as_ref()? {
-            ArmPattern::Tag(pat) => Some(pat.tag.to_string()),
+    for pattern in arms.iter().filter_map(|arm| arm.pattern.as_ref()) {
+        let matched = match pattern {
+            ArmPattern::Tag(pat) => {
+                Matched::Tag(ctx.label(&pat.tag_qualifier, &pat.tag, pat.tag_span)?)
+            }
             ArmPattern::Constructor(pat) => {
                 let ty = pat
                     .type_path
                     .last()
                     .expect("a constructor pattern names its type");
-                Some(format!("{}::{}", ty.node, pat.ctor.node))
+                Matched::Constructor {
+                    ty: &ty.node,
+                    ctor: &pat.ctor.node,
+                }
             }
-        })
-        .find(|name| !seen.insert(name.clone()))
+        };
+        if seen.contains(&matched) {
+            return Ok(Some(match matched {
+                Matched::Tag(label) => label.to_string(),
+                Matched::Constructor { ty, ctor } => format!("{ty}::{ctor}"),
+            }));
+        }
+        seen.insert(matched);
+    }
+    Ok(None)
 }
 
 /// Lower a [`ChlStmt::If`] (a flattened `if`/`elif`/`else` chain) to a

@@ -19,7 +19,7 @@ compile reads the lowering projection alone.
 | When it runs | once per compiled program, on the inspector's path only |
 | Consumer | `src/inspector_server`, which serves the payload, and the `web` frontend, which renders it |
 | Feature gate | the wire types derive `Serialize` under the default-off `serde` feature; `ci_clippy_serde` is the CI pass that compiles them |
-| `span` | throughout: `{file, start, end}`, the byte range `start..end` of the **CHL source text** of the file `file` indexes in the compilation's `SourceMap`, never an offset into a rendered pane. The payload carries one file, the root, as `source`, so every span in it names the root. A diagnostic located in another file of the compilation names that file in its message and has no span. Nothing in the payload addresses a pane's text |
+| `span` | throughout: `{file, start, end}`, the byte range `start..end` of the **CHL source text** of the file `file` indexes in the compilation's `SourceMap`, never an offset into a rendered pane. The payload carries one file, the root, as `source`, so every span in it names the root. A diagnostic located in another file of the compilation names that file in its message and has no span, and a program of several modules gets the degraded payload, whose one diagnostic says the inspector shows one file. Nothing in the payload addresses a pane's text |
 
 ## The usage model
 
