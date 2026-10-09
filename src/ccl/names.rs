@@ -47,6 +47,7 @@
 //! the spelling is unambiguous in almost every rendering. `Debug` surfaces the
 //! `uid` for [`Name::Unique`].
 
+use crate::ccl::ops::Lit;
 use crate::chl_parser::ModulePath;
 use smol_str::SmolStr;
 use std::fmt;
@@ -220,8 +221,8 @@ impl std::hash::Hash for PiRef {
 /// their home").
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Home {
-    /// The shared run of an imported module, by its module path.
-    Shared(ModulePath),
+    /// The shared run of an imported module.
+    Shared(SharedRun),
     /// A run a `run` statement declares, by its run path.
     Run(RunPath),
 }
@@ -229,9 +230,52 @@ pub enum Home {
 impl fmt::Display for Home {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Home::Shared(module) => write!(f, "{module}"),
+            Home::Shared(run) => write!(f, "{run}"),
             Home::Run(run) => write!(f, "{run}"),
         }
+    }
+}
+
+/// The shared run of an imported module: one per module and distinct set of
+/// arguments its imports pass (`docs/chl-spec.md`, "9.2 Imports").
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SharedRun {
+    pub module: ModulePath,
+    /// Each argument, by its parameter, in parameter-name order.
+    pub arguments: Arc<[(SmolStr, Lit)]>,
+}
+
+impl SharedRun {
+    /// The shared run an import of `module` with no arguments reaches.
+    pub fn of(module: ModulePath) -> Self {
+        SharedRun {
+            module,
+            arguments: Arc::new([]),
+        }
+    }
+}
+
+/// `m`, or `m(port=8080, region="eu")` for a shared run with arguments.
+impl fmt::Display for SharedRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.module)?;
+        if self.arguments.is_empty() {
+            return Ok(());
+        }
+        f.write_str("(")?;
+        for (i, (parameter, value)) in self.arguments.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            match value {
+                Lit::Int(n) => write!(f, "{parameter}={n}")?,
+                Lit::String(s) => write!(f, "{parameter}={s:?}")?,
+                Lit::Bool(true) => write!(f, "{parameter}=True")?,
+                Lit::Bool(false) => write!(f, "{parameter}=False")?,
+                Lit::Unit => unreachable!("no import argument is the unit constant"),
+            }
+        }
+        f.write_str(")")
     }
 }
 

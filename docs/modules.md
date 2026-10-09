@@ -55,9 +55,10 @@ The order does not affect meaning, since members of different modules never shar
 deterministic because two compilations of one root must produce one tree: program diffing compares
 trees structurally ([src/ccl/design/diffing.md](../src/ccl/design/diffing.md)).
 
-Linking puts one shared run per imported module, in link order, around the root, and each run at
-its `run` statement in the module that declares it ([Runs](#runs)). Each is created from its
-module's lowering, which happens once ([A module lowers once](#a-module-lowers-once)).
+Linking puts one shared run per imported module and distinct set of arguments, in link order,
+around the root, and each run at its `run` statement in the module that declares it
+([Runs](#runs)). Each is created from its module's lowering, which happens once ([A module lowers
+once](#a-module-lowers-once)).
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
@@ -109,8 +110,9 @@ spelling to the binder of the run the qualifier reaches ([A module lowers
 once](#a-module-lowers-once)).
 
 One change to `Name` (`src/ccl/names.rs`): **`Name::Unique { base, uid, home }`**, where `home` is
-the run a member belongs to: `Shared(module_path)` for a shared run's member, `Run(run_path)` for a
-member of a run a `run` statement declares, and absent for a local. Identity remains the `uid`.
+the run a member belongs to: `Shared(SharedRun)` for a shared run's member, its module path and its
+arguments, `Run(run_path)` for a member of a run a `run` statement declares, and absent for a
+local. Identity remains the `uid`.
 `home` is metadata of the kind `base` already is. It is implemented as `home: Option<Arc<Home>>`.
 `uniquify::run_in` mints a run's top-level binders with it, and every other binder, the root's
 members included, without one. A pass that re-mints a copy of a binder keeps its home
@@ -121,11 +123,12 @@ renders it without a lookup table. Neither uses a per-compilation counter. They 
 and record labels, and a counter would give two compilations of one root different labels, the
 defect [`Name::field_key`](../src/ccl/names.rs) documents.
 
-Rendering: symbolic IR output prints a member as `home::base`, `catalog::price` or `eu::stock`, and
-a local as `base`. A diagnostic about a location in a module elides the qualifier on that module's
-own members. That elision is not implemented: a diagnostic's text, types included, is formatted
-during inference, before the error has a location, so every diagnostic qualifies an imported
-module's or a run's members, its own diagnostics included.
+Rendering: symbolic IR output prints a member as `home::base`, `catalog::price`,
+`scaled(scale=3)::by`, or `eu::stock`, and a local as `base`. A diagnostic about a location in a
+module elides the qualifier on that module's own members. That elision is not implemented: a
+diagnostic's text, types included, is formatted during inference, before the error has a location,
+so every diagnostic qualifies an imported module's or a run's members, its own diagnostics
+included.
 
 `PiRef` boxes its hint to keep `Name` at the width `Unique` needs. `home` widens `Unique`: `Name`
 grows from 32 to 40 bytes, `Type` from 64 to 72, and `TypedExpr` from 328 to 368.
@@ -194,8 +197,9 @@ root file
                Checking a module on its own" requires
   → run sites  each import against the IO its module performs and the state it declares; each
                run's arguments against its module's parameter types
-  → link       create each shared run, in link order, and the root's run, which creates each run
-               it declares at its `run` statement; each run a uniquified copy of its module's chain
+  → link       create each shared run, one per imported module and distinct set of arguments, in
+               link order, and the root's run, which creates each run it declares at its `run`
+               statement; each run a uniquified copy of its module's chain
   → infer …    over the linked tree: specialization and refinement propagation
 ```
 
@@ -239,12 +243,13 @@ each file's parse, the module graph, and the link order. Every compile entry poi
 
 ### Imports
 
-Importing values and type aliases is implemented: `import m` and `import a::b as c`, `use` clauses
-on an `import`, `pub` on value bindings, `def`s and type aliases, `m::f` as a value, a callee, and a
-qualifier of labels and tags, and `m::T` as a type.
+Importing values and type aliases is implemented: `import m`, `import a::b as c`, and
+`import m(x=1)`, `use` clauses on an `import`, `pub` on value bindings, `def`s and type aliases,
+`m::f` as a value, a callee, and a qualifier of labels and tags, and `m::T` as a type.
 
-- **An imported module has one shared run**, created from its lowering in link order and linked
-  around the root ([A module lowers once](#a-module-lowers-once)).
+- **An imported module has a shared run per distinct set of arguments its imports pass**, created
+  from its lowering in link order and linked around the root ([A module lowers
+  once](#a-module-lowers-once)).
 - **An interface records declarations.** `Interface` (`src/ccl/lower/modules.rs`) records each
   top-level binding's visibility, declaration, and call shape, and each top-level type alias's type
   as its module lowered it. `m::f` lowers to the raw name `m::f`, and `m::T` to the alias's type
@@ -272,9 +277,17 @@ qualifier of labels and tags, and `m::T` as a type.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
   label, and `m::` qualifies the label of the module `m` names. `some` and `none` are `Option`'s in
   every module ([Names carry their home](#names-carry-their-home)).
-- **Refused:** an argument to an import, a module as a value, and a member of a run another module
-  declares. The later items lift these. With no import arguments, a shared run takes every
-  parameter's default, and a parameter without one is an error at the parameter.
+- **Arguments.** Each import's shared run is decided by what it writes, before any module lowers
+  (`ProgramLowering::shared_runs`): its module and its arguments, `Home::Shared`'s `SharedRun`. Each
+  import qualifier records the shared run it reaches. A shared run is created for the first
+  statement that reaches it. Two sets are compared as written, so an omitted argument and one equal
+  to its default reach two shared runs, where chl-spec.md's "9.2 Imports" has them reach one.
+  Comparing them needs a default evaluated at link time ([Link-time constants](#dependencies)). An
+  argument is a literal; anything else is an error at the argument ([Dependencies](#dependencies)).
+  Each argument is bound at the head of the shared run's chain, at its parameter's type, and a
+  parameter with neither an argument nor a default is an error at the `import`.
+- **Refused:** a module as a value, and a member of a run another module declares. The later items
+  lift these.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
@@ -306,8 +319,8 @@ members reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
   run name, so a mismatch is reported at the argument. Creating the run points each parameter with
   an argument at that name, and refuses one with neither an argument nor a default at the `run`
   statement. An unannotated parameter's type is inferred from the module's uses, so a bad argument
-  for one is reported where the module uses it, until a module is checked alone. The root and a
-  shared run take every parameter's default, and a parameter without one is an error there.
+  for one is reported where the module uses it, until a module is checked alone. The root takes
+  every parameter's default, and a parameter without one is an error there.
 - **Refused:** a type parameter and a parameter of Module type (item 7), `@RenamedFrom`, and a `run`
   in an imported module. `pub` on a `run` is a parse error: a module returns a run by binding it to
   a public member, which waits on Module types. `pub` on `:=` is refused, so no module reaches
@@ -463,9 +476,10 @@ source cache is keyed by `FileId`, so a single report can label several files. S
 An inference error's span resolves through the lowering projection, as it does today.
 
 A module lowers once, so a lowering error is reported once however many runs the module has. An
-inference error in a module that runs more than once is reported once per run, each report
-identical, since inference sees each run's copy. The label naming the run whose copy failed, with a
-secondary label at its `run` statement ([chl-spec.md, "9.14 Checking a module on its
+inference error in a module that runs more than once, or is imported with more than one set of
+arguments, is reported once per run, each report identical, since inference sees each run's copy.
+The label naming the run whose copy failed, with a secondary label at its `run` statement or
+`import` ([chl-spec.md, "9.14 Checking a module on its
 own"](chl-spec.md#914-checking-a-module-on-its-own)), is not implemented.
 
 ---
@@ -641,10 +655,12 @@ One PR per item, each updating the spec and design docs it touches:
       `Unique::home`, run members, state and IO in runs, sink and history keys qualified by run
       path, route uniqueness across runs.
    2. **Value parameters.** `param`, keyword arguments, defaults, run-site checks.
-7. **Module types and type parameters.** `Module{…}` and its subtyping, Module-typed parameters
-   and the qualified references through them, type parameters, and arguments to an import: one
-   shared run per module and distinct set of constant arguments ([chl-spec.md, "9.2
-   Imports"](chl-spec.md#92-imports)).
+7. **Module types and type parameters**, in three parts:
+   1. **Arguments to an import.** One shared run per module and distinct set of constant arguments
+      ([chl-spec.md, "9.2 Imports"](chl-spec.md#92-imports)), with a literal as the constant.
+   2. **Module types.** `Module{…}`, Module-typed parameters and the qualified references through
+      them, and an import name or run name as an argument.
+   3. **Type parameters**, and a type as an argument.
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed, route uniqueness across runs.
 9. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,

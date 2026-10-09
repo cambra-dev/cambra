@@ -316,8 +316,10 @@ a `let` at the `run` statement. A `use` name for a type is an alias, in scope th
 for an import and from the statement down for a run. A `run` statement lowers to a
 [`Run`](ir.md#run--a-run-statement-before-linking) node over the rest of the module, below a `let`
 per argument. A value `param` lowers to a `let` at the head of its module's chain, of its default,
-which creating a run replaces with the run's argument ([docs/modules.md,
-"Runs"](../../../docs/modules.md#runs)). A sink is declared, and registered by each run of the
+which creating a run or a shared run replaces with its argument ([docs/modules.md,
+"Runs"](../../../docs/modules.md#runs)). A shared run's arguments are bound at the head of its
+chain, one shared run per module and distinct set of arguments ([docs/modules.md,
+"Imports"](../../../docs/modules.md#imports)). A sink is declared, and registered by each run of the
 module.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules

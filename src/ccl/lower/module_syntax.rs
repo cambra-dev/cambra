@@ -2,8 +2,8 @@
 //! placement rules of module statements.
 //!
 //! [`refuse_module_syntax`] finds every such construct in a module, at any
-//! depth, and the module lowers nothing when it finds one. It refuses an
-//! argument to an import, a type parameter, `@RenamedFrom`, `@Discard`, `pub` on anything but a value binding,
+//! depth, and the module lowers nothing when it finds one. It refuses a type
+//! parameter, `@RenamedFrom`, `@Discard`, `pub` on anything but a value binding,
 //! a `def` or a type alias, a write to another module's member, and a method
 //! reference. A qualified value, type, label, or tag reaches
 //! lowering, which resolves it against the module's import names and run names
@@ -233,15 +233,9 @@ impl Refusals {
                 self.expr(context);
                 self.stmts(body);
             }
-            // An import's module and `use` items resolve against the program
-            // (`super::modules`).
+            // An import's module, arguments, and `use` items resolve against
+            // the program (`super::modules`).
             ChlStmt::Import { args, .. } => {
-                if let (Some(first), Some(last)) = (args.first(), args.last()) {
-                    self.refuse(
-                        first.name.span.join(last.value.span),
-                        "an argument to an import is not supported yet",
-                    );
-                }
                 for arg in args {
                     self.expr(&arg.value);
                 }
