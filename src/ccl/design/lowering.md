@@ -302,17 +302,18 @@ not intended `pass` semantics.
 
 ## Module syntax
 
-A top-level `import`, `pub` on a value binding or a `def`, and a qualified value, label, or tag lower
-([docs/modules.md, "Imports"](../../../docs/modules.md#imports)). A module lowers once, and linking
-creates each run of it from that lowering ([docs/modules.md, "A module lowers
-once"](../../../docs/modules.md#a-module-lowers-once)). Lowering resolves each qualified form
+A top-level `import` with its `use` clause, `pub` on a value binding or a `def`, and a qualified
+value, label, or tag lower ([docs/modules.md, "Imports"](../../../docs/modules.md#imports)). A module
+lowers once, and linking creates each run of it from that lowering ([docs/modules.md, "A module
+lowers once"](../../../docs/modules.md#a-module-lowers-once)). Lowering resolves each qualified form
 against the module's import names (`ccl/lower/modules/scope.rs`): a value to the raw name `m::f`, which
 creating the module's run resolves to the binder in `m`'s run, and a label to a `Label` of the
-module it names. A qualified type is refused where `lower_type_expr` meets it.
+module it names. A `use` name lowers as a raw name, which the same scope resolves to the member's
+binder. A qualified type is refused where `lower_type_expr` meets it.
 
 The rest of the module syntax parses ([chl-spec.md](../../../docs/chl-spec.md), "9. Modules") and
-does not lower yet: `run`, `param`, `@RenamedFrom`, `@Discard`, a `use` clause, `pub` on a mutable
-variable, and a write to another module's member. `refuse_module_syntax`
+does not lower yet: `run`, `param`, `@RenamedFrom`, `@Discard`, `pub` on a mutable variable, and a
+write to another module's member. `refuse_module_syntax`
 (`ccl/lower/module_syntax.rs`) walks the whole module, every block and every expression, and reports
 one `LoweringError::Unsupported` per construct, and the module lowers nothing when it reports. A
 path with a capitalized qualifier segment, `Price::discounted`, is refused as a method reference
