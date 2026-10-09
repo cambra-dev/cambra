@@ -1,8 +1,8 @@
 # Modules
 
 > **Status: [Sketched].** A proposed implementation. The first four items of the [Implementation
-> stack](#implementation-stack) are implemented, and a shared run's member's `home` ([Names carry
-> their home](#names-carry-their-home)).
+> stack](#implementation-stack) are implemented, and the first part of the sixth, runs without
+> parameters ([Runs](#runs)).
 > [Dependencies](#dependencies) lists the features outside modules it assumes, and [Open
 > questions](#open-questions) what it leaves undecided.
 
@@ -56,12 +56,12 @@ deterministic because two compilations of one root must produce one tree: progra
 trees structurally ([src/ccl/design/diffing.md](../src/ccl/design/diffing.md)).
 
 Linking puts one shared run per imported module, in link order, around the root, and each run at
-its `run` statement in the module that declares it. Each is created from its module's lowering,
-which happens once ([A module lowers once](#a-module-lowers-once)).
+its `run` statement in the module that declares it ([Runs](#runs)). Each is created from its
+module's lowering, which happens once ([A module lowers once](#a-module-lowers-once)).
 
 **The per-module check runs parsing, lowering, uniquification, and inference** (`Phase::Lower`,
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
-module's own `run` statements: argument types and the run dependency graph. Lowering's own refusals
+module's own `run` statements: argument types. Lowering's own refusals
 are part of it: the mutation-statement rules, the out-of-block `Txn` read gate, visibility, and a
 duplicate literal route within the module.
 
@@ -117,7 +117,8 @@ the run a member belongs to: `Shared(module_path)` for a shared run's member, `R
 member of a run a `run` statement declares, and absent for a local. Identity remains the `uid`.
 `home` is metadata of the kind `base` already is. It is implemented as `home: Option<Arc<Home>>`.
 `uniquify::run_in` mints a run's top-level binders with it, and every other binder, the root's
-members included, without one.
+members included, without one. A pass that re-mints a copy of a binder keeps its home
+(`Name::fresh_like`).
 
 Module paths and run paths are shared behind an `Arc`: cloning one copies a pointer, and `Display`
 renders it without a lookup table. Neither uses a per-compilation counter. They appear in state keys
@@ -128,7 +129,7 @@ Rendering: symbolic IR output prints a member as `home::base`, `catalog::price` 
 a local as `base`. A diagnostic about a location in a module elides the qualifier on that module's
 own members. That elision is not implemented: a diagnostic's text, types included, is formatted
 during inference, before the error has a location, so every diagnostic qualifies an imported
-module's members, its own diagnostics included.
+module's or a run's members, its own diagnostics included.
 
 `home` widens `Unique`, and `PiRef` boxes its hint to keep `Name` at the width `Unique` needs.
 
@@ -140,7 +141,9 @@ module path it belongs to
 ([chl-spec.md, "9.12 Field labels and tags belong to a module"](chl-spec.md#912-field-labels-and-tags-belong-to-a-module)).
 Two labels are one label when both spelling and module agree. The root's labels have no module
 path and render bare. Another module's label renders `module::label`, which is also its spelling at
-run time.
+run time. A run's top-level mutable variable is labeled in its run (`Name::field_key`), so two runs
+of one module keep separate store fields. Its label renders `eu::stock`, as the member reads, and
+its run-time spelling is `@eu::stock`, which no module's label has.
 
 A nominal type's constructor is not a label. The value it builds carries a tag of the root's
 namespace spelled as the constructor, so `Option::some` builds the same value in every module, and
@@ -148,19 +151,29 @@ a user's `` `some `` builds that module's own tag.
 
 ### A module lowers once
 
-Every module lowers once, in link order, so the modules it imports lower before it
-(`ProgramLowering::lower`). It lowers to a chain, its top-level statements around `MODULE_BODY`,
-not uniquified, and to an interface ([The module interface](#the-module-interface)). A binder in the
-chain is a raw name, and a reference to another module's member is a raw name spelled through its
-qualifier, `m::f`. Lowering errors are reported once per module, however many runs it has.
+Every module lowers once, in link order, so the modules it imports and runs lower before it
+(`ProgramLowering::lower`). Lowering produces:
 
-Linking creates each imported module's shared run from its module's lowering
-(`ProgramLowering::create`):
+- **A chain**: the module's top-level statements around `MODULE_BODY`, not uniquified. A binder is
+  a raw name. A reference to another module's member is a raw name spelled through its qualifier,
+  `m::f`. A `run` statement is a `Run` node over the rest of the module, holding the run name, the
+  module it runs, and its statement ([ir.md, "`Run` — a `run` statement before
+  linking"](../src/ccl/design/ir.md#run--a-run-statement-before-linking)).
+- **An interface** ([The module interface](#the-module-interface)).
+- **The sinks the module declares**, which a run of it registers.
+
+Lowering errors are reported once per module, however many runs it has.
+
+Linking creates each run from its module's lowering (`ProgramLowering::create`):
 
 1. **Copy** the chain. `Clone` mints fresh node ids and records each copy for provenance.
-2. **Uniquify** the copy with the run's home, in a scope that maps each spelling through a
-   qualifier to the binder of the run the qualifier reaches: `m::f` to the member of `m`'s shared run
-   (`uniquify::run_in`). Each `use` name maps to its member's binder.
+2. **Create each run it declares**, at its `Run` node, and put its chain there around the rest of
+   the module (`ProgramLowering::expand_runs`).
+3. **Uniquify** the copy with the run's home, in a scope that maps each spelling through a
+   qualifier to the binder of the run the qualifier reaches: `m::f` to the shared run's member,
+   `eu::f` to the member of the run `eu` created in step 2. Each `use` name of an import maps to its
+   member's binder.
+4. **Register** the sinks the module declares, keyed by the run path.
 
 A created run's names are every spelling its top level resolves: its spine's binders by spelling,
 and its scope's entries. A module reaching the run spells each through its qualifier for it, which
@@ -168,8 +181,9 @@ is how a type alias's predicate reaches a private member or another module's mem
 ([Imported aliases are closed over their
 module](#imported-aliases-are-closed-over-their-module)).
 
-The root lowers last and has one run, uniquified in the same way, and the shared runs' chains wrap
-it, the first in link order outermost.
+The root lowers last and has one run, with no home. Its run registers its sinks and reads every
+program sink at its tail (`finish_program`) before it is uniquified, once the runs it declares are
+in place.
 
 ### Pipeline
 
@@ -179,7 +193,7 @@ root file
                with its own FileId
   → graph      build the module graph; refuse cycles; compute link order
   → lower      once per module, in link order, against the interfaces of the modules it imports
-               and runs. Produces a chain and an interface
+               and runs. Produces a chain, with each `run` statement a `Run` node, and an interface
   → check      once per module: inference over the module alone, as chl-spec.md's "9.14
                Checking a module on its own" requires
   → run sites  each import against the IO its module performs and the state it declares; each
@@ -235,8 +249,7 @@ on an `import`, `pub` on value bindings, `def`s and type aliases, `m::f` as a va
 qualifier of labels and tags, and `m::T` as a type.
 
 - **An imported module has one shared run**, created from its lowering in link order and linked
-  around the root ([A module lowers once](#a-module-lowers-once)). Each module lowers with fresh
-  block state (`LoweringContext::begin_module`).
+  around the root ([A module lowers once](#a-module-lowers-once)).
 - **An interface records declarations.** `Interface` (`src/ccl/lower/modules/interface.rs`) records each
   top-level binding's visibility, declaration, and call shape, and each top-level type alias's type
   as its module lowered it. `m::f` lowers to the raw name `m::f`, and `m::T` to the alias's type
@@ -250,9 +263,15 @@ qualifier of labels and tags, and `m::T` as a type.
   an error, and so is a `use` name spelled like an import name, another `use` name, a builtin, or a
   built-in type. A builtin call resolves by its spelling before scope (`lower_call`), so a `use`
   name spelled like one would never reach its member.
-- **IO and state.** A module that declares a sink or mutable state lowers nothing (`sink_site`,
-  `state_site`), and lowering records a module's first read of a registered source. Each `import` of
-  a module that does any of these is an error, labeled at the site (`Unimportable`).
+- **Linking** puts each shared run's chain around the root, once, in link order, the first in link
+  order outermost ([A module lowers once](#a-module-lowers-once)).
+- **IO and state.** A module that declares a sink or mutable state (`sink_site`, `state_site`), or
+  reads a registered source, which lowering records, has no shared run. Each `import` of it is an
+  error, labeled at the site (`Unimportable`). Lowering declares a sink without opening anything, so
+  lowering such a module is harmless; a run of it registers the sink.
+- **What an import may hold.** A `run` and an expression statement in an imported module are
+  errors. A top-level `for`, `if`, `match`, or `with` in one is not supported yet. Each is
+  reported once, where the module is first imported (`ProgramLowering::importable`).
 - **`Mut` parameters.** A call to an imported `def` with a `Mut` parameter, qualified or through
   `use`, takes the curried shape the `def` lowers to.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
@@ -260,11 +279,39 @@ qualifier of labels and tags, and `m::T` as a type.
   a label, so `Option::some` is the same in every module
   ([Names carry their home](#names-carry-their-home)).
 - **Refused:** a module as a value, an imported module's nominal `type` declarations and top-level
-  loops, `if`, `match`, `with` and expression statements, and a member of a run. The later items
-  lift these.
+  `if`, `match` and `with` statements, and a member of a run another module declares. The later
+  items lift these.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error.
+
+### Runs
+
+Running modules without parameters is implemented: `run m` and `run a::b as n`, a run's members
+reached as `n::f`, `n::T`, and `n::label`, and `use` on a run.
+
+- **A run is created from its module's lowering.** A `run` statement lowers to a `Run` node over
+  the rest of the declaring module (`LoweringContext::take_run`), and creating the declaring
+  module's run creates this one at the run path `n`, or `eu::n` for a run the run `eu` declares, and
+  puts its chain there (`ProgramLowering::expand_runs`). Its members' home is `Home::Run`.
+- **A run stands at its statement.** A reference to the run name above the statement is refused,
+  and each value a run's `use` clause binds is a `let` at the statement of the raw name `n::f`, so
+  both are in scope from the statement down ([chl-spec.md, "9.3 Runs"](chl-spec.md#93-runs)). A
+  reference to such a value that no binder of the module's chain binds stands above the statement,
+  and is refused there (`LoweringContext::uses_above_their_runs`).
+- **A run performs its module's whole top level**: its state, loops, sources, and sinks. Lowering
+  declares a sink (`LoweringContext::declared_sinks`), and creating a run registers it keyed by the
+  run path, `eu::out` (`LoweringContext::register_sinks`). The program's tail reads it through the
+  binder the run's chain minted (`LoweringContext::run_sink_names`). A run's mutable variables are
+  labeled by run path in history records, so two runs keep two histories.
+- **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
+  an error at the second `run` statement, with a note at the first. A route address is a literal,
+  so two runs of one module that serves a route always conflict.
+- **Refused:** an argument to `run`, `@RenamedFrom`, a `run` in an imported module, and a nominal
+  `type` declaration, an associated function or an `impl` block in any module but the root
+  (`module_nominal_refusals`). `pub` on a `run` is a parse error: a module returns a run by binding
+  it to a public member, which waits on Module types. `pub` on `:=` is refused, so no module
+  reaches another run's mutable variable.
 
 ### The module interface
 
@@ -274,7 +321,6 @@ that does, and, for each public member:
 | Member | Recorded |
 | --- | --- |
 | value, `def`, type alias, `Txn` mutable variable, feed | its kind, its contract, and for a `def` whether it takes a `Mut` parameter |
-| `pub run` | the run |
 | intrinsic | the intrinsic ([Intrinsics resolve by identity](#intrinsics-resolve-by-identity)) |
 | parameter | its type, or for a type parameter its bound, and its default if it has one |
 
@@ -320,7 +366,8 @@ Private-in-public"](chl-spec.md#913-private-in-public)), and a private one rende
 mapped to the binder of `n`'s member `f` in `n`'s shared run, beneath every binder of the tree
 (`uniquify::run_in`). An unshadowed use of `f` resolves to that binder, and a local `f` shadows it
 by ordinary lexical scope. The scope has no position, so a `use` name is in scope throughout its
-module, above its `import` too.
+module, above its `import` too. A `use` clause on a run binds `f` instead with a `let` of `r::f` at
+the `run` statement ([Runs](#runs)).
 
 A `let f = n::f` would lose polymorphism. Its right-hand side is a variable, not a lambda, so
 inference does not generalize it (`should_generalize`, [type-inference.md, "3.1 Let-Polymorphism is
@@ -344,13 +391,14 @@ callee resolves to: `reqs, resps = http::serve(…)` is the `http_serve` tuple f
 
 An address argument of `http::serve` is a string literal, as recognition matches today. A
 parameter address waits on link-time constants ([Dependencies](#dependencies)). Route uniqueness
-across runs moves past linking, since two runs of one module that serves a literal route serve the
-same address.
+across runs is checked as linking creates each run ([Runs](#runs)), since two runs of one module
+that serves a literal route serve the same address.
 
 ### Registries keyed by spelling
 
-Four places key by a spelling that is unique within one file today and not across modules and runs.
-Each switches to the member's qualified spelling, `home::base`:
+Four places keyed by a spelling that is unique within one file and not across modules and runs. Each
+switches to the member's qualified spelling, `home::base`. The first two are switched
+(`LoweringContext::register_sinks`, `Name::field_key`), and the last two switch with reload:
 
 - **Sink bindings** (`LoweringContext::sink_bindings`), and so the linked tree's trailing-record
   field names and `CompiledOutput::name`. Two runs of one module each bind `resps`.
@@ -415,6 +463,12 @@ source cache is keyed by `FileId`, so a single report can label several files. S
   comes from.
 
 An inference error's span resolves through the lowering projection, as it does today.
+
+A module lowers once, so a lowering error is reported once however many runs the module has. An
+inference error in a module that runs more than once is reported once per run, each report
+identical, since inference sees each run's copy. The label naming the run whose copy failed, with a
+secondary label at its `run` statement ([chl-spec.md, "9.14 Checking a module on its
+own"](chl-spec.md#914-checking-a-module-on-its-own)), is not implemented.
 
 ---
 
@@ -584,12 +638,15 @@ One PR per item, each updating the spec and design docs it touches:
       state"](chl-spec.md#97-importing-asserts-no-io-and-no-state)).
 5. **Per-module checking.** Inference over one module against the interfaces it uses, contracts in
    the interface, `cambra check`.
-6. **Runs and parameters.** `Name::Member`, a run's `Unique::home`, the run tree, per-run copies of
-   a module, value parameters, run-site checks, qualified registries, `VarPath` run paths.
+6. **Runs and parameters**, in two parts:
+   1. **Runs without parameters.** A run per `run` statement at its statement, a run's
+      `Unique::home`, run members, state and IO in runs, sink and history keys qualified by run
+      path, route uniqueness across runs.
+   2. **Value parameters.** `param`, keyword arguments, defaults, run-site checks.
 7. **Module types and type parameters.** `Module{…}` and its subtyping, Module-typed parameters
    and the qualified references through them, type parameters.
 8. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
-   removed, route uniqueness across runs.
+   removed.
 9. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
 10. **No trailing expressions.** The harness-only compile option, once an output sink exists.

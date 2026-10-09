@@ -19,13 +19,15 @@ pub fn is_module_body(expr: &Expr) -> bool {
 }
 
 /// The rest of the module below `expr`, when `expr` stands on a module's spine:
-/// the body of a `let` or a type alias. A module's top level is the chain of
-/// these bodies from the root.
+/// the body of a `let`, a mutable variable, a statement, a type alias, or a
+/// `run`. A module's top level is the chain of these bodies from the root.
 pub(super) fn spine_body(expr: &Expr) -> Option<&Expr> {
     match &expr.node {
-        TypedExprNode::Let { body, .. } | TypedExprNode::LetType { body, .. } => {
-            Some(body.as_ref())
-        }
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. }
+        | TypedExprNode::LetType { body, .. }
+        | TypedExprNode::Run { body, .. } => Some(body.as_ref()),
         _ => None,
     }
 }
@@ -33,9 +35,11 @@ pub(super) fn spine_body(expr: &Expr) -> Option<&Expr> {
 /// [`spine_body`], to rewrite the rest of the module.
 pub(super) fn spine_body_mut(expr: &mut Expr) -> Option<&mut Expr> {
     match &mut expr.node {
-        TypedExprNode::Let { body, .. } | TypedExprNode::LetType { body, .. } => {
-            Some(body.as_mut())
-        }
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::MutDecl { body, .. }
+        | TypedExprNode::ExprStmt { body, .. }
+        | TypedExprNode::LetType { body, .. }
+        | TypedExprNode::Run { body, .. } => Some(body.as_mut()),
         _ => None,
     }
 }
@@ -45,7 +49,9 @@ pub(super) fn spine(chain: &Expr) -> (Vec<&Name>, &Expr) {
     let mut binders = Vec::new();
     let mut at = chain;
     while let Some(body) = spine_body(at) {
-        if let TypedExprNode::Let { binding, .. } = &at.node {
+        if let TypedExprNode::Let { binding, .. } | TypedExprNode::MutDecl { binding, .. } =
+            &at.node
+        {
             binders.push(&binding.name);
         }
         at = body;
@@ -72,20 +78,19 @@ pub(super) fn raw_scope(names: &HashMap<QualifiedName, Name>) -> HashMap<String,
         .collect()
 }
 
-/// Lower every module of `program` once and link the shared runs of the
-/// imported ones around the root (`docs/modules.md`, "A module lowers once",
-/// "Linking").
+/// Lower every module of `program` once and link its runs into one tree
+/// (`docs/modules.md`, "A module lowers once", "Linking").
 ///
-/// Each module lowers in link order, so the modules it imports lower before it,
-/// and the root lowers last. Linking then creates each imported module's shared
-/// run, in link order, whose chains wrap the root's, the first in link order
-/// outermost. A module whose own errors stop it from lowering has no interface,
-/// and a reference into it lowers to an error placeholder without an error of
-/// its own.
+/// Each module lowers in link order, so the modules it imports and runs lower
+/// before it, and the root lowers last. Linking then creates each imported
+/// module's shared run, in link order, and the root's run, which creates each
+/// run it declares in turn. The shared runs' chains wrap the root's, the first
+/// in link order outermost. A module whose own errors stop it from lowering has
+/// no interface, and a reference into it lowers to an error placeholder without
+/// an error of its own.
 ///
-/// A module that performs IO or declares state has no shared run, and each
-/// `import` of it is the error. One that declares a sink or state is not
-/// lowered, so lowering opens nothing for it.
+/// An imported module that performs IO or declares state has no shared run,
+/// and each `import` of it is the error.
 pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> LoweringResult {
     let sources = program.sources();
     let root = sources.root();
@@ -93,6 +98,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         program,
         lowered: HashMap::new(),
         shared: HashMap::new(),
+        import_refusals: HashSet::new(),
         errors: Vec::new(),
     };
     // With a cycle there is no link order, and the root lowers with no module to
@@ -113,7 +119,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     for &file in order {
         if file != root
             && imported.contains(&file)
-            && let Some(chain) = lowering.shared_run(file)
+            && let Some(chain) = lowering.shared_run(file, ctx)
         {
             chains.push(chain);
         }
@@ -127,17 +133,23 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     };
     let scope = lowering.scope(ast, None, ctx);
     ctx.begin_module(scope.clone());
-    let lowered = lower_stmts(ast, ctx);
+    let lowered = lower_root(ast, ctx);
+    let sinks = std::mem::take(&mut ctx.declared_sinks);
     let mut errors = std::mem::take(&mut lowering.errors);
     errors.extend(lowered.errors);
     let value = lowered.value.map(|chain| {
-        let scope = use_names(&scope, lowering.shared_names(&scope));
+        let mut qualified = lowering.shared_names(&scope);
+        let chain = lowering.expand_runs(chain, &RunPath::default(), &mut qualified, ctx);
+        let (chain, refused) = finish_program(&ast.body, chain, &sinks, ctx);
+        lowering.errors.extend(refused);
+        let scope = use_names(&scope, qualified);
         let root = uniquify::run_in(chain, &raw_scope(&scope), None);
         chains
             .into_iter()
             .rev()
             .fold(root, |body, chain| fill_module_body(chain, body))
     });
+    errors.extend(lowering.errors);
     errors.sort_by_key(|e| {
         let span = e.span();
         (span.file, span.start, span.end)
@@ -150,22 +162,27 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
 pub(super) struct ProgramLowering<'a> {
     pub(super) program: &'a LoadedProgram,
     /// Each module other than the root, lowered, by file, or `None` when it has
-    /// no syntax tree, has errors of its own, or declares a sink or state.
+    /// no syntax tree or has errors of its own.
     pub(super) lowered: HashMap<FileId, Option<Rc<LoweredModule>>>,
     /// The names each imported module's shared run reaches, by file
     /// ([`Created::names`]), or `None` when it has none.
     pub(super) shared: HashMap<FileId, Option<Rc<HashMap<QualifiedName, Name>>>>,
+    /// The imported modules whose statements an import may not hold have been
+    /// reported ([`ProgramLowering::importable`]).
+    pub(super) import_refusals: HashSet<FileId>,
     pub(super) errors: Vec<LoweringError>,
 }
 
 /// A module lowered once ([`ProgramLowering::lower`]).
 pub(super) struct LoweredModule {
-    /// The module's top-level statements around [`MODULE_BODY`], not
-    /// uniquified.
+    /// The module's top-level statements around [`MODULE_BODY`], each `run`
+    /// statement a [`TypedExprNode::Run`], not uniquified.
     pub(super) chain: Expr,
     pub(super) interface: Rc<Interface>,
     /// The scope it lowered in, which each run of it is uniquified against.
     pub(super) scope: ModuleScope,
+    /// The sinks it declares, which each run of it registers.
+    pub(super) sinks: Vec<DeclaredSink>,
 }
 
 /// One run of a module, created ([`ProgramLowering::create`]).
@@ -173,16 +190,16 @@ pub(super) struct Created {
     /// The run's chain, uniquified, around the placeholder for the rest of the
     /// tree it stands in.
     pub(super) chain: Expr,
-    /// Each name the run's top level resolves, by spelling: its members, its
-    /// `use` names, and each name spelled through one of its qualifiers. A
-    /// module reaching the run spells each through its own qualifier for it
-    /// ([`reroot`]).
+    /// Each name the run's top level resolves, by spelling: its members, the
+    /// other binders on its spine, its `use` names, and each name spelled
+    /// through one of its qualifiers. A module reaching the run spells each
+    /// through its own qualifier for it ([`reroot`]).
     pub(super) names: HashMap<QualifiedName, Name>,
 }
 
 impl ProgramLowering<'_> {
     /// Lower the module in `file` once, recording it, or `None` when it has no
-    /// syntax tree, has errors of its own, or declares a sink or state.
+    /// syntax tree or has errors of its own.
     pub(super) fn lower(&mut self, file: FileId, ctx: &mut LoweringContext) {
         let lowered = self.lower_once(file, ctx).map(Rc::new);
         self.lowered.insert(file, lowered);
@@ -194,12 +211,6 @@ impl ProgramLowering<'_> {
         ctx: &mut LoweringContext,
     ) -> Option<LoweredModule> {
         let ast = self.program.ast(file)?;
-        // Each import of a module that declares a sink or state is refused for
-        // that alone ([`Self::import_interface`]), and lowering it would open its
-        // sink.
-        if sink_site(ast).is_some() || state_site(ast).is_some() {
-            return None;
-        }
         let module = self
             .program
             .sources()
@@ -208,8 +219,12 @@ impl ProgramLowering<'_> {
             .clone();
         let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
-        let lowered = lower_library(ast, ctx);
-        let unimportable = ctx.io_site.map(Unimportable::Io);
+        let lowered = lower_module_body(ast, ctx);
+        let sinks = std::mem::take(&mut ctx.declared_sinks);
+        let unimportable = sink_site(ast)
+            .map(Unimportable::Io)
+            .or_else(|| state_site(ast).map(Unimportable::State))
+            .or(ctx.io_site.map(Unimportable::Io));
         let clean = lowered.errors.is_empty() && self.program.parsed_cleanly(file);
         self.errors.extend(lowered.errors);
         let chain = lowered.value.filter(|_| clean)?;
@@ -225,14 +240,35 @@ impl ProgramLowering<'_> {
             chain,
             interface: Rc::new(interface),
             scope,
+            sinks,
         })
     }
 
+    /// Whether the module in `file` can be imported for its statements: an
+    /// imported module declares no `run`, since the import would reach the run's
+    /// state (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"), and
+    /// no statement but a value binding, a `def`, a type alias, an `import`, or
+    /// `pass`. Each refusal is reported once, at the statement.
+    pub(super) fn importable(&mut self, file: FileId) -> bool {
+        let Some(ast) = self.program.ast(file) else {
+            return false;
+        };
+        let refusals = library_statement_refusals(&ast.body);
+        if refusals.is_empty() {
+            return true;
+        }
+        if self.import_refusals.insert(file) {
+            self.errors.extend(refusals);
+        }
+        false
+    }
+
     /// The interface an import of the module in `file` reaches, or `None` when
-    /// the module has errors of its own.
-    pub(super) fn import_interface(&self, file: FileId) -> Option<Rc<Interface>> {
+    /// the module has errors of its own or an import may not hold its statements.
+    pub(super) fn import_interface(&mut self, file: FileId) -> Option<Rc<Interface>> {
         // A module that performs IO or declares state is refused at each import
-        // of it, for that reason alone (`module_scope`).
+        // of it, for that reason alone (`module_scope`), whether or not it has
+        // errors of its own.
         let Some(lowered) = self.lowered.get(&file).cloned().flatten() else {
             let ast = self.program.ast(file)?;
             let why = sink_site(ast)
@@ -241,18 +277,21 @@ impl ProgramLowering<'_> {
             let module = self.program.sources().module(file)?.clone();
             return Some(Rc::new(Interface::unimportable(module, why)));
         };
-        Some(Rc::clone(&lowered.interface))
+        if lowered.interface.unimportable.is_some() {
+            return Some(Rc::clone(&lowered.interface));
+        }
+        self.importable(file).then(|| Rc::clone(&lowered.interface))
     }
 
     /// Create the shared run of the imported module in `file`, recording the
     /// names it reaches, and return its chain.
-    pub(super) fn shared_run(&mut self, file: FileId) -> Option<Expr> {
-        let created = self
-            .import_interface(file)
+    pub(super) fn shared_run(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<Expr> {
+        let interface = self.import_interface(file);
+        let created = interface
             .filter(|interface| interface.unimportable.is_none())
             .and_then(|interface| {
                 let home = Home::Shared(interface.module.clone());
-                self.create(file, home)
+                self.create(file, Some(home), None, ctx)
             });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
@@ -262,28 +301,56 @@ impl ProgramLowering<'_> {
         chain
     }
 
-    /// Create a run of the module in `file` with `home` as its members' home, or
-    /// `None` when the module has no lowering.
+    /// Create a run of the module in `file` with `home` as its members' home:
+    /// the shared run, with no `run` statement, or the run at the run path and
+    /// `run` statement `place`. `None` when the module has no lowering.
     ///
-    /// Its chain is a copy of the module's, uniquified with a scope that maps
-    /// each name spelled through a qualifier to the binder in the qualifier's
-    /// run, and each `use` name to its member's binder.
-    pub(super) fn create(&self, file: FileId, home: Home) -> Option<Created> {
+    /// Its chain is a copy of the module's, with each run it declares created in
+    /// turn and put in place ([`Self::expand_runs`]). It is uniquified with a
+    /// scope that maps each name spelled through a qualifier to the binder in the
+    /// qualifier's run, and each `use` name of an import to its member's binder.
+    /// A run registers the sinks its module declares, under its run path.
+    pub(super) fn create(
+        &mut self,
+        file: FileId,
+        home: Option<Home>,
+        place: Option<(RunPath, Span)>,
+        ctx: &mut LoweringContext,
+    ) -> Option<Created> {
         let lowered = self.lowered.get(&file).cloned().flatten()?;
         let chain = {
             let _copy = crate::ccl::provenance::copy_frame("link.run");
             lowered.chain.clone()
         };
-        let scope = use_names(&lowered.scope, self.shared_names(&lowered.scope));
-        let uniquified = uniquify::run_in(chain, &raw_scope(&scope), Some(home.clone()));
+        let path = place
+            .as_ref()
+            .map(|(path, _)| path.clone())
+            .unwrap_or_default();
+        let mut qualified = self.shared_names(&lowered.scope);
+        let chain = self.expand_runs(chain, &path, &mut qualified, ctx);
+        let (sinks, refused) = match &place {
+            Some(place) => ctx.register_sinks(&lowered.sinks, Some(place)),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.errors.extend(refused);
+        let scope = use_names(&lowered.scope, qualified);
+        let uniquified = uniquify::run_in(chain, &raw_scope(&scope), home.clone());
         let mut names = scope;
         let (spine, _) = spine(&uniquified);
         for name in spine {
-            debug_assert!(
-                name.home() == Some(&home),
-                "a shared run's spine binder `{name}` carries the run's home"
-            );
-            names.insert(QualifiedName::new(name.base()), name.clone());
+            // The spine also runs through the chain of each run this one declares,
+            // whose binders carry that run's home.
+            if name.home() == home.as_ref() {
+                names.insert(QualifiedName::new(name.base()), name.clone());
+            }
+        }
+        // Each sink the run declares is read at the program's tail through the
+        // binder its chain minted.
+        for (key, binder) in sinks {
+            let name = names
+                .get(&QualifiedName::new(binder.as_str()))
+                .unwrap_or_else(|| panic!("the run `{path}`'s chain binds its sink `{binder}`"));
+            ctx.run_sink_names.insert(key, name.clone());
         }
         Some(Created {
             chain: uniquified,
@@ -291,11 +358,59 @@ impl ProgramLowering<'_> {
         })
     }
 
+    /// `expr`, a module's chain, with each [`TypedExprNode::Run`] on its spine
+    /// replaced by the run it declares, at a run path under `path`, around the
+    /// rest of the module. Each name a created run reaches is recorded in
+    /// `qualified`, spelled through its run name.
+    pub(super) fn expand_runs(
+        &mut self,
+        mut expr: Expr,
+        path: &RunPath,
+        qualified: &mut HashMap<QualifiedName, Name>,
+        ctx: &mut LoweringContext,
+    ) -> Expr {
+        if matches!(expr.node, TypedExprNode::Run { .. }) {
+            let TypedExprNode::Run {
+                name,
+                module,
+                statement,
+                body,
+            } = expr.node
+            else {
+                unreachable!("matched a `Run` above");
+            };
+            let run_path = path.child(name.clone());
+            let created = self.program.file_of(&module).and_then(|file| {
+                let home = Home::Run(run_path.clone());
+                self.create(file, Some(home), Some((run_path, statement)), ctx)
+            });
+            let body = self.expand_runs(*body, path, qualified, ctx);
+            return match created {
+                Some(created) => {
+                    for (spelling, binder) in created.names {
+                        qualified.insert(QualifiedName::new(name.clone()).then(&spelling), binder);
+                    }
+                    fill_module_body(created.chain, body)
+                }
+                None => body,
+            };
+        }
+        // The rest of the spine stays in place, so no node is minted.
+        if let Some(body) = spine_body_mut(&mut expr) {
+            let rest = std::mem::take(body);
+            *body = self.expand_runs(rest, path, qualified, ctx);
+        }
+        expr
+    }
+
     /// Each name the shared runs of `scope`'s import names reach, spelled
     /// through the import name.
     pub(super) fn shared_names(&self, scope: &ModuleScope) -> HashMap<QualifiedName, Name> {
         let mut qualified = HashMap::new();
         for (qualifier, reached) in &scope.qualifiers {
+            if reached.run {
+                continue;
+            }
             let Some(Some(names)) = reached.file.and_then(|file| self.shared.get(&file)) else {
                 continue;
             };
@@ -318,13 +433,23 @@ impl ProgramLowering<'_> {
     ) -> ModuleScope {
         let mut interfaces = HashMap::new();
         for stmt in &module.body {
-            let ChlStmt::Import { path, .. } = &stmt.node else {
-                continue;
+            let path = match &stmt.node {
+                ChlStmt::Import { path, .. } | ChlStmt::Run { path, .. } => path,
+                _ => continue,
             };
             let Some(file) = path.to_path().and_then(|path| self.program.file_of(&path)) else {
                 continue;
             };
-            interfaces.insert(stmt.span, self.import_interface(file));
+            let interface = match &stmt.node {
+                ChlStmt::Import { .. } => self.import_interface(file),
+                _ => self
+                    .lowered
+                    .get(&file)
+                    .cloned()
+                    .flatten()
+                    .map(|lowered| Rc::clone(&lowered.interface)),
+            };
+            interfaces.insert(stmt.span, interface);
         }
         module_scope(
             module,
@@ -338,14 +463,18 @@ impl ProgramLowering<'_> {
 }
 
 /// The scope a run of the module that lowered in `scope` is uniquified in:
-/// `qualified`, each name spelled through a qualifier, and each `use` name,
-/// mapped to its member's binder.
+/// `qualified`, each name spelled through a qualifier, and each `use` name of an
+/// import, mapped to its member's binder. A run's `use` names are `let`s at its
+/// statement ([`LoweringContext::take_run`]).
 pub(super) fn use_names(
     scope: &ModuleScope,
     qualified: HashMap<QualifiedName, Name>,
 ) -> HashMap<QualifiedName, Name> {
     let mut names = qualified;
     for (bound, used) in &scope.uses {
+        if used.run.is_some() {
+            continue;
+        }
         let Reached::Value(Some(reference)) = &used.reached else {
             continue;
         };

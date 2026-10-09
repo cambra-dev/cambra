@@ -223,13 +223,40 @@ impl std::hash::Hash for PiRef {
 pub enum Home {
     /// The shared run of an imported module, by its module path.
     Shared(ModulePath),
+    /// A run a `run` statement declares, by its run path.
+    Run(RunPath),
 }
 
 impl fmt::Display for Home {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Home::Shared(module) => write!(f, "{module}"),
+            Home::Run(run) => write!(f, "{run}"),
         }
+    }
+}
+
+/// The run names from the root to a run, `eu` or `eu::inv`
+/// (`docs/chl-spec.md`, "9.1 Vocabulary"). The root's run path is empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RunPath(Arc<[SmolStr]>);
+
+impl RunPath {
+    /// The run path of the run `name` that the run at `self` declares.
+    pub fn child(&self, name: impl Into<SmolStr>) -> RunPath {
+        RunPath(self.0.iter().cloned().chain([name.into()]).collect())
+    }
+}
+
+impl fmt::Display for RunPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, name) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str("::")?;
+            }
+            f.write_str(name)?;
+        }
+        Ok(())
     }
 }
 
@@ -247,9 +274,9 @@ pub enum Name {
     /// Lowering's output; identity is the string. See module docs.
     Raw(SmolStr),
     /// A uniquified source binder; identity is `uid`, `base` is the source
-    /// spelling kept as display metadata. `home` is the imported module whose
-    /// top-level member it binds, and `None` for any other binder: a local, or a
-    /// member of the root (`docs/modules.md`, "Names carry their
+    /// spelling kept as display metadata. `home` is the imported module or the
+    /// run whose top-level member it binds, and `None` for any other binder: a
+    /// local, or a member of the root (`docs/modules.md`, "Names carry their
     /// home"). It is display metadata too, and set where the name is minted, so
     /// a binder and its uses carry the same one. It is behind an `Arc` so it
     /// costs `Name` one pointer.
@@ -300,7 +327,7 @@ impl Name {
     }
 
     /// [`Name::fresh`] for a binder whose home is `home`: the top-level member
-    /// `base` of an imported module.
+    /// `base` of an imported module or a run.
     pub fn fresh_in(base: impl Into<SmolStr>, home: Option<Arc<Home>>) -> Self {
         Name::Unique {
             base: base.into(),
@@ -309,7 +336,18 @@ impl Name {
         }
     }
 
-    /// The imported module whose top-level member this binds, if it binds one.
+    /// A fresh binder copying `name`'s spelling and home: what a pass that
+    /// re-mints a binder it copies or renames gives the copy, so the copy keeps
+    /// its display and its [`field_key`](Self::field_key).
+    pub fn fresh_like(name: &Name) -> Self {
+        match name {
+            Name::Unique { base, home, .. } => Self::fresh_in(base.clone(), home.clone()),
+            other => Self::fresh(other.base()),
+        }
+    }
+
+    /// The imported module or run whose top-level member this binds, if it
+    /// binds one.
     pub fn home(&self) -> Option<&Home> {
         match self {
             Name::Unique { home, .. } => home.as_deref(),
@@ -319,11 +357,11 @@ impl Name {
 
     /// The same kind of binder as `self`, with a globally fresh `uid`: for a rewrite that moves
     /// a binder to where a copy of it may already be bound. A synthetic binder keeps its kind,
-    /// which later rules read ([`Self::is_anf_temp`]), and a raw one becomes a uniquified
-    /// binder of its spelling.
+    /// which later rules read ([`Self::is_anf_temp`]), a uniquified one keeps its home
+    /// ([`Self::fresh_like`]), and a raw one becomes a uniquified binder of its spelling.
     pub fn refreshed(&self) -> Self {
         match self {
-            Name::Raw(base) | Name::Unique { base, .. } => Name::fresh(base.clone()),
+            Name::Raw(_) | Name::Unique { .. } => Self::fresh_like(self),
             Name::Synthetic { kind, .. } => Self::synthetic(kind.clone()),
             Name::Reserved(_) | Name::PiBound(_) => {
                 unreachable!("`{self}` is never a `let` binder, so nothing renames it")
@@ -480,7 +518,9 @@ impl Name {
         }
     }
 
-    /// Return the uid-free spelling used for a mutable-variable record field.
+    /// Return the uid-free label of the record field a binder names: a mutable
+    /// variable's in its store, and a sink's in the program's outputs. A top-level
+    /// binder of a run is labeled in its run ([`crate::ccl::Label::in_run`]).
     ///
     /// Labels must be distinct within the consuming history record. Generated reply taps
     /// use `defer_tap_field`'s reserved namespace; record/key-map construction sites
@@ -496,8 +536,28 @@ impl Name {
             Name::PiBound(_) => {
                 unreachable!("a PiBound is a reference, not a binder; it labels no field")
             }
+            // A member of a run is labeled in its run, `eu::stock`, so the
+            // variables of two runs of one module keep distinct histories.
+            Name::Unique {
+                base,
+                home: Some(home),
+                ..
+            } => match &**home {
+                Home::Run(run) => crate::ccl::Label::in_run(run.clone(), base.clone()),
+                Home::Shared(run) => unreachable!(
+                    "`{base}` of the shared run `{run}` is no mutable variable: an import of \
+                     a module that declares state is refused"
+                ),
+            },
             _ => crate::ccl::Label::new(self.base()),
         }
+    }
+
+    /// A fresh binder whose [`Self::field_key`] is `label`: one spelled as the label,
+    /// homed in the label's run when it has one.
+    pub fn fresh_for_field(label: &crate::ccl::Label) -> Self {
+        let home = label.run().map(|run| Arc::new(Home::Run(run.clone())));
+        Self::fresh_in(label.name(), home)
     }
 
     /// Is this a raw (un-uniquified) lowering name? The "still needs minting"
@@ -581,8 +641,8 @@ impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
-            // An imported module's member renders qualified, in every module's
-            // diagnostics alike.
+            // An imported module's or a run's member renders qualified, in every
+            // module's diagnostics alike.
             Name::Unique {
                 base,
                 home: Some(home),

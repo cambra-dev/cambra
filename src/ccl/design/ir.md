@@ -34,7 +34,7 @@ inside dependent types (`ccl/names.rs`):
 | Variant | Identity and use |
 |---|---|
 | `Raw(String)` | Source spelling before uniquification; lexical scope distinguishes equal spellings. |
-| `Unique { base, uid, home }` | Source binder minted by `uniquify`; `uid` distinguishes binding sites, while `base` retains the source spelling and `home` the imported module whose top-level member it binds ([docs/modules.md, "Names carry their home"](../../../docs/modules.md#names-carry-their-home)). |
+| `Unique { base, uid, home }` | Source binder minted by `uniquify`; `uid` distinguishes binding sites, while `base` retains the source spelling and `home` the imported module or run whose top-level member it binds ([docs/modules.md, "Names carry their home"](../../../docs/modules.md#names-carry-their-home)). |
 | `Synthetic { kind, uid }` | Compiler binder with a fresh `uid`; `kind` identifies its origin (`Pair`, `Mono`, `FloatedDefer`, or `SolverArg`). |
 | `Reserved(ReservedName)` | Special name; the shared refinement-element binder is `__elem`. |
 | `PiBound(PiRef)` | Bound reference in a function type's codomain; its de Bruijn index determines equality, while its spelling hint is display metadata. It is never a term binder. |
@@ -218,6 +218,15 @@ whose refinement names a binding (`lower_parameter_type`), so every predicate re
 closed and resolves the same in both scopes. A debug build asserts that a use uniquify reaches
 before its alias's `LetType` resolves each free name as the `LetType` does. Uniquify then replaces
 the node with `body`. No pass after it sees a `LetType`, and each has an unreachable arm for one.
+
+### `Run` — a `run` statement before linking
+
+`Run { name, module, statement, body }` is the `run` statement at `statement` that declares the run
+`name` of `module`, over `body`, the rest of the declaring module. A module lowers once, before any
+run of it exists, so the statement cannot stand for the run's chain yet. Linking creates the run
+and replaces the node with its chain around `body` ([docs/modules.md, "A module lowers
+once"](../../../docs/modules.md#a-module-lowers-once)). No pass after linking sees a `Run`, and
+each has an unreachable arm for one.
 
 ### `Cast` — explicit refinement acquisition
 
@@ -431,8 +440,10 @@ module"](../../../docs/chl-spec.md#912-field-labels-and-tags-belong-to-a-module)
 and terms, projections, variant constructors and patterns, and `FieldKey::Name` all hold one. The
 root module's labels have no module path, and they share that namespace with the labels the
 compiler builds for itself and with the tags of nominal types' constructors (`nominal::ctor_tag`),
-`Option`'s `some` and `none` among them. At run time, where records are keyed by strings, a label
-is its `Display` spelling: `name`, or `module::name` for another module's label.
+`Option`'s `some` and `none` among them. A run's top-level mutable variable is labeled in its run
+(`Name::field_key`). At run time, where records are keyed by strings, a label is its
+`Label::runtime_key`: `name`, `module::name` for another module's label, and `@run::name` for a
+run's, whose `Display` is `run::name`.
 
 A data function can carry witness binders in its `FunKind`: for example,
 `Σ (𝐷 : [𝐷₀, 𝐷₁]). 𝐷 ⤇ 𝑉` ranges over two possible collection domains. The witness reference

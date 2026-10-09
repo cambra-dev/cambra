@@ -43,15 +43,12 @@ pub(super) fn lower_test_sink(
     body: Expr,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // A sink nothing registered has no reader, so writing to it would drop the program's
-    // output without a trace.
-    let Some(sink) = ctx.test_sinks.get(&name).cloned() else {
-        return Err(LoweringError::unsupported(
-            span,
-            format!("no test sink is registered under `{name}`"),
-        ));
-    };
-    ctx.register_sink_binding(name.clone(), sink, span)?;
+    // Each run of the module binds the sink registered under its key
+    // ([`LoweringContext::register_sinks`]).
+    ctx.declared_sinks.push(super::DeclaredSink::Test {
+        name: name.clone(),
+        span,
+    });
     let defer = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.test_sink");
     Ok(ctx.tag_image(Expr::let_bind(name, defer, body), span))
 }

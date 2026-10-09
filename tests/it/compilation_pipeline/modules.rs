@@ -15,7 +15,7 @@ use super::panic_message::panic_message;
 
 /// The program rooted at `root`, with `modules` as its other modules' files, by
 /// module path.
-fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
+pub(crate) fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
     let mut files = modules
         .iter()
         .fold(InMemory::default(), |files, (path, text)| {
@@ -30,7 +30,7 @@ fn program(root: &str, modules: &[(&str, &str)]) -> LoadedProgram {
 }
 
 /// The rendered errors of a program that does not compile.
-fn compile_errors(program: &LoadedProgram) -> String {
+pub(crate) fn compile_errors(program: &LoadedProgram) -> String {
     let result = panic::catch_unwind(AssertUnwindSafe(|| run_program(program)));
     let Err(payload) = result else {
         panic!("expected the program not to compile");
@@ -38,7 +38,7 @@ fn compile_errors(program: &LoadedProgram) -> String {
     panic_message(&*payload)
 }
 
-fn assert_refused(program: &LoadedProgram, needle: &str) {
+pub(crate) fn assert_refused(program: &LoadedProgram, needle: &str) {
     let errors = compile_errors(program);
     assert!(errors.contains(needle), "expected {needle:?} in:\n{errors}");
 }
@@ -230,7 +230,7 @@ fn an_imported_module_uses_a_member_of_another() {
         import other
         import catalog use limit as other
     "},
-    "`other` is an import name, so no binder in its module takes it"
+    "`other` is an import name or a run name, so no binder in its module takes it"
 )]
 #[case::bound_twice(
     "import catalog use limit, double as limit\n",
@@ -727,7 +727,10 @@ fn an_imported_function_writes_the_callers_induction_variable(
     "},
     "`catalog::limit` is a value, not a type"
 )]
-#[case::unknown_qualifier("(nope::a=1).a\n", "`nope` is not an import name of this module")]
+#[case::unknown_qualifier(
+    "(nope::a=1).a\n",
+    "`nope` is not an import name or a run name of this module"
+)]
 #[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]
 #[case::member_of_a_run("shop::eu::stock\n", "names a member of a run")]
 #[case::second_import_of_a_name(
@@ -773,6 +776,45 @@ fn an_unsupported_library_statement_is_refused(#[case] library: &str, #[case] ne
             &[("lib", library)],
         ),
         needle,
+    );
+}
+
+/// A nominal type, an associated function and an `impl` block are refused in every module
+/// but the root, imported or run, each once.
+#[rstest]
+#[case::a_type("type Price = Int\n", "a nominal type in a module other than the root")]
+#[case::an_associated_function(
+    indoc! {"
+        type Price = Int
+        def Price::doubled(self) => Int:
+            self.extract() * 2
+    "},
+    "an associated function in a module other than the root"
+)]
+#[case::an_impl_block(
+    indoc! {"
+        type Price = Int
+        impl Price:
+            def doubled(self) => Int:
+                self.extract() * 2
+    "},
+    "an `impl` block in a module other than the root"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_nominal_type_outside_the_root_is_refused(
+    #[values("import shop", "run shop as s")] statement: &str,
+    #[case] shop: &str,
+    #[case] needle: &str,
+) {
+    let root = formatdoc! {"
+        {statement}
+        1
+    "};
+    let errors = compile_errors(&program(&root, &[("shop", shop)]));
+    assert_eq!(errors.matches(needle).count(), 1, "{errors}");
+    assert!(
+        !errors.contains("imported module holds value bindings"),
+        "{errors}"
     );
 }
 

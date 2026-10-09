@@ -7,6 +7,8 @@ use crate::ccl::provenance::NodeId;
 use smol_str::SmolStr;
 
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Label, Lit, Name, ProjKey, Type, UnaryOpKind};
+use crate::chl_parser::ModulePath;
+use crate::chl_parser::ast::Span;
 
 /// The `commit` tag of a writer **decision variant** —
 /// `` {`commit{𝑃} | `abort} ``. `𝑃` is the (dense) write/reply payload record
@@ -373,6 +375,20 @@ pub enum TypedExprNode {
         /// The expression being bound.
         bound_expr: Box<TypedExpr>,
         /// The expression in which `binding.name` is in scope.
+        body: Box<TypedExpr>,
+    },
+
+    /// A `run` statement in a module being lowered: the run `name` of `module`,
+    /// declared by the statement at `statement`, with the rest of the declaring
+    /// module in `body` (`docs/modules.md`, "A module lowers once").
+    ///
+    /// Exists only between lowering and linking. Linking replaces it with the
+    /// run's chain around `body`, so no pass after it sees one, and each has an
+    /// unreachable arm for one.
+    Run {
+        name: SmolStr,
+        module: ModulePath,
+        statement: Span,
         body: Box<TypedExpr>,
     },
 
@@ -880,6 +896,7 @@ impl TypedExprNode {
             TypedExprNode::Aggregate { .. } => "Aggregate",
             TypedExprNode::Let { .. } => "Let",
             TypedExprNode::LetType { .. } => "LetType",
+            TypedExprNode::Run { .. } => "Run",
             TypedExprNode::MutDecl { .. } => "MutDecl",
             TypedExprNode::List(_) => "List",
             TypedExprNode::Case { .. } => "Case",
@@ -1772,7 +1789,9 @@ impl TypedExpr {
                 f(init.as_ref());
                 f(body.as_ref());
             }
-            TypedExprNode::LetType { body, .. } => f(body.as_ref()),
+            TypedExprNode::LetType { body, .. } | TypedExprNode::Run { body, .. } => {
+                f(body.as_ref())
+            }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
@@ -1979,7 +1998,9 @@ impl TypedExpr {
                 f(init.as_mut());
                 f(body.as_mut());
             }
-            TypedExprNode::LetType { body, .. } => f(body.as_mut()),
+            TypedExprNode::LetType { body, .. } | TypedExprNode::Run { body, .. } => {
+                f(body.as_mut())
+            }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
@@ -2114,6 +2135,7 @@ impl TypedExpr {
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
             | TypedExprNode::LetType { .. }
+            | TypedExprNode::Run { .. }
             | TypedExprNode::Transact { .. } => {}
         }
     }
@@ -2170,6 +2192,7 @@ impl TypedExpr {
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
             | TypedExprNode::LetType { .. }
+            | TypedExprNode::Run { .. }
             | TypedExprNode::Transact { .. } => {}
         }
     }
