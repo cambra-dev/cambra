@@ -60,11 +60,14 @@ pub enum ConstrainError {
     /// `lhs` and `rhs` cannot be related by the subtyping rules of
     /// [`Type`] — e.g. two distinct primitives, a function compared
     /// to a record, etc.
+    ///
+    /// Boxed so that a `Result` carrying the error stays small: two inline
+    /// [`Type`]s would make every constraint result as large as both.
     Mismatch {
         /// The offending lhs type.
-        lhs: Type,
+        lhs: Box<Type>,
         /// The offending rhs type.
-        rhs: Type,
+        rhs: Box<Type>,
     },
     /// A record/tuple-on-record/tuple constraint required a field/position
     /// that lhs did not have. Width-subtyping says rhs's keys must be a
@@ -95,9 +98,9 @@ pub enum ConstrainError {
     /// a plain value.
     NotAFeed {
         /// The non-feed type that was required to be a feed handle.
-        found: Type,
+        found: Box<Type>,
         /// The feed type demanded.
-        required: Type,
+        required: Box<Type>,
     },
     /// Two function types met whose kinds disagree: a compute function (a
     /// capability, `⇒`) where a data collection (`⤇`) is demanded, or the
@@ -107,9 +110,9 @@ pub enum ConstrainError {
     /// capability would lose the invariance its domain is typed under.
     KindMismatch {
         /// The supplied function.
-        lhs: Type,
+        lhs: Box<Type>,
         /// The function demanded at the position.
-        rhs: Type,
+        rhs: Box<Type>,
     },
     /// A type met a kind that does not admit it — the `𝑇 :: 𝐾` edge failing. Raised
     /// where the type side becomes known, which is the first moment the question has an
@@ -184,9 +187,9 @@ pub enum ConstrainError {
     /// compared.
     SmtError {
         /// The supplied type, refinements included.
-        lhs: Type,
+        lhs: Box<Type>,
         /// The type demanded at the position.
-        rhs: Type,
+        rhs: Box<Type>,
         /// Boxed to keep this variant off `clippy::result_large_err`'s
         /// threshold: `constrain` returns `Result<(), ConstrainError>` on every
         /// edge it walks, so the enum's size is on the hot path and the payload
@@ -543,8 +546,8 @@ fn constrain_fun_kind(
     rhs: &Type,
 ) -> Result<(), ConstrainError> {
     let mismatch = || ConstrainError::KindMismatch {
-        lhs: lhs.clone(),
-        rhs: rhs.clone(),
+        lhs: Box::new(lhs.clone()),
+        rhs: Box::new(rhs.clone()),
     };
     match (k0, k1) {
         // **Two variables meeting are one kind**, so the edge is recorded on both: the
@@ -862,8 +865,8 @@ fn constrain_type_kinds(
     scope: &dyn ScopeEnv,
 ) -> Result<(), ConstrainError> {
     let mismatch = || ConstrainError::Mismatch {
-        lhs: lhs.clone(),
-        rhs: rhs.clone(),
+        lhs: Box::new(lhs.clone()),
+        rhs: Box::new(rhs.clone()),
     };
     match (sub, sup) {
         // The universe admits every domain, so nothing is left to ask.
@@ -911,8 +914,8 @@ fn candidate_in_kind(
         TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache, scope),
         TypeKind::Enumerated(sups) if sups.contains(d) => Ok(()),
         TypeKind::Enumerated(_) => Err(ConstrainError::Mismatch {
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
         }),
         TypeKind::UIntRanges | TypeKind::Type => match d {
             Type::Infer(v) => {
@@ -1372,8 +1375,8 @@ fn constrain_go_impl(
                 Ok(())
             } else {
                 Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
                 })
             }
         }
@@ -1403,8 +1406,8 @@ fn constrain_go_impl(
             // separate to defer it to.
             let Some(TypeKind::Enumerated(candidates)) = gamma.type_kind_of(w) else {
                 return Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
                 });
             };
             for c in &candidates {
@@ -1664,8 +1667,8 @@ fn constrain_go_impl(
             match &param.bound {
                 Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
                 None => Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
                 }),
             }
         }
@@ -1745,8 +1748,8 @@ fn constrain_go_impl(
                 ..
             },
         ) => Err(ConstrainError::NotAFeed {
-            found: lhs.clone(),
-            required: rhs.clone(),
+            found: Box::new(lhs.clone()),
+            required: Box::new(rhs.clone()),
         }),
 
         // A nominal channel domain is *deferred-compatible* with any
@@ -1863,8 +1866,8 @@ fn constrain_go_impl(
                 constrain_go(lbase, &demanded, sl, sr, cache, scope)
             } else if scope.is_skip_smt() {
                 Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
                 })
             } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
                 .or_else(|error| match error {
@@ -1874,8 +1877,8 @@ fn constrain_go_impl(
                     // ill-typed program's diagnostic into a note about this module.
                     SmtError::Encoding { .. } => Ok(false),
                     error => Err(ConstrainError::SmtError {
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
+                        lhs: Box::new(lhs.clone()),
+                        rhs: Box::new(rhs.clone()),
                         error: Box::new(error),
                     }),
                 })?
@@ -1883,15 +1886,15 @@ fn constrain_go_impl(
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
                 Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
                 })
             }
         }
 
         _ => Err(ConstrainError::Mismatch {
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
         }),
     }
 }

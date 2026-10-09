@@ -47,11 +47,12 @@
 //! the spelling is unambiguous in almost every rendering. `Debug` surfaces the
 //! `uid` for [`Name::Unique`].
 
-use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-
+use crate::chl_parser::ModulePath;
 use crate::chl_parser::ast::QualifiedName as ParserQualifiedName;
 use smol_str::SmolStr;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A globally-fresh binder identity. Minted only via [`Uid::fresh`]; nothing
 /// observes its numeric value (only `uid` *equality*), so non-determinism
@@ -216,13 +217,29 @@ impl std::hash::Hash for PiRef {
     }
 }
 
+/// Where a module's top-level member lives (`docs/modules.md`, "Names carry
+/// their home").
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Home {
+    /// The shared run of an imported module, by its module path.
+    Shared(ModulePath),
+}
+
+impl fmt::Display for Home {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Home::Shared(module) => write!(f, "{module}"),
+        }
+    }
+}
+
 /// A binder or variable name. See the module docs for the five variants.
 ///
 /// Derived `Eq`/`Ord`/`Hash` compare the whole variant. For [`Name::Unique`]
-/// that compares `(base, uid)` and for [`Name::Synthetic`] `(kind, uid)`,
+/// that compares `(base, uid, home)` and for [`Name::Synthetic`] `(kind, uid)`,
 /// both of which coincide with uid-identity under the convention (a fresh
-/// `uid` is minted per binder, copies preserve it) — the other fields can
-/// never disagree with the `uid`. The `uid`s of a `Unique` and a `Synthetic`
+/// `uid` is minted per binder, copies preserve it, and `home` is set at mint
+/// time) — the other fields can never disagree with the `uid`. The `uid`s of a `Unique` and a `Synthetic`
 /// are drawn from one space but the two are different variants, so they never
 /// collide.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -230,8 +247,17 @@ pub enum Name {
     /// Lowering's output; identity is the string. See module docs.
     Raw(SmolStr),
     /// A uniquified source binder; identity is `uid`, `base` is the source
-    /// spelling kept as display metadata.
-    Unique { base: SmolStr, uid: Uid },
+    /// spelling kept as display metadata. `home` is the imported module whose
+    /// top-level member it binds, and `None` for any other binder: a local, or a
+    /// member of the root (`docs/modules.md`, "Names carry their
+    /// home"). It is display metadata too, and set where the name is minted, so
+    /// a binder and its uses carry the same one. It is behind an `Arc` so it
+    /// costs `Name` one pointer.
+    Unique {
+        base: SmolStr,
+        uid: Uid,
+        home: Option<Arc<Home>>,
+    },
     /// A compiler-introduced binder; identity is `uid`, `kind` is its
     /// provenance and whole display (no source spelling — that was noise).
     Synthetic { kind: SyntheticKind, uid: Uid },
@@ -270,9 +296,24 @@ impl Name {
     /// thing that should produce a [`Name::Unique`] (a compiler-introduced
     /// binder is a [`Name::Synthetic`], not this).
     pub fn fresh(base: impl Into<SmolStr>) -> Self {
+        Self::fresh_in(base, None)
+    }
+
+    /// [`Name::fresh`] for a binder whose home is `home`: the top-level member
+    /// `base` of an imported module.
+    pub fn fresh_in(base: impl Into<SmolStr>, home: Option<Arc<Home>>) -> Self {
         Name::Unique {
             base: base.into(),
             uid: Uid::fresh(),
+            home,
+        }
+    }
+
+    /// The imported module whose top-level member this binds, if it binds one.
+    pub fn home(&self) -> Option<&Home> {
+        match self {
+            Name::Unique { home, .. } => home.as_deref(),
+            _ => None,
         }
     }
 
@@ -540,6 +581,13 @@ impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
+            // An imported module's member renders qualified, in every module's
+            // diagnostics alike.
+            Name::Unique {
+                base,
+                home: Some(home),
+                ..
+            } => write!(f, "{home}::{base}"),
             _ => f.write_str(self.base()),
         }
     }
