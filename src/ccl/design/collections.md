@@ -387,6 +387,9 @@ condition holds; only that leg can contribute rows, though the selected arm may 
 empty. The union's tagged domain differs from the sum's domain, so `Realize` asserts the
 original type rather than deriving it by subtyping. See
 [Planning asserts the type it replaces](type-inference.md#planning-asserts-the-type-it-replaces).
+At runtime the value is the leg holding rows, keyed by its own keys: op-conversion compiles a
+`Realize` over a copairing as a flat merge at the key bound the sum's type declares
+(`UnionOperator::new_flat_over`), so no key carries its leg's tag.
 
 Planning can instead erase a determined witness or retain a materialized one. Erasure
 removes the introduction and instantiates its type references. A materialized witness keeps
