@@ -35,7 +35,13 @@ pub(super) enum LetScheme {
     /// At its type verbatim, shared by every use.
     Monomorphic,
     /// Generalized: each use instantiates its own copy.
-    Generalized,
+    Generalized {
+        /// Whether the binding is bound at its exact annotation rather than at the
+        /// definition's own type, so that each use is typed at an instance of the
+        /// annotation and its specialization is pinned one way
+        /// ([`specialize_use`](super::solve::specialize_use)).
+        at_annotation: bool,
+    },
     /// Generalized, at a type its failed definition left unconstrained
     /// ([`emit_let`](super::emit::emit_let)). A statement that reads it reports
     /// nothing ([`Typing::recover`]).

@@ -681,7 +681,13 @@ of the same name. A frame retains the original definition until its body's walk 
    `seed_chan_dom_pairings` aligns rigid channel-domain names with the use before freshening;
    a two-way subtype pin cannot equate two different rigid names.
 5. Pin the clone and live use type in both directions, using a fresh `ConstrainCache`.
-   Pin errors are reported at the use site.
+   Pin errors are reported at the use site. A binding bound at its exact annotation is pinned one
+   way, clone below use (`SpecializeFrame::bound_at_annotation`): the use is typed at an instance
+   of the annotation, which the definition's own type need only be below. `\x -> x`, of type
+   `𝑎 ⇒ 𝑎`, checks against `{Int where _ > 0} => Int`; the reverse edge would push the
+   annotation's codomain into the shared variable that is also the domain. The clone-below-use
+   edge decides a refinement deficit with the solver under `NoScope`, which assumes nothing about
+   a free name, so `\x -> 5` meets `Int => {Int where _ > 0}` at each use.
 6. Coalesce the clone in the definition site's scope, then restore the use site's scope. If the
    pin succeeded, the errors the clone's walk raises are held on the frame
    ([Checking a definition alone](#checking-a-definition-alone)).
@@ -1340,7 +1346,7 @@ this prevents an unrelated contradictory binder from proving an otherwise unsupp
 | --- | --- |
 | Emission through `constrain_subtype_in` | `InferCtx` supplies lexical and recorded opaque binder types. `value_type` resolves their positive contributions with opposite-side compaction disabled, so a use's demand cannot prove itself. |
 | Post-inference checks | `CheckCtx` supplies lexical and opaque binder types from the tree through `constrain_subtype_in` and `constrain_subtype_under_in`. Recorded `Var` types are trusted; a missing scope entry contributes no assumption rather than a name-resolution error. |
-| `NoScope` | Supplies no binder types. Used by inlining's discharge check and probes without a program scope. The query can prove less than one with lexical assumptions. |
+| `NoScope` | Supplies no binder types. Used by inlining's discharge check, a specialization's clone-below-use pin and probes without a program scope. The query can prove less than one with lexical assumptions. |
 | `SkipSmtScope` | Suppresses the query. `constrain_subtype` uses this structural-only policy. |
 
 Emission does not instantiate a generalized binder merely to create an SMT assumption. Unresolved

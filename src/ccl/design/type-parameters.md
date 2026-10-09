@@ -301,11 +301,13 @@ whose it is, relative to the cutoff:
 | deeper: a definition's nested in the clone | a new `TypeParam`, at the same level and with its bound freshened |
 | at or below the cutoff: an enclosing definition's | itself |
 
-The clone's pin, two-way against the use's instantiation type, ties each fresh variable to the
-use's types where the parameter stands in the signature. Where it stands only in a bound, as for a
-parameter `x <: T`, the variable takes the types flowing in through the pinned parameter. No
-per-use table is kept: cloning re-mints node identities, so a table keyed by a use's `NodeId` would
-miss the uses inside a clone.
+The clone's pin against the use's instantiation type ties each fresh variable to the use's types
+where the parameter stands in the signature. A `Poly` with a body binds at its annotation, so the
+pin is one way, clone below use ([type-inference.md, "Specialization scope and
+lifecycle"](type-inference.md#specialization-scope-and-lifecycle), step 5). Where it stands only in
+a bound, as for a parameter `x <: T`, the variable takes the types flowing in through the pinned
+parameter. No per-use table is kept: cloning re-mints node identities, so a table keyed by a use's
+`NodeId` would miss the uses inside a clone.
 
 Each use substitutes its own types, so an error that only the opaque parameters expose, such as
 two unrelated parameters meeting at one position, never shows in a clone.

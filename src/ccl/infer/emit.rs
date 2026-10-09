@@ -1790,6 +1790,7 @@ pub(super) fn emit_let<C: Typing>(
     }
     let LetBound {
         ty: scheme_ty,
+        at_annotation,
         opened,
         defined,
         mut poisoned,
@@ -1826,7 +1827,7 @@ pub(super) fn emit_let<C: Typing>(
     let scheme = if poisoned {
         LetScheme::Poisoned
     } else if !defined || generalize {
-        LetScheme::Generalized
+        LetScheme::Generalized { at_annotation }
     } else {
         LetScheme::Monomorphic
     };
@@ -1846,6 +1847,9 @@ pub(super) fn emit_let<C: Typing>(
 struct LetBound {
     /// The type the binding is bound at.
     ty: Type,
+    /// Whether `ty` is the binding's exact annotation rather than the right-hand
+    /// side's own type ([`LetScheme::Generalized`]).
+    at_annotation: bool,
     /// The `Poly` the annotation opened.
     opened: Option<crate::ccl::ty::PolyType>,
     /// Whether the right-hand side typed.
@@ -1886,6 +1890,7 @@ fn emit_let_bound<C: Typing>(
             ctx.recover(error, reads_before)?;
             return Ok(LetBound {
                 ty: poison(ctx),
+                at_annotation: false,
                 opened: None,
                 defined: false,
                 poisoned: true,
@@ -1961,6 +1966,8 @@ fn emit_let_bound<C: Typing>(
     // Whether the variable is bound at a poison rather than at a type the program
     // states.
     let mut poisoned = !defined;
+    // Whether it is bound at the annotation rather than at the right-hand side's type.
+    let mut at_annotation = false;
     // The type the variable is bound at over the body.
     let scheme_ty = match &binding.user_annotation {
         // An annotation whose predicates did not type declares nothing usable.
@@ -2001,6 +2008,7 @@ fn emit_let_bound<C: Typing>(
         Some(Type::Poly(poly)) if matches!(poly.body, Type::Hole) => bound_ty,
         Some(Type::Poly(poly)) => {
             poisoned = false;
+            at_annotation = true;
             let declared = complete_annotation(&poly.body, &bound_ty);
             // The annotation as written, over the completed body, for a mismatch.
             let shown = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
@@ -2021,6 +2029,8 @@ fn emit_let_bound<C: Typing>(
                 Type::BoundedHole(_) => ann.clone(),
                 _ => {
                     poisoned = false;
+                    // An annotation that is all hole declares the right-hand side's type.
+                    at_annotation = !matches!(ann, Type::Hole);
                     complete_annotation(ann, &bound_ty)
                 }
             };
@@ -2037,6 +2047,7 @@ fn emit_let_bound<C: Typing>(
     };
     Ok(LetBound {
         ty: scheme_ty,
+        at_annotation,
         opened,
         defined,
         poisoned,
