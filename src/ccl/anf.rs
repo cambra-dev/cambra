@@ -517,6 +517,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
         }
+        TypedExprNode::Run { .. } => unreachable!("linking expands every `Run`"),
         TypedExprNode::MutDecl {
             binding,
             init,

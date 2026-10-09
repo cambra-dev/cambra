@@ -222,8 +222,11 @@ Hashing can ignore a `Name`'s uid only while the value is represented as a name.
 projection key is a `Label`, whose spelling and module participate in the hash without name
 normalization.
 
-`Name::field_key` therefore uses the base spelling for mutable-variable record fields. A
-`Transact` consumer resolves those labels in its own `keys_map`, so labels need to be unique
+`Name::field_key` therefore uses a binder's spelling, not its uid, for mutable-variable record
+fields: the base spelling, or `home::base` for a member of a run or a shared run, so two runs of one
+module keep distinct fields
+([docs/modules.md, "Registries keyed by spelling"](../../../docs/modules.md#registries-keyed-by-spelling)).
+A `Transact` consumer resolves those labels in its own `keys_map`, so labels need to be unique
 within that record, not across all transactions or loops. Including a uid would make independently
 compiled copies of the same source produce different labels and hashes.
 

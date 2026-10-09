@@ -87,6 +87,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         // after its target.
         MutDecl { binding, .. } => format!("MutDecl({})", binding.name),
         LetType { name, .. } => format!("LetType({name})"),
+        Run { name, .. } => format!("Run({name})"),
         Tuple(_) => "Tuple".to_string(),
         Proj(k) => format!("Proj({k:?})"),
         Record(_) => "Record".to_string(),

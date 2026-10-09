@@ -3717,6 +3717,7 @@ pub(crate) fn debug_assert_predicate_shape(predicate: &TypedExpr) {
                 N::LetRec { .. } => Some("LetRec"),
                 N::Transact { .. } => Some("Transact"),
                 N::LetType { .. } => Some("LetType"),
+                N::Run { .. } => Some("Run"),
                 _ => None,
             };
             if here.is_some() {
@@ -4128,7 +4129,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::LoadFrom(_)
         | N::Error => true,
         // The two shapes a term this walk compares never holds; the catch-all says why.
-        N::LetRec { .. } | N::Transact { .. } | N::LetType { .. } => false,
+        N::LetRec { .. } | N::Transact { .. } | N::LetType { .. } | N::Run { .. } => false,
     }
 }
 
