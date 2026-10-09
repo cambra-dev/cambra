@@ -175,7 +175,8 @@ pub(super) struct Created {
     pub(super) chain: Expr,
     /// Each name the run's top level resolves, by spelling: its members, its
     /// `use` names, and each name spelled through one of its qualifiers. A
-    /// module reaching the run spells each through its own qualifier for it.
+    /// module reaching the run spells each through its own qualifier for it
+    /// ([`reroot`]).
     pub(super) names: HashMap<QualifiedName, Name>,
 }
 
@@ -213,7 +214,9 @@ impl ProgramLowering<'_> {
         let chain = lowered.value.filter(|_| clean)?;
         let interface = Interface::of_lowered(
             module,
+            &chain,
             &top_level_bindings(&ast.body),
+            &top_level_aliases(&ast.body),
             |name| ctx.is_mut_param_fn(name),
             io_site,
         );
@@ -340,7 +343,7 @@ pub(super) fn use_names(
 ) -> HashMap<QualifiedName, Name> {
     let mut names = qualified;
     for (bound, used) in &scope.uses {
-        let Some(member) = &used.member else {
+        let Reached::Value(Some(member)) = &used.reached else {
             continue;
         };
         let binder = names.get(member).cloned();

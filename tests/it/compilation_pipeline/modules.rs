@@ -206,9 +206,9 @@ fn an_imported_module_uses_a_member_of_another() {
     "import catalog use missing\n",
     "module `catalog` has no member `missing`"
 )]
-#[case::type_member(
+#[case::missing_type_member(
     "import catalog use Item\n",
-    "the type member `catalog::Item` is not supported yet"
+    "module `catalog` has no type member `Item`"
 )]
 #[case::bound_by_a_member(
     indoc! {"
@@ -318,6 +318,178 @@ fn a_missing_member_is_refused() {
         ),
         "module `catalog` has no member `missing`",
     );
+}
+
+/// A module's type aliases, as `shapes` declares them: `Small` names a
+/// refinement over the private `cap`, `Pair` a record, and `Hidden` is private.
+const SHAPES: &str = indoc! {"
+    cap = 10
+    pub Small = {Int where _ < cap}
+    pub Pair = {left: Int, right: Int}
+    Hidden = Int
+    pub def first(p: Pair) => Int:
+        p.left
+"};
+
+/// An imported alias names the type its module declares, by qualified name and
+/// through `use`, under its own name or an alias (`docs/chl-spec.md`, "9.2
+/// Imports").
+#[rstest]
+#[case::qualified(indoc! {"
+    import shapes
+    x: shapes::Small = 5
+    x
+"})]
+#[case::used(indoc! {"
+    import shapes use Small
+    x: Small = 5
+    x
+"})]
+#[case::used_under_an_alias(indoc! {"
+    import shapes use Small as Tiny
+    x: Tiny = 5
+    x
+"})]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_alias_names_its_modules_type(#[case] root: &str) {
+    check_program_scalar(&program(root, &[("shapes", SHAPES)]), Value::Int(5));
+}
+
+/// An imported alias's predicate reads the bindings its declaration sees, so
+/// the importer's own `cap` does not capture it, and a value it rejects is
+/// rejected wherever the alias is used.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_alias_is_closed_over_its_module() {
+    let importer = |value: i64| {
+        formatdoc! {"
+            import shapes
+            cap = 100
+            x: shapes::Small = {value}
+            x + cap
+        "}
+    };
+    check_program_scalar(
+        &program(&importer(5), &[("shapes", SHAPES)]),
+        Value::Int(105),
+    );
+    let errors = compile_errors(&program(&importer(50), &[("shapes", SHAPES)]));
+    assert!(
+        errors.contains("annotated as {Int where _ < shapes::cap}"),
+        "{errors}"
+    );
+}
+
+/// An imported alias whose refinement reads no value is a term of the
+/// importer's own, beside the one its module's own uses hold.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_alias_used_by_its_module_is_a_term_of_its_own() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import positive
+                x: positive::Pos = 3
+                x
+            "},
+            &[(
+                "positive",
+                indoc! {"
+                    pub Pos = {Int where _ > 0}
+                    pub def keep(c: Pos) => Pos:
+                        c
+                "},
+            )],
+        ),
+        Value::Int(3),
+    );
+}
+
+/// An imported record alias is the record type its module writes, labels and
+/// all, so the importer builds it with that module's labels.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_record_alias_carries_its_modules_labels() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import shapes use Pair
+                p: Pair = (shapes::left=1, shapes::right=2)
+                shapes::first(p) + p.shapes::right
+            "},
+            &[("shapes", SHAPES)],
+        ),
+        Value::Int(3),
+    );
+}
+
+/// An alias may be built from another module's alias, and carries its type.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_alias_is_built_from_another_modules_alias() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import sizes use Medium
+                x: Medium = 5
+                x
+            "},
+            &[
+                ("shapes", SHAPES),
+                (
+                    "sizes",
+                    indoc! {"
+                        import shapes
+                        pub Medium = shapes::Small
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(5),
+    );
+}
+
+#[rstest]
+#[case::private(
+    indoc! {"
+        import shapes
+        x: shapes::Hidden = 1
+        x
+    "},
+    "`Hidden` is private to module `shapes`"
+)]
+#[case::private_through_use(
+    indoc! {"
+        import shapes use Hidden
+        1
+    "},
+    "`Hidden` is private to module `shapes`"
+)]
+#[case::bound_by_an_alias(
+    indoc! {"
+        import shapes use Small
+        Small = Int
+        1
+    "},
+    "`Small` is a `use` name, so no member of its module takes it"
+)]
+#[case::bound_by_a_nominal_type(
+    indoc! {"
+        import shapes use Small
+        type Small:
+            a
+            b
+        1
+    "},
+    "`Small` is a `use` name, so no member of its module takes it"
+)]
+#[case::a_builtin_type(indoc! {"
+    import shapes use Small as Int
+    1
+"}, "`Int` is a built-in type")]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_type_member_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(&program(root, &[("shapes", SHAPES)]), needle);
 }
 
 /// A label written in a module is that module's: the library's `price` is
@@ -440,13 +612,28 @@ fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] i
     "},
     "`catalog` is an import name"
 )]
-#[case::type_member(
+#[case::missing_type_member(
     indoc! {"
         import catalog
         x: catalog::Item = 1
         x
     "},
-    "the type member `catalog::Item`"
+    "module `catalog` has no type member `Item`"
+)]
+#[case::type_member_as_a_value(
+    indoc! {"
+        import catalog
+        catalog::Item
+    "},
+    "`catalog::Item` is a type, not a value"
+)]
+#[case::value_member_as_a_type(
+    indoc! {"
+        import catalog
+        x: catalog::limit = 1
+        x
+    "},
+    "`catalog::limit` is a value, not a type"
 )]
 #[case::unknown_qualifier("(nope::a=1).a\n", "`nope` is not an import name of this module")]
 #[case::value_qualified_by_this("this::a\n", "`this` qualifies a label or a tag")]

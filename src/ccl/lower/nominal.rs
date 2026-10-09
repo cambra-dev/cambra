@@ -329,7 +329,7 @@ fn lower_constructors(
     let aliases = ctx.snapshot_type_aliases();
     let scoped = ctx.type_params_in_scope.len();
     for param in &head.params {
-        ctx.declare_type_param(param.spelling.as_str(), Type::Param(Rc::clone(param)));
+        ctx.declare_type_throughout(param.spelling.as_str(), Type::Param(Rc::clone(param)));
         ctx.type_params_in_scope.push(param.spelling.to_string());
     }
     let result = (|| {

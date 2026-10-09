@@ -4293,7 +4293,7 @@ Module type. `::` separates the name from the member, and `.` stays record proje
 | Written | Position | Means |
 | --- | --- | --- |
 | `cart::total` | value | the public member `total` of `shop::cart`'s shared run |
-| `cart::Item` | type | **[Planned]** the public type member `Item` of `shop::cart`, an alias or a nominal type |
+| `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias, or a nominal type (**[Planned]**) |
 | `c::count` | value, write target | **[Planned]** the public member `count` of the run `c` |
 | `c::total` | value | **[Planned]** the public member `total` of the run `c`, a copy distinct from `cart::total` |
 | `p::count` | value, write target | **[Planned]** the member `count` of the run passed as `p` |
@@ -4512,11 +4512,11 @@ type by naming the same labels. `{audit_api::app: String}` written in `storefron
 - **[Open]** — which module owns the labels of data from outside the program, such as the fields
   of an HTTP request body.
 
-**[Planned]** A module's type members are its type aliases and its nominal types
+A module's type members are its type aliases and, **[Planned]**, its nominal types
 ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Exporting an
-alias exports a spelling for a structural type, and the user's type is the same type. Exporting a
-nominal type exports the type itself: `mod::Price` is one type in every module that names it, and
-distinct from every other type of its shape.
+alias exports a spelling for a structural type, and the user's type is the same type.
+**[Planned]** Exporting a nominal type exports the type itself: `mod::Price` is one type in every
+module that names it, and distinct from every other type of its shape.
 
 #### Nominal type identity
 
@@ -4593,8 +4593,6 @@ a type through its run name, and two spellings name one type exactly when those 
   module's default arguments, and a `run` passing the same arguments reaches the same types.
 
 ### 9.13 Private-in-public
-
-**[Planned]** — the rules of this section.
 
 A public member's type may mention private members. A public alias's refinement may name a private
 value, and a public function's inferred type may carry a refinement over one:

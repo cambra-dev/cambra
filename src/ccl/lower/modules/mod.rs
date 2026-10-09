@@ -17,18 +17,22 @@
 mod interface;
 mod link;
 mod scope;
+mod types;
 
 pub use interface::*;
 pub use link::*;
 pub use scope::*;
+use types::*;
 
 use super::{
     LoweringContext, LoweringError, LoweringResult, lower_library, lower_stmts, sink_site,
 };
+use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::load::{EdgeKind, LoadedProgram};
 use crate::ccl::names::QualifiedName;
+use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::uniquify;
-use crate::ccl::{Expr, Home, Label, Name, TypedExprNode};
+use crate::ccl::{Expr, Home, Label, Name, Type, TypedExprNode};
 use crate::chl_parser::ast::{
     AssignTarget, Module as ChlModule, QualifiedName as ParserQualifiedName, Span, Spanned,
     Stmt as ChlStmt,

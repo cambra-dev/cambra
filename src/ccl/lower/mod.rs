@@ -505,7 +505,8 @@ pub struct LoweringContext {
 #[derive(Debug, Clone)]
 pub(super) struct DeclaredAlias {
     /// The alias statement, below which the alias is in scope, or `None` for a
-    /// type parameter, which is in scope throughout its definition.
+    /// name in scope throughout: a type parameter in its definition, or a `use`
+    /// type name in its module.
     statement: Option<Span>,
     ty: Type,
 }
@@ -880,9 +881,10 @@ impl LoweringContext {
             });
     }
 
-    /// Bind the type parameter `name` to `ty` throughout the definition being
-    /// lowered (`docs/chl-spec.md`, "Type parameters").
-    pub(super) fn declare_type_param(&mut self, name: impl Into<String>, ty: Type) {
+    /// Bind `name` to `ty` throughout the scope being lowered: a type parameter
+    /// throughout its definition (`docs/chl-spec.md`, "Type parameters"), or a
+    /// `use` type name throughout its module.
+    pub(super) fn declare_type_throughout(&mut self, name: impl Into<String>, ty: Type) {
         self.type_aliases
             .entry(name.into())
             .or_default()
@@ -1401,6 +1403,14 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, library: bool) ->
     let members = modules::top_level_bindings(&module.body);
     errors.extend(modules::public_names_bound_twice(&members));
     errors.extend(use_name_members(&members, ctx));
+    errors.extend(use_name_members(
+        &modules::top_level_aliases(&module.body),
+        ctx,
+    ));
+    errors.extend(use_name_members(
+        &modules::top_level_nominal_types(&module.body),
+        ctx,
+    ));
     if library {
         errors.extend(library_statement_refusals(&module.body));
     }
