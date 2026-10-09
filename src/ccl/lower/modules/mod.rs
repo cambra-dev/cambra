@@ -26,25 +26,28 @@ mod types;
 use imports::*;
 pub use interface::*;
 pub use link::*;
-use parameters::*;
+pub(super) use parameters::*;
 pub use scope::*;
 use types::*;
 
 use super::{
-    DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
+    AliasAt, DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
     library_statement_refusals, lower_module_body, lower_root, sink_site, state_site,
 };
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates_mut};
 use crate::ccl::load::LoadedProgram;
+use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType};
 use crate::ccl::names::QualifiedName;
 use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::uniquify;
-use crate::ccl::{Expr, Home, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode};
+use crate::ccl::{
+    Expr, Home, KeyArgument, Label, Lit, Name, RunPath, SharedRun, Type, TypedExprNode,
+};
 use crate::chl_parser::ast::{
     AssignTarget, Expr as ChlExpr, KeywordArg, Lit as ChlLit, Module as ChlModule,
     QualifiedName as ParserQualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp, WrittenPath,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
 use smol_str::SmolStr;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;

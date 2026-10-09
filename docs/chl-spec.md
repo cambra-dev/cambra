@@ -3784,8 +3784,9 @@ module_path ::= ident ("::" ident)*
   both one `sorted_map::Map`. An omitted argument is the parameter's default, so `import m` and
   `import m(x=1)` reach one shared run when `x` defaults to `1` (**[Planned]**). An argument may be
   any constant ([9.19 Open questions](#919-open-questions)): a literal, a type (**[Planned]**), or
-  an import name or run name passed as a value of its Module type (**[Planned]**, [9.8 Module
-  types](#98-module-types)).
+  an import name passed as a value of its Module type ([9.8 Module types](#98-module-types)). A run
+  name may not: a shared run stands outside every run, and an import reaches no state ([9.7
+  Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
   names mean.
@@ -3827,7 +3828,7 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
   earlier runs' members, imports, and parameters. A run's public members are what it returns, so
   `run index(docs=p::documents) as ix` passes one run's member to another. An import name or run
   name in an argument denotes its run as a value of its Module type, which is how a module is passed
-  to another (**[Planned]**).
+  to another.
 - A run name is bound from its statement to the end of the declaring module, as a value binding
   is, because a run is an evaluation. `eu::x` reaches the run's public member `x`. An argument names
   only runs above its own, so runs cannot depend on each other in a cycle: `run svc(peer=y) as x`
@@ -3835,11 +3836,10 @@ run inventory as inv use stock                        # binds `inv`, and `stock`
 - A run needs no `import`. A run name and an import name in one module may not coincide. Importing a
   module and running it are two runs: the import reaches the shared run, and the `run` statement
   declares another.
-- **[Planned]** A module returns a run it declares the way it returns any value: by binding it to a
-  public member. `pub audit = a`, below `run audit_api as a`, is a member of the run's Module type
-  ([9.8 Module types](#98-module-types)), and a module running `shop` reaches the run's members
-  through it, `shop::audit::events`, as through a parameter of Module type. `pub` on a `run` is
-  refused.
+- A module returns a run it declares the way it returns any value: by binding it to a public member.
+  `pub audit = a`, below `run audit_api as a`, is a member of the run's Module type ([9.8 Module
+  types](#98-module-types)), and a module running `shop` reaches the run's members through it,
+  `shop::audit::events`, as through a parameter of Module type. `pub` on a `run` is refused.
 
 ### 9.4 Parameters
 
@@ -3866,10 +3866,10 @@ param payments: Module{charge: {amount: Int} => Receipt}
   default. **[Planned]** An argument left out is inferred from the types of the other arguments.
 - A value parameter is an immutable value. Its type is its annotation, or inferred from the module's
   uses the way a function parameter's is.
-- **[Planned]** A parameter of Module type is how a module takes another module. The argument is a
-  name that denotes a module ([9.6 Qualified references](#96-qualified-references)), and Module
-  subtyping is the check ([9.8 Module types](#98-module-types)). The parameter is a qualifier:
-  `audit::events` reaches the argument's member.
+- A parameter of Module type is how a module takes another module. The argument is a name that
+  denotes a module ([9.6 Qualified references](#96-qualified-references)), and Module subtyping is
+  the check ([9.8 Module types](#98-module-types)). The parameter is a qualifier: `audit::events`
+  reaches the argument's member.
 - A parameter's type is the only thing checking reads about its argument
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). An interface is an
   alias of a Module type, usually exported by a library both sides import.
@@ -3930,11 +3930,11 @@ pub held: Int
 ### 9.6 Qualified references
 
 A **name that denotes a module** reaches that module's members: an import name, a run name, a
-parameter of Module type (**[Planned]**), and a member bound to one of them, `pub audit = a`
-(**[Planned]**, [9.3 Runs](#93-runs)), whether reached by its name, through a path of public
-members, `shop::audit`, or through `use`. `::` separates the name from the member, and `.` stays
-record projection ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). With
-`import shop::cart`, `run shop::cart as c`, and `param p: Module{count: Mut(Int, Txn)}`:
+parameter of Module type, and a member bound to one of them, `pub audit = a` ([9.3 Runs](#93-runs)),
+whether reached by its name, through a path of public members, `shop::audit`, or through `use`. `::`
+separates the name from the member, and `.` stays record projection ([3.9 Subscript and attribute
+access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run shop::cart as c`, and
+`param p: Module{count: Mut(Int, Txn)}`:
 
 | Written | Position | Means |
 | --- | --- | --- |
@@ -3943,8 +3943,8 @@ record projection ([3.9 Subscript and attribute access](#39-subscript-and-attrib
 | `c::count` | value, write target | the public member `count` of the run `c` (**[Planned]** as a write target) |
 | `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
 | `p::count` | value, write target | **[Planned]** the member `count` of the run passed as `p` |
-| `cart` | value | **[Planned]** `shop::cart`'s shared run, as a value of its Module type ([9.8 Module types](#98-module-types)) |
-| `c` | value | **[Planned]** the run `c`, as a value of its Module type |
+| `cart` | value | `shop::cart`'s shared run, as a value of its Module type ([9.8 Module types](#98-module-types)) |
+| `c` | value | the run `c`, as a value of its Module type |
 | `cart::hidden` | any | error: `hidden` is private to `shop::cart`, with a secondary label at its declaration |
 | `cart::missing` | any | error: `shop::cart` has no member `missing` |
 
@@ -3998,8 +3998,6 @@ runs, each with its own `stock`, and `inv::InStock` is a different type from `eu
 
 ### 9.8 Module types
 
-**[Planned]** — the rules of this section.
-
 A **Module type** is the structural type of a module's public members. It is written like a record
 type, with `Module` before the braces:
 
@@ -4012,19 +4010,20 @@ param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt
 | --- | --- |
 | value, `def` | `name: T`, at its contract, which may be polymorphic |
 | feed | `name: Feed(T)` |
-| `Txn` mutable variable | `name: Mut(V, Txn)` |
+| `Txn` mutable variable | **[Planned]** `name: Mut(V, Txn)` |
 | member bound to a module, `pub audit = a` | `name: Module{…}`, the Module type of the module it is bound to |
-| type alias | `Name = T` for an exact type, or `Name <: T` for one known through a bound |
+| type alias | **[Planned]** `Name = T` for an exact type, or `Name <: T` for one known through a bound |
 | nominal type | `Name = T`, where `T` is the nominal type |
 | private member | none |
 
-A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
-([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal
-([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
+**[Planned]** A capitalized entry is a type member. Its `<:` is the bounded form of a type parameter
+([9.4 Parameters](#94-parameters)), and it is the one place `<:` appears inside a type literal ([Two
+annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
 in 𝐴 is a subtype of its type in 𝐵, a `Mut` member's type is equal, since `Mut` is invariant, and a
-type member satisfies 𝐵's bound. Width subtyping lets a consumer name only the members it uses:
+type member satisfies 𝐵's bound (**[Planned]**). Width subtyping lets a consumer name only the
+members it uses:
 
 ```python
 # storefront.cambra
@@ -4035,11 +4034,12 @@ run audit
 run storefront(audit=audit) as eu    # the run `audit` has `events` and may have more
 ```
 
-An import name or run name denotes its run as a Module value in one position only: a run argument.
-A Module value stored in data or returned from a function is **[Open]**
+An import name or run name denotes its run as a Module value in two positions only: an argument,
+and a binding, `pub audit = a` ([9.3 Runs](#93-runs)). A Module value stored in data or returned
+from a function is **[Open]**
 ([9.19 Open questions](#919-open-questions)). A Module-typed parameter therefore names exactly one
 run in each run of its module. A `Txn` member reached through it is a bare variable reference, as
-through a run name.
+through a run name (**[Planned]**).
 
 ### 9.9 Running
 
@@ -4050,8 +4050,8 @@ Each run performs its module's top level, with its parameters bound to its argum
   route is unique across all runs. A conflict is an error at both `run` statements.
 - Its own runs run with it, and their run paths extend its own.
 
-**[Planned]** Runs share state only by being passed: a module passes one run to others as an
-argument. A shared run holds no state ([9.7 Importing asserts no IO and no
+Runs share state only by being passed: a module passes one run to others as an argument. A shared
+run holds no state ([9.7 Importing asserts no IO and no
 state](#97-importing-asserts-no-io-and-no-state)):
 
 ```python
@@ -4068,8 +4068,8 @@ by its qualified name. For mutable state, modules add visibility and nothing els
 - **[Planned]** A qualified reference is a bare variable reference, so `eu::stock` may be passed to
   a `Mut` parameter under the downward-only discipline of [8.1 Mutation is explicit: the `:=`
   operator](#81-mutation-is-explicit-the--operator).
-- **[Planned]** A public feed is fed and read through a qualified reference. Append merges
-  commutatively, so several writers are a feed's semantics.
+- A public feed is fed and read through a qualified reference. Append merges commutatively, so
+  several writers are a feed's semantics.
 - A module that keeps its state private and exports functions over it relies on functions that
   capture mutable variables ([4.1 `def` — function definition](#41-def--function-definition)) and
   that run inside their caller's transaction
@@ -4141,11 +4141,11 @@ A tag's qualifier precedes its backtick, so the backtick still opens the tag: ``
 constructs `mod2`'s `` `some ``, `` {mod2::`some{Int} | `none} `` is a variant type over it, and
 `` case mod2::`some(v): `` matches it.
 
-The qualifier is `this`, an import name, a run name, or a member bound to one of them
-(**[Planned]**). Record and variant types stay structural
-([3.15 Variant constructors](#315-variant-constructors)), and two modules agree on a type by naming
-the same labels. `{audit_api::app: String}` written in `storefront` is the type `audit_api` writes
-as `{app: String}`. Within one file this changes nothing.
+The qualifier is `this`, an import name, a run name, or a member bound to one of them. Record and
+variant types stay structural ([3.15 Variant constructors](#315-variant-constructors)), and two
+modules agree on a type by naming the same labels. `{audit_api::app: String}` written in
+`storefront` is the type `audit_api` writes as `{app: String}`. Within one file this changes
+nothing.
 
 - **[Open]** — a syntax that aliases another module's label or tag, so the importer writes it
   unqualified.

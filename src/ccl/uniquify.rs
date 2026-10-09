@@ -450,7 +450,7 @@ impl Uniquifier {
             // then gives way to its body below. An alias statement among a module's
             // top-level statements leaves the statements below it top-level.
             TypedExprNode::LetType { ty, body, .. } => {
-                self.ty(ty);
+                ty.walk_types_mut(&mut |ty| self.ty(ty));
                 self.top_level = top_level;
                 self.expr(body);
             }

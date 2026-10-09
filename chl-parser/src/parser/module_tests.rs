@@ -672,12 +672,34 @@ fn a_case_pattern_takes_a_qualified_tag() {
     assert_eq!(patterns, [(vec!["mod2"], "some"), (vec![], "none")]);
 }
 
+// ---- Module types ---------------------------------------------------------
+
+/// `Module{name: T, …}` is a Module type, each entry a member's name and type,
+/// and `Module{}` has no entries (`docs/chl-spec.md`, "9.8 Module types").
+#[test]
+fn a_module_type_lists_its_members() {
+    let Expr::ModuleType(entries) = parse_e("Module{count: Int, bump: Int => Int}") else {
+        panic!("expected a Module type");
+    };
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["count", "bump"]);
+    assert!(matches!(parse_e("Module{}"), Expr::ModuleType(entries) if entries.is_empty()));
+}
+
+#[test]
+fn a_module_types_braces_hold_members() {
+    assert_error(
+        "param m: Module{Int,}\n",
+        "a Module type lists its members as `name: T`",
+    );
+}
+
 // ---- programs -------------------------------------------------------------
 
 /// The root and the library of the worked example in `docs/modules.md`,
 /// "Worked example: two storefronts and an audit log". Its other files use
-/// surface that does not parse yet: a feed declared without an initializer, a
-/// `Module{…}` type, and postfix `!`.
+/// surface that does not parse yet: a feed declared without an initializer, and
+/// postfix `!`.
 #[test]
 fn the_worked_example_root_and_library_parse() {
     parse_m(indoc! {"

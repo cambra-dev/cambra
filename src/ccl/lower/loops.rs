@@ -1368,18 +1368,12 @@ fn lower_loop_body_chain_scoped(
             // read-your-writes environment and hoists it out of the loop.
             ChlStmt::Expr(value)
                 if let ChlExpr::Feed {
-                    target: feed_target,
+                    target,
                     value: feed_value,
                 } = &value.node =>
             {
-                let defer_name = match &feed_target.node {
-                    ChlExpr::Name(id) => id.as_str().to_string(),
-                    _ => {
-                        return Err(LoweringError::unsupported(
-                            feed_target.span,
-                            "feed target: only simple name targets are supported",
-                        ));
-                    }
+                let Some(defer_name) = feed_target(target, "feed target", ctx)? else {
+                    return Ok(Expr::error());
                 };
                 let lowered = lower_expr(feed_value, ctx)?;
                 let feed = ctx.tag_image(Expr::feed(defer_name, lowered), value.span);
