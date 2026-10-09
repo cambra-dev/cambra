@@ -79,6 +79,7 @@ use std::collections::HashMap;
 
 use crate::ccl::ccl_utils::PredMemo;
 use crate::ccl::{Expr, Name, Type, TypedBinding, TypedExprNode};
+use crate::chl_parser::ModulePath;
 
 /// Every **distinct** refinement-predicate term reachable from `expr`, as a
 /// multiset of their id-sets, deduped by `Rc` pointer.
@@ -133,14 +134,18 @@ fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::Node
 /// before channelization. The pass is idempotent, so the second run changes
 /// nothing lowering minted.
 pub fn run(expr: Expr) -> Expr {
-    run_in(expr, &HashMap::new())
+    run_in(expr, &HashMap::new(), None)
 }
 
-/// [`run`] with `scope` beneath every binder of `expr`: a raw reference that no
-/// binder of `expr` binds resolves to the name `scope` maps its spelling to. A
-/// module's `use` names enter its tree this way (`docs/modules.md`, "`use`
-/// names are environment entries, not bindings").
-pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>) -> Expr {
+/// [`run`] on the tree of one module, with `scope` beneath every binder of
+/// `expr`: a raw reference that no binder of `expr` binds resolves to the name
+/// `scope` maps its spelling to. A module's `use` names enter its tree this way
+/// (`docs/modules.md`, "`use` names are environment entries, not bindings").
+///
+/// `home` is the module path of an imported module, whose top-level binders are
+/// minted with it as their [`Name::home`]. A top-level binder is one on the
+/// chain of `let` and `LetType` bodies from the root of `expr`.
+pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>, home: Option<&ModulePath>) -> Expr {
     debug_assert!(
         scope.values().all(|name| !name.is_raw()),
         "uniquify: a scope entry is a minted name"
@@ -159,6 +164,8 @@ pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>) -> Expr {
     let before_preds = distinct_predicate_terms(&expr);
 
     let mut u = Uniquifier {
+        home: home.cloned(),
+        top_level: true,
         env: scope
             .iter()
             .map(|(spelling, name)| (spelling.clone(), vec![name.clone()]))
@@ -206,6 +213,14 @@ pub fn run_in(mut expr: Expr, scope: &HashMap<String, Name>) -> Expr {
 }
 
 struct Uniquifier {
+    /// The module whose top-level binders this run mints, if it is an imported
+    /// one ([`run_in`]).
+    home: Option<ModulePath>,
+    /// Whether the node being entered is on the chain of `let` and `LetType`
+    /// bodies from the root, where a `let` binds a member of the module. Each
+    /// node clears it on entry, and a top-level `let` or `LetType` sets it again
+    /// for its body.
+    top_level: bool,
     /// Lexical environment: source spelling → stack of minted names, the
     /// innermost binder last. Raw `Var`s resolve to the top of their
     /// spelling's stack.
@@ -238,6 +253,7 @@ struct Uniquifier {
 
 impl Uniquifier {
     fn expr(&mut self, e: &mut Expr) {
+        let top_level = std::mem::replace(&mut self.top_level, false);
         // Anchor-borne types first: `ty` is a lowering `Hole` almost
         // everywhere, but user annotations (and a few stamped types) can
         // carry refinement predicates whose free variables live in the
@@ -325,7 +341,9 @@ impl Uniquifier {
             } => {
                 self.expr(bound_expr);
                 self.binding_tys(binding);
-                let base = self.bind(binding);
+                let home = if top_level { self.home.clone() } else { None };
+                let base = self.bind_in(binding, home);
+                self.top_level = top_level;
                 self.expr(body);
                 self.unbind(base);
             }
@@ -416,9 +434,11 @@ impl Uniquifier {
             // A type alias's predicates resolve here, in the scope its declaration
             // sees. Every use of the alias shares these predicate terms, and a
             // predicate is rebuilt once, so the uses get this resolution. The node
-            // then gives way to its body below.
+            // then gives way to its body below. An alias statement among a module's
+            // top-level statements leaves the statements below it top-level.
             TypedExprNode::LetType { ty, body, .. } => {
                 self.ty(ty);
+                self.top_level = top_level;
                 self.expr(body);
             }
 
@@ -476,11 +496,16 @@ impl Uniquifier {
     /// module docs) is left as-is and binds nothing: its bound variables were
     /// resolved when it was minted.
     fn bind(&mut self, b: &mut TypedBinding) -> Option<String> {
+        self.bind_in(b, None)
+    }
+
+    /// [`Self::bind`], minting the binder with `home` as its [`Name::home`].
+    fn bind_in(&mut self, b: &mut TypedBinding, home: Option<ModulePath>) -> Option<String> {
         if !b.name.is_raw() {
             return None;
         }
         let base = b.name.base().to_string();
-        let fresh = Name::fresh(&base);
+        let fresh = Name::fresh_in(&base, home);
         self.env
             .entry(base.clone())
             .or_default()
@@ -844,6 +869,39 @@ mod tests {
         assert_eq!(n.base(), "never_bound");
     }
 
+    /// A module's top-level `let`s, the chain of `let` bodies from the root, are
+    /// minted with the module as their home, and every other binder without one.
+    #[test]
+    fn top_level_binders_are_minted_with_their_home() {
+        let catalog = ModulePath::new(["catalog".into()]);
+        // let a = (let b = 1 in b) in let f = λ x → x in f
+        let expr = run_in(
+            Expr::let_bind(
+                "a",
+                Expr::let_bind("b", Expr::lit(Lit::Int(1)), Expr::var("b")),
+                Expr::let_bind(
+                    "f",
+                    Expr::lambda("x", Type::Hole, Expr::var("x")),
+                    Expr::var("f"),
+                ),
+            ),
+            &HashMap::new(),
+            Some(&catalog),
+        );
+        let mut homes = Vec::new();
+        fn collect(e: &Expr, out: &mut Vec<(String, Option<ModulePath>)>) {
+            e.walk_binders(|b| out.push((b.name.base().to_string(), b.name.home().cloned())));
+            e.walk_children(|c| collect(c, out));
+        }
+        collect(&expr, &mut homes);
+        homes.sort_by(|l, r| l.0.cmp(&r.0));
+        let at_home = |base: &str| homes.iter().find(|(b, _)| b == base).unwrap().1.clone();
+        assert_eq!(at_home("a"), Some(catalog.clone()));
+        assert_eq!(at_home("f"), Some(catalog));
+        assert_eq!(at_home("b"), None);
+        assert_eq!(at_home("x"), None);
+    }
+
     /// A scope entry sits beneath every binder: a free reference resolves to it,
     /// and a binder of the same spelling shadows it.
     #[test]
@@ -857,6 +915,7 @@ mod tests {
                 Expr::lambda("f", Type::Hole, Expr::var("f")),
             ]),
             &scope,
+            None,
         );
         let TypedExprNode::Tuple(items) = &expr.node else {
             panic!("expected a tuple");

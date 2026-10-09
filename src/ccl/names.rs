@@ -47,6 +47,7 @@
 //! the spelling is unambiguous in almost every rendering. `Debug` surfaces the
 //! `uid` for [`Name::Unique`].
 
+use crate::chl_parser::ModulePath;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -227,8 +228,16 @@ pub enum Name {
     /// Lowering's output; identity is the string. See module docs.
     Raw(String),
     /// A uniquified source binder; identity is `uid`, `base` is the source
-    /// spelling kept as display metadata.
-    Unique { base: String, uid: Uid },
+    /// spelling kept as display metadata. `home` is the imported module whose
+    /// top-level member it binds, and `None` for any other binder: a local, or
+    /// a member of the root (`docs/modules.md`, "Names carry their home"). It
+    /// is display metadata too, and set where the name is minted, so a binder
+    /// and its uses carry the same one.
+    Unique {
+        base: String,
+        uid: Uid,
+        home: Option<ModulePath>,
+    },
     /// A compiler-introduced binder; identity is `uid`, `kind` is its
     /// provenance and whole display (no source spelling — that was noise).
     Synthetic { kind: SyntheticKind, uid: Uid },
@@ -267,9 +276,24 @@ impl Name {
     /// thing that should produce a [`Name::Unique`] (a compiler-introduced
     /// binder is a [`Name::Synthetic`], not this).
     pub fn fresh(base: impl Into<String>) -> Self {
+        Self::fresh_in(base, None)
+    }
+
+    /// [`Name::fresh`] for a binder whose home is `home`: the top-level member
+    /// `base` of an imported module.
+    pub fn fresh_in(base: impl Into<String>, home: Option<ModulePath>) -> Self {
         Name::Unique {
             base: base.into(),
             uid: Uid::fresh(),
+            home,
+        }
+    }
+
+    /// The imported module whose top-level member this binds, if it binds one.
+    pub fn home(&self) -> Option<&ModulePath> {
+        match self {
+            Name::Unique { home, .. } => home.as_ref(),
+            _ => None,
         }
     }
 
@@ -523,6 +547,13 @@ impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
+            // An imported module's member renders qualified, in every module's
+            // diagnostics alike.
+            Name::Unique {
+                base,
+                home: Some(home),
+                ..
+            } => write!(f, "{home}::{base}"),
             _ => f.write_str(self.base()),
         }
     }

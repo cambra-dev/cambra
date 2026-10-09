@@ -483,7 +483,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             interfaces.insert(file, None);
             continue;
         };
-        let chain = uniquify::run_in(chain, &ctx.module.use_scope());
+        let chain = uniquify::run_in(chain, &ctx.module.use_scope(), Some(&path));
         let interface = Interface::of_chain(path, &chain, &top_level_bindings(&ast.body), |name| {
             ctx.is_mut_param_fn(name)
         });
@@ -502,7 +502,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
     let lowered = lower_stmts(ast, ctx);
     errors.extend(lowered.errors);
     let value = lowered.value.map(|root| {
-        let root = uniquify::run_in(root, &ctx.module.use_scope());
+        let root = uniquify::run_in(root, &ctx.module.use_scope(), None);
         chains
             .into_iter()
             .rev()
