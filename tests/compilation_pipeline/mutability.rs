@@ -1,7 +1,6 @@
 //! Mutation loops: loop-carried accumulators, multi-accumulator loops, and
 //! feeds interleaved with mutations.
 
-use cambra::chl_parser::SourceMap;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -9,6 +8,7 @@ use bit_set::BitSet;
 use indoc::indoc;
 
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, render_errors};
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
@@ -580,14 +580,14 @@ fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
 fn expect_mut_discipline_error(code: &str, needle: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<mut-discipline-test>", code);
-    let errs = match compile_program(&mut ctx, &sources, consumer) {
+    let loaded = LoadedProgram::from_text("<mut-discipline-test>", code);
+    let errs = match compile_program(&mut ctx, &loaded, consumer) {
         Ok(_) => panic!(
             "expected a Mut-discipline error containing {needle:?}, but the program compiled"
         ),
         Err(e) => e,
     };
-    let rendered = render_errors(&errs, &sources);
+    let rendered = render_errors(&errs, loaded.sources());
     assert!(
         rendered.contains(needle),
         "expected a Mut-discipline error containing {needle:?}, got:\n{rendered}"
@@ -598,10 +598,10 @@ fn expect_mut_discipline_error(code: &str, needle: &str) {
 fn compile_errors(code: &str) -> String {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<compile-error-test>", code);
-    match compile_program(&mut ctx, &sources, consumer) {
+    let loaded = LoadedProgram::from_text("<compile-error-test>", code);
+    match compile_program(&mut ctx, &loaded, consumer) {
         Ok(_) => panic!("expected a compile error, but the program compiled"),
-        Err(errs) => render_errors(&errs, &sources),
+        Err(errs) => render_errors(&errs, loaded.sources()),
     }
 }
 
@@ -1351,8 +1351,8 @@ fn rule1_selected_mut_argument_is_rejected() {
 fn tuple_of_mut_reads_compiles_as_values() {
     let code = "x := 1\ny := 0\nfor i in [1, 2, 3]:\n    y := y + i\n    x := x * i\n(x, y)";
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single("<tuple-mut-reads>", code);
-    compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::from_text("<tuple-mut-reads>", code);
+    compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
 }
 
 /// A top-level mutable write as the program's *final* statement — no trailing
@@ -1364,8 +1364,8 @@ fn tuple_of_mut_reads_compiles_as_values() {
 fn final_mutable_write_with_no_read_compiles_as_unit() {
     let code = "cnt := 0\ncnt += 1";
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single("<final-mutable-write>", code);
-    compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::from_text("<final-mutable-write>", code);
+    compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
 }
 
 /// I1(a): a `Mut(…)` accumulator loop as the program's *final* statement, with
@@ -1378,8 +1378,8 @@ fn final_mutable_write_with_no_read_compiles_as_unit() {
 fn final_mutation_loop_with_no_read_compiles_as_unit() {
     let code = "total := 0\nfor i in [1, 2, 3]:\n    total += i";
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single("<final-mutation-loop>", code);
-    compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::from_text("<final-mutation-loop>", code);
+    compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
 }
 
 // ===== Bottom-PR review regressions: Mut scoping / guards =====
@@ -1701,14 +1701,14 @@ fn trailing_hidden_writer_loop_compiles() {
     let code = "def bump(c: Mut(Int)):\n    c += 1\ncnt: Mut(Int) := 0\nfor x in [1, 2, 3]:\n    bump(cnt)";
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let result = compile_program(&mut ctx, &sources, consumer);
+    let loaded = LoadedProgram::test(code);
+    let result = compile_program(&mut ctx, &loaded, consumer);
     assert!(
         result.is_ok(),
         "expected a trailing hidden-writer loop to compile, got:\n{}",
         result
             .err()
-            .map(|e| render_errors(&e, &sources))
+            .map(|e| render_errors(&e, loaded.sources()))
             .unwrap_or_default()
     );
 }
@@ -2390,12 +2390,12 @@ fn a_domain_mismatch_whose_sides_render_alike_reports_its_cause() {
     "#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<identical-rendering-test>", code);
-    let errs = match compile_program(&mut ctx, &sources, consumer) {
+    let loaded = LoadedProgram::from_text("<identical-rendering-test>", code);
+    let errs = match compile_program(&mut ctx, &loaded, consumer) {
         Ok(_) => panic!("the annotation binds its own witness, so the comprehension is rejected"),
         Err(e) => e,
     };
-    let rendered = render_errors(&errs, &sources);
+    let rendered = render_errors(&errs, loaded.sources());
     assert!(
         rendered.contains("First structural difference"),
         "the report quotes where the two sides diverge rather than asserting an \

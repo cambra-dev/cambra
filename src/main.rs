@@ -1,11 +1,11 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc, thread, time::Duration};
+use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc, thread, time::Duration};
 
 use cambra::{
     ccl::{
-        context::{GlobalContext, ReuseTally, eprint_errors},
+        context::{CompileError, GlobalContext, ReuseTally, eprint_errors},
+        load::{LoadError, LoadedProgram},
         provenance::NodeId,
     },
-    chl_parser::SourceMap,
     control_port::{ControlPort, ControlReply, ControlRequest},
     inspector_server::{live::LiveChannel, serve_compiled},
     interpreter::{
@@ -17,7 +17,7 @@ use cambra::{
             window_tail,
         },
     },
-    live_program::{LiveProgram, render_unreadable},
+    live_program::{LiveProgram, ReloadError, render_unreadable},
 };
 use log::debug;
 
@@ -40,21 +40,21 @@ fn poll_control(
     const POSTED: &str = "<new>";
     let reply = match message.request() {
         ControlRequest::Diff { code, phase } => {
-            let sources = SourceMap::single(POSTED, code.as_str());
-            match live.diff_against(ctx, &sources, *phase) {
+            let loaded = LoadedProgram::from_text(POSTED, code.as_str());
+            match live.diff_against(ctx, &loaded, *phase) {
                 Ok(report) => ControlReply::ok(format!(
                     "{}{}",
                     report.diff,
                     render_unreadable(&report.unreadable)
                 )),
-                Err(e) => ControlReply::rejected(e.render(&sources)),
+                Err(e) => ControlReply::rejected(posted_rejection(&e, &loaded)),
             }
         }
         ControlRequest::Reload { code } => {
-            let sources = SourceMap::single(POSTED, code.as_str());
+            let loaded = LoadedProgram::from_text(POSTED, code.as_str());
             // A rebuilt operator's producer takes the scheduler's probe slot
             // when it is built, as the first compile's did.
-            match live.reload(ctx, &sources, main_consumer) {
+            match live.reload(ctx, &loaded, main_consumer) {
                 Ok(report) => {
                     // The new graph has subscribed but nothing has pulled it, so arm
                     // the driver for one pass.
@@ -66,22 +66,39 @@ fn poll_control(
                         render_unreadable(&report.unreadable),
                     ))
                 }
-                Err(e) => ControlReply::rejected(e.render(&sources)),
+                Err(e) => ControlReply::rejected(posted_rejection(&e, &loaded)),
             }
         }
     };
     message.answer(reply);
 }
 
-/// Runs a Cambra program from a source string.
+/// The reply refusing a posted version.
 ///
-/// `src_name` is the label shown in error reports (typically the input
-/// file name). Returns `Err(())` if compilation failed; the errors have
-/// already been rendered to stderr by [`eprint_errors`], so the caller's
-/// job is just to exit non-zero.
+/// A posted version is its root file alone, so a version naming a module that
+/// is not under the std root fails to load it. The reply says so, since the
+/// same version read from disk would find the module's file.
+fn posted_rejection(error: &ReloadError, loaded: &LoadedProgram) -> String {
+    let mut reply = error.render(loaded.sources());
+    let names_a_module = matches!(error, ReloadError::Compile(errs) if errs
+        .iter()
+        .any(|e| matches!(e, CompileError::Load(LoadError::Missing { .. }))));
+    if names_a_module {
+        reply.push_str(
+            "note: a posted version is a single file, so a program of several modules cannot \
+             be reloaded yet\n",
+        );
+    }
+    reply
+}
+
+/// Runs a loaded Cambra program.
+///
+/// Returns `Err(())` if compilation failed; the errors have already been
+/// rendered to stderr by [`eprint_errors`], so the caller's job is just to exit
+/// non-zero.
 fn run_program(
-    src_name: &str,
-    code: &str,
+    loaded: &LoadedProgram,
     inspect_port: Option<u16>,
     control_port: Option<u16>,
 ) -> Result<(), ()> {
@@ -96,11 +113,10 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single(src_name, code);
-    let mut live = match LiveProgram::start(&mut ctx, &sources, &main_consumer) {
+    let mut live = match LiveProgram::start(&mut ctx, loaded, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
-            eprint_errors(&errs, &sources);
+            eprint_errors(&errs, loaded.sources());
             return Err(());
         }
     };
@@ -110,7 +126,11 @@ fn run_program(
     // replaces neither the panes nor `source_node_ids` below: see
     // `src/inspector_model/design.md`, "A reload is not followed".
     let mut inspection = match inspect_port {
-        Some(port) => match serve_compiled(live.program(), src_name, port) {
+        Some(port) => match serve_compiled(
+            live.program(),
+            loaded.sources().path(loaded.sources().root()),
+            port,
+        ) {
             Ok(channel) => Some(Inspection::new(
                 channel,
                 ctx.scheduler().probes().clone(),
@@ -465,17 +485,20 @@ fn main() {
         std::process::exit(1);
     });
 
-    let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
+    let loaded = LoadedProgram::read(Path::new(&input_file)).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
 
     match mode {
         Mode::DumpSnapshot => {
             println!(
                 "{}",
-                cambra::inspector_server::snapshot_body_pretty(&code, &input_file)
+                cambra::inspector_server::snapshot_body_pretty(&loaded)
             );
         }
         Mode::InspectOnly { port } => {
-            if let Err(e) = cambra::inspector_server::serve(&code, &input_file, port) {
+            if let Err(e) = cambra::inspector_server::serve(&loaded, port) {
                 eprintln!("error: serving the inspector: {e}");
                 std::process::exit(1);
             }
@@ -484,7 +507,7 @@ fn main() {
             inspect_port,
             control_port,
         } => {
-            if run_program(&input_file, &code, inspect_port, control_port).is_err() {
+            if run_program(&loaded, inspect_port, control_port).is_err() {
                 std::process::exit(1);
             }
 
@@ -502,11 +525,31 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use crate::run_program;
+    use crate::{posted_rejection, run_program};
+    use cambra::ccl::context::{Phase, compile_to};
+    use cambra::ccl::load::LoadedProgram;
+    use cambra::live_program::ReloadError;
     use test_log::test;
 
     #[test]
     fn test_run_program() {
-        run_program("<test>", "x = 1; x", None, None).unwrap();
+        run_program(&LoadedProgram::test("x = 1; x"), None, None).unwrap();
+    }
+
+    /// A posted version naming a module is refused with the reason the module
+    /// has no file: a posted version is one file.
+    #[test]
+    fn a_posted_version_naming_a_module_says_it_is_one_file() {
+        let note = "a program of several modules cannot be reloaded yet";
+        let reject = |code: &str| {
+            let loaded = LoadedProgram::from_text("<new>", code);
+            let errors = compile_to(&loaded, Phase::Lower).unwrap_err();
+            posted_rejection(&ReloadError::Compile(errors), &loaded)
+        };
+        let reply = reject("import catalog\n1\n");
+        assert!(reply.contains("no module `catalog`"), "{reply}");
+        assert!(reply.contains(note), "{reply}");
+        let reply = reject("x = = 1\n");
+        assert!(!reply.contains(note), "{reply}");
     }
 }

@@ -172,7 +172,7 @@ fn collect_uses(
 #[cfg(test)]
 mod tests {
     use crate::ccl::context::{GlobalContext, compile_program};
-    use crate::chl_parser::SourceMap;
+    use crate::ccl::load::LoadedProgram;
     use crate::inspector_model::InspectedProgram;
     use crate::interpreter::Consumer;
     use indoc::indoc;
@@ -182,7 +182,7 @@ mod tests {
     fn resolved(code: &str) -> Vec<(String, String, String)> {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+        let compiled = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
             .expect("program compiles");
         InspectedProgram::new(&compiled)
             .definitions()
@@ -263,7 +263,7 @@ mod tests {
         let code = "x = 1\nx = x + 1\nx\n";
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        let compiled = compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+        let compiled = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
             .expect("program compiles");
         let defs = InspectedProgram::new(&compiled).definitions();
 

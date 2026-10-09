@@ -5,6 +5,7 @@
 //! compilation's [`SourceMap`]. Rendering a diagnostic fetches each label's
 //! file from the map, so one report can label spans in several files.
 
+use crate::module_path::ModulePath;
 use std::sync::{Arc, OnceLock};
 
 /// One file of a compilation: an index into that compilation's [`SourceMap`].
@@ -29,6 +30,8 @@ impl FileId {
 struct SourceFile {
     /// The name diagnostics show for the file.
     path: String,
+    /// The module the file is, or `None` for a root that no module path names.
+    module: Option<ModulePath>,
     text: Arc<str>,
     /// The file's newline index, built the first time a diagnostic renders a
     /// span in it.
@@ -51,17 +54,37 @@ impl SourceMap {
         sources
     }
 
-    /// Add a file and return the id its spans carry.
+    /// Add a file that no module path names and return the id its spans carry.
     pub fn add(&mut self, path: impl Into<String>, text: impl AsRef<str>) -> FileId {
+        self.push(path.into(), None, text.as_ref())
+    }
+
+    /// Add the file of `module` and return the id its spans carry.
+    pub fn add_module(
+        &mut self,
+        module: ModulePath,
+        path: impl Into<String>,
+        text: impl AsRef<str>,
+    ) -> FileId {
+        self.push(path.into(), Some(module), text.as_ref())
+    }
+
+    fn push(&mut self, path: String, module: Option<ModulePath>, text: &str) -> FileId {
         let id = FileId(
             u32::try_from(self.files.len()).expect("a compilation reads fewer than 2^32 files"),
         );
         self.files.push(SourceFile {
-            path: path.into(),
-            text: Arc::from(text.as_ref()),
+            path,
+            module,
+            text: Arc::from(text),
             lines: OnceLock::new(),
         });
         id
+    }
+
+    /// Every file, in the order added.
+    pub fn files(&self) -> impl Iterator<Item = FileId> + use<> {
+        (0..self.files.len()).map(|i| FileId(i as u32))
     }
 
     /// The compilation's root: the first file added, [`FileId::ROOT`].
@@ -76,6 +99,11 @@ impl SourceMap {
     /// The name diagnostics show for `file`.
     pub fn path(&self, file: FileId) -> &str {
         &self.file(file).path
+    }
+
+    /// The module `file` is, or `None` for a root that no module path names.
+    pub fn module(&self, file: FileId) -> Option<&ModulePath> {
+        self.file(file).module.as_ref()
     }
 
     /// The source text of `file`. Every span in it is a byte range of this

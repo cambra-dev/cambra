@@ -101,7 +101,8 @@ Key shape choices:
 - **Every node carries a span** via `Spanned<T>`, so diagnostics for any
   sub-expression have precise location info. A `Span` is a `FileId` and a byte
   range of that file; the `FileId` indexes the compilation's `SourceMap`
-  (`source_map.rs`), which diagnostics render against. The parser receives the
+  (`source_map.rs`), which diagnostics render against. The map also records the
+  module path of each file that has one. The parser receives the
   `FileId` as chumsky's span context, and chumsky builds every span it derives
   from the end-of-input span's context, so each node's span names the file the
   entry point was given.
@@ -152,6 +153,13 @@ Key shape choices:
   the decorator, where the statement does not start. A renamed run is a
   `Stmt::Run` whose `renamed_from` names the predecessor's run, since the
   decorator changes only which run it pairs with.
+- **A module path has two types.** `ast::ModulePath` is a path as written, each
+  segment with its span. `module_path::ModulePath` is the path itself: interned
+  segments, ordered by spelling, the identity loading keys modules by and the
+  `SourceMap` records per file. `module_path::segment_error` holds the segment
+  rule of [docs/chl-spec.md](../docs/chl-spec.md), "9.15 Module files", which
+  the parser applies to a written path and loading applies to a root file's
+  name.
 - **One production spells a `::` path.** `qualified_name` parses a name and its
   qualifier in every position that names a member: a reference
   (`Expr::Qualified`), a field access's label (`Expr::Attribute`'s

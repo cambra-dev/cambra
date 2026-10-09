@@ -38,6 +38,7 @@
 
 use std::sync::mpsc;
 
+use crate::ccl::load::LoadedProgram;
 use crate::ccl::{
     context::{
         CompileError, CompiledProgram, GlobalContext, Phase, compile_program, compile_replacement,
@@ -60,6 +61,9 @@ pub type MainConsumerFactory<'a> = &'a dyn Fn() -> Box<dyn Consumer>;
 /// A compiled program being driven, and the version-swap operation over it.
 pub struct LiveProgram {
     program: CompiledProgram,
+    /// The files this version was compiled from, kept to compile it again for a
+    /// difference.
+    loaded: LoadedProgram,
     /// The `main` output's producer, held out of `program.outputs` so the other
     /// outputs stay borrowable while the driver pulls it.
     main_producer: Option<Box<dyn TileProducer>>,
@@ -144,25 +148,25 @@ pub fn render_unreadable(unreadable: &[UnreadablePrefix]) -> String {
 }
 
 impl LiveProgram {
-    /// Compile the program rooted at `sources`'s root and subscribe it.
+    /// Compile `loaded` and subscribe it.
     pub fn start(
         ctx: &mut GlobalContext,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<Self, Vec<CompileError>> {
-        Ok(Self::driving(compile_program(
-            ctx,
-            sources,
-            main_consumer(),
-        )?))
+        Ok(Self::driving(
+            compile_program(ctx, loaded, main_consumer())?,
+            loaded.clone(),
+        ))
     }
 
     /// Hold `program`, with its `main` producer moved out of the outputs so the
     /// driver can pull it while the other outputs stay borrowable.
-    fn driving(mut program: CompiledProgram) -> Self {
+    fn driving(mut program: CompiledProgram, loaded: LoadedProgram) -> Self {
         let main_producer = program.main_mut().and_then(|o| o.producer.take());
         LiveProgram {
             program,
+            loaded,
             main_producer,
         }
     }
@@ -194,10 +198,10 @@ impl LiveProgram {
 
     /// The files this version was compiled from.
     pub fn sources(&self) -> &SourceMap {
-        &self.program.sources
+        self.loaded.sources()
     }
 
-    /// Answer what `/diff` asks: how `sources` differs from this version at
+    /// Answer what `/diff` asks: how `loaded` differs from this version at
     /// `phase`, and what reloading it would report.
     ///
     /// Compiles both sides against the running sources and sinks, which opens
@@ -209,12 +213,12 @@ impl LiveProgram {
     pub fn diff_against(
         &self,
         ctx: &GlobalContext,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         phase: Phase,
     ) -> Result<DiffReport, ReloadError> {
         // A version identical to the running one declares the same variables, so
         // none of them is new and the report is empty without being asked.
-        let Some(diff) = self.difference(ctx, sources, phase)? else {
+        let Some(diff) = self.difference(ctx, loaded, phase)? else {
             return Ok(DiffReport {
                 diff: no_difference(phase),
                 unreadable: Vec::new(),
@@ -226,14 +230,14 @@ impl LiveProgram {
         // what separates asking from doing.
         let planned = ctx
             .sources_and_sinks()
-            .compile_to(sources, Phase::Planning)?;
+            .compile_to(loaded, Phase::Planning)?;
         Ok(DiffReport {
             diff,
             unreadable: ctx.unreadable_inputs(&self.program.ast, &planned),
         })
     }
 
-    /// How `sources` differs from this version at `phase`, or `None` where the two
+    /// How `loaded` differs from this version at `phase`, or `None` where the two
     /// are identical.
     ///
     /// The difference alone. What a reload additionally reports rides its
@@ -241,10 +245,10 @@ impl LiveProgram {
     /// neither says the report twice nor compiles the planned tree twice to
     /// derive it.
     ///
-    /// Every error returned renders against `sources`, as the callers render
-    /// them. Recompiling the running version could fail too, and its errors'
+    /// Every error returned renders against `loaded`'s sources, as the callers
+    /// render them. Recompiling the running version could fail too, and its errors'
     /// spans name files of [`Self::sources`], whose [`FileId`]s mean nothing in
-    /// `sources`: rendered there they would point into the wrong text, or at no
+    /// `loaded`'s: rendered there they would point into the wrong text, or at no
     /// file at all. So those are rendered here, against their own map, and
     /// returned as one [`ReloadError::RunningVersion`].
     ///
@@ -252,14 +256,14 @@ impl LiveProgram {
     fn difference(
         &self,
         ctx: &GlobalContext,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         phase: Phase,
     ) -> Result<Option<String>, ReloadError> {
         let old = ctx
             .sources_and_sinks()
-            .compile_to(self.sources(), phase)
+            .compile_to(&self.loaded, phase)
             .map_err(|errs| ReloadError::RunningVersion(render_errors(&errs, self.sources())))?;
-        let new = ctx.sources_and_sinks().compile_to(sources, phase)?;
+        let new = ctx.sources_and_sinks().compile_to(loaded, phase)?;
         let d = diff(&old, &new);
         if d.is_identical() {
             return Ok(None);
@@ -271,7 +275,7 @@ impl LiveProgram {
         )))
     }
 
-    /// Replace this program with the version `sources` describes.
+    /// Replace this program with the version `loaded` describes.
     ///
     /// Rejected when the new version cannot **take over the state**: every
     /// mutable variable the running program holds a value for must be one the
@@ -316,11 +320,11 @@ impl LiveProgram {
     pub fn reload(
         &mut self,
         ctx: &mut GlobalContext,
-        sources: &SourceMap,
+        loaded: &LoadedProgram,
         main_consumer: MainConsumerFactory<'_>,
     ) -> Result<ReloadReport, ReloadError> {
         let diff = self
-            .difference(ctx, sources, Phase::AsOfRead)?
+            .difference(ctx, loaded, Phase::AsOfRead)?
             .unwrap_or_else(|| no_difference(Phase::AsOfRead));
         // This compile binds the ports the new version adds and keeps the
         // listeners, because binding is the one step it and the compile that
@@ -329,7 +333,7 @@ impl LiveProgram {
         // hands the ports back.
         let planned = ctx
             .sources_and_sinks_mut()
-            .compile_to_opening(sources, Phase::Planning)
+            .compile_to_opening(loaded, Phase::Planning)
             .inspect_err(|_| ctx.sources_and_sinks_mut().release_unrouted_ports())?;
 
         // What the new version can take over is read off its planned tree,
@@ -437,8 +441,9 @@ may move between loops.{remedy}",
         // drops the producers, not the program — so the compile below can be told
         // which of its nodes this version already has an operator for.
         let next = Self::driving(
-            compile_replacement(ctx, sources, main_consumer(), &self.program.ast)
+            compile_replacement(ctx, loaded, main_consumer(), &self.program.ast)
                 .expect("a version that compiled to Planning must compile to operators"),
+            loaded.clone(),
         );
         *self = next;
         Ok(ReloadReport {

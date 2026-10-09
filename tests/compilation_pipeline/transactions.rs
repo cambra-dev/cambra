@@ -18,7 +18,6 @@
 //! Translated from the prototype's transaction suite (its `txn x = e` introducer
 //! is the `x: Mut(V, Txn) := e` annotation here).
 
-use cambra::chl_parser::SourceMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -27,6 +26,7 @@ use bit_set::BitSet;
 use bit_vec::BitVec;
 use cambra::ccl::Type;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, render_errors};
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{
     BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
 };
@@ -44,12 +44,12 @@ use indoc::{formatdoc, indoc};
 fn check_compile_error(code: &str, needle: &str) {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<transactional-test>", code);
-    let err = match compile_program(&mut ctx, &sources, consumer) {
+    let loaded = LoadedProgram::from_text("<transactional-test>", code);
+    let err = match compile_program(&mut ctx, &loaded, consumer) {
         Ok(_) => panic!("expected a compile error containing {needle:?}; program compiled"),
         Err(e) => e,
     };
-    let rendered = render_errors(&err, &sources);
+    let rendered = render_errors(&err, loaded.sources());
     assert!(
         rendered.contains(needle),
         "expected compile error to contain {needle:?}; got:\n{rendered}"
@@ -2136,8 +2136,8 @@ fn a_finite_mut_var_completes_despite_a_live_unrelated_writer() {
     )));
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     assert_eq!(stores_in(&compiled.ast), vec!["Txn[a]", "Txn[b]"]);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
@@ -2195,8 +2195,8 @@ fn a_finite_mut_var_completes_despite_a_live_writer_it_shares_a_block_with() {
     )));
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     assert_eq!(
         stores_in(&compiled.ast),
         vec!["Txn[a,b]"],
@@ -2252,8 +2252,8 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
     )));
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     assert_eq!(
         stores_in(&compiled.ast),
         vec!["Txn[total,limit]"],
@@ -2336,7 +2336,7 @@ fn computed_live_cross_endpoint_read_compiles() {
     "#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer)
+    compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
         .expect("a computed live cross-endpoint read should compile to an as-of join");
 }
 
@@ -2362,7 +2362,7 @@ fn live_read_combining_request_and_store_compiles() {
     "#};
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).expect(
+    compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect(
         "a live reply combining the request with a mutable variable read should compile to a zip read",
     );
 }
@@ -2402,8 +2402,8 @@ fn live_reply_combines_request_and_store() {
     )));
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // Drain the commit store first, with no request present: the reader pulls the
@@ -3117,8 +3117,8 @@ fn broadcast_off_async_source_sibling_loop() {
     ctx.register_source(src.clone());
 
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled
         .main_mut()
         .and_then(|o| o.producer.take())
@@ -3275,8 +3275,8 @@ fn live_read_progresses_past_deny() {
     )));
     ctx.register_source(src.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(&mut ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).unwrap_or_render(&loaded);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // Request 0 (req = 100) arrives first and latches whatever the store has then.

@@ -13,7 +13,7 @@
 # (typeclass-solver-resolved, not an effect), summoned implicitly at the call
 # site.  A transaction commits on normal block exit; `abort()` rolls it back.
 
-import http
+import std::http
 
 get_reqs,   get_resps   = http.serve("8080", "GET",  "/get")
 set_reqs,   set_resps   = http.serve("8080", "POST", "/set")

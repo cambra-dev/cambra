@@ -13,6 +13,7 @@
 //! observe the phase qualifications in `src/ccl/design/diffing.md`, "Which phase to diff".
 //! [`diff_programs`] compiles sources to a common requested stop before diffing.
 
+use crate::ccl::load::LoadedProgram;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::mem::Discriminant;
@@ -21,7 +22,6 @@ use super::content_hash::{cast_target_predicates, content_hash, own_hash, resolv
 use super::context::{CompileError, Phase, compile_to};
 use super::scope::{ScopedItem, for_each_scoped_item};
 use super::{Name, TypedExpr};
-use crate::chl_parser::SourceMap;
 
 /// Minimum matched-descendant overlap for `bottom_up` candidate admission.
 const SIMILARITY_THRESHOLD: f64 = 0.5;
@@ -307,18 +307,18 @@ fn anchor_roots(s: &Indexed, d: &Indexed, m: &mut Matching) {
     recover(s, d, ROOT, ROOT, m);
 }
 
-/// Compile two programs, each the root of its own map, to `phase` and diff them — the end-to-end entry
-/// point from source. The classified [`Diff`] borrows the two compiled trees,
+/// Compile two programs to `phase` and diff them — the end-to-end entry point
+/// from source. The classified [`Diff`] borrows the two compiled trees,
 /// which live only for the duration of this call, so the result is delivered to
 /// `f`; return out of it whatever you need to keep (e.g. counts, cloned nodes).
 ///
 /// ```ignore
-/// let (shared, new) = diff_programs(&v1_sources, &v2_sources, Phase::Infer,
+/// let (shared, new) = diff_programs(&v1, &v2, Phase::Infer,
 ///     |d| (d.shared().count(), d.new.len()))?;
 /// ```
 pub fn diff_programs<R>(
-    src: &SourceMap,
-    dst: &SourceMap,
+    src: &LoadedProgram,
+    dst: &LoadedProgram,
     phase: Phase,
     f: impl FnOnce(&Diff) -> R,
 ) -> Result<R, Vec<CompileError>> {
@@ -1664,13 +1664,13 @@ mod tests {
 
     /// Pre-uniquify CCL (`Raw` names, before inference), via the public API.
     fn lower(code: &str) -> TypedExpr {
-        compile_to(&SourceMap::single("<test>", code), Phase::Lower)
+        compile_to(&LoadedProgram::test(code), Phase::Lower)
             .expect("compile to lowered phase should succeed")
     }
 
     /// Post-inference CCL (uniquified, fully typed), via the public API.
     fn lower_and_infer(code: &str) -> TypedExpr {
-        compile_to(&SourceMap::single("<test>", code), Phase::Infer)
+        compile_to(&LoadedProgram::test(code), Phase::Infer)
             .expect("compile to inferred phase should succeed")
     }
 
@@ -2308,8 +2308,8 @@ mod tests {
         "};
 
         let (v1, v2) = (
-            compile_to(&SourceMap::single("<test>", plain), Phase::Infer).unwrap(),
-            compile_to(&SourceMap::single("<test>", extracted), Phase::Infer).unwrap(),
+            compile_to(&LoadedProgram::test(plain), Phase::Infer).unwrap(),
+            compile_to(&LoadedProgram::test(extracted), Phase::Infer).unwrap(),
         );
         assert!(
             !diff(&v1, &v2).divergences().is_empty(),
@@ -2317,8 +2317,8 @@ mod tests {
         );
 
         let (v1, v2) = (
-            compile_to(&SourceMap::single("<test>", plain), Phase::Inline).unwrap(),
-            compile_to(&SourceMap::single("<test>", extracted), Phase::Inline).unwrap(),
+            compile_to(&LoadedProgram::test(plain), Phase::Inline).unwrap(),
+            compile_to(&LoadedProgram::test(extracted), Phase::Inline).unwrap(),
         );
         assert!(
             diff(&v1, &v2).is_identical(),
@@ -2356,8 +2356,8 @@ mod tests {
         "};
 
         let (a, b) = (
-            compile_to(&SourceMap::single("<test>", v1), Phase::Infer).unwrap(),
-            compile_to(&SourceMap::single("<test>", v2), Phase::Infer).unwrap(),
+            compile_to(&LoadedProgram::test(v1), Phase::Infer).unwrap(),
+            compile_to(&LoadedProgram::test(v2), Phase::Infer).unwrap(),
         );
         assert_eq!(
             diff(&a, &b).divergences().len(),
@@ -2366,8 +2366,8 @@ mod tests {
         );
 
         let (a, b) = (
-            compile_to(&SourceMap::single("<test>", v1), Phase::Inline).unwrap(),
-            compile_to(&SourceMap::single("<test>", v2), Phase::Inline).unwrap(),
+            compile_to(&LoadedProgram::test(v1), Phase::Inline).unwrap(),
+            compile_to(&LoadedProgram::test(v2), Phase::Inline).unwrap(),
         );
         assert!(
             diff(&a, &b).divergences().len() > 1,
@@ -2419,8 +2419,8 @@ mod tests {
         ] {
             for (label, src) in corpus {
                 let (a, b) = (
-                    compile_to(&SourceMap::single("<test>", src), phase).expect(label),
-                    compile_to(&SourceMap::single("<test>", src), phase).expect(label),
+                    compile_to(&LoadedProgram::test(src), phase).expect(label),
+                    compile_to(&LoadedProgram::test(src), phase).expect(label),
                 );
                 assert!(
                     diff(&a, &b).is_identical(),
@@ -2637,8 +2637,8 @@ mod tests {
         );
         for phase in [Phase::Channelize, Phase::Planning] {
             let (a, b) = (
-                compile_to(&SourceMap::single("<test>", &v1), phase).expect("v1"),
-                compile_to(&SourceMap::single("<test>", &v2), phase).expect("v2"),
+                compile_to(&LoadedProgram::test(&v1), phase).expect("v1"),
+                compile_to(&LoadedProgram::test(&v2), phase).expect("v2"),
             );
             let r = diff(&a, &b);
             assert!(
@@ -2694,13 +2694,13 @@ mod tests {
             Phase::Planning,
         ] {
             assert!(
-                compile_to(&SourceMap::single("<test>", src), phase).is_err(),
+                compile_to(&LoadedProgram::test(src), phase).is_err(),
                 "a write to an immutable binding must be rejected at {phase:?}",
             );
         }
         // `Lowered` is below every check by construction — it is the tree as
         // lowering built it, and the write is still a `MutWrite` node there.
-        assert!(compile_to(&SourceMap::single("<test>", src), Phase::Lower).is_ok());
+        assert!(compile_to(&LoadedProgram::test(src), Phase::Lower).is_ok());
     }
 
     #[test]
@@ -2715,10 +2715,9 @@ mod tests {
         // `compile_program` runs to, and `CompiledProgram::ast` is its output.
         for src in [FILTER_AGG, JOIN, ACCUM, TXN] {
             let mut ctx = GlobalContext::new();
-            let compiled =
-                compile_program(&mut ctx, &SourceMap::single("<test>", src), Box::new(|| {}))
-                    .unwrap_or_else(|e| panic!("compile_program failed on {src:?}: {e:?}"));
-            let planned = compile_to(&SourceMap::single("<test>", src), Phase::Planning)
+            let compiled = compile_program(&mut ctx, &LoadedProgram::test(src), Box::new(|| {}))
+                .unwrap_or_else(|e| panic!("compile_program failed on {src:?}: {e:?}"));
+            let planned = compile_to(&LoadedProgram::test(src), Phase::Planning)
                 .unwrap_or_else(|e| panic!("compile_to failed on {src:?}: {e:?}"));
             let d = diff(&compiled.ast, &planned);
             assert!(
@@ -2736,11 +2735,9 @@ mod tests {
         // it. `LambdaElim`'s output is one phase above `Planning`.
         let src = FILTER_AGG;
         let mut ctx = GlobalContext::new();
-        let compiled =
-            compile_program(&mut ctx, &SourceMap::single("<test>", src), Box::new(|| {}))
-                .expect("compiles");
-        let earlier =
-            compile_to(&SourceMap::single("<test>", src), Phase::LambdaElim).expect("compiles");
+        let compiled = compile_program(&mut ctx, &LoadedProgram::test(src), Box::new(|| {}))
+            .expect("compiles");
+        let earlier = compile_to(&LoadedProgram::test(src), Phase::LambdaElim).expect("compiles");
         assert!(
             !diff(&compiled.ast, &earlier).is_identical(),
             "a pre-planning tree must not read as the planned one",
@@ -2755,8 +2752,8 @@ mod tests {
         // A filter-threshold edit (`>= 18` → `>= 21`) is reflected at the
         // lowered phase.
         let changed = diff_programs(
-            &SourceMap::single("<test>", FILTER_AGG),
-            &SourceMap::single("<test>", FILTER_AGG_21),
+            &LoadedProgram::test(FILTER_AGG),
+            &LoadedProgram::test(FILTER_AGG_21),
             Phase::Lower,
             |d| d.updated().count(),
         )
@@ -2765,8 +2762,8 @@ mod tests {
 
         // Identical programs diff as identical at the inferred phase.
         let identical = diff_programs(
-            &SourceMap::single("<test>", FILTER_AGG),
-            &SourceMap::single("<test>", FILTER_AGG),
+            &LoadedProgram::test(FILTER_AGG),
+            &LoadedProgram::test(FILTER_AGG),
             Phase::Infer,
             |d| d.is_identical(),
         )
@@ -2784,8 +2781,8 @@ mod tests {
         // the public API handles sources, not just literal programs.
         let prog = "[\"> \" + line for line in stdin()]\n";
         let identical = diff_programs(
-            &SourceMap::single("<test>", prog),
-            &SourceMap::single("<test>", prog),
+            &LoadedProgram::test(prog),
+            &LoadedProgram::test(prog),
             Phase::Infer,
             |d| d.is_identical(),
         )

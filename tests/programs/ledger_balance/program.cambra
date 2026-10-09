@@ -9,7 +9,7 @@
 
 ledger: Feed({amount: Int})
 
-import http
+import std::http
 
 deposit_reqs, deposit_resps = http.serve("8080", "POST", "/deposit")
 balance_reqs, balance_resps = http.serve("8080", "GET", "/balance")

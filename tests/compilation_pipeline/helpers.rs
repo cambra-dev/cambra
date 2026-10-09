@@ -26,7 +26,6 @@
 //! thread-CPU time too — ratio ≈ 1.00 — so a CPU-time bound buys nothing over wall.)
 //! Most tests get 10s; the three heaviest compiles get 30s.
 
-use cambra::chl_parser::SourceMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -35,6 +34,7 @@ use std::rc::Rc;
 use bit_set::BitSet;
 use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
+use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
@@ -65,9 +65,9 @@ pub(crate) fn peak_held_values(code: &str) -> HashMap<String, usize> {
         }
     }
     let mut ctx = GlobalContext::default();
-    let sources = SourceMap::single("<test>", code);
+    let loaded = LoadedProgram::test(code);
     let mut compiled =
-        compile_program(&mut ctx, &sources, Box::new(|| {})).unwrap_or_render(&sources);
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     let producer = compiled
         .main_mut()
         .and_then(|o| o.producer.as_mut())
@@ -103,8 +103,8 @@ pub(crate) fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Exp
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let sources = SourceMap::single("<test>", code);
-    let mut compiled = compile_program(ctx, &sources, consumer).unwrap_or_render(&sources);
+    let loaded = LoadedProgram::test(code);
+    let mut compiled = compile_program(ctx, &loaded, consumer).unwrap_or_render(&loaded);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     let producer = compiled

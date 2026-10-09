@@ -23,10 +23,12 @@
 pub mod ast;
 pub mod builtins;
 pub mod lexer;
+pub mod module_path;
 pub mod parser;
 pub mod source_map;
 
 pub use ast::{Expr, Module, Stmt};
 pub use builtins::{Arity, SurfaceBuiltin, SurfaceBuiltinKind};
+pub use module_path::ModulePath;
 pub use parser::{ParseError, parse_expression, parse_module};
 pub use source_map::{FileId, SourceMap};
