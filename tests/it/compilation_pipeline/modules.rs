@@ -115,6 +115,178 @@ fn an_import_binds_its_alias_and_a_module_imports_another() {
     );
 }
 
+/// `use` binds a member unqualified, under its own name or an alias, and a
+/// generic member keeps its polymorphism (`docs/chl-spec.md`, "9.2 Imports").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_use_item_binds_a_member_unqualified() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import catalog use id, double as twice
+                twice(id(3)) if id(True) else 0
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(6),
+    );
+}
+
+/// A `use` name is in scope throughout its module, above its `import` too.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_use_name_is_in_scope_above_its_import() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                four = double(2)
+                import catalog use double
+                four
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(4),
+    );
+}
+
+/// A local binder shadows a `use` name, a parameter and a binding in a `def`
+/// alike (`docs/chl-spec.md`, "9.6 Qualified references").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_local_shadows_a_use_name() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import catalog use double, limit
+                def by_parameter(double):
+                    double + 1
+                def by_binding(x):
+                    limit = x + 100
+                    limit
+                by_parameter(1) + by_binding(1) + double(limit)
+            "},
+            &[("catalog", CATALOG)],
+        ),
+        Value::Int(2 + 101 + 20),
+    );
+}
+
+/// An imported module's own `use` names resolve within it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_imported_module_uses_a_member_of_another() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import pricing use plus
+                plus(1)
+            "},
+            &[
+                ("base", "pub n = 5\n"),
+                (
+                    "pricing",
+                    indoc! {"
+                        import base use n
+                        pub def plus(x):
+                            x + n
+                    "},
+                ),
+            ],
+        ),
+        Value::Int(6),
+    );
+}
+
+#[rstest]
+#[case::private_member(
+    "import catalog use hidden\n",
+    "`hidden` is private to module `catalog`"
+)]
+#[case::missing_member(
+    "import catalog use missing\n",
+    "module `catalog` has no member `missing`"
+)]
+#[case::type_member(
+    "import catalog use Item\n",
+    "the type member `catalog::Item` is not supported yet"
+)]
+#[case::bound_by_a_member(
+    indoc! {"
+        import catalog use limit
+        limit = 1
+    "},
+    "`limit` is a `use` name, so no member of its module takes it"
+)]
+#[case::bound_by_a_def(
+    indoc! {"
+        import catalog use double
+        def double(x):
+            x
+    "},
+    "`double` is a `use` name, so no member of its module takes it"
+)]
+#[case::an_import_name(
+    indoc! {"
+        import other
+        import catalog use limit as other
+    "},
+    "`other` is an import name, so no binder in its module takes it"
+)]
+#[case::bound_twice(
+    "import catalog use limit, double as limit\n",
+    "`limit` is already a `use` name"
+)]
+#[case::bound_by_two_imports(
+    indoc! {"
+        import catalog use limit
+        import other use x as limit
+    "},
+    "`limit` is already a `use` name"
+)]
+#[case::a_builtin("import catalog use double as sum\n", "`sum` is a builtin")]
+#[timeout(Duration::from_secs(10))]
+fn a_misused_use_item_is_refused(#[case] root: &str, #[case] needle: &str) {
+    assert_refused(
+        &program(
+            &format!("{root}1\n"),
+            &[("catalog", CATALOG), ("other", "pub x = 1\n")],
+        ),
+        needle,
+    );
+}
+
+/// A `use` name spelled like a registered source is refused: the source resolves by its
+/// spelling before scope is consulted, so the name would never reach its member.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_use_name_spelled_like_a_source_is_refused() {
+    use cambra::ccl::{BaseType, Type};
+    use cambra::interpreter::{Extent, TestDataSource};
+    let mut ctx = cambra::ccl::context::GlobalContext::default();
+    ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
+        TestDataSource::new(
+            "orders",
+            Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        ),
+    )));
+    let program = program(
+        "import catalog use double as orders\n1\n",
+        &[("catalog", CATALOG)],
+    );
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        run_program_with_ctx(&mut ctx, &program)
+    }));
+    let Err(payload) = result else {
+        panic!("expected the program not to compile");
+    };
+    let errors = panic_message(&*payload);
+    assert!(
+        errors.contains("`orders` is a registered source"),
+        "{errors}"
+    );
+}
+
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_private_member_is_refused_with_its_declaration() {
@@ -329,19 +501,22 @@ fn an_unsupported_library_statement_is_refused(#[case] library: &str, #[case] ne
     );
 }
 
-/// A reference into a module with errors of its own reports nothing more: the
-/// module's errors account for it.
+/// A reference or a `use` item into a module with errors of its own reports
+/// nothing more: the module's errors account for it.
 #[rstest]
+#[case::qualified(indoc! {"
+    import lib
+    lib::missing
+"})]
+#[case::used(indoc! {"
+    import lib use missing
+    missing
+"})]
 #[timeout(Duration::from_secs(10))]
-fn a_reference_into_a_module_with_errors_adds_no_error() {
-    let errors = compile_errors(&program(
-        indoc! {"
-            import lib
-            lib::missing
-        "},
-        &[("lib", "pub x = = 1\n")],
-    ));
+fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
+    let errors = compile_errors(&program(root, &[("lib", "pub x = = 1\n")]));
     assert!(!errors.contains("has no member"), "{errors}");
+    assert!(!errors.contains("missing"), "{errors}");
 }
 
 /// A module two others import is evaluated once: its bindings stand once in the

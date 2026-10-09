@@ -4122,9 +4122,8 @@ module_path ::= ident ("::" ident)*
 
 - `import a::b` binds the last segment, `b`. `import a::b as c` binds `c`. This departs from
   Python, where `import a.b` binds `a`. The module name an import binds appears in the statement.
-- **[Planned]** `import a::b use f, T as U` binds `b`, and also binds `f` and `U` to the public
-  members `f` and `T` of `a::b`. A `use` item binds an unqualified name; the module name stays bound
-  beside it.
+- `import a::b use f, T as U` binds `b`, and also binds `f` and `U` to the public members `f` and
+  `T` of `a::b`. A `use` item binds an unqualified name; the module name stays bound beside it.
 - An import name begins with a lowercase letter, as a module path segment does
   ([9.15 Module files](#915-module-files)). A `use` alias keeps the case of the member it names,
   `T as U` or `f as g`. Both rules follow from a capitalized name being a type
@@ -4313,8 +4312,9 @@ Module type. `::` separates the name from the member, and `.` stays record proje
   dispatch on the callee. Through a parameter, `p::f(x)` takes its call shape from `f`'s type in the
   parameter's Module type (**[Planned]**).
 - A qualified generic member keeps its polymorphism: `n::id(1)` and `n::id("a")` both check.
-- **[Planned]** Names bound by `use` are ordinary names and may be shadowed by locals. A member of
-  the importing module with the same spelling is an error naming both sites.
+- A name bound by `use` is in scope throughout its module, including above the statement, as an
+  import name is. A local may shadow it. A member of the importing module with the same spelling is
+  an error naming both sites.
 
 ### 9.7 Importing asserts no IO
 
