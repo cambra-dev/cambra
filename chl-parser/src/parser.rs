@@ -2125,26 +2125,11 @@ fn assign_stmt<'src>(
     Ok(Spanned::new(span, stmt))
 }
 
-/// The `case` arms of a `match`, over a parser for how an arm's body is spelled.
-///
-/// Two spellings reach this: an indented block (the statement form) and a
-/// single expression (the one-line form). They differ in the body and in
-/// nothing else, so the pattern grammar and the default-arm rule are written
-/// here once and both spellings build the same [`MatchArm`].
-///
-/// The arm list is greedy over `case` and stops at the first token that cannot
-/// begin an arm. `case` is a keyword, so no arm body can continue across one.
-///
-/// A pattern spells its tag exactly as a constructor does — `` `tag(binder) ``
-/// — so an arm reads as the inverse of what it matches. `case _:` is the
-/// **default arm**, and takes no backtick: `_` is not a tag, it is the absence
-/// of one. Accepting it here rather than as a tag named `_` is what keeps it
-/// from silently matching nothing, since no constructor can spell that name.
-///
-/// The payload position takes a name or `_`. `_` is the **unused-binder**
-/// spelling — the arm has a payload and declines to read it — so it maps to
-/// [`PayloadPattern::Ignored`] rather than to a variable called `_`: nothing
-/// may refer to it.
+/// Parse one or more `case` arms with a supplied block or expression-body parser.
+/// `case` delimits consecutive arms. The payload has three distinct states: named,
+/// ignored (`_`), or absent; a default has no pattern and cannot bind a payload.
+/// Lowering checks duplicate tags and default ordering.
+/// See `docs/chl-spec.md`, "4.10 `match` — tag dispatch".
 fn match_arms<'src, I, B>(body: B) -> impl Parser<'src, I, Vec<MatchArm>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
