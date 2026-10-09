@@ -1044,11 +1044,9 @@ impl TileProducer for MemoProducer {
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
         input.compact();
-        // Everything merged into the cache is released, because the cache cannot take a
-        // value twice: a second delivery of one is a position delivered twice, which
-        // `Tile::merge` rejects. What the release leaves behind may still be the keys of open
-        // groups, which grow by key, and join-shaped values, which combine; a plain value
-        // left there is one the input will deliver again.
+        // The release must cover the plain values merged into the cache; see
+        // `src/interpreter/design-operators.md`, "The release contract".
+        // Open-group keys and join-shaped values may remain; the check excludes plain values.
         #[cfg(debug_assertions)]
         {
             let mut unreleased = input.clone();
