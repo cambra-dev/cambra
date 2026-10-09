@@ -65,8 +65,8 @@
 //! Throughout this module, a **channel** is the expression that
 //! resolves a deferred binding: the value the cluster's let-wrap
 //! ultimately binds to `d_i`.  For a single `<<` feed the channel is
-//! that feed's value (possibly `Unit`-lifted to `Fun(Unit, T)` at
-//! top level); for multiple feeds it is their `++`-union; for feeds
+//! that feed's value, lifted to `Fun(Unit, T)` at top level whatever `T`
+//! is; for multiple feeds it is their `++`-union; for feeds
 //! inside an iteration scope it is the companion `Apply`/`Compose`/
 //! `Loop` that mirrors the iteration shape and yields the feed value
 //! instead of `Unit`.
@@ -2012,6 +2012,13 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 chan_names.insert(binding.name.clone(), n);
             }
             ctx.defer_decls.insert(binding.name.clone(), node_id);
+            // And each defer's element type, which types the union of its feeds.
+            let mut elements: HashMap<Name, Type> = HashMap::new();
+            if let Some(element) =
+                handle_element(&binding.ty).or_else(|| handle_element(&bound_expr.ty))
+            {
+                elements.insert(binding.name.clone(), element);
+            }
             let mut defer_names = vec![binding.name];
             let mut current_body = *body;
             loop {
@@ -2028,6 +2035,11 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                             chan_names.insert(b.name.clone(), n);
                         }
                         ctx.defer_decls.insert(b.name.clone(), cur_let_id);
+                        if let Some(element) =
+                            handle_element(&b.ty).or_else(|| handle_element(&be.ty))
+                        {
+                            elements.insert(b.name.clone(), element);
+                        }
                         defer_names.push(b.name);
                         current_body = *inner;
                     }
@@ -2053,7 +2065,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // defer whose handle survives in a type does not.
             let _g =
                 provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
-            channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
+            channelize_cluster(&defer_names, &chan_names, &elements, body_rewritten, ctx)
         }
         TypedExprNode::Let {
             binding,
@@ -2216,6 +2228,12 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
     }
 }
 
+/// The element type of a feed handle: what one `<<` appends. It types a channel's union
+/// ([`copair_type`]), and decides nothing about the channel's shape.
+fn handle_element(ty: &Type) -> Option<Type> {
+    ty.as_feed().map(|(_, element)| element.clone())
+}
+
 /// Process a cluster of consecutive `let d_i = Defer in …` bindings.
 ///
 /// Walks `body` once per defer to extract its feeds/defines, then emits
@@ -2233,6 +2251,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
 fn channelize_cluster(
     defer_names: &[Name],
     chan_names: &HashMap<Name, Name>,
+    elements: &HashMap<Name, Type>,
     body: Expr,
     ctx: &mut ChannelizeCtx,
 ) -> Result<Expr, Located<DeferError>> {
@@ -2276,7 +2295,7 @@ fn channelize_cluster(
                 return Err(ctx.at_declaration(DeferError::NoFeedOrDefine(name.clone())));
             }
             (true, Some((_, d))) => d,
-            (false, None) => combine_feed_values(feeds),
+            (false, None) => combine_feed_values(feeds, elements.get(name)),
             (false, Some((define_id, _))) => {
                 return Err(Located::new(
                     DeferError::FeedsAndDefinesMixed(name.clone()),
@@ -2748,10 +2767,10 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
 ///
 /// The union is stamped with its type at construction (mirroring
 /// `emit_copair`): one `FieldKey::Index(i)` domain tag per operand
-/// `i`, over the shared element codomain. A defer-read operand contributes
-/// its handle's rigid `ChanDom` domain, closed by the final
+/// `i`, over the shared element codomain, `element` where the handle states it. A
+/// defer-read operand contributes its handle's rigid `ChanDom` domain, closed by the final
 /// [`erase_chan_domains`] substitution.
-fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
+fn combine_feed_values(mut feeds: Vec<Expr>, element: Option<&Type>) -> Expr {
     debug_assert!(!feeds.is_empty());
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
@@ -2759,8 +2778,8 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
     // `copair_type` stamps one `Index(i)` tag per operand, while `Expr::copair`
     // *splices* an operand that is itself a copairing — so a `Copair` feed value would
     // leave the node with more operands than its type has tags. It cannot arise here: a
-    // feed value is a lambda, a compose or an apply, because a collection-valued feed
-    // is rejected at inference before channelize runs. The splice is silent, so state
+    // feed value is a lambda, a compose or an apply, because a feed outside any iteration
+    // is lifted into a lambda however its value is built. The splice is silent, so state
     // the precondition rather than leaving a future feed path to discover it.
     debug_assert!(
         !feeds
@@ -2770,7 +2789,7 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
          splices it and the stamped type's {} tags no longer describe the node's operands",
         feeds.len()
     );
-    let ty = copair_type(&feeds);
+    let ty = copair_type(&feeds, element);
     Expr::copair(feeds).with_ty(ty)
 }
 
@@ -2780,7 +2799,12 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
 /// function-shaped type at all (the untyped-mode pipeline); a defer-read
 /// operand is function-shaped via its handle's read view, so typed-mode
 /// unions are concrete-modulo-`ChanDom` at construction.
-fn copair_type(feeds: &[Expr]) -> Type {
+///
+/// `cod` is `element`, the channel's element type off its handle, where the handle states
+/// one: inference constrains every contribution into it, so it is their join. Two jagged rows
+/// `box([1])` and `box([2, 3])` differ in their witness kinds, which the join below, over
+/// refinements only, does not reach.
+fn copair_type(feeds: &[Expr], element: Option<&Type>) -> Type {
     let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
     let mut cod: Option<Type> = None;
     for (i, f) in feeds.iter().enumerate() {
@@ -2827,7 +2851,7 @@ fn copair_type(feeds: &[Expr]) -> Type {
             _ => return Type::Hole,
         }
     }
-    match cod {
+    match element.cloned().or(cod) {
         Some(c) => Type::data_fun(Type::variant(tags), c),
         None => Type::Hole,
     }
@@ -2938,19 +2962,12 @@ fn extract_for_defer_impl(
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
         TypedExprNode::Feed { name, value } if &name == defer_name => {
-            // Top-level (non-iteration) Feeds carry scalar values that need
-            // lifting to `Fun(Unit, T)` to match the defer-handle's
-            // expected function shape (the consumer compiles to a
-            // Function operator with Unit domain).  Inside an
-            // iteration scope (Lambda body / Loop body), the surrounding
-            // Compose/Loop machinery already provides the function shape,
-            // so we leave the value scalar — the Compose-with-Lambda case
-            // above wraps it with its own `λ x → V` companion.
-            //
-            // A feed whose value is *already* a collection (`Fun(D, T)`)
-            // contributes its whole extent. It is not lifted (that would
-            // double-wrap it as `Fun(Unit, Fun(D, T))`); it joins the channel
-            // union directly.
+            // A feed outside any iteration contributes one element, keyed by the unit: its
+            // value is lifted to `Unit ⤇ 𝑉`, whatever 𝑉 is, a collection included
+            // (`docs/chl-spec.md`, "3.7 Feed operator `<<`": the stream's element type is the
+            // type of the value). Inside an iteration scope (a lambda or loop body) the
+            // surrounding generator supplies the keys, so the value stays an element: the
+            // Compose-with-Lambda case above wraps it with its own `λ x → V` companion.
             let value = *value;
             let feed = node_id;
             let _g = provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
@@ -2958,12 +2975,6 @@ fn extract_for_defer_impl(
                 Contribution {
                     value,
                     levels: 0,
-                    feed,
-                }
-            } else if matches!(value.ty.peel_refinements(), Type::Fun { .. }) {
-                Contribution {
-                    value,
-                    levels: 1,
                     feed,
                 }
             } else {

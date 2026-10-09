@@ -64,6 +64,7 @@ const LIVE: &[&str] = &[
     "comp_source_in_loop",
     "defer_feed",
     "feed",
+    "feed_collection",
     "feed_in_loop",
     "function_arg",
     "groupby_source",
@@ -899,8 +900,14 @@ fn program(skeleton: &Skeleton, filler: &Filler, placement: &[usize]) -> String 
 /// compare the answer, so the compiler's verdict is taken first and the comparison only
 /// happens when both sides produced a value.
 fn classify(source: &str) -> Outcome {
-    let interpreted = catch_unwind(AssertUnwindSafe(|| run_interpreted(source)));
-    let compiled = catch_unwind(AssertUnwindSafe(|| run_compiled(source)));
+    compare(source, source)
+}
+
+/// [`classify`] over two programs: `compiled` through the compiler and `interpreted` through
+/// the differential interpreter. [`classify`] passes one program as both.
+fn compare(compiled: &str, interpreted: &str) -> Outcome {
+    let interpreted = catch_unwind(AssertUnwindSafe(|| run_interpreted(interpreted)));
+    let compiled = catch_unwind(AssertUnwindSafe(|| run_compiled(compiled)));
 
     let c = match compiled {
         Err(payload) => return Outcome::CompilerPanics(first_line(&panic_message(&*payload))),
@@ -1272,24 +1279,28 @@ fn run_cells(rows: impl Fn(&Skeleton) -> bool) -> BTreeMap<String, Outcome> {
     outcomes
 }
 
-/// The comparison can see a disagreement: `feed_collection/list_lit` is one.
+/// The comparison can see a disagreement: two programs whose values differ are compared, one
+/// through each side, as one program's two answers would be.
 #[test]
 fn the_comparison_discriminates() {
-    let (skeletons, fillers) = (skeletons(), fillers());
-    let s = skeletons
-        .iter()
-        .find(|s| s.name == "feed_collection")
-        .unwrap();
-    let f = fillers.iter().find(|f| f.name == "list_lit").unwrap();
-    let outcome = classify(&program(s, f, &[]));
+    let outcome = compare(
+        indoc! {r#"
+            out = test_sink()
+            out << 1
+        "#},
+        indoc! {r#"
+            out = test_sink()
+            out << 2
+        "#},
+    );
     assert!(
         matches!(outcome, Outcome::Disagrees { .. }),
         "expected a disagreement, got {outcome:?}"
     );
 }
 
-/// The collection-feed defect is one cause whatever collection is fed: the interpreter nests
-/// the compiled value under the unit key.
+/// One side nesting the other under a key is one cause whatever is nested: the signature names
+/// the key and leaves the nested values out.
 #[test]
 fn a_disagreement_is_keyed_by_its_structure_not_its_values() {
     let value = |source: &str| {

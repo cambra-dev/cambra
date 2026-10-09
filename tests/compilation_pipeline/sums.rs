@@ -366,8 +366,8 @@ fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
 /// **Rows at differing domains merged by two appends or by a keyed write do not compile.**
 /// Neither site hands its rows a demand the way a list literal does
 /// (`src/ccl/planning/conditionals.rs`, `child_demand`). These pin the failures as they stand:
-/// two `<<` appends fail the free-witness check in a debug build and the post-planning type
-/// check in a release one, and the keyed write fails group-by recognition's type check.
+/// two `<<` appends reach planning's refusal of a row it cannot place, and the keyed write
+/// fails group-by recognition's type check.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::two_appends(
@@ -377,7 +377,7 @@ fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
         x << box([2, 3])
         sum([sum(r) for r in x])
     "},
-    if cfg!(debug_assertions) { "free witness reference" } else { "post-planning produced an invalid tree" }
+    "a row read from a mutable variable is not supported yet"
 )]
 #[case::keyed_write(
     indoc! {r#"
