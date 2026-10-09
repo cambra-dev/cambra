@@ -439,8 +439,6 @@ pub enum DiscardHead {
         path: WrittenPath,
         alias: Option<Spanned<SmolStr>>,
     },
-    /// `import m` — the shared run of `m`, and every variable it held.
-    Import { path: WrittenPath },
 }
 
 /// One branch of an [`Stmt::If`]: a guard and the body to run when it holds.
