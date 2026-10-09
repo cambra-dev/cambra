@@ -1487,9 +1487,6 @@ where
                 .ignore_then(module_path())
                 .then(module_alias)
                 .map(|(path, alias)| DiscardHead::Run { path, alias }),
-            just(Token::Import)
-                .ignore_then(module_path())
-                .map(|path| DiscardHead::Import { path }),
             binder.map(DiscardHead::Name),
         ));
         let decorator_arg = select! { Token::Ident(s) => s }

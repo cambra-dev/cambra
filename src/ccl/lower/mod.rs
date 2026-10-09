@@ -454,7 +454,7 @@ pub struct LoweringContext {
     /// [`begin_module`](Self::begin_module).
     pub(super) module: modules::ModuleScope,
     /// Where the module being lowered performs IO, if it does: the first call to
-    /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
+    /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
     pub(super) io_site: Option<Span>,
 }
 
@@ -1064,7 +1064,7 @@ fn lower_expr_inner(
         // A member of another module lowers to the binder its module's chain
         // minted for it (`modules`).
         ChlExpr::Qualified(q) => Ok(match ctx.member(q, expr.span)? {
-            Some(member) => Expr::var(member),
+            Some(member) => Expr::var(member.name),
             None => Expr::error(),
         }),
         ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
@@ -1317,8 +1317,8 @@ pub fn lower_library(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringR
 
 /// Where `module`, an imported module, binds a sink: the first statement that
 /// declares one, which makes importing it an error (`docs/chl-spec.md`, "9.7
-/// Importing asserts no IO"). Reading a source is the other IO a module can
-/// perform, and lowering records it ([`LoweringContext::io_site`]).
+/// Importing asserts no IO and no state"). Reading a source is the other IO a
+/// module can perform, and lowering records it ([`LoweringContext::io_site`]).
 pub fn sink_site(module: &ChlModule) -> Option<Span> {
     module.body.iter().find_map(|stmt| {
         let inner = match &stmt.node {
@@ -1331,6 +1331,27 @@ pub fn sink_site(module: &ChlModule) -> Option<Span> {
             }
             _ => None,
         }
+    })
+}
+
+/// The first statement at `module`'s top level that declares or writes mutable
+/// state: a mutable variable, a write to one, a loaded declaration, or a
+/// deferred output's definition. Such a module is run and not imported
+/// (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+pub fn state_site(module: &ChlModule) -> Option<Span> {
+    module.body.iter().find_map(|stmt| {
+        let inner = match &stmt.node {
+            ChlStmt::Pub { stmt, .. } => &stmt.node,
+            other => other,
+        };
+        matches!(
+            inner,
+            ChlStmt::MutAssign { .. }
+                | ChlStmt::AugAssign { .. }
+                | ChlStmt::LoadFrom { .. }
+                | ChlStmt::Define { .. }
+        )
+        .then_some(stmt.span)
     })
 }
 
@@ -1453,9 +1474,9 @@ fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> 
                 ChlStmt::MutAssign { .. }
                 | ChlStmt::AugAssign { .. }
                 | ChlStmt::LoadFrom { .. }
-                | ChlStmt::Define { .. } => {
-                    "mutable state in an imported module is not supported yet"
-                }
+                | ChlStmt::Define { .. } => unreachable!(
+                    "`state_site` keeps a module that declares mutable state from lowering"
+                ),
                 _ => {
                     "this statement at an imported module's top level is not supported yet: an \
                      imported module holds value bindings, `def`s and type aliases"

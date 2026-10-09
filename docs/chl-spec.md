@@ -384,7 +384,7 @@ renamed_from_stmt ::= "@" "RenamedFrom" "(" ident ")" NEWLINE run_stmt NEWLINE
 
 -- A declaration head marked gone, by `@Discard`.
 discard_stmt    ::= "@" "Discard" NEWLINE discard_head NEWLINE
-discard_head    ::= ident | "run" module_path [ "as" ident ] | "import" module_path
+discard_head    ::= ident | "run" module_path [ "as" ident ]
 
 -- `pub` before the statement that introduces a member. Any statement parses
 -- after it; one that introduces no member is refused.
@@ -3694,8 +3694,8 @@ stock                         # the predecessor's `stock` is intentionally gone
 ```
 
 A reload that drops a variable holding state is refused without one. The name resolves at its own
-position, outward, as `@LoadFrom`'s does. On a `run` or an `import` statement the tombstone covers
-every variable of that run
+position, outward, as `@LoadFrom`'s does. On a `run` statement the tombstone covers every variable
+of that run
 ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)), and stands at a
 module's top level, as the statement it marks gone does.
 
@@ -3721,8 +3721,9 @@ labels and tags parse. `import` with its `use` clause, `pub`, qualified values, 
 and qualified type aliases lower, and lowering refuses the rest. A module is used in one of two ways:
 
 - **Importing** it brings its public members into scope. Importing asserts that the module performs
-  no IO. Its members and its state exist once in the program, however many modules import it
-  ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+  no IO and declares no mutable state. Its members exist once in the program, however many modules
+  import it ([9.7 Importing asserts no IO and no
+  state](#97-importing-asserts-no-io-and-no-state)).
 - **Running** it performs its top-level computation, public and private: its state, its sources and
   sinks, and its loops. A module may be run any number of times, each run with its own name, its own
   arguments, and its own state.
@@ -3744,9 +3745,9 @@ members ([9.8 Module types](#98-module-types)).
 - **Run.** One running of a module, declared by a `run` statement. A run has a **run name** in the
   module that declares it and a **run path** from the root: `eu`, or `eu::inv` for a run `eu`
   declares.
-- **Shared run.** The one evaluation of an imported module's top level, whose members and state
-  every importer reaches. Its run path is the module path
-  ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+- **Shared run.** The one evaluation of an imported module's top level, whose members every importer
+  reaches. Its run path is the module path
+  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)).
 - **Member.** A binding at a module's top level. Bindings inside a `def`, a loop, or a block are
   **locals**.
 - **Public member.** A member declared with `pub`. Every other member is private to its module.
@@ -3776,7 +3777,8 @@ module_path ::= ident ("::" ident)*
   `T as U` or `f as g`. Both rules follow from a capitalized name being a type
   ([6.1 Direction: term/type syntax split [Decided]](#61-direction-termtype-syntax-split-decided)).
 - An import reaches every public member of the module's shared run. Importing a module that
-  performs IO is an error ([9.7 Importing asserts no IO](#97-importing-asserts-no-io)).
+  performs IO or declares mutable state is an error ([9.7 Importing asserts no IO and no
+  state](#97-importing-asserts-no-io-and-no-state)).
 - An `import` stands at a module's top level. One inside a `def`, a loop, or a block is an error.
 - There is no wildcard `use`. Adding a public member to a module never changes what an importer's
   names mean.
@@ -3943,21 +3945,25 @@ Module type. `::` separates the name from the member, and `.` stays record proje
   import name is. A local may shadow it. A member of the importing module with the same spelling is
   an error naming both sites.
 
-### 9.7 Importing asserts no IO
+### 9.7 Importing asserts no IO and no state
 
-Importing a module asserts that the module performs no IO. A module performs IO when it opens a
-source or binds a sink, or when it runs a module that performs IO. Importing one is an error at the
-`import`, with a secondary label at the IO site. The check is per module: a module that serves a
-route is run, whatever else it exports.
+Importing a module asserts that the module performs no IO and declares no mutable state. A module
+performs IO when it opens a source or binds a sink, or when it runs a module that performs IO. It
+declares mutable state when its top level introduces a mutable variable, writes one, or loads one
+with `@LoadFrom`. Importing either kind of module is an error at the `import`, with a secondary
+label at the IO site or the state. Such a module is run instead. The check is per module: a module
+that serves a route or holds state is run, whatever else it exports.
+
+State therefore belongs to runs. Every piece of state has a run that a `run` statement names, so the
+source says which modules reach it: the module that runs it, and the modules that run handed to.
 
 An imported module's top level is evaluated once, however many modules import it, because its
-members are values it computes and state it declares. That evaluation is the module's **shared
-run**. Every importer reaches the same members, and its state exists once in the program. Its run
-path is the module path, so it never collides with a run a `run` statement names, and a reload pairs
-it by that path ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)).
+members are values it computes. That evaluation is the module's **shared run**. Every importer
+reaches the same members. Its run path is the module path, so it never collides with a run a `run`
+statement names.
 
 ```python
-# inventory.cambra: performs no IO, so it can be imported
+# inventory.cambra: declares state, so it is run and not imported
 stock: Mut(Map(String, Int), Txn) := []
 pub def reserve(sku, qty) requires Transaction:
     …
@@ -3965,10 +3971,8 @@ pub InStock = {String where _ in stock.keys()}   # intended; not supported today
 ```
 
 `InStock` is intended and not supported today, in one file as across modules: the compiler cannot
-name a mutable map's key set in a type. Every importer of `inventory` reaches one `stock` and, once
-that lands, one `InStock`. `run inventory as eu_inv` is a
-separate run with its own `stock`, and `eu_inv::InStock` is a different type from
-`inventory::InStock`.
+name a mutable map's key set in a type. `run inventory as inv` and `run inventory as eu_inv` are two
+runs, each with its own `stock`, and `inv::InStock` is a different type from `eu_inv::InStock`.
 
 A module with a parameter that has no default cannot be imported, since an import supplies no
 arguments.
@@ -4239,22 +4243,18 @@ script-shaped root therefore needs an output sink, which [10. Sinks](#10-sinks) 
 A reload replaces the source of every module, the root's included, and the running program carries
 its state across ([8.8 `@LoadFrom`](#88-loadfrom)):
 
-- **State belongs to runs.** Each run's state is its own. A reload pairs the runs of the two
-  versions by run path, and shared runs by module path. A run the new version adds starts from its
+- **State belongs to runs.** Each run's state is its own, and a shared run holds none
+  ([9.7 Importing asserts no IO and no state](#97-importing-asserts-no-io-and-no-state)). A reload
+  pairs the runs of the two versions by run path. A run the new version adds starts from its
   declared initial values. A run present in both takes over its state, whether its module's source,
   its arguments, or both changed.
 - **Removing a run is deleting stateful code.** A reload that drops a run holding state is refused
   unless the new version marks the removal with `@Discard`
-  ([8.9 `@Discard` [Decided]](#89-discard-decided)), as it must for any deleted variable. A shared
-  run is removed when the last import of its module is, so its tombstone takes the form of the
-  `import` statement:
+  ([8.9 `@Discard` [Decided]](#89-discard-decided)), as it must for any deleted variable:
 
   ```python
   @Discard
   run storefront as us          # everything `us` held is intentionally gone
-
-  @Discard
-  import inventory              # the shared run of `inventory` is intentionally gone
   ```
 
 - **Renaming a run is marked with `@RenamedFrom`.** `@RenamedFrom(eu)` on a `run` statement moves

@@ -12,6 +12,7 @@
 
 use super::{
     LoweringContext, LoweringError, LoweringResult, lower_library, lower_stmts, sink_site,
+    state_site,
 };
 use crate::ccl::load::LoadedProgram;
 use crate::ccl::uniquify::{self, Uniquified};
@@ -39,9 +40,18 @@ pub struct Interface {
     members: HashMap<SmolStr, Member>,
     /// Every top-level type alias, by spelling, public and private alike.
     types: HashMap<SmolStr, TypeMember>,
-    /// Where the module performs IO, which makes importing it an error
-    /// (`docs/chl-spec.md`, "9.7 Importing asserts no IO").
-    pub io_site: Option<Span>,
+    /// Why importing the module is an error, if it is.
+    pub unimportable: Option<Unimportable>,
+}
+
+/// What makes a module one that is run and not imported (`docs/chl-spec.md`,
+/// "9.7 Importing asserts no IO and no state").
+#[derive(Debug, Clone, Copy)]
+pub enum Unimportable {
+    /// The module performs IO here: it opens a source or binds a sink.
+    Io(Span),
+    /// The module declares mutable state here.
+    State(Span),
 }
 
 /// One top-level binding of a module.
@@ -69,14 +79,14 @@ pub struct TypeMember {
 }
 
 impl Interface {
-    /// The interface of a module that performs IO at `io_site`. Importing it is
-    /// refused, so its members are never reached.
-    pub fn performing_io(module: ModulePath, io_site: Span) -> Self {
+    /// The interface of a module that importing is an error for. Each import of
+    /// it is refused, so its members are never reached.
+    pub fn unimportable(module: ModulePath, why: Unimportable) -> Self {
         Interface {
             module,
             members: HashMap::new(),
             types: HashMap::new(),
-            io_site: Some(io_site),
+            unimportable: Some(why),
         }
     }
 
@@ -153,7 +163,7 @@ impl Interface {
             module,
             members,
             types,
-            io_site: None,
+            unimportable: None,
         }
     }
 }
@@ -310,7 +320,7 @@ impl ModuleScope {
         self.uses
             .iter()
             .filter_map(|(name, used)| match &used.reached {
-                Reached::Value(Some(member)) => Some((name.to_string(), member.clone())),
+                Reached::Value(Some(member)) => Some((name.to_string(), member.name.clone())),
                 Reached::Value(None) | Reached::Type(_) => None,
             })
             .collect()
@@ -329,8 +339,8 @@ pub struct Use {
 /// spelling says. Each is `None` when its module has errors of its own.
 #[derive(Debug, Clone)]
 pub enum Reached {
-    /// The member's binder.
-    Value(Option<Name>),
+    /// The member.
+    Value(Option<Member>),
     /// The type the alias names, resolved in its module.
     Type(Option<Type>),
 }
@@ -356,11 +366,20 @@ impl LoweringContext {
     /// (`docs/modules.md`, "The module interface").
     pub(crate) fn begin_module(&mut self, scope: ModuleScope) {
         self.type_aliases.clear();
+        self.mut_param_fns.clear();
         // A `use` type name is in scope throughout its module. One whose module
-        // has errors of its own names no type, and stands for any.
+        // has errors of its own names no type, and stands for any. A `use` name
+        // for a function with a `Mut` parameter takes the curried call shape the
+        // function was lowered with.
         for (name, used) in &scope.uses {
-            if let Reached::Type(ty) = &used.reached {
-                self.declare_type_throughout(name.as_str(), ty.clone().unwrap_or(Type::Hole));
+            match &used.reached {
+                Reached::Type(ty) => {
+                    self.declare_type_throughout(name.as_str(), ty.clone().unwrap_or(Type::Hole));
+                }
+                Reached::Value(Some(member)) if member.mut_param => {
+                    self.register_mut_param_fn(name.as_str());
+                }
+                Reached::Value(_) => {}
             }
         }
         self.module = scope;
@@ -369,7 +388,6 @@ impl LoweringContext {
         self.in_tx_body = false;
         self.type_params_in_scope.clear();
         self.shadow_depth.clear();
-        self.mut_param_fns.clear();
     }
 
     /// Whether `name` is one of this module's import names.
@@ -415,13 +433,13 @@ impl LoweringContext {
         })
     }
 
-    /// The binder the value reference `q` names, or `None` when `q`'s module has
+    /// The member the value reference `q` names, or `None` when `q`'s module has
     /// errors of its own, which already fail the compilation.
     pub(super) fn member(
         &self,
         q: &QualifiedName,
         span: Span,
-    ) -> Result<Option<Name>, LoweringError> {
+    ) -> Result<Option<Member>, LoweringError> {
         self.qualifier_import(q, span, "value")?
             .reach(&q.qualifier[0].node, &q.name.node, span)
     }
@@ -471,10 +489,10 @@ impl LoweringContext {
 }
 
 impl Import {
-    /// The binder of the public member `member`, reached through the import name
-    /// `name` at `span`, or `None` when the module has errors of its own or
-    /// performs IO, each of which is reported where it stands.
-    fn reach(&self, name: &str, member: &str, span: Span) -> Result<Option<Name>, LoweringError> {
+    /// The public member `member`, reached through the import name `name` at
+    /// `span`, or `None` when the module has errors of its own or is not
+    /// importable, each of which is reported where it stands.
+    fn reach(&self, name: &str, member: &str, span: Span) -> Result<Option<Member>, LoweringError> {
         if super::stmts::is_type_name(member) {
             return Err(LoweringError::unsupported(
                 span,
@@ -498,16 +516,7 @@ impl Import {
             )
             .with_note(found.declared, "declared here without `pub`"));
         }
-        if found.mut_param {
-            return Err(LoweringError::unsupported(
-                span,
-                format!(
-                    "`{name}::{member}` takes a `Mut` parameter, and calling such a function \
-                     across modules is not supported yet"
-                ),
-            ));
-        }
-        Ok(Some(found.name.clone()))
+        Ok(Some(found.clone()))
     }
 
     /// The type of the public type alias `member`, reached through the import
@@ -549,7 +558,7 @@ impl Import {
     fn reachable(&self) -> Option<&Interface> {
         self.interface
             .as_deref()
-            .filter(|interface| interface.io_site.is_none())
+            .filter(|interface| interface.unimportable.is_none())
     }
 }
 
@@ -607,13 +616,17 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             &mut errors,
         );
         ctx.begin_module(scope);
-        if let Some(site) = sink_site(ast) {
-            interfaces.insert(file, Some(Rc::new(Interface::performing_io(path, site))));
+        let declared = sink_site(ast)
+            .map(Unimportable::Io)
+            .or_else(|| state_site(ast).map(Unimportable::State));
+        if let Some(why) = declared {
+            interfaces.insert(file, Some(Rc::new(Interface::unimportable(path, why))));
             continue;
         }
         let lowered = lower_library(ast, ctx);
         if let Some(site) = ctx.io_site {
-            interfaces.insert(file, Some(Rc::new(Interface::performing_io(path, site))));
+            let why = Unimportable::Io(site);
+            interfaces.insert(file, Some(Rc::new(Interface::unimportable(path, why))));
             errors.extend(lowered.errors);
             continue;
         }
@@ -703,15 +716,21 @@ fn module_scope(
         let interface = program
             .file_of(&module)
             .and_then(|file| interfaces.get(&file).cloned().flatten());
-        if let Some(site) = interface.as_ref().and_then(|i| i.io_site) {
+        if let Some(why) = interface.as_ref().and_then(|i| i.unimportable) {
+            let (does, site, note) = match why {
+                Unimportable::Io(site) => ("performs IO", site, "the IO it performs"),
+                Unimportable::State(site) => {
+                    ("declares mutable state", site, "the state it declares")
+                }
+            };
             errors.push(
                 LoweringError::unsupported(
                     stmt.span,
                     format!(
-                        "module `{module}` performs IO, so importing it is an error: run it instead"
+                        "module `{module}` {does}, so importing it is an error: run it instead"
                     ),
                 )
-                .with_note(site, "the IO it performs"),
+                .with_note(site, note),
             );
         }
         use_items.extend(uses.iter().map(|item| (name.clone(), item)));
