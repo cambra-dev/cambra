@@ -892,6 +892,9 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // A `Defer` leaf's type was minted during inference (`Feed(ρ)`);
         // like `Var`, the recorded type carries the full load — trust it.
         TypedExprNode::Defer => expr.ty.clone(),
+        TypedExprNode::Abstract => unreachable!(
+            "the linked program holds no `Abstract`: each run binds its module's parameters"
+        ),
 
         // The feed/define/mut-write target lives in the scope Check doesn't
         // maintain (it trusts recorded types), and the contribution/write

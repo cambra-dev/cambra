@@ -191,6 +191,7 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Let**: `let x = e in body`.
 - **LetType** (a type alias declaration, removed by `uniquify`): `let type Name = T` then `in body` on the next line, mirroring `Let`'s layout.
 - **Run** (a `run` statement before linking, which linking replaces with the run's chain): `run name = module` then `in body` on the next line.
+- **Abstract** (a value known only by its type, a module's parameter until a run binds it): `abstract`.
 - **MutDecl** (a mutable variable introduction — the `:=` operator's *declaring* half, the only node that binds a mutable variable): `x : Mut(V, D) := init` then `in body` on the next line, mirroring `Let`'s layout. The type suffix is omitted when the binder type is a bare `_`/`?N`, so a pre-inference introduction renders `x : Mut(_, _) := init`. Erased by the mutability-elimination phases, which turn it and its `MutWrite`s into a `LetRec` recurrence or a chain of shadowing `Let`s.
 - **Comprehension** (the surface comprehension node, which `crate::ccl::comprehension` lowers to the `cast`/`λ`/`▷` encoding between `mut_read` and inference): `[element for x in xs if p]` — the element, then each generator followed by its guards, matching CHL's own spelling: `[e for x in xs if p for y in ys]`.
 - **Aggregate**: `Sum(input)`, `Max(input)`, etc. — the kind name then parens.

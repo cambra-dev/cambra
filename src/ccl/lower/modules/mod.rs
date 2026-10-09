@@ -24,6 +24,7 @@ mod types;
 
 pub use interface::*;
 pub use link::*;
+use parameters::*;
 pub use scope::*;
 use types::*;
 
@@ -38,7 +39,7 @@ use crate::ccl::scope::{ScopedItemMut, for_each_scoped_item_mut};
 use crate::ccl::uniquify;
 use crate::ccl::{Expr, Home, Label, Name, RunPath, Type, TypedExprNode};
 use crate::chl_parser::ast::{
-    AssignTarget, Module as ChlModule, QualifiedName as ParserQualifiedName, Span, Spanned,
+    AssignTarget, Module as ChlModule, QualifiedName as ParserQualifiedName, RunArg, Span, Spanned,
     Stmt as ChlStmt, WrittenPath,
 };
 use crate::chl_parser::{FileId, ModulePath, SurfaceBuiltin};
