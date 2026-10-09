@@ -26,7 +26,7 @@ use cambra::{
     live_program::{LiveProgram, MAIN_BRANCH},
 };
 
-use crate::harness::stdin_across_reload;
+use crate::harness::{OneFile, stdin_across_reload};
 use crate::serving::no_main;
 
 const ITEMS: &str = r#"["a", "b", "c", "d", "e", "f", "g", "h"]"#;
@@ -103,13 +103,13 @@ fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) 
 /// edited, drive to the end, and return everything `main` emitted.
 fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
     let mut ctx = GlobalContext::default();
-    let mut live =
-        LiveProgram::start(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main)
+        .expect("v1 compiles");
     let mut all = Vec::new();
     for _ in 0..pulls {
         all.extend(pull(&mut ctx, &mut live).0);
     }
-    live.reload(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, "!"), &no_main)
+    live.reload_text(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, "!"), &no_main)
         .expect("only the second writer changed");
     for _ in 0..100 {
         let (emitted, done) = pull(&mut ctx, &mut live);
@@ -317,7 +317,8 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
     let mut changed = Vec::new();
     for pulls in 0..=10 {
         let mut ctx = GlobalContext::default();
-        let mut live = LiveProgram::start(&mut ctx, &fold("", "n"), &no_main).expect("compiles");
+        let mut live =
+            LiveProgram::start_text(&mut ctx, &fold("", "n"), &no_main).expect("compiles");
         for _ in 0..pulls {
             let producer = live
                 .main_producer_mut(MAIN_BRANCH)
@@ -325,7 +326,7 @@ fn a_loop_added_over_a_collection_caught_mid_fold_loses_its_prefix() {
             let _ = producer.get(producer.tiling().universal_guard());
             ctx.scheduler().check_for_notifications();
         }
-        live.reload(
+        live.reload_text(
             &mut ctx,
             MAIN_BRANCH,
             &fold(added, r#"n + "|" + p"#),

@@ -32,7 +32,7 @@ use cambra::{
     live_program::{BranchError, LiveProgram, MAIN_BRANCH},
 };
 
-use crate::harness::{launch_under_control, source};
+use crate::harness::{OneFile, launch_under_control, source};
 use crate::serving::{
     exchange, http_get, http_post, no_main, raw_http, raw_http_response, reserve_test_port,
     start_sink,
@@ -415,7 +415,7 @@ fn a_two_branch_diff_compares_current_versions() {
     assert_eq!(across.status, 200, "{}", across.body);
     assert!(across.body.contains("divergence"), "{}", across.body);
     let expected = live
-        .diff_against(
+        .diff_text(
             &ctx,
             MAIN_BRANCH,
             &with_port(DASHED_LOG, port),
@@ -855,13 +855,13 @@ enum Install {
 /// released just before the install.
 fn fold_after(with_lagging_branch: bool, install: Install) -> (i64, Predicate) {
     let (mut ctx, src) = with_src();
-    let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
     assert_eq!(x_of(&live, MAIN_BRANCH), 3);
 
     if with_lagging_branch {
-        live.create_branch(&mut ctx, "lagging", MAIN_BRANCH, FOLD_VIA_VIEW, &no_main)
+        live.create_branch_text(&mut ctx, "lagging", MAIN_BRANCH, FOLD_VIA_VIEW, &no_main)
             .expect("rebuilding the iteration is accepted");
     }
     add(&src, 2, &[4, 8]);
@@ -871,12 +871,12 @@ fn fold_after(with_lagging_branch: bool, install: Install) -> (i64, Predicate) {
 
     let installed = match install {
         Install::Reload => {
-            live.reload(&mut ctx, MAIN_BRANCH, FOLD_VIA_OTHER_VIEW, &no_main)
+            live.reload_text(&mut ctx, MAIN_BRANCH, FOLD_VIA_OTHER_VIEW, &no_main)
                 .expect("rebuilding the iteration is accepted");
             MAIN_BRANCH
         }
         Install::Branch => {
-            live.create_branch(
+            live.create_branch_text(
                 &mut ctx,
                 "child",
                 MAIN_BRANCH,
@@ -956,17 +956,17 @@ const FOLD_PLUS_ZERO: &str = indoc! {r#"
 /// the reload's refusal.
 fn reload_over_a_kept_iteration(with_lagging_branch: bool) -> Result<i64, String> {
     let (mut ctx, src) = with_src();
-    let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
     if with_lagging_branch {
-        live.create_branch(&mut ctx, "lagging", MAIN_BRANCH, FOLD_TIMES_ONE, &no_main)
+        live.create_branch_text(&mut ctx, "lagging", MAIN_BRANCH, FOLD_TIMES_ONE, &no_main)
             .expect("a body edit is accepted");
     }
     add(&src, 2, &[4, 8]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
     assert_eq!(x_of(&live, MAIN_BRANCH), 15);
-    live.reload(&mut ctx, MAIN_BRANCH, FOLD_PLUS_ZERO, &no_main)
+    live.reload_text(&mut ctx, MAIN_BRANCH, FOLD_PLUS_ZERO, &no_main)
         .map_err(|e| format!("{e:?}"))?;
     add(&src, 4, &[16]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
@@ -1015,10 +1015,10 @@ const FOLD_VALUE_AND_BODY_EDITED: &str = indoc! {r#"
 #[test]
 fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
     let (mut ctx, src) = with_src();
-    let mut live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start_text(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     add(&src, 0, &[1, 2]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
-    live.create_branch(&mut ctx, "child", MAIN_BRANCH, FOLD_VALUE_EDITED, &no_main)
+    live.create_branch_text(&mut ctx, "child", MAIN_BRANCH, FOLD_VALUE_EDITED, &no_main)
         .expect("an edit outside the loop is accepted");
 
     add(&src, 2, &[4]);
@@ -1026,7 +1026,7 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
     assert_eq!(x_of(&live, MAIN_BRANCH), 7);
     assert_eq!(x_of(&live, "child"), 7, "one store, run once for both");
 
-    live.reload(&mut ctx, "child", FOLD_VALUE_AND_BODY_EDITED, &no_main)
+    live.reload_text(&mut ctx, "child", FOLD_VALUE_AND_BODY_EDITED, &no_main)
         .expect("a body edit is accepted");
     add(&src, 3, &[8]);
     pull(&mut ctx, &mut live, MAIN_BRANCH);
@@ -1048,7 +1048,7 @@ fn a_store_shared_at_creation_is_unshared_by_the_reload_that_rebuilds_it() {
 #[test]
 fn the_roots_first_version_keeps_nothing() {
     let (mut ctx, _src) = with_src();
-    let live = LiveProgram::start(&mut ctx, FOLD, &no_main).expect("v1 compiles");
+    let live = LiveProgram::start_text(&mut ctx, FOLD, &no_main).expect("v1 compiles");
     let info = live.render_info(MAIN_BRANCH).expect("main exists");
     let versions = info.split("\n\n").nth(1).expect("a versions block");
     assert!(versions.starts_with("1\tkept=0/"), "{versions}");

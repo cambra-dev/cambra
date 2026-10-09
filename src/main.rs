@@ -5,6 +5,7 @@ use cambra::{
         context::{GlobalContext, eprint_errors},
         provenance::NodeId,
     },
+    chl_parser::SourceMap,
     control_port::{ControlPort, service},
     inspector_server::{live::LiveChannel, serve_compiled},
     interpreter::{
@@ -84,10 +85,11 @@ fn run_program(
     };
 
     let mut ctx = GlobalContext::default();
-    let mut live = match LiveProgram::start(&mut ctx, code, &main_consumer) {
+    let sources = SourceMap::single(src_name, code);
+    let mut live = match LiveProgram::start(&mut ctx, &sources, &main_consumer) {
         Ok(p) => p,
         Err(errs) => {
-            eprint_errors(&errs, src_name, code);
+            eprint_errors(&errs, &sources);
             return Err(());
         }
     };

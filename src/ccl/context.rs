@@ -8,15 +8,18 @@ use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
 
 use crate::chl_parser;
+use crate::chl_parser::ast::Span;
 use crate::chl_parser::parser::ParseError;
+use crate::chl_parser::source_map::{SourceMap, report_config};
 use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Name, anf, channelize,
+        Expr, Name, Type, anf, channelize, comprehension,
         infer::{
-            InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
-            check_pre_channelize, infer, typecheck,
+            InferError, LocatedInferError, TypeInferenceContext, check_mut_discipline,
+            check_mut_write_targets, check_pre_channelize, check_pre_channelize_located, infer,
+            typecheck,
         },
         inline, lambda_elim,
         lower::{LoweredRoute, LoweringContext, LoweringError, lower_stmts},
@@ -24,8 +27,9 @@ use crate::{
         panes::gate_leaks,
         planning,
         provenance::{
-            Leak, LoweringSession, NodeId, PhaseScope, ProvenanceTable, SourceProjection,
-            TableSession, fold, fold_lowering,
+            DerivationLog, DerivationSession, Leak, Located, LoweringSession, NodeId, PhaseScope,
+            ProvenanceTable, SourceProjection, TableSession, fold, fold_derivation, fold_lowering,
+            with_active_table,
         },
         symbolic::{symbolic, symbolic_typed},
         transact_phase, uniquify,
@@ -50,28 +54,24 @@ use crate::{
 
 /// One error a user can hit when compiling a CHL program.
 ///
-/// Variants are tagged by the pipeline phase that produced them — parsing,
-/// lowering (unsupported construct), type inference, lambda elimination,
-/// defer/feed resolution, or operator-graph conversion. Phase-internal
-/// consistency checks (`typecheck`, `check_fully_typed` between phases,
-/// lambda-elim of a typed tree) are invariants — they panic with `.expect`
-/// because firing them indicates a compiler bug, not user error.
+/// Every variant but [`CompileError::Internal`] carries a [`Span`], so every
+/// error in the program renders as an ariadne report pointing into its source.
+/// The front end raises errors holding a span. Every pass after lowering raises
+/// a [`Located`] error, whose node resolves to a span at the pipeline boundary
+/// (`Blame`, in this module). Phase-internal consistency checks (`typecheck` and
+/// `check_pre_channelize` between phases) are invariants: they panic, because
+/// firing one is a compiler bug, not a user error.
 ///
-/// [`compile_program`] returns `Result<_, Vec<CompileError>>`: when multiple
-/// phases produce errors (e.g. parse errors plus a lowering error in a
-/// statement unaffected by the parse hole), every error is returned in one
-/// pass instead of giving up at the first failing phase. Each entry is
-/// single-phase; the parser's multi-error output is flattened into one
+/// [`compile_program`] returns `Result<_, Vec<CompileError>>`: the parser and
+/// lowering each report every error they find, and lowering runs on the parser's
+/// partial tree, so one pass returns all of both. Type inference runs only on a
+/// program both accept, and reports one error per failing statement. Each entry
+/// is single-phase; the parser's multi-error output is flattened into one
 /// [`CompileError::Parse`] per [`ParseError`].
 ///
-/// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
-/// span-carrying inference errors get ariadne reports with underlines; the
-/// remaining variants render as plain `error: …` lines. The same
-/// [`CompileError`]s feed the web [`Diagnostic`](crate::inspector_model::Diagnostic)
-/// JSON path via [`diagnostics_from_compile_errors`](crate::inspector_model::diagnostics_from_compile_errors)
-/// — one error model, two renderers. Lambda-elim/conversion spans remain
-/// future work; the enum is shaped so they migrate without changing the
-/// list-of-errors return contract.
+/// [`eprint_errors`] and [`render_errors`] render for a terminal; the web
+/// [`Diagnostic`](crate::inspector_model::Diagnostic) JSON path reads
+/// [`Self::message`] and [`Self::span`] — one error model, two renderers.
 #[derive(Debug)]
 pub enum CompileError {
     /// The parser rejected one token / token sequence.
@@ -79,193 +79,205 @@ pub enum CompileError {
     /// The (parseable) AST uses a construct the lowering phase does not
     /// support yet.
     Lower(LoweringError),
+    /// Type inference rejected one expression, or a post-inference check that
+    /// reports an [`InferError`] did: the second-class `Mut` discipline, a write
+    /// to a binding that is not a mutable variable, or an ambiguous program.
+    Infer {
+        /// The underlying inference error (its `Debug` impl is the human message).
+        error: InferError,
+        /// Where it was raised.
+        span: Span,
+        /// The other positions the error involves, each with its label's text
+        /// (`src/ccl/design/diagnostics.md`, "Secondary labels").
+        related: Vec<(Span, &'static str)>,
+    },
     /// Defer/Feed/Define channelization rejected the program (e.g. a defer
     /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
     /// `<<=` inside a non-top-level scope).
     ///
-    /// Channelization runs *after* inference (so type errors report against
+    /// Channelization runs after inference (so type errors report against
     /// the user's program shape); a program with both a type error and a
-    /// structural defer error therefore surfaces only the type error
-    /// first.
-    ChannelizeDefers(channelize::DeferError),
-    /// Type inference rejected one expression.
-    ///
-    /// `span` is the offending source range, resolved at the `compile_program`
-    /// boundary via the `lowering_projection` one-hop lookup. `None` when no
-    /// precise node was known (coalesce/scope errors, or a caller without the table) —
-    /// the error then renders as a plain `error: …` line instead of an ariadne
-    /// report with source context.
-    Infer {
-        /// The underlying inference error (its `Debug` impl is the human message).
-        error: InferError,
-        /// The resolved source span, when known.
-        span: Option<chl_parser::ast::Span>,
+    /// structural defer error therefore surfaces only the type error.
+    ChannelizeDefers {
+        /// The underlying channelization error.
+        error: channelize::DeferError,
+        /// The declaration of the deferred binding the error is about.
+        span: Span,
     },
-    /// Lambda elimination failed.
-    ///
-    /// `span` is resolved at the `compile_program` boundary the way
-    /// [`Infer`](Self::Infer)'s is, for an error that names the node it refuses.
-    LambdaElim {
-        error: lambda_elim::LambdaElimError,
-        span: Option<chl_parser::ast::Span>,
+    /// A post-inference phase rejected the program for a reason that only
+    /// becomes visible after inlining and type inference — e.g. a nested
+    /// transaction reaching a `with begin():` block via a function call, or a
+    /// mutable variable referenced after its `await_final`.
+    Unsupported {
+        /// Why the program is rejected.
+        message: String,
+        /// Where.
+        span: Span,
     },
-    /// Operator-graph conversion failed.
-    Conversion(ConversionError),
-    /// A post-inference phase rejected the program for a semantic reason that
-    /// only becomes visible after inlining / type inference — e.g. a nested
-    /// transaction reaching a `with begin():` block via a function call, or an
-    /// induction-only / guarded-write transaction block. These run on a
-    /// lambda-free / inlined tree whose nodes carry no source span, so they
-    /// render as a plain `error: …` line rather than an ariadne report.
-    Unsupported(String),
+    /// A phase failed on a program it does not handle yet: a limitation of the
+    /// compiler, not a mistake in the program.
+    ///
+    /// The one variant with no span. These phases (the as-of read rewrite, lambda
+    /// elimination, operator conversion) run on trees rebuilt from nodes lowering
+    /// never saw, so there is no source position to report.
+    Internal {
+        /// The phase that failed, which the rendered message names.
+        stage: &'static str,
+        /// What it failed on.
+        message: String,
+    },
 }
 
 impl CompileError {
-    /// Render this single error as a plain-ASCII string with source-code context.
-    ///
-    /// - [`CompileError::Parse`], [`CompileError::Lower`], and a
-    ///   span-carrying [`CompileError::Infer`] are rendered via ariadne with
-    ///   colour disabled (gutter, source line, underlines, labels — all in
-    ///   Unicode box-drawing). Suitable for panic messages, log files,
-    ///   snapshots, or piping through grep.
-    /// - The remaining variants (and a spanless `Infer`) render as plain
-    ///   `error: …` lines.
+    /// The error's own message, with no span or stage: what the terminal report
+    /// labels its span with.
+    pub fn message(&self) -> String {
+        match self {
+            CompileError::Parse(e) => e.to_string(),
+            CompileError::Lower(e) => e.to_string(),
+            CompileError::Infer { error, .. } => format!("{error:?}"),
+            CompileError::ChannelizeDefers { error, .. } => error.to_string(),
+            CompileError::Unsupported { message, .. } | CompileError::Internal { message, .. } => {
+                message.clone()
+            }
+        }
+    }
+
+    /// The source span the error points at: every variant's but
+    /// [`CompileError::Internal`]'s.
+    pub fn span(&self) -> Option<Span> {
+        match self {
+            CompileError::Parse(e) => Some(e.span()),
+            CompileError::Lower(e) => Some(e.span()),
+            CompileError::Infer { span, .. }
+            | CompileError::ChannelizeDefers { span, .. }
+            | CompileError::Unsupported { span, .. } => Some(*span),
+            CompileError::Internal { .. } => None,
+        }
+    }
+
+    /// Render this single error as a plain-ASCII string with source-code context,
+    /// against `sources`, the map of the compilation that produced the error.
+    /// Colour is off, so the output suits panic messages, log files, snapshots,
+    /// and piping through grep.
     ///
     /// To render a whole [`Vec<CompileError>`] from `compile_program`, use
     /// [`render_errors`].
-    pub fn render(&self, src_name: &str, src: &str) -> String {
+    pub fn render(&self, sources: &SourceMap) -> String {
+        let Rendering { report, detail } = self.rendering(sources, false);
         let mut buf: Vec<u8> = Vec::new();
-        match self {
-            CompileError::Parse(e) => {
-                e.to_report_with_config(src_name, ariadne::Config::default().with_color(false))
-                    .write((src_name, ariadne::Source::from(src)), &mut buf)
-                    .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::Lower(e) => {
-                e.to_report_with_config(src_name, ariadne::Config::default().with_color(false))
-                    .write((src_name, ariadne::Source::from(src)), &mut buf)
-                    .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::ChannelizeDefers(e) => {
-                buf.extend_from_slice(format!("error: deferred collection: {e}\n").as_bytes());
-            }
-            CompileError::Infer {
-                error,
-                span: Some(span),
-            } => {
-                infer_report(
-                    error,
-                    *span,
-                    src_name,
-                    ariadne::Config::default().with_color(false),
-                )
-                .write((src_name, ariadne::Source::from(src)), &mut buf)
-                .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::Infer { error, span: None } => {
-                buf.extend_from_slice(format!("error: type inference: {error:?}\n").as_bytes());
-            }
-            CompileError::LambdaElim {
-                error,
-                span: Some(span),
-            } => {
-                use ariadne::{Color, Label, Report, ReportKind};
-                Report::build(ReportKind::Error, src_name, span.start)
-                    .with_config(ariadne::Config::default().with_color(false))
-                    .with_message(error.to_string())
-                    .with_label(
-                        Label::new((src_name, (*span).into()))
-                            .with_message(error.to_string())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .write((src_name, ariadne::Source::from(src)), &mut buf)
-                    .expect("ariadne write should not fail on Vec<u8>");
-            }
-            CompileError::LambdaElim { error, span: None } => {
-                buf.extend_from_slice(format!("error: {error}\n").as_bytes());
-            }
-            CompileError::Conversion(e) => {
-                buf.extend_from_slice(
-                    format!("error: operator-graph conversion: {e:?}\n").as_bytes(),
-                );
-            }
-            CompileError::Unsupported(msg) => {
-                buf.extend_from_slice(format!("error: {msg}\n").as_bytes());
-            }
-        }
+        report
+            .write(sources, &mut buf)
+            .expect("ariadne write should not fail on Vec<u8>");
+        buf.extend_from_slice(detail.as_bytes());
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// Print this single error to stderr.
-    ///
-    /// [`CompileError::Parse`] and [`CompileError::Lower`] use ariadne's
-    /// coloured `eprint`; the other variants emit a plain `error: …` line
-    /// via [`Self::render`].
-    pub fn eprint(&self, src_name: &str, src: &str) {
-        match self {
+    /// Print this single error to stderr, in colour, against `sources`.
+    pub fn eprint(&self, sources: &SourceMap) {
+        let Rendering { report, detail } = self.rendering(sources, true);
+        report
+            .eprint(sources)
+            .expect("ariadne eprint should not fail on stderr");
+        eprint!("{detail}");
+    }
+
+    fn rendering(&self, sources: &SourceMap, color: bool) -> Rendering {
+        let (title, span) = match self {
             CompileError::Parse(e) => {
-                e.to_report(src_name)
-                    .eprint((src_name, ariadne::Source::from(src)))
-                    .expect("ariadne eprint should not fail on stderr");
+                return Rendering {
+                    report: e.to_report(color),
+                    detail: String::new(),
+                };
             }
-            CompileError::Lower(e) => {
-                e.to_report(src_name)
-                    .eprint((src_name, ariadne::Source::from(src)))
-                    .expect("ariadne eprint should not fail on stderr");
+            CompileError::Internal { stage, message } => {
+                return Rendering {
+                    report: ariadne::Report::build(ariadne::ReportKind::Error, sources.root(), 0)
+                        .with_config(report_config(color))
+                        .with_message(format!("internal compiler error in {stage}: {message}"))
+                        .finish(),
+                    detail: String::new(),
+                };
             }
-            CompileError::Infer {
-                error,
-                span: Some(span),
-            } => {
-                infer_report(error, *span, src_name, ariadne::Config::default())
-                    .eprint((src_name, ariadne::Source::from(src)))
-                    .expect("ariadne eprint should not fail on stderr");
-            }
-            other => eprint!("{}", other.render(src_name, src)),
-        }
+            CompileError::Lower(e) => ("lowering error", e.span()),
+            CompileError::Infer { span, .. } => ("type inference error", *span),
+            CompileError::ChannelizeDefers { span, .. } => ("deferred collection error", *span),
+            CompileError::Unsupported { span, .. } => ("unsupported program", *span),
+        };
+        let related = match self {
+            CompileError::Infer { related, .. } => related.as_slice(),
+            _ => &[],
+        };
+        span_rendering(title, span, &self.message(), related, sources, color)
     }
 }
 
-/// Build an ariadne report for an inference error pinned to a source span.
-///
-/// Mirrors the parse/lower report builders: the `Debug` impl of [`InferError`]
-/// is already the human-readable message, used as both the report title and the
-/// label. Colour is governed by `config` (off for [`CompileError::render`], on
-/// for [`CompileError::eprint`]), matching the other arms' conventions.
-fn infer_report<'a>(
-    error: &InferError,
-    span: chl_parser::ast::Span,
-    src_name: &'a str,
-    config: ariadne::Config,
-) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
-    use ariadne::{Color, Label, Report, ReportKind};
-    let message = format!("{error:?}");
-    Report::build(ReportKind::Error, src_name, span.start)
-        .with_config(config)
-        .with_message("type inference error")
-        .with_label(
-            Label::new((src_name, span.into()))
-                .with_message(message)
-                .with_color(Color::Red),
-        )
-        .finish()
+/// How one [`CompileError`] renders: an ariadne report, then the lines of its
+/// message after the first, which a label cannot hold.
+struct Rendering {
+    report: ariadne::Report<'static, Span>,
+    /// Empty, or lines each ending in a newline.
+    detail: String,
 }
 
-/// Render every error in `errs` and concatenate the output.
-pub fn render_errors(errs: &[CompileError], src_name: &str, src: &str) -> String {
+/// A report titled `title` that labels `span` with `message`, and each of `related`
+/// with its text.
+///
+/// A label holds one line: ariadne draws a newline in a label's message as a
+/// break in the report's frame. So the label carries the first line and the rest
+/// follow the report. A file with no text has no character for a label to sit
+/// on, and ariadne drops such a label with its message, so there the message
+/// joins the title instead.
+fn span_rendering(
+    title: &str,
+    span: Span,
+    message: &str,
+    related: &[(Span, &'static str)],
+    sources: &SourceMap,
+    color: bool,
+) -> Rendering {
+    use ariadne::{Color, Label, Report, ReportKind};
+    let report =
+        Report::build(ReportKind::Error, span.file, span.start).with_config(report_config(color));
+    if sources.text(span.file).is_empty() {
+        return Rendering {
+            report: report.with_message(format!("{title}: {message}")).finish(),
+            detail: String::new(),
+        };
+    }
+    let (first, rest) = message.split_once('\n').unwrap_or((message, ""));
+    let mut detail = String::new();
+    for line in rest.lines() {
+        detail.push_str(line);
+        detail.push('\n');
+    }
+    Rendering {
+        report: report
+            .with_message(title)
+            .with_label(Label::new(span).with_message(first).with_color(Color::Red))
+            .with_labels(
+                related
+                    .iter()
+                    .map(|(at, text)| Label::new(*at).with_message(*text).with_color(Color::Blue)),
+            )
+            .finish(),
+        detail,
+    }
+}
+
+/// Render every error in `errs` against `sources` and concatenate the output.
+pub fn render_errors(errs: &[CompileError], sources: &SourceMap) -> String {
     let mut s = String::new();
     for e in errs {
-        s.push_str(&e.render(src_name, src));
+        s.push_str(&e.render(sources));
     }
     s
 }
 
-/// Print every error in `errs` to stderr (coloured ariadne output for parse
-/// errors, plain `error: …` lines for the rest).
-pub fn eprint_errors(errs: &[CompileError], src_name: &str, src: &str) {
+/// Print every error in `errs` to stderr, in colour.
+pub fn eprint_errors(errs: &[CompileError], sources: &SourceMap) {
     for e in errs {
-        e.eprint(src_name, src);
+        e.eprint(sources);
     }
 }
 
@@ -275,82 +287,220 @@ impl From<LoweringError> for CompileError {
     }
 }
 
-impl From<lambda_elim::LambdaElimError> for CompileError {
-    fn from(e: lambda_elim::LambdaElimError) -> Self {
-        Self::LambdaElim {
-            error: e,
-            span: None,
+impl From<ConversionError> for CompileError {
+    fn from(e: ConversionError) -> Self {
+        let message = match e {
+            ConversionError::Unsupported(message) => message,
+            ConversionError::TypeError(message) => format!("type error: {message}"),
+        };
+        Self::Internal {
+            stage: "conversion",
+            message,
         }
     }
 }
 
-impl From<channelize::DeferError> for CompileError {
-    fn from(e: channelize::DeferError) -> Self {
-        Self::ChannelizeDefers(e)
-    }
-}
-
-impl From<ConversionError> for CompileError {
-    fn from(e: ConversionError) -> Self {
-        Self::Conversion(e)
-    }
-}
-
-/// Lift a phase-specific error (or `Vec` of them) into the
-/// [`Vec<CompileError>`] channel used by [`compile_program`].
+/// Resolves a [`Located`] error's node to the source span it traces to, through
+/// the lowering projection and the phase projections derived over it.
 ///
-/// The orphan rule prevents `From<X> for Vec<CompileError>` impls, so we go
-/// through a trait. Single-error phases produce a one-element list; the
-/// inference phase flattens its `Vec<InferError>` into one `CompileError`
-/// per inference error.
-pub trait IntoCompileErrors {
-    fn into_compile_errors(self) -> Vec<CompileError>;
+/// A phase projection covers the mints of a phase run under a
+/// [`DerivationSession`], in every compile; today that is the comprehension
+/// phase alone. A node minted after lowering by any other phase (an inlined
+/// body, a monomorphization clone, a predicate inference copied out of an
+/// annotation) has no entry in either. Its span is then, in order of
+/// preference:
+///
+/// 1. that of the nearest node it was derived from, when the compile records
+///    provenance (`compile_program` does; [`compile_to`] does not);
+/// 2. that of the nearest enclosing node in the tree it was found in, when that
+///    tree is at hand;
+/// 3. the whole root file.
+///
+/// Reaching the third means the node lost its provenance: nothing records what it
+/// was derived from, and no tree places it under a node lowering made. A debug
+/// build panics there, so a pass that drops provenance fails the suite rather
+/// than underlining the whole file.
+struct Blame<'a> {
+    projection: &'a SourceProjection,
+    /// The phase projections [`derive`](Self::derive) folded, disjoint from
+    /// `projection`'s keys because a phase mints ids lowering never saw.
+    derived: SourceProjection,
+    /// The span of the whole root file.
+    program: Span,
 }
 
-impl IntoCompileErrors for Vec<InferError> {
-    fn into_compile_errors(self) -> Vec<CompileError> {
-        // Fallback for callers without the `lowering_projection` (i.e. not
-        // `compile_program`): no span resolution, so `span: None`. The
-        // `compile_program` path resolves spans explicitly and constructs the
-        // `Infer` variant itself rather than going through `.errs()`.
-        self.into_iter()
-            .map(|error| CompileError::Infer { error, span: None })
+impl<'a> Blame<'a> {
+    fn new(projection: &'a SourceProjection, sources: &SourceMap) -> Self {
+        let root = sources.root();
+        Blame {
+            projection,
+            derived: SourceProjection::new(),
+            program: Span::new(root, 0, sources.text(root).len()),
+        }
+    }
+
+    /// Fold the derivation log phase `via` wrote into this blame's phase
+    /// projections.
+    fn derive(&mut self, log: &DerivationLog, via: Phase) {
+        let earlier = |id: &NodeId| {
+            self.projection
+                .get(id)
+                .or_else(|| self.derived.get(id))
+                .cloned()
+        };
+        let folded = fold_derivation(log, &earlier, via);
+        self.derived.extend(folded);
+    }
+
+    /// The span `node` traces to, if any. `tree`, when given, is a tree containing
+    /// `node`, whose enclosing nodes the lookup falls back to.
+    fn traced(&self, node: NodeId, tree: Option<&Expr>) -> Option<Span> {
+        let own = |id: &NodeId| {
+            self.projection
+                .get(id)
+                .or_else(|| self.derived.get(id))
+                .and_then(|attr| attr.spans.first().copied())
+        };
+        own(&node)
+            .or_else(|| with_active_table(|table| derived_from(table, node, &own)).flatten())
+            .or_else(|| {
+                tree.and_then(|tree| enclosing(tree, node))
+                    .and_then(|ancestors| ancestors.iter().rev().find_map(own))
+            })
+    }
+
+    /// The span `node` traces to. `tree`, when given, is a tree containing
+    /// `node`, whose enclosing nodes the lookup falls back to.
+    fn span(&self, node: NodeId, tree: Option<&Expr>) -> Span {
+        self.traced(node, tree).unwrap_or_else(|| {
+            if cfg!(debug_assertions) {
+                panic!(
+                    "{node:?} traces to no source span: it is not in the lowering \
+                         projection or a phase projection, no recorded provenance derives it \
+                         from a node that is, and {}",
+                    if tree.is_some() {
+                        "no node enclosing it in the tree is either"
+                    } else {
+                        "no tree was given to search for an enclosing node"
+                    }
+                );
+            }
+            self.program
+        })
+    }
+
+    fn infer(&self, errors: Vec<LocatedInferError>, tree: &Expr) -> Vec<CompileError> {
+        errors
+            .into_iter()
+            .map(|located| {
+                let span = self.span(located.node_id, Some(tree));
+                // A related position is a secondary label only where it is not part of
+                // what the primary one underlines.
+                let within = |inner: Span| {
+                    inner.file == span.file && span.start <= inner.start && inner.end <= span.end
+                };
+                let mut related: Vec<(Span, &'static str)> = Vec::new();
+                for r in located.related.iter() {
+                    let at = match r.origin {
+                        crate::ccl::infer_var::Origin::Node(id) => self.traced(id, Some(tree)),
+                        crate::ccl::infer_var::Origin::Written(at) => Some(at),
+                    };
+                    if let Some(at) = at
+                        && !within(at)
+                        && !related.iter().any(|(seen, _)| *seen == at)
+                    {
+                        related.push((at, r.role.label()));
+                    }
+                }
+                CompileError::Infer {
+                    error: located.error,
+                    span,
+                    related,
+                }
+            })
             .collect()
     }
-}
 
-impl IntoCompileErrors for lambda_elim::LambdaElimError {
-    fn into_compile_errors(self) -> Vec<CompileError> {
-        vec![CompileError::LambdaElim {
-            error: self,
-            span: None,
+    fn unsupported(&self, error: Located<String>, tree: Option<&Expr>) -> Vec<CompileError> {
+        vec![CompileError::Unsupported {
+            span: self.span(error.node_id, tree),
+            message: error.error,
         }]
     }
 }
 
-impl IntoCompileErrors for channelize::DeferError {
-    fn into_compile_errors(self) -> Vec<CompileError> {
-        vec![CompileError::ChannelizeDefers(self)]
+/// The first answer `own` gives for a node `node` was derived from, nearest first:
+/// a breadth-first walk of `table`'s parents and blamed ids.
+fn derived_from(
+    table: &ProvenanceTable,
+    node: NodeId,
+    own: &dyn Fn(&NodeId) -> Option<Span>,
+) -> Option<Span> {
+    let mut seen: HashSet<NodeId> = HashSet::from([node]);
+    let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::from([node]);
+    while let Some(id) = queue.pop_front() {
+        for &next in table.parents(id).iter().chain(table.blame(id)) {
+            if !seen.insert(next) {
+                continue;
+            }
+            if let Some(span) = own(&next) {
+                return Some(span);
+            }
+            queue.push_back(next);
+        }
     }
+    None
 }
 
-impl IntoCompileErrors for ConversionError {
-    fn into_compile_errors(self) -> Vec<CompileError> {
-        vec![CompileError::Conversion(self)]
+/// The nodes enclosing `node` in `tree`, outermost first, or `None` if `tree`
+/// does not contain it.
+///
+/// A refinement predicate in a type slot (the node's own type, its annotation, a
+/// binder's type) counts as enclosed by the node carrying the slot: inference
+/// raises errors inside annotations, and the node holding the annotation is the
+/// one the source shows. Iterative, since a tree is as deep as its program is
+/// long. Runs only on an error path.
+fn enclosing(tree: &Expr, node: NodeId) -> Option<Vec<NodeId>> {
+    fn predicates<'a>(ty: &'a Type, out: &mut Vec<&'a Expr>) {
+        if let Type::Refinement(_, refinements) = ty {
+            out.extend(refinements.iter().map(|r| &*r.predicate));
+        }
+        ty.walk_children(|c| predicates(c, out));
     }
-}
-
-/// Extension on `Result` whose `Err` knows how to become a
-/// `Vec<CompileError>`. Lets the rest of the compile pipeline write
-/// `phase(...).errs()?` instead of an inline `.map_err(...)` per call site.
-pub trait CompileErrsExt<T> {
-    fn errs(self) -> Result<T, Vec<CompileError>>;
-}
-
-impl<T, E: IntoCompileErrors> CompileErrsExt<T> for Result<T, E> {
-    fn errs(self) -> Result<T, Vec<CompileError>> {
-        self.map_err(IntoCompileErrors::into_compile_errors)
+    let mut parents: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut stack: Vec<&Expr> = vec![tree];
+    while let Some(e) = stack.pop() {
+        if e.node_id() == node {
+            let mut chain = Vec::new();
+            let mut at = node;
+            while let Some(&p) = parents.get(&at) {
+                chain.push(p);
+                at = p;
+            }
+            chain.reverse();
+            return Some(chain);
+        }
+        let mut children: Vec<&Expr> = Vec::new();
+        e.walk_children(|c| children.push(c));
+        predicates(&e.ty, &mut children);
+        if let Some(ann) = &e.user_annotation {
+            predicates(ann, &mut children);
+        }
+        e.walk_binders(|b| {
+            predicates(&b.ty, &mut children);
+            if let Some(ann) = &b.user_annotation {
+                predicates(ann, &mut children);
+            }
+        });
+        for c in children {
+            // A predicate shared by `Rc` across slots is reached once.
+            if c.node_id() != tree.node_id() && !parents.contains_key(&c.node_id()) {
+                parents.insert(c.node_id(), e.node_id());
+                stack.push(c);
+            }
+        }
     }
+    None
 }
 
 /// Extension trait for `Result<T, Vec<CompileError>>`.
@@ -362,18 +512,19 @@ impl<T, E: IntoCompileErrors> CompileErrsExt<T> for Result<T, E> {
 ///
 /// ```ignore
 /// use cambra::ccl::context::{compile_program, CompileResultExt};
-/// let compiled = compile_program(&mut ctx, code, consumer)
-///     .unwrap_or_render("<test>", code);
+/// let sources = SourceMap::single("<test>", code);
+/// let compiled = compile_program(&mut ctx, &sources, consumer)
+///     .unwrap_or_render(&sources);
 /// ```
 pub trait CompileResultExt<T> {
     /// Return `Ok` payload, or render every error via [`render_errors`] and
     /// panic with the rendering bundled into the panic message (so the
     /// output is captured by cargo test alongside the failing test).
-    fn unwrap_or_render(self, src_name: &str, src: &str) -> T;
+    fn unwrap_or_render(self, sources: &SourceMap) -> T;
 }
 
 impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
-    fn unwrap_or_render(self, src_name: &str, src: &str) -> T {
+    fn unwrap_or_render(self, sources: &SourceMap) -> T {
         self.unwrap_or_else(|errs| {
             // Bundle the rendered output into the panic message rather than
             // writing to stderr directly: ariadne's `eprint` writes raw to
@@ -382,10 +533,7 @@ impl<T> CompileResultExt<T> for Result<T, Vec<CompileError>> {
             // test's output block. Putting them in the panic message means
             // cargo test groups them with the test's `---- TEST stdout ----`
             // section as expected.
-            panic!(
-                "compilation failed:\n{}",
-                render_errors(&errs, src_name, src)
-            )
+            panic!("compilation failed:\n{}", render_errors(&errs, sources))
         })
     }
 }
@@ -557,19 +705,19 @@ impl SourceSinkRegistry {
         lowering
     }
 
-    /// Compile `code` through `phase` against these sources and sinks, without
-    /// touching the running program — see [`compile_to_in`] for why that is safe
-    /// to do while it is serving.
-    pub fn compile_to(&self, code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
+    /// Compile the root of `sources` through `phase` against these sources and
+    /// sinks, without touching the running program — see [`compile_to_in`] for
+    /// why that is safe to do while it is serving.
+    pub fn compile_to(&self, sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
         let mut lowering = self.seed_lowering_context();
         // Answering a question must not change what the program serves, so a route
         // this registry does not hold is named rather than opened.
         lowering.inherit_endpoints_only();
-        compile_to_in(lowering, code, phase)
+        compile_to_in(lowering, sources, phase)
     }
 
-    /// Compile `code` through `phase`, binding any port this registry does not
-    /// hold and keeping the listener.
+    /// Compile the root of `sources` through `phase`, binding any port this
+    /// registry does not hold and keeping the listener.
     ///
     /// The listener and nothing else: a route is registered by the compile that
     /// installs the version, so a version refused after this one leaves none
@@ -590,11 +738,11 @@ impl SourceSinkRegistry {
     /// [`release_unrouted_ports`](Self::release_unrouted_ports).
     pub fn compile_to_opening(
         &mut self,
-        code: &str,
+        sources: &SourceMap,
         phase: Phase,
     ) -> Result<Expr, Vec<CompileError>> {
         let mut scratch = GlobalContext::scratch(self.seed_lowering_context());
-        let compiled = run_frontend(&mut scratch, code, phase, &[], false);
+        let compiled = run_frontend(&mut scratch, sources, phase, &[], false);
         // Taken from the scratch *registry*, because `run_frontend` has already
         // folded the pass's listeners into it. Taken whether or not the compile
         // succeeded, so a half-lowered pass leaves no listener owned by a context
@@ -921,8 +1069,9 @@ pub struct CompiledProgram {
     /// present, since an unrecorded mint surfaces as `Leak::Unrecorded` at the
     /// fold. Produced by
     /// [`fold_lowering`](crate::ccl::provenance::fold_lowering) at the
-    /// lowering boundary, never mutated incrementally. It is always-on and the
-    /// release `InferError` diagnostics read it one-hop (spans of the blame node).
+    /// lowering boundary, never mutated incrementally. It is always-on, and every
+    /// diagnostic a pass after lowering raises resolves its blame node against it
+    /// (`Blame`).
     pub lowering_projection: SourceProjection,
     /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
     /// pre-monomorphization) pane, captured right after `uniquify` and before
@@ -1026,15 +1175,15 @@ pub struct CompiledProgram {
     /// switches off attribution, and the graph is the `post-conversion` pane's
     /// content, held like the trees beside it.
     pub operator_graph: OperatorGraph,
-    /// The original program source text, retained verbatim.
+    /// Every file the program was compiled from, retained verbatim.
     ///
-    /// Inspector queries need the source string to produce snippets (`hover`'s
-    /// `snippet` = `source[span]`) and to serve the snapshot wire's
-    /// `source.text`. Every
-    /// span-keyed projection above (the [`lowering_projection`](Self::lowering_projection), the surface AST's
-    /// spans) is a byte offset *into this string*, so retaining it is what makes
-    /// those offsets resolvable to text. Cheap (one program's source).
-    pub source: String,
+    /// Inspector queries need the source text to produce snippets (`hover`'s
+    /// `snippet` = the text under a span) and to serve the snapshot wire's
+    /// `source.text`. Every span-keyed projection above (the
+    /// [`lowering_projection`](Self::lowering_projection), the surface AST's
+    /// spans) names a file of this map and a byte range of its text, so
+    /// retaining it is what makes those spans resolvable to text.
+    pub sources: SourceMap,
     /// Every `http_serve` route this version binds, by the route's source name.
     ///
     /// What a route is retired against once more than one branch runs: the
@@ -1103,6 +1252,13 @@ pub enum Phase {
     /// binding A-normalization already gave each read it could move and minting
     /// one for the position it could not.
     MutRead,
+    /// Comprehension lowering ([`crate::ccl::comprehension`]): the surface
+    /// `Comprehension` node to the `cast`/`λ`/`▷` encoding. Runs on the
+    /// A-normalized, read-named pre-inference tree, which is the point of
+    /// placing it here: the encoding is a refined cast, and A-normalization
+    /// leaves one exactly as it finds it, so a comprehension born at lowering
+    /// reached inference un-normalized.
+    Comprehension,
     /// Type inference ([`crate::ccl::infer`]): the phase that bridges the
     /// pre-inference and post-inference panes. Monomorphization is what mints
     /// inside it — cloning a generalized definition's subtree once per distinct
@@ -1537,18 +1693,16 @@ impl ProvenanceAudit {
         // so the measurement reads them in place rather than draining anything.
         drop(scope);
         let output_ids = Self::live_ids(output);
-        let Some((rows, projection, deaths, leaks)) =
-            crate::ccl::provenance::with_active_table(|table| {
-                let (_map, projection, deaths, leaks) = fold(
-                    table,
-                    &[Self::AUDIT_VIA],
-                    &input_ids,
-                    &output_ids,
-                    &SourceProjection::new(),
-                );
-                (table.len(), projection, deaths, leaks)
-            })
-        else {
+        let Some((rows, projection, deaths, leaks)) = with_active_table(|table| {
+            let (_map, projection, deaths, leaks) = fold(
+                table,
+                &[Self::AUDIT_VIA],
+                &input_ids,
+                &output_ids,
+                &SourceProjection::new(),
+            );
+            (table.len(), projection, deaths, leaks)
+        }) else {
             return;
         };
         let mut counts = BTreeMap::<&str, usize>::new();
@@ -1582,14 +1736,19 @@ impl ProvenanceAudit {
 /// `Type::Infer`'s invariant). That residue is an *ambiguous program* — a user
 /// error — so it is rendered as a diagnostic; anything else panics, naming
 /// `boundary`.
-fn pre_channelize_wall(expr: &Expr, boundary: &str) -> Result<(), Vec<CompileError>> {
-    check_pre_channelize(expr).map_err(|errs| {
+fn pre_channelize_wall(
+    expr: &Expr,
+    boundary: &str,
+    blame: &Blame<'_>,
+) -> Result<(), Vec<CompileError>> {
+    check_pre_channelize_located(expr).map_err(|errs| {
         if errs
             .iter()
-            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
+            .all(|e| matches!(e.error, InferError::UnresolvedInfer { .. }))
         {
-            errs.into_compile_errors()
+            blame.infer(errs, expr)
         } else {
+            let errs: Vec<&InferError> = errs.iter().map(|e| &e.error).collect();
             panic!("{boundary} produced an invalid tree: {errs:?}")
         }
     })
@@ -1602,11 +1761,12 @@ fn pre_channelize_wall(expr: &Expr, boundary: &str) -> Result<(), Vec<CompileErr
 /// channel-domain types only channelization erases, so they answer to
 /// `check_pre_channelize`; everything from channelization on answers to the
 /// strict [`typecheck`].
-enum Check {
+enum Check<'a> {
     /// [`pre_channelize_wall`]: the relaxed check, with a residual `Type::Infer`
-    /// reported as an ambiguous program. The two boundaries that can still carry
-    /// one are inference's own output and the inlining that copies it.
-    PreChannelizeReportingAmbiguity,
+    /// reported as an ambiguous program, at the span `Blame` resolves. The two
+    /// boundaries that can still carry one are inference's own output and the
+    /// inlining that copies it.
+    PreChannelizeReportingAmbiguity(&'a Blame<'a>),
     /// `check_pre_channelize`. A failure is a compiler bug.
     PreChannelize,
     /// [`typecheck`]. A failure is a compiler bug.
@@ -1628,14 +1788,16 @@ enum Check {
 /// from one type and its domain from another binds a name the domain does not say. The
 /// reference is then free, which `typecheck` reports as two `σ`s that render identically
 /// while this names the reference and the node it sits on.
-fn settle(ir: &Expr, boundary: &str, check: Check) -> Result<(), Vec<CompileError>> {
+fn settle(ir: &Expr, boundary: &str, check: Check<'_>) -> Result<(), Vec<CompileError>> {
     assert_unique_node_ids(ir, boundary);
     #[cfg(debug_assertions)]
     crate::ccl::infer::debug_assert_no_free_witness(ir, boundary);
     debug!("{boundary} CCL:\n{}", symbolic(ir));
     debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
     let outcome = match check {
-        Check::PreChannelizeReportingAmbiguity => return pre_channelize_wall(ir, boundary),
+        Check::PreChannelizeReportingAmbiguity(blame) => {
+            return pre_channelize_wall(ir, boundary, blame);
+        }
         Check::PreChannelize => check_pre_channelize(ir),
         Check::Typed => typecheck(ir),
     };
@@ -1674,9 +1836,9 @@ fn invalid_tree(ir: &Expr, boundary: &str, errs: &impl std::fmt::Debug) -> ! {
 ///   already in scope, mutable variable or not (see `src/ccl/design/mutability.md`,
 ///   "Mutability is the type (no lowering registry)"), so this is what rejects a
 ///   write to an immutable binding — or to one monomorphization has since dropped.
-fn check_mut_rules(expr: &Expr) -> Result<(), Vec<CompileError>> {
-    check_mut_discipline(expr).map_err(|errs| errs.into_compile_errors())?;
-    check_mut_write_targets(expr).map_err(|errs| errs.into_compile_errors())
+fn check_mut_rules(expr: &Expr, blame: &Blame<'_>) -> Result<(), Vec<CompileError>> {
+    check_mut_discipline(expr).map_err(|errs| blame.infer(errs, expr))?;
+    check_mut_write_targets(expr).map_err(|errs| blame.infer(errs, expr))
 }
 
 /// The transact phase's five rejections, run on the inlined, typed tree before
@@ -1703,8 +1865,9 @@ fn check_mut_rules(expr: &Expr) -> Result<(), Vec<CompileError>> {
 fn check_transact_rejections(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
+    blame: &Blame<'_>,
 ) -> Result<(), Vec<CompileError>> {
-    let reject = |msg: String| vec![CompileError::Unsupported(msg)];
+    let reject = |error: Located<String>| blame.unsupported(error, Some(expr));
     transact_phase::check_no_nested_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_induction_only_transactions(expr, txn_mut_vars).map_err(reject)?;
     transact_phase::check_no_guarded_induction_write_in_block(expr, txn_mut_vars)
@@ -1726,8 +1889,8 @@ struct Frontend {
     /// which is the order [`LoweringContext`] requires.
     sink_bindings: HashMap<String, Arc<dyn DataSink>>,
     /// Every lowered node's `SourceAttribution`, the base every later fold
-    /// bottoms out in and the source release `InferError` diagnostics resolve
-    /// against one-hop.
+    /// bottoms out in and the source every post-lowering diagnostic resolves
+    /// against (`Blame`).
     lowering_projection: SourceProjection,
     /// Open when the run recorded. The caller drains it once nothing else will
     /// record, so the timing matches a compile that never split.
@@ -1757,19 +1920,17 @@ fn at_phase_output(
 
 /// The compiler frontend: source in, a CCL tree at `stop`'s output out.
 ///
-/// **This is the only place the phase sequence and its checks are written.**
-/// [`compile_program`] runs it to [`Phase::Planning`] and continues into
-/// operator conversion; [`compile_to`] runs it to whichever phase a diff is
-/// being taken at and stops. A check added here therefore lands on both, which
-/// is what keeps a stopped tree from being one the real pipeline would have
-/// rejected.
+/// Owns the phase sequence and its checks. [`compile_program`] runs through
+/// [`Phase::Planning`] before operator conversion; [`compile_to`] stops at the requested
+/// output. A stopped tree has passed only the checks reached before that stop; a later
+/// phase can still reject it. See `src/ccl/design/diffing.md`, "Which phase to diff".
 ///
 /// `capture` names the phase outputs to retain as panes; `record` selects
 /// whether the run installs the provenance table and opens the per-phase
 /// recorder scopes. Nothing else about the two callers differs.
 fn run_frontend(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     stop: Phase,
     capture: &[Phase],
     record: bool,
@@ -1788,7 +1949,9 @@ fn run_frontend(
     // below; every early return drops it, clearing the slot.
     let table_session = record.then(TableSession::install);
 
-    let parse_result = chl_parser::parse_module(code);
+    let root = sources.root();
+    let code = sources.text(root);
+    let parse_result = chl_parser::parse_module(root, code);
     errors.extend(parse_result.errors.into_iter().map(CompileError::Parse));
     let Some(module) = parse_result.value else {
         return Err(errors);
@@ -1800,7 +1963,7 @@ fn run_frontend(
     // callers of `lower_stmts` that don't go through this path.)
     if module.body.is_empty() {
         errors.push(CompileError::Lower(LoweringError::unsupported(
-            chl_parser::ast::Span::new(0, code.len()),
+            Span::new(root, 0, code.len()),
             "empty program: file contains no top-level statements",
         )));
         return Err(errors);
@@ -1812,7 +1975,7 @@ fn run_frontend(
     // `LoweringLog`, folded once at the handoff below into the always-on lowering
     // projection. It must fully drain before the first phase (`Infer`) session opens.
     let lowering_session = LoweringSession::install();
-    let lower_result = lower_stmts(&module.body, ctx.lowering_ctx());
+    let lower_result = lower_stmts(&module, ctx.lowering_ctx());
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -1837,8 +2000,8 @@ fn run_frontend(
     // handoff (before uniquify/inference, so the release `InferError` read timing
     // is unchanged), into the always-on **lowering projection**: every lowered
     // node's [`SourceAttribution`], keyed by NodeId. It is the base every later
-    // pane fold bottoms out in, and the source the release `InferError`
-    // diagnostics resolve against one-hop. `uniquify` preserves every id in
+    // pane fold bottoms out in, and the source every post-lowering diagnostic
+    // resolves against (`Blame`). `uniquify` preserves every id in
     // place, so the projection's keys survive into the pre-inference pane.
     //
     // The fold's leak taxonomy enforces mint coverage: an unrecorded lowering
@@ -1887,7 +2050,7 @@ fn run_frontend(
         stop,
         capture,
         record,
-        &lowering_projection,
+        Blame::new(&lowering_projection, sources),
         &mut panes,
     )?;
     Ok(Frontend {
@@ -1911,7 +2074,7 @@ fn run_passes(
     stop: Phase,
     capture: &[Phase],
     record: bool,
-    lowering_projection: &SourceProjection,
+    mut blame: Blame<'_>,
     panes: &mut BTreeMap<Phase, Expr>,
 ) -> Result<Expr, Vec<CompileError>> {
     // Phase recording for the rows the pane-pair folds read. One scope per
@@ -1948,6 +2111,27 @@ fn run_passes(
         return Ok(expr);
     }
 
+    // Lower each comprehension into the `cast`/`λ`/`▷` encoding, now that the
+    // tree is A-normalized and every mutable-variable read is named — so the
+    // generator source a loop-join copies into its predicate is the term both
+    // of those passes left behind, and the two copies are equal by
+    // construction (`crate::ccl::comprehension`). `recorded` because the pass
+    // mints the whole encoding.
+    //
+    // Under a `DerivationSession` in every compile, capture or not: the
+    // encoding's lambdas, casts and applications are what inference raises a
+    // comprehension's errors at, and no lowering-projection node encloses them
+    // more tightly than the whole comprehension.
+    let derivation = DerivationSession::install();
+    expr = recorded(capture_provenance, Phase::Comprehension, || {
+        comprehension::run(expr, ctx.lowering_ctx().shared_holes())
+    });
+    blame.derive(&derivation.into_log(), Phase::Comprehension);
+    debug!("Comprehensions lowered:\n{}", symbolic(&expr));
+    if at_phase_output(Phase::Comprehension, &expr, stop, capture, panes) {
+        return Ok(expr);
+    }
+
     // Mutable variable every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
@@ -1971,11 +2155,9 @@ fn run_passes(
     let infer_outcome = recorded(capture_provenance, Phase::Infer, || {
         infer(&mut expr, ctx.inference_ctx())
     });
-    // On failure, resolve each error's own blame node to a source span *here* —
-    // the lowering projection is in scope and holds the lowered attribution (this
-    // is the always-on release read: one hop, no fold). Every error names a node;
-    // an id the projection doesn't cover (a node minted after lowering, e.g. by
-    // monomorphization) degrades to a span-less diagnostic.
+    // On failure, resolve each error's blame node to a source span here, against
+    // the tree inference left: a node minted by monomorphization resolves through
+    // the node it was cloned from, or failing that the nodes enclosing it.
     if let Err(errors) = infer_outcome {
         // A refinement in a message names the binder a mutable variable's read
         // was given rather than the variable, which is machinery no program
@@ -1983,19 +2165,14 @@ fn run_passes(
         // (`mut_read::unbind` erases them below) and nothing types the error's
         // types again.
         let respelling = mut_read::read_respelling(&expr);
-        return Err(errors
+        let errors = errors
             .into_iter()
             .map(|mut located| {
                 located.error.map_types(&|ty| respelling.apply_type(ty));
-                let span = lowering_projection
-                    .get(&located.node_id)
-                    .and_then(|attr| attr.spans.first().copied());
-                CompileError::Infer {
-                    error: located.error,
-                    span,
-                }
+                located
             })
-            .collect());
+            .collect();
+        return Err(blame.infer(errors, &expr));
     }
     // Inference mints predicates (`lit_singleton`) and clones a definition per
     // instantiation (`specialize_use`), so its output is checked before the pane
@@ -2003,7 +2180,7 @@ fn run_passes(
     settle(
         &expr,
         "post-inference",
-        Check::PreChannelizeReportingAmbiguity,
+        Check::PreChannelizeReportingAmbiguity(&blame),
     )?;
 
     // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
@@ -2014,7 +2191,7 @@ fn run_passes(
     // `user_annotation`s. Unlike the surrounding `check_pre_channelize` walls
     // (compiler-bug backstops), these are user errors: aliasing or nesting a
     // mutable reference.
-    check_mut_rules(&expr)?;
+    check_mut_rules(&expr, &blame)?;
 
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
@@ -2075,7 +2252,11 @@ fn run_passes(
     expr = recorded(capture_provenance, Phase::Inline, || {
         inline::inline_capability_lambdas(expr)
     });
-    settle(&expr, "post-inline", Check::PreChannelizeReportingAmbiguity)?;
+    settle(
+        &expr,
+        "post-inline",
+        Check::PreChannelizeReportingAmbiguity(&blame),
+    )?;
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -2100,9 +2281,8 @@ fn run_passes(
     // is a nested transaction — the callee's inlined `For` would otherwise be
     // silently absorbed into the outer block's read-your-writes env, dropping its
     // commit. Reject it before the phase strips the sites.
-    check_transact_rejections(&expr, &txn_mut_vars)?;
-    mut_elim::check_no_loop_over_a_sum(&expr)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
+    mut_elim::check_no_loop_over_a_sum(&expr).map_err(|e| blame.unsupported(e, Some(&expr)))?;
 
     // The two rewrites the transactional slice runs before its own: both mint expression
     // nodes, so both sit inside the phase's recording — outside it their nodes reach the
@@ -2118,7 +2298,7 @@ fn run_passes(
         mut_elim::desugar_keyed_writes(&mut expr);
         transact_phase::run(expr, &txn_mut_vars)
     })
-    .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    .map_err(|error| blame.unsupported(error, None))?;
     settle(&expr, "post-transact", Check::PreChannelize)?;
     if at_phase_output(Phase::Transact, &expr, stop, capture, panes) {
         return Ok(expr);
@@ -2156,7 +2336,12 @@ fn run_passes(
     let mut channelized = recorded(capture_provenance, Phase::Channelize, || {
         channelize::run(phase_out)
     })
-    .errs()?;
+    .map_err(|Located { error, node_id }| {
+        vec![CompileError::ChannelizeDefers {
+            error,
+            span: blame.span(node_id, None),
+        }]
+    })?;
     settle(&channelized, "post-channelize", Check::Typed)?;
 
     // Retain the post-channelize tree for the inspector's downstream pane. On the
@@ -2178,7 +2363,12 @@ fn run_passes(
     recorded(capture_provenance, Phase::AsOfRead, || {
         transact_phase::rewrite_as_of_reads(&mut channelized)
     })
-    .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    .map_err(|message| {
+        vec![CompileError::Internal {
+            stage: "asOfRead",
+            message,
+        }]
+    })?;
     settle(&channelized, "post-as-of-read", Check::Typed)?;
     if at_phase_output(Phase::AsOfRead, &channelized, stop, capture, panes) {
         return Ok(channelized);
@@ -2187,17 +2377,24 @@ fn run_passes(
     let lambda_elim = recorded(capture_provenance, Phase::LambdaElim, || {
         lambda_elim::run(channelized)
     })
-    .map_err(|error| {
-        let span = match &error {
-            // A read a later phase built (a mutable variable's, or one substituted for a
-            // local) has no lowering span, but the list around it keeps the literal's id.
-            lambda_elim::LambdaElimError::VaryingListElement { read, list, .. } => [read, list]
-                .into_iter()
-                .find_map(|id| lowering_projection.get(id))
-                .and_then(|attr| attr.spans.first().copied()),
-            lambda_elim::LambdaElimError::Unsupported(_) => None,
-        };
-        vec![CompileError::LambdaElim { error, span }]
+    .map_err(|error| match &error {
+        lambda_elim::LambdaElimError::Unsupported(message) => vec![CompileError::Internal {
+            stage: "lambdaElim",
+            message: message.clone(),
+        }],
+        // A read a later phase built (a mutable variable's, or one substituted for a
+        // local) has no lowering span, but the list around it keeps the literal's id.
+        lambda_elim::LambdaElimError::VaryingListElement { read, list, .. } => {
+            let span = blame
+                .projection
+                .get(read)
+                .and_then(|attr| attr.spans.first().copied())
+                .unwrap_or_else(|| blame.span(*list, None));
+            vec![CompileError::Unsupported {
+                message: error.to_string(),
+                span,
+            }]
+        }
     })?;
     // `typecheck` enforces hole-freeness as its first phase, so the check here
     // covers both.
@@ -2225,7 +2422,12 @@ fn run_passes(
         }
         planning::run(recognized)
     })
-    .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    .map_err(|message| {
+        vec![CompileError::Internal {
+            stage: "planning",
+            message,
+        }]
+    })?;
     // The last instrumented pane: see the span's own note at `ProvenanceAudit::start`.
     audit.finish(&join_planned);
     // Planning is the one phase that introduces `iterate` / `restrict` /
@@ -2250,22 +2452,20 @@ fn run_passes(
     Ok(join_planned)
 }
 
-/// Compile `code` through `phase`, ready to pass to [`crate::ccl::diff::diff`].
+/// Compile the root of `sources` through `phase`, ready to pass to
+/// [`crate::ccl::diff::diff`].
 ///
-/// Runs [`run_frontend`] — the same phases and the same checks
-/// [`compile_program`] runs — stopping at `phase`'s output rather than
-/// continuing into the operator graph, and retaining no panes and no provenance.
-/// A program `compile_program` refuses therefore yields no tree here.
-///
-/// Every phase output is a consistent tree (each has a wall after it), so any
-/// `Phase` is a legal stop. Which ones answer which question — and which ones a
-/// diff should be taken at — is `src/ccl/design/diffing.md`, "Which phase to diff".
-pub fn compile_to(code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
-    compile_to_in(GlobalContext::new().lowering, code, phase)
+/// Runs [`run_frontend`] through the requested output, retaining no panes or provenance.
+/// Only checks reached before the stop have run: `Lower` can return a tree that inference
+/// rejects. Capture boundaries do not each run a consistency check. A stop beyond the
+/// frontend returns its final planned tree, not an operator graph. See
+/// `src/ccl/design/diffing.md`, "Which phase to diff" for the phase contracts.
+pub fn compile_to(sources: &SourceMap, phase: Phase) -> Result<Expr, Vec<CompileError>> {
+    compile_to_in(GlobalContext::new().lowering, sources, phase)
 }
 
-/// Compile `code` through `phase` against an already-open source/sink set,
-/// without touching the running program.
+/// Compile the root of `sources` through `phase` against an already-open
+/// source/sink set, without touching the running program.
 ///
 /// Runs the same [`run_frontend`] every other entry point runs, over a
 /// [`GlobalContext::scratch`] whose lowering registry is seeded and whose other
@@ -2276,14 +2476,15 @@ pub fn compile_to(code: &str, phase: Phase) -> Result<Expr, Vec<CompileError>> {
 /// running program already holds and fail.
 fn compile_to_in(
     lowering: LoweringContext,
-    code: &str,
+    sources: &SourceMap,
     phase: Phase,
 ) -> Result<Expr, Vec<CompileError>> {
     let mut ctx = GlobalContext::scratch(lowering);
-    Ok(run_frontend(&mut ctx, code, phase, &[], false)?.expr)
+    Ok(run_frontend(&mut ctx, sources, phase, &[], false)?.expr)
 }
 
-/// Compile a CHL program and return its operator graph plus subscribed outputs.
+/// Compile the root of `sources` as a CHL program and return its operator graph
+/// plus subscribed outputs.
 ///
 /// Returns a [`CompiledProgram`] whose `outputs` vector contains one entry
 /// per "output" of the program:
@@ -2298,13 +2499,13 @@ fn compile_to_in(
 ///   returning.
 pub fn compile_program(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     main_consumer: Box<dyn Consumer>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, code, main_consumer, None, &HashSet::new())
+    compile_version(ctx, sources, main_consumer, None, &HashSet::new())
 }
 
-/// Compile `code` as the version replacing `previous`, keeping whichever of the
+/// Compile `sources` as the version replacing `previous`, keeping whichever of the
 /// running graph's operators compute what this version's tree still asks for.
 ///
 /// `previous` is the tree the offered graph was built from
@@ -2319,17 +2520,17 @@ pub fn compile_program(
 /// either, because the endpoint registry is the process's.
 pub fn compile_replacement(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     main_consumer: Box<dyn Consumer>,
     previous: &Expr,
     bound_elsewhere: &HashSet<String>,
 ) -> Result<CompiledProgram, Vec<CompileError>> {
-    compile_version(ctx, code, main_consumer, Some(previous), bound_elsewhere)
+    compile_version(ctx, sources, main_consumer, Some(previous), bound_elsewhere)
 }
 
 fn compile_version(
     ctx: &mut GlobalContext,
-    code: &str,
+    sources: &SourceMap,
     main_consumer: Box<dyn Consumer>,
     previous: Option<&Expr>,
     bound_elsewhere: &HashSet<String>,
@@ -2354,7 +2555,7 @@ fn compile_version(
         sink_bindings: sink_bindings_registry,
         lowering_projection,
         table_session,
-    } = run_frontend(ctx, code, Phase::Planning, &PANES, true)?;
+    } = run_frontend(ctx, sources, Phase::Planning, &PANES, true)?;
     // A route the registry holds and this version did not bind is one the version
     // stopped serving. Retire it, or it keeps matching requests and buffering them
     // for a reader that no longer exists. A no-op for a first compilation, whose
@@ -2430,7 +2631,7 @@ fn compile_version(
             convert_outputs_to_operators(&join_planned, ctx.conversion_ctx())
         }
     })
-    .errs()
+    .map_err(|e| vec![e.into()])
     .inspect_err(|_| {
         ctx.scheduler().end_source_producers();
     })?;
@@ -2533,7 +2734,7 @@ fn compile_version(
         post_lambda_elim_ir,
         provenance_table,
         operator_graph,
-        source: code.to_string(),
+        sources: sources.clone(),
         routes,
         source_producers,
     };
@@ -2577,10 +2778,10 @@ mod tests {
     /// Driver that runs `compile_program` for an error-only test, returning
     /// the collected error list. Discards the program — these tests only
     /// care about which errors surface.
-    fn compile_err(code: &str) -> Vec<CompileError> {
+    fn compile_err(sources: &SourceMap) -> Vec<CompileError> {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        match compile_program(&mut ctx, code, consumer) {
+        match compile_program(&mut ctx, sources, consumer) {
             Ok(_) => panic!("expected compile error, got success"),
             Err(errs) => errs,
         }
@@ -2590,7 +2791,7 @@ mod tests {
     fn compile_ok(code: &str) -> CompiledProgram {
         let mut ctx = GlobalContext::default();
         let consumer: Box<dyn Consumer> = Box::new(|| {});
-        compile_program(&mut ctx, code, consumer).expect("compiles")
+        compile_program(&mut ctx, &SourceMap::single("<test>", code), consumer).expect("compiles")
     }
 
     /// Lowering's own recording overhead, measured rather than gated.
@@ -2630,8 +2831,9 @@ x = 1 +
 y = {a: 1}
 y
 ";
-        let errs = compile_err(code);
-        let out = render_errors(&errs, "<test>", code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let out = render_errors(&errs, &sources);
         let expected = "\
 Error: parse error
    ╭─[<test>:1:8]
@@ -2671,7 +2873,7 @@ Error: lowering error
     /// integer literal against `and`'s `Bool` operand during pass-1 emission,
     /// so the blame node is that pass-1 emit site and its id round-trips
     /// through the lowering projection (`SourceProjection`, keyed by `NodeId`)
-    /// to a `Some` span over the offending expression.
+    /// to a span over the offending expression.
     ///
     /// (`1 + "a"` reaches the same outcome by the other route: its `Int`/`String`
     /// collision surfaces in pass-2 coalesce, which blames per error — see
@@ -2679,11 +2881,12 @@ Error: lowering error
     #[test]
     fn infer_error_carries_resolved_span() {
         let code = "1 and 2\n";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2691,7 +2894,6 @@ Error: lowering error
             matches!(error, InferError::TypeMismatch { .. }),
             "expected a pass-1 TypeMismatch, got {error:?}"
         );
-        let span = span.expect("the type error resolves to a source span");
         let pointed = &code[span.start..span.end];
         assert!(
             pointed.contains("and"),
@@ -2710,17 +2912,15 @@ Error: lowering error
     #[test]
     fn coalesce_error_carries_resolved_span() {
         let code = "1 + \"a\"\n";
-        let errs = compile_err(code);
-        let (error, span) = errs
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let span = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { span, .. } => Some(*span),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
-        let span = span.unwrap_or_else(|| {
-            panic!("the coalesce error resolves to a source span, got {error:?} with no span")
-        });
         let pointed = &code[span.start..span.end];
         assert_eq!(
             pointed, "1 + \"a\"",
@@ -2734,18 +2934,19 @@ Error: lowering error
     #[test]
     fn unbound_variable_carries_resolved_span() {
         let code = "y\n";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
         assert!(matches!(error, InferError::UnboundVariable(_)));
         assert_eq!(
             span,
-            Some(chl_parser::ast::Span::new(0, 1)),
+            Span::new(sources.root(), 0, 1),
             "the use of `y` spans byte offsets 0..1"
         );
     }
@@ -2775,11 +2976,12 @@ Error: lowering error
         "\\a, b -> (a + 1, a + \"s\")"
     )]
     fn unsatisfiable_operand_carries_resolved_span(#[case] code: &str, #[case] expected: &str) {
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let (error, span) = errs
             .iter()
             .find_map(|e| match e {
-                CompileError::Infer { error, span } => Some((error, *span)),
+                CompileError::Infer { error, span, .. } => Some((error, *span)),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected an Infer error, got: {errs:?}"));
@@ -2787,7 +2989,6 @@ Error: lowering error
             matches!(error, InferError::UnsatisfiableOperand { .. }),
             "expected the sweep's own error, got {error:?}"
         );
-        let span = span.expect("an unsatisfiable operand resolves to a source span");
         assert_eq!(
             &code[span.start..span.end],
             expected,
@@ -2796,18 +2997,329 @@ Error: lowering error
         );
     }
 
-    /// Terminal rendering: a span-carrying inference error renders
-    /// as an ariadne report with the source line and an underline, NOT the
-    /// bare `error: type inference: …` plain-text fallback.
+    /// An error inference raises inside a comprehension's encoding resolves to
+    /// the same span whether or not the compile captures provenance:
+    /// `compile_program` resolves the encoding's nodes through the table,
+    /// [`compile_to`] through the comprehension phase's derivation log
+    /// ([`Blame::derive`]). `element` is raised under the generator's plumbing
+    /// and resolves to its source; `guard` is raised at the cast, the encoding's
+    /// root, which keeps the comprehension's id.
+    #[rstest]
+    #[case::element("[x + \"a\" for x in [1, 2]]\n", 18, 24)]
+    #[case::guard("[x for x in [1, 2] if x]\n", 0, 24)]
+    fn a_comprehension_error_resolves_alike_with_and_without_recording(
+        #[case] code: &str,
+        #[case] start: usize,
+        #[case] end: usize,
+    ) {
+        let sources = SourceMap::single("<test>", code);
+        let expected = Span::new(sources.root(), start, end);
+        let first_span = |errs: Vec<CompileError>| {
+            errs.iter()
+                .find_map(CompileError::span)
+                .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"))
+        };
+        let recorded = first_span(compile_err(&sources));
+        let unrecorded = first_span(
+            GlobalContext::default()
+                .sources_and_sinks()
+                .compile_to(&sources, Phase::Planning)
+                .expect_err("expected a compile error"),
+        );
+        assert_eq!(recorded, expected, "with recording");
+        assert_eq!(unrecorded, expected, "without recording");
+    }
+
+    /// Without recording, an error inference raises at a node it
+    /// minted itself, outside the final tree, traces to no
+    /// span. `compile_program` resolves it through the table, to the
+    /// element `x`; [`compile_to`] has no table, the node is in
+    /// neither projection, and no node encloses it in the
+    /// tree. `Blame::span` therefore panics in a debug build and
+    /// answers the whole root file in a release build.
+    ///
+    /// The failing node is minted by inference, not by the
+    /// comprehension phase, and the compiler before that phase
+    /// existed fails the same way.
+    ///
+    /// TODO: give inference's mints a projection that is always on,
+    /// as the comprehension phase's have (`design/provenance.md`,
+    /// "The derivation log"), and pin the element's span here
+    /// instead.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "traces to no source span"))]
+    fn an_inference_minted_blame_node_has_no_span_without_recording() {
+        let code = "xs = [1, 2]\n[x for x in xs if x > \"a\"]\n";
+        let sources = SourceMap::single("<test>", code);
+        let errs = GlobalContext::default()
+            .sources_and_sinks()
+            .compile_to(&sources, Phase::Planning)
+            .expect_err("expected a compile error");
+        let span = errs
+            .iter()
+            .find_map(CompileError::span)
+            .unwrap_or_else(|| panic!("expected a spanned error, got: {errs:?}"));
+        assert_eq!(span, Span::new(sources.root(), 0, code.len()));
+    }
+
+    /// Every rejection a pass after lowering raises points at the source of what
+    /// it rejects. Each case is one phase's check, and one of its errors' spans
+    /// covers exactly the `nth` occurrence of `expected` in `code`.
+    #[rstest]
+    #[case::write_to_an_immutable("x = 1\nx += 2\nx\n", "x += 2", 0)]
+    #[case::mut_rule_1("def g(n):\n    z := n\n    z\ng(5)\n", "g(5)", 0)]
+    #[case::ambiguous_program("f = \\x -> [x, x]\nf\n", "f = \\x -> [x, x]", 0)]
+    #[case::used_after_await_final(
+        indoc::indoc! {"
+            a: Mut(Int, Txn) := 0
+            for x in [1, 2]:
+                with begin():
+                    a := a + x
+            await_final(a) + await_final(a)
+        "},
+        "await_final(a)",
+        1
+    )]
+    #[case::deferred_collection_defined_twice(
+        indoc::indoc! {"
+            x = defer()
+            x <<= [1]
+            x <<= [2]
+            x
+        "},
+        "x <<= [2]",
+        0
+    )]
+    #[case::deferred_collection_defined_in_a_loop(
+        indoc::indoc! {"
+            x = defer()
+            for i in [1, 2]:
+                x <<= [i]
+            x
+        "},
+        "x <<= [i]",
+        0
+    )]
+    #[case::deferred_collection_fed_and_defined(
+        indoc::indoc! {"
+            x = defer()
+            x << 1
+            x <<= [2]
+            x
+        "},
+        "x <<= [2]",
+        0
+    )]
+    #[case::deferred_collection_never_fed(
+        indoc::indoc! {"
+            x = defer()
+            x
+        "},
+        "x = defer()",
+        0
+    )]
+    fn a_rejection_after_lowering_points_at_its_source(
+        #[case] code: &str,
+        #[case] expected: &str,
+        #[case] nth: usize,
+    ) {
+        let (start, _) = code
+            .match_indices(expected)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("{expected:?} occurs fewer than {} times", nth + 1));
+        let expected_span = Span::new(chl_parser::FileId::ROOT, start, start + expected.len());
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let spans: Vec<Span> = errs
+            .iter()
+            .map(|e| {
+                e.span()
+                    .unwrap_or_else(|| panic!("a rejection is not an internal error: {e:?}"))
+            })
+            .collect();
+        assert!(
+            spans.contains(&expected_span),
+            "no error spans bytes {start}..{} ({expected:?}):\n{}",
+            start + expected.len(),
+            render_errors(&errs, &sources)
+        );
+    }
+
+    /// Emission recovers at each statement: every failing statement reports, in
+    /// source order, and a binding whose definition failed reports nothing more at
+    /// its uses, even where a rule needs the value's shape as it emits (`m[1]?`). An
+    /// exact annotation binds its name at the declared type, so a use of it
+    /// still reports. `expected` is the text each error's span covers.
+    #[rstest]
+    #[case::two_definitions(
+        indoc::indoc! {"
+            x = foo + 1
+            y = bar + 2
+            x + y
+        "},
+        &["foo", "bar"]
+    )]
+    #[case::two_mismatches(
+        indoc::indoc! {r#"
+            x = 1 + "a"
+            y = 2 + "b"
+            x
+        "#},
+        &["1 + \"a\"", "2 + \"b\""]
+    )]
+    #[case::uses_of_a_failed_definition(
+        indoc::indoc! {"
+            x = foo
+            y = x + 1
+            z = not x
+            m = bar
+            v = m[1]?
+            y
+        "},
+        &["foo", "bar"]
+    )]
+    #[case::uses_of_an_annotated_failed_definition(
+        indoc::indoc! {r#"
+            x: Int = foo
+            y = x + "a"
+            y
+        "#},
+        &["foo", "x + \"a\""]
+    )]
+    #[case::a_polymorphic_annotation_whose_bound_fails(
+        indoc::indoc! {r#"
+            g: forall (T <: {Int where _ > zz}) T => T = \x -> x
+            y = g(1) + 1
+            z = 2 + "t"
+            y
+        "#},
+        &["zz", "2 + \"t\""]
+    )]
+    #[case::a_failed_annotation(
+        indoc::indoc! {r#"
+            x: Int = "s"
+            y = x + 1
+            z = 2 + "t"
+            y
+        "#},
+        &["x: Int = \"s\"", "2 + \"t\""]
+    )]
+    #[case::a_mutable_seed(
+        indoc::indoc! {r#"
+            a := foo
+            for i in [1, 2]:
+                a := a + i
+            b = 1 + "s"
+            a
+        "#},
+        &["foo", "1 + \"s\""]
+    )]
+    #[case::a_statement(
+        indoc::indoc! {r#"
+            acc := 0
+            for i in nope:
+                acc := acc + i
+            b = 1 + "s"
+            acc
+        "#},
+        &["nope", "1 + \"s\""]
+    )]
+    fn emission_reports_every_failing_statement(#[case] code: &str, #[case] expected: &[&str]) {
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let pointed: Vec<&str> = errs
+            .iter()
+            .map(|e| {
+                let span = e.span().expect("an inference error carries a span");
+                &code[span.start..span.end]
+            })
+            .collect();
+        assert_eq!(pointed, expected, "{}", render_errors(&errs, &sources));
+    }
+
+    /// Lowering reports its errors in source order, though it lowers a block's
+    /// statements last to first.
+    #[test]
+    fn lowering_errors_report_in_source_order() {
+        let code = "a: Frob = 1\nb: Blarg = 2\na + b\n";
+        let sources = SourceMap::single("<test>", code);
+        let messages: Vec<String> = compile_err(&sources)
+            .iter()
+            .map(CompileError::message)
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "unknown type annotation: Frob",
+                "unknown type annotation: Blarg"
+            ]
+        );
+    }
+
+    /// An empty file has no character for a label to sit on, so the message
+    /// joins the title rather than being dropped with the label.
+    #[test]
+    fn an_empty_program_renders_its_message() {
+        let sources = SourceMap::single("<test>", "");
+        let out = render_errors(&compile_err(&sources), &sources);
+        assert_eq!(
+            out.trim_end(),
+            "Error: lowering error: empty program: file contains no top-level statements"
+        );
+    }
+
+    /// A label holds the message's first line; the rest follow the report, so a
+    /// multi-line message leaves the report's frame whole.
+    #[test]
+    fn a_multi_line_message_follows_its_report() {
+        let code = "x = 1\n";
+        let sources = SourceMap::single("<test>", code);
+        let error = CompileError::Unsupported {
+            message: "first line\n  second line".to_string(),
+            span: Span::new(sources.root(), 0, 1),
+        };
+        let out = error.render(&sources);
+        let (report, detail) = out.split_once("───╯\n").expect("a framed report");
+        assert!(report.contains("first line"), "{out}");
+        assert!(!report.contains("second line"), "{out}");
+        assert_eq!(detail, "  second line\n");
+    }
+
+    /// An internal compiler error names the phase that failed and points at no
+    /// source.
+    #[test]
+    fn an_internal_error_renders_without_a_label() {
+        let sources = SourceMap::single("<test>", "x = 1\n");
+        let error = CompileError::Internal {
+            stage: "lambdaElim",
+            message: "a `Case` with a guard".to_string(),
+        };
+        assert_eq!(error.span(), None);
+        assert_eq!(
+            error.render(&sources).trim_end(),
+            "Error: internal compiler error in lambdaElim: a `Case` with a guard"
+        );
+    }
+
+    /// A diagnostic after a multi-byte character names the column of its own
+    /// text: `1 and 2` starts at byte 11 but is the 11th character, and ariadne
+    /// reading the offset as a character index would report column 12.
+    #[test]
+    fn a_diagnostic_after_a_multibyte_character_names_its_column() {
+        let code = "s = (\"é\", 1 and 2)\ns\n";
+        let sources = SourceMap::single("<test>", code);
+        let out = render_errors(&compile_err(&sources), &sources);
+        assert!(out.contains("<test>:1:11"), "{out}");
+    }
+
+    /// Terminal rendering: an inference error renders as an ariadne report with
+    /// the source line and an underline.
     #[test]
     fn infer_error_renders_with_source_context() {
         let code = "1 and 2\n";
-        let errs = compile_err(code);
-        let out = render_errors(&errs, "<test>", code);
-        assert!(
-            !out.contains("error: type inference:"),
-            "span-carrying infer error must not use the plain-text fallback; got:\n{out}"
-        );
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
+        let out = render_errors(&errs, &sources);
         // ariadne report markers: the source line, the file:line:col header,
         // and box-drawing for the underline/gutter.
         assert!(
@@ -2830,7 +3342,8 @@ x = (1 +)
 y = {a: 1}
 y
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let has_parse = errs.iter().any(|e| matches!(e, CompileError::Parse(_)));
         let has_lower = errs.iter().any(|e| matches!(e, CompileError::Lower(_)));
         assert!(
@@ -2848,7 +3361,8 @@ x = 1 +
 y = 2 *
 1
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let parse_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Parse(_)))
@@ -2869,7 +3383,8 @@ x = {a: 1}
 y = {b: 2}
 y
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let lower_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Lower(_)))
@@ -2889,7 +3404,8 @@ y
 x = (1 +)
 1
 ";
-        let errs = compile_err(code);
+        let sources = SourceMap::single("<test>", code);
+        let errs = compile_err(&sources);
         let lower_count = errs
             .iter()
             .filter(|e| matches!(e, CompileError::Lower(_)))

@@ -10,6 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cambra::{
+    ccl::context::{CompileError, GlobalContext, Phase},
+    chl_parser::SourceMap,
+    live_program::{
+        BranchError, Created, DiffReport, LiveProgram, MainConsumerFactory, ReloadReport,
+    },
+};
+
 use crate::serving::{raw_http, reserve_test_port};
 /// Run a `stdin`-sourced program under `--control`, feeding it `before`, then
 /// swapping it for `reloaded` and feeding it `after`.
@@ -791,6 +799,96 @@ pub(crate) mod fixtures {
     "#};
 }
 
+/// [`LiveProgram`]'s calls that take a version, for a version that is one
+/// file.
+///
+/// Every case writes a version as one program text. These build its one-file
+/// [`SourceMap`], so a case passes the text as it reads.
+pub(crate) trait OneFile: Sized {
+    fn start_text(
+        ctx: &mut GlobalContext,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Self, Vec<CompileError>>;
+
+    fn reload_text(
+        &mut self,
+        ctx: &mut GlobalContext,
+        branch: &str,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<ReloadReport, BranchError>;
+
+    fn diff_text(
+        &self,
+        ctx: &GlobalContext,
+        branch: &str,
+        text: &str,
+        phase: Phase,
+    ) -> Result<DiffReport, BranchError>;
+
+    fn create_branch_text(
+        &mut self,
+        ctx: &mut GlobalContext,
+        name: &str,
+        parent: &str,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Created, BranchError>;
+}
+
+impl OneFile for LiveProgram {
+    fn start_text(
+        ctx: &mut GlobalContext,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Self, Vec<CompileError>> {
+        LiveProgram::start(ctx, &SourceMap::single("<test>", text), main_consumer)
+    }
+
+    fn reload_text(
+        &mut self,
+        ctx: &mut GlobalContext,
+        branch: &str,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<ReloadReport, BranchError> {
+        self.reload(
+            ctx,
+            branch,
+            &SourceMap::single("<test>", text),
+            main_consumer,
+        )
+    }
+
+    fn diff_text(
+        &self,
+        ctx: &GlobalContext,
+        branch: &str,
+        text: &str,
+        phase: Phase,
+    ) -> Result<DiffReport, BranchError> {
+        self.diff_against(ctx, branch, &SourceMap::single("<test>", text), phase)
+    }
+
+    fn create_branch_text(
+        &mut self,
+        ctx: &mut GlobalContext,
+        name: &str,
+        parent: &str,
+        text: &str,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Created, BranchError> {
+        self.create_branch(
+            ctx,
+            name,
+            parent,
+            &SourceMap::single("<test>", text),
+            main_consumer,
+        )
+    }
+}
+
 pub(crate) fn source(name: &str, port: u16) -> String {
     let text = match name {
         "guestbook" => include_str!("../programs/hot_reload/program.cambra"),
@@ -853,6 +951,7 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
 
     use cambra::{
         ccl::{Type, context::GlobalContext},
+        chl_parser::SourceMap,
         interpreter::{BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value},
         live_program::{LiveProgram, MAIN_BRANCH},
     };
@@ -881,7 +980,8 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
         producer.get(producer.tiling().universal_guard())
     };
 
-    let mut live = LiveProgram::start(&mut ctx, v1, &no_main).expect("v1 compiles");
+    let mut live = LiveProgram::start(&mut ctx, &SourceMap::single("<test>", v1), &no_main)
+        .expect("v1 compiles");
     source.borrow_mut().add_data(&rows(0, before));
     source
         .borrow_mut()
@@ -889,8 +989,13 @@ pub(crate) fn int_value_across_a_reload_over_a_live_source(
     for _ in 0..20 {
         pull(&mut ctx, &mut live);
     }
-    live.reload(&mut ctx, MAIN_BRANCH, v2, &no_main)
-        .expect("v2 replaces v1");
+    live.reload(
+        &mut ctx,
+        MAIN_BRANCH,
+        &SourceMap::single("<test>", v2),
+        &no_main,
+    )
+    .expect("v2 replaces v1");
     source.borrow_mut().add_data(&rows(before.len(), after));
     source.borrow_mut().set_yield_predicate(Predicate::True);
     for _ in 0..500 {

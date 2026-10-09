@@ -39,7 +39,8 @@ use std::thread;
 
 use log::info;
 
-use crate::ccl::context::{GlobalContext, Phase, ReuseTally, render_errors};
+use crate::ccl::context::{GlobalContext, Phase, ReuseTally};
+use crate::chl_parser::SourceMap;
 use crate::live_program::{
     BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadReport, is_branch_name,
     render_unreadable,
@@ -153,16 +154,20 @@ fn render_reload(report: &ReloadReport) -> String {
     )
 }
 
+/// The label a posted version's diagnostics carry: the text arrived over the
+/// control port and need not match any file on disk.
+const POSTED: &str = "<new>";
+
 /// The reply to a branch operation that did nothing: `404` for a name the
-/// table does not hold, `400` for a refusal or a compile error. `code` is the
-/// source a compile error's spans point into.
-fn branch_error(error: BranchError, code: &str) -> ControlReply {
+/// table does not hold, `400` for a refusal or a compile error. `posted` is the
+/// version the request carried, which a compile error's spans point into.
+fn branch_error(error: BranchError, posted: &SourceMap) -> ControlReply {
     match error {
         BranchError::Unknown(name) => {
             ControlReply::not_found(format!("no branch named `{name}`\n"))
         }
         BranchError::Refused(why) => ControlReply::rejected(why),
-        BranchError::Compile(errs) => ControlReply::rejected(render_errors(&errs, "<new>", code)),
+        BranchError::Reload(e) => ControlReply::rejected(e.render(posted)),
     }
 }
 
@@ -183,33 +188,38 @@ pub fn service(
             branch,
             code,
             phase,
-        } => match live.diff_against(ctx, branch, code, *phase) {
-            Ok(report) => ControlReply::ok(format!(
-                "{}{}",
-                report.diff,
-                render_unreadable(&report.unreadable)
-            )),
-            Err(e) => branch_error(e, code),
-        },
+        } => {
+            let posted = SourceMap::single(POSTED, code.as_str());
+            match live.diff_against(ctx, branch, &posted, *phase) {
+                Ok(report) => ControlReply::ok(format!(
+                    "{}{}",
+                    report.diff,
+                    render_unreadable(&report.unreadable)
+                )),
+                Err(e) => branch_error(e, &posted),
+            }
+        }
         ControlRequest::DiffBranches { from, to, phase } => {
             match live.diff_between(ctx, from, to, *phase) {
                 Ok(diff) => ControlReply::ok(diff),
-                // A compile error here is in a running branch's source, and
-                // which of the two it is in is not known here; the rendering
-                // names no source text.
-                Err(e) => branch_error(e, ""),
+                // Both versions are running ones, so `diff_between` renders a
+                // compile error in either against its own map, and nothing
+                // posted is rendered against.
+                Err(e) => branch_error(e, &SourceMap::single(POSTED, "")),
             }
         }
         // A rebuilt operator's producer takes the scheduler's probe slot when it
         // is built, as the first compile's did; a created branch's do too.
         ControlRequest::Reload { branch, code } => {
-            match live.reload(ctx, branch, code, main_consumer) {
+            let posted = SourceMap::single(POSTED, code.as_str());
+            match live.reload(ctx, branch, &posted, main_consumer) {
                 Ok(report) => ControlReply::ok(render_reload(&report)),
-                Err(e) => branch_error(e, code),
+                Err(e) => branch_error(e, &posted),
             }
         }
         ControlRequest::Branch { name, parent, code } => {
-            match live.create_branch(ctx, name, parent, code, main_consumer) {
+            let posted = SourceMap::single(POSTED, code.as_str());
+            match live.create_branch(ctx, name, parent, &posted, main_consumer) {
                 Ok(created) => ControlReply::ok(format!(
                     "created `{}@{}` from `{}`\n{}",
                     created.name,
@@ -217,16 +227,16 @@ pub fn service(
                     created.from,
                     render_reload(&created.report),
                 )),
-                Err(e) => branch_error(e, code),
+                Err(e) => branch_error(e, &posted),
             }
         }
         ControlRequest::Delete { name } => match live.delete_branch(ctx, name) {
             Ok(_) => ControlReply::ok(format!("deleted branch `{name}`\n")),
-            Err(e) => branch_error(e, ""),
+            Err(e) => branch_error(e, &SourceMap::single(POSTED, "")),
         },
         ControlRequest::Info { name } => match live.render_info(name) {
             Ok(info) => ControlReply::ok(info),
-            Err(e) => branch_error(e, ""),
+            Err(e) => branch_error(e, &SourceMap::single(POSTED, "")),
         },
         ControlRequest::List => ControlReply::ok(live.render_branches()),
     }
