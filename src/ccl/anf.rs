@@ -406,13 +406,18 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             let_chain(binds, rebuild(TypedExprNode::Record(out)))
         }
 
-        TypedExprNode::VariantCtor { tag, payload } => {
+        TypedExprNode::VariantCtor {
+            tag,
+            payload,
+            nominal,
+        } => {
             let (binds, payload) = atomize(*payload, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::VariantCtor {
                     tag,
                     payload: Box::new(payload),
+                    nominal,
                 }),
             )
         }

@@ -105,6 +105,73 @@ fn a_variant_feed() {
     "#});
 }
 
+/// A nominal value is held as its constructor's name and argument
+/// (`docs/chl-spec.md`, "A nominal type is opaque").
+#[test]
+fn a_nominal_constructor_feed() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+            empty
+
+        out = test_sink()
+        out << Shape::circle(2)
+        out << Shape::rect(3, 4)
+        out << Shape::empty
+    "#});
+}
+
+/// A loop builds a nominal value per iteration.
+#[test]
+fn nominal_values_fed_from_a_loop() {
+    agree(indoc! {r#"
+        type Price = Int
+
+        out = test_sink()
+        for p in [1, 2, 3]:
+            out << Price::new(p)
+    "#});
+}
+
+/// A constructor called through a `def` and per loop iteration, and a parameterised one at
+/// two instantiations.
+#[test]
+fn nominal_values_built_in_a_loop() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            rect(w: Int, h: Int)
+
+        type Box(T):
+            boxed(T)
+
+        def square(n: Int) => Shape:
+            Shape::rect(n, n)
+
+        out = test_sink()
+        for r in [1, 2]:
+            out << (square(r), Box::boxed(r), Box::boxed("x"))
+    "#});
+}
+
+/// A mutable variable holding a nominal value: its history's value type is the nominal
+/// type, through `mut_elim` and the store.
+#[test]
+fn a_mutable_variable_of_a_nominal_type() {
+    agree(indoc! {r#"
+        type Shape:
+            circle(radius: Int)
+            empty
+
+        s: Mut(Shape) := Shape::empty
+        for r in [1, 2, 3]:
+            s := Shape::circle(r)
+        out = test_sink()
+        out << s
+    "#});
+}
+
 /// A collection fed at a site that does not iterate nests under that site's one key. The
 /// compiler splices it into the channel instead: channelize takes the channel's domain from
 /// the contribution's own domain. Pinned at both answers.

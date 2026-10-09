@@ -229,7 +229,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             branches,
         } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
 
-        TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
+        TypedExprNode::VariantCtor {
+            tag,
+            payload,
+            nominal,
+        } => emit_variant_ctor(tag, payload, nominal.as_ref(), ctx)?,
 
         TypedExprNode::Source(name) => match ctx.sources.get(name) {
             Some(t) => t.clone(),
@@ -508,7 +512,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             emit_annotation_predicates(d, ctx)?;
             emit_annotation_predicates(c, ctx)
         }
-        Type::Tuple(ts) => {
+        Type::Tuple(ts) | Type::Nominal(_, ts) => {
             for t in ts.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
@@ -2480,15 +2484,41 @@ fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, Loca
     emit_value_read(&mut b.body, ctx)
 }
 
+/// A plain constructor is the one-tag variant of its payload. A nominal one is its type
+/// applied to fresh arguments, with the payload below the constructor's parameter type
+/// at those arguments.
+///
+/// The parameter type is compared with its refinements stripped. A nominal constructor is
+/// only the body of the function its declaration lowers to, whose annotation states the
+/// parameter type in full, so each call discharges the refinements where it applies that
+/// function ([`TypedExprNode::VariantCtor`]).
 pub(super) fn emit_variant_ctor<C: Typing>(
     tag: &str,
     payload: &mut Expr,
+    nominal: Option<&std::rc::Rc<crate::ccl::nominal::NominalDecl>>,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let payload_ty = emit_value_read(payload, ctx)?;
-    let mut tags = BTreeMap::new();
-    tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
-    Ok(variant_type(tags))
+    let Some(decl) = nominal else {
+        let mut tags = BTreeMap::new();
+        tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
+        return Ok(variant_type(tags));
+    };
+    let ctor = decl.ctor(tag).unwrap_or_else(|| {
+        panic!(
+            "`{}` declares no constructor `{tag}`; lowering builds a nominal constructor \
+             only from the declaration",
+            decl.name
+        )
+    });
+    let args: Vec<Type> = decl.params.iter().map(|_| ctx.fresh()).collect();
+    let expected =
+        crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&ctor.payload(), &args));
+    let expected = ctx.normalize(&expected);
+    ctx.require_sub(&payload_ty, &expected, &|| {
+        format!("the argument of constructor `{}::{tag}`", decl.name)
+    })?;
+    Ok(Type::Nominal(decl.clone(), args))
 }
 
 /// What [`compose_chain`] reports back about the chain it walked: the head

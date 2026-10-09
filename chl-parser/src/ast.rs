@@ -279,6 +279,10 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
+    /// `type N(P…):` over constructor lines, or `type N(P…) = R` (`docs/chl-spec.md`,
+    /// "Declaring a nominal type").
+    TypeDecl(TypeDecl),
+
     /// `with <binding> = <context>: body` — a transaction block. The context
     /// is `begin()` (the transaction marker); `binding`, when present, names
     /// the transaction's commit time (`with t = begin(): …`) — parsed but not
@@ -469,6 +473,45 @@ pub enum PayloadPattern {
     /// `` case `tag: `` — the tag carries **no** payload. A type statement, not an
     /// elision: this arm does not match a `` `tag `` that carries one.
     Absent,
+}
+
+/// A nominal type declaration ([`Stmt::TypeDecl`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDecl {
+    /// The capitalized type name.
+    pub name: Spanned<SmolStr>,
+    /// The type parameters, `T` in `type Option(T):`.
+    pub params: Vec<Spanned<SmolStr>>,
+    pub body: TypeDeclBody,
+}
+
+/// What a [`TypeDecl`] declares after its head.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeDeclBody {
+    /// One constructor per indented line, in source order.
+    Constructors(Vec<Constructor>),
+    /// `= R`: the single-constructor form, whose one constructor is `new(R)`.
+    Single(Spanned<Expr>),
+}
+
+/// One constructor line of a [`TypeDecl`], `rect(w: Int, h: Int)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Constructor {
+    /// The lowercase constructor name.
+    pub name: Spanned<SmolStr>,
+    /// The declared parameters. Empty for a line with no parentheses, which declares a
+    /// constructor that is a value.
+    pub params: Vec<ConstructorParam>,
+}
+
+/// One parameter of a [`Constructor`]: a type, and the name it is documented by.
+///
+/// The name is not a record label: a constructor call is positional
+/// (`docs/chl-spec.md`, "Declaring a nominal type").
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstructorParam {
+    pub name: Option<Spanned<SmolStr>>,
+    pub ty: Spanned<Expr>,
 }
 
 /// A function parameter: a name with an optional type annotation.

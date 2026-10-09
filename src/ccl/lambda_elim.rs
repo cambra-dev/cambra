@@ -659,7 +659,8 @@ fn arms_variant(branches: &[Branch], scrut_ty: &Type) -> Type {
     // still have to accept it, so what they consume is the join of the arms' demand
     // and the scrutinee's type — exactly what the open variable `emit_case` relates
     // them both to coalesces to.
-    if let Type::Variant(scrut_tags, _) = strip_refinements(scrut_ty) {
+    let scrut_shape = strip_refinements(scrut_ty);
+    if let Type::Variant(scrut_tags, _) = scrut_shape.structure().into_owned() {
         for (k, t) in scrut_tags {
             if !tags.iter().any(|(existing, _)| *existing == k) {
                 tags.push((k, t));
@@ -1696,15 +1697,15 @@ fn elim_lambda_impl(
         // `VariantCtor` whose payload is *constant* in `param` never reaches here
         // — the `const` arm above lifts the whole scalar variant value with
         // ``const(`cᵢ(…))``, which op-conversion broadcasts.
-        TypedExprNode::VariantCtor { tag, payload } => {
+        TypedExprNode::VariantCtor { tag, payload, .. } => {
             // `variant_wrap` carries the tag itself, so there is nothing to resolve
             // here and nothing to fail: the node's type need not have been
             // width-subtyped up to its consumer's tag set for the injection to be
             // well-defined. (A position would have had to be resolved against that
             // full tag set — see `TagMap`, "Why keyed rather than positional".)
             debug_assert!(
-                matches!(strip_refinements(&body_ty), Type::Variant(..)),
-                "VariantCtor must have a Variant type, got {body_ty}"
+                matches!(*strip_refinements(&body_ty).structure(), Type::Variant(..)),
+                "VariantCtor must have a variant or nominal type, got {body_ty}"
             );
             let payload_ty = payload.ty.clone();
             // eᵢ  ⟹  point-free `param_ty ⇒ P_c`.
@@ -1774,7 +1775,7 @@ fn elim_lambda_impl(
             // reads: every tag the scrutinee can carry must be handled by some arm.
             // Nothing here resolves a tag to a position — `variant_project` names
             // its tag — so this is the only reason the concrete type is needed.
-            let variants = match strip_refinements(&scrut_ty) {
+            let variants = match strip_refinements(&scrut_ty).structure().into_owned() {
                 Type::Variant(v, _) => v,
                 other => {
                     return Err(LambdaElimError::Unsupported(format!(

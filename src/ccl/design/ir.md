@@ -244,7 +244,7 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Lit`, `Var`, `Builtin` | Literal, named reference, and compiler primitive reference. `Builtin` avoids magic variable spellings for combinators. |
 | `BinOp`, `UnaryOp` | Typed scalar operations with expression operands. |
 | `Tuple`, `Record`, `List` | Positional product, named product, and source list construction. Elements may be expressions. |
-| `VariantCtor` | Tag and payload construction, dual to a `Case` pattern. |
+| `VariantCtor` | Tag and payload construction, dual to a `Case` pattern. It may name the nominal type whose constructor the tag is ([nominal-types.md](nominal-types.md#constructors)). |
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
 | `Compose` | Function composition in application order, built by lowering and lambda elimination. |
 | `ExprStmt` | Statement expression followed by its continuation. |
